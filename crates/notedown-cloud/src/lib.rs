@@ -1,13 +1,16 @@
 //! notedown-cloud: a file-based Supernote Private Cloud server.
 //!
-//! This crate currently holds the configuration, the always-on protocol log and the accounts,
-//! login codes and tokens.
+//! This crate currently holds the configuration, the always-on protocol log, the accounts, login
+//! codes and tokens, and the HTTP routes of the capture server (login, server queries, refusal of
+//! every file operation).
 
 pub(crate) mod fsutil;
 
+pub mod api;
 pub mod auth;
 pub mod config;
 pub mod diag;
+pub mod server;
 
 pub use config::Config;
 pub use diag::{Clock, LogEntry, LogKind, ProtocolLog, SystemClock};
@@ -31,6 +34,16 @@ pub enum Error {
     AccountExists(String),
     #[error("account {0} does not exist")]
     NoAccount(String),
+    #[error("cannot listen on {addr}: {source}")]
+    Bind {
+        addr: std::net::SocketAddr,
+        source: std::io::Error,
+    },
+    #[error("server on {addr} stopped: {source}")]
+    Serve {
+        addr: String,
+        source: std::io::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

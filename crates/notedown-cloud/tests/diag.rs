@@ -446,6 +446,7 @@ fn config_defaults_created_and_round_trip() {
     let custom = Config {
         listen: vec!["127.0.0.1:1".parse().unwrap(), "[::1]:2".parse().unwrap()],
         external_base_url: Some("https://notes.example.org".into()),
+        trusted_proxies: vec!["10.0.0.1".parse().unwrap(), "::1".parse().unwrap()],
         protect: false,
         capture: true,
         log_retention_days: 7,
@@ -463,4 +464,22 @@ fn config_partial_file_uses_defaults_and_bad_file_errors() {
     assert!(c.capture && c.protect);
     std::fs::write(dir.path().join("server.toml"), "listen = 3\n").unwrap();
     assert!(Config::load_or_create(dir.path()).is_err());
+}
+
+#[test]
+fn channel_header_and_jwt_shaped_header_values_are_masked() {
+    use notedown_cloud::diag::{contains_jwt, mask_headers};
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJ1c2VySWQiOjF9.c2lnbmF0dXJl";
+    assert!(contains_jwt(jwt));
+    assert!(contains_jwt(&format!("{jwt}_SN078C10000000_1791270000000")));
+    assert!(!contains_jwt("eyJ only"));
+    assert!(!contains_jwt("application/json"));
+    let mut h = std::collections::BTreeMap::new();
+    h.insert("channel".to_string(), String::new());
+    h.insert("x-custom".to_string(), format!("Bearer {jwt}"));
+    h.insert("user-agent".to_string(), "okhttp/3.12".to_string());
+    let m = mask_headers(&h);
+    assert_eq!(m["channel"], "<masked:0 chars>");
+    assert!(m["x-custom"].starts_with("<masked:"));
+    assert_eq!(m["user-agent"], "okhttp/3.12");
 }

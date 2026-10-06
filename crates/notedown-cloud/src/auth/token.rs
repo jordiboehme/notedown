@@ -1,6 +1,7 @@
 //! Server key, tokens and the per-device token generation.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
@@ -66,6 +67,18 @@ impl TokenKey {
         }
     }
 
+    /// A stable public id derived from the key (domain-separated hash, the key cannot be
+    /// recovered from it): 32 hex characters, the same across restarts.
+    pub fn derive_id(&self, label: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"notedown-cloud/");
+        h.update(label.as_bytes());
+        h.update([0u8]);
+        h.update(&self.secret);
+        const_hex::encode(&h.finalize()[..16])
+    }
+
     pub fn issue(&self, claims: &Claims) -> Result<String> {
         jsonwebtoken::encode(
             &Header::new(Algorithm::HS256),
@@ -92,18 +105,46 @@ impl TokenKey {
     }
 }
 
-/// `accounts/<slug>/devices/<serial>.json`. Later tasks add binding and firmware fields.
+/// `accounts/<slug>/devices/<serial>.json`. Field order is the file order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Device {
     pub serial: String,
+    /// Device name from `bindEquipment`.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Bound to this account (`bindEquipment`); `unlink` clears it.
+    #[serde(default)]
+    pub bound: bool,
+    /// The `version` the device sent last (login, bind, unlink).
+    #[serde(default)]
+    pub firmware: Option<String>,
+    /// `totalCapacity` from `bindEquipment`, as sent (a string).
+    #[serde(default)]
+    pub total_capacity: Option<String>,
     pub token_generation: u64,
     /// Milliseconds since the epoch of the last login.
     pub last_login_ms: u64,
 }
 
+impl Device {
+    fn new(serial: &str) -> Device {
+        Device {
+            serial: serial.to_string(),
+            name: None,
+            bound: false,
+            firmware: None,
+            total_capacity: None,
+            token_generation: 0,
+            last_login_ms: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Devices {
     data_dir: PathBuf,
+    /// Serializes every read-modify-write of device files in this process.
+    write_lock: Arc<Mutex<()>>,
 }
 
 fn valid_serial(serial: &str) -> bool {
@@ -118,7 +159,90 @@ impl Devices {
     pub fn new(data_dir: &Path) -> Devices {
         Devices {
             data_dir: data_dir.to_path_buf(),
+            write_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// Whether `serial` is acceptable as a file name (1 to 64 of letters, digits, `-`, `_`).
+    pub fn valid_serial(serial: &str) -> bool {
+        valid_serial(serial)
+    }
+
+    /// Read, change and write one device record under the write lock; creates it when missing.
+    /// Returns the record before (`None` when new) and after the change.
+    pub fn update(
+        &self,
+        slug: &str,
+        serial: &str,
+        change: impl FnOnce(&mut Device),
+    ) -> Result<(Option<Device>, Device)> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let path = self.file(slug, serial)?;
+        let before = self.get(slug, serial)?;
+        let mut device = before.clone().unwrap_or_else(|| Device::new(serial));
+        change(&mut device);
+        if before.as_ref() != Some(&device) {
+            write_atomic(&path, &json_bytes(&device), false)?;
+        }
+        Ok((before, device))
+    }
+
+    /// All devices of one account, sorted by serial.
+    pub fn list(&self, slug: &str) -> Result<Vec<Device>> {
+        super::accounts::validate_slug(slug)?;
+        let dir = self.data_dir.join("accounts").join(slug).join("devices");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(io_err(&dir)(e)),
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(io_err(&dir))?;
+            let name = entry.file_name();
+            let Some(serial) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
+                continue;
+            };
+            if !valid_serial(serial) {
+                continue;
+            }
+            if let Some(d) = self.get(slug, serial)? {
+                out.push(d);
+            }
+        }
+        out.sort_by(|a, b| a.serial.cmp(&b.serial));
+        Ok(out)
+    }
+
+    /// Slugs of the accounts that have a record of this device, sorted.
+    pub fn owners(&self, serial: &str) -> Result<Vec<String>> {
+        if !valid_serial(serial) {
+            return Ok(Vec::new());
+        }
+        let root = self.data_dir.join("accounts");
+        let entries = match std::fs::read_dir(&root) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(io_err(&root)(e)),
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(io_err(&root))?;
+            let Some(slug) = entry.file_name().to_str().map(String::from) else {
+                continue;
+            };
+            if super::accounts::validate_slug(&slug).is_ok()
+                && entry
+                    .path()
+                    .join("devices")
+                    .join(format!("{serial}.json"))
+                    .is_file()
+            {
+                out.push(slug);
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 
     fn file(&self, slug: &str, serial: &str) -> Result<PathBuf> {
@@ -167,17 +291,12 @@ impl Devices {
     }
 
     fn bump_inner(&self, slug: &str, serial: &str, login_ms: Option<u64>) -> Result<u64> {
-        let path = self.file(slug, serial)?;
-        let mut device = self.get(slug, serial)?.unwrap_or(Device {
-            serial: serial.to_string(),
-            token_generation: 0,
-            last_login_ms: 0,
-        });
-        device.token_generation += 1;
-        if let Some(ms) = login_ms {
-            device.last_login_ms = ms;
-        }
-        write_atomic(&path, &json_bytes(&device), false)?;
+        let (_, device) = self.update(slug, serial, |d| {
+            d.token_generation += 1;
+            if let Some(ms) = login_ms {
+                d.last_login_ms = ms;
+            }
+        })?;
         Ok(device.token_generation)
     }
 }

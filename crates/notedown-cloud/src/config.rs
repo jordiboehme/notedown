@@ -1,7 +1,7 @@
 //! `<data>/server.toml`: created with defaults on first start.
 
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,9 @@ pub struct Config {
     /// Base URL the device must use to reach the server (behind a reverse proxy).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_base_url: Option<String>,
+    /// Reverse proxies whose `X-Forwarded-For` header names the client address. Empty: the
+    /// header is ignored and the peer address counts.
+    pub trusted_proxies: Vec<IpAddr>,
     /// Log and refuse device deletes, moves and overwrites.
     pub protect: bool,
     /// Write full, masked dumps of every request and frame to `capture/`.
@@ -33,6 +36,7 @@ impl Default for Config {
         Config {
             listen: vec![SocketAddr::from(([0, 0, 0, 0], 19072))],
             external_base_url: None,
+            trusted_proxies: Vec::new(),
             protect: true,
             capture: false,
             log_retention_days: 30,

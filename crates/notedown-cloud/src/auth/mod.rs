@@ -9,8 +9,10 @@ use std::sync::Mutex;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-pub use accounts::{ACCOUNT_FILE, Account, Accounts, MAX_FAILED_LOGINS, md5_hex, validate_slug};
-pub use codes::{CODE_LEN, CODE_TTL_MS, LoginCodes};
+pub use accounts::{
+    ACCOUNT_FILE, Account, Accounts, LOCK_COOLDOWN_MS, MAX_FAILED_LOGINS, md5_hex, validate_slug,
+};
+pub use codes::{CODE_LEN, CODE_TTL_MS, LoginCodes, MAX_PENDING_CODES};
 pub use token::{Claims, Device, Devices, KEY_FILE, TokenKey};
 
 use crate::Error;
@@ -113,12 +115,20 @@ impl Auth {
         &self.devices
     }
 
+    /// The server instance id the device sees as `uniqueMachineId`: stable across restarts.
+    pub fn machine_id(&self) -> String {
+        self.key.derive_id("unique-machine-id")
+    }
+
     /// `query/random/code`: issues a code for any email, so the answer does not reveal accounts.
-    pub fn challenge(&self, email: &str, now_ms: u64) -> (String, u64) {
+    /// `None` when too many codes are pending.
+    pub fn challenge(&self, email: &str, now_ms: u64) -> Option<(String, u64)> {
         self.codes.issue(email, now_ms)
     }
 
-    /// `login/equipment`. Order: unknown account `E0018`, locked `E0045`, then the code is
+    /// `login/equipment`. A lock older than [`LOCK_COOLDOWN_MS`] is cleared first (counter back
+    /// to zero); a lock without a stored time (older file) gets the current time and stays.
+    /// Order: unknown account `E0018`, locked `E0045`, then the code is
     /// consumed (single use). A missing, used or expired code gives `E0019` without counting
     /// (no password guess was possible); a wrong hash gives `E0019` and counts, the sixth failure
     /// locks the account. Success resets the counter, raises the device's token generation and
@@ -137,7 +147,22 @@ impl Auth {
             .find_by_email(email)?
             .ok_or(AuthError::NoAccount)?;
         if account.locked {
-            return Err(AuthError::Locked);
+            match account.locked_at_ms {
+                Some(at) if now_ms.saturating_sub(at) >= LOCK_COOLDOWN_MS => {
+                    // Cooldown over: a fresh start, so one more failure does not lock again.
+                    account.locked = false;
+                    account.locked_at_ms = None;
+                    account.failed_logins = 0;
+                    self.accounts.save(&account)?;
+                }
+                Some(_) => return Err(AuthError::Locked),
+                None => {
+                    // A lock without a time (older file): the cooldown starts now.
+                    account.locked_at_ms = Some(now_ms);
+                    self.accounts.save(&account)?;
+                    return Err(AuthError::Locked);
+                }
+            }
         }
         let Some(code) = code else {
             return Err(AuthError::WrongPassword);
@@ -146,6 +171,7 @@ impl Auth {
             account.failed_logins += 1;
             if account.failed_logins >= MAX_FAILED_LOGINS {
                 account.locked = true;
+                account.locked_at_ms = Some(now_ms);
             }
             self.accounts.save(&account)?;
             return Err(AuthError::WrongPassword);

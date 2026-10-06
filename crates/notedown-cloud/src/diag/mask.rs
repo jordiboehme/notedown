@@ -33,9 +33,32 @@ pub fn is_sensitive_key(key: &str) -> bool {
     k == "code" || SENSITIVE_PARTS.iter().any(|p| k.contains(p))
 }
 
-/// Header names: the key rule plus anything containing `auth`.
+/// Header names: the key rule plus anything containing `auth`, and `channel` (the device may
+/// send `<token>_<serial>_<ms>` there, `docs/sync-protocol.md` 2.5).
 pub fn is_sensitive_header(name: &str) -> bool {
-    is_sensitive_key(name) || name.to_ascii_lowercase().contains("auth")
+    let n = name.to_ascii_lowercase();
+    is_sensitive_key(name) || n.contains("auth") || n == "channel"
+}
+
+/// Whether a text holds something shaped like a JWT: `eyJ` and two more base64url parts
+/// separated by dots.
+pub fn contains_jwt(s: &str) -> bool {
+    let b64 = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '=';
+    s.match_indices("eyJ").any(|(i, _)| {
+        let rest = &s[i..];
+        let mut parts = rest.split('.');
+        let ok = |p: Option<&str>, whole: bool| {
+            p.is_some_and(|p| {
+                let p = if whole {
+                    p
+                } else {
+                    p.split(|c: char| !b64(c)).next().unwrap_or("")
+                };
+                !p.is_empty() && p.chars().all(b64)
+            })
+        };
+        ok(parts.next(), true) && ok(parts.next(), true) && ok(parts.next(), false)
+    })
 }
 
 /// The one placeholder: `<masked:N chars>`.
@@ -170,7 +193,7 @@ pub fn mask_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, Stri
     headers
         .iter()
         .map(|(k, v)| {
-            let v = if is_sensitive_header(k) {
+            let v = if is_sensitive_header(k) || contains_jwt(v) {
                 mask_str(v)
             } else {
                 cap_text(v, MAX_FIELD_BYTES)

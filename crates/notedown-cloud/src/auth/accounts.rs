@@ -13,6 +13,8 @@ use crate::{Error, Result, io_err};
 pub const ACCOUNT_FILE: &str = "account.json";
 /// Failed logins after which an account is locked (`E0045`).
 pub const MAX_FAILED_LOGINS: u32 = 6;
+/// A lock clears by itself after this time (ms); `cloud account passwd` clears it at once.
+pub const LOCK_COOLDOWN_MS: u64 = 15 * 60 * 1000;
 const NEXT_ID_FILE: &str = ".next_user_id";
 const FIRST_USER_ID: u64 = 1_000_001;
 
@@ -27,6 +29,10 @@ pub struct Account {
     pub password_md5: String,
     pub created: String,
     pub locked: bool,
+    /// When the lock was set (ms since the epoch); `None` while unlocked. Files written before
+    /// this field existed read as `None`.
+    #[serde(default)]
+    pub locked_at_ms: Option<u64>,
     pub failed_logins: u32,
 }
 
@@ -135,6 +141,7 @@ impl Accounts {
                 .format(&Rfc3339)
                 .expect("rfc3339 formatting"),
             locked: false,
+            locked_at_ms: None,
             failed_logins: 0,
         };
         self.save(&account)?;
@@ -170,6 +177,7 @@ impl Accounts {
             .ok_or_else(|| Error::NoAccount(slug.to_string()))?;
         account.password_md5 = md5_hex(password);
         account.locked = false;
+        account.locked_at_ms = None;
         account.failed_logins = 0;
         self.save(&account)
     }

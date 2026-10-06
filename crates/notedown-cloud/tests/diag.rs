@@ -268,43 +268,163 @@ fn firmware_marker_recorded_in_this_run_protects_neighbours() {
 }
 
 #[test]
-fn concurrent_writers_lose_no_lines() {
+fn concurrent_writers_lose_no_lines_across_a_day_switch() {
+    use std::sync::Barrier;
+    const THREADS: usize = 8;
+    const PER_PHASE: usize = 25;
     let dir = tempfile::tempdir().unwrap();
     let clock = FakeClock::at(2026, 10, 6);
-    let log = Arc::new(ProtocolLog::open_with_clock(dir.path(), 30, 4000, clock.clone()).unwrap());
-    let handles: Vec<_> = (0..4)
-        .map(|t| {
-            let log = log.clone();
-            let clock = clock.clone();
+    let log =
+        Arc::new(ProtocolLog::open_with_clock(dir.path(), 30, 1 << 30, clock.clone()).unwrap());
+    let barrier = Arc::new(Barrier::new(THREADS + 1));
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let (log, barrier) = (log.clone(), barrier.clone());
             std::thread::spawn(move || {
-                for i in 0..50 {
-                    if t == 0 && i == 25 {
-                        clock.set(2026, 10, 7);
-                    }
+                for _ in 0..PER_PHASE {
                     log.record(req("/x"));
+                }
+                barrier.wait(); // phase 1 done
+                barrier.wait(); // day switched
+                for _ in 0..PER_PHASE {
+                    log.record(req("/y"));
                 }
             })
         })
         .collect();
+    barrier.wait();
+    clock.set(2026, 10, 7);
+    barrier.wait();
     for h in handles {
         h.join().unwrap();
     }
-    let total: usize = names(dir.path())
-        .iter()
-        .map(|n| {
-            std::fs::read_to_string(dir.path().join("logs").join(n))
-                .unwrap()
-                .lines()
-                .inspect(|l| {
-                    serde_json::from_str::<Value>(l).unwrap();
-                })
-                .count()
-        })
-        .sum();
-    // the cap may have deleted the (older) first-day file, but never lines of the current one
-    assert!(total >= 1);
-    let day2 = std::fs::read_to_string(dir.path().join("logs/protocol-2026-10-07.jsonl")).unwrap();
-    assert!(day2.lines().count() > 0);
+    let count = |n: &str| {
+        std::fs::read_to_string(dir.path().join("logs").join(n))
+            .unwrap()
+            .lines()
+            .inspect(|l| {
+                serde_json::from_str::<Value>(l).unwrap();
+            })
+            .count()
+    };
+    assert_eq!(count("protocol-2026-10-06.jsonl"), THREADS * PER_PHASE);
+    assert_eq!(count("protocol-2026-10-07.jsonl"), THREADS * PER_PHASE);
+    assert_eq!(log.dropped_lines(), 0);
+}
+
+#[test]
+fn clock_going_back_keeps_the_current_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::at(2026, 10, 7);
+    let log = ProtocolLog::open_with_clock(dir.path(), 30, 1 << 30, clock.clone()).unwrap();
+    log.record(req("/a"));
+    clock.set(2026, 10, 6);
+    log.record(req("/b"));
+    assert_eq!(names(dir.path()), ["protocol-2026-10-07.jsonl"]);
+    let t = std::fs::read_to_string(dir.path().join("logs/protocol-2026-10-07.jsonl")).unwrap();
+    assert_eq!(t.lines().count(), 2);
+}
+
+#[test]
+fn all_headers_logged_secret_ones_masked_repeats_joined() {
+    let dir = tempfile::tempdir().unwrap();
+    let log =
+        ProtocolLog::open_with_clock(dir.path(), 30, 1 << 30, FakeClock::at(2026, 10, 6)).unwrap();
+    let mut e = req("/p?sign=SECRETSIGN&a=1");
+    e.add_header("User-Agent", "nomad");
+    e.add_header("Accept", "a/b");
+    e.add_header("accept", "c/d");
+    e.add_header("Authorization", "Bearer SECRETAUTH");
+    e.add_header("Proxy-Authorization", "SECRETPROXY");
+    e.add_header("Cookie", "s=SECRETCOOKIE");
+    e.add_header("Set-Cookie", "s=SECRETSETCOOKIE");
+    e.add_header("X-Access-Token", "SECRETTOKEN");
+    e.add_header("X-Api-Secret", "SECRETX");
+    e.add_header("X-Custom-Whatever", "visible");
+    e.add_header("x-long", &"y".repeat(10_000));
+    e.query = Some("password=SECRETPW&Pass%77ord=SECRETPW2&flag".into());
+    log.record(e);
+    let text = std::fs::read_to_string(dir.path().join("logs/protocol-2026-10-06.jsonl")).unwrap();
+    assert!(!text.contains("SECRET"), "{text}");
+    let v: Value = serde_json::from_str(text.trim()).unwrap();
+    let h = &v["headers"];
+    assert_eq!(h["x-custom-whatever"], "visible");
+    assert_eq!(h["accept"], "a/b, c/d");
+    assert!(h["authorization"].as_str().unwrap().starts_with("<masked:"));
+    assert!(h["x-long"].as_str().unwrap().contains("<cut:"));
+    assert_eq!(v["path"], "/p?sign=<masked:10 chars>&a=1");
+    assert_eq!(
+        v["query"],
+        "password=<masked:8 chars>&Pass%77ord=<masked:9 chars>&flag"
+    );
+}
+
+#[test]
+fn long_path_and_query_are_cut() {
+    let dir = tempfile::tempdir().unwrap();
+    let log =
+        ProtocolLog::open_with_clock(dir.path(), 30, 1 << 30, FakeClock::at(2026, 10, 6)).unwrap();
+    let mut e = req(&format!("/{}", "p".repeat(10_000)));
+    e.query = Some("q".repeat(10_000));
+    log.record(e);
+    let text = std::fs::read_to_string(dir.path().join("logs/protocol-2026-10-06.jsonl")).unwrap();
+    assert!(text.len() < 10_000);
+    assert!(text.contains("<cut:"));
+}
+
+#[test]
+fn embedded_secrets_in_frames_and_form_bodies_are_masked() {
+    let frame = Value::String(r#"42["ClientMessage","{\"token\":\"abc\"}"]"#.into());
+    let m = mask_json(&frame);
+    assert_eq!(
+        m,
+        Value::String(r#"42["ClientMessage","{\"token\":\"<masked:3 chars>\"}"]"#.into())
+    );
+    // JSON inside a JSON string field
+    let nested = json!({"msg": "{\"a\":{\"password\":\"pw\"}}", "keep": "plain"});
+    let m = mask_json(&nested);
+    assert!(!m.to_string().contains("\\\"pw\\\""));
+    assert_eq!(m["keep"], "plain");
+
+    let dir = tempfile::tempdir().unwrap();
+    let log =
+        ProtocolLog::open_with_clock(dir.path(), 30, 1 << 30, FakeClock::at(2026, 10, 6)).unwrap();
+    let mut e = LogEntry::new(LogKind::Frame);
+    e.request_body = Some(Value::String("password=x&randomCode=yy&account=me".into()));
+    e.response_body = Some(Value::String(
+        r#"42["ClientMessage","{\"token\":\"abc\"}"]"#.into(),
+    ));
+    log.record(e);
+    let text = std::fs::read_to_string(dir.path().join("logs/protocol-2026-10-06.jsonl")).unwrap();
+    let v: Value = serde_json::from_str(text.trim()).unwrap();
+    assert_eq!(
+        v["request_body"],
+        "password=<masked:1 chars>&randomCode=<masked:2 chars>&account=me"
+    );
+    assert!(!text.contains("abc"));
+}
+
+#[test]
+fn key_rule_matches_names_containing_secret_parts() {
+    let m = mask_json(&json!({
+        "userToken": "a", "client_secret": "b", "Authorization": "c", "setCookie": "d",
+        "signature": "e", "newPassword": "f", "validCode": "g", "code": "h",
+        "errorCode": "E0019", "codes": "keep"
+    }));
+    for k in [
+        "userToken",
+        "client_secret",
+        "Authorization",
+        "setCookie",
+        "signature",
+        "newPassword",
+        "validCode",
+        "code",
+    ] {
+        assert!(m[k].as_str().unwrap().starts_with("<masked:"), "{k}");
+    }
+    assert_eq!(m["errorCode"], "E0019");
+    assert_eq!(m["codes"], "keep");
 }
 
 // ---- config ----

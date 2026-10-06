@@ -4,13 +4,14 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::{Date, Month, OffsetDateTime, format_description::well_known::Rfc3339};
 
-use super::mask::{cut_body, mask_headers, mask_json, mask_query};
+use super::mask::{MAX_FIELD_BYTES, cap_text, cut_body, mask_form, mask_headers, mask_json};
 use super::rotate::{LogFile, plan_deletions};
 use crate::{Result, io_err};
 
@@ -78,6 +79,9 @@ pub struct LogEntry {
     /// For frames: `in` or `out`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
+    /// For a `log_lines_dropped` marker: how many lines could not be written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dropped: Option<u64>,
 }
 
 impl LogEntry {
@@ -92,10 +96,30 @@ impl LogEntry {
         self.kind == LogKind::Marker && self.flags.iter().any(|f| f == FLAG_FIRMWARE_CHANGED)
     }
 
-    /// Apply masking and the size cap. Called by [`ProtocolLog::record`], so no caller can log a
-    /// secret in clear.
+    /// Add a header, joining the values of a repeated header with `, ` (names lowercased).
+    pub fn add_header(&mut self, name: &str, value: &str) {
+        let slot = self.headers.entry(name.to_ascii_lowercase()).or_default();
+        if !slot.is_empty() {
+            slot.push_str(", ");
+        }
+        slot.push_str(value);
+    }
+
+    /// Apply masking and the size caps to every field that can carry request data. Called by
+    /// [`ProtocolLog::record`], so no caller can log a secret in clear.
     fn sanitized(mut self) -> Self {
-        self.query = self.query.as_deref().map(mask_query);
+        // A query string inside the path is masked like the query field.
+        self.path = self.path.take().map(|p| {
+            let p = match p.split_once('?') {
+                Some((path, q)) => format!("{path}?{}", mask_form(q)),
+                None => p,
+            };
+            cap_text(&p, MAX_FIELD_BYTES)
+        });
+        self.query = self
+            .query
+            .take()
+            .map(|q| cap_text(&mask_form(&q), MAX_FIELD_BYTES));
         self.headers = mask_headers(&self.headers);
         let prep = |v: Option<Value>| v.map(|v| cut_body(&mask_json(&v)));
         self.request_body = prep(self.request_body.take());
@@ -115,6 +139,10 @@ struct State {
     /// Size-cap check runs again when `total` exceeds this (avoids a directory scan per line when
     /// protected files keep the total above the cap).
     check_at: u64,
+    /// A write failed: start the next line with a newline so a torn line cannot merge with it.
+    torn: bool,
+    /// Lines lost since the last `log_lines_dropped` marker.
+    pending_dropped: u64,
 }
 
 pub struct ProtocolLog {
@@ -122,6 +150,7 @@ pub struct ProtocolLog {
     retention_days: u32,
     max_bytes: u64,
     clock: Arc<dyn Clock>,
+    dropped: AtomicU64,
     state: Mutex<State>,
 }
 
@@ -217,12 +246,15 @@ impl ProtocolLog {
             retention_days,
             max_bytes,
             clock,
+            dropped: AtomicU64::new(0),
             state: Mutex::new(State {
                 day,
                 file,
                 total,
                 firmware_dates,
                 check_at: max_bytes,
+                torn: false,
+                pending_dropped: 0,
             }),
         };
         {
@@ -262,49 +294,154 @@ impl ProtocolLog {
         };
     }
 
-    /// Append one line. Never fails the caller: I/O errors go to stderr.
+    /// Total lines that could not be written to disk (they went to stderr instead).
+    pub fn dropped_lines(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Write one line, retrying once after reopening the file. Returns whether it reached the file.
+    fn try_write(&self, st: &mut State, line: &str) -> bool {
+        let mut buf = String::with_capacity(line.len() + 1);
+        if st.torn {
+            buf.push('\n');
+        }
+        buf.push_str(line);
+        let attempt = |f: &mut File, b: &str| f.write_all(b.as_bytes()).and_then(|_| f.flush());
+        let mut ok = attempt(&mut st.file, &buf).is_ok();
+        if !ok {
+            // A partial write may be on disk: separate the retry from it.
+            st.torn = true;
+            if buf.as_bytes().first() != Some(&b'\n') {
+                buf.insert(0, '\n');
+            }
+            if let Ok(f) = open_day(&self.logs_dir, st.day) {
+                st.file = f;
+                ok = attempt(&mut st.file, &buf).is_ok();
+            }
+        }
+        if ok {
+            st.torn = false;
+            st.total += buf.len() as u64;
+        }
+        ok
+    }
+
+    /// Append one line. Never fails the caller and never loses an entry silently: when the file
+    /// cannot be written, the masked line goes to stderr and is counted in [`Self::dropped_lines`];
+    /// after recovery a `log_lines_dropped` marker with the count follows.
     pub fn record(&self, entry: LogEntry) {
-        let now = self.clock.now();
         let mut entry = entry.sanitized();
+        let mut st = self.lock();
+        // The clock is read inside the lock so lines and day switches stay ordered.
+        let now = self.clock.now();
         if entry.ts.is_empty() {
             entry.ts = now.format(&Rfc3339).unwrap_or_default();
         }
         let mut line = match serde_json::to_string(&entry) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("protocol log: cannot serialize entry: {e}");
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "protocol log: cannot serialize entry: {e}"
+                );
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                st.pending_dropped += 1;
                 return;
             }
         };
         line.push('\n');
 
-        let mut st = self.lock();
         let today = now.date();
         let mut need_rotate = false;
-        if today != st.day {
+        // Only move forward: a clock that goes back keeps writing to the current file.
+        if today > st.day {
             match open_day(&self.logs_dir, today) {
                 Ok(f) => {
                     st.file = f;
                     st.day = today;
                     need_rotate = true;
                 }
-                Err(e) => eprintln!("protocol log: {e}"),
+                Err(e) => {
+                    let _ = writeln!(std::io::stderr(), "protocol log: {e}");
+                }
             }
         }
         if entry.is_firmware_marker() && !st.firmware_dates.contains(&st.day) {
             let d = st.day;
             st.firmware_dates.push(d);
         }
-        match st
-            .file
-            .write_all(line.as_bytes())
-            .and_then(|_| st.file.flush())
-        {
-            Ok(()) => st.total += line.len() as u64,
-            Err(e) => eprintln!("protocol log: write failed: {e}"),
+        if self.try_write(&mut st, &line) {
+            if st.pending_dropped > 0 {
+                let mut m = LogEntry::new(LogKind::Marker);
+                m.ts = entry.ts.clone();
+                m.flags = vec!["log_lines_dropped".into()];
+                m.dropped = Some(st.pending_dropped);
+                if let Ok(mut ml) = serde_json::to_string(&m) {
+                    ml.push('\n');
+                    if self.try_write(&mut st, &ml) {
+                        st.pending_dropped = 0;
+                    }
+                }
+            }
+        } else {
+            let _ = std::io::stderr().write_all(line.as_bytes());
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            st.pending_dropped += 1;
         }
         if need_rotate || st.total > st.check_at {
             self.rotate(&mut st);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn write_failure_is_counted_then_marked_and_never_merges_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = ProtocolLog::open(dir.path(), 30, 1 << 30).unwrap();
+        let path = dir
+            .path()
+            .join("logs")
+            .join(file_name(OffsetDateTime::now_utc().date()));
+        log.record(LogEntry::new(LogKind::Request));
+        // Break the file: read-only handle and mode 0444 so the reopen fails too.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        log.lock().file = File::open(&path).unwrap();
+        let mut e = LogEntry::new(LogKind::Request);
+        e.path = Some("/lost?token=SECRET".into());
+        log.record(e);
+        assert_eq!(log.dropped_lines(), 1);
+        // Recovery.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        log.record(LogEntry::new(LogKind::Request));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        for l in &lines {
+            serde_json::from_str::<Value>(l).unwrap();
+        }
+        let marker: Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(marker["flags"][0], "log_lines_dropped");
+        assert_eq!(marker["dropped"], 1);
+        assert_eq!(log.dropped_lines(), 1);
+    }
+
+    #[test]
+    fn one_failed_write_is_retried_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = ProtocolLog::open(dir.path(), 30, 1 << 30).unwrap();
+        let path = dir
+            .path()
+            .join("logs")
+            .join(file_name(OffsetDateTime::now_utc().date()));
+        log.lock().file = File::open(&path).unwrap(); // read-only: write fails, reopen works
+        log.record(LogEntry::new(LogKind::Request));
+        assert_eq!(log.dropped_lines(), 0);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().filter(|l| !l.is_empty()).count(), 1);
     }
 }

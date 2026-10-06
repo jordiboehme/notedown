@@ -325,7 +325,7 @@ pub fn convert_one(
             output.display()
         ));
     }
-    let sha = hex::encode(Sha256::digest(&bytes));
+    let sha = const_hex::encode(Sha256::digest(&bytes));
     let generator = format!("notedown {}", env!("CARGO_PKG_VERSION"));
     if !opts.force && can_skip(output, &sha, engine.label(), &generator) {
         return Ok(Outcome::Skipped);

@@ -37,7 +37,7 @@ fn open(path: &std::path::Path) -> Notebook {
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+    const_hex::encode(Sha256::digest(bytes))
 }
 
 fn record_count(nb: &Notebook, address: u64) -> u32 {

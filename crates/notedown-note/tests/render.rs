@@ -34,7 +34,7 @@ fn diff_pixels(a: &image::RgbaImage, b: &image::RgbaImage) -> usize {
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+    const_hex::encode(Sha256::digest(bytes))
 }
 
 /// (name, notebook, golden dir) for every sample that is present.

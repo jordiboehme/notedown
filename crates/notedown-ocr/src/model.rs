@@ -124,7 +124,7 @@ fn hash_reader(mut r: impl Read) -> std::io::Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hex::encode(hasher.finalize()))
+    Ok(const_hex::encode(hasher.finalize()))
 }
 
 fn check_hash(path: &Path, expected: &ModelFile, actual: String) -> Result<(), OcrError> {
@@ -199,7 +199,7 @@ fn download(
         }
         out.flush()?;
         drop(out);
-        let actual = hex::encode(hasher.finalize());
+        let actual = const_hex::encode(hasher.finalize());
         if done != file.size {
             return Err(OcrError::Checksum {
                 path: part.clone(),

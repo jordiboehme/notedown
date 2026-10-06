@@ -12,13 +12,19 @@ rust-version = "1.99"
 [workspace.dependencies]
 notedown-note = { path = "crates/notedown-note", version = "0.1.0" }
 notedown-ocr = { path = "crates/notedown-ocr", version = "0.1.0" }
-thiserror = "2"
-anyhow = "1"
-base64 = "0.22"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-image = { version = "0.25", default-features = false, features = ["png"] }
-sha2 = "0.10"
-hex = "0.4"
-insta = "1"
-zip = { version = "8", default-features = false, features = ["deflate"] }
+thiserror = "=2.0.21"
+anyhow = "=1.0.104"
+base64 = "=0.23.1"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+sha2 = "=0.11.0"
+const-hex = "=1.19.3"
+insta = "=1.49.0"
+zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
+scraper = "=0.27.0"
+dirs = "=7.0.0"
+reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "rustls"] }
+tempfile = "=3.27.0"
+clap = { version = "=4.6.7", features = ["derive"] }
+time = { version = "=0.3.55", features = ["formatting"] }

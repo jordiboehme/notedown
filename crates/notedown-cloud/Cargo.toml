@@ -27,6 +27,7 @@ unicode-normalization.workspace = true
 unicase.workspace = true
 notedown-note.workspace = true
 futures-util.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "io-util"] }

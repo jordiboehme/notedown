@@ -336,3 +336,126 @@ fn cloud_journal_tail_follow_prints_new_events_and_stops_on_ctrl_c() {
     let status = child.wait().unwrap();
     assert!(status.success(), "{status:?}");
 }
+
+fn notedown(args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn stdout(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn cloud_import_dry_run_import_and_put() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let out = cloud(
+        d,
+        &[
+            "add",
+            "jordi",
+            "--email",
+            "jordi@example.org",
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(out.status.success());
+    let backup = d.join("backup");
+    std::fs::create_dir_all(backup.join("Note/Work")).unwrap();
+    std::fs::write(backup.join("Note/Work/a.note"), b"note").unwrap();
+    std::fs::create_dir_all(backup.join("Document")).unwrap();
+    std::fs::write(backup.join("Document/b.pdf"), b"pdf").unwrap();
+    std::fs::create_dir_all(backup.join("REMOVABLE0")).unwrap();
+    let data = d.to_str().unwrap();
+    let b = backup.to_str().unwrap();
+
+    let out = notedown(&[
+        "cloud",
+        "import",
+        b,
+        "--data",
+        data,
+        "--account",
+        "jordi",
+        "--dry-run",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout(&out),
+        "dry run, nothing is written\n\
+         Document -> DOCUMENT/Document: 1 file, 0 folders, 0.0 MB\n\
+         Note -> NOTE/Note: 1 file, 1 folder, 0.0 MB\n\
+         skipped REMOVABLE0 (SD card)\n\
+         account jordi holds 0 files now\n\
+         would import 2 files (0.0 MB)\n"
+    );
+    assert!(!d.join("accounts/jordi/files").exists());
+    assert!(!d.join("journal").exists());
+
+    let out = notedown(&["cloud", "import", b, "--data", data, "--account", "jordi"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout(&out).ends_with("imported 2 files (0.0 MB), protect gate open for jordi\n"),
+        "{}",
+        stdout(&out)
+    );
+    let again = notedown(&["cloud", "import", b, "--data", data, "--account", "jordi"]);
+    assert_eq!(again.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&again.stderr).contains("--replace"));
+
+    let src = d.join("c.pdf");
+    std::fs::write(&src, b"c").unwrap();
+    let s = src.to_str().unwrap();
+    let out = notedown(&[
+        "cloud",
+        "put",
+        s,
+        "--data",
+        data,
+        "--account",
+        "jordi",
+        "--to",
+        "INBOX",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    assert!(text.starts_with("INBOX/c.pdf id "), "{text}");
+    assert!(text.ends_with(" (created)\n"), "{text}");
+    let out = notedown(&[
+        "cloud",
+        "put",
+        s,
+        "--data",
+        data,
+        "--account",
+        "jordi",
+        "--to",
+        "Other",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    let ev = lines(&journal(d, &["tail"]));
+    let last = ev.last().unwrap();
+    assert_eq!(last["type"], "file.created");
+    assert_eq!(last["path"], "INBOX/c.pdf");
+    assert_eq!(last["origin"], "cli");
+    // no em-dash in what people read
+    for o in [&out, &again] {
+        assert!(!String::from_utf8_lossy(&o.stderr).contains('\u{2014}'));
+    }
+}

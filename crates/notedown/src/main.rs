@@ -72,6 +72,67 @@ enum CloudAction {
         #[command(subcommand)]
         action: JournalAction,
     },
+    /// Fill an account with a device backup and open its protect gate
+    Import(ImportArgs),
+    /// Copy one file into an account (the device downloads it at its next sync)
+    Put(PutArgs),
+    /// Copy every file of the device over Browse & Access (port 8089) into a folder
+    BackupDevice(BackupDeviceArgs),
+}
+
+#[derive(clap::Args)]
+struct ImportArgs {
+    /// The backup folder (Note, Document, MyStyle, EXPORT, SCREENSHOT, INBOX)
+    #[arg(value_name = "BACKUP DIR")]
+    backup: PathBuf,
+    /// The data folder
+    #[arg(long, value_name = "DIR")]
+    data: PathBuf,
+    /// The account slug
+    #[arg(long)]
+    account: String,
+    /// Move the files the account holds now to the recycle bin first
+    #[arg(long)]
+    replace: bool,
+    /// Print the mapping and the counts, write nothing
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(clap::Args)]
+struct PutArgs {
+    /// The file to copy
+    file: PathBuf,
+    /// The data folder
+    #[arg(long, value_name = "DIR")]
+    data: PathBuf,
+    /// The account slug
+    #[arg(long)]
+    account: String,
+    /// The wire folder, inside NOTE/Note, NOTE/MyStyle, DOCUMENT/Document, EXPORT, SCREENSHOT or
+    /// INBOX (for example DOCUMENT/Document/Inbox)
+    #[arg(long, value_name = "WIRE FOLDER")]
+    to: String,
+    /// The file name in the store (default: the name of the file)
+    #[arg(long)]
+    name: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct BackupDeviceArgs {
+    /// The Browse & Access address of the device, for example http://192.168.1.20:8089
+    url: String,
+    /// The folder to write into (empty or missing, unless --resume)
+    dir: PathBuf,
+    /// Also copy REMOVABLE0 (the SD card)
+    #[arg(long)]
+    include_sd: bool,
+    /// Continue an earlier backup in DIR; files whose size matches are kept
+    #[arg(long)]
+    resume: bool,
+    /// The device's offset from UTC for the file dates, like +02:00 (default: this computer's)
+    #[arg(long, value_name = "+HH:MM", allow_hyphen_values = true)]
+    utc_offset: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -485,6 +546,210 @@ fn cloud_command(action: CloudAction) -> Result<ExitCode> {
             recover_accounts(&data)?;
             journal_command(&data, action)
         }
+        CloudAction::Import(args) => {
+            if !args.dry_run {
+                recover_accounts(&args.data)?;
+            }
+            import_command(args)
+        }
+        CloudAction::Put(args) => {
+            recover_accounts(&args.data)?;
+            put_command(args)
+        }
+        CloudAction::BackupDevice(args) => backup_device_command(args),
+    }
+}
+
+/// Bytes as megabytes with one decimal, for people.
+fn mb(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+fn print_scan(scan: &notedown_cloud::import::Scan) {
+    use notedown_cloud::import::SkipReason;
+    for f in &scan.folders {
+        println!(
+            "{} -> {}: {}, {}, {}",
+            f.source,
+            f.target,
+            plural(f.files as usize, "file"),
+            plural(f.folders as usize, "folder"),
+            mb(f.bytes)
+        );
+    }
+    let mut counts: std::collections::BTreeMap<SkipReason, usize> = Default::default();
+    for s in &scan.skipped {
+        match s.reason {
+            SkipReason::SdCard | SkipReason::Unknown | SkipReason::BackupFile => {
+                println!("skipped {} ({})", s.path, s.reason.describe());
+            }
+            SkipReason::Snbak | SkipReason::DotFile => {
+                *counts.entry(s.reason).or_default() += 1;
+            }
+        }
+    }
+    for (reason, n) in counts {
+        println!("skipped {} ({})", plural(n, "file"), reason.describe());
+    }
+}
+
+fn import_command(args: ImportArgs) -> Result<ExitCode> {
+    use notedown_cloud::import;
+    if args.dry_run {
+        let plan = import::dry_run(&args.data, &args.account, &args.backup)?;
+        println!("dry run, nothing is written");
+        print_scan(&plan.scan);
+        for e in &plan.scan.errors {
+            println!("error: {e}");
+        }
+        println!(
+            "account {} holds {} now{}",
+            args.account,
+            plural(plan.files_present as usize, "file"),
+            if plan.files_present > 0 {
+                "; the import needs --replace"
+            } else {
+                ""
+            }
+        );
+        println!(
+            "would import {} ({})",
+            plural(plan.scan.files() as usize, "file"),
+            mb(plan.scan.bytes())
+        );
+        return Ok(if plan.scan.errors.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        });
+    }
+    let journal = notedown_cloud::journal::Journal::open(&args.data)?;
+    let report = import::import(
+        &args.data,
+        &args.account,
+        &args.backup,
+        &import::ImportOptions {
+            replace: args.replace,
+        },
+        &journal,
+        &mut |line| eprintln!("{line}"),
+    )?;
+    print_scan(&report.scan);
+    if report.replaced > 0 {
+        println!(
+            "moved {} of the old tree to the recycle bin",
+            plural(report.replaced as usize, "file")
+        );
+    }
+    println!(
+        "imported {} ({}), protect gate open for {}",
+        plural(report.files as usize, "file"),
+        mb(report.bytes),
+        args.account
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn put_command(args: PutArgs) -> Result<ExitCode> {
+    use notedown_cloud::put::{PutOutcome, put};
+    let journal = notedown_cloud::journal::Journal::open(&args.data)?;
+    let r = put(
+        &args.data,
+        &args.account,
+        &journal,
+        &args.file,
+        &args.to,
+        args.name.as_deref(),
+    )?;
+    let what = match r.outcome {
+        PutOutcome::Created => "created",
+        PutOutcome::Replaced => "replaced, the old version is in the recycle bin",
+        PutOutcome::Unchanged => "unchanged, the same bytes are there already",
+    };
+    println!("{} id {} ({what})", r.path, r.id);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `+HH:MM`, `-HH:MM`, `+HHMM` or `Z`.
+fn parse_utc_offset(text: &str) -> Option<time::UtcOffset> {
+    let t = text.trim();
+    if t == "Z" || t == "z" {
+        return Some(time::UtcOffset::UTC);
+    }
+    let (sign, rest) = match t.as_bytes().first()? {
+        b'+' => (1i8, &t[1..]),
+        b'-' => (-1i8, &t[1..]),
+        _ => return None,
+    };
+    let digits: String = rest.chars().filter(|c| *c != ':').collect();
+    if digits.len() != 4 || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let h: i8 = digits[..2].parse().ok()?;
+    let m: i8 = digits[2..].parse().ok()?;
+    time::UtcOffset::from_hms(sign * h, sign * m, 0).ok()
+}
+
+/// This computer's current offset from UTC, from `date +%z` (the time crate cannot read it
+/// safely once threads run).
+fn local_utc_offset() -> Option<time::UtcOffset> {
+    let out = std::process::Command::new("date")
+        .arg("+%z")
+        .output()
+        .ok()?;
+    parse_utc_offset(std::str::from_utf8(&out.stdout).ok()?)
+}
+
+fn backup_device_command(args: BackupDeviceArgs) -> Result<ExitCode> {
+    use notedown_cloud::device_backup::{BackupOptions, backup};
+    let utc_offset = match &args.utc_offset {
+        Some(t) => parse_utc_offset(t)
+            .ok_or_else(|| anyhow!("--utc-offset {t:?}: use a form like +02:00 or -05:00"))?,
+        None => local_utc_offset().unwrap_or_else(|| {
+            eprintln!("warning: cannot read the local UTC offset; file dates are read as UTC");
+            time::UtcOffset::UTC
+        }),
+    };
+    let options = BackupOptions {
+        include_sd: args.include_sd,
+        resume: args.resume,
+        utc_offset,
+    };
+    let report = backup(&args.url, &args.dir, &options, &mut |line| {
+        eprintln!("{line}")
+    })?;
+    for (folder, t) in &report.folders {
+        println!(
+            "{folder}: {}, {}",
+            plural(t.files as usize, "file"),
+            mb(t.bytes)
+        );
+    }
+    if report.skipped_existing > 0 {
+        println!(
+            "kept {} from the earlier run",
+            plural(report.skipped_existing as usize, "file")
+        );
+    }
+    let report_file = args.dir.join(notedown_cloud::import::BACKUP_FILE);
+    if report.errors.is_empty() {
+        println!(
+            "backed up {} ({}) from {} into {}",
+            plural(report.files as usize, "file"),
+            mb(report.bytes),
+            args.url,
+            args.dir.display()
+        );
+        Ok(ExitCode::SUCCESS)
+    } else {
+        println!(
+            "backed up {} ({}) with {}, see {}",
+            plural(report.files as usize, "file"),
+            mb(report.bytes),
+            plural(report.errors.len(), "error"),
+            report_file.display()
+        );
+        Ok(ExitCode::from(1))
     }
 }
 
@@ -750,6 +1015,21 @@ mod tests {
             device_urls(&listen, &ips),
             ["http://192.168.1.20:19072", "http://10.0.0.5:19072"]
         );
+    }
+
+    #[test]
+    fn utc_offsets_parse_in_the_usual_forms() {
+        let two = time::UtcOffset::from_hms(2, 0, 0).unwrap();
+        assert_eq!(parse_utc_offset("+02:00"), Some(two));
+        assert_eq!(parse_utc_offset("+0200\n"), Some(two));
+        assert_eq!(
+            parse_utc_offset("-05:30"),
+            Some(time::UtcOffset::from_hms(-5, -30, 0).unwrap())
+        );
+        assert_eq!(parse_utc_offset("Z"), Some(time::UtcOffset::UTC));
+        for bad in ["", "02:00", "+2", "+02:0x", "CEST"] {
+            assert_eq!(parse_utc_offset(bad), None, "{bad}");
+        }
     }
 
     #[test]

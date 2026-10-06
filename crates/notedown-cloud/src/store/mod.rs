@@ -125,7 +125,7 @@ pub fn write_atomic_short(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// The comparison key for name collisions, Unicode canonical caseless matching: NFD, full case
 /// folding (`ß` and `SS`, final sigma, ligatures such as `ﬁ`), then NFC.
-fn fold(name: &str) -> String {
+pub(crate) fn fold(name: &str) -> String {
     let nfd: String = name.nfd().collect();
     unicase::UniCase::new(nfd).to_folded_case().nfc().collect()
 }

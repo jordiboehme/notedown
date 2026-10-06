@@ -280,15 +280,19 @@ impl Accounts {
         Ok(self.list()?.into_iter().find(|a| a.user_id == user_id))
     }
 
-    /// Delete the account folder with everything in it (files, digests, devices).
+    /// Delete the account folder with everything in it (files, digests, devices), under the
+    /// store lock and the account lock.
     pub fn remove(&self, slug: &str) -> Result<()> {
         validate_slug(slug)?;
         if self.get(slug)?.is_none() {
             return Err(Error::NoAccount(slug.to_string()));
         }
-        // Wait for a running change of the account to finish.
-        let _lock = self.lock(slug)?;
         let dir = self.account_dir(slug);
+        // Wait for a running change of the account to finish: the store lock first (a commit
+        // or an import of the server or another command), then the account lock, as the
+        // global lock order says. The raw lock works on a damaged store too.
+        let _store = crate::store::take_store_lock(&dir, Some(slug))?;
+        let _lock = self.lock(slug)?;
         std::fs::remove_dir_all(&dir).map_err(io_err(&dir))
     }
 }

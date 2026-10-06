@@ -652,3 +652,31 @@ fn duplicate_email_is_reported_as_such() {
     );
     assert!(accounts.get("jordi2").unwrap().is_none());
 }
+
+#[test]
+fn account_remove_waits_for_the_store_lock_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let accounts = notedown_cloud::auth::Accounts::new(dir.path());
+    accounts.create("jordi", "j@example.org", "secret").unwrap();
+    let account = accounts.account_dir("jordi");
+    std::fs::create_dir_all(account.join("files/NOTE")).unwrap();
+    // A commit of the server (or an import) holds the store lock.
+    let held = notedown_cloud::store::take_store_lock(&account, None).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let data = dir.path().to_path_buf();
+    let remover = std::thread::spawn(move || {
+        let r = notedown_cloud::auth::Accounts::new(&data).remove("jordi");
+        tx.send(()).unwrap();
+        r
+    });
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(300))
+            .is_err(),
+        "remove did not wait for the store lock"
+    );
+    assert!(account.join("files/NOTE").is_dir());
+    drop(held);
+    rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    remover.join().unwrap().unwrap();
+    assert!(!account.exists());
+}

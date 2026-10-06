@@ -1865,7 +1865,9 @@ pub fn sweep_all_temps(data_dir: &Path) -> Result<usize> {
 
 /// Run [`Store::recover`] for every account that may need it: one with a `pending.json` or with
 /// a `files/` folder (an account that never synced is not touched, so no `files/` appears).
-/// Returns the accounts whose recovery did something or failed. A failure of one account (an
+/// When an account's store lock is busy (an import runs), it prints "waiting for the store lock
+/// of account <slug>" on stderr and then waits. Returns the accounts whose recovery did
+/// something or failed. A failure of one account (an
 /// unreadable `pending.json`, say) does not stop the others; the caller reports it.
 pub fn recover_all(data_dir: &Path, journal: &Journal) -> Result<Vec<(String, Result<Recovery>)>> {
     let accounts = crate::auth::Accounts::new(data_dir);
@@ -1875,7 +1877,8 @@ pub fn recover_all(data_dir: &Path, journal: &Journal) -> Result<Vec<(String, Re
         if !store_dir.join(PENDING_FILE).exists() && !store_dir.join(super::FILES_DIR).is_dir() {
             continue;
         }
-        let r = Store::open(data_dir, &account.slug).and_then(|store| {
+        // A running import holds the store lock for its whole run: say why this waits.
+        let r = Store::open_announced(data_dir, &account.slug).and_then(|store| {
             let guard = store.lock()?;
             store.recover(&guard, journal)
         });

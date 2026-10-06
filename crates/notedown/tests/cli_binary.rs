@@ -518,3 +518,51 @@ fn cloud_backup_device_exits_non_zero_when_the_device_does_not_answer() {
     assert_eq!(report["errors"].as_array().unwrap().len(), 1);
     assert!(stdout(&out).contains("with 1 error"), "{}", stdout(&out));
 }
+
+#[test]
+fn cloud_commands_say_when_they_wait_for_a_store_lock() {
+    use std::io::BufRead;
+    let dir = tempfile::tempdir().unwrap();
+    let add = cloud(
+        dir.path(),
+        &[
+            "add",
+            "jordi",
+            "--email",
+            "j@example.org",
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let account = dir.path().join("accounts/jordi");
+    std::fs::create_dir_all(account.join("files")).unwrap();
+    // Another process (an import, say) holds the store lock.
+    let held = notedown_cloud::store::take_store_lock(&account, None).unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["cloud", "account", "--data"])
+        .arg(dir.path())
+        .arg("list")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut err = std::io::BufReader::new(child.stderr.take().unwrap());
+    let mut line = String::new();
+    err.read_line(&mut line).unwrap();
+    assert_eq!(
+        line.trim_end(),
+        "waiting for the store lock of account jordi"
+    );
+    // It waits until the lock is free, then finishes normally.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(child.try_wait().unwrap().is_none(), "it did not wait");
+    drop(held);
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("jordi"));
+}

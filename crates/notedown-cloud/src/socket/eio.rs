@@ -132,7 +132,7 @@ pub fn answer(frame: &str) -> Action {
             (EVENT_CLIENT_MESSAGE, Some(Value::String(s))) if s == "status" => {
                 Action::Answer(event(EVENT_SERVER_MESSAGE, "true"))
             }
-            // Marks pending file messages delivered; the capture server has none.
+            // Marks pending file messages delivered; this server sends none yet.
             (EVENT_CLIENT_MESSAGE, Some(Value::String(s))) if s == "Received" => Action::Nothing,
             _ => Action::Unknown,
         },

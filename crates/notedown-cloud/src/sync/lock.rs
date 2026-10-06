@@ -64,7 +64,8 @@ impl SyncLocks {
 
     /// Extend the lock by [`SYNC_LOCK_TTL_MS`] from `now_ms` when `serial` holds it. Every file
     /// call of the owning device does this, and transfers do it while the bytes flow. Returns
-    /// whether the lock was extended. A lapsed lock is not revived.
+    /// whether the lock was extended. A lapsed lock is not revived here; [`SyncLocks::retake`]
+    /// does that for the last holder after the protect gate.
     pub fn touch(&self, slug: &str, serial: &str, now_ms: u64) -> bool {
         let mut map = self.map();
         match map.get_mut(slug) {

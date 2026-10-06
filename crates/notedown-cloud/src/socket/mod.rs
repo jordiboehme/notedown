@@ -6,7 +6,7 @@
 //! entry, token and sign masked); every frame in both directions is logged as `kind: frame`. The
 //! token is checked for signature and generation; `sign` is accepted and ignored (4.2). A bad
 //! token still gets the open and connect packets, then `ServerMessage` `{"code":"403",...}` and
-//! the close, as Ratta does. The capture server sends no pushes: the device only gets the
+//! the close, as Ratta does. The server sends no pushes yet: the device only gets the
 //! heartbeat answers of 4.3.
 
 pub mod eio;

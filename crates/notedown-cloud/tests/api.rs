@@ -1,4 +1,4 @@
-//! HTTP routes of the capture server: login, server queries, safe refusal of every sync, the
+//! HTTP routes of the cloud server: login, server queries, safe refusal of every sync, the
 //! catch-all and the request log. Requests go through the router in memory (`tower::oneshot`).
 
 use std::net::SocketAddr;

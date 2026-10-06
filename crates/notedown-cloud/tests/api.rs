@@ -644,6 +644,71 @@ async fn bind_in_accept_mode_creates_the_native_folders_and_journals_once() {
 }
 
 #[tokio::test]
+async fn a_journal_failure_does_not_fail_the_unlink() {
+    let s = Server::accept();
+    s.login("secret", SERIAL, "202407").await;
+    assert_ok(&s.bind(SERIAL, "202407").await);
+    let dir = s.data().join("journal");
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::write(&dir, b"not a folder").unwrap();
+    let v = s
+        .call(
+            "POST",
+            "/api/terminal/equipment/unlink",
+            &[],
+            Some(json!({"equipmentNo": SERIAL, "version": "202407"})),
+        )
+        .await;
+    assert_ok(&v);
+}
+
+#[tokio::test]
+async fn a_firmware_change_is_journaled() {
+    let s = Server::new();
+    s.login("secret", SERIAL, "202407").await; // first sighting: no change
+    s.login("secret", SERIAL, "202407").await;
+    assert!(journal_lines(s.data()).is_empty());
+    s.login("secret", SERIAL, "202408").await;
+    let lines = journal_lines(s.data());
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["type"], "device.firmware_changed");
+    assert_eq!(lines[0]["device"], SERIAL);
+    assert_eq!(lines[0]["origin"], "device");
+    assert_eq!(lines[0]["account"], "jordi");
+    assert_eq!(lines[0]["from"], "202407");
+    assert_eq!(lines[0]["to"], "202408");
+}
+
+#[test]
+fn server_start_reports_a_broken_account_and_goes_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let accounts = Accounts::new(dir.path());
+    accounts.create("jordi", EMAIL, "secret").unwrap();
+    let account = accounts.account_dir("jordi");
+    std::fs::create_dir_all(account.join("files")).unwrap();
+    std::fs::write(account.join("pending.json"), b"{broken").unwrap();
+    let clock = Arc::new(TestClock(AtomicI64::new(T0)));
+    let state = AppState::open_with_clock(Config::default(), dir.path(), clock).unwrap();
+    drop(state);
+    let mut text = String::new();
+    for e in std::fs::read_dir(dir.path().join("logs")).unwrap() {
+        text.push_str(&std::fs::read_to_string(e.unwrap().path()).unwrap());
+    }
+    let marker: Value = text
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|v| v["flags"][0] == "recovery_failed")
+        .expect("a recovery_failed marker");
+    assert_eq!(marker["kind"], "marker");
+    let message = marker["message"].as_str().unwrap();
+    assert!(
+        message.contains("account jordi: recovery failed"),
+        "{message}"
+    );
+    assert!(message.contains("pending.json"), "{message}");
+}
+
+#[tokio::test]
 async fn a_journal_failure_does_not_fail_the_bind() {
     let s = Server::accept();
     s.login("secret", SERIAL, "202407").await;

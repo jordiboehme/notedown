@@ -127,7 +127,7 @@ fn panic_reply(_: Box<dyn std::any::Any + Send + 'static>) -> Response {
 
 /// Change a device record and store the `version` it sent. A change from a stored value writes a
 /// `firmware_changed` marker to the protocol log (that marker protects the log days around it
-/// from rotation). The first sighting is not a change. Returns the record before (if any) and
+/// from rotation) and journals `device.firmware_changed`. The first sighting is not a change. Returns the record before (if any) and
 /// after the change.
 pub(crate) fn note_firmware(
     state: &AppState,
@@ -151,6 +151,20 @@ pub(crate) fn note_firmware(
         m.firmware = Some(new.to_string());
         m.flags = vec![crate::diag::FLAG_FIRMWARE_CHANGED.to_string()];
         state.log.record(m);
+        let mut event = crate::journal::Event::new(
+            slug,
+            crate::journal::Origin::Device,
+            Some(serial.to_string()),
+            &crate::journal::new_op_id(),
+            crate::journal::EventBody::DeviceFirmwareChanged {
+                from: old,
+                to: new.to_string(),
+            },
+        );
+        // A journal failure is logged and never fails the request.
+        if let Err(e) = state.journal.append(std::slice::from_mut(&mut event)) {
+            eprintln!("notedown cloud: journal append failed: {e}");
+        }
     }
     Ok((before, after))
 }

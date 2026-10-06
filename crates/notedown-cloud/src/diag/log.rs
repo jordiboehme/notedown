@@ -24,6 +24,8 @@ const FILE_SUFFIX: &str = ".jsonl";
 /// The flag of the marker written when a device reports a new firmware. Rotation keeps the log
 /// days around such a marker, so every writer of the marker must use this constant.
 pub const FLAG_FIRMWARE_CHANGED: &str = "firmware_changed";
+/// Marker flag: the crash recovery of an account failed at server start.
+pub const FLAG_RECOVERY_FAILED: &str = "recovery_failed";
 /// Set when a JSON body has a repeated key; its raw text is then left out of the log.
 pub const FLAG_DUPLICATE_KEYS: &str = "duplicate_keys";
 
@@ -97,6 +99,9 @@ pub struct LogEntry {
     /// For a `log_lines_dropped` marker: how many lines could not be written.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dropped: Option<u64>,
+    /// For server markers such as `recovery_failed`: what happened, for people.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 impl LogEntry {
@@ -136,6 +141,10 @@ impl LogEntry {
             .take()
             .map(|q| cap_text(&mask_form(&q), MAX_FIELD_BYTES));
         self.headers = mask_headers(&self.headers);
+        self.message = self
+            .message
+            .take()
+            .map(|m| cap_text(&mask_jwts(&m), MAX_FIELD_BYTES));
         // A raw body with a repeated key is left out (see `mask_raw_json_from`); the flag keeps
         // the fact that the device sent one.
         let dup = |r: &Option<String>| r.as_deref().is_some_and(has_duplicate_keys);

@@ -8,22 +8,25 @@
 //! 3. Append the events to the journal (one write, one fsync).
 //! 4. Delete `pending.json`.
 //!
-//! [`Store::recover`] runs at server start, at the start of every CLI command and before every
-//! commit. With a `pending.json` it checks whether the change is applied ([`PendingOp`] lists
-//! the check per operation). Applied: it brings the registry up to date and appends the events
-//! that the journal does not have yet (`origin: "repair"`), found by the `opId` in the last
-//! [`REPAIR_SCAN_LINES`] lines. Not applied: it discards the intent. It also sweeps stale temp
-//! files (`.nd-*.tmp`, older than one hour) from `files/`.
+//! [`Store::recover`] runs at server start, at the start of every CLI command and in
+//! [`Store::lock_recovered`], the only way to get the [`WriteGuard`] that planning and
+//! committing need. So no change is ever planned on a registry that an unfinished commit left
+//! behind. With a `pending.json` recovery checks whether the change is applied ([`PendingOp`]
+//! lists the check per operation). Applied: it brings the registry up to date and appends the
+//! events that the journal does not have yet (`origin: "repair"`), found by the `opId` in the
+//! journal after the `journalSeq` stored in the intent. Not applied: it discards the intent. It
+//! also sweeps stale temp files (`.nd-*.tmp`, older than one hour) from `files/`.
 //!
 //! Lock order: the store lock first, then `journal/.lock`.
 
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
 use super::{Kind, Store, StoreGuard, WirePath, is_native_folder, list};
-use crate::journal::{Event, EventBody, FileKind, Journal, Origin, REPAIR_SCAN_LINES, new_op_id};
+use crate::journal::{Event, EventBody, FileKind, Journal, Origin, new_op_id};
 use crate::{Error, Result, io_err};
 
 /// `accounts/<slug>/pending.json`: the intent of the commit in progress.
@@ -82,6 +85,10 @@ pub enum PendingOp {
     /// Create the folder `path`.
     #[serde(rename_all = "camelCase")]
     CreateFolder { id: u64, path: String },
+    /// Nothing to do: a put of the bytes the file already has. [`Store::commit`] writes no
+    /// intent, no data and no event for it and returns no `seq`. Never in `pending.json`.
+    #[serde(rename_all = "camelCase")]
+    Unchanged { id: u64, path: String, md5: String },
 }
 
 /// A planned commit, the content of `pending.json`. Build it with a `Store::plan_*` method,
@@ -95,6 +102,11 @@ pub struct Commit {
     pub origin: Origin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
+    /// The journal's last `seq` when the commit started (set by [`Store::commit`]). Recovery
+    /// looks for this commit's events only after it. `None` (an intent written without it)
+    /// scans the whole journal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_seq: Option<u64>,
     pub op: PendingOp,
     /// The events, in journal order.
     pub events: Vec<EventBody>,
@@ -112,6 +124,7 @@ impl Commit {
             op_id: new_op_id(),
             origin,
             device,
+            journal_seq: None,
             op,
             events,
         }
@@ -161,10 +174,27 @@ impl std::fmt::Display for Recovery {
             }
             Recovery::Repaired { op_id, seqs } => write!(
                 f,
-                "finished the change {op_id} and journaled {} missing events",
-                seqs.len()
+                "finished the change {op_id} and journaled {} missing {}",
+                seqs.len(),
+                if seqs.len() == 1 { "event" } else { "events" }
             ),
         }
+    }
+}
+
+/// The store lock, taken through [`Store::lock_recovered`]: recovery ran under it, so the id
+/// registry is current. Planning (`plan_*`), [`Store::commit`] and [`Store::snapshot`] need it.
+/// It derefs to the [`StoreGuard`] for every other method.
+#[derive(Debug)]
+pub struct WriteGuard {
+    guard: StoreGuard,
+}
+
+impl Deref for WriteGuard {
+    type Target = StoreGuard;
+
+    fn deref(&self) -> &StoreGuard {
+        &self.guard
     }
 }
 
@@ -206,6 +236,44 @@ fn safe_relative(text: &str, what: &'static str) -> Result<PathBuf> {
 impl Store {
     fn pending_path(&self) -> PathBuf {
         self.account_dir.join(PENDING_FILE)
+    }
+
+    /// Take the store lock and recover an unfinished commit under it ([`Store::recover`]). The
+    /// only way to a [`WriteGuard`]. An intent that cannot be read or finished is an error, so a
+    /// write to that account fails until the operator fixes it.
+    pub fn lock_recovered(&self, journal: &Journal) -> Result<WriteGuard> {
+        let guard = self.lock()?;
+        self.recover(&guard, journal).map_err(|e| match e {
+            Error::Config { path, message } => Error::Config {
+                path,
+                message: format!(
+                    "{message}; this unfinished change blocks every write to account {}",
+                    self.slug
+                ),
+            },
+            other => other,
+        })?;
+        Ok(WriteGuard { guard })
+    }
+
+    /// Refuse to plan or commit while an intent is on disk (a commit under this guard failed
+    /// after writing it): the registry may not reflect it. `lock_recovered` again to repair.
+    fn check_no_pending(&self) -> Result<()> {
+        if self.pending_path().exists() {
+            return Err(invalid(
+                "store state",
+                format!(
+                    "an unfinished change is in {}; take the lock again to recover it first",
+                    self.pending_path().display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_write(&self, guard: &WriteGuard) -> Result<()> {
+        self.check_guard(guard)?;
+        self.check_no_pending()
     }
 
     /// The intent of an unfinished commit, if any.
@@ -267,13 +335,13 @@ impl Store {
     /// exist. The MD5 and size are taken from the staged file.
     pub fn plan_put(
         &self,
-        guard: &StoreGuard,
+        guard: &WriteGuard,
         path: &WirePath,
         staged: &Path,
         origin: Origin,
         device: Option<String>,
     ) -> Result<Commit> {
-        self.check_guard(guard)?;
+        self.check_write(guard)?;
         let parent = path
             .parent()
             .ok_or_else(|| invalid("path", "the root is not a file".into()))?;
@@ -306,6 +374,14 @@ impl Store {
         };
         let id = self.assign(guard, path, Kind::File)?;
         let display = path.display();
+        if prev.as_deref() == Some(md5.as_str()) {
+            let op = PendingOp::Unchanged {
+                id,
+                path: display,
+                md5,
+            };
+            return Ok(Commit::new(origin, device, op, Vec::new()));
+        }
         let kind = FileKind::of(path.name().unwrap_or_default());
         let event = match prev {
             None => EventBody::FileCreated {
@@ -339,13 +415,13 @@ impl Store {
     /// Plan copying the file `source` to the new path `target` (new id): `file.copied`.
     pub fn plan_copy(
         &self,
-        guard: &StoreGuard,
+        guard: &WriteGuard,
         source: &WirePath,
         target: &WirePath,
         origin: Origin,
         device: Option<String>,
     ) -> Result<Commit> {
-        self.check_guard(guard)?;
+        self.check_write(guard)?;
         match self.resolve(source)? {
             Some(f) if f.kind == Kind::File => {}
             _ => {
@@ -386,13 +462,13 @@ impl Store {
     /// `file.moved` or `folder.moved`. Native folders cannot be moved.
     pub fn plan_move(
         &self,
-        guard: &StoreGuard,
+        guard: &WriteGuard,
         from: &WirePath,
         to: &WirePath,
         origin: Origin,
         device: Option<String>,
     ) -> Result<Commit> {
-        self.check_guard(guard)?;
+        self.check_write(guard)?;
         let Some(found) = self.resolve(from)? else {
             return Err(invalid("source", format!("{from} is not in the store")));
         };
@@ -433,13 +509,13 @@ impl Store {
     /// be deleted.
     pub fn plan_delete(
         &self,
-        guard: &StoreGuard,
+        guard: &WriteGuard,
         path: &WirePath,
         deleted_at_ms: u64,
         origin: Origin,
         device: Option<String>,
     ) -> Result<Commit> {
-        self.check_guard(guard)?;
+        self.check_write(guard)?;
         let Some(found) = self.resolve(path)? else {
             return Err(invalid("path", format!("{path} is not in the store")));
         };
@@ -483,12 +559,12 @@ impl Store {
     /// Plan creating the folder `path` (its parent must exist): `folder.created`.
     pub fn plan_create_folder(
         &self,
-        guard: &StoreGuard,
+        guard: &WriteGuard,
         path: &WirePath,
         origin: Origin,
         device: Option<String>,
     ) -> Result<Commit> {
-        self.check_guard(guard)?;
+        self.check_write(guard)?;
         let parent = path
             .parent()
             .ok_or_else(|| invalid("path", "the root exists".into()))?;
@@ -512,7 +588,7 @@ impl Store {
     /// An unfinished earlier commit (a `pending.json`) is recovered first.
     pub fn commit(
         &self,
-        guard: &StoreGuard,
+        guard: &WriteGuard,
         commit: Commit,
         journal: &Journal,
     ) -> Result<Vec<u64>> {
@@ -523,16 +599,17 @@ impl Store {
     #[doc(hidden)]
     pub fn commit_until(
         &self,
-        guard: &StoreGuard,
-        commit: Commit,
+        guard: &WriteGuard,
+        mut commit: Commit,
         journal: &Journal,
         crash: Option<CrashPoint>,
     ) -> Result<Vec<u64>> {
-        self.check_guard(guard)?;
-        if self.pending_path().exists() {
-            self.recover_pending(guard, journal)?;
+        self.check_write(guard)?;
+        if matches!(commit.op, PendingOp::Unchanged { .. }) {
+            return Ok(Vec::new());
         }
-        // 1. intent
+        // 1. intent, with the journal position recovery searches from
+        commit.journal_seq = Some(journal.last_seq()?);
         super::write_atomic_short(&self.pending_path(), &crate::fsutil::json_bytes(&commit))?;
         if crash == Some(CrashPoint::BeforeApply) {
             return Ok(Vec::new());
@@ -619,6 +696,7 @@ impl Store {
                 std::fs::create_dir(&target).map_err(io_err(&target))?;
                 crate::fsutil::fsync_dir(target.parent().unwrap_or(&self.files))
             }
+            PendingOp::Unchanged { .. } => Ok(()),
         }
     }
 
@@ -647,7 +725,9 @@ impl Store {
     /// Whether the data change of `op` is in place (see [`PendingOp`]).
     fn is_applied(&self, guard: &StoreGuard, op: &PendingOp) -> Result<bool> {
         Ok(match op {
-            PendingOp::Put { path, md5, .. } | PendingOp::Copy { path, md5, .. } => {
+            PendingOp::Put { path, md5, .. }
+            | PendingOp::Copy { path, md5, .. }
+            | PendingOp::Unchanged { path, md5, .. } => {
                 let path = wire(path)?;
                 match self.resolve(&path)? {
                     Some(f) if f.kind == Kind::File => self.md5_of(guard, &path)? == *md5,
@@ -674,9 +754,10 @@ impl Store {
     fn finish_registry(&self, guard: &StoreGuard, op: &PendingOp) -> Result<()> {
         match op {
             // The id was assigned (durably) while planning, before the intent was written.
-            PendingOp::Put { .. } | PendingOp::Copy { .. } | PendingOp::CreateFolder { .. } => {
-                Ok(())
-            }
+            PendingOp::Put { .. }
+            | PendingOp::Copy { .. }
+            | PendingOp::CreateFolder { .. }
+            | PendingOp::Unchanged { .. } => Ok(()),
             PendingOp::Move { id, to, .. } => {
                 let to = wire(to)?;
                 if self.path_of(*id)?.as_ref() == Some(&to) {
@@ -725,7 +806,7 @@ impl Store {
         self.finish_registry(guard, &commit.op)?;
         let seqs = {
             let lock = journal.lock()?;
-            let have = lock.count_op(&commit.op_id, REPAIR_SCAN_LINES)?;
+            let have = lock.count_op_after(&commit.op_id, commit.journal_seq.unwrap_or(0))?;
             let missing = commit.events.get(have..).unwrap_or(&[]);
             let mut events = commit.journal_events(&self.slug, Origin::Repair, missing);
             lock.append(&mut events)?
@@ -740,8 +821,8 @@ impl Store {
     /// Journal the current state for a new consumer: `folder.created` and `file.created` for
     /// every listed entry (parents first), as one batch with one `opId` and `origin: "cli"`.
     /// Returns the `seq` values. Page events for notes are added by the page indexer.
-    pub fn snapshot(&self, guard: &StoreGuard, journal: &Journal) -> Result<Vec<u64>> {
-        self.check_guard(guard)?;
+    pub fn snapshot(&self, guard: &WriteGuard, journal: &Journal) -> Result<Vec<u64>> {
+        self.check_write(guard)?;
         let entries = self.list(guard, &WirePath::root(), true)?;
         let op_id = new_op_id();
         let mut events: Vec<Event> = entries
@@ -816,18 +897,21 @@ impl Store {
 
 /// Run [`Store::recover`] for every account that may need it: one with a `pending.json` or with
 /// a `files/` folder (an account that never synced is not touched, so no `files/` appears).
-/// Returns the accounts whose recovery did something.
-pub fn recover_all(data_dir: &Path, journal: &Journal) -> Result<Vec<(String, Recovery)>> {
+/// Returns the accounts whose recovery did something or failed. A failure of one account (an
+/// unreadable `pending.json`, say) does not stop the others; the caller reports it.
+pub fn recover_all(data_dir: &Path, journal: &Journal) -> Result<Vec<(String, Result<Recovery>)>> {
+    let accounts = crate::auth::Accounts::new(data_dir);
     let mut out = Vec::new();
-    for account in crate::auth::Accounts::new(data_dir).list()? {
-        let store_dir = crate::auth::Accounts::new(data_dir).account_dir(&account.slug);
+    for account in accounts.list()? {
+        let store_dir = accounts.account_dir(&account.slug);
         if !store_dir.join(PENDING_FILE).exists() && !store_dir.join(super::FILES_DIR).is_dir() {
             continue;
         }
-        let store = Store::open(data_dir, &account.slug)?;
-        let guard = store.lock()?;
-        let r = store.recover(&guard, journal)?;
-        if r != Recovery::Clean {
+        let r = Store::open(data_dir, &account.slug).and_then(|store| {
+            let guard = store.lock()?;
+            store.recover(&guard, journal)
+        });
+        if !matches!(r, Ok(Recovery::Clean)) {
             out.push((account.slug, r));
         }
     }

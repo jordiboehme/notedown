@@ -36,8 +36,6 @@ pub const LOCK_FILE: &str = ".lock";
 pub const CONSUMERS_DIR: &str = "consumers";
 /// A journal file that has reached this size is closed; the next append starts a new one.
 pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
-/// Crash repair looks for an operation's events in this many last journal lines.
-pub const REPAIR_SCAN_LINES: usize = 1000;
 
 const PREFIX: &str = "journal-";
 const SUFFIX: &str = ".jsonl";
@@ -337,20 +335,21 @@ impl JournalLock<'_> {
         let next = tail.last_seq + 1;
         let (path, base) = match tail.newest {
             Some((path, complete, len, first_ts)) => {
+                if len > complete {
+                    // A torn line of a crashed append: cut it, also when a new file starts now,
+                    // so no file keeps a fragment.
+                    let f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .map_err(io_err(&path))?;
+                    f.set_len(complete).map_err(io_err(&path))?;
+                    f.sync_all().map_err(io_err(&path))?;
+                }
                 let full = complete >= j.max_file_bytes;
                 let new_month = first_ts.is_some_and(|ts| month_of(ts) != month_of(now));
                 if complete > 0 && (full || new_month) {
                     (self.create(next)?, 0)
                 } else {
-                    if len > complete {
-                        // A torn line of a crashed append: cut it so the next line starts clean.
-                        let f = std::fs::OpenOptions::new()
-                            .write(true)
-                            .open(&path)
-                            .map_err(io_err(&path))?;
-                        f.set_len(complete).map_err(io_err(&path))?;
-                        f.sync_all().map_err(io_err(&path))?;
-                    }
                     (path, complete)
                 }
             }
@@ -390,25 +389,13 @@ impl JournalLock<'_> {
         Ok(path)
     }
 
-    /// How many of the last `window` complete journal lines carry `opId == op_id`. Continues
-    /// into older files when the newest one is short.
-    pub fn count_op(&self, op_id: &str, window: usize) -> Result<usize> {
-        let mut left = window;
+    /// How many events with `opId == op_id` the journal has after `seq` (crash repair: `seq` is
+    /// the last one before the commit started).
+    pub fn count_op_after(&self, op_id: &str, seq: u64) -> Result<usize> {
         let mut count = 0;
-        for (_, path) in self.journal.files()?.iter().rev() {
-            if left == 0 {
-                break;
-            }
-            let (lines, _) = tail_lines(path, left)?;
-            left -= lines.len();
-            for line in &lines {
-                let v: serde_json::Value = match serde_json::from_str(line) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                if v.get("opId").and_then(|o| o.as_str()) == Some(op_id) {
-                    count += 1;
-                }
+        for event in self.journal.read_from(seq.saturating_add(1))? {
+            if event?.op_id == op_id {
+                count += 1;
             }
         }
         Ok(count)

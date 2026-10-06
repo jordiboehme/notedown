@@ -460,8 +460,12 @@ fn recover_accounts(data: &Path) -> Result<()> {
         return Ok(());
     }
     let journal = notedown_cloud::journal::Journal::open(data)?;
+    // A broken account is reported and skipped; a write to it fails later with the reason.
     for (slug, r) in notedown_cloud::store::recover_all(data, &journal)? {
-        eprintln!("account {slug}: {r}");
+        match r {
+            Ok(r) => eprintln!("account {slug}: {r}"),
+            Err(e) => eprintln!("warning: account {slug}: recovery failed: {e}"),
+        }
     }
     Ok(())
 }
@@ -537,7 +541,7 @@ fn journal_command(data: &Path, action: JournalAction) -> Result<ExitCode> {
         }
         JournalAction::Snapshot { account, .. } => {
             let store = notedown_cloud::store::Store::open(data, &account)?;
-            let guard = store.lock()?;
+            let guard = store.lock_recovered(&journal)?;
             let seqs = store.snapshot(&guard, &journal)?;
             match (seqs.first(), seqs.last()) {
                 (Some(a), Some(b)) => println!(

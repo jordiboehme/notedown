@@ -8,7 +8,7 @@ use tokio::net::TcpListener;
 
 use crate::api::limit::{RateLimiter, RetryTracker};
 use crate::auth::Auth;
-use crate::diag::{Capture, Clock, ProtocolLog, SystemClock};
+use crate::diag::{Capture, Clock, LogEntry, LogKind, ProtocolLog, SystemClock};
 use crate::journal::{Journal, JournalOptions};
 use crate::{Config, Error, Result};
 
@@ -62,7 +62,17 @@ impl AppState {
             },
         )?;
         for (slug, r) in crate::store::recover_all(data_dir, &journal)? {
-            eprintln!("notedown cloud: account {slug}: {r}");
+            match r {
+                Ok(r) => eprintln!("notedown cloud: account {slug}: {r}"),
+                Err(e) => {
+                    let message = format!("account {slug}: recovery failed: {e}");
+                    eprintln!("notedown cloud: {message}");
+                    let mut m = LogEntry::new(LogKind::Marker);
+                    m.flags = vec![crate::diag::FLAG_RECOVERY_FAILED.to_string()];
+                    m.message = Some(message);
+                    log.record(m);
+                }
+            }
         }
         Ok(Arc::new(AppState {
             auth: Auth::open(data_dir)?,

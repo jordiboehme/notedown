@@ -111,6 +111,9 @@ pub enum EventBody {
     /// The serial is in the event's `device` field.
     #[serde(rename = "device.unbound")]
     DeviceUnbound,
+    /// The device reported another firmware `version` than the stored one.
+    #[serde(rename = "device.firmware_changed", rename_all = "camelCase")]
+    DeviceFirmwareChanged { from: String, to: String },
 }
 
 impl EventBody {
@@ -127,6 +130,7 @@ impl EventBody {
             EventBody::FolderDeleted { .. } => "folder.deleted",
             EventBody::DeviceBound => "device.bound",
             EventBody::DeviceUnbound => "device.unbound",
+            EventBody::DeviceFirmwareChanged { .. } => "device.firmware_changed",
         }
     }
 }

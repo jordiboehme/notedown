@@ -399,7 +399,7 @@ impl Fixture {
     }
 
     fn put(&self, path: &str, bytes: &[u8]) -> Vec<u64> {
-        let g = self.store.lock().unwrap();
+        let g = self.store.lock_recovered(&self.journal).unwrap();
         let staged = self.stage("f", bytes);
         let c = self
             .store
@@ -444,7 +444,7 @@ fn commits_journal_every_operation() {
     // modify keeps the id and carries prevMd5
     f.put("NOTE/Note/a.note", b"two!");
     // folder, copy, move, delete
-    let g = f.store.lock().unwrap();
+    let g = f.store.lock_recovered(&f.journal).unwrap();
     let c = f
         .store
         .plan_create_folder(&g, &wp("NOTE/Note/Work"), Origin::Cli, None)
@@ -571,7 +571,7 @@ fn commits_journal_every_operation() {
 fn planning_refuses_bad_operations() {
     let f = Fixture::new();
     f.put("NOTE/Note/a.note", b"x");
-    let g = f.store.lock().unwrap();
+    let g = f.store.lock_recovered(&f.journal).unwrap();
     let s = &f.store;
     let staged = f.stage("g", b"y");
     // missing parent, outside staging, existing targets, native folders, own subtree
@@ -644,7 +644,7 @@ fn planning_refuses_bad_operations() {
 #[test]
 fn crash_after_the_rename_before_the_append_is_repaired_exactly_once() {
     let f = Fixture::new();
-    let g = f.store.lock().unwrap();
+    let g = f.store.lock_recovered(&f.journal).unwrap();
     let staged = f.stage("f", b"hello");
     let c = f
         .store
@@ -693,7 +693,7 @@ fn crash_after_the_rename_before_the_append_is_repaired_exactly_once() {
 #[test]
 fn crash_before_the_rename_discards_the_intent() {
     let f = Fixture::new();
-    let g = f.store.lock().unwrap();
+    let g = f.store.lock_recovered(&f.journal).unwrap();
     let staged = f.stage("f", b"hello");
     let c = f
         .store
@@ -716,7 +716,7 @@ fn crash_before_the_rename_discards_the_intent() {
 fn crash_before_the_rename_of_a_modify_discards_the_intent() {
     let f = Fixture::new();
     f.put("NOTE/Note/a.note", b"old");
-    let g = f.store.lock().unwrap();
+    let g = f.store.lock_recovered(&f.journal).unwrap();
     let staged = f.stage("f", b"new");
     let c = f
         .store
@@ -736,7 +736,7 @@ fn crash_before_the_rename_of_a_modify_discards_the_intent() {
 #[test]
 fn crash_after_the_append_before_clearing_does_not_duplicate() {
     let f = Fixture::new();
-    let g = f.store.lock().unwrap();
+    let g = f.store.lock_recovered(&f.journal).unwrap();
     let staged = f.stage("f", b"hello");
     let c = f
         .store
@@ -766,7 +766,7 @@ fn crash_after_the_append_before_clearing_does_not_duplicate() {
 #[test]
 fn a_torn_batch_gets_only_its_missing_events() {
     let f = Fixture::new();
-    let g = f.store.lock().unwrap();
+    let g = f.store.lock_recovered(&f.journal).unwrap();
     let staged = f.stage("f", b"hello");
     let mut c = f
         .store
@@ -825,7 +825,7 @@ fn the_repair_scan_reaches_into_the_previous_file() {
     let store = Store::open(dir.path(), "jordi").unwrap();
     // a cap of one byte: every append after a non-empty file starts a new one
     let journal = journal_with(dir.path(), 1, clock(T0));
-    let g = store.lock().unwrap();
+    let g = store.lock_recovered(&journal).unwrap();
     store.ensure_native_folders(&g).unwrap();
     let c = store
         .plan_create_folder(&g, &wp("A"), Origin::Cli, None)
@@ -848,7 +848,7 @@ fn a_crashed_move_is_repaired_with_the_registry() {
     let f = Fixture::new();
     f.put("NOTE/Note/a.note", b"x");
     let id = f.store.id_of(&wp("NOTE/Note/a.note")).unwrap().unwrap();
-    let g = f.store.lock().unwrap();
+    let g = f.store.lock_recovered(&f.journal).unwrap();
     let c = f
         .store
         .plan_move(
@@ -877,7 +877,7 @@ fn a_crashed_move_is_repaired_with_the_registry() {
         }
     );
     // the listing shows the file under its old id
-    let g = f.store.lock().unwrap();
+    let g = f.store.lock_recovered(&f.journal).unwrap();
     let e = f.store.entry(&g, &wp("NOTE/b.note")).unwrap().unwrap();
     assert_eq!(e.id, id);
 }
@@ -887,7 +887,7 @@ fn a_crashed_delete_is_repaired_and_a_crashed_folder_create_too() {
     let f = Fixture::new();
     f.put("NOTE/Note/a.note", b"x");
     let id = f.store.id_of(&wp("NOTE/Note/a.note")).unwrap().unwrap();
-    let g = f.store.lock().unwrap();
+    let g = f.store.lock_recovered(&f.journal).unwrap();
     let c = f
         .store
         .plan_delete(&g, &wp("NOTE/Note/a.note"), 77, Origin::Device, None)
@@ -905,7 +905,7 @@ fn a_crashed_delete_is_repaired_and_a_crashed_folder_create_too() {
             .is_file()
     );
 
-    let g = f.store.lock().unwrap();
+    let g = f.store.lock_recovered(&f.journal).unwrap();
     let c = f
         .store
         .plan_create_folder(&g, &wp("INBOX/New"), Origin::Device, None)
@@ -925,7 +925,7 @@ fn a_crashed_delete_is_repaired_and_a_crashed_folder_create_too() {
 #[test]
 fn a_commit_first_finishes_an_earlier_unfinished_one() {
     let f = Fixture::new();
-    let g = f.store.lock().unwrap();
+    let g = f.store.lock_recovered(&f.journal).unwrap();
     let staged = f.stage("f", b"one");
     let c = f
         .store
@@ -987,7 +987,7 @@ fn recover_all_leaves_accounts_without_files_alone() {
     let journal = Journal::open(dir.path()).unwrap();
     {
         let store = Store::open(dir.path(), "busy").unwrap();
-        let g = store.lock().unwrap();
+        let g = store.lock_recovered(&journal).unwrap();
         store.ensure_native_folders(&g).unwrap();
         let c = store
             .plan_create_folder(&g, &wp("A"), Origin::Cli, None)
@@ -999,6 +999,7 @@ fn recover_all_leaves_accounts_without_files_alone() {
     let done = recover_all(dir.path(), &journal).unwrap();
     assert_eq!(done.len(), 1);
     assert_eq!(done[0].0, "busy");
+    assert!(matches!(done[0].1, Ok(Recovery::Repaired { .. })));
     assert!(!accounts.account_dir("idle").join("files").exists());
     assert_eq!(journal.read_from(0).unwrap().count(), 1);
     assert!(recover_all(dir.path(), &journal).unwrap().is_empty());
@@ -1009,7 +1010,7 @@ fn snapshot_journals_the_current_state() {
     let f = Fixture::new();
     f.put("NOTE/Note/a.note", b"one");
     f.put("INBOX/b.pdf", b"two");
-    let g = f.store.lock().unwrap();
+    let g = f.store.lock_recovered(&f.journal).unwrap();
     let before = f.events().len();
     let s = f.store.snapshot(&g, &f.journal).unwrap();
     let ev: Vec<Event> = f.events().into_iter().skip(before).collect();
@@ -1042,4 +1043,198 @@ fn snapshot_journals_the_current_state() {
         .unwrap();
     let file = ev.iter().position(|e| matches!(&e.body, EventBody::FileCreated { path, .. } if path == "NOTE/Note/a.note")).unwrap();
     assert!(note < file, "parents first");
+}
+
+// ---------------------------------------------------------------- fix round 1
+
+#[test]
+fn a_fresh_handle_plans_only_on_the_recovered_registry() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/a.note", b"x");
+    let id = f.store.id_of(&wp("NOTE/Note/a.note")).unwrap().unwrap();
+    {
+        let g = f.store.lock_recovered(&f.journal).unwrap();
+        let c = f
+            .store
+            .plan_move(
+                &g,
+                &wp("NOTE/Note/a.note"),
+                &wp("NOTE/b.note"),
+                Origin::Cli,
+                None,
+            )
+            .unwrap();
+        f.store
+            .commit_until(&g, c, &f.journal, Some(CrashPoint::BeforeAppend))
+            .unwrap();
+        // under the same guard nothing can be planned on top of the unfinished change
+        let err = f
+            .store
+            .plan_create_folder(&g, &wp("INBOX/X"), Origin::Cli, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("unfinished change"), "{err}");
+    }
+    // the server, a long-running handle of its own, deletes the moved file next
+    let store = Store::open(f.dir.path(), "jordi").unwrap();
+    let journal = Journal::open(f.dir.path()).unwrap();
+    let g = store.lock_recovered(&journal).unwrap();
+    let c = store
+        .plan_delete(&g, &wp("NOTE/b.note"), 9, Origin::Device, None)
+        .unwrap();
+    store.commit(&g, c, &journal).unwrap();
+    drop(g);
+    let ev = f.events();
+    let types: Vec<&str> = ev.iter().map(|e| e.body.type_name()).collect();
+    assert_eq!(types, ["file.created", "file.moved", "file.deleted"]);
+    assert_eq!(ev[1].origin, Origin::Repair);
+    assert!(matches!(ev[2].body, EventBody::FileDeleted { id: d, .. } if d == id));
+    // no stale row: neither the old nor the new path nor the id is registered
+    assert_eq!(store.path_of(id).unwrap(), None);
+    assert_eq!(store.id_of(&wp("NOTE/Note/a.note")).unwrap(), None);
+    assert_eq!(store.id_of(&wp("NOTE/b.note")).unwrap(), None);
+}
+
+#[test]
+fn the_repair_finds_its_events_after_more_than_a_thousand_other_lines() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/z.note", b"z"); // the journal is not empty at the commit start
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    let staged = f.stage("f", b"hello");
+    let c = f
+        .store
+        .plan_put(&g, &wp("NOTE/Note/a.note"), &staged, Origin::Device, None)
+        .unwrap();
+    let op_id = c.op_id.clone();
+    f.store
+        .commit_until(&g, c, &f.journal, Some(CrashPoint::BeforeClear))
+        .unwrap();
+    drop(g);
+    let pending: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(f.store.account_dir().join(PENDING_FILE)).unwrap())
+            .unwrap();
+    assert_eq!(pending["journalSeq"], 1);
+    // other accounts append 1100 lines before the restart
+    let other = Journal::open(f.dir.path()).unwrap();
+    let mut batch: Vec<Event> = (0..1100).map(ev).collect();
+    other.append(&mut batch).unwrap();
+    assert_eq!(
+        f.restart_and_recover(),
+        Recovery::Repaired {
+            op_id: op_id.clone(),
+            seqs: vec![]
+        }
+    );
+    assert_eq!(f.events().iter().filter(|e| e.op_id == op_id).count(), 1);
+    assert_eq!(f.events().len(), 1102);
+}
+
+#[test]
+fn a_put_of_identical_bytes_is_a_no_op() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/a.note", b"same");
+    let target = f.store.fs_path(&wp("NOTE/Note/a.note"));
+    let ino = |p: &Path| {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(p).unwrap().ino()
+    };
+    let before = ino(&target);
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    let staged = f.stage("f", b"same");
+    let c = f
+        .store
+        .plan_put(&g, &wp("NOTE/Note/a.note"), &staged, Origin::Device, None)
+        .unwrap();
+    assert!(matches!(c.op, PendingOp::Unchanged { .. }));
+    assert!(c.events.is_empty());
+    assert_eq!(
+        f.store.commit(&g, c, &f.journal).unwrap(),
+        Vec::<u64>::new()
+    );
+    drop(g);
+    assert_eq!(f.events().len(), 1);
+    assert_eq!(ino(&target), before, "no data write");
+    assert!(staged.is_file(), "the staged file is left to the caller");
+    assert!(!f.pending_exists());
+}
+
+#[test]
+fn a_broken_intent_stops_only_its_own_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let accounts = Accounts::new(dir.path());
+    accounts
+        .create("broken", "b@example.org", "secret")
+        .unwrap();
+    accounts.create("good", "g@example.org", "secret").unwrap();
+    let journal = Journal::open(dir.path()).unwrap();
+    std::fs::create_dir_all(accounts.account_dir("broken").join("files")).unwrap();
+    std::fs::write(
+        accounts.account_dir("broken").join(PENDING_FILE),
+        b"{not json",
+    )
+    .unwrap();
+    {
+        let store = Store::open(dir.path(), "good").unwrap();
+        let g = store.lock_recovered(&journal).unwrap();
+        store.ensure_native_folders(&g).unwrap();
+        let c = store
+            .plan_create_folder(&g, &wp("A"), Origin::Cli, None)
+            .unwrap();
+        store
+            .commit_until(&g, c, &journal, Some(CrashPoint::BeforeAppend))
+            .unwrap();
+    }
+    let done = recover_all(dir.path(), &journal).unwrap();
+    assert_eq!(done.len(), 2);
+    assert_eq!(done[0].0, "broken");
+    assert!(done[0].1.is_err());
+    assert_eq!(done[1].0, "good");
+    assert!(matches!(done[1].1, Ok(Recovery::Repaired { .. })));
+    // a write to the broken account fails with the reason
+    let store = Store::open(dir.path(), "broken").unwrap();
+    let err = store.lock_recovered(&journal).unwrap_err().to_string();
+    assert!(err.contains("pending.json"), "{err}");
+    assert!(
+        err.contains("blocks every write to account broken"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_rotation_cuts_the_torn_tail_of_the_old_file() {
+    let dir = tempfile::tempdir().unwrap();
+    // 2026-10-31T23:59:59.000Z
+    let c = clock(1_793_491_199_000);
+    let j = journal_with(dir.path(), 1 << 30, c.clone());
+    j.append(&mut [ev(1)]).unwrap();
+    let old = j.files().unwrap()[0].1.clone();
+    let mut text = std::fs::read_to_string(&old).unwrap();
+    text.push_str("{\"seq\":2,\"ts\":1");
+    std::fs::write(&old, text).unwrap();
+    c.0.fetch_add(5_000, Ordering::SeqCst); // November
+    assert_eq!(j.append(&mut [ev(2)]).unwrap(), vec![2]);
+    assert_eq!(j.files().unwrap().len(), 2);
+    let text = std::fs::read_to_string(&old).unwrap();
+    assert!(text.ends_with('\n'), "{text}");
+    assert_eq!(text.lines().count(), 1);
+    assert_eq!(seqs(&j), vec![1, 2]);
+}
+
+#[test]
+fn recovery_messages_count_events_in_plain_english() {
+    let one = Recovery::Repaired {
+        op_id: "o".into(),
+        seqs: vec![7],
+    };
+    assert_eq!(
+        one.to_string(),
+        "finished the change o and journaled 1 missing event"
+    );
+    let two = Recovery::Repaired {
+        op_id: "o".into(),
+        seqs: vec![7, 8],
+    };
+    assert_eq!(
+        two.to_string(),
+        "finished the change o and journaled 2 missing events"
+    );
 }

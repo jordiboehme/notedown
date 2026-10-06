@@ -6,7 +6,9 @@ mod mask;
 mod rotate;
 
 pub use capture::Capture;
-pub use log::{Clock, FLAG_FIRMWARE_CHANGED, LogEntry, LogKind, ProtocolLog, SystemClock};
+pub use log::{
+    Clock, FLAG_FIRMWARE_CHANGED, FLAG_RECOVERY_FAILED, LogEntry, LogKind, ProtocolLog, SystemClock,
+};
 pub use mask::{
     MAX_BODY_BYTES, MAX_FIELD_BYTES, Origin, cap_text, contains_jwt, cut_body, has_duplicate_keys,
     is_masked, is_sensitive_header, is_sensitive_key, is_sensitive_key_from, mask_form,

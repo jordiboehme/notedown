@@ -677,7 +677,7 @@ fn jwt_shaped_values_never_reach_the_log_or_capture() {
 fn raw_body_kept_masked_when_it_differs_from_the_parsed_one() {
     let dir = tempfile::tempdir().unwrap();
     let log = open_log(dir.path());
-    let raw = r#"{"z":1.50,"password":"SECRETPW","code":123456,"a":"x","a":"y"}"#;
+    let raw = r#"{"z":1.50,"password":"SECRETPW","code":123456,"a":"y"}"#;
     let mut e = req("/api/x");
     e.request_body = Some(serde_json::from_str(raw).unwrap());
     e.request_body_raw = Some(raw.into());
@@ -689,7 +689,7 @@ fn raw_body_kept_masked_when_it_differs_from_the_parsed_one() {
     );
     assert_eq!(
         v["request_body_raw"],
-        r#"{"z":1.50,"password":"<masked:8 chars>","code":"<masked:6 chars>","a":"x","a":"y"}"#
+        r#"{"z":1.50,"password":"<masked:8 chars>","code":"<masked:6 chars>","a":"y"}"#
     );
     assert_eq!(v["request_body"]["a"], "y");
 }
@@ -817,4 +817,72 @@ fn naive_mask_jwts(s: &str) -> String {
     }
     out.push_str(&s[copied..]);
     out
+}
+
+/// `PASSW` becomes the JSON escape spelling of `password` (backslash, u0077 for the w), which the
+/// substring masker cannot read.
+fn esc(s: &str) -> String {
+    s.replace("PASSW", &format!("pass{}u0077ord", '\\'))
+}
+
+#[test]
+fn duplicate_keys_never_let_a_secret_through_raw_text() {
+    use notedown_cloud::diag::{has_duplicate_keys, mask_raw_json_from, mask_text};
+    assert!(has_duplicate_keys(
+        r#"{"password":"hunter2","password":"x"}"#
+    ));
+    assert!(has_duplicate_keys(r#"[{"a":{"b":1,"b":2}}]"#));
+    assert!(has_duplicate_keys(&esc(r#"{"PASSW":"a","password":"b"}"#)));
+    assert!(has_duplicate_keys(
+        r#"["m","{\"password\":\"a\",\"password\":\"b\"}"]"#
+    ));
+    assert!(!has_duplicate_keys(r#"{"a":1,"b":{"a":2}}"#));
+    assert!(!has_duplicate_keys("not json"));
+    // Body: the raw text is dropped.
+    for raw in [
+        r#"{"password":"hunter2","password":"x"}"#,
+        r#"{"password":"hunter2","password":"<masked:3 chars>"}"#,
+        r#"{"PASSW":"hunter2","password":"x"}"#,
+        r#"{"a":{"PASSW":"hunter2"},"a":{}}"#,
+    ] {
+        let raw = esc(raw);
+        assert_eq!(mask_raw_json_from(&raw, Origin::Client), None, "{raw}");
+    }
+    // Without duplicates, an escaped key name is caught by the structural check.
+    assert_eq!(
+        mask_raw_json_from(&esc(r#"{"PASSW":"hunter2"}"#), Origin::Client),
+        None
+    );
+    // Through the log: no secret in the line.
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let raw = esc(r#"{"z":1,"password":"<masked:3 chars>","PASSW":"hunter2"}"#);
+    let mut e = req("/api/x");
+    e.request_body = Some(serde_json::from_str(&raw).unwrap());
+    e.request_body_raw = Some(raw);
+    log.record(e);
+    let (text, v) = one_line(dir.path());
+    assert!(!text.contains("hunter2"), "{text}");
+    assert!(v.get("request_body_raw").is_none(), "{v}");
+    assert_eq!(v["flags"], json!(["duplicate_keys"]), "{v}");
+    // Frame: the parsed, masked form is logged instead of the raw text.
+    for frame in [
+        r#"42["login",{"password":"hunter2","password":"<masked:3 chars>"}]"#,
+        r#"42["login",{"a":{"password":"hunter2"},"a":{}}]"#,
+        r#"42["m","{\"password\":\"hunter2\",\"password\":\"<masked:1 chars>\"}"]"#,
+    ] {
+        let m = mask_text(frame);
+        assert!(!m.contains("hunter2"), "{frame} -> {m}");
+        assert!(m.starts_with("42["), "{m}");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let mut f = LogEntry::new(LogKind::Frame);
+    f.direction = Some("in".into());
+    f.request_body = Some(Value::String(
+        r#"42["login",{"password":"hunter2","password":"<masked:3 chars>"}]"#.into(),
+    ));
+    log.record(f);
+    let (text, _) = one_line(dir.path());
+    assert!(!text.contains("hunter2"), "{text}");
 }

@@ -13,8 +13,8 @@ use time::{Date, Month, OffsetDateTime, format_description::well_known::Rfc3339}
 
 use super::capture::Capture;
 use super::mask::{
-    MAX_BODY_BYTES, MAX_FIELD_BYTES, Origin, cap_text, cut_body, mask_form, mask_headers,
-    mask_json_from, mask_jwts, mask_raw_json_from,
+    MAX_BODY_BYTES, MAX_FIELD_BYTES, Origin, cap_text, cut_body, has_duplicate_keys, mask_form,
+    mask_headers, mask_json_from, mask_jwts, mask_raw_json_from,
 };
 use super::rotate::{LogFile, plan_deletions};
 use crate::{Result, io_err};
@@ -24,6 +24,8 @@ const FILE_SUFFIX: &str = ".jsonl";
 /// The flag of the marker written when a device reports a new firmware. Rotation keeps the log
 /// days around such a marker, so every writer of the marker must use this constant.
 pub const FLAG_FIRMWARE_CHANGED: &str = "firmware_changed";
+/// Set when a JSON body has a repeated key; its raw text is then left out of the log.
+pub const FLAG_DUPLICATE_KEYS: &str = "duplicate_keys";
 
 /// Source of time, injectable for tests. Days are UTC days.
 pub trait Clock: Send + Sync {
@@ -134,6 +136,14 @@ impl LogEntry {
             .take()
             .map(|q| cap_text(&mask_form(&q), MAX_FIELD_BYTES));
         self.headers = mask_headers(&self.headers);
+        // A raw body with a repeated key is left out (see `mask_raw_json_from`); the flag keeps
+        // the fact that the device sent one.
+        let dup = |r: &Option<String>| r.as_deref().is_some_and(has_duplicate_keys);
+        if (dup(&self.request_body_raw) || dup(&self.response_body_raw))
+            && !self.flags.iter().any(|f| f == FLAG_DUPLICATE_KEYS)
+        {
+            self.flags.push(FLAG_DUPLICATE_KEYS.to_string());
+        }
         // Request bodies and in-frames come from the device, responses and out-frames from the
         // server (`code` is masked only in device data, see `Origin`).
         let (body, raw) = sanitize_body(

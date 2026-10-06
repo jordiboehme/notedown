@@ -262,7 +262,9 @@ pub fn mask_text_from(s: &str, origin: Origin) -> String {
         && let Ok(parsed) = serde_json::from_str::<Value>(rest)
     {
         let masked = mask_json_from(&parsed, origin);
-        if masked != parsed {
+        // With a duplicate key the parsed form has lost the earlier values, so the raw text
+        // could hold a secret the masker never saw: log the parsed, masked form instead.
+        if masked != parsed || has_duplicate_keys(rest) {
             return format!("{prefix}{masked}");
         }
         return mask_jwts(s);
@@ -273,15 +275,123 @@ pub fn mask_text_from(s: &str, origin: Origin) -> String {
     mask_jwts(&mask_pairs_from(s, origin, false))
 }
 
-/// Mask a raw JSON text without parsing and re-serializing it, so key order, number spelling
-/// and duplicate keys stay as sent: sensitive key values by substring (an unquoted value becomes
-/// a quoted placeholder) and every JWT-shaped substring. `None` when the result is not valid
-/// JSON or when the structural masker ([`mask_json_from`]) still finds something to mask in it;
-/// the raw text is then left out rather than risking a secret.
+/// Mask a raw JSON text without parsing and re-serializing it, so key order and number
+/// spelling stay as sent: sensitive key values by substring (an unquoted value becomes a quoted
+/// placeholder) and every JWT-shaped substring. `None` (the raw text is left out rather than
+/// risking a secret) when
+/// - the text has a duplicate key at any depth, also inside embedded JSON strings (the parsed
+///   form keeps only the last value, so the checks below cannot see the earlier ones),
+/// - the result is not valid JSON or the structural masker ([`mask_json_from`]) still finds
+///   something to mask in it,
+/// - a string value that the structural masker masks in the parsed text still appears in it.
 pub fn mask_raw_json_from(s: &str, origin: Origin) -> Option<String> {
+    if has_duplicate_keys(s) {
+        return None;
+    }
+    let original = serde_json::from_str::<Value>(s).ok()?;
     let masked = mask_jwts(&mask_pairs_from(s, origin, true));
     let parsed = serde_json::from_str::<Value>(&masked).ok()?;
-    (mask_json_from(&parsed, origin) == parsed).then_some(masked)
+    if mask_json_from(&parsed, origin) != parsed {
+        return None;
+    }
+    let mut secrets = Vec::new();
+    masked_strings(&original, origin, &mut secrets);
+    secrets
+        .iter()
+        .all(|v| !masked.contains(&Value::String(v.clone()).to_string()))
+        .then_some(masked)
+}
+
+/// The non-empty string values under sensitive keys (at any depth) that the masker replaces.
+fn masked_strings(v: &Value, origin: Origin, out: &mut Vec<String>) {
+    match v {
+        Value::Object(map) => {
+            for (k, v) in map {
+                match v {
+                    Value::String(s)
+                        if is_sensitive_key_from(k, origin) && !s.is_empty() && !is_masked(s) =>
+                    {
+                        out.push(s.clone())
+                    }
+                    other => masked_strings(other, origin, out),
+                }
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|v| masked_strings(v, origin, out)),
+        _ => {}
+    }
+}
+
+const DUPLICATE_KEY: &str = "duplicate key";
+
+/// Whether a JSON text has an object with the same (decoded) key twice, at any depth and inside
+/// string values that hold JSON (after an optional numeric Engine.IO prefix). Text that is not
+/// JSON has no duplicate keys.
+pub fn has_duplicate_keys(s: &str) -> bool {
+    matches!(
+        serde_json::from_str::<DupCheck>(s),
+        Err(e) if e.to_string().starts_with(DUPLICATE_KEY)
+    )
+}
+
+/// Deserializes any JSON value and fails with [`DUPLICATE_KEY`] on a repeated key.
+struct DupCheck;
+
+impl<'de> serde::Deserialize<'de> for DupCheck {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(DupVisitor)
+    }
+}
+
+struct DupVisitor;
+
+impl<'de> serde::de::Visitor<'de> for DupVisitor {
+    type Value = DupCheck;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<DupCheck, E> {
+        Ok(DupCheck)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<DupCheck, E> {
+        Ok(DupCheck)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<DupCheck, E> {
+        Ok(DupCheck)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<DupCheck, E> {
+        Ok(DupCheck)
+    }
+    fn visit_unit<E>(self) -> Result<DupCheck, E> {
+        Ok(DupCheck)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<DupCheck, E> {
+        let t = v.trim_start();
+        let rest = t.trim_start_matches(|c: char| c.is_ascii_digit());
+        if rest.starts_with(['{', '[', '"']) && has_duplicate_keys(rest) {
+            return Err(E::custom(DUPLICATE_KEY));
+        }
+        Ok(DupCheck)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<DupCheck, A::Error> {
+        while seq.next_element::<DupCheck>()?.is_some() {}
+        Ok(DupCheck)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<DupCheck, A::Error> {
+        let mut seen = std::collections::HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key) {
+                return Err(serde::de::Error::custom(DUPLICATE_KEY));
+            }
+            map.next_value::<DupCheck>()?;
+        }
+        Ok(DupCheck)
+    }
 }
 
 fn is_key_byte(b: u8) -> bool {

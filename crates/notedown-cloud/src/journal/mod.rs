@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use cursor::{Cursor, validate_consumer};
-pub use event::{Event, EventBody, FileKind, Origin, new_op_id};
+pub use event::{Event, EventBody, FileKind, Origin, PartChange, new_op_id};
 
 use crate::diag::{Clock, SystemClock};
 use crate::{Error, Result, io_err};

@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 pub use commit::{
-    Commit, CrashPoint, PENDING_FILE, PendingOp, RECYCLE_DIR, Recovery, STALE_TEMP_AGE, WriteGuard,
-    recover_all,
+    Commit, CrashPoint, PENDING_FILE, PendingOp, RECYCLE_DIR, Recovery, STALE_TEMP_AGE, SideWrite,
+    WriteGuard, recover_all,
 };
 pub use ids::FIRST_ID;
 pub use list::Entry;

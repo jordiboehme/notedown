@@ -114,6 +114,57 @@ pub enum EventBody {
     /// The device reported another firmware `version` than the stored one.
     #[serde(rename = "device.firmware_changed", rename_all = "camelCase")]
     DeviceFirmwareChanged { from: String, to: String },
+    /// A page with a new `PAGEID` (see [`crate::pages`]). `id` is the note's store id, `fileId`
+    /// its `FILE_ID` (or `path:<md5 of the wire path>`), `position` 0-based.
+    #[serde(rename = "page.added", rename_all = "camelCase")]
+    PageAdded {
+        id: u64,
+        file_id: String,
+        page_id: String,
+        position: u64,
+    },
+    /// A page with the same `PAGEID` and other content; `parts` lists what changed.
+    #[serde(rename = "page.modified", rename_all = "camelCase")]
+    PageModified {
+        id: u64,
+        file_id: String,
+        page_id: String,
+        position: u64,
+        parts: Vec<PartChange>,
+    },
+    /// A `PAGEID` that the note no longer has.
+    #[serde(rename = "page.removed", rename_all = "camelCase")]
+    PageRemoved {
+        id: u64,
+        file_id: String,
+        page_id: String,
+    },
+    /// A page at another position (0-based).
+    #[serde(rename = "page.moved", rename_all = "camelCase")]
+    PageMoved {
+        id: u64,
+        file_id: String,
+        page_id: String,
+        from: u64,
+        to: u64,
+    },
+    /// The note could not be indexed (it does not parse, or it is too large). The file event
+    /// of the same commit stands; only the page events are missing.
+    #[serde(rename = "page.index_failed", rename_all = "camelCase")]
+    PageIndexFailed {
+        id: u64,
+        path: String,
+        reason: String,
+    },
+}
+
+/// One changed part of a page in `page.modified`: its name (`strokes`, `layers`, `textboxes`,
+/// `template`, `recognition`) and its hash before and after.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartChange {
+    pub name: String,
+    pub old: String,
+    pub new: String,
 }
 
 impl EventBody {
@@ -131,6 +182,11 @@ impl EventBody {
             EventBody::DeviceBound => "device.bound",
             EventBody::DeviceUnbound => "device.unbound",
             EventBody::DeviceFirmwareChanged { .. } => "device.firmware_changed",
+            EventBody::PageAdded { .. } => "page.added",
+            EventBody::PageModified { .. } => "page.modified",
+            EventBody::PageRemoved { .. } => "page.removed",
+            EventBody::PageMoved { .. } => "page.moved",
+            EventBody::PageIndexFailed { .. } => "page.index_failed",
         }
     }
 }

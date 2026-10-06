@@ -1015,8 +1015,15 @@ fn snapshot_journals_the_current_state() {
     let s = f.store.snapshot(&g, &f.journal).unwrap();
     let ev: Vec<Event> = f.events().into_iter().skip(before).collect();
     assert_eq!(s.len(), ev.len());
-    // 8 native folders and 2 files
-    assert_eq!(ev.len(), 10);
+    // 8 native folders, 2 files and page.index_failed for a.note ("one" is not a note)
+    assert_eq!(ev.len(), 11);
+    let failed = ev
+        .iter()
+        .position(|e| e.body.type_name() == "page.index_failed")
+        .unwrap();
+    assert!(
+        matches!(&ev[failed - 1].body, EventBody::FileCreated { path, .. } if path == "NOTE/Note/a.note")
+    );
     assert!(
         ev.iter()
             .all(|e| e.origin == Origin::Cli && e.op_id == ev[0].op_id)

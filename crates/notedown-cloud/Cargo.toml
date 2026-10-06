@@ -25,6 +25,7 @@ time.workspace = true
 toml.workspace = true
 unicode-normalization.workspace = true
 unicase.workspace = true
+notedown-note.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "io-util"] }

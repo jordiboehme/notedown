@@ -1431,6 +1431,7 @@ dependencies = [
  "futures-util",
  "hmac",
  "md-5",
+ "notedown-note",
  "rand 0.10.3",
  "serde",
  "serde_json",

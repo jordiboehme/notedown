@@ -2,8 +2,8 @@
 //!
 //! This crate currently holds the configuration, the always-on protocol log, the accounts, login
 //! codes and tokens, the HTTP routes of the capture server (login, server queries, refusal of
-//! every file operation), the auto-sync socket, the file store of each account and the change
-//! journal.
+//! every file operation), the auto-sync socket, the file store of each account, the change
+//! journal and the page index of notes.
 
 pub mod fsutil;
 
@@ -12,6 +12,7 @@ pub mod auth;
 pub mod config;
 pub mod diag;
 pub mod journal;
+pub mod pages;
 pub mod server;
 pub mod socket;
 pub mod store;

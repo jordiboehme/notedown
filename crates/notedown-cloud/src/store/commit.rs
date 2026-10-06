@@ -4,7 +4,8 @@
 //!
 //! 1. Write the intent ([`Commit`]: the operation and its planned events) to
 //!    `accounts/<slug>/pending.json` (atomic).
-//! 2. Apply the data change durably (rename, fsync of the folders), then update the id registry.
+//! 2. Apply the data change durably (rename, fsync of the folders), then update the id registry
+//!    and write the commit's side files ([`SideWrite`], the page record of a note).
 //! 3. Append the events to the journal (one write, one fsync).
 //! 4. Delete `pending.json`.
 //!
@@ -110,6 +111,28 @@ pub struct Commit {
     pub op: PendingOp,
     /// The events, in journal order.
     pub events: Vec<EventBody>,
+    /// Files written after the data change and before the journal append, such as the page
+    /// record of a note ([`crate::pages`]). Not part of the intent: recovery does not write
+    /// them, so they must be files whose loss is harmless.
+    #[serde(skip)]
+    pub side_writes: Vec<SideWrite>,
+}
+
+/// A file below the account folder that a commit writes (atomically) after its data change and
+/// before its journal append. A failed write is reported on stderr and does not fail the commit.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SideWrite {
+    pub path: PathBuf,
+    pub bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for SideWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SideWrite")
+            .field("path", &self.path)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
 }
 
 impl Commit {
@@ -127,6 +150,7 @@ impl Commit {
             journal_seq: None,
             op,
             events,
+            side_writes: Vec::new(),
         }
     }
 
@@ -630,6 +654,11 @@ impl Store {
             return Ok(Vec::new());
         }
         self.finish_registry(guard, &commit.op)?;
+        for w in &commit.side_writes {
+            if let Err(e) = self.write_side(w) {
+                eprintln!("warning: account {}: {e}", self.slug);
+            }
+        }
         // 3. events
         let mut events = commit.journal_events(&self.slug, commit.origin, &commit.events);
         let seqs = journal.append(&mut events)?;
@@ -639,6 +668,19 @@ impl Store {
         // 4. done
         self.clear_pending()?;
         Ok(seqs)
+    }
+
+    /// Write a side file atomically; its folder is created if needed.
+    fn write_side(&self, w: &SideWrite) -> Result<()> {
+        if !w.path.starts_with(&self.account_dir) {
+            return Err(invalid(
+                "side file",
+                format!("{} is outside the account", w.path.display()),
+            ));
+        }
+        let parent = w.path.parent().unwrap_or(&self.account_dir).to_path_buf();
+        self.create_dirs_durable(&parent)?;
+        super::write_atomic_short(&w.path, &w.bytes)
     }
 
     /// Perform the data change durably.
@@ -820,31 +862,45 @@ impl Store {
 
     /// Journal the current state for a new consumer: `folder.created` and `file.created` for
     /// every listed entry (parents first), as one batch with one `opId` and `origin: "cli"`.
-    /// Returns the `seq` values. Page events for notes are added by the page indexer.
+    /// A `.note` gets `pagesChanged` and one `page.added` per page right after its
+    /// `file.created` (or `page.index_failed`). Page records are not written. Returns the `seq`
+    /// values.
     pub fn snapshot(&self, guard: &WriteGuard, journal: &Journal) -> Result<Vec<u64>> {
         self.check_write(guard)?;
         let entries = self.list(guard, &WirePath::root(), true)?;
         let op_id = new_op_id();
-        let mut events: Vec<Event> = entries
-            .into_iter()
-            .map(|e| {
-                let body = match e.tag {
-                    Kind::Folder => EventBody::FolderCreated {
+        let mut events: Vec<Event> = Vec::new();
+        for e in entries {
+            let mut bodies = Vec::new();
+            match e.tag {
+                Kind::Folder => bodies.push(EventBody::FolderCreated {
+                    id: e.id,
+                    path: e.path_display,
+                }),
+                Kind::File => {
+                    let kind = FileKind::of(&e.name);
+                    let (pages_changed, page_events) = if kind == FileKind::Note {
+                        crate::pages::snapshot_note(self, &e.path, e.id)
+                    } else {
+                        (None, Vec::new())
+                    };
+                    bodies.push(EventBody::FileCreated {
                         id: e.id,
-                        path: e.path_display,
-                    },
-                    Kind::File => EventBody::FileCreated {
-                        id: e.id,
-                        kind: FileKind::of(&e.name),
+                        kind,
                         path: e.path_display,
                         md5: e.content_hash.unwrap_or_default(),
                         size: e.size,
-                        pages_changed: None,
-                    },
-                };
-                Event::new(&self.slug, Origin::Cli, None, &op_id, body)
-            })
-            .collect();
+                        pages_changed,
+                    });
+                    bodies.extend(page_events);
+                }
+            }
+            events.extend(
+                bodies
+                    .into_iter()
+                    .map(|body| Event::new(&self.slug, Origin::Cli, None, &op_id, body)),
+            );
+        }
         journal.append(&mut events)
     }
 

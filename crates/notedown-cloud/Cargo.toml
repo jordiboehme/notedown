@@ -17,7 +17,8 @@ const-hex.workspace = true
 md-5.workspace = true
 rand.workspace = true
 subtle.workspace = true
-jsonwebtoken.workspace = true
+hmac.workspace = true
+base64.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
@@ -26,7 +27,6 @@ toml.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "io-util"] }
 tower.workspace = true
-base64.workspace = true
 tempfile.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true

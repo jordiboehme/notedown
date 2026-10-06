@@ -380,6 +380,56 @@ fn token_round_trip_claims_and_rejections() {
     assert!(key.decode(&tampered).is_err());
 }
 
+/// A known HS256 vector, computed independently with Python's `hmac` and `hashlib`
+/// (key: the bytes 0 to 31).
+const VECTOR: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEwMDAwMDEsImVxdWlwbWVudE5vIjoiU04wNzhDMTAwMTIzNDUiLCJnZW5lcmF0aW9uIjozLCJjcmVhdGVUaW1lIjoxNzkxMzAwNjEyfQ.te3Wt1R8KOyL5oGqGohVYDGLCa79dWQprB2dk52pC-A";
+
+fn vector_claims() -> Claims {
+    Claims {
+        user_id: 1000001,
+        equipment_no: "SN078C10012345".into(),
+        generation: 3,
+        create_time: 1_791_300_612,
+    }
+}
+
+#[test]
+fn token_matches_an_independent_hs256_vector() {
+    let key = TokenKey::from_bytes((0u8..32).collect());
+    assert_eq!(key.issue(&vector_claims()).unwrap(), VECTOR);
+    assert_eq!(key.decode(VECTOR).unwrap(), vector_claims());
+}
+
+#[test]
+fn token_with_another_alg_or_malformed_is_rejected_without_panic() {
+    let key = TokenKey::from_bytes((0u8..32).collect());
+    // Correct HMAC-SHA256 signatures over headers that name HS384 and none.
+    let hs384 = "eyJhbGciOiJIUzM4NCIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEwMDAwMDEsImVxdWlwbWVudE5vIjoiU04wNzhDMTAwMTIzNDUiLCJnZW5lcmF0aW9uIjozLCJjcmVhdGVUaW1lIjoxNzkxMzAwNjEyfQ.kxTlHz-rhl1VOv7ILOqlfBBcsQGdgdUdGaGEdsFulXs";
+    let none = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJ1c2VySWQiOjEwMDAwMDEsImVxdWlwbWVudE5vIjoiU04wNzhDMTAwMTIzNDUiLCJnZW5lcmF0aW9uIjozLCJjcmVhdGVUaW1lIjoxNzkxMzAwNjEyfQ.sUdf9aRpDd1PHDu4_xaqtW4i8Q6-g5qmwjO9Kq7sPP0";
+    assert!(key.decode(hs384).is_err());
+    assert!(key.decode(none).is_err());
+    let (h, rest) = VECTOR.split_once('.').unwrap();
+    let (p, _) = rest.split_once('.').unwrap();
+    for bad in [
+        "".to_string(),
+        ".".into(),
+        "..".into(),
+        "...".into(),
+        "a.b.c".into(),
+        "a.b.c.d".into(),
+        format!("{h}.{p}"),
+        format!("{h}.{p}."),
+        format!("{h}.{p}.!!!"),
+        format!("{VECTOR}.x"),
+        format!("{h}.{p}.te3Wt1R8KOyL5oGqGohVYDGLCa79dWQprB2dk52pC-Q"),
+        format!("{h}.{p}.te3Wt1R8KOyL5oGqGohVYDGLCa79dWQprB2dk52pC"),
+        format!("x{VECTOR}"),
+        "eyJ\u{e9}.\u{1f600}.\u{0}".into(),
+    ] {
+        assert!(key.decode(&bad).is_err(), "{bad}");
+    }
+}
+
 #[test]
 fn new_login_and_logout_invalidate_older_tokens() {
     let (_d, auth) = setup();

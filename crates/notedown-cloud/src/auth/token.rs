@@ -3,13 +3,27 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 
 use crate::fsutil::{json_bytes, write_atomic};
 use crate::{Error, Result, io_err};
 
 pub const KEY_FILE: &str = "token.key";
+
+/// The header of every issued token, base64url of `{"alg":"HS256","typ":"JWT"}`.
+const HEADER: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// The token header; only `alg` is checked.
+#[derive(Deserialize)]
+struct JwtHeader {
+    alg: String,
+}
 
 /// Claims of a device token. Device tokens carry no `exp` (`docs/sync-protocol.md` 2.5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,29 +93,54 @@ impl TokenKey {
         const_hex::encode(&h.finalize()[..16])
     }
 
-    pub fn issue(&self, claims: &Claims) -> Result<String> {
-        jsonwebtoken::encode(
-            &Header::new(Algorithm::HS256),
-            claims,
-            &EncodingKey::from_secret(&self.secret),
-        )
-        .map_err(|e| Error::Invalid {
-            what: "token",
-            message: e.to_string(),
-        })
+    fn mac(&self) -> HmacSha256 {
+        // HMAC takes a key of any length.
+        <HmacSha256 as KeyInit>::new_from_slice(&self.secret).expect("hmac accepts any key length")
     }
 
-    /// Checks the signature only; the generation is checked against the device record.
+    /// A standard HS256 JWT: header `{"alg":"HS256","typ":"JWT"}`, the claims, base64url without
+    /// padding. No `exp`.
+    pub fn issue(&self, claims: &Claims) -> Result<String> {
+        let payload = serde_json::to_vec(claims).map_err(|e| Error::Invalid {
+            what: "token",
+            message: e.to_string(),
+        })?;
+        let signing_input = format!("{HEADER}.{}", URL_SAFE_NO_PAD.encode(payload));
+        let mut mac = self.mac();
+        mac.update(signing_input.as_bytes());
+        let sig = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        Ok(format!("{signing_input}.{sig}"))
+    }
+
+    /// Checks the signature only (constant time); the generation is checked against the device
+    /// record. Any `alg` other than `HS256` and any malformed token are rejected.
     pub fn decode(&self, token: &str) -> Result<Claims> {
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.required_spec_claims.clear();
-        validation.validate_exp = false;
-        jsonwebtoken::decode::<Claims>(token, &DecodingKey::from_secret(&self.secret), &validation)
-            .map(|d| d.claims)
-            .map_err(|_| Error::Invalid {
-                what: "token",
-                message: "bad signature or claims".into(),
-            })
+        let bad = || Error::Invalid {
+            what: "token",
+            message: "bad signature or claims".into(),
+        };
+        let mut parts = token.split('.');
+        let (Some(header), Some(payload), Some(sig), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(bad());
+        };
+        let sig = URL_SAFE_NO_PAD.decode(sig).map_err(|_| bad())?;
+        let mut mac = self.mac();
+        mac.update(header.as_bytes());
+        mac.update(b".");
+        mac.update(payload.as_bytes());
+        mac.verify_slice(&sig).map_err(|_| bad())?;
+        let header: JwtHeader = URL_SAFE_NO_PAD
+            .decode(header)
+            .ok()
+            .and_then(|h| serde_json::from_slice(&h).ok())
+            .ok_or_else(bad)?;
+        if header.alg != "HS256" {
+            return Err(bad());
+        }
+        let payload = URL_SAFE_NO_PAD.decode(payload).map_err(|_| bad())?;
+        serde_json::from_slice(&payload).map_err(|_| bad())
     }
 }
 

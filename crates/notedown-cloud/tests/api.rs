@@ -688,6 +688,34 @@ const REFUSED: &[(&str, &str)] = &[
     ("POST", "/api/file/download/url"),
 ];
 
+/// Relative path, size and content hash of every file in the data folder except `logs/`.
+fn snapshot(dir: &Path) -> Vec<(String, u64, String)> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64, String)>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+            if rel == "logs" {
+                continue;
+            }
+            if p.is_dir() {
+                out.push((format!("{rel}/"), 0, String::new()));
+                walk(root, &p, out);
+            } else {
+                let bytes = std::fs::read(&p).unwrap();
+                out.push((
+                    rel,
+                    bytes.len() as u64,
+                    md5_hex(&String::from_utf8_lossy(&bytes)),
+                ));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
 const LISTING_KEYS: &[&str] = &[
     "entries",
     "entriesVO",
@@ -733,6 +761,7 @@ async fn every_documented_file_endpoint_is_refused() {
     let s = Server::new();
     let (login, _, _) = s.login("secret", SERIAL, "202407").await;
     let token = login["token"].as_str().unwrap().to_string();
+    let before = snapshot(s.data());
     for (method, path) in REFUSED {
         for auth in [None, Some(token.as_str())] {
             let headers: Vec<(&str, &str)> =
@@ -746,6 +775,9 @@ async fn every_documented_file_endpoint_is_refused() {
             }
         }
     }
+    // nothing in the data folder changed (the log aside)
+    assert_eq!(snapshot(s.data()), before);
+    assert!(!s.data().join("accounts/jordi/files").exists());
     // documented paths are not flagged as unknown (repeats after an error are retries)
     for e in s.log() {
         if e["error_code"] == "E0079" {
@@ -1006,32 +1038,47 @@ async fn per_address_limit_refuses_only_that_address() {
     assert_err(&refused, "409");
     assert!(refused.get("randomCode").is_none());
     assert_ok(&ask_code(&s, b).await);
-    // login/equipment has its own budget per address
-    for _ in 0..10 {
-        let v = s
-            .call_from(
-                a,
+    // login/equipment has its own budget per address, and a refused login leaves the account
+    // alone: no failure counted, the pending code not consumed
+    let c = "192.168.1.80:7000";
+    let code = ask_code(&s, c).await["randomCode"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let login_from = |peer: &'static str, account: &'static str, hash: String| {
+        let s = &s;
+        async move {
+            s.call_from(
+                peer,
                 "POST",
                 "/api/official/user/account/login/equipment",
                 &[],
-                Some(json!({"account": EMAIL, "password": "00", "equipmentNo": SERIAL})),
+                Some(json!({"account": account, "password": hash, "equipmentNo": SERIAL})),
             )
-            .await;
-        assert_err(&v, "E0019");
+            .await
+        }
+    };
+    for _ in 0..10 {
+        // another account: uses up the budget without touching jordi's code
+        assert_err(
+            &login_from(c, "ghost@example.org", "00".into()).await,
+            "E0018",
+        );
     }
-    let v = s
-        .call_from(
-            a,
-            "POST",
-            "/api/official/user/account/login/equipment",
-            &[],
-            Some(json!({"account": EMAIL, "password": "00", "equipmentNo": SERIAL})),
-        )
-        .await;
+    let before = Accounts::new(s.data()).get("jordi").unwrap().unwrap();
+    let v = login_from(c, EMAIL, expected_login_hash(&md5_hex("wrong"), &code)).await;
     assert_err(&v, "409");
-    // the account lock is not touched by refused or code-less attempts
-    let acc = Accounts::new(s.data()).get("jordi").unwrap().unwrap();
-    assert!(!acc.locked);
+    let after = Accounts::new(s.data()).get("jordi").unwrap().unwrap();
+    assert_eq!(after.failed_logins, before.failed_logins);
+    assert!(!after.locked);
+    // the code is still pending: the right password from another address uses it
+    let v = login_from(
+        "192.168.1.81:7000",
+        EMAIL,
+        expected_login_hash(&md5_hex("secret"), &code),
+    )
+    .await;
+    assert_ok(&v);
     // after a minute the address may try again
     s.advance_ms(60_001);
     assert_ok(&ask_code(&s, a).await);
@@ -1106,4 +1153,23 @@ async fn serves_on_a_real_loopback_listener() {
     assert_ok(&answers[0]);
     assert_err(&answers[1], "E0079");
     assert_eq!(s.requests_to("/api/file/query/server").len(), 1);
+}
+
+#[tokio::test]
+async fn oversized_body_to_a_known_route_is_not_called_unknown() {
+    let s = Server::new();
+    let (status, v) = s
+        .raw(
+            "127.0.0.1:1",
+            "POST",
+            "/api/official/user/account/login/equipment",
+            &[("content-type", "application/json")],
+            Body::from(vec![b' '; MAX_REQUEST_BODY + 1]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_err(&v, "422");
+    let logged = s.requests_to("/api/official/user/account/login/equipment");
+    assert_eq!(logged.len(), 1);
+    assert!(logged[0].get("flags").is_none(), "{}", logged[0]);
 }

@@ -226,7 +226,8 @@ pub async fn log_request(
             let reply = if refuse::is_refused_path(&normalized) {
                 refuse::refusal(&parts.method, &parts.uri)
             } else {
-                Reply::bad_params("body too large").flag(FLAG_UNKNOWN)
+                // The note in request_body explains it; the route may well be a known one.
+                Reply::bad_params("body too large")
             };
             reply.into_response()
         }

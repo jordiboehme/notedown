@@ -187,6 +187,14 @@ fn body_for_log(bytes: &[u8], content_type: &str) -> Option<Value> {
     }
 }
 
+/// The text of a JSON body, for `request_body_raw` / `response_body_raw` (the log masks it and
+/// keeps it only when it differs from the re-serialized body).
+fn raw_json(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    serde_json::from_str::<serde::de::IgnoredAny>(text).ok()?;
+    Some(text.to_string())
+}
+
 /// Writes one [`LogEntry`] per request: method, path, query, headers, masked bodies, status,
 /// envelope result, duration, device, firmware and flags. The request body is read up to
 /// [`MAX_REQUEST_BODY`]; a larger one is not passed on (the answer is still an envelope).
@@ -228,6 +236,7 @@ pub async fn log_request(
     let response = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
         Ok(bytes) => {
             entry.request_body = body_for_log(&bytes, &content_type);
+            entry.request_body_raw = raw_json(&bytes);
             if let Some(Value::Object(m)) = &entry.request_body {
                 let text = |k: &str| match m.get(k) {
                     Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
@@ -289,6 +298,7 @@ pub async fn log_request(
         .and_then(Value::as_str)
         .map(str::to_string);
     entry.response_status = Some(rparts.status.as_u16());
+    entry.response_body_raw = rjson.as_ref().and_then(|_| raw_json(&rbytes));
     entry.response_body = rjson.or_else(|| {
         (!rbytes.is_empty()).then(|| Value::String(String::from_utf8_lossy(&rbytes).into_owned()))
     });

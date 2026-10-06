@@ -1249,3 +1249,49 @@ async fn oversized_body_to_an_unknown_path_is_flagged() {
     assert_eq!(logged.len(), 1);
     assert_eq!(logged[0]["flags"], json!(["unknown_endpoint"]));
 }
+
+#[tokio::test]
+async fn tokens_in_unknown_fields_and_raw_bodies_are_masked() {
+    let s = Server::new();
+    let (resp, _, _) = s.login("secret", "SN078C10000001", "Dsr.1").await;
+    let token = resp["token"].as_str().unwrap().to_string();
+    assert!(token.starts_with("eyJ"));
+    // The device's own key order, an unknown key and `channel` as a body field and a query value.
+    let raw = format!(
+        r#"{{"equipmentNo":"SN078C10000001","accessKey":"{token}","channel":"{token}_SN078C10000001_1791270000000"}}"#
+    );
+    let path = format!("/api/user/query?t={token}&channel={token}_SN1_1");
+    let (status, _) = s
+        .raw(
+            "192.168.1.50:40000",
+            "POST",
+            &path,
+            &[("content-type", "application/json")],
+            Body::from(raw),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = s.log_text();
+    assert!(!text.contains(&token[..20]), "{text}");
+    let logged = s.requests_to("/api/user/query");
+    assert_eq!(logged.len(), 1);
+    let raw = logged[0]["request_body_raw"].as_str().unwrap();
+    assert!(
+        raw.starts_with(r#"{"equipmentNo":"SN078C10000001","accessKey":"<masked:"#),
+        "{raw}"
+    );
+    assert!(
+        logged[0]["query"]
+            .as_str()
+            .unwrap()
+            .starts_with("t=<masked:")
+    );
+    // The login answer (as sent, with its token) is logged masked as well.
+    let login = s.requests_to("/api/official/user/account/login/equipment");
+    assert!(
+        login[0]["response_body"]["token"]
+            .as_str()
+            .unwrap()
+            .starts_with("<masked:")
+    );
+}

@@ -13,7 +13,8 @@ use time::{Date, Month, OffsetDateTime, format_description::well_known::Rfc3339}
 
 use super::capture::Capture;
 use super::mask::{
-    MAX_FIELD_BYTES, Origin, cap_text, cut_body, mask_form, mask_headers, mask_json_from,
+    MAX_BODY_BYTES, MAX_FIELD_BYTES, Origin, cap_text, cut_body, mask_form, mask_headers,
+    mask_json_from, mask_jwts, mask_raw_json_from,
 };
 use super::rotate::{LogFile, plan_deletions};
 use crate::{Result, io_err};
@@ -68,10 +69,17 @@ pub struct LogEntry {
     pub headers: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_body: Option<Value>,
+    /// The request body as sent (JSON text), kept only when it differs from the re-serialized
+    /// `request_body` (key order, number spelling, duplicate keys). Masked like the body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_body_raw: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_body: Option<Value>,
+    /// The response body as sent, like `request_body_raw`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_body_raw: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub success: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -116,8 +124,8 @@ impl LogEntry {
         // A query string inside the path is masked like the query field.
         self.path = self.path.take().map(|p| {
             let p = match p.split_once('?') {
-                Some((path, q)) => format!("{path}?{}", mask_form(q)),
-                None => p,
+                Some((path, q)) => format!("{}?{}", mask_jwts(path), mask_form(q)),
+                None => mask_jwts(&p),
             };
             cap_text(&p, MAX_FIELD_BYTES)
         });
@@ -128,11 +136,40 @@ impl LogEntry {
         self.headers = mask_headers(&self.headers);
         // Request bodies and in-frames come from the device, responses and out-frames from the
         // server (`code` is masked only in device data, see `Origin`).
-        let prep = |v: Option<Value>, o| v.map(|v| cut_body(&mask_json_from(&v, o)));
-        self.request_body = prep(self.request_body.take(), Origin::Client);
-        self.response_body = prep(self.response_body.take(), Origin::Server);
+        let (body, raw) = sanitize_body(
+            self.request_body.take(),
+            self.request_body_raw.take(),
+            Origin::Client,
+        );
+        (self.request_body, self.request_body_raw) = (body, raw);
+        let (body, raw) = sanitize_body(
+            self.response_body.take(),
+            self.response_body_raw.take(),
+            Origin::Server,
+        );
+        (self.response_body, self.response_body_raw) = (body, raw);
         self
     }
+}
+
+/// Mask and cut a body and its raw text. The raw text is kept only when its masked form differs
+/// from the masked, re-serialized body, and only when it can be masked safely
+/// ([`mask_raw_json_from`]).
+fn sanitize_body(
+    body: Option<Value>,
+    raw: Option<String>,
+    origin: Origin,
+) -> (Option<Value>, Option<String>) {
+    let Some(body) = body else {
+        return (None, None);
+    };
+    let masked = mask_json_from(&body, origin);
+    let reserialized = masked.to_string();
+    let raw = raw
+        .and_then(|r| mask_raw_json_from(&r, origin))
+        .filter(|r| *r != reserialized)
+        .map(|r| cap_text(&r, MAX_BODY_BYTES));
+    (Some(cut_body(&masked)), raw)
 }
 
 struct State {

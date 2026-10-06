@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use notedown_cloud::diag::{MAX_BODY_BYTES, cut_body, mask_headers, mask_json, mask_query};
+use notedown_cloud::diag::{MAX_BODY_BYTES, Origin, cut_body, mask_headers, mask_json, mask_query};
 use notedown_cloud::{Clock, Config, LogEntry, LogKind, ProtocolLog};
 use serde_json::{Value, json};
 use time::{Date, Month, OffsetDateTime, Time};
@@ -572,4 +572,162 @@ fn text_that_is_neither_json_nor_form_is_masked_by_substring() {
     );
     let once = mask_text(&cut);
     assert_eq!(mask_text(&once), once);
+}
+
+// ---- JWT-shaped values outside sensitive keys ----
+
+const JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJ1c2VySWQiOjF9.c2lnbmF0dXJl";
+
+fn one_line(dir: &Path) -> (String, Value) {
+    let text = std::fs::read_to_string(dir.join("logs/protocol-2026-10-06.jsonl")).unwrap();
+    assert_eq!(text.lines().count(), 1, "{text}");
+    let v = serde_json::from_str(text.trim()).unwrap();
+    (text, v)
+}
+
+fn open_log(dir: &Path) -> ProtocolLog {
+    ProtocolLog::open_with_clock(dir, 30, 1 << 30, FakeClock::at(2026, 10, 6)).unwrap()
+}
+
+#[test]
+fn jwt_shaped_values_are_masked_in_every_form() {
+    use notedown_cloud::diag::{mask_form, mask_jwts, mask_text, mask_text_from};
+    let n = JWT.len();
+    let ph = format!("<masked:{n} chars>");
+    assert_eq!(mask_jwts(&format!("a {JWT} b")), format!("a {ph} b"));
+    // unknown key, nested
+    let m = mask_json(&json!({"accessKey": JWT, "auth": JWT, "deep": [{"x": JWT}]}));
+    assert_eq!(m, json!({"accessKey": ph, "auth": ph, "deep": [{"x": ph}]}));
+    // a JWT as an object key
+    let m = mask_json(&json!({ JWT: 1 }));
+    assert!(!m.to_string().contains(JWT), "{m}");
+    // keyless event argument, both directions
+    let frame = format!(r#"42["auth","{JWT}"]"#);
+    for origin in [Origin::Client, Origin::Server] {
+        let m = mask_text_from(&frame, origin);
+        assert_eq!(m, format!(r#"42["auth","{ph}"]"#));
+    }
+    // event argument holding embedded JSON with an unknown key
+    let m = mask_text(&format!(r#"42["ClientMessage","{{\"k\":\"{JWT}\"}}"]"#));
+    assert!(!m.contains(JWT), "{m}");
+    // channel in a body: `<jwt>_<serial>_<ms>`
+    let m = mask_json(&json!({"channel": format!("{JWT}_SN078C1_1791270000000")}));
+    let ch = m["channel"].as_str().unwrap();
+    assert!(!ch.contains("eyJ"), "{ch}");
+    assert!(ch.starts_with("<masked:"), "{ch}");
+    // query values, plain and percent-encoded
+    let q = mask_query(&format!("t={JWT}&channel={JWT}_SN1_123&EIO=3"));
+    assert!(!q.contains("eyJ"), "{q}");
+    assert!(q.starts_with(&format!("t={ph}&channel=<masked:")), "{q}");
+    assert!(q.ends_with("&EIO=3"), "{q}");
+    let enc = JWT.replace('.', "%2E");
+    let q = mask_form(&format!("v={enc}&x=1"));
+    assert_eq!(q, format!("v=<masked:{} chars>&x=1", enc.len()));
+    // free text and a form body
+    assert_eq!(
+        mask_text(&format!("Bearer {JWT} tail")),
+        format!("Bearer {ph} tail")
+    );
+    assert_eq!(
+        mask_text(&format!("a=1&blob={JWT}")),
+        format!("a=1&blob={ph}")
+    );
+    // harmless dots stay; masking twice is stable
+    assert_eq!(mask_jwts("v1.2.3 eyJ.x"), "v1.2.3 eyJ.x");
+    let once = mask_text(&frame);
+    assert_eq!(mask_text(&once), once);
+}
+
+#[test]
+fn jwt_shaped_values_never_reach_the_log_or_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    let capture = notedown_cloud::diag::Capture::open(dir.path()).unwrap();
+    let log = open_log(dir.path()).with_capture(capture);
+    let mut e = req(&format!("/socket.io/{JWT}/?t={JWT}"));
+    e.query = Some(format!("t={JWT}&channel={JWT}_SN1_123"));
+    e.request_body = Some(json!({"accessKey": JWT, "channel": format!("{JWT}_SN1_1")}));
+    e.request_body_raw = Some(format!(
+        r#"{{"channel":"{JWT}_SN1_1","accessKey":"{JWT}"}}"#
+    ));
+    e.response_body = Some(json!({"data": JWT}));
+    e.response_body_raw = Some(format!(r#"{{"data":"{JWT}"}}"#));
+    log.record(e);
+    let mut f = LogEntry::new(LogKind::Frame);
+    f.direction = Some("out".into());
+    f.response_body = Some(Value::String(format!(r#"42["auth","{JWT}"]"#)));
+    log.record(f);
+    let text = std::fs::read_to_string(dir.path().join("logs/protocol-2026-10-06.jsonl")).unwrap();
+    assert!(!text.contains("eyJ"), "{text}");
+    assert_eq!(text.matches("<masked:").count(), 10, "{text}");
+    for entry in std::fs::read_dir(dir.path().join("capture")).unwrap() {
+        let dump = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+        assert!(!dump.contains("eyJ"), "{dump}");
+    }
+}
+
+// ---- raw bodies ----
+
+#[test]
+fn raw_body_kept_masked_when_it_differs_from_the_parsed_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let raw = r#"{"z":1.50,"password":"SECRETPW","code":123456,"a":"x","a":"y"}"#;
+    let mut e = req("/api/x");
+    e.request_body = Some(serde_json::from_str(raw).unwrap());
+    e.request_body_raw = Some(raw.into());
+    log.record(e);
+    let (text, v) = one_line(dir.path());
+    assert!(
+        !text.contains("SECRET") && !text.contains("123456"),
+        "{text}"
+    );
+    assert_eq!(
+        v["request_body_raw"],
+        r#"{"z":1.50,"password":"<masked:8 chars>","code":"<masked:6 chars>","a":"x","a":"y"}"#
+    );
+    assert_eq!(v["request_body"]["a"], "y");
+}
+
+#[test]
+fn raw_body_left_out_when_equal_or_not_safely_maskable() {
+    // Equal to the re-serialized form: no raw field.
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let raw = r#"{"a":1,"password":"pw"}"#;
+    let mut e = req("/api/x");
+    e.request_body = Some(serde_json::from_str(raw).unwrap());
+    e.request_body_raw = Some(raw.into());
+    e.response_body = Some(json!({"errorCode": "E0079", "success": false}));
+    e.response_body_raw = Some(r#"{"errorCode":"E0079","success":false}"#.into());
+    log.record(e);
+    let (_, v) = one_line(dir.path());
+    assert!(v.get("request_body_raw").is_none(), "{v}");
+    assert!(v.get("response_body_raw").is_none(), "{v}");
+    // An object under a sensitive key cannot be masked by substring: the raw text is dropped,
+    // the parsed body is masked as always.
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let raw = r#"{"b":1, "token":{"inner":"SECRETVALUE"}}"#;
+    let mut e = req("/api/x");
+    e.request_body = Some(serde_json::from_str(raw).unwrap());
+    e.request_body_raw = Some(raw.into());
+    log.record(e);
+    let (text, v) = one_line(dir.path());
+    assert!(!text.contains("SECRET"), "{text}");
+    assert!(v.get("request_body_raw").is_none(), "{v}");
+}
+
+#[test]
+fn raw_body_is_cut_at_the_body_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let raw = format!(r#"{{"z":"{}","a":1}}"#, "x".repeat(MAX_BODY_BYTES));
+    let mut e = req("/api/x");
+    e.request_body = Some(serde_json::from_str(&raw).unwrap());
+    e.request_body_raw = Some(raw);
+    log.record(e);
+    let (_, v) = one_line(dir.path());
+    let r = v["request_body_raw"].as_str().unwrap();
+    assert!(r.len() < MAX_BODY_BYTES + 100, "{}", r.len());
+    assert!(r.contains("<cut: "), "cut note");
 }

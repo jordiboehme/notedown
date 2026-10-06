@@ -56,25 +56,54 @@ pub fn is_sensitive_header(name: &str) -> bool {
     is_sensitive_key(name) || n.contains("auth") || n == "channel"
 }
 
+fn is_b64url(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'=')
+}
+
+/// The first JWT-shaped substring at or after `from`: `eyJ` and two more base64url parts
+/// separated by dots. Returns its byte range.
+fn find_jwt(s: &str, from: usize) -> Option<(usize, usize)> {
+    let b = s.as_bytes();
+    let run = |mut j: usize| {
+        while j < b.len() && is_b64url(b[j]) {
+            j += 1;
+        }
+        j
+    };
+    s[from..].match_indices("eyJ").find_map(|(i, _)| {
+        let start = from + i;
+        let end1 = run(start);
+        if b.get(end1) != Some(&b'.') {
+            return None;
+        }
+        let end2 = run(end1 + 1);
+        if end2 == end1 + 1 || b.get(end2) != Some(&b'.') {
+            return None;
+        }
+        let end3 = run(end2 + 1);
+        (end3 > end2 + 1).then_some((start, end3))
+    })
+}
+
 /// Whether a text holds something shaped like a JWT: `eyJ` and two more base64url parts
 /// separated by dots.
 pub fn contains_jwt(s: &str) -> bool {
-    let b64 = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '=';
-    s.match_indices("eyJ").any(|(i, _)| {
-        let rest = &s[i..];
-        let mut parts = rest.split('.');
-        let ok = |p: Option<&str>, whole: bool| {
-            p.is_some_and(|p| {
-                let p = if whole {
-                    p
-                } else {
-                    p.split(|c: char| !b64(c)).next().unwrap_or("")
-                };
-                !p.is_empty() && p.chars().all(b64)
-            })
-        };
-        ok(parts.next(), true) && ok(parts.next(), true) && ok(parts.next(), false)
-    })
+    find_jwt(s, 0).is_some()
+}
+
+/// Replace every JWT-shaped substring by the placeholder, whatever key or context it is in. A
+/// token in a field the key rule does not know (`accessKey`, a socket event argument, `channel`
+/// as `<jwt>_<serial>_<ms>`) is masked this way.
+pub fn mask_jwts(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0;
+    while let Some((start, end)) = find_jwt(s, copied) {
+        out.push_str(&s[copied..start]);
+        out.push_str(&placeholder(s[start..end].chars().count()));
+        copied = end;
+    }
+    out.push_str(&s[copied..]);
+    out
 }
 
 /// The one placeholder: `<masked:N chars>`.
@@ -116,10 +145,11 @@ pub fn mask_json_from(value: &Value, origin: Origin) -> Value {
         Value::Object(map) => Value::Object(
             map.iter()
                 .map(|(k, v)| {
+                    let key = mask_jwts(k);
                     if is_sensitive_key_from(k, origin) {
-                        (k.clone(), mask_value(v))
+                        (key, mask_value(v))
                     } else {
-                        (k.clone(), mask_json_from(v, origin))
+                        (key, mask_json_from(v, origin))
                     }
                 })
                 .collect(),
@@ -180,9 +210,13 @@ fn mask_form_from(text: &str, origin: Origin) -> String {
     text.split('&')
         .map(|pair| match pair.split_once('=') {
             Some((k, v)) if is_sensitive_key_from(&percent_decode(k), origin) => {
-                format!("{k}={}", mask_str(v))
+                format!("{}={}", mask_jwts(k), mask_str(v))
             }
-            _ => pair.to_string(),
+            // A token may be percent-encoded: then the whole value goes.
+            Some((k, v)) if !contains_jwt(v) && contains_jwt(&percent_decode(v)) => {
+                format!("{}={}", mask_jwts(k), mask_str(v))
+            }
+            _ => mask_jwts(pair),
         })
         .collect::<Vec<_>>()
         .join("&")
@@ -200,7 +234,8 @@ pub fn mask_text(s: &str) -> String {
     mask_text_from(s, Origin::Client)
 }
 
-/// [`mask_text`] for data of the given origin (see [`Origin`]).
+/// [`mask_text`] for data of the given origin (see [`Origin`]). JWT-shaped substrings are
+/// masked in every case (see [`mask_jwts`]).
 pub fn mask_text_from(s: &str, origin: Origin) -> String {
     let trimmed = s.trim_start();
     let digits = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
@@ -212,12 +247,23 @@ pub fn mask_text_from(s: &str, origin: Origin) -> String {
         if masked != parsed {
             return format!("{prefix}{masked}");
         }
-        return s.to_string();
+        return mask_jwts(s);
     }
     if looks_like_form(s) {
-        return mask_form_from(s, origin);
+        return mask_jwts(&mask_form_from(s, origin));
     }
-    mask_pairs_from(s, origin)
+    mask_jwts(&mask_pairs_from(s, origin, false))
+}
+
+/// Mask a raw JSON text without parsing and re-serializing it, so key order, number spelling
+/// and duplicate keys stay as sent: sensitive key values by substring (an unquoted value becomes
+/// a quoted placeholder) and every JWT-shaped substring. `None` when the result is not valid
+/// JSON or when the structural masker ([`mask_json_from`]) still finds something to mask in it;
+/// the raw text is then left out rather than risking a secret.
+pub fn mask_raw_json_from(s: &str, origin: Origin) -> Option<String> {
+    let masked = mask_jwts(&mask_pairs_from(s, origin, true));
+    let parsed = serde_json::from_str::<Value>(&masked).ok()?;
+    (mask_json_from(&parsed, origin) == parsed).then_some(masked)
 }
 
 fn is_key_byte(b: u8) -> bool {
@@ -228,7 +274,9 @@ fn is_key_byte(b: u8) -> bool {
 /// `"key": value`, `\"key\":\"value\"`, `'key': value`, `key: value` or `key=value`, the value
 /// up to its closing quote (or the end of the text when the quote is missing) or, unquoted, up to
 /// the next `,`, `}`, `]`, `&`, `;`, quote or whitespace is replaced by the placeholder.
-fn mask_pairs_from(s: &str, origin: Origin) -> String {
+///
+/// With `quote_bare`, an unquoted value is replaced by a quoted placeholder, so JSON stays JSON.
+fn mask_pairs_from(s: &str, origin: Origin, quote_bare: bool) -> String {
     let b = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut copied = 0;
@@ -304,7 +352,13 @@ fn mask_pairs_from(s: &str, origin: Origin) -> String {
         let value = &s[vstart..vend];
         if !is_masked(value) {
             out.push_str(&s[copied..vstart]);
-            out.push_str(&placeholder(value.chars().count()));
+            if quote.is_none() && quote_bare {
+                out.push('"');
+                out.push_str(&placeholder(value.chars().count()));
+                out.push('"');
+            } else {
+                out.push_str(&placeholder(value.chars().count()));
+            }
             copied = vend;
         }
         i = next.max(i);

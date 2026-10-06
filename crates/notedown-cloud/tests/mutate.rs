@@ -125,6 +125,35 @@ impl Server {
         std::fs::write(p, bytes).unwrap();
     }
 
+    /// Write a note through a store put with its page index, as an upload does.
+    fn index_note(&self, path: &str, bytes: &[u8]) {
+        let store = self.state.store("jordi").unwrap();
+        let g = store.lock_recovered(&self.state.journal).unwrap();
+        let staged = self.account().join("staged-note");
+        std::fs::write(&staged, bytes).unwrap();
+        let mut c = store
+            .plan_put(&g, &wp(path), &staged, Origin::Cli, None)
+            .unwrap();
+        notedown_cloud::pages::plan_page_events(&store, &g, &mut c);
+        store.commit(&g, c, &self.state.journal).unwrap();
+    }
+
+    /// The page records as (file name, content).
+    fn records(&self) -> Vec<(String, Value)> {
+        let mut out: Vec<(String, Value)> = std::fs::read_dir(self.account().join("pages"))
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    serde_json::from_slice(&std::fs::read(e.path()).unwrap()).unwrap(),
+                )
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     fn advance_ms(&self, ms: i64) {
         self.clock.0.fetch_add(ms, Ordering::SeqCst);
     }
@@ -550,16 +579,97 @@ async fn a_folder_delete_arrives_per_file_and_prunes_the_emptied_user_folders() 
 }
 
 #[tokio::test]
-async fn a_folder_with_a_hidden_file_is_not_pruned() {
+async fn a_folder_with_only_dot_files_goes_to_the_recycle_bin_with_them() {
     let s = Server::new();
     let t = s.session().await;
-    s.put("NOTE/Note/Proj/a.note", b"a");
+    s.put("NOTE/Note/Proj/Sub/a.note", b"a");
+    s.put("NOTE/Note/Proj/Sub/.DS_Store", b"sub mac");
     s.put("NOTE/Note/Proj/.DS_Store", b"mac");
-    let a = s.id_of(&t, "NOTE/Note/Proj/a.note").await;
+    let a = s.id_of(&t, "NOTE/Note/Proj/Sub/a.note").await;
+    let proj = s.id_of(&t, "NOTE/Note/Proj").await;
     let n = s.events().len();
     assert_ok(&s.delete(&t, &a).await);
-    assert_eq!(types(&s.events_after(n)), ["file.deleted"]);
-    assert!(s.files().join("NOTE/Note/Proj/.DS_Store").is_file());
+    let ev = s.events_after(n);
+    assert_eq!(
+        types(&ev),
+        ["file.deleted", "folder.deleted", "folder.deleted"]
+    );
+    assert_eq!(ev[1]["path"], "NOTE/Note/Proj/Sub");
+    assert_eq!(ev[2]["path"], "NOTE/Note/Proj");
+    assert!(!s.files().join("NOTE/Note/Proj").exists());
+    assert!(!s.listed(&t, "NOTE/Note/Proj").await);
+    // the dot-files are kept: the topmost pruned folder moved with them to its own slot
+    let slot = s
+        .account()
+        .join(format!("recycle/{}/NOTE/Note/Proj", T0 + 1));
+    assert_eq!(std::fs::read(slot.join(".DS_Store")).unwrap(), b"mac");
+    assert_eq!(
+        std::fs::read(slot.join("Sub/.DS_Store")).unwrap(),
+        b"sub mac"
+    );
+    assert_eq!(
+        std::fs::read(
+            s.account()
+                .join(format!("recycle/{T0}/NOTE/Note/Proj/Sub/a.note"))
+        )
+        .unwrap(),
+        b"a"
+    );
+    let index = s.recycle_index();
+    assert_eq!(index.len(), 2);
+    assert_eq!(index[0].path, "NOTE/Note/Proj/Sub/a.note");
+    assert_eq!(index[1].path, "NOTE/Note/Proj");
+    assert_eq!(index[1].id.to_string(), proj);
+    assert_eq!(index[1].md5, "");
+    assert_eq!(index[1].deleted_at, T0 as u64 + 1);
+    for e in &index {
+        assert!(
+            s.account().join("recycle").join(e.location()).exists(),
+            "{e:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_move_out_of_a_folder_with_dot_files_recycles_the_folder() {
+    let s = Server::new();
+    let t = s.session().await;
+    s.put("NOTE/Note/M/x.pdf", b"x");
+    s.put("NOTE/Note/M/.DS_Store", b"mac");
+    let x = s.id_of(&t, "NOTE/Note/M/x.pdf").await;
+    let n = s.events().len();
+    assert_ok(&s.mv(&t, &x, "/INBOX/x.pdf", false).await);
+    assert_eq!(types(&s.events_after(n)), ["file.moved", "folder.deleted"]);
+    assert_eq!(
+        std::fs::read(
+            s.account()
+                .join(format!("recycle/{T0}/NOTE/Note/M/.DS_Store"))
+        )
+        .unwrap(),
+        b"mac"
+    );
+    let index = s.recycle_index();
+    assert_eq!(index.len(), 1);
+    assert_eq!(index[0].location(), format!("{T0}/NOTE/Note/M"));
+}
+
+#[tokio::test]
+async fn a_folder_with_a_server_temp_name_is_not_pruned() {
+    let s = Server::new();
+    let t = s.session().await;
+    for (folder, temp) in [("Q", ".nd-move-77-1"), ("R", ".nd-77-1.tmp")] {
+        s.put(&format!("NOTE/Note/{folder}/a.pdf"), b"a");
+        s.put(&format!("NOTE/Note/{folder}/{temp}"), b"temp");
+        let a = s.id_of(&t, &format!("NOTE/Note/{folder}/a.pdf")).await;
+        let n = s.events().len();
+        assert_ok(&s.delete(&t, &a).await);
+        assert_eq!(types(&s.events_after(n)), ["file.deleted"]);
+        assert!(
+            s.files()
+                .join(format!("NOTE/Note/{folder}/{temp}"))
+                .is_file()
+        );
+    }
 }
 
 #[tokio::test]
@@ -600,10 +710,30 @@ async fn a_folder_with_content_goes_to_the_recycle_bin_as_a_whole() {
         .unwrap(),
         b"a"
     );
+    // one line per file, then the folder line, each locating its own bytes
     let index = s.recycle_index();
-    assert_eq!(index.len(), 1);
-    assert_eq!(index[0].path, "NOTE/Note/Proj");
-    assert_eq!(index[0].md5, "");
+    let lines: Vec<(&str, &str)> = index
+        .iter()
+        .map(|e| (e.path.as_str(), e.md5.as_str()))
+        .collect();
+    let (ma, mb) = (md5_of(b"a"), md5_of(b"b"));
+    assert_eq!(
+        lines,
+        [
+            ("NOTE/Note/Proj/b.note", mb.as_str()),
+            ("NOTE/Note/Proj/Sub/a.note", ma.as_str()),
+            ("NOTE/Note/Proj", ""),
+        ]
+    );
+    assert_eq!(index[1].id.to_string(), a);
+    for e in &index {
+        assert_eq!(e.deleted_at, T0 as u64);
+        assert_eq!(e.reason, RecycleReason::Deleted);
+        assert!(
+            s.account().join("recycle").join(e.location()).exists(),
+            "{e:?}"
+        );
+    }
     assert!(!s.listed(&t, "NOTE/Note/Proj").await);
     assert_err(&s.delete(&t, &a).await, "E0318");
 }
@@ -670,10 +800,15 @@ async fn native_folders_cannot_be_deleted_or_moved() {
     let t = s.session().await;
     for path in ["NOTE/Note", "NOTE", "INBOX"] {
         let id = s.id_of(&t, path).await;
-        let d = s.delete(&t, &id).await;
-        assert_eq!(d["success"], false, "{d}");
-        let m = s.mv(&t, &id, "/Elsewhere", false).await;
-        assert_eq!(m["success"], false, "{m}");
+        assert_err(&s.delete(&t, &id).await, "422");
+        assert_err(&s.mv(&t, &id, "/Elsewhere", false).await, "422");
+        for route in [DELETE, MOVE] {
+            let flags = s.log_flags(route);
+            assert!(
+                flags.last().unwrap().contains(&"native_folder".to_string()),
+                "{flags:?}"
+            );
+        }
         assert!(s.files().join(path).is_dir());
     }
 }
@@ -973,7 +1108,7 @@ async fn a_copy_gets_a_new_id_and_journals_file_copied() {
 async fn a_copied_note_gets_page_events_after_file_copied() {
     let s = Server::new();
     let t = s.session().await;
-    s.put("NOTE/Note/t.note", &test1());
+    s.index_note("NOTE/Note/t.note", &test1());
     let id = s.id_of(&t, "NOTE/Note/t.note").await;
     let n = s.events().len();
     assert_ok(&s.cp(&t, &id, "/NOTE/Note/t2.note", false).await);
@@ -981,6 +1116,22 @@ async fn a_copied_note_gets_page_events_after_file_copied() {
     assert_eq!(ev[0]["type"], "file.copied");
     assert!(ev.len() > 1);
     assert!(ev[1..].iter().all(|e| e["type"] == "page.added"), "{ev:?}");
+    // two records: the source under its FILE_ID, the copy under its path
+    let records = s.records();
+    assert_eq!(records.len(), 2, "{records:?}");
+    let source = records.iter().find(|(n, _)| n.starts_with('F')).unwrap();
+    let copy = records
+        .iter()
+        .find(|(n, _)| n.starts_with("path-"))
+        .unwrap();
+    assert_eq!(source.1["path"], "NOTE/Note/t.note");
+    assert_eq!(
+        format!("{}.json", source.1["fileId"].as_str().unwrap()),
+        source.0
+    );
+    assert_eq!(copy.1["path"], "NOTE/Note/t2.note");
+    assert!(copy.1["fileId"].as_str().unwrap().starts_with("path:"));
+    assert_eq!(copy.1["noteId"], source.1["fileId"]);
 }
 
 #[tokio::test]
@@ -1073,6 +1224,7 @@ async fn every_mutation_needs_the_sync_lock() {
     let n = s.events().len();
     for (path, body) in [
         (CREATE, json!({"path": "/INBOX/F", "autorename": false})),
+        (CREATE, json!({})),
         (DELETE, json!({"id": a})),
         (MOVE, json!({"id": a, "to_path": "/INBOX/b.pdf"})),
         (COPY, json!({"id": a, "to_path": "/INBOX/b.pdf"})),
@@ -1101,6 +1253,34 @@ async fn mutations_answer_the_device_mismatch() {
             .await;
         assert_err(&v, "E0312");
     }
+}
+
+#[tokio::test]
+async fn a_new_folder_never_takes_the_id_of_a_vanished_one() {
+    let s = Server::new();
+    let t = s.session().await;
+    let first = s.mkdir(&t, "/INBOX/A", false).await["metadata"]["id"].clone();
+    std::fs::remove_dir(s.files().join("INBOX/A")).unwrap();
+    let again = s.mkdir(&t, "/INBOX/A", false).await;
+    assert_ok(&again);
+    assert_ne!(again["metadata"]["id"], first);
+    // the same for a parent folder that a move creates
+    let b = s.mkdir(&t, "/INBOX/B", false).await["metadata"]["id"].clone();
+    std::fs::remove_dir(s.files().join("INBOX/B")).unwrap();
+    s.put("INBOX/f.pdf", b"f");
+    let f = s.id_of(&t, "INBOX/f.pdf").await;
+    let n = s.events().len();
+    assert_ok(&s.mv(&t, &f, "/INBOX/B/f.pdf", false).await);
+    let ev = s.events_after(n);
+    assert_eq!(ev[0]["type"], "folder.created");
+    assert_ne!(
+        ev[0]["id"].as_u64().unwrap().to_string(),
+        b.as_str().unwrap()
+    );
+    assert_eq!(
+        s.id_of(&t, "INBOX/B").await,
+        ev[0]["id"].as_u64().unwrap().to_string()
+    );
 }
 
 // ------------------------------------------------------------------ crash repair (store level)
@@ -1278,4 +1458,148 @@ fn a_prune_folder_that_is_no_longer_empty_stays_and_gets_no_event() {
     assert!(ev[1].to_line().contains("\"path\":\"NOTE/Note/P/Q\""));
     assert!(f.store.fs_path(&wp("NOTE/Note/P/late.pdf")).is_file());
     assert!(f.store.id_of(&wp("NOTE/Note/P")).unwrap().is_some());
+}
+
+#[test]
+fn a_failed_second_rename_keeps_the_intent_and_recovery_finishes_the_move() {
+    let f = Fixture::new();
+    let id = f.put("NOTE/Note/bike.note", b"bike");
+    if !case_insensitive(&f.store.fs_path(&wp("NOTE/Note"))) {
+        // A plain rename here: there is no second rename to fail.
+        return;
+    }
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    let c = f
+        .store
+        .plan_move(
+            &g,
+            &wp("NOTE/Note/bike.note"),
+            &wp("NOTE/Note/Bike.note"),
+            Origin::Device,
+            None,
+        )
+        .unwrap();
+    let err = f
+        .store
+        .commit_until(&g, c, &f.journal, Some(CrashPoint::FailSecondRename))
+        .unwrap_err();
+    assert!(err.to_string().contains("second rename"), "{err}");
+    drop(g);
+    // the entry is under the temp name, and the intent is kept for it
+    assert!(f.store.account_dir().join(PENDING_FILE).exists());
+    let names = names_in(&f, "NOTE/Note");
+    assert_eq!(names.len(), 1);
+    assert!(names[0].starts_with(".nd-move-"), "{names:?}");
+    assert!(f.types().is_empty());
+    // the next lock recovers it: the move is finished and journaled once
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    drop(g);
+    assert_eq!(names_in(&f, "NOTE/Note"), ["Bike.note"]);
+    assert_eq!(f.store.id_of(&wp("NOTE/Note/Bike.note")).unwrap(), Some(id));
+    assert_eq!(f.types(), ["file.moved"]);
+    assert!(!f.store.account_dir().join(PENDING_FILE).exists());
+}
+
+#[test]
+fn a_rename_whose_target_was_taken_or_whose_entry_vanished_is_never_journaled() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/bike.note", b"bike");
+    if !case_insensitive(&f.store.fs_path(&wp("NOTE/Note"))) {
+        return;
+    }
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    let c = f
+        .store
+        .plan_move(
+            &g,
+            &wp("NOTE/Note/bike.note"),
+            &wp("NOTE/Note/Bike.note"),
+            Origin::Device,
+            None,
+        )
+        .unwrap();
+    f.store
+        .commit_until(&g, c, &f.journal, Some(CrashPoint::FailSecondRename))
+        .unwrap_err();
+    drop(g);
+    let via = names_in(&f, "NOTE/Note").remove(0);
+    // something else takes the new name while the entry is under the temp name
+    std::fs::write(f.store.fs_path(&wp("NOTE/Note/Bike.note")), b"other").unwrap();
+    let store = Store::open(f.dir.path(), "jordi").unwrap();
+    assert!(store.lock_recovered(&f.journal).is_err());
+    assert!(f.store.account_dir().join(PENDING_FILE).exists());
+    let dir = f.store.fs_path(&wp("NOTE/Note"));
+    assert_eq!(std::fs::read(dir.join(&via)).unwrap(), b"bike");
+    assert_eq!(std::fs::read(dir.join("Bike.note")).unwrap(), b"other");
+    assert!(f.types().is_empty());
+    // neither the old nor the temp name is there any more (and nothing at the new one)
+    std::fs::remove_file(dir.join(&via)).unwrap();
+    std::fs::remove_file(dir.join("Bike.note")).unwrap();
+    assert!(store.lock_recovered(&f.journal).is_err());
+    assert!(f.store.account_dir().join(PENDING_FILE).exists());
+    assert!(f.types().is_empty());
+}
+
+#[test]
+fn the_index_lines_of_a_folder_delete_are_written_once_after_a_crash() {
+    let f = Fixture::new();
+    f.put("INBOX/P/a.pdf", b"a");
+    f.put("INBOX/P/S/b.pdf", b"b");
+    f.put("INBOX/Q/c.pdf", b"c");
+    let index_file = f.store.account_dir().join("recycle/index.jsonl");
+    let index = |f: &Fixture| {
+        let g = f.store.lock().unwrap();
+        f.store.recycle_index(&g).unwrap()
+    };
+    // a crash after the whole batch reached the disk: nothing is written twice
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    let c = f
+        .store
+        .plan_delete(&g, &wp("INBOX/P"), 7, Origin::Device, None)
+        .unwrap();
+    f.store
+        .commit_until(&g, c, &f.journal, Some(CrashPoint::BeforeClear))
+        .unwrap();
+    drop(g);
+    assert!(matches!(f.restart_and_recover(), Recovery::Repaired { .. }));
+    let paths: Vec<String> = index(&f).into_iter().map(|e| e.path).collect();
+    assert_eq!(paths, ["INBOX/P/a.pdf", "INBOX/P/S/b.pdf", "INBOX/P"]);
+    // a crash after only the first line of the batch reached the disk: the rest is added
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    let c = f
+        .store
+        .plan_delete(&g, &wp("INBOX/Q"), 9, Origin::Device, None)
+        .unwrap();
+    f.store
+        .commit_until(&g, c, &f.journal, Some(CrashPoint::BeforeClear))
+        .unwrap();
+    drop(g);
+    let text = std::fs::read_to_string(&index_file).unwrap();
+    let keep: usize = text.lines().take(4).map(|l| l.len() + 1).sum();
+    std::fs::write(&index_file, &text[..keep]).unwrap();
+    assert!(matches!(f.restart_and_recover(), Recovery::Repaired { .. }));
+    let all = index(&f);
+    let paths: Vec<&str> = all.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "INBOX/P/a.pdf",
+            "INBOX/P/S/b.pdf",
+            "INBOX/P",
+            "INBOX/Q/c.pdf",
+            "INBOX/Q"
+        ]
+    );
+    for e in &all {
+        assert!(f.store.recycle_dir().join(e.location()).exists(), "{e:?}");
+    }
+}
+
+fn names_in(f: &Fixture, folder: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(f.store.fs_path(&wp(folder)))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
 }

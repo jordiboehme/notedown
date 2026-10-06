@@ -1121,6 +1121,10 @@ pub async fn create_folder_v2(
     bytes: Bytes,
 ) -> Reply {
     let req = device_request!(state, headers, bytes);
+    // The lock first: a call without it is always E0079, whatever its body.
+    if !holds_sync_lock(&state, &req.slug, &req.serial) {
+        return no_sync_lock(&req.serial);
+    }
     let Some(text) = req
         .body
         .get("path")
@@ -1280,6 +1284,7 @@ pub async fn move_v3(
 ) -> Reply {
     let req = device_request!(state, headers, bytes);
     let t = Transfer::of(&req.body);
+    let now = state.now_ms();
     mutate(&state, &req, move |st, slug, serial| {
         let IdArg::Id(id) = t.id else {
             return Outcome::refused(E_MOVE_MISSING, MSG_MOVE_MISSING);
@@ -1303,7 +1308,14 @@ pub async fn move_v3(
             Target::Path(p) => p,
             Target::Refused(o) => return Ok(o),
         };
-        let mut c = store.plan_move(&guard, &src.path, &to, Origin::Device, Some(serial.into()))?;
+        let mut c = store.plan_move_at(
+            &guard,
+            &src.path,
+            &to,
+            now,
+            Origin::Device,
+            Some(serial.into()),
+        )?;
         crate::pages::plan_page_move(&store, &guard, &mut c);
         store.commit(&guard, c, &st.journal)?;
         let e = entry_after(&store, &guard, &to)?;

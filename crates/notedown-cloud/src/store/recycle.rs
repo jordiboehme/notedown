@@ -142,6 +142,10 @@ impl Store {
         entry: &RecycleEntry,
     ) -> Result<()> {
         self.check_guard(guard)?;
+        self.move_into_recycle(from, entry)
+    }
+
+    pub(super) fn move_into_recycle(&self, from: &Path, entry: &RecycleEntry) -> Result<()> {
         let target = self.recycle_path(entry)?;
         let dir = target.parent().unwrap_or(&self.account_dir).to_path_buf();
         self.create_dirs_durable(&dir)?;
@@ -157,6 +161,18 @@ impl Store {
     }
 
     pub(super) fn append_recycled(&self, entry: &RecycleEntry) -> Result<bool> {
+        self.append_recycled_all(std::slice::from_ref(entry))
+    }
+
+    /// Append the index lines of `entries` in one write and one fsync, idempotently: when the
+    /// index already ends with the first `k` of them (a crash after a part or all of the write
+    /// reached the disk), only the rest is written. A torn last line is cut first. Returns
+    /// whether a line was written. Lines name their slot (`deletedAt` and path), and a slot is
+    /// never reused, so an earlier line never matches by chance.
+    pub(super) fn append_recycled_all(&self, entries: &[RecycleEntry]) -> Result<bool> {
+        if entries.is_empty() {
+            return Ok(false);
+        }
         let dir = self.recycle_dir();
         self.create_dirs_durable(&dir)?;
         let path = dir.join(RECYCLE_INDEX);
@@ -168,8 +184,20 @@ impl Store {
             .truncate(false)
             .open(&path)
             .map_err(io_err(&path))?;
-        let (complete, last) = tail(&mut f).map_err(io_err(&path))?;
-        if last.as_ref() == Some(entry) {
+        let lines: Vec<String> = entries.iter().map(RecycleEntry::line).collect();
+        let window = lines.iter().map(|l| l.len() as u64).sum::<u64>() + TAIL_BYTES;
+        let (complete, last) = tail(&mut f, window, entries.len()).map_err(io_err(&path))?;
+        // The longest head of `entries` that the index ends with.
+        let done = (1..=entries.len().min(last.len()))
+            .rev()
+            .find(|&k| {
+                last[last.len() - k..]
+                    .iter()
+                    .zip(&entries[..k])
+                    .all(|(have, want)| have.as_ref() == Some(want))
+            })
+            .unwrap_or(0);
+        if done == entries.len() {
             return Ok(false);
         }
         let len = f.metadata().map_err(io_err(&path))?.len();
@@ -177,7 +205,7 @@ impl Store {
             f.set_len(complete).map_err(io_err(&path))?;
         }
         f.seek(SeekFrom::Start(complete)).map_err(io_err(&path))?;
-        f.write_all(entry.line().as_bytes())
+        f.write_all(lines[done..].concat().as_bytes())
             .and_then(|()| f.sync_data())
             .map_err(io_err(&path))?;
         if !existed {
@@ -219,22 +247,34 @@ impl Store {
     }
 }
 
-/// The length of the complete part of the index (up to and including the last newline) and
-/// its last complete line, parsed (`None` when empty or not a [`RecycleEntry`]).
-fn tail(f: &mut std::fs::File) -> std::io::Result<(u64, Option<RecycleEntry>)> {
+/// The length of the complete part of the index (up to and including the last newline) and its
+/// last complete lines (at most `count`, oldest first), each parsed (`None` when it is not a
+/// [`RecycleEntry`]). Only the last `window` bytes are read.
+fn tail(
+    f: &mut std::fs::File,
+    window: u64,
+    count: usize,
+) -> std::io::Result<(u64, Vec<Option<RecycleEntry>>)> {
     let len = f.metadata()?.len();
-    let start = len.saturating_sub(TAIL_BYTES);
+    let start = len.saturating_sub(window);
     f.seek(SeekFrom::Start(start))?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
     let Some(end) = buf.iter().rposition(|b| *b == b'\n') else {
-        // No newline at all: an empty file or a single torn line, cut it. A tail of 64 KiB
-        // without a newline in a longer file is no line of ours; leave the file as it is.
-        return Ok((if start == 0 { 0 } else { len }, None));
+        // No newline at all: an empty file or a single torn line, cut it. A window without a
+        // newline in a longer file is no line of ours; leave the file as it is.
+        return Ok((if start == 0 { 0 } else { len }, Vec::new()));
     };
     let complete = start + end as u64 + 1;
-    let body = &buf[..end];
-    let begin = body.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-    let last = serde_json::from_slice(&body[begin..]).ok();
+    let mut parts: Vec<&[u8]> = buf[..end].split(|b| *b == b'\n').collect();
+    if start > 0 {
+        // The first part may be the cut-off end of an older line.
+        parts.remove(0);
+    }
+    let skip = parts.len().saturating_sub(count);
+    let last = parts[skip..]
+        .iter()
+        .map(|l| serde_json::from_slice(l).ok())
+        .collect();
     Ok((complete, last))
 }

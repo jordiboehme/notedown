@@ -112,24 +112,31 @@ fn percent_decode_path(path: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Percent-decode, collapse repeated slashes and lowercase, so `//API//%66ile/x` cannot slip past
-/// the refusal.
+/// Percent-decode, drop `;params` of a segment, resolve `.` and `..` segments, collapse repeated
+/// slashes and lowercase, so `//API/./%66ile;v=1/x` cannot slip past the refusal.
 pub fn normalize(path: &str) -> String {
     let path = percent_decode_path(path);
-    let mut out = String::with_capacity(path.len() + 1);
-    for seg in path.split('/').filter(|s| !s.is_empty()) {
-        out.push('/');
-        out.push_str(&seg.to_ascii_lowercase());
+    let mut segs: Vec<String> = Vec::new();
+    for seg in path.split('/') {
+        let seg = seg.split(';').next().unwrap_or("");
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            s => segs.push(s.to_ascii_lowercase()),
+        }
     }
-    if out.is_empty() {
-        out.push('/');
+    if segs.is_empty() {
+        return "/".to_string();
     }
-    out
+    segs.iter().map(|s| format!("/{s}")).collect()
 }
 
-/// Whether a (normalized) path belongs to the refused families.
+/// Whether a (normalized) path belongs to the refused families: `/api/file`, `/api/oss`, and the
+/// same without `/api` (as a backend behind a proxy that strips the prefix would see them).
 pub fn is_refused_path(normalized: &str) -> bool {
-    ["/api/file", "/api/oss"]
+    ["/api/file", "/api/oss", "/file", "/oss"]
         .iter()
         .any(|p| normalized == *p || normalized.starts_with(&format!("{p}/")))
 }

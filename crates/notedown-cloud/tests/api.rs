@@ -1214,6 +1214,14 @@ async fn percent_encoded_file_path_is_refused() {
         "/api/%66ile/2/files/list_folder",
         "/api/file%2F2/files/list_folder",
         "/%61pi/oss/upload",
+        "/api/./file/2/files/list_folder",
+        "/api/x/../file/2/files/list_folder",
+        "/api/%2e/file/2/files/list_folder",
+        "/api/file;v=1/2/files/list_folder",
+        "/api;x=y/oss/upload",
+        "/file/2/files/list_folder",
+        "/FILE/2/files/synchronous/start",
+        "/oss/download",
     ] {
         let v = s.call("POST", path, &[], Some(json!({}))).await;
         assert_err(&v, "E0079");

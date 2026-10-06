@@ -940,7 +940,7 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
     runtime.block_on(async {
         let listeners = bind(&config).await?;
         let state = AppState::open(config.clone(), &args.data)?;
-        println!("notedown cloud capture server");
+        println!("notedown cloud server");
         for l in &listeners {
             println!("listening on: {}", l.local_addr()?);
         }

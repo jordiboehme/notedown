@@ -35,7 +35,10 @@ pub struct Config {
     /// Reverse proxies whose `X-Forwarded-For` header names the client address. Empty: the
     /// header is ignored and the peer address counts.
     pub trusted_proxies: Vec<IpAddr>,
-    /// Log and refuse device deletes, moves and overwrites.
+    /// Protect mode (default on). Every file request is refused (`E0079`) until
+    /// `notedown cloud import` has filled the account and set its `imported` marker. After that,
+    /// device deletes, moves and overwrites are logged and carried out, and deleted or
+    /// overwritten bytes are kept in the recycle bin.
     pub protect: bool,
     /// `"accept"` (default) exchanges files with the device. `"refuse"` answers every sync
     /// with a busy error (capture only). `notedown serve --refuse-sync` sets it for one run.

@@ -191,7 +191,10 @@ fn serve_refuse_sync_flag_counts_for_one_run_and_keeps_server_toml() {
         std::fs::read_to_string(&toml).unwrap(),
         "listen = [\"127.0.0.1:0\"]\n"
     );
+    assert!(out.starts_with("notedown cloud server\n"), "{out}");
     let out = serve_startup(dir.path(), &[]);
+    assert!(out.starts_with("notedown cloud server\n"), "{out}");
+    assert!(!out.contains("capture server"), "{out}");
     assert!(out.contains("sync mode: accept (protect: on)"), "{out}");
 }
 

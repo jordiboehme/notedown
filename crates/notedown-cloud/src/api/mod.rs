@@ -1,4 +1,4 @@
-//! HTTP routes of the capture server and the request log.
+//! HTTP routes of the cloud server and the request log.
 //!
 //! Every request passes [`log_request`], which writes exactly one protocol-log line for it.
 //! Routes: login and binding ([`login`]), server queries ([`server`]), in accept mode the sync

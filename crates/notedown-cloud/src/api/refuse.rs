@@ -1,6 +1,8 @@
-//! Safety: the capture server never lists files and never accepts a file operation. Every path
-//! under `/api/file/` (except `query/server`) and `/api/oss/` answers `E0079`, whatever the method,
-//! the body or the token. Nothing here reads or writes the data folder.
+//! Refusal of file operations: in refuse mode (`sync = "refuse"`, `--refuse-sync`) every path
+//! under `/api/file/` (except `query/server`) and `/api/oss/` answers `E0079`, whatever the
+//! method, the body or the token, so no file is listed or exchanged. In accept mode the same
+//! answer covers every file operation that is not implemented yet. Nothing here reads or writes
+//! the data folder.
 
 use axum::http::{Method, Uri};
 

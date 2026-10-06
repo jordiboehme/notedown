@@ -977,3 +977,123 @@ fn a_symlinked_files_folder_names_the_right_repair() {
     assert!(message.contains("Remove the link"), "{message}");
     assert!(message.contains("does not help"), "{message}");
 }
+
+// ---------------------------------------------------------------- a tree that vanishes
+
+/// Native folders with ids and the `imported` marker, as after an import.
+fn seed_imported(data: &Path, store: &Store) {
+    {
+        let g = store.lock().unwrap();
+        store.ensure_native_folders(&g).unwrap();
+    }
+    let accounts = Accounts::new(data);
+    let mut a = accounts.get(SLUG).unwrap().unwrap();
+    a.imported = Some(notedown_cloud::auth::Imported {
+        at: "2026-10-06T10:00:00Z".into(),
+        source: "/backup/Supernote".into(),
+        files: 0,
+        bytes: 0,
+    });
+    accounts.save(&a).unwrap();
+}
+
+fn damage_reason(r: notedown_cloud::Result<Vec<Entry>>) -> String {
+    match r {
+        Err(Error::StoreDamaged { reason, .. }) => reason,
+        Err(e) => panic!("expected StoreDamaged, got {e}"),
+        Ok(entries) => panic!("expected StoreDamaged, got a listing {:?}", paths(&entries)),
+    }
+}
+
+/// `files/` of an imported account vanishes after the lock checked it (another process removed
+/// it): the listing is an error, never empty, since an empty listing makes the device delete
+/// its files. The hash cache is kept.
+#[test]
+fn a_files_folder_that_vanishes_after_the_lock_is_no_empty_listing() {
+    let (dir, store) = setup();
+    seed_imported(dir.path(), &store);
+    put(dir.path(), "NOTE/Note/a.note", b"a");
+    {
+        let g = store.lock().unwrap();
+        assert_eq!(store.list(&g, &WirePath::root(), true).unwrap().len(), 9);
+    }
+    let before = cache_keys(dir.path());
+    let g = store.lock().unwrap();
+    std::fs::remove_dir_all(files_dir(dir.path())).unwrap();
+    for recursive in [true, false] {
+        let reason = damage_reason(store.list(&g, &WirePath::root(), recursive));
+        assert!(
+            reason.contains("is missing although the account was imported"),
+            "{reason}"
+        );
+    }
+    assert_eq!(cache_keys(dir.path()), before);
+    // A listing below the root is no way around it.
+    let reason = damage_reason(store.list(&g, &wp("/NOTE/Note"), false));
+    assert!(reason.contains("is missing"), "{reason}");
+    drop(g);
+    // The next lock answers the same, and nothing was recreated.
+    assert!(matches!(store.lock(), Err(Error::StoreDamaged { .. })));
+    assert!(!files_dir(dir.path()).exists());
+}
+
+/// A native folder that vanishes after the lock: an error with the reason of the lock check.
+#[test]
+fn a_native_folder_that_vanishes_after_the_lock_is_no_listing_without_it() {
+    let (dir, store) = setup();
+    seed_imported(dir.path(), &store);
+    put(dir.path(), "NOTE/Note/a.note", b"a");
+    let g = store.lock().unwrap();
+    std::fs::remove_dir_all(files_dir(dir.path()).join("NOTE/Note")).unwrap();
+    for (path, recursive) in [
+        ("/", true),
+        ("/", false),
+        ("/NOTE", false),
+        ("/NOTE/Note", false),
+    ] {
+        let reason = damage_reason(store.list(&g, &wp(path), recursive));
+        assert!(
+            reason.contains("the device folder NOTE/Note is missing"),
+            "{path}: {reason}"
+        );
+    }
+}
+
+/// A non-native folder that vanishes is a deletion, not damage: the listing goes on without it.
+#[test]
+fn a_vanished_user_folder_is_just_gone_from_the_listing() {
+    let (dir, store) = setup();
+    seed_imported(dir.path(), &store);
+    put(dir.path(), "NOTE/Note/Work/a.note", b"a");
+    let g = store.lock().unwrap();
+    std::fs::remove_dir_all(files_dir(dir.path()).join("NOTE/Note/Work")).unwrap();
+    let listed = store.list(&g, &WirePath::root(), true).unwrap();
+    assert!(
+        !paths(&listed).iter().any(|p| p.contains("Work")),
+        "{:?}",
+        paths(&listed)
+    );
+    assert!(
+        store
+            .list(&g, &wp("/NOTE/Note/Work"), false)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Before the import marker, and during an import, a vanished `files/` lists empty as before.
+#[test]
+fn without_the_marker_or_during_an_import_a_vanished_files_folder_lists_empty() {
+    let (dir, store) = setup();
+    let g = store.lock().unwrap();
+    std::fs::remove_dir_all(files_dir(dir.path())).unwrap();
+    assert!(store.list(&g, &WirePath::root(), true).unwrap().is_empty());
+    drop(g);
+    drop(store);
+    let store = Store::open(dir.path(), SLUG).unwrap();
+    seed_imported(dir.path(), &store);
+    let import = Store::open_for_import(dir.path(), SLUG).unwrap();
+    let g = import.lock().unwrap();
+    std::fs::remove_dir_all(files_dir(dir.path())).unwrap();
+    assert!(import.list(&g, &WirePath::root(), true).unwrap().is_empty());
+}

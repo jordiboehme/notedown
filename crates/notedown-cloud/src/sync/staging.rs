@@ -134,6 +134,15 @@ pub fn find_applied(
     Ok(best.map(|(_, p)| p))
 }
 
+/// Whether the apply record of `entry` names `device`. An entry without a readable record
+/// belongs to no device.
+pub fn applied_by(entry: &Path, device: &str) -> bool {
+    std::fs::read(entry.join(APPLY_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ApplyRecord>(&bytes).ok())
+        .is_some_and(|r| r.device == device)
+}
+
 /// A UUID in its 36-character text form (lowercase or uppercase hex), as `upload/apply`
 /// issues for `innerName`.
 pub fn valid_inner_name(s: &str) -> bool {

@@ -856,6 +856,8 @@ struct FinishArgs {
     path: String,
     file_name: String,
     inner: String,
+    /// `innerName` is the internal id (not the file name).
+    by_id: bool,
     content_hash: String,
     size: u64,
     protect: bool,
@@ -867,16 +869,28 @@ struct FinishArgs {
 fn finish_upload(state: &AppState, a: FinishArgs) -> crate::Result<Finished> {
     let cannot = |flag| Ok(Finished::Refused(Refusal::Cannot(flag)));
     let store = state.store(&a.slug)?;
+    // By internal id: the entry of that id, if this device applied for it (the entry lives
+    // below the account, so the account matches). Another device's id is an unknown upload,
+    // and its entry stays for the device that applied.
+    let by_id = if a.by_id {
+        let entry = staging::entry_dir(store.account_dir(), &a.inner)?;
+        if !staging::applied_by(&entry, &a.serial) {
+            return cannot(FLAG_UPLOAD_MISSING);
+        }
+        Some(entry)
+    } else {
+        None
+    };
     let Some((parent, target)) = upload_target(&a.path, &a.file_name) else {
-        if staging::valid_inner_name(&a.inner) {
-            staging::remove_entry(&staging::entry_dir(store.account_dir(), &a.inner)?);
+        if let Some(entry) = &by_id {
+            staging::remove_entry(entry);
         }
         return cannot(FLAG_BAD_NAME);
     };
     // `innerName` is the internal id, or the file name (then the latest apply of this device
     // for this parent and name).
-    let entry = if staging::valid_inner_name(&a.inner) {
-        staging::entry_dir(store.account_dir(), &a.inner)?
+    let entry = if let Some(entry) = by_id {
+        entry
     } else {
         match staging::find_applied(
             store.account_dir(),
@@ -983,8 +997,9 @@ fn finish_claimed(
 
 /// `POST /api/file/2/files/upload/finish` `{path (parent folder + "/"), fileName,
 /// content_hash, innerName, size (string)}`: `innerName` is the file name (the latest apply of
-/// this device for this parent folder and name) or the internal id of the upload (log flags
-/// `inner_name_file_name` / `inner_name_id`). It claims the staged data (no other request can change
+/// this device for this parent folder and name) or the internal id of an upload this device
+/// applied for (log flags `inner_name_file_name` / `inner_name_id`; equal to `fileName` is
+/// always the file name). It claims the staged data (no other request can change
 /// it afterwards), checks that the parent is the one signed at apply, verifies size and MD5
 /// (`E0324` and nothing kept on a mismatch), creates missing parent folders
 /// (`folder.created`), writes the file (`file.created`, or `file.modified` with `prevMd5` and
@@ -1009,10 +1024,12 @@ pub async fn upload_finish(
     else {
         return Refusal::Cannot(FLAG_UPLOAD_MISSING).reply(&req.serial);
     };
-    let form = if inner == file_name {
-        FLAG_INNER_NAME_FILE
-    } else {
+    // The file name route first: a file may be named like an internal id.
+    let by_id = inner != file_name;
+    let form = if by_id {
         FLAG_INNER_NAME_ID
+    } else {
+        FLAG_INNER_NAME_FILE
     };
     let (Some(content_hash), Some(size)) = (text("content_hash"), size_arg(&req.body, "size"))
     else {
@@ -1024,6 +1041,7 @@ pub async fn upload_finish(
         path: text("path").unwrap_or_default(),
         file_name,
         inner,
+        by_id,
         content_hash,
         size,
         protect: state.config.protect,

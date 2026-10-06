@@ -359,7 +359,7 @@ impl Store {
             _file: file,
             account_dir: self.account_dir.clone(),
         };
-        self.check_tree()?;
+        self.check_tree(true)?;
         let mut state = self.state();
         self.refresh_ids(&mut state, true)?;
         let hs = stamp(&self.account_dir.join(hashes::HASHES_FILE));
@@ -393,8 +393,10 @@ impl Store {
         }
     }
 
-    /// The tree check of [`Store::lock`] (the lock is held).
-    fn check_tree(&self) -> Result<()> {
+    /// The tree check of [`Store::lock`] (the lock is held). `create_missing` creates a missing
+    /// `files/` where that is allowed (no marker, or an import); [`Store::list`] checks again
+    /// after its walk without it, so a tree that vanished meanwhile is never listed as empty.
+    fn check_tree(&self, create_missing: bool) -> Result<()> {
         let imported = !self.import_mode && self.has_import_marker()?;
         match std::fs::symlink_metadata(&self.files) {
             Ok(m) if m.file_type().is_dir() => {}
@@ -419,8 +421,10 @@ impl Store {
                         self.files.display()
                     )));
                 }
-                std::fs::create_dir_all(&self.files).map_err(io_err(&self.files))?;
-                crate::fsutil::fsync_dir(&self.account_dir)?;
+                if create_missing {
+                    std::fs::create_dir_all(&self.files).map_err(io_err(&self.files))?;
+                    crate::fsutil::fsync_dir(&self.account_dir)?;
+                }
             }
             Err(e) => return Err(io_err(&self.files)(e)),
         }
@@ -656,17 +660,21 @@ impl Store {
     /// The entries below `path` (direct children, or every descendant with `recursive`), flat
     /// and sorted by path segments, so a folder's descendants follow it. Folders are entries of
     /// their own. Dot-entries and everything outside `files/` never appear. A missing path or a
-    /// file gives an empty list. Entries without an id get one here.
+    /// file gives an empty list. Entries without an id get one here. A tree that broke after
+    /// [`Store::lock`] checked it (`files/` or a native folder gone) is `Error::StoreDamaged`,
+    /// never an empty or partial list.
     pub fn list(&self, guard: &StoreGuard, path: &WirePath, recursive: bool) -> Result<Vec<Entry>> {
         self.check_guard(guard)?;
-        let Some(found) = list::resolve(&self.files, path)? else {
-            return Ok(Vec::new());
-        };
-        if found.kind != Kind::Folder {
-            return Ok(Vec::new());
-        }
         let mut all = Vec::new();
-        list::walk(&found, recursive, &mut all)?;
+        if let Some(found) = list::resolve(&self.files, path)?
+            && found.kind == Kind::Folder
+        {
+            list::walk(&found, recursive, &mut all)?;
+        }
+        // `files/` or a native folder may have vanished since the lock checked the tree
+        // (another process): an empty or partial listing would make the device delete its
+        // files, so the same check runs again before anything is listed or the cache pruned.
+        self.check_tree(false)?;
         all.sort_by(|a, b| a.path.cmp(&b.path));
         let full = path.is_root() && recursive;
         let entries = self.entries(all)?;

@@ -2358,3 +2358,82 @@ async fn by_file_name_the_latest_apply_wins_and_other_names_are_unknown() {
     let f = s.finish(&t, "/INBOX/", "u.pdf", "u.pdf", b"u").await;
     assert_ok(&f);
 }
+
+/// The internal id names an upload of one device: another device that sends it gets the answer
+/// of an unknown upload, and its bad request does not remove the staged bytes. The device that
+/// applied finishes afterwards.
+#[tokio::test]
+async fn by_internal_id_only_the_applying_device_finishes() {
+    let s = Server::new();
+    let t = s.session().await;
+    let a = s.apply(&t, "/INBOX/d.pdf", "d.pdf", 1).await;
+    assert_ok(&a);
+    s.send(a["fullUploadUrl"].as_str().unwrap(), "", "d.pdf", b"d")
+        .await;
+    let id = internal_id(&a);
+    let end = |token: String, serial: &'static str| {
+        let s = &s;
+        async move {
+            assert_ok(
+                &s.post(END, &token, json!({"equipmentNo": serial, "flag": "Y"}))
+                    .await,
+            );
+        }
+    };
+    end(t.clone(), SERIAL).await;
+    let other = s.login(OTHER).await;
+    assert_ok(&s.post(START, &other, json!({"equipmentNo": OTHER})).await);
+    let finish_as_other = |path: &'static str| {
+        s.post(
+            FINISH,
+            &other,
+            json!({"equipmentNo": OTHER, "path": path, "fileName": "d.pdf",
+                   "content_hash": md5_of(b"d"), "innerName": id, "size": "1"}),
+        )
+    };
+    let f = finish_as_other("/INBOX/").await;
+    assert_err(&f, "E0324");
+    let e = s.requests_to(FINISH).pop().unwrap();
+    assert!(e["flags"].to_string().contains("upload_missing"), "{e}");
+    assert!(e["flags"].to_string().contains("inner_name_id"), "{e}");
+    // A bad path with the id of another device removes nothing either.
+    assert_err(&finish_as_other("/../").await, "E0324");
+    assert!(!s.files().join("INBOX/d.pdf").exists());
+    assert_eq!(s.staging_entries(), vec![id.clone()]);
+    end(other.clone(), OTHER).await;
+    // The device that applied: success with the same id.
+    assert_ok(&s.post(START, &t, json!({"equipmentNo": SERIAL})).await);
+    let f = s.finish(&t, "/INBOX/", "d.pdf", &id, b"d").await;
+    assert_ok(&f);
+    assert_eq!(std::fs::read(s.files().join("INBOX/d.pdf")).unwrap(), b"d");
+    assert!(s.staging_entries().is_empty(), "{:?}", s.staging_entries());
+}
+
+/// A file whose name looks like an internal id takes the file name route when `innerName`
+/// equals `fileName`: it finds the latest apply of this device for that name.
+#[tokio::test]
+async fn a_file_named_like_an_internal_id_finishes_by_its_name() {
+    let s = Server::new();
+    let t = s.session().await;
+    let name = "0f8fad5b-d9cb-469f-a165-70867728950e";
+    assert!(staging::valid_inner_name(name));
+    let a = s.apply(&t, &format!("/INBOX/{name}"), name, 1).await;
+    assert_ok(&a);
+    assert_eq!(a["innerName"], name);
+    assert_ne!(internal_id(&a), name);
+    s.send(a["fullUploadUrl"].as_str().unwrap(), "", name, b"x")
+        .await;
+    let f = s.finish(&t, "/INBOX/", name, name, b"x").await;
+    assert_ok(&f);
+    assert_eq!(f["path_display"], format!("INBOX/{name}"));
+    let e = s.requests_to(FINISH).pop().unwrap();
+    assert!(
+        e["flags"].to_string().contains("inner_name_file_name"),
+        "{e}"
+    );
+    assert_eq!(
+        std::fs::read(s.files().join("INBOX").join(name)).unwrap(),
+        b"x"
+    );
+    assert!(s.staging_entries().is_empty(), "{:?}", s.staging_entries());
+}

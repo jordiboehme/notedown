@@ -13,7 +13,9 @@
 //! - Each file goes to `<name>.part` first (a short dot-name when that would be too long), its
 //!   size is checked against the listing, the date becomes its modification time, then it is
 //!   renamed. Three tries per file and per folder listing.
-//! - `REMOVABLE0` (the SD card) is skipped unless asked for.
+//! - The SD card is skipped unless asked for. The device lists it at the root as `REMOVABLE0`
+//!   or under the card's name with a `uri` below `/REMOVABLE0/`; with `--include-sd` it is
+//!   stored below `REMOVABLE0/` either way.
 //! - `<dir>/backup.json` is written with `"complete": false` before the first download and
 //!   again at the end with `"complete": true`, the counts per top folder, the total bytes, the
 //!   errors and the dates that did not parse. A killed run leaves `false`, and the import
@@ -55,6 +57,14 @@ pub struct BackupOptions {
     pub resume: bool,
     /// The device's offset from UTC, to read the listing dates.
     pub utc_offset: UtcOffset,
+}
+
+/// The SD card: the device lists it at the root, either as `REMOVABLE0` or under the card's own
+/// name (Jordi's Nomad, firmware 3.29.42: `name` "Extended", `uri` "/REMOVABLE0/Extended").
+fn is_sd_card(entry: &DeviceEntry) -> bool {
+    entry.name == SD_CARD
+        || entry.uri == format!("/{SD_CARD}")
+        || entry.uri.starts_with(&format!("/{SD_CARD}/"))
 }
 
 /// One entry of a device listing. Unknown fields are ignored.
@@ -349,8 +359,9 @@ impl Run<'_> {
                 self.error(format!("{shown}: {:?}", entry.name), why.to_string());
                 continue;
             }
-            if rel.is_empty() && entry.name == SD_CARD && !self.options.include_sd {
-                (self.progress)(&format!("skipped {SD_CARD} (the SD card)"));
+            let sd_card = rel.is_empty() && is_sd_card(&entry);
+            if sd_card && !self.options.include_sd {
+                (self.progress)(&format!("skipped {} (the SD card)", entry.name));
                 continue;
             }
             if rel.is_empty() && entry.name == BACKUP_FILE {
@@ -368,7 +379,14 @@ impl Run<'_> {
                 );
                 continue;
             }
-            let target = local.join(&entry.name);
+            let mut target = local.join(&entry.name);
+            if sd_card && entry.name != SD_CARD {
+                // The device lists the card at the root under its own name (for example
+                // "Extended") with a uri below /REMOVABLE0/. Keep it below REMOVABLE0 locally,
+                // so the import skips it like any SD card content.
+                target = local.join(SD_CARD).join(&entry.name);
+                here = vec![SD_CARD.to_string(), entry.name.clone()];
+            }
             if entry.is_directory {
                 if let Err(e) = std::fs::create_dir_all(&target) {
                     self.error(path, format!("cannot create the folder: {e}"));

@@ -939,6 +939,9 @@ fn device_routes() -> BTreeMap<String, Served> {
             entry("Note", "/Note", true, 0),
             entry("INBOX", "/INBOX", true, 0),
             entry("REMOVABLE0", "/REMOVABLE0", true, 0),
+            // How the Nomad (3.29.42) really lists its SD card: its own name, uri below
+            // /REMOVABLE0/.
+            entry("Extended", "/REMOVABLE0/Extended", true, 0),
         ]),
     );
     r.insert(
@@ -983,6 +986,19 @@ fn device_routes() -> BTreeMap<String, Served> {
         Served::Page(vec![entry("sd.note", "/REMOVABLE0/sd.note", false, 2)]),
     );
     r.insert("/REMOVABLE0/sd.note".into(), Served::File(b"sd".to_vec()));
+    r.insert(
+        "/REMOVABLE0/Extended".into(),
+        Served::Page(vec![entry(
+            "card.epub",
+            "/REMOVABLE0/Extended/card.epub",
+            false,
+            4,
+        )]),
+    );
+    r.insert(
+        "/REMOVABLE0/Extended/card.epub".into(),
+        Served::File(b"card".to_vec()),
+    );
     r
 }
 
@@ -1029,7 +1045,10 @@ fn backup_device_copies_byte_exact_names_and_fails_on_a_short_file() {
         .iter()
         .map(|s| s.as_bytes().to_vec())
         .collect();
-    assert_eq!(top, want, "REMOVABLE0 is skipped by default");
+    assert_eq!(
+        top, want,
+        "the SD card is skipped by default, under either name"
+    );
     let note = names(&dir.join("Note"));
     let want: BTreeSet<Vec<u8>> = [NFD_NAME, "Jordi's list.note", "Sub"]
         .iter()
@@ -1111,6 +1130,12 @@ fn backup_device_copies_byte_exact_names_and_fails_on_a_short_file() {
         std::fs::read(dir.join("REMOVABLE0/sd.note")).unwrap(),
         b"sd"
     );
+    // The card listed under its own name lands below REMOVABLE0 too, so the import skips it.
+    assert_eq!(
+        std::fs::read(dir.join("REMOVABLE0/Extended/card.epub")).unwrap(),
+        b"card"
+    );
+    assert!(!dir.join("Extended").exists());
 }
 
 #[test]

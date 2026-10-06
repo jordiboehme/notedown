@@ -307,7 +307,7 @@ POST /api/file/2/files/list_folder
 
 #### list_folder_v3
 
-`{"equipmentNo", "id", "recursive"}` -> same `entries` list for the folder with that id [ratta-server] [community:allenporter]. Whether firmware 3.29.42 calls it is [unknown]; implement it [proposal].
+`{"equipmentNo", "id", "recursive"}` -> same `entries` list for the folder with that id [ratta-server] [community:allenporter]. Firmware 3.29.42 did not call it in the first syncs; it used `2/files/list_folder` (9.2) [capture:nomad-3.29.42]. Implement it anyway [proposal].
 
 #### query/by/path_v3
 
@@ -1042,3 +1042,24 @@ Further observations:
 - No request outside the documented endpoints was seen.
 
 Still open after this session: 3 (the file listing calls, not reached because `synchronous/start` was refused), 4 to 7, 9, 11 and 13. They need a server that accepts the sync (milestone 3, with protect mode) or the Ratta test stack.
+
+### 9.2 Switchover results [capture:nomad-3.29.42]
+
+First real syncs on 2026-10-06 against notedown (protect on, after an import of a fresh Browse & Access backup of the same device):
+
+| # | Answer |
+|---|---|
+| 3 | The device lists with `POST /api/file/2/files/list_folder`, `recursive: true`, the whole tree in one call. While the user picks the sync folders it sends `path: ""` with a `version` field; during a sync it sends `path: "/"` without `version`. `list_folder_v3` was not called. |
+| 9 | Moving from Ratta's cloud works with new server ids. After the import the device compared all 56 files by path and hash, found no difference and ended the sync with `flag: "Y"`: no upload, no download, no delete. The Ratta ids in the device's sync database did no harm. |
+| 13 | Partly answered: these syncs showed no difference to the community traces. Deletes, moves, digests and to-dos are not checked yet. |
+
+Further observations:
+
+- After a login to a new private cloud account, no sync folders are selected. A manual sync then sends `synchronous/start`, gets success, and sends `synchronous/end` with `flag: "N"` about 30 ms later, without any listing. The device shows "Private Cloud Sync Failed: No folders selected to sync. Select Now". The user must select the folders after the login.
+- The refused digest and to-do calls (`E0079`) do not stop the file sync. The device shows "App Data Sync Failed" and syncs the files.
+- Sync run: `synchronous/start` -> `list_folder` -> per changed file `3/files/upload/apply` -> `POST /api/oss/upload` -> `2/files/upload/finish` -> `synchronous/end` `Y`. The device also calls `2/users/get_space_usage` (not `capacity/query`) when the folder selection opens. The digest and to-do calls run in parallel with the file sync.
+- `upload/finish` sends back exactly the `innerName` that `upload/apply` answered (the server answered the file name, as Ratta does). `path` is the parent with a trailing slash and `size` a string, as in 7.3.
+- A one-sentence edit on one page of a 1.4 MB note uploaded the whole file (no delta), as 3.1 says.
+- Browse & Access (port 8089) lists the SD card at the root under the card's own name (`"name": "Extended"`) with `"uri": "/REMOVABLE0/Extended"`, not as `REMOVABLE0`.
+
+Still open: 4 to 7, 10 and 11. They need a sync with deletes and moves on the device, digests and to-dos (milestone 5), and a token loss test.

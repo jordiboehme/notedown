@@ -169,7 +169,7 @@ Do this only after the capture session. Take your time. A wrong step can make th
    notedown cloud backup-device http://<nomad ip>:8089 ~/nomad-backup
    ```
 
-   Use a new, empty folder for this final backup. It copies every file and writes `backup.json` with the result. It skips the SD card (`REMOVABLE0`) unless you add `--include-sd`. If any file failed, run it again with `--resume` into the same folder. Use `--resume` only to finish this same backup, never on an older backup folder. With `--resume` it also removes stale `.part` files. It also lists local files that the device no longer has (in `backup.json` and on the screen). The import refuses such a backup.
+   Use a new, empty folder for this final backup. It copies every file and writes `backup.json` with the result. It skips the SD card unless you add `--include-sd`. The Nomad lists the card at the top under its own name (for example `Extended`); with `--include-sd` it is stored below `REMOVABLE0/`, and the import skips it. If any file failed, run it again with `--resume` into the same folder. Use `--resume` only to finish this same backup, never on an older backup folder. With `--resume` it also removes stale `.part` files. It also lists local files that the device no longer has (in `backup.json` and on the screen). The import refuses such a backup.
 3. **Import the backup.** First look at what would happen. Nothing is written with `--dry-run`.
 
    ```
@@ -193,9 +193,12 @@ Do this only after the capture session. Take your time. A wrong step can make th
 
    Do not add `--refuse-sync`. Leave `protect` at `true` in `server.toml`.
 5. **Log out on the Nomad** from Ratta's cloud. The device asks what to do with digests and to-dos: "Retain locally" or "Delete locally". **Always choose "Retain locally".**
-6. **Log in to the private cloud** with the address `http://<mac ip>:19072` (the `device URL:` line of the server startup shows the address), and start one manual sync.
-7. **Check the protocol log** (or send it to whoever helps you) before you do anything else. They are in `~/notedown-cloud/logs/` and `~/notedown-cloud/capture/`. Continue only if the log shows no unexpected delete.
-8. **The way back.** Log out of the private cloud, choose "Retain locally", and log in to Ratta's cloud again.
+6. **Log in to the private cloud** with the address `http://<mac ip>:19072` (the `device URL:` line of the server startup shows the address).
+7. **Select the folders to sync.** After the login to a new account, no folders are selected, and every sync ends at once with "No folders selected to sync". Tap "Select Now" and choose the same folders as before (usually Note, Document, MyStyle, EXPORT, SCREENSHOT and INBOX). Leave "Auto Sync" off for now.
+8. **Start one manual sync.** If the import was complete, the Nomad lists the files, finds nothing to change and ends the sync with success. Nothing is uploaded, downloaded or deleted.
+9. **Check the protocol log** (or send it to whoever helps you) before you do anything else. The logs are in `~/notedown-cloud/logs/` and `~/notedown-cloud/capture/`. Continue only if the log shows no unexpected delete.
+10. **Try one change.** Write a few strokes into a note and sync again. The server stores the new version, keeps the old one in `recycle/`, and the journal names the changed page. Then you can turn "Auto Sync" on.
+11. **The way back.** Log out of the private cloud, choose "Retain locally", and log in to Ratta's cloud again.
 
 What to expect:
 

@@ -62,6 +62,10 @@ fn is_b64url(b: u8) -> bool {
 
 /// The first JWT-shaped substring at or after `from`: `eyJ` and two more base64url parts
 /// separated by dots. Returns its byte range.
+///
+/// Linear in the length of the text: when a candidate fails, the scan goes on at the end of the
+/// run it has read, because every later `eyJ` inside that run ends at the same place and fails
+/// the same way (`"eyJ".repeat(n)` must not cost n scans of the rest).
 fn find_jwt(s: &str, from: usize) -> Option<(usize, usize)> {
     let b = s.as_bytes();
     let run = |mut j: usize| {
@@ -70,19 +74,33 @@ fn find_jwt(s: &str, from: usize) -> Option<(usize, usize)> {
         }
         j
     };
-    s[from..].match_indices("eyJ").find_map(|(i, _)| {
-        let start = from + i;
+    let mut pos = from;
+    while let Some(i) = s.get(pos..).and_then(|t| t.find("eyJ")) {
+        let start = pos + i;
         let end1 = run(start);
         if b.get(end1) != Some(&b'.') {
-            return None;
+            pos = end1;
+            continue;
         }
         let end2 = run(end1 + 1);
-        if end2 == end1 + 1 || b.get(end2) != Some(&b'.') {
-            return None;
+        if end2 == end1 + 1 {
+            // Empty second part: the next candidate can only start after the dot.
+            pos = end1 + 1;
+            continue;
+        }
+        if b.get(end2) != Some(&b'.') {
+            // A candidate inside the second part would end at `end2` without a dot as well.
+            pos = end2;
+            continue;
         }
         let end3 = run(end2 + 1);
-        (end3 > end2 + 1).then_some((start, end3))
-    })
+        if end3 > end2 + 1 {
+            return Some((start, end3));
+        }
+        // Empty third part: a candidate inside the second part would fail the same way.
+        pos = end2 + 1;
+    }
+    None
 }
 
 /// Whether a text holds something shaped like a JWT: `eyJ` and two more base64url parts

@@ -737,3 +737,84 @@ fn raw_body_is_cut_at_the_body_cap() {
     assert!(r.len() < MAX_BODY_BYTES + 100, "{}", r.len());
     assert!(r.contains("<cut: "), "cut note");
 }
+
+// ---- linear JWT scan, duplicate keys ----
+
+#[test]
+fn jwt_scan_is_linear_on_hostile_input() {
+    use notedown_cloud::diag::{contains_jwt, mask_jwts, mask_text};
+    use std::time::{Duration, Instant};
+    let hostile = "eyJ".repeat((1 << 20) / 3);
+    let started = Instant::now();
+    assert!(!contains_jwt(&hostile));
+    assert_eq!(mask_jwts(&hostile), hostile);
+    let _ = mask_text(&hostile);
+    let _ = mask_json(&json!({ "x": hostile }));
+    // Other near misses: many dots, empty parts.
+    let dots = "eyJa..".repeat((1 << 20) / 6);
+    assert!(!contains_jwt(&dots));
+    let empty3 = "eyJa.b.!".repeat((1 << 20) / 8);
+    assert!(!contains_jwt(&empty3));
+    let nodot = "eyJa.b!".repeat((1 << 20) / 7);
+    assert!(!contains_jwt(&nodot));
+    assert!(!contains_jwt(&empty3));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    // Results stay the same, also behind failed candidates.
+    let ph = format!("<masked:{} chars>", JWT.len());
+    assert_eq!(mask_jwts(&format!("eyJeyJ {JWT}")), format!("eyJeyJ {ph}"));
+    // Same results as the plain quadratic scan, on every short text over a small alphabet.
+    let alphabet = ['e', 'y', 'J', 'a', '.', '!'];
+    let mut texts = vec![String::new()];
+    let mut level = vec![String::new()];
+    for _ in 0..7 {
+        level = level
+            .iter()
+            .flat_map(|t| alphabet.iter().map(move |c| format!("{t}{c}")))
+            .collect();
+        texts.extend(level.iter().cloned());
+    }
+    assert_eq!(texts.len(), (0..=7).map(|n| 6usize.pow(n)).sum::<usize>());
+    for t in &texts {
+        assert_eq!(mask_jwts(t), naive_mask_jwts(t), "{t}");
+    }
+}
+
+/// The plain scan: try every `eyJ` in turn.
+fn naive_mask_jwts(s: &str) -> String {
+    let b = s.as_bytes();
+    let b64 = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'=');
+    let run = |mut j: usize| {
+        while j < b.len() && b64(b[j]) {
+            j += 1;
+        }
+        j
+    };
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut i = 0;
+    while i + 3 <= b.len() {
+        if i >= copied && &s[i..i + 3] == "eyJ" {
+            let e1 = run(i);
+            if b.get(e1) == Some(&b'.') {
+                let e2 = run(e1 + 1);
+                if e2 > e1 + 1 && b.get(e2) == Some(&b'.') {
+                    let e3 = run(e2 + 1);
+                    if e3 > e2 + 1 {
+                        out.push_str(&s[copied..i]);
+                        out.push_str(&format!("<masked:{} chars>", e3 - i));
+                        copied = e3;
+                        i = e3;
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&s[copied..]);
+    out
+}

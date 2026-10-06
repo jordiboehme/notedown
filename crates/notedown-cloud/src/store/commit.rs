@@ -118,19 +118,21 @@ pub struct Commit {
     pub side_writes: Vec<SideWrite>,
 }
 
-/// A file below the account folder that a commit writes (atomically) after its data change and
-/// before its journal append. A failed write is reported on stderr and does not fail the commit.
+/// A file below the account folder that a commit writes (atomically) or removes after its data
+/// change and before its journal append. A failure is reported on stderr and does not fail the
+/// commit.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SideWrite {
     pub path: PathBuf,
-    pub bytes: Vec<u8>,
+    /// The new content; `None` removes the file.
+    pub bytes: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for SideWrite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SideWrite")
             .field("path", &self.path)
-            .field("bytes", &self.bytes.len())
+            .field("bytes", &self.bytes.as_ref().map(Vec::len))
             .finish()
     }
 }
@@ -670,7 +672,7 @@ impl Store {
         Ok(seqs)
     }
 
-    /// Write a side file atomically; its folder is created if needed.
+    /// Write a side file atomically (its folder is created if needed), or remove it.
     fn write_side(&self, w: &SideWrite) -> Result<()> {
         if !w.path.starts_with(&self.account_dir) {
             return Err(invalid(
@@ -679,8 +681,15 @@ impl Store {
             ));
         }
         let parent = w.path.parent().unwrap_or(&self.account_dir).to_path_buf();
+        let Some(bytes) = &w.bytes else {
+            return match std::fs::remove_file(&w.path) {
+                Ok(()) => crate::fsutil::fsync_dir(&parent),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(io_err(&w.path)(e)),
+            };
+        };
         self.create_dirs_durable(&parent)?;
-        super::write_atomic_short(&w.path, &w.bytes)
+        super::write_atomic_short(&w.path, bytes)
     }
 
     /// Perform the data change durably.
@@ -863,8 +872,9 @@ impl Store {
     /// Journal the current state for a new consumer: `folder.created` and `file.created` for
     /// every listed entry (parents first), as one batch with one `opId` and `origin: "cli"`.
     /// A `.note` gets `pagesChanged` and one `page.added` per page right after its
-    /// `file.created` (or `page.index_failed`). Page records are not written. Returns the `seq`
-    /// values.
+    /// `file.created` (or `page.index_failed`), and its page record is written now, under the
+    /// same guard and before the append, so the records agree with the journal. Returns the
+    /// `seq` values.
     pub fn snapshot(&self, guard: &WriteGuard, journal: &Journal) -> Result<Vec<u64>> {
         self.check_write(guard)?;
         let entries = self.list(guard, &WirePath::root(), true)?;
@@ -879,16 +889,22 @@ impl Store {
                 }),
                 Kind::File => {
                     let kind = FileKind::of(&e.name);
-                    let (pages_changed, page_events) = if kind == FileKind::Note {
-                        crate::pages::snapshot_note(self, &e.path, e.id)
+                    let md5 = e.content_hash.clone().unwrap_or_default();
+                    let (pages_changed, page_events, record) = if kind == FileKind::Note {
+                        crate::pages::snapshot_note(self, &e.path, e.id, &md5, e.size)
                     } else {
-                        (None, Vec::new())
+                        (None, Vec::new(), None)
                     };
+                    if let Some(w) = record
+                        && let Err(err) = self.write_side(&w)
+                    {
+                        eprintln!("warning: account {}: {err}", self.slug);
+                    }
                     bodies.push(EventBody::FileCreated {
                         id: e.id,
                         kind,
                         path: e.path_display,
-                        md5: e.content_hash.unwrap_or_default(),
+                        md5,
                         size: e.size,
                         pages_changed,
                     });

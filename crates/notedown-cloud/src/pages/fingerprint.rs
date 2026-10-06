@@ -140,14 +140,10 @@ pub struct NoteFingerprint {
     pub pages: Vec<PageFingerprint>,
 }
 
-/// Parse `bytes` as a `.note` and fingerprint every page. The error is a reason for people:
-/// the parse error, or the page and block that could not be read.
-pub fn fingerprint_note(bytes: &[u8]) -> Result<NoteFingerprint, String> {
-    fingerprint_owned(bytes.to_vec())
-}
-
-/// [`fingerprint_note`] without a copy of the bytes.
-pub(crate) fn fingerprint_owned(bytes: Vec<u8>) -> Result<NoteFingerprint, String> {
+/// Parse `bytes` as a `.note` and fingerprint every page. The bytes are moved into the parser,
+/// not copied. The error is a reason for people: the parse error, or the page and block that
+/// could not be read.
+pub fn fingerprint_note(bytes: Vec<u8>) -> Result<NoteFingerprint, String> {
     // A newer firmware's signature must not stop the index: the known rules still apply.
     let nb = Notebook::from_bytes(bytes, VersionPolicy::AllowUnknown).map_err(|e| e.to_string())?;
     let mut seen: HashMap<String, usize> = HashMap::new();

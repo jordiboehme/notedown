@@ -124,7 +124,7 @@ fn pages_changed(e: &Event) -> Option<u64> {
 #[test]
 fn test1_fingerprint_hashes_the_raw_blocks() {
     let bytes = public("test1");
-    let fp = fingerprint_note(&bytes).unwrap();
+    let fp = fingerprint_note(bytes.clone()).unwrap();
     let nb = notedown_note::Notebook::from_bytes(
         bytes.clone(),
         notedown_note::VersionPolicy::AllowUnknown,
@@ -163,7 +163,7 @@ fn test1_fingerprint_hashes_the_raw_blocks() {
         );
     }
     // deterministic
-    assert_eq!(fingerprint_note(&bytes).unwrap(), fp);
+    assert_eq!(fingerprint_note(bytes.clone()).unwrap(), fp);
 }
 
 #[test]
@@ -171,7 +171,7 @@ fn bike_strokes_hash_matches_the_published_sha256() {
     let Some(bytes) = local("bike") else {
         return;
     };
-    let fp = fingerprint_note(&bytes).unwrap();
+    let fp = fingerprint_note(bytes.clone()).unwrap();
     assert_eq!(fp.pages.len(), 3);
     // docs/note-format.md 11.3: sha256 of the TOTALPATH blocks
     assert_eq!(fp.pages[0].strokes, "9ac691b048787dd6");
@@ -276,17 +276,14 @@ fn the_same_pages_give_no_change() {
 }
 
 #[test]
-fn a_reorder_gives_moved_events() {
+fn a_swap_moves_one_of_the_two_pages() {
     let old = pages_of(&[("A", "a"), ("B", "b"), ("C", "c")]);
     let new = pages_of(&[("B", "b"), ("A", "a"), ("C", "c")]);
     let d = diff(&old, &new);
-    assert_eq!(d.moved.len(), 2);
+    assert_eq!(d.moved.len(), 1);
     assert!(d.added.is_empty() && d.removed.is_empty() && d.modified.is_empty());
-    assert_eq!(
-        event_summary(&d.events(5)),
-        ["moved B 1->0", "moved A 0->1"]
-    );
-    assert_eq!(d.pages_changed(), Some(2));
+    assert_eq!(event_summary(&d.events(5)), ["moved B 1->0"]);
+    assert_eq!(d.pages_changed(), Some(1));
     for e in d.events(5) {
         match e {
             EventBody::PageMoved { id, file_id, .. } => assert_eq!((id, file_id.as_str()), (5, "")),
@@ -296,20 +293,31 @@ fn a_reorder_gives_moved_events() {
 }
 
 #[test]
-fn an_insert_gives_added_and_moves_the_pages_after_it() {
+fn an_insert_moves_nothing() {
     let old = pages_of(&[("A", "a"), ("B", "b")]);
     let new = pages_of(&[("A", "a"), ("X", "x"), ("B", "b")]);
-    let d = diff(&old, &new);
-    assert_eq!(event_summary(&d.events(1)), ["added X@1", "moved B 1->2"]);
+    assert_eq!(event_summary(&diff(&old, &new).events(1)), ["added X@1"]);
+    // also at the front
+    let new = pages_of(&[("X", "x"), ("A", "a"), ("B", "b")]);
+    assert_eq!(event_summary(&diff(&old, &new).events(1)), ["added X@0"]);
 }
 
 #[test]
-fn a_delete_gives_removed_and_moves_the_pages_after_it() {
+fn a_rotation_moves_one_page() {
+    let old = pages_of(&[("A", "a"), ("B", "b"), ("C", "c"), ("D", "d")]);
+    let new = pages_of(&[("B", "b"), ("C", "c"), ("D", "d"), ("A", "a")]);
+    assert_eq!(event_summary(&diff(&old, &new).events(1)), ["moved A 0->3"]);
+    let new = pages_of(&[("D", "d"), ("A", "a"), ("B", "b"), ("C", "c")]);
+    assert_eq!(event_summary(&diff(&old, &new).events(1)), ["moved D 3->0"]);
+}
+
+#[test]
+fn a_delete_moves_nothing() {
     let old = pages_of(&[("A", "a"), ("B", "b"), ("C", "c")]);
     let new = pages_of(&[("A", "a"), ("C", "c")]);
     let d = diff(&old, &new);
     assert_eq!(d.removed.len(), 1);
-    assert_eq!(event_summary(&d.events(1)), ["removed B", "moved C 2->1"]);
+    assert_eq!(event_summary(&d.events(1)), ["removed B"]);
 }
 
 #[test]
@@ -328,11 +336,7 @@ fn a_changed_page_lists_its_parts_with_old_and_new_hashes() {
     let d = diff(&old, &new);
     assert_eq!(
         event_summary(&d.events(1)),
-        [
-            "moved B 1->0",
-            "modified B@0 strokes,layers,textboxes",
-            "moved A 0->1"
-        ]
+        ["moved B 1->0", "modified B@0 strokes,layers,textboxes"]
     );
     let parts = &d.modified[0].parts;
     assert_eq!(
@@ -362,7 +366,7 @@ fn everything_new_or_gone() {
 fn a_new_note_journals_its_pages_right_after_the_file_event() {
     let f = Fixture::new();
     let bytes = public("test1");
-    let fp = fingerprint_note(&bytes).unwrap();
+    let fp = fingerprint_note(bytes.clone()).unwrap();
     let (d, ev) = f.put("NOTE/Note/t1.note", &bytes);
     let d = d.unwrap();
     assert!(d.failed.is_none());
@@ -475,7 +479,7 @@ fn bike_then_bike_digest_modifies_only_page_3() {
         types(&ev),
         ["file.created", "page.added", "page.added", "page.added"]
     );
-    let before = fingerprint_note(&bike).unwrap();
+    let before = fingerprint_note(bike.clone()).unwrap();
     let (d, ev) = f.put("NOTE/Note/bike.note", &digest);
     let d = d.unwrap();
     assert_eq!(types(&ev), ["file.modified", "page.modified"]);
@@ -502,7 +506,7 @@ fn bike_then_bike_digest_modifies_only_page_3() {
     assert_eq!(d.modified.len(), 1);
     // the record now holds the new state
     let rec = f.record("F20240708174639550429bHksqaP2wKQ8").unwrap();
-    assert_eq!(rec.pages, fingerprint_note(&digest).unwrap().pages);
+    assert_eq!(rec.pages, fingerprint_note(digest.clone()).unwrap().pages);
 }
 
 #[test]
@@ -510,7 +514,7 @@ fn a_truncated_note_gives_index_failed_and_keeps_the_record() {
     let f = Fixture::new();
     let bytes = public("test2");
     f.put("NOTE/Note/t2.note", &bytes);
-    let file_id = fingerprint_note(&bytes).unwrap().file_id.unwrap();
+    let file_id = fingerprint_note(bytes.clone()).unwrap().file_id.unwrap();
     let before = f.record(&file_id).unwrap();
     let truncated = &bytes[..bytes.len() / 2];
     let (d, ev) = f.put("NOTE/Note/t2.note", truncated);
@@ -561,22 +565,44 @@ fn other_files_get_no_page_events() {
 }
 
 #[test]
-fn a_different_note_at_the_same_path_is_indexed_under_its_own_file_id() {
+fn a_different_note_at_the_same_path_removes_the_old_pages() {
     let f = Fixture::new();
-    f.put("NOTE/Note/n.note", &public("test1"));
+    let t1 = public("test1");
     let t2 = public("test2");
-    let fp = fingerprint_note(&t2).unwrap();
+    let fp1 = fingerprint_note(t1.clone()).unwrap();
+    let fp2 = fingerprint_note(t2.clone()).unwrap();
+    let (id1, id2) = (fp1.file_id.clone().unwrap(), fp2.file_id.clone().unwrap());
+    f.put("NOTE/Note/n.note", &t1);
+    assert!(f.record(&id1).is_some());
     let (_, ev) = f.put("NOTE/Note/n.note", &t2);
     let mut expect = vec!["file.modified"];
-    expect.extend(std::iter::repeat_n("page.added", fp.pages.len()));
+    expect.extend(std::iter::repeat_n("page.removed", fp1.pages.len()));
+    expect.extend(std::iter::repeat_n("page.added", fp2.pages.len()));
     assert_eq!(types(&ev), expect);
+    assert_eq!(
+        pages_changed(&ev[0]),
+        Some((fp1.pages.len() + fp2.pages.len()) as u64)
+    );
+    match &ev[1].body {
+        EventBody::PageRemoved {
+            file_id, page_id, ..
+        } => assert_eq!((file_id, page_id), (&id1, &fp1.pages[0].page_id)),
+        other => panic!("{other:?}"),
+    }
+    match ev.last().map(|e| &e.body) {
+        Some(EventBody::PageAdded { file_id, .. }) => assert_eq!(file_id, &id2),
+        other => panic!("{other:?}"),
+    }
+    // the old record is dropped, the new one is in place
+    assert!(f.record(&id1).is_none());
+    assert_eq!(f.record(&id2).unwrap().path, "NOTE/Note/n.note");
 }
 
 #[test]
 fn snapshot_journals_the_pages_of_every_note() {
     let f = Fixture::new();
     let t1 = public("test1");
-    let fp = fingerprint_note(&t1).unwrap();
+    let fp = fingerprint_note(t1.clone()).unwrap();
     f.put("NOTE/Note/t1.note", &t1);
     f.put("NOTE/Note/bad.note", b"not a note");
     f.put("INBOX/a.pdf", b"pdf");
@@ -621,7 +647,7 @@ fn a_crash_before_the_append_leaves_no_record_and_the_next_write_rediffs() {
     use notedown_cloud::store::CrashPoint;
     let f = Fixture::new();
     let bytes = public("test1");
-    let file_id = fingerprint_note(&bytes).unwrap().file_id.unwrap();
+    let file_id = fingerprint_note(bytes.clone()).unwrap().file_id.unwrap();
     {
         let g = f.store.lock_recovered(&f.journal).unwrap();
         let staged = f.stage(&bytes);
@@ -648,9 +674,320 @@ fn a_crash_before_the_append_leaves_no_record_and_the_next_write_rediffs() {
     assert_eq!(ev[0].body.type_name(), "file.created");
     assert!(ev[1..].iter().all(|e| e.body.type_name() == "page.added"));
     assert!(ev.iter().all(|e| e.origin == Origin::Repair));
-    // the record is missing: harmless, the next write of the note diffs against nothing
+    // the record is missing: harmless, the next write diffs against the file on disk
     let (_, ev) = f.put("NOTE/Note/t1.note", &test1_with_a_stale_block_changed());
-    assert_eq!(ev[0].body.type_name(), "file.modified");
-    assert!(ev[1..].iter().all(|e| e.body.type_name() == "page.added"));
+    assert_eq!(types(&ev), ["file.modified"]);
+    assert_eq!(pages_changed(&ev[0]), Some(0));
     assert!(f.record(&file_id).is_some());
+}
+
+// ---------------------------------------------------------------- fix round 1
+
+const FID: &str = "F20261006120000000000abcdefABCDEF";
+
+fn block(data: &mut Vec<u8>, payload: &[u8]) -> u32 {
+    let at = data.len() as u32;
+    data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    data.extend_from_slice(payload);
+    at
+}
+
+/// A minimal note (docs/note-format.md 1 to 4): a header with `FILE_ID` (or none) and one page
+/// block per `(PAGEID, PAGESTYLE)`. The style is the part a test changes (`template`).
+fn synthetic(file_id: Option<&str>, pages: &[(Option<&str>, &str)]) -> Vec<u8> {
+    let mut d = b"noteSN_FILE_VER_20230015".to_vec();
+    let header = match file_id {
+        Some(id) => format!("<FILE_ID:{id}><APPLY_EQUIPMENT:N6>"),
+        None => "<APPLY_EQUIPMENT:N6>".to_string(),
+    };
+    let h = block(&mut d, header.as_bytes());
+    let mut footer = format!("<FILE_FEATURE:{h}>");
+    for (n, (id, style)) in pages.iter().enumerate() {
+        let meta = match id {
+            Some(id) => format!("<PAGEID:{id}><PAGESTYLE:{style}>"),
+            None => format!("<PAGESTYLE:{style}>"),
+        };
+        let at = block(&mut d, meta.as_bytes());
+        footer.push_str(&format!("<PAGE{}:{at}>", n + 1));
+    }
+    let f = block(&mut d, footer.as_bytes());
+    d.extend_from_slice(b"tail");
+    d.extend_from_slice(&f.to_le_bytes());
+    d
+}
+
+/// Three pages A, B, C with the given styles.
+fn abc(file_id: Option<&str>, styles: [&str; 3]) -> Vec<u8> {
+    synthetic(
+        file_id,
+        &[
+            (Some("PA"), styles[0]),
+            (Some("PB"), styles[1]),
+            (Some("PC"), styles[2]),
+        ],
+    )
+}
+
+fn md5_hex(bytes: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    const_hex::encode(Md5::digest(bytes))
+}
+
+fn path_key_file(path: &str) -> String {
+    format!("path-{}", md5_hex(path.as_bytes()))
+}
+
+impl Fixture {
+    /// A put without the indexer: the record is not touched.
+    fn put_raw(&self, path: &str, bytes: &[u8]) {
+        let g = self.store.lock_recovered(&self.journal).unwrap();
+        let staged = self.stage(bytes);
+        let c = self
+            .store
+            .plan_put(&g, &wp(path), &staged, Origin::Cli, None)
+            .unwrap();
+        self.store.commit(&g, c, &self.journal).unwrap();
+    }
+
+    fn since(&self, before: u64) -> Vec<Event> {
+        self.journal
+            .read_from(before + 1)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect()
+    }
+
+    fn copy(&self, from: &str, to: &str) -> (Option<PageDiff>, Vec<Event>) {
+        let before = self.journal.last_seq().unwrap();
+        let g = self.store.lock_recovered(&self.journal).unwrap();
+        let mut c = self
+            .store
+            .plan_copy(&g, &wp(from), &wp(to), Origin::Device, None)
+            .unwrap();
+        let d = pages::plan_page_events(&self.store, &g, &mut c);
+        self.store.commit(&g, c, &self.journal).unwrap();
+        (d, self.since(before))
+    }
+
+    fn mv(&self, from: &str, to: &str) -> Vec<Event> {
+        let before = self.journal.last_seq().unwrap();
+        let g = self.store.lock_recovered(&self.journal).unwrap();
+        let mut c = self
+            .store
+            .plan_move(&g, &wp(from), &wp(to), Origin::Device, None)
+            .unwrap();
+        pages::plan_page_move(&self.store, &g, &mut c);
+        assert!(pages::plan_page_events(&self.store, &g, &mut c).is_none());
+        self.store.commit(&g, c, &self.journal).unwrap();
+        self.since(before)
+    }
+
+    fn mkdir(&self, path: &str) {
+        let g = self.store.lock_recovered(&self.journal).unwrap();
+        let c = self
+            .store
+            .plan_create_folder(&g, &wp(path), Origin::Cli, None)
+            .unwrap();
+        self.store.commit(&g, c, &self.journal).unwrap();
+    }
+
+    fn record_path(&self, file_name: &str) -> PathBuf {
+        self.store
+            .account_dir()
+            .join(PAGES_DIR)
+            .join(format!("{file_name}.json"))
+    }
+}
+
+fn summary(events: &[Event]) -> Vec<String> {
+    let bodies: Vec<EventBody> = events.iter().map(|e| e.body.clone()).collect();
+    event_summary(&bodies)
+}
+
+#[test]
+fn snapshot_writes_the_records_so_the_next_edit_is_exact() {
+    let f = Fixture::new();
+    f.put_raw("NOTE/Note/n.note", &abc(Some(FID), ["s", "s", "s"]));
+    assert!(f.record(FID).is_none());
+    {
+        let g = f.store.lock_recovered(&f.journal).unwrap();
+        f.store.snapshot(&g, &f.journal).unwrap();
+    }
+    let rec = f.record(FID).unwrap();
+    assert_eq!(rec.path, "NOTE/Note/n.note");
+    let v1 = abc(Some(FID), ["s", "s", "s"]);
+    assert_eq!(
+        (rec.size, rec.md5.as_str()),
+        (v1.len() as u64, md5_hex(&v1).as_str())
+    );
+    let (_, ev) = f.put("NOTE/Note/n.note", &abc(Some(FID), ["s", "t", "s"]));
+    assert_eq!(types(&ev), ["file.modified", "page.modified"]);
+    assert_eq!(summary(&ev[1..]), ["modified PB@1 template"]);
+}
+
+#[test]
+fn a_stale_record_gives_only_the_real_change() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/n.note", &abc(Some(FID), ["s", "s", "s"]));
+    // a write the indexer did not see (a crash, an older server): the record is stale
+    f.put_raw("NOTE/Note/n.note", &abc(Some(FID), ["t", "s", "s"]));
+    let (_, ev) = f.put("NOTE/Note/n.note", &abc(Some(FID), ["t", "s", "u"]));
+    assert_eq!(summary(&ev[1..]), ["modified PC@2 template"]);
+    assert_eq!(pages_changed(&ev[0]), Some(1));
+    // healed
+    let v3 = abc(Some(FID), ["t", "s", "u"]);
+    assert_eq!(f.record(FID).unwrap().md5, md5_hex(&v3));
+}
+
+#[test]
+fn a_note_placed_before_the_indexer_ran_gives_only_the_real_change() {
+    let f = Fixture::new();
+    f.put_raw("NOTE/Note/n.note", &abc(Some(FID), ["s", "s", "s"]));
+    let (_, ev) = f.put("NOTE/Note/n.note", &abc(Some(FID), ["s", "s", "t"]));
+    assert_eq!(summary(&ev[1..]), ["modified PC@2 template"]);
+}
+
+#[test]
+fn a_corrupt_record_counts_as_missing() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/n.note", &abc(Some(FID), ["s", "s", "s"]));
+    std::fs::write(f.record_path(FID), b"{not json").unwrap();
+    // a warning on stderr; the baseline comes from the file on disk
+    let (_, ev) = f.put("NOTE/Note/n.note", &abc(Some(FID), ["t", "s", "s"]));
+    assert_eq!(summary(&ev[1..]), ["modified PA@0 template"]);
+    assert_eq!(f.record(FID).unwrap().pages.len(), 3);
+}
+
+#[test]
+fn a_copy_is_keyed_by_its_path() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/a.note", &abc(Some(FID), ["s", "s", "s"]));
+    let (d, ev) = f.copy("NOTE/Note/a.note", "NOTE/Note/b.note");
+    let key = format!("path:{}", md5_hex(b"NOTE/Note/b.note"));
+    assert_eq!(d.unwrap().file_id, key);
+    assert_eq!(
+        types(&ev),
+        ["file.copied", "page.added", "page.added", "page.added"]
+    );
+    assert!(
+        ev[1..]
+            .iter()
+            .all(|e| matches!(&e.body, EventBody::PageAdded { file_id, .. } if *file_id == key))
+    );
+    let copy = f.record(&path_key_file("NOTE/Note/b.note")).unwrap();
+    assert_eq!(copy.file_id, key);
+    assert_eq!(copy.note_id.as_deref(), Some(FID));
+    assert_eq!(copy.path, "NOTE/Note/b.note");
+    assert_eq!(f.record(FID).unwrap().path, "NOTE/Note/a.note");
+
+    // an edit of the copy diffs against the copy, the original's record stays
+    let (_, ev) = f.put("NOTE/Note/b.note", &abc(Some(FID), ["s", "t", "s"]));
+    assert_eq!(summary(&ev[1..]), ["modified PB@1 template"]);
+    assert!(matches!(&ev[1].body, EventBody::PageModified { file_id, .. } if *file_id == key));
+    assert_eq!(f.record(FID).unwrap().path, "NOTE/Note/a.note");
+    // and an edit of the original against the original
+    let (_, ev) = f.put("NOTE/Note/a.note", &abc(Some(FID), ["s", "s", "u"]));
+    assert_eq!(summary(&ev[1..]), ["modified PC@2 template"]);
+    assert!(matches!(&ev[1].body, EventBody::PageModified { file_id, .. } if file_id == FID));
+}
+
+#[test]
+fn a_move_carries_the_record_along() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/a.note", &abc(Some(FID), ["s", "s", "s"]));
+    let ev = f.mv("NOTE/Note/a.note", "NOTE/Note/c.note");
+    assert_eq!(types(&ev), ["file.moved"]);
+    assert_eq!(f.record(FID).unwrap().path, "NOTE/Note/c.note");
+
+    // a folder move takes its notes along; a record keyed by path is re-keyed
+    f.mkdir("NOTE/Note/D");
+    f.put("NOTE/Note/D/x.note", &abc(None, ["s", "s", "s"]));
+    assert!(f.record(&path_key_file("NOTE/Note/D/x.note")).is_some());
+    f.mv("NOTE/Note/D", "NOTE/Note/E");
+    assert!(f.record(&path_key_file("NOTE/Note/D/x.note")).is_none());
+    let rec = f.record(&path_key_file("NOTE/Note/E/x.note")).unwrap();
+    assert_eq!(rec.path, "NOTE/Note/E/x.note");
+    assert_eq!(
+        rec.file_id,
+        format!("path:{}", md5_hex(b"NOTE/Note/E/x.note"))
+    );
+    let (_, ev) = f.put("NOTE/Note/E/x.note", &abc(None, ["s", "t", "s"]));
+    assert_eq!(summary(&ev[1..]), ["modified PB@1 template"]);
+}
+
+#[test]
+fn a_note_without_a_valid_file_id_is_keyed_by_its_path() {
+    let f = Fixture::new();
+    for (path, id) in [
+        ("NOTE/Note/none.note", None),
+        ("NOTE/Note/bad.note", Some("G123")),
+    ] {
+        let (_, ev) = f.put(path, &abc(id, ["s", "s", "s"]));
+        let key = format!("path:{}", md5_hex(path.as_bytes()));
+        assert_eq!(types(&ev)[1..], ["page.added"; 3]);
+        assert!(
+            ev[1..].iter().all(
+                |e| matches!(&e.body, EventBody::PageAdded { file_id, .. } if *file_id == key)
+            )
+        );
+        let rec = f.record(&path_key_file(path)).unwrap();
+        assert_eq!((rec.file_id, rec.note_id), (key, None));
+        let (_, ev) = f.put(path, &abc(id, ["s", "s", "t"]));
+        assert_eq!(summary(&ev[1..]), ["modified PC@2 template"]);
+    }
+}
+
+#[test]
+fn duplicate_and_missing_page_ids_get_stable_ids() {
+    let bytes = synthetic(
+        Some(FID),
+        &[
+            (None, "s"),
+            (Some("P1"), "s"),
+            (Some("P1"), "s"),
+            (None, "s"),
+        ],
+    );
+    let fp = fingerprint_note(bytes.clone()).unwrap();
+    let ids: Vec<&str> = fp.pages.iter().map(|p| p.page_id.as_str()).collect();
+    assert_eq!(ids, ["position:0", "P1", "P1#2", "position:3"]);
+    let f = Fixture::new();
+    f.put("NOTE/Note/n.note", &bytes);
+    let (_, ev) = f.put(
+        "NOTE/Note/n.note",
+        &synthetic(
+            Some(FID),
+            &[
+                (None, "s"),
+                (Some("P1"), "s"),
+                (Some("P1"), "t"),
+                (None, "s"),
+            ],
+        ),
+    );
+    assert_eq!(summary(&ev[1..]), ["modified P1#2@2 template"]);
+}
+
+#[test]
+fn index_note_compares_with_the_file_there_and_writes_nothing() {
+    let f = Fixture::new();
+    let v1 = abc(Some(FID), ["s", "s", "s"]);
+    f.put("NOTE/Note/n.note", &v1);
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    let v2 = abc(Some(FID), ["s", "s", "t"]);
+    let d = pages::index_note(&f.store, &g, &wp("NOTE/Note/n.note"), v2.clone());
+    assert_eq!(d.file_id, FID);
+    assert_eq!(d.modified.len(), 1);
+    assert_eq!(d.pages_changed(), Some(1));
+    let rec = d.record.unwrap();
+    assert_eq!(rec.md5, md5_hex(&v2));
+    // nothing written
+    assert_eq!(f.record(FID).unwrap().md5, md5_hex(&v1));
+    // a new path: every page is added
+    let d = pages::index_note(&f.store, &g, &wp("NOTE/Note/m.note"), v2);
+    assert_eq!(d.added.len(), 3);
+    assert!(d.removed.is_empty());
+    // not a note
+    let d = pages::index_note(&f.store, &g, &wp("NOTE/Note/m.note"), b"x".to_vec());
+    assert!(d.failed.is_some());
 }

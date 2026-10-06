@@ -1,0 +1,168 @@
+//! One socket session: the handshake, the heartbeat answers and the frame log.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::extract::ws::{CloseFrame, Message, WebSocket, close_code};
+use rand::RngExt;
+use serde_json::Value;
+
+use super::eio::{self, Action};
+use crate::diag::{LogEntry, LogKind};
+use crate::server::AppState;
+
+/// Flag of a frame that is neither a known Engine.IO packet nor a known event.
+pub const FLAG_UNKNOWN_EVENT: &str = "unknown_event";
+
+/// A session without any frame from the device for this long is closed (a device that went to
+/// sleep leaves a half-open connection behind). Far above every heartbeat interval: the capture
+/// must see the device's own heartbeat style, so the Engine.IO ping timeout is not enforced.
+pub const IDLE_LIMIT: Duration = Duration::from_secs(10 * 60);
+
+const SID_LEN: usize = 20;
+const SID_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+/// A new random Engine.IO session id.
+pub fn new_sid() -> String {
+    let mut rng = rand::rng();
+    (0..SID_LEN)
+        .map(|_| SID_ALPHABET[rng.random_range(0..SID_ALPHABET.len())] as char)
+        .collect()
+}
+
+/// The result of the token check, decided before the upgrade.
+pub enum Access {
+    Granted,
+    /// Bad, stale or missing token: the reason goes to the device in the `403` message.
+    Denied(&'static str),
+}
+
+/// Who is on the other end, for the frame log.
+pub struct Session {
+    pub state: Arc<AppState>,
+    pub sid: String,
+    pub device: Option<String>,
+    pub path: String,
+}
+
+impl Session {
+    fn log(&self, direction: &str, payload: Value, flags: &[&str]) {
+        let mut e = LogEntry::new(LogKind::Frame);
+        e.device = self.device.clone();
+        e.path = Some(self.path.clone());
+        e.direction = Some(direction.to_string());
+        if direction == "in" {
+            e.request_body = Some(payload);
+        } else {
+            e.response_body = Some(payload);
+        }
+        e.flags = flags.iter().map(|f| f.to_string()).collect();
+        self.state.log.record(e);
+    }
+
+    /// Log, then send. `false` when the connection is gone.
+    async fn send(&self, ws: &mut WebSocket, frame: String) -> bool {
+        self.log("out", Value::String(frame.clone()), &[]);
+        ws.send(Message::text(frame)).await.is_ok()
+    }
+
+    async fn close(&self, ws: &mut WebSocket, code: u16, reason: &'static str) {
+        self.log(
+            "out",
+            Value::String(format!("<close {code} {reason}>")),
+            &[],
+        );
+        let _ = ws
+            .send(Message::Close(Some(CloseFrame {
+                code,
+                reason: reason.into(),
+            })))
+            .await;
+    }
+}
+
+/// Run one session until the device or the server ends it.
+pub async fn run(mut ws: WebSocket, session: Session, access: Access) {
+    // Server speaks first: open packet, then the connect packet (4.2).
+    if !session.send(&mut ws, eio::open_packet(&session.sid)).await
+        || !session.send(&mut ws, eio::CONNECT.to_string()).await
+    {
+        return;
+    }
+    if let Access::Denied(reason) = access {
+        if session.send(&mut ws, eio::rejection(reason)).await
+            && session.send(&mut ws, eio::DISCONNECT.to_string()).await
+        {
+            session
+                .close(&mut ws, close_code::POLICY, "forbidden")
+                .await;
+        }
+        return;
+    }
+    loop {
+        let msg = match tokio::time::timeout(IDLE_LIMIT, ws.recv()).await {
+            Err(_) => {
+                session.close(&mut ws, close_code::AWAY, "idle").await;
+                return;
+            }
+            Ok(None | Some(Err(_))) => return,
+            Ok(Some(Ok(msg))) => msg,
+        };
+        match msg {
+            Message::Text(text) => {
+                let text = text.as_str();
+                let action = eio::answer(text);
+                let flags: &[&str] = if action == Action::Unknown {
+                    &[FLAG_UNKNOWN_EVENT]
+                } else {
+                    &[]
+                };
+                session.log("in", Value::String(text.to_string()), flags);
+                match action {
+                    Action::Answer(frame) => {
+                        if !session.send(&mut ws, frame).await {
+                            return;
+                        }
+                    }
+                    Action::Close => {
+                        session.close(&mut ws, close_code::NORMAL, "bye").await;
+                        return;
+                    }
+                    Action::Nothing | Action::Unknown => {}
+                }
+            }
+            Message::Binary(bytes) => {
+                // Engine.IO 3 binary data only follows a binary event, which the device does not
+                // send (4.6).
+                session.log(
+                    "in",
+                    Value::String(format!("<{} bytes binary>", bytes.len())),
+                    &[FLAG_UNKNOWN_EVENT],
+                );
+            }
+            Message::Ping(bytes) => {
+                // The WebSocket layer answers with a pong itself.
+                session.log(
+                    "in",
+                    Value::String(format!("<websocket ping, {} bytes>", bytes.len())),
+                    &[],
+                );
+            }
+            Message::Pong(bytes) => {
+                session.log(
+                    "in",
+                    Value::String(format!("<websocket pong, {} bytes>", bytes.len())),
+                    &[],
+                );
+            }
+            Message::Close(frame) => {
+                let text = match frame {
+                    Some(f) => format!("<close {} {}>", f.code, f.reason.as_str()),
+                    None => "<close>".to_string(),
+                };
+                session.log("in", Value::String(text), &[]);
+                return;
+            }
+        }
+    }
+}

@@ -2,7 +2,8 @@
 //!
 //! Every request passes [`log_request`], which writes exactly one protocol-log line for it.
 //! Routes: login and binding ([`login`]), server queries ([`server`]), the refusal of every file
-//! operation ([`refuse`]) and the catch-all ([`catchall`]).
+//! operation ([`refuse`]), the socket handshake ([`crate::socket`]) and the catch-all
+//! ([`catchall`]).
 
 pub mod catchall;
 pub mod envelope;
@@ -50,6 +51,7 @@ const IMPLEMENTED: &[(&str, &str)] = &[
     ("GET", "/api/file/query/server"),
     ("POST", "/api/file/query/server"),
     ("POST", "/api/official/system/base/param"),
+    ("GET", crate::socket::PATH),
 ];
 
 fn is_implemented(method: &axum::http::Method, path: &str) -> bool {
@@ -92,6 +94,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(server::query_server).post(server::query_server),
         )
         .route("/api/official/system/base/param", post(server::base_param))
+        // The auto-sync socket: the handshake passes the request log like any request.
+        .route(crate::socket::PATH, get(crate::socket::upgrade))
         // Safety: every other file, digest, task, oss, recycle, share and convert path.
         .route("/api/file/{*rest}", any(refuse::refuse))
         .route("/api/oss/{*rest}", any(refuse::refuse))

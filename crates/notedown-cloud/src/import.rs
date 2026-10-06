@@ -360,7 +360,7 @@ fn walk(
 }
 
 /// The `backup.json` of `backup-device` must say `"complete": true` and carry an empty
-/// `errors` array. Without a report (a copy made another way, for example over USB) the import
+/// `errors` array and no `stale` entries (a missing `stale` counts as empty). Without a report (a copy made another way, for example over USB) the import
 /// needs `no_report`.
 fn check_backup_report(backup: &Path, no_report: bool, scan: &mut Scan) {
     let path = backup.join(BACKUP_FILE);
@@ -398,6 +398,16 @@ fn check_backup_report(backup: &Path, no_report: bool, scan: &mut Scan) {
             "{BACKUP_FILE}: the backup run did not finish (\"complete\" is not true); run it \
              again with --resume"
         )),
+    }
+    // A resumed backup with files the device no longer lists would give them back.
+    if let Some(stale) = report.get("stale").and_then(|v| v.as_array()) {
+        for path in stale {
+            scan.errors.push(format!(
+                "{BACKUP_FILE} lists a file the device no longer has: {}. Make a fresh backup \
+                 into a new, empty folder",
+                path.as_str().unwrap_or("")
+            ));
+        }
     }
     match report["errors"].as_array() {
         None => scan

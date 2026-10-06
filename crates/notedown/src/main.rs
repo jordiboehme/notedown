@@ -752,6 +752,16 @@ fn backup_device_command(args: BackupDeviceArgs) -> Result<ExitCode> {
         );
     }
     let report_file = args.dir.join(notedown_cloud::import::BACKUP_FILE);
+    if !report.stale.is_empty() {
+        eprintln!(
+            "{} the device no longer lists (deleted or renamed since the earlier run), see {}. \
+             The import refuses this backup. Make the final backup a fresh run into a new, \
+             empty folder.",
+            plural(report.stale.len(), "local file"),
+            report_file.display()
+        );
+        return Ok(ExitCode::from(1));
+    }
     if report.errors.is_empty() {
         println!(
             "backed up {} ({}) from {} into {}",

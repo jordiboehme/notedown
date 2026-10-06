@@ -1357,3 +1357,79 @@ async fn bind_journals_the_native_folders_and_the_import_adds_none() {
         assert_eq!(n, 1, "{native}: {after:?}");
     }
 }
+
+#[test]
+fn a_resumed_backup_reports_local_files_the_device_no_longer_lists() {
+    let url = fake_device(device_routes());
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("nomad");
+    let opts = BackupOptions {
+        include_sd: false,
+        resume: false,
+        utc_offset: UtcOffset::from_hms(2, 0, 0).unwrap(),
+    };
+    let first = device_backup::backup(&url, &dir, &opts, &mut quiet()).unwrap();
+    assert!(first.stale.is_empty());
+    // Deleted or renamed on the device since the first run.
+    write(&dir.join("Note/Deleted.note"), b"old");
+    write(&dir.join("Note/Old/x.note"), b"old");
+    std::fs::create_dir_all(dir.join("Note/Empty")).unwrap();
+    write(&dir.join("Note/.DS_Store"), b"junk");
+    let mut lines = Vec::new();
+    let resumed = device_backup::backup(
+        &url,
+        &dir,
+        &BackupOptions {
+            resume: true,
+            ..opts
+        },
+        &mut |l: &str| lines.push(l.to_string()),
+    )
+    .unwrap();
+    assert_eq!(
+        resumed.stale,
+        ["Note/Deleted.note", "Note/Empty/", "Note/Old/x.note"]
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("stale: Note/Deleted.note")),
+        "{lines:?}"
+    );
+    let json: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("backup.json")).unwrap()).unwrap();
+    assert_eq!(
+        json["stale"],
+        json!(["Note/Deleted.note", "Note/Empty/", "Note/Old/x.note"])
+    );
+    // the files are left in place; the report says what to do
+    assert!(dir.join("Note/Deleted.note").is_file());
+}
+
+#[test]
+fn the_import_refuses_a_report_with_stale_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (backup, _, _) = backup_tree(tmp.path());
+    let report = backup.join("backup.json");
+    let mut json: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    // a report without the field (an older run) is fine
+    assert!(json.get("stale").is_none());
+    json["stale"] = json!(["Note/Deleted.note"]);
+    std::fs::write(&report, json.to_string()).unwrap();
+    let data = data_with_account();
+    let err = run_import(data.path(), &backup, false).unwrap_err();
+    assert!(err.to_string().contains("Note/Deleted.note"), "{err}");
+    assert!(err.to_string().contains("fresh backup"), "{err}");
+    assert!(
+        Accounts::new(data.path())
+            .get("jordi")
+            .unwrap()
+            .unwrap()
+            .imported
+            .is_none()
+    );
+    // an empty list is fine
+    json["stale"] = json!([]);
+    std::fs::write(&report, json.to_string()).unwrap();
+    run_import(data.path(), &backup, false).unwrap();
+}

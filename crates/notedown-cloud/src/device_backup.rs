@@ -18,7 +18,11 @@
 //!   again at the end with `"complete": true`, the counts per top folder, the total bytes, the
 //!   errors and the dates that did not parse. A killed run leaves `false`, and the import
 //!   refuses it.
-//! - `resume` keeps a file only when its size and its date both match the listing.
+//! - `resume` keeps a file only when its size and its date both match the listing. At the end
+//!   it reports every local file the device no longer lists (deleted or renamed on the device
+//!   since the earlier run) in the `stale` list of `backup.json` and on the progress lines. The
+//!   import refuses such a backup, because it would give the device those files back: the
+//!   final backup before a switch is a fresh run into an empty folder.
 //! - Timeouts: 10 s to connect, and 60 s for the answer headers and for each read of the body
 //!   (reqwest's blocking `timeout` applies per send and per read, not to the whole transfer).
 //!   So a stalled download fails within a minute, and a large slow one that keeps moving does
@@ -105,6 +109,10 @@ pub struct BackupReport {
     pub date_warnings: u64,
     /// One entry per date warning.
     pub warnings: Vec<BackupError>,
+    /// `resume`: local files (paths from the device root) that the device no longer lists. A
+    /// stale folder without files is listed with a trailing `/`. The import refuses a report
+    /// with entries here.
+    pub stale: Vec<String>,
     /// Files kept from an earlier run (`resume`).
     #[serde(skip)]
     pub skipped_existing: u64,
@@ -249,6 +257,7 @@ pub fn backup(
             errors: Vec::new(),
             date_warnings: 0,
             warnings: Vec::new(),
+            stale: Vec::new(),
             skipped_existing: 0,
         },
         progress,
@@ -330,6 +339,7 @@ impl Run<'_> {
         let siblings: HashSet<String> = list.iter().map(|e| e.name.clone()).collect();
         if self.options.resume {
             self.remove_stale_parts(local, &siblings, &shown);
+            self.report_stale(local, &siblings, rel);
         }
         for entry in list {
             let mut here = rel.to_vec();
@@ -385,6 +395,62 @@ impl Run<'_> {
                     Err(e) => self.error(path, e),
                 }
             }
+        }
+    }
+
+    /// `resume`: report every local entry of `local` that the device listing does not name: a
+    /// file by its path, a folder by every file inside it (or by itself with a trailing `/`
+    /// when it holds none). `backup.json` at the top and host junk (`.DS_Store`, `._*`) are no
+    /// device files.
+    fn report_stale(&mut self, local: &Path, siblings: &HashSet<String>, rel: &[String]) {
+        let Ok(entries) = std::fs::read_dir(local) else {
+            return;
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !siblings.contains(n))
+            .filter(|n| !(rel.is_empty() && n == BACKUP_FILE))
+            .filter(|n| !crate::import::is_host_junk(n))
+            .collect();
+        names.sort();
+        for name in names {
+            let mut here = rel.to_vec();
+            here.push(name.clone());
+            self.stale_entry(&local.join(&name), &here);
+        }
+    }
+
+    fn stale_entry(&mut self, path: &Path, rel: &[String]) {
+        let shown = rel.join("/");
+        let is_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+        if !is_dir {
+            (self.progress)(&format!(
+                "stale: {shown}: the device no longer lists this file"
+            ));
+            self.report.stale.push(shown);
+            return;
+        }
+        let before = self.report.stale.len();
+        let mut names: Vec<String> = std::fs::read_dir(path)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| !crate::import::is_host_junk(n))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        for name in names {
+            let mut here = rel.to_vec();
+            here.push(name.clone());
+            self.stale_entry(&path.join(&name), &here);
+        }
+        if self.report.stale.len() == before {
+            (self.progress)(&format!(
+                "stale: {shown}/: the device no longer lists this folder"
+            ));
+            self.report.stale.push(format!("{shown}/"));
         }
     }
 

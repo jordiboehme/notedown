@@ -940,3 +940,22 @@ fn moved_and_removed_carry_the_hash_rows() {
     store.removed(&g, f).unwrap();
     assert_eq!(cache_keys(dir.path()), ["A/w.txt"]);
 }
+
+#[test]
+fn the_name_probe_finds_a_normalization_preserving_file_system_and_cleans_up() {
+    // The test folder is on the developer's APFS (or another preserving file system).
+    let dir = tempfile::tempdir().unwrap();
+    assert!(notedown_cloud::store::probe_names_preserved(dir.path()));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    let (dir, store) = setup();
+    assert!(store.names_preserved());
+    let leftovers: Vec<_> = std::fs::read_dir(store.account_dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".nd-probe"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    drop(dir);
+    // The warning names the requirement.
+    assert!(store.names_warning().contains("APFS"));
+}

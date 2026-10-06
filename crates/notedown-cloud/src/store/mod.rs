@@ -211,8 +211,9 @@ const PROBE_NFC_NAME: &str = "\u{e9}";
 
 /// Create a file with an NFC name in `dir` and check that the folder lists it with exactly
 /// these bytes. The file is removed again. An error of the probe itself counts as preserved
-/// (nothing is known); only a changed name is a finding.
-fn probe_names_preserved(dir: &Path) -> bool {
+/// (nothing is known); only a changed name is a finding. Public for tests.
+#[doc(hidden)]
+pub fn probe_names_preserved(dir: &Path) -> bool {
     let name = format!(
         ".nd-probe-{}-{}-{PROBE_NFC_NAME}.tmp",
         std::process::id(),

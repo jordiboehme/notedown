@@ -50,6 +50,10 @@ pub struct AppState {
     file_max: AtomicU64,
 }
 
+/// Marker flag: the file system of the data folder changes the Unicode normalization of file
+/// names (the probe of `Store::open`), so lookups by the device's names can fail.
+pub const FLAG_NAMES_NOT_PRESERVED: &str = "names_not_preserved";
+
 /// How long a computed `usedCapacity` is reused (ms).
 pub const USAGE_CACHE_MS: u64 = 60_000;
 
@@ -136,6 +140,13 @@ impl AppState {
         // Opened without the map lock: `Store::open` waits for the account's store lock (a CLI
         // import may hold it), and other accounts must not wait behind that.
         let store = Arc::new(Store::open(&self.data_dir, slug)?);
+        if !store.names_preserved() {
+            // `Store::open` warned on stderr; the protocol log gets a marker too.
+            let mut m = LogEntry::new(LogKind::Marker);
+            m.flags = vec![FLAG_NAMES_NOT_PRESERVED.to_string()];
+            m.message = Some(store.names_warning());
+            self.log.record(m);
+        }
         Ok(stores().entry(slug.to_string()).or_insert(store).clone())
     }
 

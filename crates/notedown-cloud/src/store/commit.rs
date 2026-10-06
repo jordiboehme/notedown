@@ -118,8 +118,8 @@ pub struct Commit {
     pub side_writes: Vec<SideWrite>,
 }
 
-/// A file below the account folder that a commit writes (atomically) or removes after its data
-/// change and before its journal append. A failure is reported on stderr and does not fail the
+/// A file directly inside `<account>/pages/` that a commit writes (atomically) or removes after
+/// its data change and before its journal append; any other path is refused. A failure is reported on stderr and does not fail the
 /// commit.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SideWrite {
@@ -672,12 +672,26 @@ impl Store {
         Ok(seqs)
     }
 
-    /// Write a side file atomically (its folder is created if needed), or remove it.
+    /// Write a side file atomically (its folder is created if needed), or remove it. Only a
+    /// file directly inside `<account>/pages/` is accepted: the path must be the account folder
+    /// followed by exactly `pages` and one plain name (no `..`, `.`, root or prefix part).
     fn write_side(&self, w: &SideWrite) -> Result<()> {
-        if !w.path.starts_with(&self.account_dir) {
+        use std::path::Component;
+        let confined = w.path.strip_prefix(&self.account_dir).is_ok_and(|rel| {
+            let parts: Vec<Component<'_>> = rel.components().collect();
+            matches!(
+                parts.as_slice(),
+                [Component::Normal(dir), Component::Normal(_)] if *dir == crate::pages::PAGES_DIR
+            )
+        });
+        if !confined {
             return Err(invalid(
                 "side file",
-                format!("{} is outside the account", w.path.display()),
+                format!(
+                    "{} is not a file directly inside {}",
+                    w.path.display(),
+                    self.account_dir.join(crate::pages::PAGES_DIR).display()
+                ),
             ));
         }
         let parent = w.path.parent().unwrap_or(&self.account_dir).to_path_buf();

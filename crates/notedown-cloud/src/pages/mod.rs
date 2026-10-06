@@ -345,18 +345,46 @@ pub fn note_key(file_id: Option<&str>, path: &WirePath) -> String {
 }
 
 /// The record file of `key`: `pages/<FILE_ID>.json` or `pages/path-<md5>.json`.
-fn record_path(store: &Store, key: &str) -> PathBuf {
+/// `None` for anything but a valid key ([`valid_key`]), so no record path is ever built from
+/// other text.
+fn record_path(store: &Store, key: &str) -> Option<PathBuf> {
+    if !valid_key(key) {
+        return None;
+    }
     let name = match key.strip_prefix("path:") {
         Some(md5) => format!("path-{md5}.json"),
         None => format!("{key}.json"),
     };
-    store.account_dir().join(PAGES_DIR).join(name)
+    Some(store.account_dir().join(PAGES_DIR).join(name))
 }
 
-/// The stored record of `key`. A missing record is `None`; so is an unreadable one (it is
-/// replaced by the next write), with a warning.
+/// True for a key this module makes: a valid `FILE_ID` ([`valid_file_id`]) or `path:` followed
+/// by 32 lowercase hex digits ([`path_key`]).
+pub fn valid_key(key: &str) -> bool {
+    match key.strip_prefix("path:") {
+        Some(md5) => {
+            md5.len() == 32
+                && md5
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+        None => valid_file_id(Some(key)).is_some(),
+    }
+}
+
+/// The side write that stores `record` under its key, or removes the record of `key`.
+fn record_write(store: &Store, key: &str, bytes: Option<Vec<u8>>) -> Option<SideWrite> {
+    Some(SideWrite {
+        path: record_path(store, key)?,
+        bytes,
+    })
+}
+
+/// The stored record of `key`. A missing record is `None`; so is an unreadable one, and one
+/// whose `fileId` is not `key` or whose `noteId` is not a valid `FILE_ID` (it is replaced by the
+/// next write), with a warning. Record content never names a file.
 pub fn read_record(store: &Store, key: &str) -> Option<PageRecord> {
-    let path = record_path(store, key);
+    let path = record_path(store, key)?;
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -365,8 +393,20 @@ pub fn read_record(store: &Store, key: &str) -> Option<PageRecord> {
             return None;
         }
     };
-    match serde_json::from_slice(&bytes) {
-        Ok(r) => Some(r),
+    match serde_json::from_slice::<PageRecord>(&bytes) {
+        Ok(r)
+            if r.file_id == key && r.note_id.iter().all(|id| valid_file_id(Some(id)).is_some()) =>
+        {
+            Some(r)
+        }
+        Ok(_) => {
+            eprintln!(
+                "warning: {} has a fileId or noteId that does not match its name; the note is \
+                 indexed anew",
+                path.display()
+            );
+            None
+        }
         Err(e) => {
             eprintln!(
                 "warning: {} is not a page record ({e}); the note is indexed anew",
@@ -642,16 +682,13 @@ pub fn plan_page_events_with_limit(
     commit.events.extend(events);
     commit.events.extend(tail);
     for key in &diff.drop_records {
-        commit.side_writes.push(SideWrite {
-            path: record_path(store, key),
-            bytes: None,
-        });
+        commit.side_writes.extend(record_write(store, key, None));
     }
     if let Some(record) = &diff.record {
-        commit.side_writes.push(SideWrite {
-            path: record_path(store, &record.file_id),
-            bytes: Some(crate::fsutil::json_bytes(record)),
-        });
+        let bytes = crate::fsutil::json_bytes(record);
+        commit
+            .side_writes
+            .extend(record_write(store, &record.file_id, Some(bytes)));
     }
     Some(diff)
 }
@@ -688,41 +725,47 @@ pub fn plan_page_move(store: &Store, _guard: &WriteGuard, commit: &mut Commit) {
             }
         }
     }
+    if notes.is_empty() {
+        return;
+    }
+    // One pass over the records, instead of parsing every moved note for its FILE_ID.
+    let by_path = records_by_path(store);
     let mut writes = Vec::new();
     for (old, new) in notes {
-        let note_id = std::fs::read(store.fs_path(&old))
-            .ok()
-            .filter(|b| b.len() as u64 <= MAX_NOTE_BYTES)
-            .and_then(|b| {
-                notedown_note::Notebook::from_bytes(b, notedown_note::VersionPolicy::AllowUnknown)
-                    .ok()
-            })
-            .and_then(|nb| valid_file_id(nb.file_id.as_deref()));
-        let mut keys = Vec::new();
-        keys.extend(note_id);
-        keys.push(path_key(&old));
-        for key in keys {
-            let Some(mut r) = read_record(store, &key) else {
-                continue;
-            };
-            if r.path != old.display() {
-                continue;
-            }
+        for (key, mut r) in by_path.get(&old.display()).cloned().unwrap_or_default() {
             r.path = new.display();
             if key.starts_with("path:") {
-                writes.push(SideWrite {
-                    path: record_path(store, &key),
-                    bytes: None,
-                });
+                writes.extend(record_write(store, &key, None));
                 r.file_id = path_key(&new);
             }
-            writes.push(SideWrite {
-                path: record_path(store, &r.file_id),
-                bytes: Some(crate::fsutil::json_bytes(&r)),
-            });
+            // `r.file_id` is `key` (checked by read_record) or the new path key
+            let bytes = crate::fsutil::json_bytes(&r);
+            writes.extend(record_write(store, &r.file_id, Some(bytes)));
         }
     }
     commit.side_writes.extend(writes);
+}
+
+/// Every valid record in `pages/` by its `path`, with its key.
+fn records_by_path(store: &Store) -> HashMap<String, Vec<(String, PageRecord)>> {
+    let mut out: HashMap<String, Vec<(String, PageRecord)>> = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(store.account_dir().join(PAGES_DIR)) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(stem) = name.strip_suffix(".json") else {
+            continue;
+        };
+        let key = match stem.strip_prefix("path-") {
+            Some(md5) => format!("path:{md5}"),
+            None => stem.to_string(),
+        };
+        if let Some(r) = read_record(store, &key) {
+            out.entry(r.path.clone()).or_default().push((key, r));
+        }
+    }
+    out
 }
 
 /// Relative paths (`a/b.note`) of the `.note` files below `dir`; dot-files are skipped.
@@ -779,11 +822,8 @@ pub(crate) fn snapshot_note(
                 md5: md5.to_string(),
                 pages: note.pages,
             };
-            let write = SideWrite {
-                path: record_path(store, &key),
-                bytes: Some(crate::fsutil::json_bytes(&record)),
-            };
-            (Some(events.len() as u64), events, Some(write))
+            let write = record_write(store, &key, Some(crate::fsutil::json_bytes(&record)));
+            (Some(events.len() as u64), events, write)
         }
         Err(reason) => (
             None,

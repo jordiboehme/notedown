@@ -991,3 +991,150 @@ fn index_note_compares_with_the_file_there_and_writes_nothing() {
     let d = pages::index_note(&f.store, &g, &wp("NOTE/Note/m.note"), b"x".to_vec());
     assert!(d.failed.is_some());
 }
+
+// ---------------------------------------------------------------- fix round 2
+
+/// Every file below the data folder outside `pages/`, with its content.
+fn files_outside_pages(f: &Fixture) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(dir: &std::path::Path, pages: &std::path::Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p == pages {
+                continue;
+            }
+            if p.is_dir() {
+                walk(&p, pages, out);
+            } else {
+                out.insert(p.clone(), std::fs::read(&p).unwrap_or_default());
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(&f.data, &f.store.account_dir().join(PAGES_DIR), &mut out);
+    out
+}
+
+/// Replace the record of `FID` with one whose `fileId` or `noteId` is a path.
+fn poison_record(f: &Fixture, path: &str, field: &str, value: &str) {
+    let p = f.record_path(FID);
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+    v[field] = serde_json::Value::String(value.into());
+    v["path"] = serde_json::Value::String(path.into());
+    std::fs::write(&p, serde_json::to_vec(&v).unwrap()).unwrap();
+}
+
+#[test]
+fn record_content_never_names_a_file() {
+    for (field, value) in [
+        ("fileId", "../../evil"),
+        ("noteId", "../x"),
+        ("fileId", "path:../../x"),
+    ] {
+        let f = Fixture::new();
+        // sentinels where a path built from the record would land
+        let accounts = f.store.account_dir().parent().unwrap().to_path_buf();
+        std::fs::write(accounts.join("evil.json"), b"keep").unwrap();
+        std::fs::write(f.store.account_dir().join("x.json"), b"keep").unwrap();
+
+        f.put("NOTE/Note/a.note", &abc(Some(FID), ["s", "s", "s"]));
+        poison_record(&f, "NOTE/Note/a.note", field, value);
+        let mut outside = files_outside_pages(&f);
+
+        // the poisoned record counts as missing: the move carries nothing
+        f.mv("NOTE/Note/a.note", "NOTE/Note/c.note");
+        // a put heals from the file on disk: only the real change
+        let (_, ev) = f.put("NOTE/Note/c.note", &abc(Some(FID), ["s", "t", "s"]));
+        assert_eq!(summary(&ev[1..]), ["modified PB@1 template"], "{field}");
+        poison_record(&f, "NOTE/Note/c.note", field, value);
+        // a replace by another note
+        let (_, ev) = f.put(
+            "NOTE/Note/c.note",
+            &abc(Some("F20261006120000000000zzzzzzZZZZZZ"), ["s", "s", "s"]),
+        );
+        assert_eq!(types(&ev)[1..4], ["page.removed"; 3], "{field}");
+
+        // nothing outside pages/ changed except the moved and written note itself
+        let after = files_outside_pages(&f);
+        assert_eq!(after.get(&accounts.join("evil.json")).unwrap(), b"keep");
+        assert_eq!(
+            after.get(&f.store.account_dir().join("x.json")).unwrap(),
+            b"keep"
+        );
+        let moved = f.store.fs_path(&wp("NOTE/Note/a.note"));
+        let target = f.store.fs_path(&wp("NOTE/Note/c.note"));
+        outside.remove(&moved);
+        let new_paths: Vec<&PathBuf> = after
+            .keys()
+            .filter(|p| !outside.contains_key(*p) && **p != target)
+            .filter(|p| !p.starts_with(f.data.join("journal")))
+            .filter(|p| {
+                let n = p.file_name().unwrap().to_string_lossy();
+                !(n.starts_with("ids") || n == "hashes.json")
+            })
+            .collect();
+        assert!(new_paths.is_empty(), "{field}: {new_paths:?}");
+    }
+}
+
+#[test]
+fn a_side_write_outside_pages_is_refused() {
+    use notedown_cloud::store::SideWrite;
+    let f = Fixture::new();
+    let acct = f.store.account_dir().to_path_buf();
+    std::fs::write(acct.join("keep.txt"), b"keep").unwrap();
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    let staged = f.stage(b"pdf");
+    let mut c = f
+        .store
+        .plan_put(&g, &wp("INBOX/a.pdf"), &staged, Origin::Cli, None)
+        .unwrap();
+    let bad = [
+        acct.join("pages/../../evil.json"),
+        acct.join("pages/../keep.txt"),
+        acct.join("keep.txt"),
+        acct.join("pages/sub/x.json"),
+        acct.join("pages"),
+        acct.join("../jordi/pages/x.json"),
+    ];
+    for p in &bad {
+        c.side_writes.push(SideWrite {
+            path: p.clone(),
+            bytes: Some(b"bad".to_vec()),
+        });
+        c.side_writes.push(SideWrite {
+            path: p.clone(),
+            bytes: None,
+        });
+    }
+    c.side_writes.push(SideWrite {
+        path: acct.join("pages/ok.json"),
+        bytes: Some(b"ok".to_vec()),
+    });
+    // a refused side write never fails the commit
+    f.store.commit(&g, c, &f.journal).unwrap();
+    assert_eq!(std::fs::read(acct.join("keep.txt")).unwrap(), b"keep");
+    assert!(!acct.parent().unwrap().join("evil.json").exists());
+    assert!(!acct.join("pages/sub").exists());
+    assert_eq!(std::fs::read(acct.join("pages/ok.json")).unwrap(), b"ok");
+    assert_eq!(
+        std::fs::read(f.store.fs_path(&wp("INBOX/a.pdf"))).unwrap(),
+        b"pdf"
+    );
+}
+
+#[test]
+fn keys_are_valid_file_ids_or_path_keys() {
+    assert!(pages::valid_key(FID));
+    assert!(pages::valid_key(&format!("path:{}", md5_hex(b"x"))));
+    for bad in [
+        "",
+        "../x",
+        "path:../../x",
+        "path:ABCDEF0123456789ABCDEF0123456789",
+        "path:0123",
+        "G1",
+        "F",
+    ] {
+        assert!(!pages::valid_key(bad), "{bad:?}");
+    }
+}

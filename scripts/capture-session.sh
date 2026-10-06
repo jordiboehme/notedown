@@ -7,7 +7,10 @@ if [ $# -ne 1 ]; then
   echo "usage: scripts/capture-session.sh <data dir>" >&2
   exit 2
 fi
-data="$1"
+case "$1" in
+  /*) data="$1" ;;
+  *) data="$PWD/$1" ;;
+esac
 root="$(cd "$(dirname "$0")/.." && pwd)"
 bin="$root/target/release/notedown"
 cd "$root"
@@ -15,6 +18,10 @@ cd "$root"
 if ! command -v cargo >/dev/null 2>&1; then
   tc="$HOME/.rustup/toolchains/1.99.0-aarch64-apple-darwin/bin"
   export PATH="$tc:$PATH"
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "cargo not found, install Rust 1.99.0 with rustup" >&2
+  exit 1
 fi
 
 stale() {
@@ -28,7 +35,10 @@ if stale; then
   cargo build --release -p notedown
 fi
 
-accounts="$("$bin" cloud account --data "$data" list)"
+accounts=""
+if [ -d "$data/accounts" ]; then
+  accounts="$("$bin" cloud account --data "$data" list)"
+fi
 if [ -z "$accounts" ]; then
   echo "No account in $data yet. In $root run:" >&2
   echo "" >&2

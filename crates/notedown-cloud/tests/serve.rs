@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use notedown_cloud::Config;
+use notedown_cloud::auth::{Accounts, expected_login_hash, md5_hex};
 use notedown_cloud::server::{AppState, bind, serve_until};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -60,18 +61,59 @@ async fn serve_answers_file_query_server_and_stops_on_signal() {
     handle.await.unwrap().unwrap();
 }
 
+fn json_body(reply: &str) -> serde_json::Value {
+    let (a, b) = (reply.find('{').unwrap(), reply.rfind('}').unwrap());
+    serde_json::from_str(&reply[a..=b]).unwrap()
+}
+
+#[tokio::test]
+async fn file_endpoints_answer_e0079_through_serve() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _state, tx, handle) = start(false, dir.path()).await;
+    for path in [
+        "/api/file/2/files/synchronous/start",
+        "/api/oss/upload/part",
+    ] {
+        let reply = http(addr, "POST", path, "{}").await;
+        assert_eq!(json_body(&reply)["errorCode"], "E0079", "{path}: {reply}");
+    }
+    tx.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn capture_writes_masked_dumps() {
     let dir = tempfile::tempdir().unwrap();
+    Accounts::new(dir.path())
+        .create("jordi", "a@b.c", "hunter2-very-secret")
+        .unwrap();
     let (addr, state, tx, handle) = start(true, dir.path()).await;
-    let body = r#"{"account":"a@b.c","password":"hunter2-very-secret","equipmentNo":"SN1"}"#;
-    http(
+    let code_reply = http(
+        addr,
+        "POST",
+        "/api/official/user/query/random/code",
+        r#"{"account":"a@b.c"}"#,
+    )
+    .await;
+    let ch = json_body(&code_reply);
+    let hash = expected_login_hash(
+        &md5_hex("hunter2-very-secret"),
+        ch["randomCode"].as_str().unwrap(),
+    );
+    let body = serde_json::json!({
+        "account": "a@b.c", "password": hash, "equipmentNo": "SN1",
+        "timestamp": ch["timestamp"]
+    })
+    .to_string();
+    let login = http(
         addr,
         "POST",
         "/api/official/user/account/login/equipment",
-        body,
+        &body,
     )
     .await;
+    let login = json_body(&login);
+    let token = login["token"].as_str().expect("login succeeds").to_string();
     tx.send(()).unwrap();
     handle.await.unwrap().unwrap();
     assert_eq!(state.log.capture_failures(), 0);
@@ -82,10 +124,19 @@ async fn capture_writes_masked_dumps() {
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
     names.sort();
-    assert!(!names.is_empty());
-    assert!(names[0].ends_with("-1.json"), "{names:?}");
-    let text = std::fs::read_to_string(cap.join(&names[0])).unwrap();
-    assert!(!text.contains("hunter2"), "{text}");
-    assert!(text.contains("<masked:"), "{text}");
-    assert!(text.contains("\n  \"kind\""), "{text}");
+    assert!(names.len() >= 2, "{names:?}");
+    assert!(names[0].ends_with("-000001.json"), "{names:?}");
+    let mut saw_login = false;
+    for name in &names {
+        let text = std::fs::read_to_string(cap.join(name)).unwrap();
+        assert!(!text.contains("hunter2"), "{name}: {text}");
+        assert!(!text.contains(&hash), "{name}: {text}");
+        assert!(!text.contains(&token), "{name}: {text}");
+        assert!(text.contains("\n  \"kind\""), "{text}");
+        if text.contains("login/equipment") {
+            saw_login = true;
+            assert!(text.contains("\"token\": \"<masked:"), "{text}");
+        }
+    }
+    assert!(saw_login);
 }

@@ -58,8 +58,14 @@ impl Capture {
     /// Write one already sanitized entry. Never fails the caller: a failure is counted and
     /// reported on stderr.
     pub(super) fn write(&self, entry: &LogEntry, now: OffsetDateTime) {
-        let n = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
-        let path = self.dir.join(format!("{}-{n}.json", stamp(now)));
+        // Never overwrite a dump of an earlier run: take the next free number.
+        let path = loop {
+            let n = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
+            let path = self.dir.join(format!("{}-{n:06}.json", stamp(now)));
+            if !path.exists() {
+                break path;
+            }
+        };
         if let Err(e) = write_atomic(&path, &json_bytes(entry), false) {
             self.failed.fetch_add(1, Ordering::Relaxed);
             let _ = writeln!(std::io::stderr(), "capture: {e}");
@@ -81,13 +87,29 @@ mod tests {
         e.path = Some("/x".into());
         c.write(&e, t);
         c.write(&e, t);
-        let name = format!("{}-1.json", stamp(t));
+        let name = format!("{}-000001.json", stamp(t));
         assert!(name.starts_with("2026"), "{name}");
         let text = std::fs::read_to_string(c.dir().join(&name)).unwrap();
         assert!(text.contains("\n  \"path\": \"/x\""), "{text}");
         assert!(text.ends_with("}\n"));
-        assert!(c.dir().join(format!("{}-2.json", stamp(t))).exists());
+        assert!(c.dir().join(format!("{}-000002.json", stamp(t))).exists());
         assert_eq!(c.failed(), 0);
+    }
+
+    #[test]
+    fn an_existing_file_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = OffsetDateTime::from_unix_timestamp(1_791_300_612).unwrap();
+        let old = dir
+            .path()
+            .join("capture")
+            .join(format!("{}-000001.json", stamp(t)));
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, "old").unwrap();
+        let c = Capture::open(dir.path()).unwrap();
+        c.write(&LogEntry::new(LogKind::Request), t);
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "old");
+        assert!(c.dir().join(format!("{}-000002.json", stamp(t))).exists());
     }
 
     #[test]

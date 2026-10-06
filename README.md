@@ -139,12 +139,12 @@ Follow these steps in this order.
    scripts/capture-session.sh ~/notedown-cloud
    ```
 
-   macOS may ask if notedown may accept incoming connections. Allow it. The Mac and the Nomad must be on the same network.
+   You can start the script from any folder. macOS may ask if notedown may accept incoming connections. Allow it. The Mac and the Nomad must be on the same network.
 4. **Find the IP address of the Mac.** The startup output shows one or more lines like `device URL: http://192.168.1.20:19072`. Use the address of your home network.
 5. **Log in on the Nomad.** Log out of Ratta's cloud only now, after the backup is complete. Then use the Private Cloud login on the device. Enter the address `http://<mac ip>:19072` and the email and the password from step 2.
 6. **Leave it idle for 10 minutes.** Then try one manual sync on the device. It will say that the sync is busy. This is expected. The server refuses the sync on purpose.
 7. **Stop the server.** Press Ctrl-C in the terminal. Then log back in to Ratta's cloud on the Nomad.
-8. **The logs.** Everything the device sent is in `~/notedown-cloud/logs/` (one file per day) and, in capture mode, in `~/notedown-cloud/capture/`. They hold no passwords and no tokens. Those values are replaced by `<masked:N chars>` before anything is written. Please keep these folders. They are the result of the session.
+8. **The logs.** Everything the device sent is in `~/notedown-cloud/logs/` (one file per day) and, in capture mode, in `~/notedown-cloud/capture/`. Passwords, login codes and tokens are masked in the logs. They are replaced by `<masked:N chars>` before anything is written. Please keep these folders. They are the result of the session.
 
 ## Format documentation and tests
 

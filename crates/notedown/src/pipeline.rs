@@ -3,12 +3,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use notedown_note::{Notebook, RenderOptions, VersionPolicy, encode_png};
+use notedown_note::{Notebook, RenderOptions, TextBox, VersionPolicy, encode_png};
 use notedown_ocr::convert::{LayoutBlock, html_to_markdown};
 use notedown_ocr::{OcrEngine, PageOcr};
 use sha2::{Digest, Sha256};
 
-use crate::document::{Frontmatter, PageOut, render_document};
+use crate::document::{Frontmatter, FrontmatterDigest, PageOut, render_document};
 use crate::inputs::{Input, InputKind};
 use crate::links::{FileIndex, LinkContext, apply as apply_links, encode_url};
 
@@ -35,6 +35,10 @@ pub trait PageSource {
     /// The PNG the OCR engine sees (and `--images` writes).
     fn png(&self, i: usize) -> Result<Vec<u8>>;
     fn page_id(&self, i: usize) -> Option<String>;
+    /// The text boxes of the page; none by default.
+    fn text_boxes(&self, _i: usize) -> Result<Vec<TextBox>> {
+        Ok(Vec::new())
+    }
 }
 
 struct NoteSource<'a> {
@@ -60,6 +64,56 @@ impl PageSource for NoteSource<'_> {
     fn page_id(&self, i: usize) -> Option<String> {
         self.notebook.page(i).and_then(|p| p.id.clone())
     }
+    fn text_boxes(&self, i: usize) -> Result<Vec<TextBox>> {
+        Ok(self.notebook.text_boxes(i)?)
+    }
+}
+
+/// The text boxes of every page, and the frontmatter entries for those with a digest.
+/// A page whose text boxes cannot be read gets a warning (through `warn`) and no entries.
+pub fn collect_text_boxes(
+    source: &dyn PageSource,
+    warn: &mut dyn FnMut(String),
+) -> (Vec<Vec<TextBox>>, Vec<FrontmatterDigest>) {
+    let mut per_page = Vec::new();
+    let mut digests = Vec::new();
+    for i in 0..source.pages() {
+        let boxes = match source.text_boxes(i) {
+            Ok(b) => b,
+            Err(e) => {
+                warn(format!(
+                    "page {}: cannot read the text boxes, no digests listed: {e:#}",
+                    i + 1
+                ));
+                Vec::new()
+            }
+        };
+        for b in &boxes {
+            if let Some(d) = &b.digest {
+                digests.push(FrontmatterDigest {
+                    page: i + 1,
+                    digest_id: d.id.clone(),
+                    text: b.text.clone(),
+                    rect: b.rect,
+                });
+            }
+        }
+        per_page.push(boxes);
+    }
+    (per_page, digests)
+}
+
+/// The debug JSON of a text box: every field, the embedded strokes as a count.
+fn text_box_json(b: &TextBox) -> serde_json::Value {
+    let mut v = serde_json::to_value(b).unwrap_or_default();
+    if let Some(o) = v.as_object_mut() {
+        o.remove("source_strokes");
+        o.insert(
+            "source_stroke_count".into(),
+            serde_json::json!(b.source_strokes.len()),
+        );
+    }
+    v
 }
 
 struct PngSource {
@@ -284,58 +338,73 @@ pub fn convert_one(
     let assets_name = format!("{stem}.assets");
     let dir = output.parent().unwrap_or_else(|| Path::new("."));
 
-    let (kind, file_id, keywords, notebook, results, fm_links) = match input.kind {
-        InputKind::Note => {
-            let policy = if opts.allow_unknown_version {
-                VersionPolicy::AllowUnknown
-            } else {
-                VersionPolicy::Strict
-            };
-            let nb = Notebook::from_bytes(bytes, policy)
-                .with_context(|| format!("cannot read {}", input.source.display()))?;
-            let src = NoteSource {
-                notebook: &nb,
-                keep_template: opts.keep_template,
-            };
-            let mut results = process_pages(&src, engine, opts.images, &assets_name)?;
-            let page_ids: Vec<Option<String>> = nb.pages.iter().map(|p| p.id.clone()).collect();
-            let fm_links = apply_links(
-                &nb.links,
-                &mut results,
-                &LinkContext {
-                    index,
-                    from_md: output,
-                    page_ids: &page_ids,
-                    width: nb.width,
-                    height: nb.height,
-                },
-            );
-            let keywords = nb
-                .keywords
-                .iter()
-                .filter_map(|k| {
-                    let text = k.text.as_deref()?.trim();
-                    (!text.is_empty()).then(|| format!("p{}: {text}", k.page + 1))
-                })
-                .collect::<Vec<_>>();
-            (
-                "supernote-note",
-                nb.file_id.clone(),
-                keywords,
-                Some(nb),
-                results,
-                fm_links,
-            )
-        }
-        InputKind::Png => {
-            let src = PngSource {
-                png: load_png_page(&bytes)
-                    .with_context(|| format!("cannot read {}", input.source.display()))?,
-            };
-            let results = process_pages(&src, engine, opts.images, &assets_name)?;
-            ("png", None, Vec::new(), None, results, Vec::new())
-        }
-    };
+    let (kind, file_id, keywords, notebook, results, fm_links, text_boxes, digests) =
+        match input.kind {
+            InputKind::Note => {
+                let policy = if opts.allow_unknown_version {
+                    VersionPolicy::AllowUnknown
+                } else {
+                    VersionPolicy::Strict
+                };
+                let nb = Notebook::from_bytes(bytes, policy)
+                    .with_context(|| format!("cannot read {}", input.source.display()))?;
+                let src = NoteSource {
+                    notebook: &nb,
+                    keep_template: opts.keep_template,
+                };
+                let mut results = process_pages(&src, engine, opts.images, &assets_name)?;
+                let page_ids: Vec<Option<String>> = nb.pages.iter().map(|p| p.id.clone()).collect();
+                let fm_links = apply_links(
+                    &nb.links,
+                    &mut results,
+                    &LinkContext {
+                        index,
+                        from_md: output,
+                        page_ids: &page_ids,
+                        width: nb.width,
+                        height: nb.height,
+                    },
+                );
+                let (text_boxes, digests) = collect_text_boxes(&src, &mut |w| {
+                    eprintln!("warning: {}: {w}", input.rel.display())
+                });
+                let keywords = nb
+                    .keywords
+                    .iter()
+                    .filter_map(|k| {
+                        let text = k.text.as_deref()?.trim();
+                        (!text.is_empty()).then(|| format!("p{}: {text}", k.page + 1))
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    "supernote-note",
+                    nb.file_id.clone(),
+                    keywords,
+                    Some(nb),
+                    results,
+                    fm_links,
+                    text_boxes,
+                    digests,
+                )
+            }
+            InputKind::Png => {
+                let src = PngSource {
+                    png: load_png_page(&bytes)
+                        .with_context(|| format!("cannot read {}", input.source.display()))?,
+                };
+                let results = process_pages(&src, engine, opts.images, &assets_name)?;
+                (
+                    "png",
+                    None,
+                    Vec::new(),
+                    None,
+                    results,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            }
+        };
 
     let fm = Frontmatter {
         source: input.rel.to_string_lossy().replace('\\', "/"),
@@ -348,6 +417,7 @@ pub fn convert_one(
         generator,
         keywords,
         links: fm_links,
+        digests,
     };
 
     if opts.images {
@@ -375,10 +445,14 @@ pub fn convert_one(
                     "recogn_text": p.recogn_text,
                 })).collect::<Vec<_>>(),
             })),
-            "pages": results.iter().map(|r| serde_json::json!({
+            "pages": results.iter().enumerate().map(|(i, r)| serde_json::json!({
                 "number": r.out.number,
                 "ocr": r.ocr,
                 "blocks": r.blocks,
+                "text_boxes": text_boxes
+                    .get(i)
+                    .map(|bs| bs.iter().map(text_box_json).collect::<Vec<_>>())
+                    .unwrap_or_default(),
             })).collect::<Vec<_>>(),
         });
         write_atomic(

@@ -12,6 +12,7 @@ pub struct Frontmatter {
     pub generator: String,
     pub keywords: Vec<String>,
     pub links: Vec<FrontmatterLink>,
+    pub digests: Vec<FrontmatterDigest>,
 }
 
 /// A link to another note, kept for a later import (`page` is 1-based).
@@ -23,6 +24,17 @@ pub struct FrontmatterLink {
     pub target_path: String,
     /// Relative path of the generated Markdown file, only when the target resolved.
     pub target_md: Option<String>,
+}
+
+/// A text box that carries a note digest (`page` is 1-based). The digest's own
+/// annotation is not in the `.note` file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrontmatterDigest {
+    pub page: usize,
+    pub digest_id: String,
+    pub text: String,
+    /// `left, top, width, height` in page pixels.
+    pub rect: [u32; 4],
 }
 
 #[derive(Debug, Clone)]
@@ -200,6 +212,21 @@ impl Frontmatter {
                 ));
             }
         }
+        if !self.digests.is_empty() {
+            s.push_str("digests:\n");
+            for d in &self.digests {
+                s.push_str(&format!(
+                    "  - {{ page: {}, digest_id: {}, text: {}, rect: \"{},{},{},{}\" }}\n",
+                    d.page,
+                    flow_scalar(&d.digest_id),
+                    flow_scalar(&d.text),
+                    d.rect[0],
+                    d.rect[1],
+                    d.rect[2],
+                    d.rect[3]
+                ));
+            }
+        }
         s.push_str("---\n");
         s
     }
@@ -220,6 +247,7 @@ impl Frontmatter {
         let mut generator = None;
         let mut keywords = None;
         let mut links = Vec::new();
+        let mut digests = Vec::new();
         let mut closed = false;
         while let Some(line) = lines.next() {
             if line == "---" {
@@ -277,6 +305,37 @@ impl Frontmatter {
                     }
                     lines = rest;
                 }
+                "digests" => {
+                    if !value.is_empty() {
+                        return None;
+                    }
+                    let mut rest = lines.clone();
+                    while let Some(item) = rest.clone().next() {
+                        let Some(v) = item.strip_prefix("  - ") else {
+                            break;
+                        };
+                        let fields = parse_flow_map(v)?;
+                        let get =
+                            |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+                        let mut rect = [0u32; 4];
+                        let raw = get("rect")?;
+                        let mut parts = raw.split(',');
+                        for slot in &mut rect {
+                            *slot = parts.next()?.trim().parse().ok()?;
+                        }
+                        if parts.next().is_some() {
+                            return None;
+                        }
+                        digests.push(FrontmatterDigest {
+                            page: get("page")?.parse().ok()?,
+                            digest_id: get("digest_id")?,
+                            text: get("text")?,
+                            rect,
+                        });
+                        rest.next();
+                    }
+                    lines = rest;
+                }
                 _ => return None,
             }
         }
@@ -294,6 +353,7 @@ impl Frontmatter {
             generator: generator?,
             keywords: keywords?,
             links,
+            digests,
         })
     }
 }

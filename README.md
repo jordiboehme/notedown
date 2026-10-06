@@ -111,6 +111,13 @@ matter keeps each link to another note: `target_file_id` is the `FILE_ID` of the
 one. `target_md` is missing when the target note was not converted (yet); the `Links:` line then shows
 the name and the device path instead of a link.
 
+A note digest is a text box that the Supernote device created from selected handwriting and linked to
+a digest. `digests:` in the front matter lists each such text box: `page` (1-based), `digest_id`,
+the `text` of the box and its `rect` as `left,top,width,height` in page pixels. The text is also
+part of the page text from the OCR, so the Markdown body does not change. The annotation of the digest
+itself is stored outside the `.note` file and is not available to notedown. The key is left out when
+a note has no digests.
+
 ## Format documentation and tests
 
 The `.note` format is documented in `docs/note-format.md`. The parser in `crates/notedown-note` is a

@@ -1,6 +1,6 @@
 use notedown::links::FileIndex;
 use notedown::{
-    document::{Frontmatter, FrontmatterLink},
+    document::{Frontmatter, FrontmatterDigest, FrontmatterLink},
     inputs, pipeline,
 };
 use notedown_ocr::{OcrEngine, OcrError, PageOcr};
@@ -189,11 +189,26 @@ fn frontmatter_roundtrip() {
                 target_md: None,
             },
         ],
+        digests: vec![
+            FrontmatterDigest {
+                page: 3,
+                digest_id: "d1".into(),
+                text: "Note: a, b {c} [d] #1 \"q\" \\ Größe\nzwei".into(),
+                rect: [256, 796, 271, 88],
+            },
+            FrontmatterDigest {
+                page: 4,
+                digest_id: "0123456789abcdef0123456789abcdef".into(),
+                text: "plain".into(),
+                rect: [0, 1, 2, 3],
+            },
+        ],
     };
     let back = Frontmatter::parse(&format!("{}\n## Page 1\n", fm.render())).unwrap();
     assert_eq!(back.source_sha256, "ab");
     assert_eq!(back.keywords, fm.keywords);
     assert_eq!(back.links, fm.links);
+    assert_eq!(back.digests, fm.digests);
     assert_eq!(back, fm);
     assert!(fm.render().contains("\\u0001"));
 }
@@ -374,6 +389,7 @@ fn apply_links_resolves_by_file_id_without_private_files() {
         generator: "notedown 0.1.0".into(),
         keywords: vec![],
         links: vec![],
+        digests: vec![],
     };
     std::fs::write(out.join("sub/My Bike.md"), fm.render()).unwrap();
     let index = FileIndex::build(&[], &[], Some(&out));
@@ -697,6 +713,7 @@ fn page_id_cannot_close_its_comment() {
         generator: "notedown 0.1.0".into(),
         keywords: vec![],
         links: vec![],
+        digests: vec![],
     };
     let page = PageOut {
         number: 1,
@@ -710,4 +727,135 @@ fn page_id_cannot_close_its_comment() {
     assert!(doc.contains("<!-- page_id: P2026-x-script- -->\n"), "{doc}");
     assert_eq!(doc.matches("-->").count(), 1, "{doc}");
     assert!(!doc.contains("<script"), "{doc}");
+}
+
+struct BoxSource {
+    fail_page: Option<usize>,
+}
+impl pipeline::PageSource for BoxSource {
+    fn pages(&self) -> usize {
+        2
+    }
+    fn is_blank(&self, _i: usize) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    fn png(&self, _i: usize) -> anyhow::Result<Vec<u8>> {
+        Ok(vec![0])
+    }
+    fn page_id(&self, _i: usize) -> Option<String> {
+        None
+    }
+    fn text_boxes(&self, i: usize) -> anyhow::Result<Vec<notedown_note::TextBox>> {
+        if self.fail_page == Some(i) {
+            anyhow::bail!("broken record");
+        }
+        let mk = |digest: Option<notedown_note::DigestRef>| notedown_note::TextBox {
+            page: i,
+            record_index: 0,
+            id: 61,
+            rect: [256, 796, 271, 88],
+            text: "Text: with #".into(),
+            font_size: Some(48.0),
+            font_path: None,
+            created: None,
+            style_raw: String::new(),
+            flags_raw: vec![],
+            digest,
+            source_stroke_ids: vec![53],
+            source_strokes: vec![],
+        };
+        Ok(if i == 0 {
+            vec![
+                mk(None),
+                mk(Some(notedown_note::DigestRef {
+                    id: "abc".into(),
+                    time_ms: Some(1),
+                    source: None,
+                })),
+            ]
+        } else {
+            vec![mk(None)]
+        })
+    }
+}
+
+fn fm_with(digests: Vec<FrontmatterDigest>) -> Frontmatter {
+    Frontmatter {
+        source: "a.note".into(),
+        source_sha256: "ab".into(),
+        kind: "supernote-note".into(),
+        file_id: None,
+        pages: 2,
+        model: "m".into(),
+        converted_at: "t".into(),
+        generator: "notedown 0.1.0".into(),
+        keywords: vec![],
+        links: vec![],
+        digests,
+    }
+}
+
+#[test]
+fn digests_are_listed_in_the_frontmatter_and_body_is_unchanged() {
+    let src = BoxSource { fail_page: None };
+    let mut warnings = Vec::new();
+    let (boxes, digests) = pipeline::collect_text_boxes(&src, &mut |w| warnings.push(w));
+    assert!(warnings.is_empty());
+    assert_eq!(boxes.len(), 2);
+    assert_eq!(digests.len(), 1, "only text boxes with a digest");
+    assert_eq!(digests[0].page, 1);
+    let mut engine = FakeEngine { calls: 0 };
+    let results = pipeline::process_pages(&src, &mut engine, false, "x.assets").unwrap();
+    let outs: Vec<_> = results.iter().map(|r| r.out.clone()).collect();
+    let with = notedown::document::render_document(&fm_with(digests), &outs);
+    let without = notedown::document::render_document(&fm_with(vec![]), &outs);
+    assert!(
+        with.contains("digests:\n  - { page: 1, digest_id: abc,"),
+        "{with}"
+    );
+    assert!(!without.contains("digests:"));
+    let body = |d: &str| d.split_once("\n---\n").unwrap().1.to_string();
+    assert_eq!(
+        body(&with).split_once("\n---\n").map(|x| x.1),
+        body(&without).split_once("\n---\n").map(|x| x.1)
+    );
+    assert_eq!(Frontmatter::parse(&with).unwrap().digests.len(), 1);
+}
+
+#[test]
+fn unreadable_text_boxes_warn_and_skip_the_page() {
+    let src = BoxSource { fail_page: Some(0) };
+    let mut warnings = Vec::new();
+    let (boxes, digests) = pipeline::collect_text_boxes(&src, &mut |w| warnings.push(w));
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].starts_with("page 1:"), "{warnings:?}");
+    assert!(digests.is_empty());
+    assert_eq!(boxes.len(), 2);
+}
+
+#[test]
+fn bike_digest_lists_one_digest_on_page_3() {
+    let Some(note) = fixture_ok("bike-digest.note") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("in");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::copy(note, src.join("Bike digest.note")).unwrap();
+    let out = dir.path().join("out");
+    let (inputs, _) = inputs::collect(std::slice::from_ref(&src), None);
+    let outputs = inputs::output_paths(&inputs, Some(&out));
+    let index = FileIndex::build(&inputs, &outputs, Some(&out));
+    let mut engine = FakeEngine { calls: 0 };
+    for (i, o) in inputs.iter().zip(&outputs) {
+        pipeline::convert_one(i, o, &mut engine, &opts(Some(out.clone())), &index).unwrap();
+    }
+    let md = std::fs::read_to_string(out.join("Bike digest.md")).unwrap();
+    let fm = Frontmatter::parse(&md).unwrap();
+    assert_eq!(fm.digests.len(), 1, "{md}");
+    assert_eq!(fm.digests[0].page, 3);
+    assert_eq!(fm.digests[0].rect, [256, 796, 271, 88]);
+    let debug = std::fs::read_to_string(out.join("Bike digest.debug.json")).unwrap();
+    assert!(debug.contains("\"text_boxes\""));
+    assert!(debug.contains("\"source_stroke_count\": 7"));
 }

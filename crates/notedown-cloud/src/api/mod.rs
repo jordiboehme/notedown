@@ -34,7 +34,6 @@ use envelope::{LogDevice, LogFlags, Reply};
 
 pub const FLAG_UNKNOWN: &str = "unknown_endpoint";
 pub const FLAG_RETRY: &str = "retry_suspected";
-pub const FLAG_FIRMWARE: &str = "firmware_changed";
 
 /// The implemented routes (method, path), besides the refused families. A request outside
 /// them and outside the documented refused endpoints is flagged `unknown_endpoint`.
@@ -135,7 +134,7 @@ pub(crate) fn note_firmware(
         let mut m = LogEntry::new(LogKind::Marker);
         m.device = Some(serial.to_string());
         m.firmware = Some(new.to_string());
-        m.flags = vec![FLAG_FIRMWARE.to_string()];
+        m.flags = vec![crate::diag::FLAG_FIRMWARE_CHANGED.to_string()];
         state.log.record(m);
     }
     Ok(after)

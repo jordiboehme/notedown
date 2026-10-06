@@ -20,7 +20,9 @@ use crate::{Result, io_err};
 
 const FILE_PREFIX: &str = "protocol-";
 const FILE_SUFFIX: &str = ".jsonl";
-const FLAG_FIRMWARE_CHANGED: &str = "firmware_changed";
+/// The flag of the marker written when a device reports a new firmware. Rotation keeps the log
+/// days around such a marker, so every writer of the marker must use this constant.
+pub const FLAG_FIRMWARE_CHANGED: &str = "firmware_changed";
 
 /// Source of time, injectable for tests. Days are UTC days.
 pub trait Clock: Send + Sync {

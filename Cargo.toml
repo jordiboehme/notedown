@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/notedown-note", "crates/notedown-ocr", "crates/notedown"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/jordiboehme/notedown"
+rust-version = "1.99"
+
+[workspace.dependencies]
+notedown-note = { path = "crates/notedown-note", version = "0.1.0" }
+notedown-ocr = { path = "crates/notedown-ocr", version = "0.1.0" }
+thiserror = "2"
+anyhow = "1"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+sha2 = "0.10"
+hex = "0.4"
+insta = "1"
+zip = { version = "8", default-features = false, features = ["deflate"] }

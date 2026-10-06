@@ -1,0 +1,14 @@
+notedown
+Copyright 2026 Jordi Böhme
+
+notedown is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version (AGPL-3.0-or-later). See the LICENSE file for the full text.
+
+notedown is not affiliated with Ratta or Supernote.
+
+The Supernote .note format was documented from sample files and public
+community research, see docs/note-format.md. The .note parser in
+crates/notedown-note is a clean-room implementation of that document.
+No third-party code is included.

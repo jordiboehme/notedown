@@ -4,8 +4,13 @@
 //!
 //! - Device folders map to wire folders ([`FOLDER_MAP`]): `Note` to `NOTE/Note`, `MyStyle` to
 //!   `NOTE/MyStyle`, `Document` to `DOCUMENT/Document`; `EXPORT`, `SCREENSHOT` and `INBOX` keep
-//!   their names. `REMOVABLE0` (the SD card), `backup.json`, `*.snbak` and dot-files are
-//!   skipped; any other top-level entry is reported and skipped.
+//!   their names. At the top of the backup folder, `REMOVABLE0` (the SD card), `backup.json`,
+//!   `*.snbak` and dot-files are skipped, and any other entry is reported and skipped. Inside
+//!   the device folders every file is imported; only host junk (`.DS_Store`, `._*`,
+//!   `.localized`) is skipped, and any other dot-name refuses the import.
+//! - The backup must be complete: no `*.part` file anywhere, and a `backup.json` that says
+//!   `"complete": true` with no errors (a copy without it needs `no_report`). A backup without
+//!   files needs `allow_empty`.
 //! - All six device folders must be in the backup (the device root always holds them), so a
 //!   wrong folder or a partial backup is refused instead of importing too little.
 //! - Anything the store cannot hold (a name that is no valid wire name, a symlink, two names
@@ -37,7 +42,8 @@ use crate::{Error, Result, io_err};
 pub const BACKUP_FILE: &str = "backup.json";
 /// The device's SD card folder; never imported.
 pub const SD_CARD: &str = "REMOVABLE0";
-/// Device backup files; never imported.
+/// Device backup files at the top of the backup folder; not imported (inside the device
+/// folders every file is).
 pub const SNBAK_EXT: &str = ".snbak";
 
 /// Device top folder and the wire folder it maps to, sorted by device name.
@@ -72,8 +78,10 @@ pub enum SkipReason {
     BackupFile,
     /// A `*.snbak` device backup file.
     Snbak,
-    /// A name starting with `.`.
+    /// A name starting with `.` at the top of the backup folder.
     DotFile,
+    /// Host junk inside a device folder: `.DS_Store`, `._*`, `.localized`.
+    HostJunk,
     /// A top-level entry that is no device folder.
     Unknown,
 }
@@ -85,6 +93,7 @@ impl SkipReason {
             SkipReason::BackupFile => "backup report",
             SkipReason::Snbak => "device backup file",
             SkipReason::DotFile => "dot-file",
+            SkipReason::HostJunk => "host junk file",
             SkipReason::Unknown => "not a device folder",
         }
     }
@@ -146,8 +155,22 @@ fn rel_display(rel: &[&str]) -> String {
     rel.join("/")
 }
 
-/// Walk the backup folder (read only). Symlinks and names the store cannot hold are errors.
-pub fn scan(backup: &Path) -> Result<Scan> {
+/// Host junk that may sit in a copied device folder; skipped silently (only counted).
+pub fn is_host_junk(name: &str) -> bool {
+    name == ".DS_Store" || name == ".localized" || name.starts_with("._")
+}
+
+/// The temp name suffix of an unfinished download (`backup-device`).
+pub const PART_EXT: &str = ".part";
+
+/// How many `.part` paths an error names before it gives a count.
+const MAX_PART_NAMES: usize = 20;
+
+/// Walk the backup folder (read only). Symlinks, dot-names inside device folders (except
+/// [`is_host_junk`]), `*.part` files anywhere, missing device folders and names the store
+/// cannot hold are errors. Unless `no_report`, the backup must carry a `backup.json` of a
+/// complete `backup-device` run without errors.
+pub fn scan(backup: &Path, no_report: bool) -> Result<Scan> {
     let meta = std::fs::metadata(backup).map_err(io_err(backup))?;
     if !meta.is_dir() {
         return Err(Error::Invalid {
@@ -157,12 +180,17 @@ pub fn scan(backup: &Path) -> Result<Scan> {
     }
     let mut scan = Scan::default();
     let mut found = Vec::new();
+    let mut parts = Vec::new();
     for (name, path, ftype) in sorted_children(backup)? {
         let Some(name) = name else {
             scan.errors
                 .push(format!("{}: the name is not UTF-8", path.display()));
             continue;
         };
+        if name.ends_with(PART_EXT) && !ftype.is_dir() {
+            parts.push(name);
+            continue;
+        }
         let reason = if name == SD_CARD {
             Some(SkipReason::SdCard)
         } else if name == BACKUP_FILE {
@@ -211,11 +239,29 @@ pub fn scan(backup: &Path) -> Result<Scan> {
             folders: 0,
             bytes: 0,
         };
-        walk(&path, &[name.as_str()], &target, &mut count, &mut scan)?;
+        walk(
+            &path,
+            &[name.as_str()],
+            &target,
+            &mut count,
+            &mut scan,
+            &mut parts,
+        )?;
         scan.folders.push(count);
     }
+    if !parts.is_empty() {
+        parts.sort();
+        let mut lines: Vec<String> = parts.iter().take(MAX_PART_NAMES).cloned().collect();
+        if parts.len() > MAX_PART_NAMES {
+            lines.push(format!("and {} more", parts.len() - MAX_PART_NAMES));
+        }
+        scan.errors.push(format!(
+            "the backup is not complete, it holds unfinished downloads (*{PART_EXT}):\n    {}",
+            lines.join("\n    ")
+        ));
+    }
     scan.items.sort_by(|a, b| a.target.cmp(&b.target));
-    check_backup_report(backup, &mut scan);
+    check_backup_report(backup, no_report, &mut scan);
     Ok(scan)
 }
 
@@ -239,6 +285,7 @@ fn walk(
     target: &WirePath,
     count: &mut FolderCount,
     scan: &mut Scan,
+    parts: &mut Vec<String>,
 ) -> Result<()> {
     // Two names in one folder that the store would refuse as a collision.
     let mut folded: HashMap<String, String> = HashMap::new();
@@ -251,18 +298,23 @@ fn walk(
         let mut here = rel.to_vec();
         here.push(&name);
         let shown = rel_display(&here);
-        if name.starts_with('.') {
-            scan.skipped.push(Skip {
-                path: shown,
-                reason: SkipReason::DotFile,
-            });
+        if name.ends_with(PART_EXT) && !ftype.is_dir() {
+            parts.push(shown);
             continue;
         }
-        if ftype.is_file() && name.ends_with(SNBAK_EXT) {
-            scan.skipped.push(Skip {
-                path: shown,
-                reason: SkipReason::Snbak,
-            });
+        if name.starts_with('.') {
+            if is_host_junk(&name) {
+                scan.skipped.push(Skip {
+                    path: shown,
+                    reason: SkipReason::HostJunk,
+                });
+            } else {
+                // The store cannot hold a dot-name, and a silent skip would make the device
+                // delete the file.
+                scan.errors.push(format!(
+                    "{shown}: a name starting with a dot cannot be stored"
+                ));
+            }
             continue;
         }
         if ftype.is_symlink() || !(ftype.is_file() || ftype.is_dir()) {
@@ -291,7 +343,7 @@ fn walk(
                 kind: Kind::Folder,
                 size: 0,
             });
-            walk(&path, &here, &wire, count, scan)?;
+            walk(&path, &here, &wire, count, scan, parts)?;
         } else {
             let size = std::fs::metadata(&path).map_err(io_err(&path))?.len();
             count.files += 1;
@@ -307,11 +359,27 @@ fn walk(
     Ok(())
 }
 
-/// A `backup.json` that lists errors outside the SD card marks an incomplete backup.
-fn check_backup_report(backup: &Path, scan: &mut Scan) {
+/// The `backup.json` of `backup-device` must say `"complete": true` and carry an empty
+/// `errors` array. Without a report (a copy made another way, for example over USB) the import
+/// needs `no_report`.
+fn check_backup_report(backup: &Path, no_report: bool, scan: &mut Scan) {
     let path = backup.join(BACKUP_FILE);
-    let Ok(bytes) = std::fs::read(&path) else {
-        return;
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if !no_report {
+                scan.errors.push(format!(
+                    "{BACKUP_FILE}: missing. A backup made by `notedown cloud backup-device` has \
+                     it. For a copy made another way (USB), make sure the copy is complete, then \
+                     pass --no-report"
+                ));
+            }
+            return;
+        }
+        Err(e) => {
+            scan.errors.push(format!("{}: {e}", path.display()));
+            return;
+        }
     };
     let report: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
@@ -320,15 +388,24 @@ fn check_backup_report(backup: &Path, scan: &mut Scan) {
             return;
         }
     };
-    for err in report["errors"].as_array().into_iter().flatten() {
-        let p = err["path"].as_str().unwrap_or("");
-        if p == SD_CARD || p.starts_with(&format!("{SD_CARD}/")) {
-            continue;
-        }
+    if report["complete"] != serde_json::Value::Bool(true) {
         scan.errors.push(format!(
-            "{BACKUP_FILE} lists a failed entry, the backup is incomplete: {p}: {}",
-            err["message"].as_str().unwrap_or("")
+            "{BACKUP_FILE}: the backup run did not finish (\"complete\" is not true)"
         ));
+    }
+    match report["errors"].as_array() {
+        None => scan
+            .errors
+            .push(format!("{BACKUP_FILE}: the report has no errors list")),
+        Some(errors) => {
+            for err in errors {
+                scan.errors.push(format!(
+                    "{BACKUP_FILE} lists a failed entry, the backup is incomplete: {}: {}",
+                    err["path"].as_str().unwrap_or(""),
+                    err["message"].as_str().unwrap_or("")
+                ));
+            }
+        }
     }
 }
 
@@ -342,11 +419,11 @@ pub struct DryRun {
 
 /// Scan the backup and count the account's files without writing anything (no lock file, no
 /// `files/`, no journal).
-pub fn dry_run(data: &Path, slug: &str, backup: &Path) -> Result<DryRun> {
+pub fn dry_run(data: &Path, slug: &str, backup: &Path, options: &ImportOptions) -> Result<DryRun> {
     if Accounts::new(data).get(slug)?.is_none() {
         return Err(Error::NoAccount(slug.to_string()));
     }
-    let scan = scan(backup)?;
+    let scan = scan(backup, options.no_report)?;
     let files = data
         .join("accounts")
         .join(slug)
@@ -386,6 +463,10 @@ fn count_plain_files(dir: &Path) -> Result<u64> {
 pub struct ImportOptions {
     /// Move the account's current files to the recycle bin first, instead of refusing.
     pub replace: bool,
+    /// Accept a backup without `backup.json` (a copy made another way, for example over USB).
+    pub no_report: bool,
+    /// Accept a backup with no files at all (it would open the gate on an empty tree).
+    pub allow_empty: bool,
 }
 
 /// What [`import`] did.
@@ -428,12 +509,19 @@ pub fn import(
     if accounts.get(slug)?.is_none() {
         return Err(Error::NoAccount(slug.to_string()));
     }
-    let scan = scan(backup)?;
+    let scan = scan(backup, options.no_report)?;
     if !scan.errors.is_empty() {
         return Err(failed(format!(
             "the backup cannot be imported completely, nothing was written:\n  {}",
             scan.errors.join("\n  ")
         )));
+    }
+    if scan.files() == 0 && !options.allow_empty {
+        return Err(failed(
+            "the backup holds no files; an empty import would open the protect gate on an \
+             empty tree. Pass --allow-empty if the device is really empty"
+                .into(),
+        ));
     }
     let store = Store::open(data, slug)?;
     let guard = store.lock_recovered(journal)?;

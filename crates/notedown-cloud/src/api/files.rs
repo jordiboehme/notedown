@@ -199,6 +199,30 @@ macro_rules! device_request {
     };
 }
 
+/// The protect gate: in accept mode with `protect = true`, an account without an `imported`
+/// marker gets `E0079` (flag `protect_refused`). `synchronous/start` checks it, and so does
+/// every file route on each request, so a session that started before the marker was cleared
+/// (`import --replace`) stops at its next call. `account` is the read of this request.
+pub fn protect_gate(state: &AppState, account: &Account, serial: &str) -> Option<Reply> {
+    (state.config.protect && account.imported.is_none()).then(|| protect_refused(serial))
+}
+
+/// The answer of a closed protect gate: `E0079` with flag `protect_refused`.
+pub fn protect_refused(serial: &str) -> Reply {
+    Reply::sync_busy().flag(FLAG_PROTECT_REFUSED).device(serial)
+}
+
+/// [`device_request!`] followed by the protect gate.
+macro_rules! gated_request {
+    ($state:expr, $headers:expr, $bytes:expr) => {{
+        let req = device_request!($state, $headers, $bytes);
+        if let Some(reply) = protect_gate(&$state, &req.account, &req.serial) {
+            return reply;
+        }
+        req
+    }};
+}
+
 /// `POST /api/file/2/files/synchronous/start`. Order: device check, the protect gate (accept
 /// mode with `protect = true` refuses with `E0079` until the account has an `imported` marker),
 /// then the lock (`E0078` while another device holds it). Answers `synType: true`.
@@ -208,10 +232,8 @@ pub async fn sync_start(
     bytes: Bytes,
 ) -> Reply {
     let req = device_request!(state, headers, bytes);
-    if state.config.protect && req.account.imported.is_none() {
-        return Reply::sync_busy()
-            .flag(FLAG_PROTECT_REFUSED)
-            .device(&req.serial);
+    if let Some(reply) = protect_gate(&state, &req.account, &req.serial) {
+        return reply;
     }
     match state
         .sync_locks
@@ -284,7 +306,7 @@ pub async fn list_folder(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = device_request!(state, headers, bytes);
+    let req = gated_request!(state, headers, bytes);
     let text = match req.body.get("path") {
         None | Some(Value::Null) => String::new(),
         Some(Value::String(s)) => s.clone(),
@@ -314,7 +336,7 @@ pub async fn list_folder_v3(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = device_request!(state, headers, bytes);
+    let req = gated_request!(state, headers, bytes);
     let id = match id_arg(&req.body, "id") {
         IdArg::Missing | IdArg::Id(0) => None,
         IdArg::Id(n) => Some(n),
@@ -359,7 +381,7 @@ pub async fn query_v3(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = device_request!(state, headers, bytes);
+    let req = gated_request!(state, headers, bytes);
     let IdArg::Id(id) = id_arg(&req.body, "id") else {
         return req.ok(json!({"entriesVO": null}));
     };
@@ -377,7 +399,7 @@ pub async fn query_by_path_v3(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = device_request!(state, headers, bytes);
+    let req = gated_request!(state, headers, bytes);
     let Some(path) = req
         .body
         .get("path")
@@ -407,7 +429,7 @@ pub async fn download_v3(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = device_request!(state, headers, bytes);
+    let req = gated_request!(state, headers, bytes);
     let IdArg::Id(id) = id_arg(&req.body, "id") else {
         return req.error(E_NO_FILE, MSG_NO_FILE);
     };
@@ -630,7 +652,7 @@ pub async fn upload_apply(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = device_request!(state, headers, bytes);
+    let req = gated_request!(state, headers, bytes);
     if !holds_sync_lock(&state, &req.slug, &req.serial) {
         return no_sync_lock(&req.serial);
     }
@@ -829,7 +851,7 @@ pub async fn upload_finish(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = device_request!(state, headers, bytes);
+    let req = gated_request!(state, headers, bytes);
     if !holds_sync_lock(&state, &req.slug, &req.serial) {
         return no_sync_lock(&req.serial);
     }
@@ -1120,7 +1142,7 @@ pub async fn create_folder_v2(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = device_request!(state, headers, bytes);
+    let req = gated_request!(state, headers, bytes);
     // The lock first: a call without it is always E0079, whatever its body.
     if !holds_sync_lock(&state, &req.slug, &req.serial) {
         return no_sync_lock(&req.serial);
@@ -1178,7 +1200,7 @@ pub async fn delete_folder_v3(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = device_request!(state, headers, bytes);
+    let req = gated_request!(state, headers, bytes);
     let id = id_arg(&req.body, "id");
     let now = state.now_ms();
     mutate(&state, &req, move |st, slug, serial| {
@@ -1282,7 +1304,7 @@ pub async fn move_v3(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = device_request!(state, headers, bytes);
+    let req = gated_request!(state, headers, bytes);
     let t = Transfer::of(&req.body);
     let now = state.now_ms();
     mutate(&state, &req, move |st, slug, serial| {
@@ -1336,7 +1358,7 @@ pub async fn copy_v3(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = device_request!(state, headers, bytes);
+    let req = gated_request!(state, headers, bytes);
     let t = Transfer::of(&req.body);
     mutate(&state, &req, move |st, slug, serial| {
         let IdArg::Id(id) = t.id else {

@@ -46,7 +46,8 @@ fn write(path: &Path, bytes: &[u8]) {
 }
 
 /// A synthetic device backup with all six folders, the SD card, an NFD name, a name with
-/// spaces, `+`, `%` and `'`, an empty folder, a `.snbak`, dot-files and an unknown top entry.
+/// spaces, `+`, `%` and `'`, an empty folder, a `.snbak` inside and one at the top, host junk,
+/// a dot-file at the top, an unknown top entry and a complete `backup.json`.
 /// Returns the backup folder and the expected wire files (path -> bytes) and wire folders.
 fn backup_tree(root: &Path) -> (PathBuf, BTreeMap<String, Vec<u8>>, BTreeSet<String>) {
     let b = root.join("backup");
@@ -74,6 +75,8 @@ fn backup_tree(root: &Path) -> (PathBuf, BTreeMap<String, Vec<u8>>, BTreeSet<Str
     );
     add("Document/empty.pdf", "DOCUMENT/Document/empty.pdf", b"");
     add("EXPORT/e.pdf", "EXPORT/e.pdf", b"export");
+    // inside a device folder every file is imported, a .snbak too
+    add("EXPORT/old.snbak", "EXPORT/old.snbak", b"device backup");
     add("SCREENSHOT/s.png", "SCREENSHOT/s.png", b"shot");
     add("INBOX/in.txt", "INBOX/in.txt", b"inbox");
     // empty folders are kept
@@ -81,13 +84,14 @@ fn backup_tree(root: &Path) -> (PathBuf, BTreeMap<String, Vec<u8>>, BTreeSet<Str
     std::fs::create_dir_all(b.join("Document/Books/Nothing")).unwrap();
     // skipped
     write(&b.join("REMOVABLE0/sd.note"), b"sd card");
-    write(&b.join("Note/Bike.snbak"), b"device backup");
+    write(&b.join("root.snbak"), b"device backup at the root");
     write(&b.join("Note/.DS_Store"), b"finder");
+    write(&b.join("Note/._Bike.note"), b"apple double");
     write(&b.join(".hidden"), b"dot");
     write(&b.join("Unknown/u.txt"), b"unknown top folder");
     write(
         &b.join("backup.json"),
-        br#"{"url":"http://device:8089","errors":[]}"#,
+        br#"{"url":"http://device:8089","complete":true,"errors":[]}"#,
     );
     let folders: BTreeSet<String> = [
         "NOTE",
@@ -178,7 +182,10 @@ fn run_import(
         data,
         "jordi",
         backup,
-        &ImportOptions { replace },
+        &ImportOptions {
+            replace,
+            ..ImportOptions::default()
+        },
         &journal,
         &mut quiet(),
     )
@@ -190,7 +197,7 @@ fn run_import(
 fn scan_maps_the_device_folders_and_reports_every_skip() {
     let tmp = tempfile::tempdir().unwrap();
     let (backup, files, _) = backup_tree(tmp.path());
-    let scan = import::scan(&backup).unwrap();
+    let scan = import::scan(&backup, false).unwrap();
     assert!(scan.errors.is_empty(), "{:?}", scan.errors);
     let mapping: Vec<(String, String)> = scan
         .folders
@@ -220,8 +227,9 @@ fn scan_maps_the_device_folders_and_reports_every_skip() {
         .collect();
     let want: BTreeSet<(String, SkipReason)> = [
         (".hidden", SkipReason::DotFile),
-        ("Note/.DS_Store", SkipReason::DotFile),
-        ("Note/Bike.snbak", SkipReason::Snbak),
+        ("Note/.DS_Store", SkipReason::HostJunk),
+        ("Note/._Bike.note", SkipReason::HostJunk),
+        ("root.snbak", SkipReason::Snbak),
         ("REMOVABLE0", SkipReason::SdCard),
         ("Unknown", SkipReason::Unknown),
         ("backup.json", SkipReason::BackupFile),
@@ -239,7 +247,7 @@ fn a_dry_run_writes_nothing() {
     let data = data_with_account();
     let before = tree(data.path());
     let backup_before = tree(&backup);
-    let plan = import::dry_run(data.path(), "jordi", &backup).unwrap();
+    let plan = import::dry_run(data.path(), "jordi", &backup, &ImportOptions::default()).unwrap();
     assert_eq!(plan.files_present, 0);
     assert_eq!(plan.scan.folders.len(), 6);
     assert_eq!(tree(data.path()), before);
@@ -381,22 +389,134 @@ fn a_bad_name_in_the_backup_refuses_the_whole_import() {
 }
 
 #[test]
-fn a_backup_with_errors_in_backup_json_is_refused() {
+fn a_backup_report_must_say_complete_without_errors() {
     let tmp = tempfile::tempdir().unwrap();
     let (backup, _, _) = backup_tree(tmp.path());
-    write(
-        &backup.join("backup.json"),
-        br#"{"errors":[{"path":"Note/a.note","message":"size 3, expected 4"}]}"#,
-    );
     let data = data_with_account();
+    let report = backup.join("backup.json");
+    for (text, want) in [
+        (
+            r#"{"complete":true,"errors":[{"path":"Note/a.note","message":"size 3, expected 4"}]}"#,
+            "Note/a.note",
+        ),
+        // the SD card is not imported, but a report with errors is not a clean backup
+        (
+            r#"{"complete":true,"errors":[{"path":"REMOVABLE0/a.note","message":"x"}]}"#,
+            "REMOVABLE0/a.note",
+        ),
+        (r#"{"complete":false,"errors":[]}"#, "did not finish"),
+        (r#"{"errors":[]}"#, "did not finish"),
+        (r#"{"complete":true}"#, "no errors list"),
+        ("not json", "backup.json"),
+    ] {
+        std::fs::write(&report, text).unwrap();
+        let err = run_import(data.path(), &backup, false).unwrap_err();
+        assert!(err.to_string().contains(want), "{text}: {err}");
+    }
+    assert!(!data.path().join("accounts/jordi/files").exists());
+
+    // a copy without a report needs --no-report
+    std::fs::remove_file(&report).unwrap();
     let err = run_import(data.path(), &backup, false).unwrap_err();
-    assert!(err.to_string().contains("Note/a.note"), "{err}");
-    // errors on the SD card do not count: it is never imported
-    write(
-        &backup.join("backup.json"),
-        br#"{"errors":[{"path":"REMOVABLE0/a.note","message":"x"}]}"#,
+    assert!(err.to_string().contains("--no-report"), "{err}");
+    let journal = Journal::open(data.path()).unwrap();
+    let options = ImportOptions {
+        no_report: true,
+        ..ImportOptions::default()
+    };
+    import::import(
+        data.path(),
+        "jordi",
+        &backup,
+        &options,
+        &journal,
+        &mut quiet(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn unfinished_downloads_anywhere_refuse_the_import() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (backup, _, _) = backup_tree(tmp.path());
+    let data = data_with_account();
+    write(&backup.join("Note/Work/a.note.part"), b"half");
+    write(&backup.join("INBOX/.nd-backup-1234abcd.part"), b"half");
+    write(&backup.join("x.part"), b"half");
+    let err = run_import(data.path(), &backup, false)
+        .unwrap_err()
+        .to_string();
+    for p in [
+        "Note/Work/a.note.part",
+        "INBOX/.nd-backup-1234abcd.part",
+        "x.part",
+    ] {
+        assert!(err.contains(p), "{p}: {err}");
+    }
+    // more than 20: the first 20 by name, then a count
+    for i in 0..25 {
+        write(&backup.join(format!("EXPORT/f{i:02}.pdf.part")), b"half");
+    }
+    let err = run_import(data.path(), &backup, false)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("and 8 more"), "{err}");
+    assert!(!data.path().join("accounts/jordi/files").exists());
+}
+
+#[test]
+fn a_dot_name_inside_a_device_folder_refuses_the_import() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (backup, _, _) = backup_tree(tmp.path());
+    let data = data_with_account();
+    write(&backup.join("Note/.secret.note"), b"x");
+    write(&backup.join("Document/.trash/y.pdf"), b"y");
+    let err = run_import(data.path(), &backup, false)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Note/.secret.note"), "{err}");
+    assert!(err.contains("Document/.trash"), "{err}");
+    assert!(
+        !err.contains(".DS_Store"),
+        "host junk is skipped silently: {err}"
     );
-    run_import(data.path(), &backup, false).unwrap();
+    assert!(!data.path().join("accounts/jordi/files").exists());
+}
+
+#[test]
+fn an_empty_backup_needs_allow_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let b = tmp.path().join("empty");
+    for f in [
+        "Note",
+        "MyStyle",
+        "Document",
+        "EXPORT",
+        "SCREENSHOT",
+        "INBOX",
+    ] {
+        std::fs::create_dir_all(b.join(f)).unwrap();
+    }
+    write(&b.join("backup.json"), br#"{"complete":true,"errors":[]}"#);
+    let data = data_with_account();
+    let err = run_import(data.path(), &b, false).unwrap_err();
+    assert!(err.to_string().contains("--allow-empty"), "{err}");
+    assert!(!data.path().join("accounts/jordi/files").exists());
+    let journal = Journal::open(data.path()).unwrap();
+    let options = ImportOptions {
+        allow_empty: true,
+        ..ImportOptions::default()
+    };
+    let r = import::import(data.path(), "jordi", &b, &options, &journal, &mut quiet()).unwrap();
+    assert_eq!(r.files, 0);
+    assert!(
+        Accounts::new(data.path())
+            .get("jordi")
+            .unwrap()
+            .unwrap()
+            .imported
+            .is_some()
+    );
 }
 
 #[test]
@@ -420,7 +540,7 @@ fn a_wrong_or_partial_backup_folder_is_refused() {
         "{err}"
     );
     assert!(!err.to_string().contains("Note:"), "{err}");
-    let plan = import::dry_run(data.path(), "jordi", &backup).unwrap();
+    let plan = import::dry_run(data.path(), "jordi", &backup, &ImportOptions::default()).unwrap();
     assert_eq!(plan.scan.errors.len(), 1, "{:?}", plan.scan.errors);
     // a device folder that is a file
     write(&backup.join("INBOX"), b"not a folder");
@@ -584,7 +704,8 @@ async fn the_protect_gate_opens_after_the_import_and_list_folder_shows_the_backu
     assert_eq!(got_files, want);
     assert_eq!(got_folders, folders);
     assert!(!listed.to_string().contains("REMOVABLE0"));
-    assert!(!listed.to_string().contains("snbak"));
+    assert!(!listed.to_string().contains("root.snbak"));
+    assert!(listed.to_string().contains("EXPORT/old.snbak"));
 }
 
 // ------------------------------------------------------------------ put
@@ -751,6 +872,8 @@ fn put_refuses_paths_outside_the_device_folders_and_name_collisions() {
 enum Served {
     Page(Vec<Value>),
     File(Vec<u8>),
+    /// The bytes after a pause (ms).
+    Slow(Vec<u8>, u64),
 }
 
 fn entry(name: &str, uri: &str, dir: bool, size: u64) -> Value {
@@ -788,6 +911,10 @@ fn fake_device(routes: BTreeMap<String, Served>) -> String {
                             ([("content-type", "text/html")], page_html(list)).into_response()
                         }
                         Some(Served::File(bytes)) => bytes.clone().into_response(),
+                        Some(Served::Slow(bytes, ms)) => {
+                            tokio::time::sleep(Duration::from_millis(*ms)).await;
+                            bytes.clone().into_response()
+                        }
                         None => StatusCode::NOT_FOUND.into_response(),
                     }
                 }
@@ -929,6 +1056,16 @@ fn backup_device_copies_byte_exact_names_and_fails_on_a_short_file() {
     assert_eq!(json["bytes"], 10 + 3 + 4);
     assert_eq!(json["folders"]["Note"]["files"], 2);
     assert_eq!(json["errors"][0]["path"], "Note/Short.note");
+    assert_eq!(json["complete"], true);
+    assert_eq!(json["date_warnings"], 0);
+    // a file whose date differs from the listing is fetched again by --resume
+    let nfd = dir.join("Note").join(NFD_NAME);
+    std::fs::File::options()
+        .write(true)
+        .open(&nfd)
+        .unwrap()
+        .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000))
+        .unwrap();
 
     // a rerun into the same folder needs --resume
     assert!(device_backup::backup(&url, &dir, &opts, &mut quiet()).is_err());
@@ -943,7 +1080,12 @@ fn backup_device_copies_byte_exact_names_and_fails_on_a_short_file() {
         &mut quiet(),
     )
     .unwrap();
-    assert_eq!(resumed.skipped_existing, 3);
+    assert_eq!(resumed.skipped_existing, 2);
+    assert_eq!(std::fs::read(&nfd).unwrap(), b"nfd");
+    assert_eq!(
+        OffsetDateTime::from(std::fs::metadata(&nfd).unwrap().modified().unwrap()),
+        OffsetDateTime::parse_rfc3339_free("2026-10-01T10:34:00Z")
+    );
     assert_eq!(
         std::fs::read(dir.join("REMOVABLE0/sd.note")).unwrap(),
         b"sd"
@@ -1000,4 +1142,97 @@ impl FromRfc for OffsetDateTime {
             .unwrap()
             .assume_utc()
     }
+}
+
+#[test]
+fn a_killed_backup_run_is_marked_incomplete_and_the_import_refuses_it() {
+    let mut r = BTreeMap::new();
+    let folders = [
+        "Document",
+        "EXPORT",
+        "INBOX",
+        "MyStyle",
+        "Note",
+        "SCREENSHOT",
+    ];
+    r.insert(
+        "/".into(),
+        Served::Page(
+            folders
+                .iter()
+                .map(|f| entry(f, &format!("/{f}"), true, 0))
+                .collect(),
+        ),
+    );
+    for f in folders {
+        r.insert(format!("/{f}"), Served::Page(vec![]));
+    }
+    r.insert(
+        "/Note".into(),
+        Served::Page(vec![entry("slow.note", "/Note/slow.note", false, 4)]),
+    );
+    r.insert(
+        "/Note/slow.note".into(),
+        Served::Slow(b"slow".to_vec(), 1500),
+    );
+    let url = fake_device(r);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("nomad");
+    let (u, d) = (url.clone(), dir.clone());
+    let run = std::thread::spawn(move || {
+        let opts = BackupOptions {
+            include_sd: false,
+            resume: false,
+            utc_offset: UtcOffset::UTC,
+        };
+        device_backup::backup(&u, &d, &opts, &mut quiet()).unwrap()
+    });
+    // while the download hangs, the report on disk says the run is not complete
+    let report = dir.join("backup.json");
+    let started = Instant::now();
+    while !report.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "no report written"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let text: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    assert_eq!(text["complete"], false, "{text}");
+    let data = data_with_account();
+    let err = run_import(data.path(), &dir, false).unwrap_err();
+    assert!(err.to_string().contains("did not finish"), "{err}");
+    // the finished run says complete and imports
+    let done = run.join().unwrap();
+    assert!(done.complete && done.errors.is_empty(), "{done:?}");
+    run_import(data.path(), &dir, false).unwrap();
+}
+
+#[test]
+fn a_date_that_does_not_parse_is_counted_in_the_report() {
+    let mut r = BTreeMap::new();
+    let mut bad = entry("a.note", "/Note/a.note", false, 1);
+    bad["date"] = json!("yesterday");
+    r.insert(
+        "/".into(),
+        Served::Page(vec![entry("Note", "/Note", true, 0)]),
+    );
+    r.insert("/Note".into(), Served::Page(vec![bad]));
+    r.insert("/Note/a.note".into(), Served::File(b"a".to_vec()));
+    let url = fake_device(r);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("nomad");
+    let opts = BackupOptions {
+        include_sd: false,
+        resume: false,
+        utc_offset: UtcOffset::UTC,
+    };
+    let report = device_backup::backup(&url, &dir, &opts, &mut quiet()).unwrap();
+    assert!(report.errors.is_empty());
+    assert_eq!(report.date_warnings, 1);
+    let json: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("backup.json")).unwrap()).unwrap();
+    assert_eq!(json["date_warnings"], 1);
+    assert_eq!(json["warnings"][0]["path"], "Note/a.note");
+    assert_eq!(std::fs::read(dir.join("Note/a.note")).unwrap(), b"a");
 }

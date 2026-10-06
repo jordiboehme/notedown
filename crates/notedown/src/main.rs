@@ -97,6 +97,13 @@ struct ImportArgs {
     /// Print the mapping and the counts, write nothing
     #[arg(long)]
     dry_run: bool,
+    /// Accept a backup without backup.json (a copy made another way, for example over USB).
+    /// Make sure the copy is complete: a missing file makes the device delete its own copy.
+    #[arg(long)]
+    no_report: bool,
+    /// Accept a backup without any files (the device is really empty)
+    #[arg(long)]
+    allow_empty: bool,
 }
 
 #[derive(clap::Args)]
@@ -583,7 +590,7 @@ fn print_scan(scan: &notedown_cloud::import::Scan) {
             SkipReason::SdCard | SkipReason::Unknown | SkipReason::BackupFile => {
                 println!("skipped {} ({})", s.path, s.reason.describe());
             }
-            SkipReason::Snbak | SkipReason::DotFile => {
+            SkipReason::Snbak | SkipReason::DotFile | SkipReason::HostJunk => {
                 *counts.entry(s.reason).or_default() += 1;
             }
         }
@@ -595,8 +602,13 @@ fn print_scan(scan: &notedown_cloud::import::Scan) {
 
 fn import_command(args: ImportArgs) -> Result<ExitCode> {
     use notedown_cloud::import;
+    let options = import::ImportOptions {
+        replace: args.replace,
+        no_report: args.no_report,
+        allow_empty: args.allow_empty,
+    };
     if args.dry_run {
-        let plan = import::dry_run(&args.data, &args.account, &args.backup)?;
+        let plan = import::dry_run(&args.data, &args.account, &args.backup, &options)?;
         println!("dry run, nothing is written");
         print_scan(&plan.scan);
         for e in &plan.scan.errors {
@@ -617,7 +629,11 @@ fn import_command(args: ImportArgs) -> Result<ExitCode> {
             plural(plan.scan.files() as usize, "file"),
             mb(plan.scan.bytes())
         );
-        return Ok(if plan.scan.errors.is_empty() {
+        let empty_refused = plan.scan.files() == 0 && !args.allow_empty;
+        if empty_refused {
+            println!("error: the backup holds no files; the import needs --allow-empty");
+        }
+        return Ok(if plan.scan.errors.is_empty() && !empty_refused {
             ExitCode::SUCCESS
         } else {
             ExitCode::from(1)
@@ -628,9 +644,7 @@ fn import_command(args: ImportArgs) -> Result<ExitCode> {
         &args.data,
         &args.account,
         &args.backup,
-        &import::ImportOptions {
-            replace: args.replace,
-        },
+        &options,
         &journal,
         &mut |line| eprintln!("{line}"),
     )?;
@@ -723,6 +737,12 @@ fn backup_device_command(args: BackupDeviceArgs) -> Result<ExitCode> {
             "{folder}: {}, {}",
             plural(t.files as usize, "file"),
             mb(t.bytes)
+        );
+    }
+    if report.date_warnings > 0 {
+        println!(
+            "{} could not be read (see backup.json)",
+            plural(report.date_warnings as usize, "file date")
         );
     }
     if report.skipped_existing > 0 {

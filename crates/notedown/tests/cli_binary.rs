@@ -384,6 +384,7 @@ fn cloud_import_dry_run_import_and_put() {
         "--account",
         "jordi",
         "--dry-run",
+        "--no-report",
     ]);
     assert!(
         out.status.success(),
@@ -406,7 +407,19 @@ fn cloud_import_dry_run_import_and_put() {
     assert!(!d.join("accounts/jordi/files").exists());
     assert!(!d.join("journal").exists());
 
-    let out = notedown(&["cloud", "import", b, "--data", data, "--account", "jordi"]);
+    let refused = notedown(&["cloud", "import", b, "--data", data, "--account", "jordi"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--no-report"));
+    let out = notedown(&[
+        "cloud",
+        "import",
+        b,
+        "--data",
+        data,
+        "--account",
+        "jordi",
+        "--no-report",
+    ]);
     assert!(
         out.status.success(),
         "{}",
@@ -417,7 +430,16 @@ fn cloud_import_dry_run_import_and_put() {
         "{}",
         stdout(&out)
     );
-    let again = notedown(&["cloud", "import", b, "--data", data, "--account", "jordi"]);
+    let again = notedown(&[
+        "cloud",
+        "import",
+        b,
+        "--data",
+        data,
+        "--account",
+        "jordi",
+        "--no-report",
+    ]);
     assert_eq!(again.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&again.stderr).contains("--replace"));
 

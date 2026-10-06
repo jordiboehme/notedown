@@ -14,8 +14,15 @@
 //!   size is checked against the listing, the date becomes its modification time, then it is
 //!   renamed. Three tries per file and per folder listing.
 //! - `REMOVABLE0` (the SD card) is skipped unless asked for.
-//! - `<dir>/backup.json` records the URL, the time, counts per top folder, the total bytes and
-//!   the errors.
+//! - `<dir>/backup.json` is written with `"complete": false` before the first download and
+//!   again at the end with `"complete": true`, the counts per top folder, the total bytes, the
+//!   errors and the dates that did not parse. A killed run leaves `false`, and the import
+//!   refuses it.
+//! - `resume` keeps a file only when its size and its date both match the listing.
+//! - Timeouts: 10 s to connect, and 60 s for the answer headers and for each read of the body
+//!   (reqwest's blocking `timeout` applies per send and per read, not to the whole transfer).
+//!   So a stalled download fails within a minute, and a large slow one that keeps moving does
+//!   not.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -83,14 +90,21 @@ pub struct BackupError {
 #[derive(Debug, Clone, Serialize)]
 pub struct BackupReport {
     pub url: String,
-    /// When the backup finished, RFC 3339.
+    /// When the backup started (while `complete` is false) or finished, RFC 3339.
     pub time: String,
+    /// False from the start of the run until it finished: a killed run leaves `false`, and
+    /// `notedown cloud import` refuses such a backup.
+    pub complete: bool,
     /// Per top folder (device name); files at the root count under [`ROOT_KEY`].
     pub folders: BTreeMap<String, FolderTotal>,
     /// Files in the backup (downloaded now or kept by `resume`).
     pub files: u64,
     pub bytes: u64,
     pub errors: Vec<BackupError>,
+    /// Listing dates that did not parse (the file keeps the download time as its mtime).
+    pub date_warnings: u64,
+    /// One entry per date warning.
+    pub warnings: Vec<BackupError>,
     /// Files kept from an earlier run (`resume`).
     #[serde(skip)]
     pub skipped_existing: u64,
@@ -181,6 +195,8 @@ struct Run<'a> {
     report: BackupReport,
     progress: &'a mut dyn FnMut(&str),
     downloaded: u64,
+    /// The backup folder, for paths in warnings.
+    root: PathBuf,
 }
 
 /// Copy the device at `url` (for example `http://192.168.1.30:8089`) into `dir`, which must be
@@ -225,27 +241,35 @@ pub fn backup(
         options: *options,
         report: BackupReport {
             url: url.to_string(),
-            time: String::new(),
+            time: now_rfc3339(),
+            complete: false,
             folders: BTreeMap::new(),
             files: 0,
             bytes: 0,
             errors: Vec::new(),
+            date_warnings: 0,
+            warnings: Vec::new(),
             skipped_existing: 0,
         },
         progress,
         downloaded: 0,
+        root: dir.to_path_buf(),
     };
+    // Written before the first download: a run that is killed leaves `complete: false`.
+    let report_path = dir.join(BACKUP_FILE);
+    crate::fsutil::write_atomic(&report_path, &crate::fsutil::json_bytes(&run.report), false)?;
     run.folder("/", dir, &[]);
-    run.report.time = OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .expect("rfc3339 formatting");
+    run.report.time = now_rfc3339();
+    run.report.complete = true;
     let report = run.report;
-    crate::fsutil::write_atomic(
-        &dir.join(BACKUP_FILE),
-        &crate::fsutil::json_bytes(&report),
-        false,
-    )?;
+    crate::fsutil::write_atomic(&report_path, &crate::fsutil::json_bytes(&report), false)?;
     Ok(report)
+}
+
+fn now_rfc3339() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .expect("rfc3339 formatting")
 }
 
 impl Run<'_> {
@@ -368,16 +392,32 @@ impl Run<'_> {
         target: &Path,
         siblings: &HashSet<String>,
     ) -> std::result::Result<bool, String> {
+        let mtime = parse_date(&entry.date, self.options.utc_offset);
+        if mtime.is_none() {
+            let path = target
+                .strip_prefix(&self.root)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| entry.name.clone());
+            let message = format!("the date {:?} does not parse", entry.date);
+            (self.progress)(&format!("warning: {path}: {message}"));
+            self.report.date_warnings += 1;
+            self.report.warnings.push(BackupError { path, message });
+        }
         if let Ok(meta) = std::fs::symlink_metadata(target) {
             if !meta.is_file() {
                 return Err("a folder or link is in the way".into());
             }
-            if self.options.resume && meta.len() == entry.size {
+            // Kept only when the size and the date both match: a file changed on the device
+            // since the earlier run is downloaded again.
+            if self.options.resume
+                && meta.len() == entry.size
+                && mtime.is_some()
+                && meta.modified().ok() == mtime
+            {
                 return Ok(true);
             }
         }
         let part = part_path(target, siblings);
-        let mtime = parse_date(&entry.date, self.options.utc_offset);
         let mut last = String::new();
         for _ in 0..TRIES {
             match self.fetch(&entry.uri, &part, mtime) {

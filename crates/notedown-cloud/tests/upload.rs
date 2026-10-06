@@ -2072,3 +2072,94 @@ async fn an_upload_into_a_folder_removed_out_of_band_answers_the_listed_id() {
         .to_string();
     assert_eq!(ev[0]["id"].as_u64().unwrap().to_string(), folder);
 }
+
+/// Ruling: the protect gate holds on every file route of a running session. Clearing the
+/// marker (as `import --replace` does) stops the next call, not only the next
+/// `synchronous/start`.
+#[tokio::test]
+async fn a_cleared_marker_closes_every_file_route_of_a_running_session() {
+    let s = Server::protected();
+    let t = s.session().await;
+    let done = s.upload(&t, "INBOX", "a.pdf", b"a").await;
+    assert_ok(&done);
+    let id = done["id"].as_str().unwrap().to_string();
+    let a = s.apply(&t, "/INBOX/b.pdf", "b.pdf", 1).await;
+    assert_ok(&a);
+    assert_ok(
+        &s.post(LIST, &t, json!({"equipmentNo": SERIAL, "path": "/"}))
+            .await,
+    );
+
+    let accounts = Accounts::new(s.data());
+    {
+        let _lock = accounts.lock("jordi").unwrap();
+        let mut acc = accounts.get("jordi").unwrap().unwrap();
+        acc.imported = None;
+        accounts.save(&acc).unwrap();
+    }
+    let calls: Vec<(&str, Value)> = vec![
+        (LIST, json!({"path": "/", "recursive": true})),
+        ("/api/file/3/files/list_folder_v3", json!({"id": "0"})),
+        ("/api/file/3/files/query_v3", json!({"id": id})),
+        (
+            "/api/file/3/files/query/by/path_v3",
+            json!({"path": "/INBOX/a.pdf"}),
+        ),
+        (DOWNLOAD, json!({"id": id})),
+        (
+            APPLY,
+            json!({"path": "/INBOX/c.pdf", "fileName": "c.pdf", "size": 1}),
+        ),
+        (
+            FINISH,
+            json!({"path": "/INBOX/", "fileName": "b.pdf", "content_hash": md5_of(b"b"),
+                   "innerName": a["innerName"], "size": "1"}),
+        ),
+        (
+            "/api/file/2/files/create_folder_v2",
+            json!({"path": "/INBOX/New"}),
+        ),
+        ("/api/file/3/files/delete_folder_v3", json!({"id": id})),
+        (
+            "/api/file/3/files/move_v3",
+            json!({"id": id, "to_path": "/INBOX/m.pdf"}),
+        ),
+        (
+            "/api/file/3/files/copy_v3",
+            json!({"id": id, "to_path": "/INBOX/c2.pdf"}),
+        ),
+    ];
+    for (path, mut body) in calls {
+        body["equipmentNo"] = json!(SERIAL);
+        let v = s.post(path, &t, body).await;
+        assert_err(&v, "E0079");
+        let e = s.requests_to(path).pop().unwrap();
+        assert!(
+            e["flags"].to_string().contains("protect_refused"),
+            "{path}: {e}"
+        );
+    }
+    let r = s
+        .send(a["fullUploadUrl"].as_str().unwrap(), "", "b.pdf", b"b")
+        .await;
+    assert_err(&r.json(), "E0079");
+    let r = s
+        .send(
+            a["partUploadUrl"].as_str().unwrap(),
+            "&uploadId=u&partNumber=1&totalChunks=1",
+            "b.pdf",
+            b"b",
+        )
+        .await;
+    assert_err(&r.json(), "E0079");
+    for path in [UPLOAD, PART] {
+        let e = s.requests_to(path).pop().unwrap();
+        assert!(
+            e["flags"].to_string().contains("protect_refused"),
+            "{path}: {e}"
+        );
+    }
+    // nothing changed on disk
+    assert!(s.account().join("files/INBOX/a.pdf").exists());
+    assert!(!s.account().join("files/INBOX/New").exists());
+}

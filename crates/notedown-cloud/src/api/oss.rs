@@ -376,9 +376,25 @@ async fn upload_target(
         )));
     }
     let (st, t) = (state.clone(), target.clone());
-    match tokio::task::spawn_blocking(move || generation_current(&st, &t)).await {
-        Ok(Ok(true)) => {}
-        Ok(Ok(false)) => {
+    // The token generation, then the protect gate (as on every file route).
+    let checked = tokio::task::spawn_blocking(move || -> crate::Result<Option<bool>> {
+        if !generation_current(&st, &t)? {
+            return Ok(None);
+        }
+        let account = st.auth.accounts().get(&t.account)?;
+        Ok(Some(account.is_some_and(|a| {
+            super::files::protect_gate(&st, &a, &t.device).is_none()
+        })))
+    })
+    .await;
+    match checked {
+        Ok(Ok(Some(true))) => {}
+        Ok(Ok(Some(false))) => {
+            return Err(Box::new(
+                super::files::protect_refused(&serial).into_response(),
+            ));
+        }
+        Ok(Ok(None)) => {
             return Err(Box::new(plain_error(
                 E_SIGNATURE,
                 FLAG_STALE_TOKEN,

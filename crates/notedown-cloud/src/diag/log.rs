@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::{Date, Month, OffsetDateTime, format_description::well_known::Rfc3339};
 
+use super::capture::Capture;
 use super::mask::{
     MAX_FIELD_BYTES, Origin, cap_text, cut_body, mask_form, mask_headers, mask_json_from,
 };
@@ -155,6 +156,7 @@ pub struct ProtocolLog {
     max_bytes: u64,
     clock: Arc<dyn Clock>,
     dropped: AtomicU64,
+    capture: Option<Capture>,
     state: Mutex<State>,
 }
 
@@ -251,6 +253,7 @@ impl ProtocolLog {
             max_bytes,
             clock,
             dropped: AtomicU64::new(0),
+            capture: None,
             state: Mutex::new(State {
                 day,
                 file,
@@ -266,6 +269,17 @@ impl ProtocolLog {
             log.rotate(&mut st);
         }
         Ok(log)
+    }
+
+    /// Also write every request and frame as a masked dump (see [`Capture`]).
+    pub fn with_capture(mut self, capture: Capture) -> ProtocolLog {
+        self.capture = Some(capture);
+        self
+    }
+
+    /// Capture dumps that could not be written (0 when capture is off).
+    pub fn capture_failures(&self) -> u64 {
+        self.capture.as_ref().map_or(0, Capture::failed)
     }
 
     pub fn logs_dir(&self) -> &Path {
@@ -340,6 +354,12 @@ impl ProtocolLog {
         let now = self.clock.now();
         if entry.ts.is_empty() {
             entry.ts = now.format(&Rfc3339).unwrap_or_default();
+        }
+        // The entry is sanitized here: the dump has the masking of the log line.
+        if let Some(capture) = &self.capture
+            && entry.kind != LogKind::Marker
+        {
+            capture.write(&entry, now);
         }
         let mut line = match serde_json::to_string(&entry) {
             Ok(l) => l,

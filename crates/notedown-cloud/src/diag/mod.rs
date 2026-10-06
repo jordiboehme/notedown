@@ -1,9 +1,11 @@
 //! Diagnostics: the always-on protocol log.
 
+mod capture;
 mod log;
 mod mask;
 mod rotate;
 
+pub use capture::Capture;
 pub use log::{Clock, LogEntry, LogKind, ProtocolLog, SystemClock};
 pub use mask::{
     MAX_BODY_BYTES, MAX_FIELD_BYTES, Origin, cap_text, contains_jwt, cut_body, is_masked,

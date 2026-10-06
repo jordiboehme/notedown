@@ -8,7 +8,7 @@ use tokio::net::TcpListener;
 
 use crate::api::limit::{RateLimiter, RetryTracker};
 use crate::auth::Auth;
-use crate::diag::{Clock, ProtocolLog, SystemClock};
+use crate::diag::{Capture, Clock, ProtocolLog, SystemClock};
 use crate::{Config, Error, Result};
 
 pub use crate::api::router;
@@ -45,6 +45,11 @@ impl AppState {
             config.log_max_bytes,
             clock.clone(),
         )?;
+        let log = if config.capture {
+            log.with_capture(Capture::open(data_dir)?)
+        } else {
+            log
+        };
         Ok(Arc::new(AppState {
             auth: Auth::open(data_dir)?,
             log,
@@ -63,8 +68,8 @@ impl AppState {
     }
 }
 
-/// Bind every address of `config.listen` and serve until a listener fails.
-pub async fn serve(config: Config, data_dir: &Path) -> Result<()> {
+/// Bind every address of `config.listen`.
+pub async fn bind(config: &Config) -> Result<Vec<TcpListener>> {
     let mut listeners = Vec::new();
     for addr in &config.listen {
         let l = TcpListener::bind(addr)
@@ -75,32 +80,78 @@ pub async fn serve(config: Config, data_dir: &Path) -> Result<()> {
             })?;
         listeners.push(l);
     }
+    Ok(listeners)
+}
+
+/// Bind every address of `config.listen` and serve until a listener fails.
+pub async fn serve(config: Config, data_dir: &Path) -> Result<()> {
+    let listeners = bind(&config).await?;
     let state = AppState::open(config, data_dir)?;
     serve_listeners(listeners, state).await
 }
 
 /// Serve on listeners that are already bound (tests bind `127.0.0.1:0`).
 pub async fn serve_listeners(listeners: Vec<TcpListener>, state: Arc<AppState>) -> Result<()> {
+    serve_until(listeners, state, std::future::pending()).await
+}
+
+/// How long open connections (a device keeps its socket open) get to finish after `shutdown`.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Serve until `shutdown` completes, then stop accepting, give open requests a short grace and
+/// return. Every log line is flushed when it is written, so nothing is pending afterwards.
+pub async fn serve_until(
+    listeners: Vec<TcpListener>,
+    state: Arc<AppState>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<()> {
     let app = router(state);
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let mut set = tokio::task::JoinSet::new();
     for l in listeners {
         let addr = l.local_addr().ok();
         let app = app.clone();
+        let mut stop = stop_rx.clone();
         set.spawn(async move {
-            let r = axum::serve(l, app.into_make_service_with_connect_info::<SocketAddr>()).await;
+            let r = axum::serve(l, app.into_make_service_with_connect_info::<SocketAddr>())
+                .with_graceful_shutdown(async move {
+                    let _ = stop.wait_for(|s| *s).await;
+                })
+                .await;
             (addr, r)
         });
     }
-    while let Some(joined) = set.join_next().await {
+    let mut shutdown = std::pin::pin!(shutdown);
+    let mut stopping = false;
+    loop {
+        let joined = if stopping {
+            match tokio::time::timeout(SHUTDOWN_GRACE, set.join_next()).await {
+                Ok(j) => j,
+                Err(_) => {
+                    set.abort_all();
+                    return Ok(());
+                }
+            }
+        } else {
+            tokio::select! {
+                j = set.join_next() => j,
+                () = &mut shutdown => {
+                    stopping = true;
+                    let _ = stop_tx.send(true);
+                    continue;
+                }
+            }
+        };
         match joined {
-            Ok((_, Ok(()))) => {}
-            Ok((addr, Err(source))) => {
+            None => return Ok(()),
+            Some(Ok((_, Ok(())))) => {}
+            Some(Ok((addr, Err(source)))) => {
                 return Err(Error::Serve {
                     addr: addr.map(|a| a.to_string()).unwrap_or_default(),
                     source,
                 });
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 return Err(Error::Serve {
                     addr: String::new(),
                     source: std::io::Error::other(e.to_string()),
@@ -108,5 +159,4 @@ pub async fn serve_listeners(listeners: Vec<TcpListener>, state: Arc<AppState>) 
             }
         }
     }
-    Ok(())
 }

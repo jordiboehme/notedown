@@ -34,11 +34,23 @@ enum Command {
         #[command(subcommand)]
         action: ModelAction,
     },
+    /// Run the capture server for a Supernote device (sync is refused, no files are exchanged)
+    Serve(ServeArgs),
     /// The Supernote cloud server and its data folder
     Cloud {
         #[command(subcommand)]
         action: CloudAction,
     },
+}
+
+#[derive(clap::Args)]
+struct ServeArgs {
+    /// The data folder (server.toml, accounts, logs)
+    #[arg(long, value_name = "DIR")]
+    data: PathBuf,
+    /// Also write every request and frame, masked, to <data>/capture/ (this run only)
+    #[arg(long)]
+    capture: bool,
 }
 
 #[derive(Subcommand)]
@@ -461,12 +473,99 @@ fn cloud_command(action: CloudAction) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The URLs a device can use: `http://<ip>:<port>` for each listen address. A wildcard address
+/// expands to every non-loopback IPv4 address of this host (`host_ips`).
+fn device_urls(listen: &[std::net::SocketAddr], host_ips: &[std::net::Ipv4Addr]) -> Vec<String> {
+    let mut urls = Vec::new();
+    for addr in listen {
+        match addr.ip() {
+            std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
+                urls.extend(
+                    host_ips
+                        .iter()
+                        .map(|h| format!("http://{h}:{}", addr.port())),
+                );
+            }
+            std::net::IpAddr::V4(ip) if !ip.is_loopback() => {
+                urls.push(format!("http://{ip}:{}", addr.port()));
+            }
+            _ => {}
+        }
+    }
+    urls
+}
+
+fn host_ipv4s() -> Vec<std::net::Ipv4Addr> {
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|i| match i.ip() {
+            std::net::IpAddr::V4(ip) if !ip.is_loopback() => Some(ip),
+            _ => None,
+        })
+        .collect()
+}
+
+fn serve_command(args: ServeArgs) -> Result<ExitCode> {
+    use notedown_cloud::Config;
+    use notedown_cloud::server::{AppState, bind, serve_until};
+    let mut config = Config::load_or_create(&args.data)?;
+    // The flag counts for this run only; server.toml is not rewritten.
+    config.capture |= args.capture;
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let listeners = bind(&config).await?;
+        let state = AppState::open(config.clone(), &args.data)?;
+        println!("notedown cloud capture server");
+        for l in &listeners {
+            println!("listening on: {}", l.local_addr()?);
+        }
+        let bound: Vec<_> = listeners
+            .iter()
+            .filter_map(|l| l.local_addr().ok())
+            .collect();
+        let urls = device_urls(&bound, &host_ipv4s());
+        if urls.is_empty() {
+            println!("device URL: none found, use the IP address of this host");
+        }
+        for url in urls {
+            println!("device URL: {url}");
+        }
+        if let Some(url) = &config.external_base_url {
+            println!("external base URL: {url}");
+        }
+        println!("data folder: {}", args.data.display());
+        println!("log folder: {}", state.log.logs_dir().display());
+        if config.capture {
+            println!("capture dumps: {}/capture", args.data.display());
+        }
+        println!("capture mode: sync is refused, no files are exchanged");
+        println!("press Ctrl-C to stop");
+        std::io::stdout().flush()?;
+        serve_until(listeners, state.clone(), async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+        println!("stopped");
+        let (dropped, failed) = (state.log.dropped_lines(), state.log.capture_failures());
+        if dropped > 0 {
+            eprintln!("warning: {dropped} log lines could not be written");
+        }
+        if failed > 0 {
+            eprintln!("warning: {failed} capture dumps could not be written");
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(ExitCode::SUCCESS)
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Convert(a) => convert(a),
         Command::Render(a) => render(a),
         Command::Model { action } => model_command(action),
+        Command::Serve(a) => serve_command(a),
         Command::Cloud { action } => cloud_command(action),
     };
     let _ = std::io::stdout().flush();
@@ -482,5 +581,31 @@ fn main() -> ExitCode {
             }
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn wildcard_listen_expands_to_host_addresses() {
+        let listen = ["0.0.0.0:19072".parse().unwrap()];
+        let ips = [Ipv4Addr::new(192, 168, 1, 20), Ipv4Addr::new(10, 0, 0, 5)];
+        assert_eq!(
+            device_urls(&listen, &ips),
+            ["http://192.168.1.20:19072", "http://10.0.0.5:19072"]
+        );
+    }
+
+    #[test]
+    fn loopback_gives_no_device_url_and_a_lan_address_stays() {
+        let ips = [Ipv4Addr::new(192, 168, 1, 20)];
+        assert!(device_urls(&["127.0.0.1:19072".parse().unwrap()], &ips).is_empty());
+        assert_eq!(
+            device_urls(&["192.168.1.7:80".parse().unwrap()], &ips),
+            ["http://192.168.1.7:80"]
+        );
     }
 }

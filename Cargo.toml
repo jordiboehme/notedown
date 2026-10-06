@@ -35,8 +35,9 @@ md-5 = "=0.11.0"
 rand = "=0.10.3"
 subtle = "=2.6.1"
 rpassword = "=7.5.4"
+if-addrs = "=0.15.0"
 axum = { version = "=0.8.9", features = ["ws"] }
-tokio = { version = "=1.53.2", features = ["net", "rt-multi-thread", "macros", "sync", "time", "io-util"] }
+tokio = { version = "=1.53.2", features = ["net", "rt-multi-thread", "macros", "sync", "time", "io-util", "signal"] }
 tower-http = { version = "=0.7.1", features = ["catch-panic"] }
 tower = { version = "=0.5.3", features = ["util"] }
 tokio-tungstenite = "=0.30.0"

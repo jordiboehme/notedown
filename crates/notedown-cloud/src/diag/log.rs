@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::{Date, Month, OffsetDateTime, format_description::well_known::Rfc3339};
 
-use super::mask::{MAX_FIELD_BYTES, cap_text, cut_body, mask_form, mask_headers, mask_json};
+use super::mask::{
+    MAX_FIELD_BYTES, Origin, cap_text, cut_body, mask_form, mask_headers, mask_json_from,
+};
 use super::rotate::{LogFile, plan_deletions};
 use crate::{Result, io_err};
 
@@ -121,9 +123,11 @@ impl LogEntry {
             .take()
             .map(|q| cap_text(&mask_form(&q), MAX_FIELD_BYTES));
         self.headers = mask_headers(&self.headers);
-        let prep = |v: Option<Value>| v.map(|v| cut_body(&mask_json(&v)));
-        self.request_body = prep(self.request_body.take());
-        self.response_body = prep(self.response_body.take());
+        // Request bodies and in-frames come from the device, responses and out-frames from the
+        // server (`code` is masked only in device data, see `Origin`).
+        let prep = |v: Option<Value>, o| v.map(|v| cut_body(&mask_json_from(&v, o)));
+        self.request_body = prep(self.request_body.take(), Origin::Client);
+        self.response_body = prep(self.response_body.take(), Origin::Server);
         self
     }
 }

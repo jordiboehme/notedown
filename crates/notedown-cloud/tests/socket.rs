@@ -271,6 +271,7 @@ async fn handshake_request_is_logged_once_with_the_token_masked() {
         !text.contains("c2lnbmF0dXJlLXZhbHVl"),
         "sign in clear in the log"
     );
+    assert!(e.get("flags").is_none(), "{e}");
     assert!(
         !e["flags"]
             .as_array()
@@ -471,8 +472,12 @@ async fn secrets_in_frames_are_masked() {
     )
     .await;
     sync(&mut ws).await;
+    send(&mut ws, r#"42["ClientMessage","{\"code\":\"777123\"}"]"#).await;
+    sync(&mut ws).await;
     close(ws).await;
-    assert!(!s.log_text().contains("s3cr3t-value"));
+    let text = s.log_text();
+    assert!(!text.contains("s3cr3t-value"));
+    assert!(!text.contains("777123"), "a code from the device is masked");
 }
 
 // bad tokens
@@ -513,7 +518,19 @@ async fn garbage_token_is_rejected_with_403_and_closed() {
     let hs = s.handshakes();
     assert_eq!(hs.len(), 1, "{hs:?}");
     assert_eq!(hs[0]["response_status"], 101);
-    assert_eq!(hs[0]["device"], SERIAL);
+    // The claimed serial is not trusted: no device, but the flag and the serial in the query.
+    assert!(hs[0].get("device").is_none(), "{}", hs[0]);
+    assert_eq!(hs[0]["flags"], serde_json::json!(["unauthenticated"]));
+    assert!(hs[0]["query"].as_str().unwrap().contains(SERIAL));
+    for e in s.log().iter().filter(|e| e["kind"] == "frame") {
+        assert!(e.get("device").is_none(), "{e}");
+    }
+    // A result code from the server stays readable (only device data masks `code`).
+    assert!(
+        out[2].1.contains(r#"\"code\":\"403\""#),
+        "403 masked in the log: {}",
+        out[2].1
+    );
 }
 
 #[tokio::test]
@@ -554,4 +571,117 @@ async fn socket_works_on_every_listener() {
         close(ws).await;
     }
     assert_eq!(s.handshakes().len(), 2);
+}
+
+// limits and broken connections
+
+/// Wait until the log holds an entry for which `f` is true.
+async fn wait_for_log(s: &Server, what: &str, f: impl Fn(&Value) -> bool) -> Value {
+    for _ in 0..200 {
+        if let Some(e) = s.log().into_iter().find(|e| f(e)) {
+            return e;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("no log entry for {what}: {}", s.log_text());
+}
+
+fn ended(e: &Value) -> bool {
+    e["kind"] == "frame"
+        && e["direction"] == "in"
+        && e["request_body"]
+            .as_str()
+            .is_some_and(|b| b.starts_with("<connection ended"))
+}
+
+#[tokio::test]
+async fn oversized_frame_ends_the_session() {
+    use notedown_cloud::socket::handler::MAX_FRAME_BYTES;
+    let s = Server::start().await;
+    let mut ws = s.session().await;
+    // Just at the limit is fine.
+    let at_limit = format!("2{}", "x".repeat(MAX_FRAME_BYTES - 1));
+    send(&mut ws, &at_limit).await;
+    assert_eq!(recv(&mut ws).await.len(), MAX_FRAME_BYTES);
+    let big = format!("2{}", "x".repeat(MAX_FRAME_BYTES));
+    let _ = ws.send(Message::text(big)).await;
+    // The server ends the session: the stream ends or fails, no answer comes.
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("session not ended")
+        {
+            None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+            Some(Ok(Message::Text(t))) => panic!("answered an oversized frame: {} bytes", t.len()),
+            Some(Ok(_)) => continue,
+        }
+    }
+    wait_for_log(&s, "the oversized frame", ended).await;
+    // The server is still fine.
+    let mut ws = s.session().await;
+    sync(&mut ws).await;
+    close(ws).await;
+}
+
+#[tokio::test]
+async fn rejected_session_has_the_same_frame_limit() {
+    use notedown_cloud::socket::handler::MAX_FRAME_BYTES;
+    let s = Server::start().await;
+    let mut ws = s.connect(Some("bad")).await;
+    let _ = ws
+        .send(Message::text("x".repeat(MAX_FRAME_BYTES + 1)))
+        .await;
+    // The rejection still arrives and the session ends without a panic.
+    expect_rejected(&mut ws).await;
+}
+
+#[tokio::test]
+async fn abrupt_tcp_drop_ends_the_session() {
+    for reset in [false, true] {
+        let s = Server::start().await;
+        let mut ws = s.session().await;
+        sync(&mut ws).await;
+        if reset {
+            let MaybeTlsStream::Plain(tcp) = ws.get_mut() else {
+                panic!("plain TCP expected");
+            };
+            // RST instead of FIN on drop.
+            tcp.set_zero_linger().unwrap();
+        }
+        // No close handshake: the socket just goes away.
+        drop(ws);
+        let e = wait_for_log(&s, "the dropped connection", ended).await;
+        assert_eq!(e["device"], SERIAL);
+        let mut ws = s.session().await;
+        sync(&mut ws).await;
+        close(ws).await;
+    }
+}
+
+#[tokio::test]
+async fn a_device_that_stops_reading_is_dropped_after_the_send_timeout() {
+    use notedown_cloud::socket::handler::SEND_TIMEOUT;
+    let s = Server::start().await;
+    let mut ws = s.session().await;
+    // Pings with a large payload get equally large pongs; the client never reads them, so the
+    // server's sends block once the socket buffers are full.
+    let ping = format!("2{}", "p".repeat(512 * 1024));
+    for _ in 0..256 {
+        let sent =
+            tokio::time::timeout(Duration::from_secs(1), ws.send(Message::text(ping.clone())))
+                .await;
+        if !matches!(sent, Ok(Ok(()))) {
+            break;
+        }
+    }
+    let started = std::time::Instant::now();
+    wait_for_log(&s, "the send timeout", |e| {
+        e["kind"] == "frame"
+            && e["response_body"]
+                .as_str()
+                .is_some_and(|b| b.starts_with("<send timed out"))
+    })
+    .await;
+    assert!(started.elapsed() <= SEND_TIMEOUT + Duration::from_secs(5));
+    drop(ws);
 }

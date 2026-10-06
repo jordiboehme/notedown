@@ -29,8 +29,24 @@ const SUFFIX: &str = " chars>";
 /// contains password, token, secret, authorization, cookie, sign, randomcode or validcode, or is
 /// exactly `code`.
 pub fn is_sensitive_key(key: &str) -> bool {
+    is_sensitive_key_from(key, Origin::Client)
+}
+
+/// Who wrote the data being masked. The bare key `code` is a login code only in data the device
+/// sends; in server data (HTTP responses, server-to-device frames) it is a result code such as
+/// `"403"` and stays readable. Every other key is masked whatever the origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// Request query, request body, device-to-server frames.
+    Client,
+    /// HTTP responses, server-to-device frames.
+    Server,
+}
+
+/// [`is_sensitive_key`] for data of the given origin.
+pub fn is_sensitive_key_from(key: &str, origin: Origin) -> bool {
     let k = key.to_ascii_lowercase();
-    k == "code" || SENSITIVE_PARTS.iter().any(|p| k.contains(p))
+    (k == "code" && origin == Origin::Client) || SENSITIVE_PARTS.iter().any(|p| k.contains(p))
 }
 
 /// Header names: the key rule plus anything containing `auth`, and `channel` (the device may
@@ -91,20 +107,27 @@ fn mask_value(v: &Value) -> Value {
 /// optional numeric Engine.IO prefix such as `42`) or urlencoded pairs is masked inside; when that
 /// changes anything, the string is replaced by the masked text (still a string).
 pub fn mask_json(value: &Value) -> Value {
+    mask_json_from(value, Origin::Client)
+}
+
+/// [`mask_json`] for data of the given origin (see [`Origin`]).
+pub fn mask_json_from(value: &Value, origin: Origin) -> Value {
     match value {
         Value::Object(map) => Value::Object(
             map.iter()
                 .map(|(k, v)| {
-                    if is_sensitive_key(k) {
+                    if is_sensitive_key_from(k, origin) {
                         (k.clone(), mask_value(v))
                     } else {
-                        (k.clone(), mask_json(v))
+                        (k.clone(), mask_json_from(v, origin))
                     }
                 })
                 .collect(),
         ),
-        Value::Array(items) => Value::Array(items.iter().map(mask_json).collect()),
-        Value::String(s) => Value::String(mask_text(s)),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|v| mask_json_from(v, origin)).collect())
+        }
+        Value::String(s) => Value::String(mask_text_from(s, origin)),
         other => other.clone(),
     }
 }
@@ -150,9 +173,13 @@ fn looks_like_form(s: &str) -> bool {
 /// Mask sensitive values in urlencoded `key=value` pairs (query strings and form bodies). A pair
 /// without `=` is kept.
 pub fn mask_form(text: &str) -> String {
+    mask_form_from(text, Origin::Client)
+}
+
+fn mask_form_from(text: &str, origin: Origin) -> String {
     text.split('&')
         .map(|pair| match pair.split_once('=') {
-            Some((k, v)) if is_sensitive_key(&percent_decode(k)) => {
+            Some((k, v)) if is_sensitive_key_from(&percent_decode(k), origin) => {
                 format!("{k}={}", mask_str(v))
             }
             _ => pair.to_string(),
@@ -168,24 +195,29 @@ pub fn mask_query(query: &str) -> String {
 
 /// Mask secrets inside a free text: embedded JSON (optionally behind digits, as in the Engine.IO
 /// frame `42["ClientMessage","{\"token\":\"abc\"}"]`) or urlencoded pairs. Any other text (cut or
-/// broken JSON, a form with a bare flag, free text) is masked by substring with [`mask_pairs`].
+/// broken JSON, a form with a bare flag, free text) is masked by substring (`mask_pairs_from`).
 pub fn mask_text(s: &str) -> String {
+    mask_text_from(s, Origin::Client)
+}
+
+/// [`mask_text`] for data of the given origin (see [`Origin`]).
+pub fn mask_text_from(s: &str, origin: Origin) -> String {
     let trimmed = s.trim_start();
     let digits = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
     let (prefix, rest) = trimmed.split_at(digits);
     if rest.starts_with(['{', '[', '"'])
         && let Ok(parsed) = serde_json::from_str::<Value>(rest)
     {
-        let masked = mask_json(&parsed);
+        let masked = mask_json_from(&parsed, origin);
         if masked != parsed {
             return format!("{prefix}{masked}");
         }
         return s.to_string();
     }
     if looks_like_form(s) {
-        return mask_form(s);
+        return mask_form_from(s, origin);
     }
-    mask_pairs(s)
+    mask_pairs_from(s, origin)
 }
 
 fn is_key_byte(b: u8) -> bool {
@@ -196,7 +228,7 @@ fn is_key_byte(b: u8) -> bool {
 /// `"key": value`, `\"key\":\"value\"`, `'key': value`, `key: value` or `key=value`, the value
 /// up to its closing quote (or the end of the text when the quote is missing) or, unquoted, up to
 /// the next `,`, `}`, `]`, `&`, `;`, quote or whitespace is replaced by the placeholder.
-pub fn mask_pairs(s: &str) -> String {
+fn mask_pairs_from(s: &str, origin: Origin) -> String {
     let b = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut copied = 0;
@@ -224,7 +256,7 @@ pub fn mask_pairs(s: &str) -> String {
             j += 1;
         }
         j = skip_ws(j);
-        if !matches!(b.get(j), Some(b':' | b'=')) || !is_sensitive_key(key) {
+        if !matches!(b.get(j), Some(b':' | b'=')) || !is_sensitive_key_from(key, origin) {
             continue;
         }
         j = skip_ws(j + 1);

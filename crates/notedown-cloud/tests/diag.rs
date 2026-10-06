@@ -126,6 +126,56 @@ fn record_masks_before_writing() {
     assert_eq!(v["request_body"]["password"], "<masked:8 chars>");
 }
 
+#[test]
+fn code_is_masked_only_in_device_data() {
+    use notedown_cloud::diag::{Origin, mask_json_from, mask_text_from};
+    // Server data: result codes stay readable, every other secret stays masked.
+    let resp = mask_json_from(
+        &json!({"code": "403", "errorCode": "E0019", "randomCode": "abc", "token": "t",
+                "inner": "{\"code\":\"200\",\"password\":\"pw\"}"}),
+        Origin::Server,
+    );
+    assert_eq!(resp["code"], "403");
+    assert_eq!(resp["errorCode"], "E0019");
+    assert_eq!(resp["randomCode"], "<masked:3 chars>");
+    assert_eq!(resp["token"], "<masked:1 chars>");
+    let inner = resp["inner"].as_str().unwrap();
+    assert!(inner.contains(r#""code":"200""#), "{inner}");
+    assert!(!inner.contains(r#""pw""#), "{inner}");
+    assert_eq!(
+        mask_text_from("code=403&token=abc", Origin::Server),
+        "code=403&token=<masked:3 chars>"
+    );
+    // Device data: `code` is a login code.
+    assert_eq!(
+        mask_json_from(&json!({"code": "123456"}), Origin::Client)["code"],
+        "<masked:6 chars>"
+    );
+    assert_eq!(mask_json(&json!({"code": "1"}))["code"], "<masked:1 chars>");
+
+    // Through the log: request body and query mask `code`, the response keeps it.
+    let dir = tempfile::tempdir().unwrap();
+    let log =
+        ProtocolLog::open_with_clock(dir.path(), 30, 1 << 30, FakeClock::at(2026, 10, 6)).unwrap();
+    let mut e = req("/api/x");
+    e.query = Some("code=QCODE".into());
+    e.request_body = Some(json!({"code": "BODYCODE"}));
+    e.response_body = Some(json!({"code": "403", "errorCode": "E0019", "token": "SECRETJWT"}));
+    log.record(e);
+    let mut f = LogEntry::new(LogKind::Frame);
+    f.request_body = Some(Value::String(
+        r#"42["ClientMessage","{\"code\":\"FRAMECODE\"}"]"#.into(),
+    ));
+    log.record(f);
+    let text = std::fs::read_to_string(dir.path().join("logs/protocol-2026-10-06.jsonl")).unwrap();
+    for secret in ["QCODE", "BODYCODE", "SECRETJWT", "FRAMECODE"] {
+        assert!(!text.contains(secret), "{secret} in {text}");
+    }
+    let v: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(v["response_body"]["code"], "403");
+    assert_eq!(v["response_body"]["errorCode"], "E0019");
+}
+
 // ---- rotation ----
 
 #[test]

@@ -23,13 +23,15 @@ use axum::http::{Method, Uri};
 use axum::response::{IntoResponse, Response};
 
 use crate::api::catchall::catch_all;
-use crate::api::envelope::LogDevice;
-use crate::auth::Devices;
+use crate::api::envelope::{LogDevice, LogFlags};
 use crate::server::AppState;
 use handler::{Access, Session};
 
 /// The socket path (4.1).
 pub const PATH: &str = "/socket.io/";
+
+/// Flag of a handshake whose token was missing, bad or stale.
+pub const FLAG_UNAUTHENTICATED: &str = "unauthenticated";
 
 /// The handshake route. A request that is not a WebSocket upgrade (for example Engine.IO long
 /// polling) gets the envelope of the catch-all and the `unknown_endpoint` flag.
@@ -53,22 +55,26 @@ pub async fn upgrade(
             Err(_) => (Access::Denied("Token verification failed"), None),
         }
     };
-    // Without a valid token the serial the client names in `type` (logged as sent).
-    let device = device.or_else(|| {
-        query
-            .get("type")
-            .filter(|t| Devices::valid_serial(t))
-            .cloned()
-    });
+    // Without a valid token the device stays unnamed: the serial it claims is visible in the
+    // logged query only.
+    let denied = matches!(access, Access::Denied(_));
     let session = Session {
         state,
         sid: handler::new_sid(),
         device: device.clone(),
         path: uri.path().to_string(),
     };
+    let ws = ws
+        .max_message_size(handler::MAX_FRAME_BYTES)
+        .max_frame_size(handler::MAX_FRAME_BYTES);
     let mut response = ws.on_upgrade(move |socket| handler::run(socket, session, access));
     if let Some(d) = device {
         response.extensions_mut().insert(LogDevice(d));
+    }
+    if denied {
+        response
+            .extensions_mut()
+            .insert(LogFlags(vec![FLAG_UNAUTHENTICATED.to_string()]));
     }
     response
 }

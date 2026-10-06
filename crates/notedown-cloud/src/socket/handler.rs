@@ -19,6 +19,14 @@ pub const FLAG_UNKNOWN_EVENT: &str = "unknown_event";
 /// must see the device's own heartbeat style, so the Engine.IO ping timeout is not enforced.
 pub const IDLE_LIMIT: Duration = Duration::from_secs(10 * 60);
 
+/// A send or close that does not finish within this time (the device stopped reading) ends the
+/// session.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Largest WebSocket message and frame the server reads. Heartbeats are a few bytes; a larger
+/// frame ends the session (logged as a receive error) instead of filling memory.
+pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
 const SID_LEN: usize = 20;
 const SID_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
@@ -60,10 +68,27 @@ impl Session {
         self.state.log.record(e);
     }
 
-    /// Log, then send. `false` when the connection is gone.
+    /// Log, then send. `false` when the connection is gone or the send timed out.
     async fn send(&self, ws: &mut WebSocket, frame: String) -> bool {
         self.log("out", Value::String(frame.clone()), &[]);
-        ws.send(Message::text(frame)).await.is_ok()
+        self.send_bounded(ws, Message::text(frame)).await
+    }
+
+    async fn send_bounded(&self, ws: &mut WebSocket, msg: Message) -> bool {
+        match tokio::time::timeout(SEND_TIMEOUT, ws.send(msg)).await {
+            Ok(r) => r.is_ok(),
+            Err(_) => {
+                self.log(
+                    "out",
+                    Value::String(format!(
+                        "<send timed out after {} s, session ended>",
+                        SEND_TIMEOUT.as_secs()
+                    )),
+                    &[],
+                );
+                false
+            }
+        }
     }
 
     async fn close(&self, ws: &mut WebSocket, code: u16, reason: &'static str) {
@@ -72,12 +97,11 @@ impl Session {
             Value::String(format!("<close {code} {reason}>")),
             &[],
         );
-        let _ = ws
-            .send(Message::Close(Some(CloseFrame {
-                code,
-                reason: reason.into(),
-            })))
-            .await;
+        let close = Message::Close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        }));
+        self.send_bounded(ws, close).await;
     }
 }
 
@@ -105,7 +129,12 @@ pub async fn run(mut ws: WebSocket, session: Session, access: Access) {
                 session.close(&mut ws, close_code::AWAY, "idle").await;
                 return;
             }
-            Ok(None | Some(Err(_))) => return,
+            Ok(None) => return,
+            Ok(Some(Err(e))) => {
+                // A dropped connection, a frame above MAX_FRAME_BYTES or a protocol error.
+                session.log("in", Value::String(format!("<connection ended: {e}>")), &[]);
+                return;
+            }
             Ok(Some(Ok(msg))) => msg,
         };
         match msg {

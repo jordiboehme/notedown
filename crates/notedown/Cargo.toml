@@ -21,6 +21,8 @@ image.workspace = true
 time.workspace = true
 notedown-note.workspace = true
 notedown-ocr.workspace = true
+notedown-cloud.workspace = true
+rpassword.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

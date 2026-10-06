@@ -34,6 +34,54 @@ enum Command {
         #[command(subcommand)]
         action: ModelAction,
     },
+    /// The Supernote cloud server and its data folder
+    Cloud {
+        #[command(subcommand)]
+        action: CloudAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CloudAction {
+    /// Manage the accounts of a data folder
+    Account {
+        /// The data folder
+        #[arg(long, value_name = "DIR")]
+        data: PathBuf,
+        #[command(subcommand)]
+        action: AccountAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AccountAction {
+    /// Create an account
+    Add {
+        /// Folder name of the account (a-z, 0-9, - and _)
+        slug: String,
+        /// Email the device logs in with
+        #[arg(long)]
+        email: String,
+        /// Read the password from the first line of stdin instead of asking for it
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Set a new password (also unlocks the account)
+    Passwd {
+        slug: String,
+        /// Read the password from the first line of stdin instead of asking for it
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// List the accounts
+    List,
+    /// Delete an account with all its files
+    Remove {
+        slug: String,
+        /// Confirm the deletion
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(clap::Args)]
@@ -335,12 +383,91 @@ fn model_command(action: ModelAction) -> Result<ExitCode> {
     }
 }
 
+fn read_password(from_stdin: bool, confirm: bool) -> Result<String> {
+    let password = if from_stdin {
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("reading the password from stdin")?;
+        line.trim_end_matches(['\r', '\n']).to_string()
+    } else {
+        let first = rpassword::prompt_password("Password: ").context("reading the password")?;
+        if confirm {
+            let second =
+                rpassword::prompt_password("Repeat password: ").context("reading the password")?;
+            if first != second {
+                return Err(anyhow!("the passwords do not match"));
+            }
+        }
+        first
+    };
+    if password.is_empty() {
+        return Err(anyhow!("the password must not be empty"));
+    }
+    Ok(password)
+}
+
+fn cloud_command(action: CloudAction) -> Result<ExitCode> {
+    use notedown_cloud::auth::Accounts;
+    let CloudAction::Account { data, action } = action;
+    let accounts = Accounts::new(&data);
+    match action {
+        AccountAction::Add {
+            slug,
+            email,
+            password_stdin,
+        } => {
+            // Validate before asking for a password.
+            notedown_cloud::auth::validate_slug(&slug)?;
+            if accounts.get(&slug)?.is_some() {
+                return Err(anyhow!("account {slug} already exists"));
+            }
+            let password = read_password(password_stdin, true)?;
+            let a = accounts.create(&slug, &email, &password)?;
+            println!("created account {} (user id {})", a.slug, a.user_id);
+        }
+        AccountAction::Passwd {
+            slug,
+            password_stdin,
+        } => {
+            if accounts.get(&slug)?.is_none() {
+                return Err(anyhow!("account {slug} does not exist"));
+            }
+            let password = read_password(password_stdin, true)?;
+            accounts.set_password(&slug, &password)?;
+            println!("password of {slug} changed");
+        }
+        AccountAction::List => {
+            for a in accounts.list()? {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    a.slug,
+                    a.email,
+                    a.user_id,
+                    if a.locked { "locked" } else { "active" }
+                );
+            }
+        }
+        AccountAction::Remove { slug, yes } => {
+            if !yes {
+                return Err(anyhow!(
+                    "this deletes account {slug} with all its files; add --yes to confirm"
+                ));
+            }
+            accounts.remove(&slug)?;
+            println!("removed account {slug}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Convert(a) => convert(a),
         Command::Render(a) => render(a),
         Command::Model { action } => model_command(action),
+        Command::Cloud { action } => cloud_command(action),
     };
     let _ = std::io::stdout().flush();
     match result {

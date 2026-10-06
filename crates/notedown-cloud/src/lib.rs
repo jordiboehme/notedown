@@ -1,7 +1,11 @@
 //! notedown-cloud: a file-based Supernote Private Cloud server.
 //!
-//! This crate currently holds the configuration and the always-on protocol log.
+//! This crate currently holds the configuration, the always-on protocol log and the accounts,
+//! login codes and tokens.
 
+pub(crate) mod fsutil;
+
+pub mod auth;
 pub mod config;
 pub mod diag;
 
@@ -21,6 +25,12 @@ pub enum Error {
         path: std::path::PathBuf,
         message: String,
     },
+    #[error("invalid {what}: {message}")]
+    Invalid { what: &'static str, message: String },
+    #[error("account {0} already exists")]
+    AccountExists(String),
+    #[error("account {0} does not exist")]
+    NoAccount(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

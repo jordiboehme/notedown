@@ -483,3 +483,43 @@ fn channel_header_and_jwt_shaped_header_values_are_masked() {
     assert!(m["x-custom"].starts_with("<masked:"));
     assert_eq!(m["user-agent"], "okhttp/3.12");
 }
+
+#[test]
+fn text_that_is_neither_json_nor_form_is_masked_by_substring() {
+    use notedown_cloud::diag::mask_text;
+    let md5 = "5ebe2294ecd0e0f08eab7690d2a6ee69";
+    // cut JSON
+    let cut = format!(r#"{{"account":"a","password":"{md5}","equipmentNo":"X"#);
+    let m = mask_text(&cut);
+    assert!(!m.contains(md5), "{m}");
+    assert!(m.contains(r#""password":"<masked:32 chars>""#), "{m}");
+    assert!(m.contains(r#""account":"a""#), "{m}");
+    // value cut before its closing quote
+    let m = mask_text(r#"{"account":"a","token":"eyJabc.def"#);
+    assert!(!m.contains("eyJabc"), "{m}");
+    // a form with a bare flag, and other spellings of the listed keys
+    let m = mask_text("password=hunter2&flag");
+    assert_eq!(m, "password=<masked:7 chars>&flag");
+    for (text, secret) in [
+        ("passwordMd5: abc123 rest", "abc123"),
+        ("x-access-token=tok123;", "tok123"),
+        ("'randomCode': 'Ab12Cd34'", "Ab12Cd34"),
+        ("sign=s1g; code=9876 validCode=777", "9876"),
+        ("validCode=777 tail", "777"),
+        (r#"42["ClientMessage","{\"token\":\"abc"#, "abc"),
+        (r#"{"password":"a\"b secret"#, "secret"),
+        ("CODE=4321", "4321"),
+    ] {
+        let m = mask_text(text);
+        assert!(!m.contains(secret), "{text} -> {m}");
+        assert!(m.contains("<masked:"), "{text} -> {m}");
+    }
+    // harmless text stays as it is; masking twice is stable
+    assert_eq!(mask_text("errorCode=E0019 hello"), "errorCode=E0019 hello");
+    assert_eq!(
+        mask_text("plain words, no secrets"),
+        "plain words, no secrets"
+    );
+    let once = mask_text(&cut);
+    assert_eq!(mask_text(&once), once);
+}

@@ -167,8 +167,8 @@ pub fn mask_query(query: &str) -> String {
 }
 
 /// Mask secrets inside a free text: embedded JSON (optionally behind digits, as in the Engine.IO
-/// frame `42["ClientMessage","{\"token\":\"abc\"}"]`) or urlencoded pairs. Other text is returned
-/// unchanged.
+/// frame `42["ClientMessage","{\"token\":\"abc\"}"]`) or urlencoded pairs. Any other text (cut or
+/// broken JSON, a form with a bare flag, free text) is masked by substring with [`mask_pairs`].
 pub fn mask_text(s: &str) -> String {
     let trimmed = s.trim_start();
     let digits = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
@@ -185,7 +185,100 @@ pub fn mask_text(s: &str) -> String {
     if looks_like_form(s) {
         return mask_form(s);
     }
-    s.to_string()
+    mask_pairs(s)
+}
+
+fn is_key_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
+}
+
+/// Mask by substring: after every sensitive key name (see [`is_sensitive_key`]) written as
+/// `"key": value`, `\"key\":\"value\"`, `'key': value`, `key: value` or `key=value`, the value
+/// up to its closing quote (or the end of the text when the quote is missing) or, unquoted, up to
+/// the next `,`, `}`, `]`, `&`, `;`, quote or whitespace is replaced by the placeholder.
+pub fn mask_pairs(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0;
+    let mut i = 0;
+    let skip_ws = |mut j: usize| {
+        while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+            j += 1;
+        }
+        j
+    };
+    while i < b.len() {
+        if !is_key_byte(b[i]) || (i > 0 && is_key_byte(b[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && is_key_byte(b[i]) {
+            i += 1;
+        }
+        let key = &s[start..i];
+        let mut j = i;
+        if b.get(j) == Some(&b'\\') && b.get(j + 1) == Some(&b'"') {
+            j += 2;
+        } else if matches!(b.get(j), Some(b'"' | b'\'')) {
+            j += 1;
+        }
+        j = skip_ws(j);
+        if !matches!(b.get(j), Some(b':' | b'=')) || !is_sensitive_key(key) {
+            continue;
+        }
+        j = skip_ws(j + 1);
+        let quote: Option<&str> = if b.get(j) == Some(&b'\\') && b.get(j + 1) == Some(&b'"') {
+            Some("\\\"")
+        } else if b.get(j) == Some(&b'"') {
+            Some("\"")
+        } else if b.get(j) == Some(&b'\'') {
+            Some("'")
+        } else {
+            None
+        };
+        let (vstart, vend, next) = match quote {
+            Some(q) => {
+                let vstart = j + q.len();
+                let end = if q == "\"" {
+                    // Skip escaped characters, so `\"` inside the value does not end it.
+                    let mut k = vstart;
+                    loop {
+                        match b.get(k) {
+                            None => break None,
+                            Some(b'\\') => k += 2,
+                            Some(b'"') => break Some(k - vstart),
+                            Some(_) => k += 1,
+                        }
+                    }
+                } else {
+                    s[vstart..].find(q)
+                };
+                match end {
+                    Some(k) => (vstart, vstart + k, vstart + k + q.len()),
+                    None => (vstart, s.len(), s.len()),
+                }
+            }
+            None => {
+                let vend = s[j..]
+                    .find(|c: char| {
+                        matches!(c, ',' | '}' | ']' | '&' | ';' | '"' | '\'' | '\\')
+                            || c.is_whitespace()
+                    })
+                    .map_or(s.len(), |k| j + k);
+                (j, vend, vend)
+            }
+        };
+        let value = &s[vstart..vend];
+        if !is_masked(value) {
+            out.push_str(&s[copied..vstart]);
+            out.push_str(&placeholder(value.chars().count()));
+            copied = vend;
+        }
+        i = next.max(i);
+    }
+    out.push_str(&s[copied..]);
+    out
 }
 
 /// Mask header values by name (case-insensitive), cut every value at [`MAX_FIELD_BYTES`].

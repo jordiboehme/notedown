@@ -225,7 +225,7 @@ async fn finish_sequence(s: &Server) -> String {
     assert_eq!(login["isBind"], "N");
     assert_eq!(login["isBindEquipment"], "N");
     assert_eq!(login["soldOutCount"], 0);
-    assert_eq!(login["userName"], "jordi");
+    assert_eq!(login["userName"], EMAIL);
 
     assert_ok(&s.bind(SERIAL, "202407").await);
 
@@ -239,7 +239,7 @@ async fn finish_sequence(s: &Server) -> String {
         .await;
     assert_ok(&user);
     assert_eq!(user["email"], EMAIL);
-    assert_eq!(user["userName"], "jordi");
+    assert_eq!(user["userName"], EMAIL);
     assert!(user["userId"].as_u64().unwrap() >= 1_000_001);
     assert_eq!(user["fileServer"], "0");
     assert_eq!(user["isNormal"], "Y");
@@ -1172,4 +1172,72 @@ async fn oversized_body_to_a_known_route_is_not_called_unknown() {
     let logged = s.requests_to("/api/official/user/account/login/equipment");
     assert_eq!(logged.len(), 1);
     assert!(logged[0].get("flags").is_none(), "{}", logged[0]);
+}
+
+// fix round 1
+
+#[tokio::test]
+async fn truncated_login_body_never_leaks_the_hash() {
+    let s = Server::new();
+    let secret = "5ebe2294ecd0e0f08eab7690d2a6ee69";
+    let body = format!(r#"{{"account":"{EMAIL}","password":"{secret}","equipmentNo":"SN07"#);
+    let (status, v) = s
+        .raw(
+            "127.0.0.1:1",
+            "POST",
+            "/api/official/user/account/login/equipment",
+            &[("content-type", "application/json; charset=UTF-8")],
+            Body::from(body),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_err(&v, "422");
+    let text = s.log_text();
+    assert!(!text.contains(secret), "{text}");
+    assert!(text.contains("<masked:32 chars>"), "{text}");
+    // a form body with a bare flag
+    s.raw(
+        "127.0.0.1:1",
+        "POST",
+        "/api/some/form",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        Body::from("password=hunter2&flag"),
+    )
+    .await;
+    assert!(!s.log_text().contains("hunter2"));
+}
+
+#[tokio::test]
+async fn percent_encoded_file_path_is_refused() {
+    let s = Server::new();
+    for path in [
+        "/api/%66ile/2/files/list_folder",
+        "/api/file%2F2/files/list_folder",
+        "/%61pi/oss/upload",
+    ] {
+        let v = s.call("POST", path, &[], Some(json!({}))).await;
+        assert_err(&v, "E0079");
+        let logged = s.requests_to(path);
+        assert_eq!(logged.len(), 1, "{path}");
+        assert_eq!(logged[0]["flags"], json!(["unknown_endpoint"]), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn oversized_body_to_an_unknown_path_is_flagged() {
+    let s = Server::new();
+    let (status, v) = s
+        .raw(
+            "127.0.0.1:1",
+            "POST",
+            "/api/nowhere",
+            &[("content-type", "application/json")],
+            Body::from(vec![b' '; MAX_REQUEST_BODY + 1]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_err(&v, "422");
+    let logged = s.requests_to("/api/nowhere");
+    assert_eq!(logged.len(), 1);
+    assert_eq!(logged[0]["flags"], json!(["unknown_endpoint"]));
 }

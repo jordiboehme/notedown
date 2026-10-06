@@ -35,6 +35,29 @@ pub const FLAG_UNKNOWN: &str = "unknown_endpoint";
 pub const FLAG_RETRY: &str = "retry_suspected";
 pub const FLAG_FIRMWARE: &str = "firmware_changed";
 
+/// The implemented routes (method, path), besides the refused families. A request outside
+/// them and outside the documented refused endpoints is flagged `unknown_endpoint`.
+const IMPLEMENTED: &[(&str, &str)] = &[
+    ("POST", "/api/terminal/equipment/unlink"),
+    ("POST", "/api/official/user/check/exists/server"),
+    ("POST", "/api/official/user/query/random/code"),
+    ("POST", "/api/official/user/account/login/equipment"),
+    ("POST", "/api/terminal/user/bindEquipment"),
+    ("POST", "/api/user/query"),
+    ("POST", "/api/equipment/bind/status"),
+    ("POST", "/api/user/logout"),
+    ("POST", "/api/user/query/token"),
+    ("GET", "/api/file/query/server"),
+    ("POST", "/api/file/query/server"),
+    ("POST", "/api/official/system/base/param"),
+];
+
+fn is_implemented(method: &axum::http::Method, path: &str) -> bool {
+    IMPLEMENTED
+        .iter()
+        .any(|(m, p)| method.as_str() == *m && path == *p)
+}
+
 /// The client address used for rate limits: the peer, or the `X-Forwarded-For` client when the
 /// peer is a trusted proxy.
 #[derive(Debug, Clone, Copy)]
@@ -226,8 +249,14 @@ pub async fn log_request(
             let reply = if refuse::is_refused_path(&normalized) {
                 refuse::refusal(&parts.method, &parts.uri)
             } else {
-                // The note in request_body explains it; the route may well be a known one.
-                Reply::bad_params("body too large")
+                // The note in request_body explains the refusal; only a path no route takes is
+                // unknown.
+                let reply = Reply::bad_params("body too large");
+                if is_implemented(&parts.method, parts.uri.path()) {
+                    reply
+                } else {
+                    reply.flag(FLAG_UNKNOWN)
+                }
             };
             reply.into_response()
         }

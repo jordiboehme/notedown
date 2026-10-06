@@ -90,8 +90,32 @@ const DOCUMENTED: &[(&str, &str)] = &[
     ("POST", "/api/file/download/url"),
 ];
 
-/// Collapse repeated slashes and lowercase, so `//API//file/x` cannot slip past the refusal.
+/// Decode `%XX` escapes of a path (`+` stays as it is). Invalid escapes are kept.
+fn percent_decode_path(path: &str) -> String {
+    let b = path.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && let Some(v) = b
+                .get(i + 1..i + 3)
+                .and_then(|h| std::str::from_utf8(h).ok())
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Percent-decode, collapse repeated slashes and lowercase, so `//API//%66ile/x` cannot slip past
+/// the refusal.
 pub fn normalize(path: &str) -> String {
+    let path = percent_decode_path(path);
     let mut out = String::with_capacity(path.len() + 1);
     for seg in path.split('/').filter(|s| !s.is_empty()) {
         out.push('/');

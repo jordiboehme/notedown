@@ -43,7 +43,7 @@ pub async fn user_query(State(state): State<Arc<AppState>>, headers: HeaderMap) 
     };
     Reply::ok(json!({
         "userId": a.account.user_id,
-        "userName": a.account.user_name,
+        "userName": a.account.email,
         "email": a.account.email,
         "telephone": null,
         "countryCode": null,

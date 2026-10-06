@@ -163,7 +163,8 @@ pub async fn login_equipment(
     Reply::ok(json!({
         "token": ok.token,
         "counts": ok.failed_logins_before.to_string(),
-        "userName": ok.account.user_name,
+        // The device trace shows the email here (docs/sync-protocol.md 2.4).
+        "userName": ok.account.email,
         "avatarsUrl": null,
         "lastUpdateTime": null,
         "isBind": yn(any_bound),

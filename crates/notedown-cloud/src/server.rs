@@ -1,4 +1,4 @@
-//! The capture server: state, router and listeners.
+//! The cloud server: state, router and listeners.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -101,6 +101,7 @@ impl AppState {
             Ok(n) => eprintln!("notedown cloud: removed {n} stale upload staging entries"),
             Err(e) => eprintln!("notedown cloud: staging sweep failed: {e}"),
         }
+        report_temp_sweep(crate::store::sweep_all_temps(data_dir));
         Ok(Arc::new(AppState {
             auth: Auth::open(data_dir)?,
             url_signer: UrlSigner::load_or_create(data_dir)?,
@@ -198,9 +199,24 @@ impl AppState {
         staging::sweep(&self.data_dir, self.now_ms())
     }
 
+    /// Remove stale temp files (`.nd-*.tmp`, older than one hour) from every account's
+    /// `files/`, under each store lock. Blocking. The server runs it on start and every hour
+    /// (not on every request: it walks the whole tree).
+    pub fn sweep_temps(&self) -> Result<usize> {
+        crate::store::sweep_all_temps(&self.data_dir)
+    }
+
     /// Milliseconds since the epoch, from the clock.
     pub fn now_ms(&self) -> u64 {
         now_ms_of(self.clock.as_ref())
+    }
+}
+
+fn report_temp_sweep(r: Result<usize>) {
+    match r {
+        Ok(0) => {}
+        Ok(n) => eprintln!("notedown cloud: removed {n} stale temp files"),
+        Err(e) => eprintln!("notedown cloud: temp file sweep failed: {e}"),
     }
 }
 
@@ -256,7 +272,8 @@ pub async fn serve_until(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let app = router(state.clone());
-    // The hourly staging sweep (the first one ran at start); stopped when this returns.
+    // The hourly staging and temp file sweep (the first one ran at start); stopped when this
+    // returns.
     let _sweeper = AbortOnDrop(tokio::spawn(async move {
         let mut every = tokio::time::interval(crate::sync::staging::SWEEP_INTERVAL);
         every.tick().await;
@@ -268,6 +285,11 @@ pub async fn serve_until(
                 Ok(Ok(n)) => eprintln!("notedown cloud: removed {n} stale upload staging entries"),
                 Ok(Err(e)) => eprintln!("notedown cloud: staging sweep failed: {e}"),
                 Err(e) => eprintln!("notedown cloud: staging sweep failed: {e}"),
+            }
+            let st = state.clone();
+            match tokio::task::spawn_blocking(move || st.sweep_temps()).await {
+                Ok(r) => report_temp_sweep(r),
+                Err(e) => eprintln!("notedown cloud: temp file sweep failed: {e}"),
             }
         }
     }));

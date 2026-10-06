@@ -15,8 +15,11 @@
 //! behind. With a `pending.json` recovery checks whether the change is applied ([`PendingOp`]
 //! lists the check per operation). Applied: it brings the registry up to date and appends the
 //! events that the journal does not have yet (`origin: "repair"`), found by the `opId` in the
-//! journal after the `journalSeq` stored in the intent. Not applied: it discards the intent. It
-//! also sweeps stale temp files (`.nd-*.tmp`, older than one hour) from `files/`.
+//! journal after the `journalSeq` stored in the intent. Not applied: it discards the intent.
+//!
+//! Stale temp files (`.nd-*.tmp`, older than one hour) are swept from `files/` at server start
+//! and with the hourly staging sweep ([`sweep_all_temps`]), not on every lock: the sweep walks
+//! the whole tree.
 //!
 //! Lock order: the store lock first, then `journal/.lock`.
 
@@ -1686,10 +1689,9 @@ impl Store {
 
     // ------------------------------------------------------------------ recovery
 
-    /// Finish or discard an unfinished commit and sweep stale temp files (see the module docs).
+    /// Finish or discard an unfinished commit (see the module docs).
     pub fn recover(&self, guard: &StoreGuard, journal: &Journal) -> Result<Recovery> {
         self.check_guard(guard)?;
-        self.sweep_temps()?;
         self.recover_pending(guard, journal)
     }
 
@@ -1786,7 +1788,7 @@ impl Store {
     }
 
     /// Remove `.nd-*.tmp` files older than [`STALE_TEMP_AGE`] anywhere below `files/`. Symlinks
-    /// are not followed. Returns how many were removed.
+    /// are not followed. Returns how many were removed. The caller holds the store lock.
     pub fn sweep_temps(&self) -> Result<usize> {
         fn walk(dir: &Path, now: SystemTime, removed: &mut usize) -> Result<()> {
             let entries = match std::fs::read_dir(dir) {
@@ -1830,6 +1832,35 @@ impl Store {
         walk(&self.files, SystemTime::now(), &mut removed)?;
         Ok(removed)
     }
+}
+
+/// [`Store::sweep_temps`] under the store lock for every account with a `files/` folder: at
+/// server start and with the hourly staging sweep. An account whose store cannot be opened (a
+/// damaged one, say) is reported on stderr and skipped. Returns how many files were removed.
+pub fn sweep_all_temps(data_dir: &Path) -> Result<usize> {
+    let accounts = crate::auth::Accounts::new(data_dir);
+    let mut removed = 0;
+    for account in accounts.list()? {
+        if !accounts
+            .account_dir(&account.slug)
+            .join(super::FILES_DIR)
+            .is_dir()
+        {
+            continue;
+        }
+        let swept = Store::open(data_dir, &account.slug).and_then(|store| {
+            let _guard = store.lock()?;
+            store.sweep_temps()
+        });
+        match swept {
+            Ok(n) => removed += n,
+            Err(e) => eprintln!(
+                "notedown cloud: account {}: temp file sweep failed: {e}",
+                account.slug
+            ),
+        }
+    }
+    Ok(removed)
 }
 
 /// Run [`Store::recover`] for every account that may need it: one with a `pending.json` or with

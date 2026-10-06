@@ -950,7 +950,7 @@ fn a_commit_first_finishes_an_earlier_unfinished_one() {
 }
 
 #[test]
-fn recovery_sweeps_stale_temp_files_only() {
+fn the_server_sweeps_stale_temp_files_at_start_and_hourly_not_recovery() {
     let f = Fixture::new();
     let dir = f.store.fs_path(&wp("NOTE/Note"));
     let old = dir.join(".nd-1-1.tmp");
@@ -968,10 +968,30 @@ fn recovery_sweeps_stale_temp_files_only() {
             .set_modified(two_hours_ago)
             .unwrap();
     }
+    // Recovery (every lock of every request) does not walk the tree any more.
     assert_eq!(f.restart_and_recover(), Recovery::Clean);
+    assert!(old.exists());
+    // The server start sweeps.
+    let state =
+        notedown_cloud::server::AppState::open(notedown_cloud::Config::default(), f.dir.path())
+            .unwrap();
     assert!(!old.exists());
     assert!(fresh.exists());
     assert!(other.exists());
+    // And the hourly sweep does too.
+    std::fs::write(&old, b"x").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(two_hours_ago)
+        .unwrap();
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    drop(g);
+    assert!(old.exists());
+    assert_eq!(state.sweep_temps().unwrap(), 1);
+    assert!(!old.exists());
+    assert!(fresh.exists());
 }
 
 #[test]

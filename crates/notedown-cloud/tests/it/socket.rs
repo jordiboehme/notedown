@@ -703,7 +703,7 @@ async fn wait_connected(s: &Server, connected: bool) {
 async fn a_registered_session_receives_a_pushed_frame_and_logs_it() {
     let s = Server::start().await;
     let mut ws = s.session().await;
-    wait_connected(&s, true).await;
+    sync(&mut ws).await;
     let frame = notedown_cloud::push::server_message_frame("{\"x\":1}");
     assert!(s.state.sockets.send("jordi", SERIAL, frame.clone()));
     assert_eq!(recv(&mut ws).await, frame);
@@ -723,7 +723,10 @@ async fn a_second_session_of_the_same_device_replaces_the_first() {
     wait_connected(&s, true).await;
     let mut second = s.session().await;
     match next(&mut first).await {
-        Some(Message::Close(Some(f))) => assert_eq!(f.reason.as_str(), "replaced"),
+        Some(Message::Close(Some(f))) => {
+            assert_eq!(u16::from(f.code), 1001);
+            assert_eq!(f.reason.as_str(), "replaced");
+        }
         other => panic!("expected the close with reason replaced, got {other:?}"),
     }
     expect_closed(&mut first).await;
@@ -739,6 +742,7 @@ async fn the_replaced_sessions_end_keeps_the_new_registration() {
     let first = s.session().await;
     wait_connected(&s, true).await;
     let mut second = s.session().await;
+    sync(&mut second).await;
     close(first).await;
     sync(&mut second).await;
     assert!(s.state.sockets.is_connected("jordi", SERIAL));

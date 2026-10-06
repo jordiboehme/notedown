@@ -110,6 +110,24 @@ mod tests {
     }
 
     #[test]
+    fn replacing_a_session_with_a_full_channel_still_ends_its_receiver() {
+        let r = SocketRegistry::new();
+        let mut first = r.register("jordi", "SN1", "a");
+        for _ in 0..CHANNEL_CAPACITY {
+            assert!(r.send("jordi", "SN1", "f".into()));
+        }
+        let _second = r.register("jordi", "SN1", "b");
+        for _ in 0..CHANNEL_CAPACITY {
+            assert_eq!(first.try_recv().unwrap(), frame("f"));
+        }
+        // The notice did not fit; the dropped sender is what tells the session.
+        assert_eq!(
+            first.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        );
+    }
+
+    #[test]
     fn unregister_with_the_old_sid_keeps_the_new_entry() {
         let r = SocketRegistry::new();
         let _first = r.register("jordi", "SN1", "a");

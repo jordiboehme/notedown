@@ -156,9 +156,12 @@ pub async fn run(mut ws: WebSocket, session: Session, access: Access) {
         }
         _ => (None, None),
     };
+    // The idle rule counts frames from the device only: the deadline moves when a message
+    // arrives, never when the server pushes, so a half-open session cannot swallow pushes forever.
+    let mut deadline = tokio::time::Instant::now() + IDLE_LIMIT;
     loop {
         let msg = tokio::select! {
-            received = tokio::time::timeout(IDLE_LIMIT, ws.recv()) => match received {
+            received = tokio::time::timeout_at(deadline, ws.recv()) => match received {
                 Err(_) => {
                     session.close(&mut ws, close_code::AWAY, "idle").await;
                     return;
@@ -169,7 +172,10 @@ pub async fn run(mut ws: WebSocket, session: Session, access: Access) {
                     session.log("in", Value::String(format!("<connection ended: {e}>")), &[]);
                     return;
                 }
-                Ok(Some(Ok(msg))) => msg,
+                Ok(Some(Ok(msg))) => {
+                    deadline = tokio::time::Instant::now() + IDLE_LIMIT;
+                    msg
+                }
             },
             out = recv_outbound(&mut rx) => match out {
                 Outbound::Frame(frame) => {
@@ -243,13 +249,14 @@ pub async fn run(mut ws: WebSocket, session: Session, access: Access) {
     }
 }
 
-/// The next server instruction. Pends forever when the session has no channel or the registry
-/// dropped its sender (the session then ends with its connection).
+/// The next server instruction. Pends forever when the session has no channel. A registered
+/// session whose sender is gone was replaced (the registry dropped it, and the notice may have
+/// been lost on a full channel), so that is the same as `Close("replaced")`.
 async fn recv_outbound(rx: &mut Option<tokio::sync::mpsc::Receiver<Outbound>>) -> Outbound {
     match rx {
         Some(rx) => match rx.recv().await {
             Some(out) => out,
-            None => std::future::pending().await,
+            None => Outbound::Close("replaced"),
         },
         None => std::future::pending().await,
     }

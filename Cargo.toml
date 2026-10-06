@@ -37,7 +37,7 @@ subtle = "=2.6.1"
 rpassword = "=7.5.4"
 if-addrs = "=0.15.0"
 axum = { version = "=0.8.9", features = ["ws"] }
-tokio = { version = "=1.53.2", features = ["net", "rt-multi-thread", "macros", "sync", "time", "io-util", "signal"] }
+tokio = { version = "=1.53.2", features = ["net", "rt-multi-thread", "sync", "time", "signal"] }
 tower-http = { version = "=0.7.1", features = ["catch-panic"] }
 tower = { version = "=0.5.3", features = ["util"] }
 tokio-tungstenite = "=0.30.0"

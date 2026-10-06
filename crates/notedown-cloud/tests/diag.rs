@@ -491,6 +491,12 @@ fn config_defaults_created_and_round_trip() {
     assert_eq!(c.log_max_bytes, 1 << 30);
     let text = std::fs::read_to_string(dir.path().join("server.toml")).unwrap();
     assert!(text.ends_with('\n'));
+    assert!(
+        text.contains("# For one capture session only.") && text.contains("\ncapture = false\n"),
+        "{text}"
+    );
+    let comment = text.find("# For one capture session only.").unwrap();
+    assert!(comment < text.find("\ncapture = ").unwrap(), "{text}");
     assert_eq!(Config::load_or_create(dir.path()).unwrap(), c);
 
     let custom = Config {

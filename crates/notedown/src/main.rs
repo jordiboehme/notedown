@@ -511,6 +511,7 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
     use notedown_cloud::server::{AppState, bind, serve_until};
     let mut config = Config::load_or_create(&args.data)?;
     // The flag counts for this run only; server.toml is not rewritten.
+    let capture_from_file = config.capture && !args.capture;
     config.capture |= args.capture;
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
@@ -538,6 +539,12 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
         println!("log folder: {}", state.log.logs_dir().display());
         if config.capture {
             println!("capture dumps: {}/capture", args.data.display());
+        }
+        if capture_from_file {
+            eprintln!(
+                "warning: capture = true is set in server.toml. Capture is for one capture \
+                 session only, the dumps have no size cap. Set capture = false and use --capture."
+            );
         }
         println!("capture mode: sync is refused, no files are exchanged");
         println!("press Ctrl-C to stop");

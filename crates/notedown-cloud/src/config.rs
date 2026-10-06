@@ -10,6 +10,10 @@ use crate::{Error, Result, io_err};
 
 pub const CONFIG_FILE: &str = "server.toml";
 
+/// The comment above `capture` in the written `server.toml`.
+pub const CAPTURE_COMMENT: &str = "# For one capture session only. The dumps in capture/ have no size cap \
+     and no rotation.\n# Prefer `notedown serve --capture`, which counts for one run.";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -23,7 +27,9 @@ pub struct Config {
     pub trusted_proxies: Vec<IpAddr>,
     /// Log and refuse device deletes, moves and overwrites.
     pub protect: bool,
-    /// Write full, masked dumps of every request and frame to `capture/`.
+    /// Write full, masked dumps of every request and frame to `capture/`. For one capture
+    /// session only: the dumps have no size cap and no rotation. The `--capture` flag of
+    /// `serve` is the usual way; it counts for one run.
     pub capture: bool,
     /// Protocol log files older than this many days are deleted.
     pub log_retention_days: u32,
@@ -75,6 +81,11 @@ impl Config {
             path: path.clone(),
             message: e.to_string(),
         })?;
+        let text = text.replacen(
+            "\ncapture = ",
+            &format!("\n{CAPTURE_COMMENT}\ncapture = "),
+            1,
+        );
         let tmp = data_dir.join(format!(".{CONFIG_FILE}.tmp"));
         let write = || -> std::io::Result<()> {
             let mut f = std::fs::File::create(&tmp)?;

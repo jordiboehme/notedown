@@ -24,6 +24,9 @@ notedown cloud import ~/supernote-backup --data ~/notedown-data --account me
 notedown serve --data ~/notedown-data
 ```
 
+On the device, log out of Ratta's cloud and **always choose "Retain locally"**. Then log in to the
+Private Cloud with the `device URL` that the server prints, and select the folders to sync.
+
 Don't skip a step here: a cloud that misses files makes the device delete them. The
 [getting started guide](docs/getting-started.md) describes every step, with the backup, the first
 sync and the way back.

@@ -141,15 +141,17 @@ After the login to a new account, no folders are selected. Every sync then ends 
 
 Start a manual sync on the device. If the import was complete, the device finds nothing to change and ends with success. Nothing is uploaded, downloaded or deleted.
 
-Then look at the log before you do anything else. It's in `~/notedown-data/logs/` (one file per day). Passwords, login codes and tokens are masked. Go on only if the log shows no unexpected delete.
-
-### 10. Try one change
-
-Write a few strokes into a note and sync again. The server stores the new version and keeps the old one in the recycle bin. The journal names the changed page:
+Then check that nothing was deleted before you do anything else:
 
 ```sh
 notedown cloud journal tail --data ~/notedown-data
 ```
+
+The import wrote one `file.created` line per file. After this sync there must be no `file.deleted` line. Go on only then. The full protocol log is in `~/notedown-data/logs/` (one file per day, passwords and tokens masked) if someone helps you look into a problem.
+
+### 10. Try one change
+
+Write a few strokes into a note and sync again. The server stores the new version and keeps the old one in the recycle bin. `notedown cloud journal tail` now shows a `file.modified` line and a `page.modified` line for the changed page.
 
 Now you can turn "Auto Sync" on. Done.
 
@@ -178,7 +180,9 @@ The device downloads it at its next sync.
 
 ## The way back
 
-Log out of the Private Cloud on the device, choose "Retain locally" and log in to Ratta's cloud again. Your files stay on the device. The data folder stays as it is, so you can come back later (run the import again with `--replace` first, because the device changed in the meantime).
+Log out of the Private Cloud on the device, choose "Retain locally" and log in to Ratta's cloud again. Your files stay on the device. The data folder stays as it is.
+
+To come back later, never reuse the old backup: the device changed in the meantime, and a file that's missing in the cloud gets deleted on the device. Stop writing, make a new backup into a new folder (step 3), import that one with `--replace` (step 4) and go on with step 5.
 
 ## Troubleshooting
 

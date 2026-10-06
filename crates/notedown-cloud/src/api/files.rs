@@ -20,7 +20,7 @@ use crate::Error;
 use crate::auth::{Account, DEFAULT_QUOTA_BYTES};
 use crate::journal::Origin;
 use crate::server::AppState;
-use crate::store::{Entry, Kind, PutOptions, Store, StoreGuard, WirePath};
+use crate::store::{Entry, Kind, PendingOp, PutOptions, Store, StoreGuard, WirePath};
 use crate::sync::staging;
 use crate::sync::urls::{base_url, download_url, upload_url};
 use crate::sync::{Purpose, SignedTarget, StartOutcome};
@@ -732,17 +732,45 @@ fn finish_upload(state: &AppState, a: FinishArgs) -> crate::Result<Finished> {
         staging::Claim::Missing => return cannot(FLAG_UPLOAD_MISSING),
         staging::Claim::ParentMismatch => return cannot(FLAG_PARENT_MISMATCH),
     };
-    let len = std::fs::metadata(&data).map_err(|e| Error::Io {
-        path: data.clone(),
+    let r = finish_claimed(state, &store, &a, &entry, &target, &data);
+    if r.is_err() {
+        // Not committed: give the bytes back so the finish can be retried. An intent that
+        // names the claimed file belongs to recovery and is left alone.
+        let staged_in_intent = match store.pending() {
+            Ok(Some(c)) => matches!(
+                &c.op,
+                PendingOp::Put { staged, .. } if store.account_dir().join(staged) == data
+            ),
+            _ => false,
+        };
+        if !staged_in_intent && let Err(e) = state.staging_locks.release(&entry, &data) {
+            eprintln!("notedown cloud: cannot give the upload back: {e}");
+        }
+    }
+    r
+}
+
+/// The part of [`finish_upload`] after the claim: verify size and MD5 and commit.
+fn finish_claimed(
+    state: &AppState,
+    store: &Store,
+    a: &FinishArgs,
+    entry: &std::path::Path,
+    target: &WirePath,
+    data: &std::path::Path,
+) -> crate::Result<Finished> {
+    let cannot = |flag| Ok(Finished::Refused(Refusal::Cannot(flag)));
+    let len = std::fs::metadata(data).map_err(|e| Error::Io {
+        path: data.to_path_buf(),
         source: e,
     })?;
     if len.len() != a.size {
-        staging::remove_entry(&entry);
+        staging::remove_entry(entry);
         return cannot(FLAG_SIZE_MISMATCH);
     }
     let guard = store.lock_recovered(&state.journal)?;
-    if let Some(refusal) = check_target(&store, &guard, &target)? {
-        staging::remove_entry(&entry);
+    if let Some(refusal) = check_target(store, &guard, target)? {
+        staging::remove_entry(entry);
         return Ok(Finished::Refused(refusal));
     }
     let options = PutOptions {
@@ -753,8 +781,8 @@ fn finish_upload(state: &AppState, a: FinishArgs) -> crate::Result<Finished> {
     };
     let planned = store.plan_put_with(
         &guard,
-        &target,
-        &data,
+        target,
+        data,
         Origin::Device,
         Some(a.serial.clone()),
         options,
@@ -762,28 +790,28 @@ fn finish_upload(state: &AppState, a: FinishArgs) -> crate::Result<Finished> {
     let mut commit = match planned {
         Ok(c) => c,
         Err(Error::Invalid { what, .. }) if what == crate::store::CONTENT_HASH_MISMATCH => {
-            staging::remove_entry(&entry);
+            staging::remove_entry(entry);
             return cannot(FLAG_HASH_MISMATCH);
         }
         Err(e) => match refusal_of(&e) {
             Some(refusal) => {
-                staging::remove_entry(&entry);
+                staging::remove_entry(entry);
                 return Ok(Finished::Refused(refusal));
             }
             None => return Err(e),
         },
     };
-    crate::pages::plan_page_events(&store, &guard, &mut commit);
+    crate::pages::plan_page_events(store, &guard, &mut commit);
     store.commit(&guard, commit, &state.journal)?;
     let listed = store
-        .entry(&guard, &target)?
+        .entry(&guard, target)?
         .filter(|e| e.tag == Kind::File)
         .ok_or_else(|| Error::Invalid {
             what: "upload",
             message: format!("{target} is not a file after the commit"),
         })?;
     drop(guard);
-    staging::remove_entry(&entry);
+    staging::remove_entry(entry);
     Ok(Finished::Done(listed))
 }
 

@@ -1718,13 +1718,30 @@ async fn finish_must_name_the_parent_signed_at_apply() {
 }
 
 #[tokio::test]
-async fn an_upload_url_takes_bytes_once() {
+async fn an_upload_url_takes_one_set_of_bytes_and_answers_its_retry() {
     let s = Server::new();
     let t = s.session().await;
     let a = s.apply(&t, "/INBOX/once.pdf", "once.pdf", 4).await;
     let url = a["fullUploadUrl"].as_str().unwrap();
     let inner = a["innerName"].as_str().unwrap();
-    assert_ok(&s.send(url, "", "once.pdf", b"good").await.json());
+    let first = s.send(url, "", "once.pdf", b"good").await.json();
+    assert_ok(&first);
+    // The answer was lost: the device sends the same bytes again and gets the same answer.
+    let again = s.send(url, "", "once.pdf", b"good").await.json();
+    assert_ok(&again);
+    assert_eq!(again["md5"], first["md5"]);
+    assert_eq!(again["innerName"], inner);
+    let entry = s.account().join("staging").join(inner);
+    let names: Vec<String> = std::fs::read_dir(&entry)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(!names.iter().any(|n| n.ends_with(".tmp")), "{names:?}");
+    let meta: Value =
+        serde_json::from_slice(&std::fs::read(entry.join("upload.json")).unwrap()).unwrap();
+    assert_eq!(meta["md5"], md5_of(b"good"));
+    assert_eq!(meta["parent"], "INBOX");
+    // Other bytes are refused.
     let r = s.send(url, "", "once.pdf", b"evil").await;
     assert_err(&r.json(), "E0324");
     let data = s.account().join("staging").join(inner).join("data");
@@ -1862,4 +1879,151 @@ async fn a_dropped_request_stops_extending_the_lock() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     s.advance_ms(20_000); // T0 + 55 s
     assert_eq!(holder(), None);
+}
+
+// ------------------------------------------------------------------ fix round 2
+
+#[test]
+fn the_staging_lock_answers_retries_of_claimed_bytes_and_cleans_up_failures() {
+    use notedown_cloud::sync::staging::{Claim, SingleOutcome, StagingLocks};
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("55555555-5555-4555-8555-555555555555");
+    std::fs::create_dir_all(&entry).unwrap();
+    let locks = StagingLocks::default();
+    let tmp = |bytes: &[u8]| {
+        let p = entry.join(format!(".nd-test-{}.tmp", md5_of(bytes)));
+        std::fs::write(&p, bytes).unwrap();
+        p
+    };
+    // A write error after upload.json (the temp file is missing, so the rename fails): the
+    // metadata is removed again and the URL stays usable.
+    let missing = entry.join(".nd-missing.tmp");
+    assert!(
+        locks
+            .store_single(&entry, &missing, "INBOX", &md5_of(b"a"))
+            .is_err()
+    );
+    assert!(!entry.join("upload.json").exists());
+    let t = tmp(b"a");
+    assert_eq!(
+        locks
+            .store_single(&entry, &t, "INBOX", &md5_of(b"a"))
+            .unwrap(),
+        SingleOutcome::Stored
+    );
+    assert!(!t.exists());
+    // Claimed by a finish: a retry of the same bytes is still answered, other bytes are not,
+    // and no temp file is left either way.
+    let Claim::Claimed(claimed) = locks.claim(&entry, "INBOX", "op1").unwrap() else {
+        panic!("not claimed")
+    };
+    let t = tmp(b"a");
+    assert_eq!(
+        locks
+            .store_single(&entry, &t, "INBOX", &md5_of(b"a"))
+            .unwrap(),
+        SingleOutcome::Same
+    );
+    assert!(!t.exists());
+    let t = tmp(b"b");
+    assert_eq!(
+        locks
+            .store_single(&entry, &t, "INBOX", &md5_of(b"b"))
+            .unwrap(),
+        SingleOutcome::Refused
+    );
+    assert!(!t.exists());
+    assert!(!entry.join("data").exists());
+    // Released after a failed finish: `data` again, and a new claim works.
+    locks.release(&entry, &claimed).unwrap();
+    assert_eq!(std::fs::read(entry.join("data")).unwrap(), b"a");
+    assert!(matches!(
+        locks.claim(&entry, "INBOX", "op2").unwrap(),
+        Claim::Claimed(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_finish_that_fails_before_its_commit_can_be_retried() {
+    let s = Server::new();
+    let t = s.session().await;
+    let a = s.apply(&t, "/INBOX/retry.pdf", "retry.pdf", 5).await;
+    let inner = a["innerName"].as_str().unwrap();
+    s.send(
+        a["fullUploadUrl"].as_str().unwrap(),
+        "",
+        "retry.pdf",
+        b"bytes",
+    )
+    .await;
+    // An unreadable intent blocks every write of the account: the finish fails after its
+    // claim, with no intent of its own.
+    let pending = s.account().join("pending.json");
+    std::fs::write(&pending, b"{broken").unwrap();
+    let f = s.finish(&t, "/INBOX/", "retry.pdf", inner, b"bytes").await;
+    assert_err(&f, "500");
+    let entry = s.account().join("staging").join(inner);
+    assert_eq!(std::fs::read(entry.join("data")).unwrap(), b"bytes");
+    assert!(!std::fs::read_dir(&entry).unwrap().any(|e| {
+        e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("finishing-")
+    }));
+    // The operator fixes it; the device retries the finish.
+    std::fs::remove_file(&pending).unwrap();
+    let f = s.finish(&t, "/INBOX/", "retry.pdf", inner, b"bytes").await;
+    assert_ok(&f);
+    assert_eq!(
+        std::fs::read(s.files().join("INBOX/retry.pdf")).unwrap(),
+        b"bytes"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_finish_whose_intent_names_the_bytes_leaves_them_to_recovery() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Server::new();
+    let t = s.session().await;
+    // The journal cannot be written: the commit writes its intent and applies the change, then
+    // the append fails and the intent stays.
+    let (_, newest) = s.state.journal.files().unwrap().pop().unwrap();
+    let ro = std::fs::Permissions::from_mode(0o444);
+    std::fs::set_permissions(&newest, ro).unwrap();
+    let a = s.apply(&t, "/INBOX/intent.pdf", "intent.pdf", 5).await;
+    let inner = a["innerName"].as_str().unwrap().to_string();
+    s.send(
+        a["fullUploadUrl"].as_str().unwrap(),
+        "",
+        "intent.pdf",
+        b"bytes",
+    )
+    .await;
+    let f = s
+        .finish(&t, "/INBOX/", "intent.pdf", &inner, b"bytes")
+        .await;
+    assert_err(&f, "500");
+    let intent: Value =
+        serde_json::from_slice(&std::fs::read(s.account().join("pending.json")).unwrap()).unwrap();
+    let staged = intent["op"]["staged"].as_str().unwrap().to_string();
+    assert!(staged.contains("/finishing-"), "{staged}");
+    // Nothing was given back: no `data` reappears beside the intent's file.
+    let entry = s.account().join("staging").join(&inner);
+    assert!(!entry.join("data").exists());
+    assert_eq!(
+        std::fs::read(s.files().join("INBOX/intent.pdf")).unwrap(),
+        b"bytes"
+    );
+    // Recovery journals the change exactly once.
+    std::fs::set_permissions(&newest, std::fs::Permissions::from_mode(0o644)).unwrap();
+    s.post(LIST, &t, json!({"path": "/INBOX"})).await;
+    assert!(!s.account().join("pending.json").exists());
+    let created: Vec<Value> = s
+        .events()
+        .into_iter()
+        .filter(|e| e["type"] == "file.created" && e["path"] == "INBOX/intent.pdf")
+        .collect();
+    assert_eq!(created.len(), 1, "{created:?}");
+    assert_eq!(created[0]["origin"], "repair");
 }

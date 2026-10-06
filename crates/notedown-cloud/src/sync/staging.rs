@@ -192,8 +192,17 @@ impl StreamFile {
     }
 
     /// Write the rest and fsync. Returns the temp file (the caller renames it under the entry's
-    /// lock), the size and the lowercase hex MD5.
-    pub async fn close(mut self) -> Result<(PathBuf, u64, String)> {
+    /// lock), the size and the lowercase hex MD5. On an error the temp file is removed.
+    pub async fn close(self) -> Result<(PathBuf, u64, String)> {
+        let tmp = self.tmp.clone();
+        let r = self.close_inner().await;
+        if r.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        r
+    }
+
+    async fn close_inner(mut self) -> Result<(PathBuf, u64, String)> {
         self.flush().await?;
         let (Some(file), Some(hasher)) = (self.file.take(), self.hasher.take()) else {
             return Err(io_err(&self.tmp)(std::io::Error::other(
@@ -222,6 +231,21 @@ pub struct UploadMeta {
     pub upload_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_chunks: Option<u64>,
+    /// A single upload: the MD5 of its bytes, so a retry of the same bytes (after a lost
+    /// answer) is recognized and answered again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub md5: Option<String>,
+}
+
+/// What became of a single upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SingleOutcome {
+    /// The bytes are the entry's `data` now.
+    Stored,
+    /// The entry already holds these bytes (a retry): nothing changed.
+    Same,
+    /// The entry holds other bytes or parts: refused, nothing changed.
+    Refused,
 }
 
 /// What became of a received part.
@@ -300,12 +324,36 @@ impl StagingLocks {
         f()
     }
 
-    /// Make the closed temp file `tmp` the `data` of a single upload (blocking). Refused
-    /// (`false`, the temp file removed) when the entry already has `upload.json`, `data`, a
-    /// part or claimed data: each upload URL takes bytes once, so nothing can change them while
-    /// a finish verifies and commits them.
-    pub fn store_single(&self, entry: &Path, tmp: &Path, parent: &str) -> Result<bool> {
-        self.with(entry, || {
+    /// Make the closed temp file `tmp` (with MD5 `md5`) the `data` of a single upload
+    /// (blocking). The temp file is gone afterwards in every case, errors included.
+    ///
+    /// - A fresh entry: `upload.json` (with the MD5) is written, then `tmp` becomes `data`. If
+    ///   that fails, `upload.json` is removed again, so the URL stays usable.
+    /// - An entry with a single upload of the same MD5 (still `data`, or claimed by a finish):
+    ///   [`SingleOutcome::Same`], the retry of a lost answer.
+    /// - Anything else (other bytes, parts): [`SingleOutcome::Refused`]. Bytes a finish
+    ///   verifies can never change.
+    pub fn store_single(
+        &self,
+        entry: &Path,
+        tmp: &Path,
+        parent: &str,
+        md5: &str,
+    ) -> Result<SingleOutcome> {
+        let drop_tmp = || {
+            let _ = std::fs::remove_file(tmp);
+        };
+        let r = self.with(entry, || {
+            if let Some(meta) = read_meta(entry)? {
+                let same = meta.upload_id.is_none()
+                    && meta.md5.as_deref() == Some(md5)
+                    && (entry.join(DATA_FILE).is_file() || is_finishing(entry));
+                return Ok(if same {
+                    SingleOutcome::Same
+                } else {
+                    SingleOutcome::Refused
+                });
+            }
             let used = std::fs::read_dir(entry)
                 .map_err(io_err(entry))?
                 .flatten()
@@ -315,17 +363,36 @@ impl StagingLocks {
                     !(name.starts_with(".nd-") && name.ends_with(".tmp"))
                 });
             if used {
-                let _ = std::fs::remove_file(tmp);
-                return Ok(false);
+                return Ok(SingleOutcome::Refused);
             }
             let meta = UploadMeta {
                 parent: parent.to_string(),
                 upload_id: None,
                 total_chunks: None,
+                md5: Some(md5.to_string()),
             };
             write_meta(entry, &meta)?;
-            crate::fsutil::rename_durable(tmp, &entry.join(DATA_FILE))?;
-            Ok(true)
+            if let Err(e) = crate::fsutil::rename_durable(tmp, &entry.join(DATA_FILE)) {
+                let _ = std::fs::remove_file(entry.join(META_FILE));
+                let _ = crate::fsutil::fsync_dir(entry);
+                return Err(e);
+            }
+            Ok(SingleOutcome::Stored)
+        });
+        drop_tmp();
+        r
+    }
+
+    /// Give claimed data back after a finish failed without committing it (blocking): rename
+    /// `claimed` to `data` again, so the finish can be retried. Nothing happens when the file is
+    /// gone (the commit moved it) or `data` exists.
+    pub fn release(&self, entry: &Path, claimed: &Path) -> Result<()> {
+        self.with(entry, || {
+            let data = entry.join(DATA_FILE);
+            if claimed.is_file() && !data.exists() {
+                crate::fsutil::rename_durable(claimed, &data)?;
+            }
+            Ok(())
         })
     }
 

@@ -24,7 +24,8 @@ use super::files::{
 use crate::server::AppState;
 use crate::store::WirePath;
 use crate::sync::staging::{
-    self, MAX_CHUNKS, PartOutcome, STATUS_MERGED, STATUS_UPLOADING, StreamFile, UploadMeta,
+    self, MAX_CHUNKS, PartOutcome, STATUS_MERGED, STATUS_UPLOADING, SingleOutcome, StreamFile,
+    UploadMeta,
 };
 use crate::sync::urls::{E_DOWNLOAD, E_SIGNATURE, content_disposition};
 use crate::sync::{Purpose, SignedTarget, UrlError};
@@ -516,8 +517,9 @@ async fn open_entry(state: &AppState, target: &SignedTarget) -> crate::Result<st
 
 /// `POST /api/oss/upload?path&signature&timestamp&nonce` (multipart field `file`): the bytes
 /// of a whole file into `staging/<innerName>/data`, at most 1 GiB (`E0324`). An upload URL
-/// takes bytes once: a second POST (also one during `upload/finish`) or one after parts is
-/// refused (`E0324`, `part_mismatch`), so the bytes a finish verifies cannot change. Answers
+/// takes one set of bytes: a retry with the same bytes (a lost answer) is answered again, but
+/// other bytes (also during `upload/finish`) or bytes after parts are refused (`E0324`,
+/// `part_mismatch`), so the bytes a finish verifies cannot change. Answers
 /// `{innerName, md5}`.
 pub async fn upload(
     State(state): State<Arc<AppState>>,
@@ -537,10 +539,6 @@ pub async fn upload(
         Ok(e) => e,
         Err(e) => return recv_refused(Recv::Failed(e), &serial),
     };
-    // Each upload URL takes bytes once (checked again under the entry's lock below).
-    if entry.join(staging::META_FILE).exists() {
-        return upload_refused(FLAG_PART_MISMATCH, &serial);
-    }
     let file = match receive_file(&state, &target, &mut multipart, &entry, state.file_max()).await {
         Ok(f) => f,
         Err(why) => return recv_refused(why, &serial),
@@ -549,24 +547,34 @@ pub async fn upload(
         Ok(c) => c,
         Err(e) => return recv_refused(Recv::Failed(e), &serial),
     };
-    let (st, e, parent) = (state.clone(), entry.clone(), target.path.clone());
+    let (st, e, parent, m) = (
+        state.clone(),
+        entry.clone(),
+        target.path.clone(),
+        md5.clone(),
+    );
+    let t = tmp.clone();
     let stored = keep_lock(
         &state,
         &target.account,
         &serial,
-        tokio::task::spawn_blocking(move || st.staging_locks.store_single(&e, &tmp, &parent)),
+        tokio::task::spawn_blocking(move || st.staging_locks.store_single(&e, &t, &parent, &m)),
     )
     .await;
     match stored {
-        Ok(Ok(true)) => Reply::ok(serde_json::json!({
+        Ok(Ok(SingleOutcome::Stored | SingleOutcome::Same)) => Reply::ok(serde_json::json!({
             "innerName": target.inner,
             "md5": md5,
         }))
         .device(&serial)
         .into_response(),
-        Ok(Ok(false)) => upload_refused(FLAG_PART_MISMATCH, &serial),
-        Ok(Err(e)) => recv_refused(Recv::Failed(e), &serial),
+        Ok(Ok(SingleOutcome::Refused)) => upload_refused(FLAG_PART_MISMATCH, &serial),
+        Ok(Err(e)) => {
+            let _ = std::fs::remove_file(&tmp);
+            recv_refused(Recv::Failed(e), &serial)
+        }
         Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
             eprintln!("notedown cloud: upload failed: {e}");
             Reply::internal().device(&serial).into_response()
         }
@@ -624,14 +632,16 @@ pub async fn upload_part(
         parent: target.path.clone(),
         upload_id: Some(upload_id.to_string()),
         total_chunks: Some(total),
+        md5: None,
     };
     let (st, e, file_max) = (state.clone(), entry.clone(), state.file_max());
+    let t = tmp.clone();
     let stored = keep_lock(
         &state,
         &target.account,
         &serial,
         tokio::task::spawn_blocking(move || {
-            st.staging_locks.store_part(&e, &tmp, part, &meta, file_max)
+            st.staging_locks.store_part(&e, &t, part, &meta, file_max)
         }),
     )
     .await;
@@ -640,8 +650,12 @@ pub async fn upload_part(
         Ok(Ok(PartOutcome::Merged)) => STATUS_MERGED,
         Ok(Ok(PartOutcome::Mismatch)) => return upload_refused(FLAG_PART_MISMATCH, &serial),
         Ok(Ok(PartOutcome::TooLarge)) => return upload_refused(FLAG_UPLOAD_TOO_LARGE, &serial),
-        Ok(Err(e)) => return recv_refused(Recv::Failed(e), &serial),
+        Ok(Err(e)) => {
+            let _ = std::fs::remove_file(&tmp);
+            return recv_refused(Recv::Failed(e), &serial);
+        }
         Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
             eprintln!("notedown cloud: upload failed: {e}");
             return Reply::internal().device(&serial).into_response();
         }

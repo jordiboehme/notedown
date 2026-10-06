@@ -585,6 +585,53 @@ fn set_password_clears_the_lock_time() {
     assert_eq!(accounts.get("jordi").unwrap().unwrap().locked_at_ms, None);
 }
 
+// The account lock (`accounts/<slug>/.lock`) between the CLI and the server
+
+#[test]
+fn concurrent_failed_login_cannot_undo_set_password() {
+    let (d, auth) = setup();
+    let accounts = Accounts::new(d.path());
+    let (code, _) = auth.challenge("jordi@example.org", NOW).unwrap();
+    // The CLI is inside `cloud account passwd` and holds the account lock.
+    let held = accounts.lock("jordi").unwrap();
+    let login = std::thread::spawn(move || {
+        auth.login("jordi@example.org", &hash_for(&code, "wrong"), "SN1", NOW)
+            .map_err(|e| e.code())
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!login.is_finished(), "the login must wait for the lock");
+    let mut a = accounts.get("jordi").unwrap().unwrap();
+    a.password_md5 = md5_hex("new");
+    a.failed_logins = 0;
+    accounts.save(&a).unwrap();
+    drop(held);
+    assert_eq!(login.join().unwrap().unwrap_err(), "E0019");
+    let a = accounts.get("jordi").unwrap().unwrap();
+    assert_eq!(a.password_md5, md5_hex("new"), "the new password survives");
+    assert_eq!(a.failed_logins, 1, "the failure counts on top of it");
+    assert!(d.path().join("accounts/jordi/.lock").is_file());
+}
+
+#[test]
+fn set_password_waits_for_a_running_login_and_wins() {
+    let (d, _auth) = setup();
+    let accounts = Accounts::new(d.path());
+    // The server is inside a login and holds the account lock.
+    let held = accounts.lock("jordi").unwrap();
+    let cli = accounts.clone();
+    let passwd = std::thread::spawn(move || cli.set_password("jordi", "new"));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!passwd.is_finished(), "passwd must wait for the lock");
+    let mut a = accounts.get("jordi").unwrap().unwrap();
+    a.failed_logins = 3;
+    accounts.save(&a).unwrap();
+    drop(held);
+    passwd.join().unwrap().unwrap();
+    let a = accounts.get("jordi").unwrap().unwrap();
+    assert_eq!(a.password_md5, md5_hex("new"));
+    assert_eq!(a.failed_logins, 0);
+}
+
 #[test]
 fn duplicate_email_is_reported_as_such() {
     let d = data();

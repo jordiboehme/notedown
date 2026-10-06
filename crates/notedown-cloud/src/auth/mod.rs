@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 pub use accounts::{
-    ACCOUNT_FILE, Account, Accounts, LOCK_COOLDOWN_MS, MAX_FAILED_LOGINS, md5_hex, validate_slug,
+    ACCOUNT_FILE, Account, AccountLock, Accounts, LOCK_COOLDOWN_MS, LOCK_FILE, MAX_FAILED_LOGINS,
+    md5_hex, validate_slug,
 };
 pub use codes::{CODE_LEN, CODE_TTL_MS, LoginCodes, MAX_PENDING_CODES};
 pub use token::{Claims, Device, Devices, KEY_FILE, TokenKey};
@@ -91,7 +92,8 @@ pub struct Auth {
     devices: Devices,
     codes: LoginCodes,
     key: TokenKey,
-    /// Serializes the read-modify-write of the failed-login counter.
+    /// Serializes logins in this process (codes and counter); the account lock file serializes
+    /// them with the CLI.
     login_lock: Mutex<()>,
 }
 
@@ -142,10 +144,15 @@ impl Auth {
     ) -> Result<LoginOk, AuthError> {
         let _guard = self.login_lock.lock().unwrap_or_else(|e| e.into_inner());
         let code = self.codes.consume(email, now_ms);
-        let mut account = self
+        let slug = self
             .accounts
             .find_by_email(email)?
-            .ok_or(AuthError::NoAccount)?;
+            .ok_or(AuthError::NoAccount)?
+            .slug;
+        // Read the account again under the account lock: a `cloud account passwd` of the CLI
+        // in between is not overwritten by the counter update below.
+        let _account_lock = self.accounts.lock(&slug)?;
+        let mut account = self.accounts.get(&slug)?.ok_or(AuthError::NoAccount)?;
         if account.locked {
             match account.locked_at_ms {
                 Some(at) if now_ms.saturating_sub(at) >= LOCK_COOLDOWN_MS => {

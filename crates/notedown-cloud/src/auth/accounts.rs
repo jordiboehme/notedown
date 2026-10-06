@@ -11,6 +11,9 @@ use crate::fsutil::{json_bytes, write_atomic};
 use crate::{Error, Result, io_err};
 
 pub const ACCOUNT_FILE: &str = "account.json";
+/// `accounts/<slug>/.lock`: an advisory lock that the CLI and the server take around every
+/// read-modify-write of `account.json`, so neither can overwrite a change of the other.
+pub const LOCK_FILE: &str = ".lock";
 /// Failed logins after which an account is locked (`E0045`).
 pub const MAX_FAILED_LOGINS: u32 = 6;
 /// A lock clears by itself after this time (ms); `cloud account passwd` clears it at once.
@@ -81,6 +84,12 @@ fn validate_password(password: &str) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// The held account lock; dropping it closes the file and releases the lock.
+#[derive(Debug)]
+pub struct AccountLock {
+    _file: std::fs::File,
 }
 
 /// The accounts of one data folder.
@@ -154,6 +163,22 @@ impl Accounts {
         Ok(account)
     }
 
+    /// Take the account lock (`accounts/<slug>/.lock`, exclusive, blocking). It is held until
+    /// the guard is dropped. Every read-modify-write of `account.json` runs under it, in the CLI
+    /// and in the server.
+    pub fn lock(&self, slug: &str) -> Result<AccountLock> {
+        validate_slug(slug)?;
+        let path = self.account_dir(slug).join(LOCK_FILE);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(io_err(&path))?;
+        file.lock().map_err(io_err(&path))?;
+        Ok(AccountLock { _file: file })
+    }
+
     /// Atomic write with mode 0600.
     pub fn save(&self, account: &Account) -> Result<()> {
         validate_slug(&account.slug)?;
@@ -178,6 +203,10 @@ impl Accounts {
     /// Sets a new password and clears the lock and the failed-login counter.
     pub fn set_password(&self, slug: &str, password: &str) -> Result<()> {
         validate_password(password)?;
+        if self.get(slug)?.is_none() {
+            return Err(Error::NoAccount(slug.to_string()));
+        }
+        let _lock = self.lock(slug)?;
         let mut account = self
             .get(slug)?
             .ok_or_else(|| Error::NoAccount(slug.to_string()))?;
@@ -230,6 +259,8 @@ impl Accounts {
         if self.get(slug)?.is_none() {
             return Err(Error::NoAccount(slug.to_string()));
         }
+        // Wait for a running change of the account to finish.
+        let _lock = self.lock(slug)?;
         let dir = self.account_dir(slug);
         std::fs::remove_dir_all(&dir).map_err(io_err(&dir))
     }

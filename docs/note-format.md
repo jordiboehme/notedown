@@ -24,6 +24,7 @@ Every statement carries one of these marks:
 | t2 | `tests/fixtures/notes/test2.note` | `SN_FILE_VER_20260016` | `N6` | 1 | two drawn diagrams, ruled template, one erased stroke |
 | bike | `tests/fixtures/local/bike.note` (local only) | `SN_FILE_VER_20230015` | `N6` | 3 | compacted file, no stale data |
 | content | `tests/fixtures/local/content.note` (local only) | `SN_FILE_VER_20230015` | `A6X` | 2 | 6 links to other notes, 15 saves, erased strokes, lasso records |
+| bike-digest | `tests/fixtures/local/bike-digest.note` (local only) | `SN_FILE_VER_20260016` | `N6` | 3 | bike edited on firmware Chauvet 3.29.42: a handwritten word on page 3 turned into a text box that is a note digest; compacted |
 
 The handwritten content of the samples is private. This document describes structure only. Worked examples use t1 and t2 where possible; for bike and content only counts, addresses and hashes are given.
 
@@ -56,8 +57,9 @@ The digits are a date-like version number (`YYYY` + 4-digit sequence) [inferred]
 
 No difference in container structure, block encoding, metadata syntax, RLE or stroke layout was found [verified]. Differences seen:
 
-- The stroke record trailer is 4 bytes longer in 20260016 files (section 9.3, part P) [verified].
+- Stroke records written by 20260016 firmware have a trailer 4 bytes longer (section 9.3, part P). This depends on the firmware that wrote the TOTALPATH block, not on the file signature: bike-digest (20260016) keeps the byte-identical old TOTALPATH blocks of pages 1 and 2 with the short trailer, while the rewritten page 3 block has the long trailer for all its records, old and new [verified].
 - Some metadata keys appear only in blocks written by newer firmware: page keys `PAGETEXTBOX`, `DISABLE`; link keys `ANTI`, `BOLD`, `ITALIC`. They depend on the firmware that wrote the block, not on the file signature: content (20230015) has them in blocks written in 2026 and lacks them in older blocks of the same file [verified].
+- Upgrade on edit [verified: bike to bike-digest]: when firmware 3.29.42 edited a 20230015 file, it wrote the signature `SN_FILE_VER_20260016`, rewrote every page block (adding `PAGETEXTBOX` and `DISABLE`, all other keys and the `LAYERINFO` value unchanged), kept the header block byte-identical, kept the bitmaps and TOTALPATH blocks of unedited pages byte-identical, and rewrote only the edited page's MAINLAYER bitmap and TOTALPATH. It saved the result compacted (one save marker, no stale blocks). A reader must therefore expect mixed-generation content inside one file and decide per block, never per signature.
 - The first header written at creation can be a short variant without `MODULE_LABEL`, `APP_VERSION`, `PDFSTYLE`, `PDFSTYLEMD5`, `STYLEUSAGETYPE`, `HIGHLIGHTINFO` (t1 at 24, t2 at 24, 302 bytes); later saves write the full header (t1 at 3194, 402 bytes) [verified].
 
 ### Unknown signatures
@@ -229,11 +231,11 @@ t1 and t2 carry no `COVER_` key at all [verified]; bike and content carry `COVER
 | `EXTERNALLINKINFO` | `0` | address, unknown content | [unknown] |
 | `IDTABLE` | `0` | address, unknown content | [unknown] |
 | `ORIENTATION` | `1000` | `1000` portrait; `1090` and `1270` landscape | `1000` [verified], others [reference] |
-| `PAGETEXTBOX` | `0` | text boxes present | [others] |
-| `DISABLE` | `none` | regions of bitmap-only content (text boxes, digests) | [others] |
+| `PAGETEXTBOX` | `0`, `1` | `1` on a page that has a text box, `0` otherwise (a count is possible, only 0 and 1 seen) | [verified: bike-digest page 3] |
+| `DISABLE` | `none`, `256,796,271,88\|` | list of rects `left,top,width,height`, each followed by `\|`; `none` when empty. Each rect is a region whose pixels are device-drawn and have no ink strokes (text boxes; digests per others) | [verified: the rect equals the text box rect in the stroke data (7.4) and contains all pixels the text box added to MAINLAYER] |
 | `FIVESTAR` | absent | present only on starred pages; value holds the star stroke coordinates and a trailing flag, exact layout not documented | [others] |
 
-Keys of a page block written by newer firmware: `PAGETEXTBOX`, `DISABLE` [verified present in t1, t2, content page 1; absent in bike and content page 2].
+Keys of a page block written by newer firmware: `PAGETEXTBOX`, `DISABLE` [verified present in t1, t2, content page 1, all bike-digest pages; absent in bike and content page 2].
 
 All address-valued page keys with value `0` mean "absent" [verified].
 
@@ -351,6 +353,8 @@ Anti-aliasing [verified]: all X2 sample layers contain edge pixels with codes ou
 
 Note on `0x63`/`0x64` [inferred, strong]: in content page 1 these two codes occur only inside the link icons that the device draws into MAINLAYER (24 and 12 pixels), surrounded by levels `0x10, 0x20, ..., 0xE0`, `0x60`, `0x70`. There they are plain anti-aliasing levels between 0x60 and 0x70, not "compat" colors. The reference maps them to 0x30 and 0x50 and the goldens follow it. To reproduce the goldens use 0x30/0x50; for a faithful image use the code value [inferred].
 
+The same holds for device-rendered text [verified on bike-digest page 3]: the glyph edges of the text box contain codes `0x65` (28 pixels), `0x9D` (6), `0x9E` (5), `0xC9` (1) and `0xCA` (10) among plain levels. The named mappings (`0x65` -> 0xFE, `0x9E` -> 0x9D, `0xCA` -> 0xC9) change these pixels by at most 1 gray step, so the difference is invisible, but it decides whether hashes match: the reference applies the full table, and so do the test vectors in section 11.
+
 The code `0x62` as a literal gray level would be indistinguishable from transparent; levels in the samples never fall on `0x61`-`0x66` except the two link icon cases above [verified].
 
 ### 5.4 Template layer (BGLAYER)
@@ -428,6 +432,36 @@ None of the samples has titles or keywords [verified]. content has six links [ve
 Link targets [verified]: content's third link has `LINKFILE` decoding to `/storage/emulated/0/Note/Bike.note` and `LINKFILEID:F20240708174639550429bHksqaP2wKQ8`, which is exactly bike's header `FILE_ID`. Resolve a link by `LINKFILEID` first (stable across renames and moves) and use the decoded path as a fallback [inferred]. A link is internal when `LINKFILEID` equals the file's own `FILE_ID` [reference]. All six `LINKFILE` values are device paths under `/storage/emulated/0/Note/` ending in `.note` [verified].
 
 The device draws a link icon at the right end of the link rect into MAINLAYER [verified: content page 1, the icons lie at the right ends of the six rects]. A link also leaves records in the page's stroke data (9.6).
+
+### 7.4 Text boxes and note digests [verified on bike-digest unless marked]
+
+A text box is typed text placed on a page. A note digest is created by circling handwriting with the lasso tool and choosing "Recognize as Text" [Ratta support documentation]; the device then replaces the handwriting by a text box holding the recognized text and registers a digest in the Digest app. bike-digest page 3 holds exactly one such text box. The pieces in the file:
+
+| Piece | Where | Content |
+|---|---|---|
+| page flag | page key `PAGETEXTBOX:1` | the page has a text box |
+| region | page key `DISABLE:256,796,271,88\|` | the text box rect (`left,top,width,height`) |
+| image | MAINLAYER bitmap | the typeset text, drawn by the device: 4,424 pixels changed against bike, all inside the rect (x 259 to 523, y 820 to 872), black plus anti-aliasing levels. The text is shown between square brackets and underlined |
+| source handwriting | 7 ink records in TOTALPATH (records 52 to 58, ids 53 to 59) | ordinary needle-pen strokes with status `-5` (part G). They are not drawn: none of their pixels is in the bitmap |
+| lasso | 1 record (record 59, id 60): tool 4, class -5, operation 604 | the selection loop |
+| text box record | 1 record (record 60, id 61), see below | rect, text, font, style, digest reference, embedded copy of the source strokes |
+| group record | 1 record (record 61, id 62), see below | ties the source strokes and the text box together |
+
+No footer key, no new block kind and no other key refers to the text box [verified: every block of bike-digest is reachable from the footer and accounted for; the only new keys are `PAGETEXTBOX` and `DISABLE`].
+
+**Text box record** (stroke record layout of 9.3):
+- head: tool 0, color 0, thickness 100, offset 12 = 0, class 0, kind name `0000` (the same kind name as a link box), document kind `name is not set`; digitizer ranges 15819/11864; the bbox fields read `256, 796, 0, 0, 754, 1111` (meaning of the last two [unknown]);
+- 5 points, all pressure 0; one outline ring = the rect as a closed 5-point polygon (256,883), (526,883), (526,796), (256,796), (256,883);
+- status 0, operation `52` (link boxes use 500), referenced ids: none;
+- first string: base64 items separated and terminated by commas, 19 items, the same layout as a link box (9.6). Decoded: `0`, `0`, `0`, creation timestamp `YYYYMMDDhhmmss` + microseconds (local time), rect, original rect, `none`, `none`, `none`, `0`, font size `48.000000`, font path `/system/fonts/DroidSansFallbackFull.ttf`, the text (UTF-8), a style list of 18 comma-separated numbers (`4,0,0,0.000000,0.000000,1.000000,0,1,0,0,0,0,0,3,0,255,255,0`, meaning [unknown]), `63` [unknown], `1`, `1`, `0` (anti-alias, bold, italic by analogy with links [inferred]), and a JSON object `{"digest_source":"1","digest_id":"<32 hex digits>","digest_time":"<ms since epoch>"}`;
+- third string of part P (empty on ink): an extension payload of 14667 bytes: ASCII `TEXTBOX_TRAILS`, `u32` count (7), `u32` 1000 [unknown], `u32` 4 [unknown], then count x (`u32` length + stroke record). The embedded records are byte-identical to the 7 source stroke records except the status field, which is 0 in the copy and -5 on the page [verified].
+- The record class of a text box is 0 like link boxes; tell them apart by the operation (52 versus 500), the document kind and the digest JSON [verified on the samples, rule inferred].
+
+**Group record** (record 61): tool 4, class 5000, kind name `others`, document kind `name is not set`, no points, no rings, operation 52, referenced ids = the 7 source stroke ids and the text box id. Its color and thickness fields (offsets 4 and 8) and maxB (offset 132) hold large values that are not colors or ranges (`644497065`, `1527775965`) [unknown]; the part P `u32` that is 3 on other records is 1 [verified]. A parser must not draw it and must not use its ranges.
+
+**Digest link** [verified values, meaning from others]: `digest_time` 1791270408460 ms = 2026-10-06 07:06:48.460 UTC, the same instant as the item timestamp `20261006090648924962` in local time (UTC+2). `digest_id` has the form of the 32-hex-digit `unique_identifier` that the Supernote cloud sync protocol uses for digest items [others]. A note digest item in that protocol carries `note_fileId`, `note_pageId` and `note_page` of its source page, `content` (the recognized text), optional `commentStr` (typed annotation) and an optional handwritten annotation as a separate `.mark` file named `<md5>.mark` [others: ultrabridge protocol notes]. So the link from the digest back to the note is FILE_ID + PAGEID + page number, and the link from the note to the digest is `digest_id` [inferred].
+
+**Not in the `.note` file**: the digest record itself (category, typed comment) and the handwritten annotation written in the Digest app [verified by exhaustion: no block, key or record in bike-digest holds handwriting other than the page's own strokes and the 7 embedded source strokes]. Per others, the device keeps digests in the Digest app's own storage and syncs them as structured records ("summary" items) with the handwriting as `.mark` files (stored by the cloud under a `digest` folder) [others]. The device folder for these files was not found in any public source [unknown].
 
 ## 8. Real-time recognition
 
@@ -535,9 +569,9 @@ Offsets are relative to the start of the record. "n" means a count read just bef
 
 **F. Two arrays, empty in the samples**: `u32` n + n x 8 bytes (a point list, same shape as part B), then `u32` n + n x 4 bytes (`i32` gray values) [counts verified as 0; element sizes others].
 
-**G. Status** `i32` [verified]: `0` = the stroke is visible; `-99` = the stroke was erased. Verified: t2 record 78 (ink, `-99`) has only 9% of its points on ink, all live ink records have 100%; content page 1 has 8 records with `-99` (0% to low coverage) and 5 eraser records that together list exactly these 8 ids (one eraser lists 4). Others report further codes (-16 lasso delete, -4 partially erased with fragments in later records, -3 moved by lasso, -2 whole page cleared) [others].
+**G. Status** `i32` [verified]: `0` = the stroke is visible; `-99` = the stroke was erased; `-5` = the stroke was converted into a text box and is hidden (bike-digest page 3, 7 records, none drawn; see 7.4). Verified: t2 record 78 (ink, `-99`) has only 9% of its points on ink, all live ink records have 100%; content page 1 has 8 records with `-99` (0% to low coverage) and 5 eraser records that together list exactly these 8 ids (one eraser lists 4). Others report further codes (-16 lasso delete, -4 partially erased with fragments in later records, -3 moved by lasso, -2 whole page cleared) [others].
 
-**H. Operation** `i32` [verified]: `0` on ink (`99` on 20 of content page 2's 48 ink records), `601` eraser, `604` lasso path, `500` link box. Others report 602, 603 (other eraser modes), 400 (heading box), 14/4/2 (operation applied by a lasso: delete, move, copy) [others].
+**H. Operation** `i32` [verified]: `0` on ink (`99` on 20 of content page 2's 48 ink records), `601` eraser, `604` lasso path, `500` link box, `52` text box and its group record (7.4). Others report 602, 603 (other eraser modes), 400 (heading box), 14/4/2 (operation applied by a lasso: delete, move, copy) [others].
 
 **I. Id** `u32`: per-page record id, starting at 1 or 2 in the samples, strictly increasing, gaps possible [verified]. Erased strokes keep their id; other records refer to ids (part K).
 
@@ -568,10 +602,10 @@ The samples cannot tell apart the order of the zero-valued `u8`, rotation and co
 **P. Strings and trailer**:
 - `u32` length + bytes: `none` on ink; on link boxes a comma-separated list of base64 items, see 9.6 [verified].
 - `u32` length + bytes: `none` [verified].
-- `u32` length + bytes: empty (length 0) [verified].
-- `u32` 3 [verified constant].
+- `u32` length + bytes: empty (length 0) on ink, lasso, eraser and link records; on a text box record an extension payload starting with ASCII `TEXTBOX_TRAILS` (7.4) [verified].
+- `u32` 3 [verified on all records except the text box group record, which has 1].
 - `u32` n, then n x 8 bytes (`f32` pairs, "marker fill direction" [others]) [verified: n is 0 in bike and older content records, 2 with zero values in t1, t2 and newer content records].
-- 20260016 only: 4 more zero bytes [verified: t1, t2].
+- Only in records written by 20260016 firmware: 4 more zero bytes [verified: t1, t2, bike-digest page 3; absent in bike-digest pages 1 and 2, see section 1].
 
 A parser should read records strictly by the record length (9.1) and treat anything after part O that does not parse as raw bytes [inferred]. Every count field must be honored with its element size, even where the samples only show 0: disable areas 24 bytes (A at 208), points 8 (B, F first), pressure 2 (C), tilt 4 (D), flags 1 (E), gray values 4 (F second), ids 4 (K), ring points 8 (M), hierarchy entries 16 (N), part O array 4, trailer pairs 8 (P). Only the head (212 bytes including the A count), the 40-byte span J, the 10-byte span L and the scalar fields of O and P are fixed [verified layout].
 
@@ -603,7 +637,9 @@ Records to skip when drawing [verified unless marked]:
 - status (part G) not 0 (erased);
 - tool 3 or color 255 (eraser path);
 - record class -5 or tool 4 (lasso path);
-- kind name `0000` (link box; the rectangle is not drawn by the device);
+- kind name `0000` (link box or text box; the rectangle is not drawn by the device, the text box text is in the bitmap only);
+- operation 52 group records and any record with tool 4 (7.4);
+- status -5 (handwriting replaced by a text box) is already covered by "status not 0". To show the original handwriting of a text box, use the embedded copies in the text box record [inferred].
 - class 0 records with kind `0001` are filled rectangles (heading backgrounds) and `straightLine` records are lines between two points [others].
 
 Erasing in the samples always removed whole strokes; partial erasing is recorded with fragment records [others].
@@ -625,7 +661,7 @@ Creating a link can write a lasso path record (tool 4, class -5, operation 604) 
 
 - `TOTALPATH:0`: no vector data; only the bitmap exists [verified: t1 and t2 in their early saves, while the bitmap already held ink].
 - Present: it is complete for the save in which it was written. Because the bitmap is written one save earlier (2.), a file captured in between has vectors older than the bitmap [verified pattern]. A cheap check: the TOTALPATH block address is greater than the address of the MAINLAYER bitmap block in every final state of the samples [verified]; in the intermediate saves it was smaller [verified]. A stronger check: rasterize the live outlines and compare with the bitmap ink (IoU around 0.75 to 0.84 for complete data on these devices, 9.5) [inferred threshold].
-- Device-drawn content without strokes: link icons (verified), text boxes and digests (`DISABLE` regions) [others], and anything pasted as an image [inferred]. These exist only in the bitmap.
+- Device-drawn content without strokes: link icons [verified], text box text (`DISABLE` regions) [verified on bike-digest], digest excerpts [others], and anything pasted as an image [inferred]. These exist only in the bitmap.
 - Erased strokes and eraser/lasso paths stay in TOTALPATH (append-only per page until compaction) [verified]. The firmware removes fully erased strokes at some point [others]; bike (compacted) has no erased records [verified].
 
 ## 10. Robustness rules for a parser
@@ -653,7 +689,7 @@ All values computed by an independent decoder written from this document, and cr
 
 Definitions:
 - "codes" = the decoded RLE output, one byte per pixel, the raw code values, row-major.
-- "gray" = codes mapped with the X2 table of 5.3 (`0x63` -> 0x30, `0x64` -> 0x50, `0x65` -> 0xFE, `0x66` -> 0, `0x61` -> 0), transparent -> 255.
+- "gray" = codes mapped with the full X2 table of 5.3 (`0x61` -> 0, `0x63` -> 0x30, `0x64` -> 0x50, `0x65` -> 0xFE, `0x66` -> 0, `0x9E` -> 0x9D, `0xCA` -> 0xC9, other codes unchanged), transparent -> 255.
 - "opaque" = pixels whose code is not `0x62`.
 
 ### 11.1 t1 (`test1.note`, 186649 bytes)
@@ -701,6 +737,17 @@ Definitions:
 
 BGLAYER bitmap 439 on all pages, identical bytes to t1's 330. `FILE_ID` `F20240708174639550429bHksqaP2wKQ8`. Record page number field reads 1, 2, 3 respectively.
 
+### 11.3a bike-digest (local only, 1135077 bytes)
+
+| Item | Value |
+|---|---|
+| footer / header | 1134930 / 24 (header block byte-identical to bike) |
+| pages 1, 2 | page blocks 544370, 958898; bitmaps and TOTALPATH blocks byte-identical to bike |
+| page 3 block | 1133641, `PAGETEXTBOX:1`, `DISABLE:256,796,271,88\|` |
+| page 3 MAINLAYER bitmap | 960176, 28802 bytes, opaque 22775, sha256(gray) `7229c7bfcd2818f1070c1c33530dc8e3d0e1958afcf8a5fd72dd1fdd4defba12` (matches supernotelib) |
+| page 3 TOTALPATH | 989245, 144392 bytes, 64 records: 52 old ink (ids 1 to 52), 7 ink with status -5, 1 lasso, 1 text box, 1 group record, 1 erased ink tap and 1 eraser; sha256 `d9dbdcb4ffc594f2e1bd31ea004c75b713dac7596bbe55f248a84e495bc30ef4` |
+| text box record | record 60, 15609 bytes, rect 256,796,271,88, 7 embedded strokes |
+
 ### 11.4 content (local only, 1681602 bytes)
 
 | Page | Page block | MAINLAYER bitmap (bytes, opaque, sha256 gray) | TOTALPATH (address, records, sha256) |
@@ -716,9 +763,9 @@ Rendering per 6.1 reproduces all of `tests/fixtures/golden/test{1,2}-p1-{bg,nobg
 
 ## 12. Unknowns and open items
 
-Raw-only fields (expose as raw data): header `MODULE_LABEL`, `FILE_PARSE_TYPE`, `RATTA_ETMD`, `APP_VERSION`, `PDFSTYLE`, `PDFSTYLEMD5`, `STYLEUSAGETYPE`, `HORIZONTAL_CHECK`, `IS_OLD_APPLY_EQUIPMENT`; page `THUMBNAILTYPE`, `RECOGNTYPE`, `RECOGNLANGUAGE`, `EXTERNALLINKINFO`, `IDTABLE` (both address-shaped, 0 in samples); layer `LAYERPATH`, `LAYERVECTORGRAPH`, `LAYERRECOGN` (address-shaped, 0 in samples); link `LINKSTYLE`, `FONTSIZE`, `FONTPATH`, `FULLTEXT`, `SHOWTEXT`, `ANTI`, `BOLD`, `ITALIC`; stroke head offsets 12, 16, 20, 24, 32, 36, 124, 188; tilt semantics; render flag; trailer values; `page.bdom`, `style.css`, the `ink.bink` element table.
+Raw-only fields (expose as raw data): text box style list, item 15 (`63`) and the bbox values of the text box record, the `1000`/`4` values in `TEXTBOX_TRAILS`, color/thickness/range fields of the group record, `digest_source`; header `MODULE_LABEL`, `FILE_PARSE_TYPE`, `RATTA_ETMD`, `APP_VERSION`, `PDFSTYLE`, `PDFSTYLEMD5`, `STYLEUSAGETYPE`, `HORIZONTAL_CHECK`, `IS_OLD_APPLY_EQUIPMENT`; page `THUMBNAILTYPE`, `RECOGNTYPE`, `RECOGNLANGUAGE`, `EXTERNALLINKINFO`, `IDTABLE` (both address-shaped, 0 in samples); layer `LAYERPATH`, `LAYERVECTORGRAPH`, `LAYERRECOGN` (address-shaped, 0 in samples); link `LINKSTYLE`, `FONTSIZE`, `FONTPATH`, `FULLTEXT`, `SHOWTEXT`, `ANTI`, `BOLD`, `ITALIC`; stroke head offsets 12, 16, 20, 24, 32, 36, 124, 188; tilt semantics; render flag; trailer values; `page.bdom`, `style.css`, the `ink.bink` element table.
 
-Not present in the samples: titles, keywords, stars, covers, thumbnails, custom (PNG) or PDF templates, landscape pages, layers 1-3, `SN_ASA_COMPRESS`, X-table files (versions below 20230015), `.mark` files, RECOGNTEXT, N5 (1920 x 2560) files, other pens than needle point, other colors than black, lasso move/delete, partial erase, text boxes and digests. Each of these needs a sample before its rules can be verified.
+Not present in the samples: titles, keywords, stars, covers, thumbnails, custom (PNG) or PDF templates, landscape pages, layers 1-3, `SN_ASA_COMPRESS`, X-table files (versions below 20230015), `.mark` files, RECOGNTEXT, N5 (1920 x 2560) files, other pens than needle point, other colors than black, lasso move/delete, partial erase, typed text boxes (not created from handwriting), document digests, the digest record and its handwritten `.mark` annotation (stored outside the `.note`, 7.4). Each of these needs a sample before its rules can be verified.
 
 ## Appendix A. Data model for a complete parser
 
@@ -735,6 +782,8 @@ Entities and fields a parser should expose (no API prescribed). Section referenc
 | Template | style name, footer address, bitmap, list of pages using it | 4.1, 5.4 |
 | Page image | composite with/without template, golden-compatible and device-compatible variants | 6 |
 | Stroke record | index, id, tool, color, thickness, record class, layer, kind name, document kind, page number, bbox, digitizer ranges, points (raw and in pixels), pressure, tilt, point flags, status (live/erased/other code), operation code, referenced ids, render flag, outline rings with hierarchy, page size fields, strings, trailer raw, all unknown fields raw | 9 |
+| Text box | page, rect (from the record ring and `DISABLE`), text, font size, font path, style list raw, flags, creation timestamp, ids of the hidden source strokes and their embedded copies, digest reference (`digest_id`, `digest_time`, `digest_source`) | 4.3, 7.4, 9.3 |
+| Digest reference | digest id, time, source; the note side of a digest (file id, page id, page number); the digest content and annotation are external | 7.4 |
 | Link | footer key with decoded page and position, all link keys, decoded target path or URL, target file id, target page id, kind, direction, rect, timestamp, bitmap, link-box stroke record and linked stroke ids | 4.1, 7.3, 9.6 |
 | Title | footer key with page and position, rect, original rect, level, sequence number, style (decoded background and text gray), protocol, bitmap | 7.1 |
 | Keyword | footer key with page and position, page, rect, original rect, sequence number, text (from `KEYWORDSITE` and inline), length | 7.2 |
@@ -777,7 +826,10 @@ Projects surveyed (feature inventory only): supernotelib (reference, Python), su
 | eraser and link records referencing stroke ids | - | - | - | - | - | - | - | 9.3 K verified | beyond baseline |
 | link-box stroke record and its embedded link fields | - | excluded only | - | - | - | - | - | 9.6 verified | beyond baseline |
 | stroke layer field | - | yes | yes | - | - | - | - | 9.3 others | required, not testable on samples |
-| text boxes and digests (`DISABLE`, `PAGETEXTBOX`) | - | yes | - | - | - | - | - | 4.3 others | required, not in samples |
+| text boxes (`DISABLE`, `PAGETEXTBOX`, text box records) | - | yes | - | - | - | - | - | 4.3, 7.4 verified | required |
+| text box text, font and digest reference from the stroke record | - | - | - | - | - | - | - | 7.4 verified | beyond baseline |
+| hidden source handwriting of a text box (status -5, `TEXTBOX_TRAILS`) | - | - | - | - | - | - | - | 7.4 verified | beyond baseline |
+| digest records and their `.mark` handwriting (cloud sync) | - | - | - | - | - | yes (sync events) | yes (stores and serves them) | 7.4 others | outside the `.note`; not required for a `.note` parser |
 | heading rects, ruler lines, partial-erase fragments | - | yes | - | - | - | - | - | 9.5 others | required, not in samples |
 | vector freshness versus bitmap | - | heuristic | - | - | - | - | - | 9.7 verified pattern | beyond baseline |
 | device export compositing (multiply, black = 1) | - | - | - | - | - | - | - | 6.2 verified | beyond baseline |

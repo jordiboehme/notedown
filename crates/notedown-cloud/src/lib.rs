@@ -50,6 +50,10 @@ pub enum Error {
         "{new:?} collides with {existing:?}: the names differ only in case or Unicode normalization"
     )]
     NameCollision { existing: String, new: String },
+    /// The protect gate of the account closed while a request waited for the store lock (an
+    /// import cleared the `imported` marker). Routes answer `E0079` with `protect_refused`.
+    #[error("the protect gate of account {0} is closed (no imported marker)")]
+    GateClosed(String),
     #[error("cannot listen on {addr}: {source}")]
     Bind {
         addr: std::net::SocketAddr,

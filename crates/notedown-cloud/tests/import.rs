@@ -405,7 +405,10 @@ fn a_backup_report_must_say_complete_without_errors() {
             "REMOVABLE0/a.note",
         ),
         (r#"{"complete":false,"errors":[]}"#, "did not finish"),
-        (r#"{"errors":[]}"#, "did not finish"),
+        (
+            r#"{"errors":[]}"#,
+            "made by an older version or did not finish",
+        ),
         (r#"{"complete":true}"#, "no errors list"),
         ("not json", "backup.json"),
     ] {
@@ -1069,6 +1072,16 @@ fn backup_device_copies_byte_exact_names_and_fails_on_a_short_file() {
 
     // a rerun into the same folder needs --resume
     assert!(device_backup::backup(&url, &dir, &opts, &mut quiet()).is_err());
+    // leftovers of a killed run: a short temp name, a file the device no longer lists, and a
+    // .part of a file that is still listed
+    for p in [
+        "Note/.nd-backup-deadbeef.part",
+        "Note/Gone.note.part",
+        "Note/Jordi's list.note.part",
+        "INBOX/x.part",
+    ] {
+        write(&dir.join(p), b"half");
+    }
     let resumed = device_backup::backup(
         &url,
         &dir,
@@ -1081,6 +1094,14 @@ fn backup_device_copies_byte_exact_names_and_fails_on_a_short_file() {
     )
     .unwrap();
     assert_eq!(resumed.skipped_existing, 2);
+    for p in [
+        "Note/.nd-backup-deadbeef.part",
+        "Note/Gone.note.part",
+        "Note/Jordi's list.note.part",
+        "INBOX/x.part",
+    ] {
+        assert!(!dir.join(p).exists(), "{p} was left");
+    }
     assert_eq!(std::fs::read(&nfd).unwrap(), b"nfd");
     assert_eq!(
         OffsetDateTime::from(std::fs::metadata(&nfd).unwrap().modified().unwrap()),

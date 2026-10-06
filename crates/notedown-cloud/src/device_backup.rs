@@ -328,6 +328,9 @@ impl Run<'_> {
         };
         let mut folded: HashMap<String, String> = HashMap::new();
         let siblings: HashSet<String> = list.iter().map(|e| e.name.clone()).collect();
+        if self.options.resume {
+            self.remove_stale_parts(local, &siblings, &shown);
+        }
         for entry in list {
             let mut here = rel.to_vec();
             here.push(entry.name.clone());
@@ -381,6 +384,34 @@ impl Run<'_> {
                     }
                     Err(e) => self.error(path, e),
                 }
+            }
+        }
+    }
+
+    /// `resume`: remove the unfinished downloads of an earlier run in `local`: every `*.part`
+    /// file the listing does not name itself (`.nd-backup-*.part`, and `<name>.part` whether
+    /// or not the device still lists `<name>`). Without this a leftover would stay next to the
+    /// finished backup and refuse its import.
+    fn remove_stale_parts(&mut self, local: &Path, siblings: &HashSet<String>, shown: &str) {
+        let Ok(entries) = std::fs::read_dir(local) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let is_file = e.file_type().is_ok_and(|t| t.is_file());
+            if !is_file || !name.ends_with(".part") || siblings.contains(&name) {
+                continue;
+            }
+            if let Err(err) = std::fs::remove_file(e.path()) {
+                let path = if shown == "/" {
+                    name.clone()
+                } else {
+                    format!("{shown}/{name}")
+                };
+                self.error(
+                    path,
+                    format!("cannot remove the unfinished download: {err}"),
+                );
             }
         }
     }
@@ -470,9 +501,9 @@ impl Run<'_> {
     }
 }
 
-/// `<name>.part` next to `target`, or a short dot-name when that would be too long or is the
-/// name of another entry in the folder (the import skips dot-names, so a leftover of those is
-/// never imported).
+/// `<name>.part` next to `target`, or a short dot-name `.nd-backup-<8 hex>.part` when that
+/// would be too long or is the name of another entry in the folder. A leftover of either kind
+/// (a killed run) refuses the import, which refuses every `*.part`; `--resume` removes them.
 fn part_path(target: &Path, siblings: &HashSet<String>) -> PathBuf {
     let name = target
         .file_name()

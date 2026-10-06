@@ -381,10 +381,12 @@ async fn upload_target(
         if !generation_current(&st, &t)? {
             return Ok(None);
         }
-        let account = st.auth.accounts().get(&t.account)?;
-        Ok(Some(account.is_some_and(|a| {
-            super::files::protect_gate(&st, &a, &t.device).is_none()
-        })))
+        let Some(account) = st.auth.accounts().get(&t.account)? else {
+            return Err(crate::Error::NoAccount(t.account.clone()));
+        };
+        Ok(Some(
+            super::files::protect_gate(&st, &account, &t.device).is_none(),
+        ))
     })
     .await;
     match checked {

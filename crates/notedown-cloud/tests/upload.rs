@@ -2163,3 +2163,69 @@ async fn a_cleared_marker_closes_every_file_route_of_a_running_session() {
     assert!(s.account().join("files/INBOX/a.pdf").exists());
     assert!(!s.account().join("files/INBOX/New").exists());
 }
+
+/// A listing that passed the protect gate, then waited for the store lock behind an import
+/// that cleared the marker, is refused after the lock is released: it never sees the
+/// half-imported tree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_that_waited_behind_a_failed_import_is_refused() {
+    let s = Server::protected();
+    let t = s.session().await; // lock taken at T0, live until T0 + 30 s
+    s.advance_ms(20_000);
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let data = s.data().to_path_buf();
+    // the import: holds the store lock, clears the marker, then gives up
+    let import = std::thread::spawn(move || {
+        let store = notedown_cloud::store::Store::open(&data, "jordi").unwrap();
+        let guard = store.lock().unwrap();
+        held_tx.send(()).unwrap();
+        go_rx.recv().unwrap();
+        let accounts = Accounts::new(&data);
+        {
+            let _lock = accounts.lock("jordi").unwrap();
+            let mut a = accounts.get("jordi").unwrap().unwrap();
+            a.imported = None;
+            accounts.save(&a).unwrap();
+        }
+        drop(guard);
+    });
+    held_rx.recv().unwrap();
+    let state = s.state.clone();
+    let listing = s.post(LIST, &t, json!({"equipmentNo": SERIAL, "path": "/"}));
+    let watcher = async {
+        // The request touched the sync lock (now T0 + 20 s, so it lives past T0 + 40 s): its
+        // gate check ran in the same step, with the marker still set.
+        while state
+            .sync_locks
+            .holder("jordi", (T0 + 40_000) as u64)
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        go_tx.send(()).unwrap();
+    };
+    let (v, ()) = tokio::join!(listing, watcher);
+    import.join().unwrap();
+    assert_err(&v, "E0079");
+    let e = s.requests_to(LIST).pop().unwrap();
+    assert!(e["flags"].to_string().contains("protect_refused"), "{e}");
+}
+
+/// Without its account, an upload URL gets an internal error, not the protect refusal (which
+/// would be wrong with protect off).
+#[tokio::test]
+async fn an_upload_for_a_vanished_account_is_no_protect_refusal() {
+    let s = Server::new();
+    let t = s.session().await;
+    let a = s.apply(&t, "/INBOX/v.pdf", "v.pdf", 1).await;
+    assert_ok(&a);
+    std::fs::remove_file(s.account().join("account.json")).unwrap();
+    let r = s
+        .send(a["fullUploadUrl"].as_str().unwrap(), "", "v.pdf", b"v")
+        .await;
+    let e = s.requests_to(UPLOAD).pop().unwrap();
+    assert!(!e["flags"].to_string().contains("protect_refused"), "{e}");
+    assert_ne!(r.json()["errorCode"], "E0079", "{}", r.json());
+    assert_eq!(r.json()["success"], false);
+}

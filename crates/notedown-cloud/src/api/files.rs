@@ -169,6 +169,7 @@ where
 {
     match tokio::task::spawn_blocking(f).await {
         Ok(Ok(v)) => Ok(v),
+        Ok(Err(Error::GateClosed(_))) => Err(protect_refused(serial)),
         Ok(Err(e)) => {
             eprintln!("notedown cloud: {e}");
             Err(Reply::internal().device(serial))
@@ -205,6 +206,20 @@ macro_rules! device_request {
 /// (`import --replace`) stops at its next call. `account` is the read of this request.
 pub fn protect_gate(state: &AppState, account: &Account, serial: &str) -> Option<Reply> {
     (state.config.protect && account.imported.is_none()).then(|| protect_refused(serial))
+}
+
+/// The protect gate again, read fresh under the store lock: a request that passed
+/// [`protect_gate`] and then waited for the lock behind an import that cleared the marker (and
+/// failed) must not see the half-imported tree. Call it right after `lock_recovered` in every
+/// gated route; [`blocking`] turns the error into the `E0079` answer.
+pub fn gate_locked(state: &AppState, slug: &str) -> crate::Result<()> {
+    if !state.config.protect {
+        return Ok(());
+    }
+    match state.auth.accounts().get(slug)? {
+        Some(a) if a.imported.is_some() => Ok(()),
+        _ => Err(Error::GateClosed(slug.to_string())),
+    }
 }
 
 /// The answer of a closed protect gate: `E0079` with flag `protect_refused`.
@@ -282,6 +297,7 @@ fn list_folder_of(
 ) -> crate::Result<Option<Vec<Entry>>> {
     let store = state.store(slug)?;
     let guard = store.lock_recovered(&state.journal)?;
+    gate_locked(state, store.slug())?;
     let path = match folder {
         Folder::Path(p) => p,
         Folder::Id(id) => match store.kind_and_path_of(id)? {
@@ -368,6 +384,7 @@ pub async fn list_folder_v3(
 fn entry_by_id(state: &AppState, slug: &str, id: u64) -> crate::Result<Option<Entry>> {
     let store = state.store(slug)?;
     let guard = store.lock_recovered(&state.journal)?;
+    gate_locked(state, store.slug())?;
     let Some(path) = store.path_of(id)? else {
         return Ok(None);
     };
@@ -413,6 +430,7 @@ pub async fn query_by_path_v3(
     let r = blocking(&req.serial, move || {
         let store = st.store(&slug)?;
         let guard = store.lock_recovered(&st.journal)?;
+        gate_locked(&st, store.slug())?;
         store.entry(&guard, &path)
     })
     .await;
@@ -677,6 +695,7 @@ pub async fn upload_apply(
     let checked = blocking(&req.serial, move || {
         let store = st.store(&slug)?;
         let guard = store.lock_recovered(&st.journal)?;
+        gate_locked(&st, store.slug())?;
         check_target(&store, &guard, &t)
     })
     .await;
@@ -792,6 +811,7 @@ fn finish_claimed(
         return cannot(FLAG_SIZE_MISMATCH);
     }
     let guard = store.lock_recovered(&state.journal)?;
+    gate_locked(state, store.slug())?;
     if let Some(refusal) = check_target(store, &guard, target)? {
         staging::remove_entry(entry);
         return Ok(Finished::Refused(refusal));
@@ -1166,6 +1186,7 @@ pub async fn create_folder_v2(
         };
         let store = st.store(slug)?;
         let guard = store.lock_recovered(&st.journal)?;
+        gate_locked(st, store.slug())?;
         if !way_is_open(&store, &guard, &parent)? {
             return Outcome::taken();
         }
@@ -1209,6 +1230,7 @@ pub async fn delete_folder_v3(
         };
         let store = st.store(slug)?;
         let guard = store.lock_recovered(&st.journal)?;
+        gate_locked(st, store.slug())?;
         let Some(e) = source_of(&store, &guard, id)? else {
             return Outcome::refused(E_DELETE_MISSING, MSG_DELETE_MISSING);
         };
@@ -1313,6 +1335,7 @@ pub async fn move_v3(
         };
         let store = st.store(slug)?;
         let guard = store.lock_recovered(&st.journal)?;
+        gate_locked(st, store.slug())?;
         let Some(src) = source_of(&store, &guard, id)? else {
             return Outcome::refused(E_MOVE_MISSING, MSG_MOVE_MISSING);
         };
@@ -1366,6 +1389,7 @@ pub async fn copy_v3(
         };
         let store = st.store(slug)?;
         let guard = store.lock_recovered(&st.journal)?;
+        gate_locked(st, store.slug())?;
         let Some(src) = source_of(&store, &guard, id)? else {
             return Outcome::refused(E_COPY_MISSING, MSG_COPY_MISSING);
         };

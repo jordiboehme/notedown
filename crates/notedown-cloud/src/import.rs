@@ -388,10 +388,16 @@ fn check_backup_report(backup: &Path, no_report: bool, scan: &mut Scan) {
             return;
         }
     };
-    if report["complete"] != serde_json::Value::Bool(true) {
-        scan.errors.push(format!(
-            "{BACKUP_FILE}: the backup run did not finish (\"complete\" is not true)"
-        ));
+    match report.get("complete") {
+        Some(serde_json::Value::Bool(true)) => {}
+        None => scan.errors.push(format!(
+            "{BACKUP_FILE}: it has no \"complete\" field, it was made by an older version or \
+             did not finish; run the backup again"
+        )),
+        Some(_) => scan.errors.push(format!(
+            "{BACKUP_FILE}: the backup run did not finish (\"complete\" is not true); run it \
+             again with --resume"
+        )),
     }
     match report["errors"].as_array() {
         None => scan

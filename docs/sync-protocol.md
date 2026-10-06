@@ -504,6 +504,7 @@ Firmware 3.29.42 sends, every 5 s, both an Engine.IO `2` and `42["ratta_ping"]` 
 - The event name decides the handler on the device, not `msgType`: the device's task service listens on `to-do` and starts a task sync on any message [community:ultrabridge].
 - The payload is sent as one **string** argument holding JSON (`42["ServerMessage","{\"code\":\"200\",...}"]`); the device parses `args[0]` [community:ultrabridge] [ratta-server] [inferred for to-do].
 - Ratta queues messages per connection in Redis and sends them when the next heartbeat arrives; it drops a push if the previous push to that client was less than 5 s ago [ratta-server log strings]. A server can also push immediately [community:ultrabridge task push works].
+- notedown: with `sync = "accept"` the server pushes by default one `ServerMessage` with one `STARTSYNC` item to the connected devices of the account after a file or folder change by `put`, an import or another device. `equipmentNo` is the serial of the device that caused the change, or `"null-null"` for the CLI. The server pushes only while no sync lock is held, at most once per 5 s per device, and never to the device that caused the change. The `push` key of `server.toml` switches the form: `startsync` (default), `detail` (one item per changed file or folder with the fields of 4.5) or `off`. The reaction of the device to either form is not confirmed on firmware 3.29.42 yet [inferred].
 - Ratta runs the task channel on a second socket server (18073) that nginx does not expose; the device opens only one socket. Task pushes on the `to-do` event over the main socket work [community:ultrabridge, device-confirmed].
 
 ### 4.5 Payloads
@@ -955,6 +956,7 @@ Append-only JSONL, one event per line, written after the change is durable (data
 ```
 
 - Event types: `file.created`, `file.modified`, `file.moved` (`path`, `oldPath`), `file.copied` (`id`, `sourceId`), `file.deleted`, `file.restored`, `folder.created`, `folder.moved`, `folder.deleted`, `digest.created`, `digest.updated`, `digest.deleted`, `digest.mark.stored`, `digest.group.created|updated|deleted`, `digest.tag.*`, `task.created|updated|deleted`, `device.bound`, `device.unlinked`.
+- `origin` is one of `device`, `cli`, `scan`, `repair` or `snapshot`. Events of `journal snapshot` carry `origin: snapshot`: they describe the current state, not a change, and a consumer that reacts to changes (such as the push of 4.5) ignores them.
 - `kind` for files: `note`, `document` (pdf, epub, doc...), `mark` (document sidecar), `image`, `other`, derived from the extension.
 - `seq` is a server-wide counter, strictly increasing, never reused; it is recovered at start from the last line of the newest journal file.
 - Rotation: a new file `journal-<firstSeq>.jsonl` when the current one passes a size (for example 64 MiB) or at a month change; old files are kept until all registered consumers passed them (then they may be compressed or removed by the admin).

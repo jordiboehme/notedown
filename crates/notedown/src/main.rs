@@ -74,7 +74,7 @@ enum CloudAction {
     },
     /// Fill an account with a device backup and open its protect gate
     Import(ImportArgs),
-    /// Copy one file into an account (the device downloads it at its next sync)
+    /// Copy one file into an account (connected devices are told to sync)
     Put(PutArgs),
     /// Copy every file of the device over Browse & Access (port 8089) into a folder
     BackupDevice(BackupDeviceArgs),

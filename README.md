@@ -203,7 +203,7 @@ What to expect:
 - To add a file from the Mac, use `notedown cloud put report.pdf --data ~/notedown-cloud --account jordi --to DOCUMENT/Document/Inbox`. The Nomad downloads it at its next sync. A later version will push a message that starts the sync.
 - Do not delete or change files in the data folder directly. The device would see that as a delete and remove its own copy too. Use `put`, or change files on the device.
 - Keep the data folder on the Mac's own disk with APFS. The file system must keep file names exactly as they are (APFS does, HFS+ and some network shares do not). The server warns at start if it does not.
-- Do not move `files/` in the data folder, and do not replace it with a symlink. If `files/` or one of the device folders is missing or is a symlink, the server refuses every file request (`E0079`). The device then keeps all of its files. Move the folder back (a real folder, not a link), or import the device again with `--replace`.
+- Do not move `files/` in the data folder, and do not replace it with a symlink. If `files/` or one of the device folders is missing or is a symlink, the server refuses every file request (`E0079`). The device then keeps all of its files. If `files/` is a symlink, remove the link and put the real folder back; `--replace` does not help in that case. If `files/` or a device folder is missing, move it back or import the device again with `--replace`. The error message names the case.
 
 ## Format documentation and tests
 

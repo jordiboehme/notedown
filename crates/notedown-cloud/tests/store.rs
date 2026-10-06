@@ -959,3 +959,21 @@ fn the_name_probe_finds_a_normalization_preserving_file_system_and_cleans_up() {
     // The warning names the requirement.
     assert!(store.names_warning().contains("APFS"));
 }
+
+/// A symlinked `files/` names the only repair that helps: removing the link. `--replace` runs the
+/// same check, so the message must not point to it.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_files_folder_names_the_right_repair() {
+    let (dir, store) = setup();
+    let elsewhere = dir.path().join("files-elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let _ = std::fs::remove_dir_all(files_dir(dir.path()));
+    std::os::unix::fs::symlink(&elsewhere, files_dir(dir.path())).unwrap();
+    let message = match store.lock() {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a symlinked files/ must be refused"),
+    };
+    assert!(message.contains("Remove the link"), "{message}");
+    assert!(message.contains("does not help"), "{message}");
+}

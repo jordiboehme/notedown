@@ -400,17 +400,22 @@ impl Store {
             Ok(m) if m.file_type().is_dir() => {}
             Ok(m) if m.file_type().is_symlink() => {
                 return Err(self.damaged(format!(
-                    "{} is a symlink; keep files/ as a real folder in the data folder",
+                    "{} is a symlink. Remove the link and put the real folder back in its place. \
+                     import --replace does not help here",
                     self.files.display()
                 )));
             }
             Ok(_) => {
-                return Err(self.damaged(format!("{} is not a folder", self.files.display())));
+                return Err(self.damaged(format!(
+                    "{} is not a folder. Remove it and put the real folder back in its place",
+                    self.files.display()
+                )));
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if imported {
                     return Err(self.damaged(format!(
-                        "{} is missing although the account was imported",
+                        "{} is missing although the account was imported. Put the real folder back, \
+                         or import the device again with --replace",
                         self.files.display()
                     )));
                 }
@@ -424,7 +429,8 @@ impl Store {
                 let path = WirePath::parse_named(folder)?;
                 if !list::resolve(&self.files, &path)?.is_some_and(|f| f.kind == Kind::Folder) {
                     return Err(self.damaged(format!(
-                        "the native folder {folder} is missing or no real folder"
+                        "the device folder {folder} is missing or no real folder. Put it back, \
+                         or import the device again with --replace"
                     )));
                 }
             }

@@ -67,6 +67,36 @@ enum CloudAction {
         #[command(subcommand)]
         action: AccountAction,
     },
+    /// Read the change journal or write a snapshot for a new consumer
+    Journal {
+        #[command(subcommand)]
+        action: JournalAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum JournalAction {
+    /// Print the journal events as JSON lines
+    Tail {
+        /// The data folder
+        #[arg(long, value_name = "DIR")]
+        data: PathBuf,
+        /// Start at this seq (default: the oldest kept event)
+        #[arg(long, value_name = "SEQ")]
+        from: Option<u64>,
+        /// Keep running and print new events as they come (Ctrl-C stops)
+        #[arg(long)]
+        follow: bool,
+    },
+    /// Journal the current files and folders of an account as created events
+    Snapshot {
+        /// The data folder
+        #[arg(long, value_name = "DIR")]
+        data: PathBuf,
+        /// The account slug
+        #[arg(long)]
+        account: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -423,10 +453,107 @@ fn read_password(from_stdin: bool, confirm: bool) -> Result<String> {
     Ok(password)
 }
 
+/// Finish or drop unfinished changes of every account (a crash of the server or of an
+/// earlier command). Runs at the start of every cloud command.
+fn recover_accounts(data: &Path) -> Result<()> {
+    if !data.join("accounts").is_dir() {
+        return Ok(());
+    }
+    let journal = notedown_cloud::journal::Journal::open(data)?;
+    for (slug, r) in notedown_cloud::store::recover_all(data, &journal)? {
+        eprintln!("account {slug}: {r}");
+    }
+    Ok(())
+}
+
 fn cloud_command(action: CloudAction) -> Result<ExitCode> {
+    match action {
+        CloudAction::Account { data, action } => {
+            recover_accounts(&data)?;
+            account_command(&data, action)
+        }
+        CloudAction::Journal { action } => {
+            let data = match &action {
+                JournalAction::Tail { data, .. } | JournalAction::Snapshot { data, .. } => {
+                    data.clone()
+                }
+            };
+            recover_accounts(&data)?;
+            journal_command(&data, action)
+        }
+    }
+}
+
+/// Print the events from `*next` on and move `*next` past them. Returns false when stdout is
+/// closed (a pipe into `head`), which ends the command cleanly.
+fn print_events(journal: &notedown_cloud::journal::Journal, next: &mut u64) -> Result<bool> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for event in journal.read_from(*next)? {
+        let event = event?;
+        let written = writeln!(out, "{}", event.to_line());
+        match written {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+        *next = event.seq + 1;
+    }
+    match out.flush() {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn journal_command(data: &Path, action: JournalAction) -> Result<ExitCode> {
+    use notedown_cloud::journal::Journal;
+    if !data.is_dir() {
+        return Err(anyhow!("data folder {} does not exist", data.display()));
+    }
+    let journal = Journal::open(data)?;
+    match action {
+        JournalAction::Tail { from, follow, .. } => {
+            let mut next = from.unwrap_or(0);
+            if !print_events(&journal, &mut next)? || !follow {
+                return Ok(ExitCode::SUCCESS);
+            }
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                let mut stop = std::pin::pin!(tokio::signal::ctrl_c());
+                loop {
+                    tokio::select! {
+                        _ = &mut stop => return Ok::<(), anyhow::Error>(()),
+                        () = tokio::time::sleep(Duration::from_secs(1)) => {
+                            if !print_events(&journal, &mut next)? {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            })?;
+        }
+        JournalAction::Snapshot { account, .. } => {
+            let store = notedown_cloud::store::Store::open(data, &account)?;
+            let guard = store.lock()?;
+            let seqs = store.snapshot(&guard, &journal)?;
+            match (seqs.first(), seqs.last()) {
+                (Some(a), Some(b)) => println!(
+                    "journaled {} for account {account} (seq {a} to {b})",
+                    plural(seqs.len(), "event")
+                ),
+                _ => println!("account {account} has no files or folders"),
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn account_command(data: &Path, action: AccountAction) -> Result<ExitCode> {
     use notedown_cloud::auth::Accounts;
-    let CloudAction::Account { data, action } = action;
-    let accounts = Accounts::new(&data);
+    let accounts = Accounts::new(data);
     match action {
         AccountAction::Add {
             slug,

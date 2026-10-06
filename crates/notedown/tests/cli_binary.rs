@@ -194,3 +194,145 @@ fn serve_refuse_sync_flag_counts_for_one_run_and_keeps_server_toml() {
     let out = serve_startup(dir.path(), &[]);
     assert!(out.contains("sync mode: accept (protect: on)"), "{out}");
 }
+
+/// `notedown cloud journal <action> --data <dir> <rest>`, the documented argument order.
+fn journal(data: &std::path::Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["cloud", "journal", args[0], "--data"])
+        .arg(data)
+        .args(&args[1..])
+        .output()
+        .unwrap()
+}
+
+fn lines(out: &std::process::Output) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// An account with one file and an unfinished commit (a crash after the folder was created,
+/// before its event was journaled).
+fn journal_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let out = cloud(
+        d,
+        &[
+            "add",
+            "jordi",
+            "--email",
+            "jordi@example.org",
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(out.status.success());
+    let files = d.join("accounts/jordi/files");
+    std::fs::create_dir_all(files.join("INBOX/New")).unwrap();
+    std::fs::write(files.join("INBOX/a.pdf"), b"pdf").unwrap();
+    std::fs::write(
+        d.join("accounts/jordi/pending.json"),
+        r#"{"opId":"op-x","origin":"device","device":"SN1","op":{"op":"createFolder","id":5000,"path":"INBOX/New"},"events":[{"type":"folder.created","id":5000,"path":"INBOX/New"}]}"#,
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn cloud_journal_recovers_snapshots_and_tails() {
+    let dir = journal_fixture();
+    let d = dir.path();
+    // every command recovers first: the missing event is journaled once
+    let out = journal(d, &["tail"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("account jordi: finished the change op-x")
+    );
+    let ev = lines(&out);
+    assert_eq!(ev.len(), 1);
+    assert_eq!(ev[0]["type"], "folder.created");
+    assert_eq!(ev[0]["origin"], "repair");
+    assert_eq!(ev[0]["opId"], "op-x");
+    assert!(!d.join("accounts/jordi/pending.json").exists());
+
+    let out = journal(d, &["snapshot", "--account", "jordi"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "journaled 3 events for account jordi (seq 2 to 4)\n"
+    );
+    let ev = lines(&journal(d, &["tail"]));
+    assert_eq!(ev.len(), 4);
+    let types: Vec<&str> = ev.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        types,
+        [
+            "folder.created",
+            "folder.created",
+            "folder.created",
+            "file.created"
+        ]
+    );
+    assert_eq!(ev[3]["path"], "INBOX/a.pdf");
+    assert_eq!(ev[3]["kind"], "document");
+    assert_eq!(ev[3]["origin"], "cli");
+    let ev = lines(&journal(d, &["tail", "--from", "3"]));
+    assert_eq!(
+        ev.iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [3, 4]
+    );
+    let out = journal(d, &["snapshot", "--account", "ghost"]);
+    assert!(!out.status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn cloud_journal_tail_follow_prints_new_events_and_stops_on_ctrl_c() {
+    use std::io::BufRead;
+    let dir = journal_fixture();
+    let d = dir.path();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["cloud", "journal", "tail", "--data"])
+        .arg(d)
+        .arg("--follow")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stdout = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let _ = tx.send(line.unwrap());
+        }
+    });
+    let wait = std::time::Duration::from_secs(10);
+    let first = rx.recv_timeout(wait).unwrap();
+    assert!(first.contains("\"seq\":1"), "{first}");
+    // another process appends; the follower prints it
+    let out = journal(d, &["snapshot", "--account", "jordi"]);
+    assert!(out.status.success());
+    for seq in 2..=4 {
+        let line = rx.recv_timeout(wait).unwrap();
+        assert!(line.contains(&format!("\"seq\":{seq},")), "{line}");
+    }
+    let st = std::process::Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let status = child.wait().unwrap();
+    assert!(status.success(), "{status:?}");
+}

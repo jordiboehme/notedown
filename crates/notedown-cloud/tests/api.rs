@@ -306,6 +306,15 @@ async fn variant_a_login_sequence() {
     assert_eq!(dev["name"], "Supernote Nomad");
     assert_eq!(dev["firmware"], "202407");
     assert!(!s.data().join("accounts/jordi/files").exists());
+    // the binding is journaled; the unlink of a device that was not bound is not
+    let types: Vec<String> = journal_lines(s.data())
+        .iter()
+        .map(|e| format!("{} {} {}", e["type"], e["device"], e["origin"]))
+        .collect();
+    assert_eq!(
+        types,
+        vec![format!("\"device.bound\" \"{SERIAL}\" \"device\"")]
+    );
 
     // a second login now sees the binding; the machine id is stable across a restart
     let (login, _, _) = s.login("secret", SERIAL, "202407").await;
@@ -568,6 +577,81 @@ async fn bind_rules() {
         )
         .await;
     assert_err(&v, "E0083");
+}
+
+fn journal_lines(data: &Path) -> Vec<Value> {
+    let journal = notedown_cloud::journal::Journal::open(data).unwrap();
+    journal
+        .read_from(0)
+        .unwrap()
+        .map(|e| serde_json::to_value(e.unwrap()).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn bind_in_accept_mode_creates_the_native_folders_and_journals_once() {
+    let s = Server::accept();
+    s.login("secret", SERIAL, "202407").await;
+    assert_ok(&s.bind(SERIAL, "202407").await);
+    assert_ok(&s.bind(SERIAL, "202407").await); // already bound: no second event
+    for folder in [
+        "NOTE/Note",
+        "NOTE/MyStyle",
+        "DOCUMENT/Document",
+        "EXPORT",
+        "SCREENSHOT",
+        "INBOX",
+    ] {
+        assert!(
+            s.data().join("accounts/jordi/files").join(folder).is_dir(),
+            "{folder}"
+        );
+    }
+    let lines = journal_lines(s.data());
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["type"], "device.bound");
+    assert_eq!(lines[0]["account"], "jordi");
+    assert_eq!(lines[0]["device"], SERIAL);
+    assert_eq!(lines[0]["seq"], 1);
+    assert_eq!(lines[0]["ts"], T0);
+    let v = s
+        .call(
+            "POST",
+            "/api/terminal/equipment/unlink",
+            &[],
+            Some(json!({"equipmentNo": SERIAL, "version": "202407"})),
+        )
+        .await;
+    assert_ok(&v);
+    // a second unlink of an unbound device journals nothing
+    let v = s
+        .call(
+            "POST",
+            "/api/terminal/equipment/unlink",
+            &[],
+            Some(json!({"equipmentNo": SERIAL, "version": "202407"})),
+        )
+        .await;
+    assert_ok(&v);
+    let lines = journal_lines(s.data());
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[1]["type"], "device.unbound");
+    assert_eq!(lines[1]["seq"], 2);
+    // bound again after the unlink: journaled again
+    s.login("secret", SERIAL, "202407").await;
+    assert_ok(&s.bind(SERIAL, "202407").await);
+    assert_eq!(journal_lines(s.data()).len(), 3);
+}
+
+#[tokio::test]
+async fn a_journal_failure_does_not_fail_the_bind() {
+    let s = Server::accept();
+    s.login("secret", SERIAL, "202407").await;
+    // the journal folder is replaced by a file: every append fails
+    let dir = s.data().join("journal");
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::write(&dir, b"not a folder").unwrap();
+    assert_ok(&s.bind(SERIAL, "202407").await);
 }
 
 // server info

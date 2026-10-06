@@ -9,6 +9,7 @@
 //! Names are stored byte-exact. Lookups compare names byte by byte against the folder entries,
 //! so a case-insensitive file system (macOS APFS) cannot match a different spelling.
 
+mod commit;
 mod hashes;
 mod ids;
 mod list;
@@ -22,6 +23,9 @@ use std::sync::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
+pub use commit::{
+    Commit, CrashPoint, PENDING_FILE, PendingOp, RECYCLE_DIR, Recovery, STALE_TEMP_AGE, recover_all,
+};
 pub use ids::FIRST_ID;
 pub use list::Entry;
 pub use path::WirePath;
@@ -158,6 +162,7 @@ pub struct StoreGuard {
 
 /// The file store of one account.
 pub struct Store {
+    slug: String,
     account_dir: PathBuf,
     files: PathBuf,
     state: Mutex<State>,
@@ -182,6 +187,7 @@ impl Store {
         }
         let files = account_dir.join(FILES_DIR);
         let store = Store {
+            slug: slug.to_string(),
             account_dir,
             files,
             state: Mutex::new(State {
@@ -201,6 +207,11 @@ impl Store {
         }
         drop(guard);
         Ok(store)
+    }
+
+    /// The account slug.
+    pub fn slug(&self) -> &str {
+        &self.slug
     }
 
     /// The account folder (`accounts/<slug>`).

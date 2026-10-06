@@ -127,21 +127,22 @@ fn panic_reply(_: Box<dyn std::any::Any + Send + 'static>) -> Response {
 
 /// Change a device record and store the `version` it sent. A change from a stored value writes a
 /// `firmware_changed` marker to the protocol log (that marker protects the log days around it
-/// from rotation). The first sighting is not a change.
+/// from rotation). The first sighting is not a change. Returns the record before (if any) and
+/// after the change.
 pub(crate) fn note_firmware(
     state: &AppState,
     slug: &str,
     serial: &str,
     version: Option<&str>,
     change: impl FnOnce(&mut Device),
-) -> crate::Result<Device> {
+) -> crate::Result<(Option<Device>, Device)> {
     let (before, after) = state.auth.devices().update(slug, serial, |d| {
         if let Some(v) = version {
             d.firmware = Some(v.to_string());
         }
         change(d);
     })?;
-    let old = before.and_then(|d| d.firmware);
+    let old = before.as_ref().and_then(|d| d.firmware.clone());
     if let (Some(old), Some(new)) = (old, version)
         && old != new
     {
@@ -151,7 +152,7 @@ pub(crate) fn note_firmware(
         m.flags = vec![crate::diag::FLAG_FIRMWARE_CHANGED.to_string()];
         state.log.record(m);
     }
-    Ok(after)
+    Ok((before, after))
 }
 
 /// The client address: the peer, or with a trusted proxy as the peer the rightmost

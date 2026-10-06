@@ -9,8 +9,11 @@ use serde_json::{Value, json};
 
 use super::envelope::{E_BOUND_ELSEWHERE, Reply, field, parse_body};
 use super::{ClientAddr, note_firmware};
+use crate::SyncMode;
 use crate::auth::{AuthError, Devices};
+use crate::journal::{Event, EventBody, Origin, new_op_id};
 use crate::server::AppState;
+use crate::store::Store;
 
 const MSG_NO_ACCOUNT: &str = "Account does not exist";
 const MSG_WRONG_PASSWORD: &str = "Wrong account or password";
@@ -65,9 +68,14 @@ pub async fn unlink(State(state): State<Arc<AppState>>, body: Bytes) -> Reply {
         let r = note_firmware(&state, &slug, &serial, version.as_deref(), |d| {
             d.bound = false
         })
-        .and_then(|_| state.auth.logout(&slug, &serial));
-        if let Err(e) = r {
-            return internal(e).device(&serial);
+        .and_then(|(before, _)| state.auth.logout(&slug, &serial).map(|()| before));
+        match r {
+            Ok(before) => {
+                if before.is_some_and(|d| d.bound) {
+                    journal_device(&state, &slug, &serial, EventBody::DeviceUnbound).await;
+                }
+            }
+            Err(e) => return internal(e).device(&serial),
         }
     }
     Reply::ok(json!({})).device(&serial)
@@ -145,7 +153,7 @@ pub async fn login_equipment(
         Err(e) => return auth_error(&e).device(&serial),
     };
     let slug = ok.account.slug.clone();
-    let this = match note_firmware(
+    let (_, this) = match note_firmware(
         &state,
         &slug,
         &serial,
@@ -177,8 +185,10 @@ pub async fn login_equipment(
 }
 
 /// `POST /api/terminal/user/bindEquipment` (2.4, 2.6): records the binding in
-/// `devices/<serial>.json`. Creates nothing under `files/`. The device must have logged in to
-/// this account before (the call carries no token).
+/// `devices/<serial>.json` and journals `device.bound` when the serial was not bound to the
+/// account before. In accept mode it first creates the native folders under `files/` (under the
+/// store lock); in refuse mode (capture only) nothing under `files/` is created. The device must
+/// have logged in to this account before (the call carries no token).
 pub async fn bind_equipment(State(state): State<Arc<AppState>>, body: Bytes) -> Reply {
     let body = match parse_body(&body) {
         Ok(b) => b,
@@ -213,6 +223,24 @@ pub async fn bind_equipment(State(state): State<Arc<AppState>>, body: Bytes) -> 
     if !owners.contains(&account.slug) {
         return Reply::error(super::envelope::E_NOT_LOGGED_IN, MSG_LOGIN_FIRST).device(&serial);
     }
+    if state.sync_mode() == SyncMode::Accept {
+        let data_dir = state.data_dir.clone();
+        let slug = account.slug.clone();
+        let made = tokio::task::spawn_blocking(move || {
+            let store = Store::open(&data_dir, &slug)?;
+            let guard = store.lock()?;
+            store.ensure_native_folders(&guard)
+        })
+        .await;
+        match made {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return internal(e).device(&serial),
+            Err(e) => {
+                eprintln!("notedown cloud: creating the native folders failed: {e}");
+                return Reply::internal().device(&serial);
+            }
+        }
+    }
     let name = field(&body, "name");
     let capacity = field(&body, "totalCapacity");
     let r = note_firmware(
@@ -231,7 +259,32 @@ pub async fn bind_equipment(State(state): State<Arc<AppState>>, body: Bytes) -> 
         },
     );
     match r {
-        Ok(_) => Reply::ok(json!({})).device(&serial),
+        Ok((before, after)) => {
+            if after.bound && !before.is_some_and(|d| d.bound) {
+                journal_device(&state, &account.slug, &serial, EventBody::DeviceBound).await;
+            }
+            Reply::ok(json!({})).device(&serial)
+        }
         Err(e) => internal(e).device(&serial),
+    }
+}
+
+/// Journal a device event (`origin: "device"`). A failure is logged and never fails the call.
+async fn journal_device(state: &Arc<AppState>, slug: &str, serial: &str, body: EventBody) {
+    let state = state.clone();
+    let mut event = Event::new(
+        slug,
+        Origin::Device,
+        Some(serial.to_string()),
+        &new_op_id(),
+        body,
+    );
+    let r =
+        tokio::task::spawn_blocking(move || state.journal.append(std::slice::from_mut(&mut event)))
+            .await;
+    match r {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => eprintln!("notedown cloud: journal append failed: {e}"),
+        Err(e) => eprintln!("notedown cloud: journal append failed: {e}"),
     }
 }

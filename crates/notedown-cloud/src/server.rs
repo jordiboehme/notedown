@@ -9,6 +9,7 @@ use tokio::net::TcpListener;
 use crate::api::limit::{RateLimiter, RetryTracker};
 use crate::auth::Auth;
 use crate::diag::{Capture, Clock, ProtocolLog, SystemClock};
+use crate::journal::{Journal, JournalOptions};
 use crate::{Config, Error, Result};
 
 pub use crate::api::router;
@@ -24,6 +25,8 @@ pub struct AppState {
     pub auth: Auth,
     pub log: ProtocolLog,
     pub clock: Arc<dyn Clock>,
+    /// The change journal (server-wide).
+    pub journal: Journal,
     pub(crate) limiter: RateLimiter,
     pub(crate) retries: RetryTracker,
 }
@@ -33,7 +36,8 @@ impl AppState {
         Self::open_with_clock(config, data_dir, Arc::new(SystemClock))
     }
 
-    /// With an injected clock (tests): it drives login times, limits and the log.
+    /// With an injected clock (tests): it drives login times, limits, the log and the journal.
+    /// Unfinished commits of every account are recovered here (`Store::recover`).
     pub fn open_with_clock(
         config: Config,
         data_dir: &Path,
@@ -50,8 +54,19 @@ impl AppState {
         } else {
             log
         };
+        let journal = Journal::open_with(
+            data_dir,
+            JournalOptions {
+                clock: clock.clone(),
+                ..JournalOptions::default()
+            },
+        )?;
+        for (slug, r) in crate::store::recover_all(data_dir, &journal)? {
+            eprintln!("notedown cloud: account {slug}: {r}");
+        }
         Ok(Arc::new(AppState {
             auth: Auth::open(data_dir)?,
+            journal,
             log,
             clock,
             data_dir: data_dir.to_path_buf(),

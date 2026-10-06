@@ -13,7 +13,6 @@ use crate::SyncMode;
 use crate::auth::{AuthError, Devices};
 use crate::journal::{Event, EventBody, Origin, new_op_id};
 use crate::server::AppState;
-use crate::store::Store;
 
 const MSG_NO_ACCOUNT: &str = "Account does not exist";
 const MSG_WRONG_PASSWORD: &str = "Wrong account or password";
@@ -224,21 +223,36 @@ pub async fn bind_equipment(State(state): State<Arc<AppState>>, body: Bytes) -> 
         return Reply::error(super::envelope::E_NOT_LOGGED_IN, MSG_LOGIN_FIRST).device(&serial);
     }
     if state.sync_mode() == SyncMode::Accept {
-        let data_dir = state.data_dir.clone();
-        let slug = account.slug.clone();
-        let made = tokio::task::spawn_blocking(move || {
-            let store = Store::open(&data_dir, &slug)?;
-            let guard = store.lock()?;
-            store.ensure_native_folders(&guard)
+        // Only for an account that was never imported: the folders of an imported account
+        // come from the import, and recreating a missing one would hide a damaged tree.
+        let (st, slug, device) = (state.clone(), account.slug.clone(), serial.clone());
+        let imported = move |st: &AppState, slug: &str| -> crate::Result<bool> {
+            Ok(st
+                .auth
+                .accounts()
+                .get(slug)?
+                .is_some_and(|a| a.imported.is_some()))
+        };
+        let made = tokio::task::spawn_blocking(move || -> crate::Result<()> {
+            if imported(&st, &slug)? {
+                return Ok(());
+            }
+            let store = st.store(&slug)?;
+            let guard = store.lock_recovered(&st.journal)?;
+            if imported(&st, &slug)? {
+                return Ok(());
+            }
+            store.create_native_folders(&guard, &st.journal, Origin::Device, Some(device))?;
+            Ok(())
         })
         .await;
+        // The folders are a help for the device, not a condition of the bind: a failure
+        // (a broken journal, say) is reported and the bind goes on. An unfinished commit is
+        // repaired at the next lock.
         match made {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => return internal(e).device(&serial),
-            Err(e) => {
-                eprintln!("notedown cloud: creating the native folders failed: {e}");
-                return Reply::internal().device(&serial);
-            }
+            Ok(Err(e)) => eprintln!("notedown cloud: creating the native folders failed: {e}"),
+            Err(e) => eprintln!("notedown cloud: creating the native folders failed: {e}"),
         }
     }
     let name = field(&body, "name");

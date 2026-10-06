@@ -60,10 +60,12 @@ impl Raw {
 impl Server {
     /// Accept mode with the protect gate open (most tests).
     fn new() -> Server {
-        Self::with_config(Config {
+        let s = Self::with_config(Config {
             protect: false,
             ..Config::default()
-        })
+        });
+        seed_imported(s.data());
+        s
     }
 
     fn with_config(config: Config) -> Server {
@@ -215,16 +217,28 @@ impl Server {
     }
 
     fn mark_imported(&self) {
-        let accounts = Accounts::new(self.data());
-        let mut a = accounts.get("jordi").unwrap().unwrap();
-        a.imported = Some(Imported {
-            at: "2026-10-06T10:00:00Z".into(),
-            source: "/backup/Supernote".into(),
-            files: 3,
-            bytes: 1234,
-        });
-        accounts.save(&a).unwrap();
+        seed_imported(self.data());
     }
+}
+
+/// The account as after an import: the native folders exist (with ids) and `account.json`
+/// carries the `imported` marker. A store with the marker must keep its tree, and an account
+/// without marker and without files gets no sync, so most tests start here.
+fn seed_imported(data: &std::path::Path) {
+    let store = notedown_cloud::store::Store::open(data, "jordi").unwrap();
+    {
+        let g = store.lock().unwrap();
+        store.ensure_native_folders(&g).unwrap();
+    }
+    let accounts = notedown_cloud::auth::Accounts::new(data);
+    let mut a = accounts.get("jordi").unwrap().unwrap();
+    a.imported = Some(notedown_cloud::auth::Imported {
+        at: "2026-10-06T10:00:00Z".into(),
+        source: "/backup/Supernote".into(),
+        files: 0,
+        bytes: 0,
+    });
+    accounts.save(&a).unwrap();
 }
 
 const START: &str = "/api/file/2/files/synchronous/start";
@@ -1185,4 +1199,197 @@ async fn list_folder_v3_resolves_the_id_after_recovery() {
         .await;
     assert_ok(&v);
     assert_eq!(paths(&v), ["NOTE/Note/Play/Plan.note"]);
+}
+
+// ------------------------------------------------------------------ a damaged store (C1)
+
+const CREATE: &str = "/api/file/2/files/create_folder_v2";
+const APPLY: &str = "/api/file/3/files/upload/apply";
+const DELETE: &str = "/api/file/3/files/delete_folder_v3";
+
+/// An imported account in a running session with one note; returns the token and its id.
+async fn damaged_setup(s: &Server) -> (String, String) {
+    let t = s.login(SERIAL).await;
+    assert_ok(&s.post(START, &t, json!({"equipmentNo": SERIAL})).await);
+    s.put("NOTE/Note/a.note", b"a");
+    let v = s
+        .post(LIST, &t, json!({"path": "/", "recursive": true}))
+        .await;
+    assert_ok(&v);
+    let id = find(&v, "NOTE/Note/a.note")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    (t, id)
+}
+
+/// Every file route, reads and writes, answers E0079 with `store_damaged` (and the reason in
+/// the log entry), never a listing.
+async fn assert_store_damaged(s: &Server, t: &str, id: &str) {
+    let calls = [
+        (START, json!({"equipmentNo": SERIAL})),
+        (LIST, json!({"path": "/", "recursive": true})),
+        (LIST, json!({"path": "", "recursive": false})),
+        (LIST, json!({"path": "/NOTE/Note", "recursive": false})),
+        (LIST_V3, json!({"id": "0", "recursive": true})),
+        (QUERY, json!({"id": id})),
+        (BY_PATH, json!({"path": "/NOTE/Note/a.note"})),
+        (DOWNLOAD, json!({"id": id})),
+        (CREATE, json!({"path": "/INBOX/New", "autorename": false})),
+        (
+            APPLY,
+            json!({"path": "/INBOX/x.pdf", "fileName": "x.pdf", "size": 1}),
+        ),
+        (DELETE, json!({"id": id})),
+    ];
+    for (path, body) in calls {
+        let v = s.post(path, t, body.clone()).await;
+        assert_err(&v, "E0079");
+        assert!(v.get("entries").is_none(), "{path}: {v}");
+        let e = s.requests_to(path).pop().unwrap();
+        assert!(
+            e["flags"].to_string().contains("store_damaged"),
+            "{path} {body}: {e}"
+        );
+        assert!(
+            e["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("is damaged")),
+            "{e}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_missing_files_folder_is_refused_and_never_recreated() {
+    for protect in [false, true] {
+        let s = Server::with_config(Config {
+            protect,
+            ..Config::default()
+        });
+        s.mark_imported();
+        let (t, id) = damaged_setup(&s).await;
+        let away = s.data().join("files-moved");
+        std::fs::rename(s.files(), &away).unwrap();
+        assert_store_damaged(&s, &t, &id).await;
+        // A new login (bindEquipment) does not recreate the native folders either.
+        let t = s.login(SERIAL).await;
+        assert!(!s.files().exists(), "files/ was recreated");
+        assert!(away.join("NOTE/Note/a.note").is_file());
+        // Put back, everything works again.
+        std::fs::rename(&away, s.files()).unwrap();
+        let v = s
+            .post(LIST, &t, json!({"path": "/", "recursive": true}))
+            .await;
+        assert_ok(&v);
+        find(&v, "NOTE/Note/a.note");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlinked_files_folder_is_refused_for_every_path() {
+    let s = Server::new();
+    let (t, id) = damaged_setup(&s).await;
+    let elsewhere = s.data().join("nas-files");
+    std::fs::rename(s.files(), &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, s.files()).unwrap();
+    // The root, NOTE/Note through the link and the path query all fail the same way.
+    assert_store_damaged(&s, &t, &id).await;
+}
+
+#[tokio::test]
+async fn a_files_entry_that_is_no_folder_is_refused() {
+    let s = Server::new();
+    let (t, id) = damaged_setup(&s).await;
+    std::fs::rename(s.files(), s.data().join("files-moved")).unwrap();
+    std::fs::write(s.files(), b"not a folder").unwrap();
+    assert_store_damaged(&s, &t, &id).await;
+}
+
+#[tokio::test]
+async fn a_missing_native_folder_is_refused() {
+    let s = Server::new();
+    let (t, id) = damaged_setup(&s).await;
+    std::fs::rename(
+        s.files().join("NOTE/MyStyle"),
+        s.data().join("MyStyle-moved"),
+    )
+    .unwrap();
+    assert_store_damaged(&s, &t, &id).await;
+    assert!(!s.files().join("NOTE/MyStyle").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlinked_native_folder_is_refused() {
+    let s = Server::new();
+    let (t, id) = damaged_setup(&s).await;
+    let elsewhere = s.data().join("NOTE-elsewhere");
+    std::fs::rename(s.files().join("NOTE"), &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, s.files().join("NOTE")).unwrap();
+    assert_store_damaged(&s, &t, &id).await;
+}
+
+#[tokio::test]
+async fn a_native_folder_replaced_by_a_file_is_refused() {
+    let s = Server::new();
+    let (t, id) = damaged_setup(&s).await;
+    std::fs::remove_dir(s.files().join("DOCUMENT/Document")).unwrap();
+    std::fs::write(s.files().join("DOCUMENT/Document"), b"x").unwrap();
+    assert_store_damaged(&s, &t, &id).await;
+}
+
+#[cfg(unix)]
+#[test]
+fn a_damaged_store_refuses_put_and_server_start_reports_it() {
+    let s = Server::new();
+    std::fs::rename(s.files(), s.data().join("files-moved")).unwrap();
+    let journal = notedown_cloud::journal::Journal::open(s.data()).unwrap();
+    let src = s.data().join("report.pdf");
+    std::fs::write(&src, b"%PDF").unwrap();
+    let err =
+        notedown_cloud::put::put(s.data(), "jordi", &journal, &src, "INBOX", None).unwrap_err();
+    assert!(
+        matches!(err, notedown_cloud::Error::StoreDamaged { .. }),
+        "{err}"
+    );
+    assert!(!s.files().exists());
+    // A symlinked files/ is reported at server start (the recovery cannot lock the store).
+    std::os::unix::fs::symlink(s.data().join("files-moved"), s.files()).unwrap();
+    let clock = Arc::new(TestClock(AtomicI64::new(T0)));
+    let state = AppState::open_with_clock(Config::default(), s.data(), clock).unwrap();
+    drop(state);
+    assert!(
+        s.log_text().contains("is damaged"),
+        "no marker in {}",
+        s.log_text()
+    );
+}
+
+#[tokio::test]
+async fn protect_off_refuses_an_empty_account_that_was_never_imported() {
+    let s = Server::with_config(Config {
+        protect: false,
+        ..Config::default()
+    });
+    let t = s.login(SERIAL).await;
+    // Only the native folders that bindEquipment created: no sync.
+    assert!(s.files().join("NOTE/Note").is_dir());
+    let v = s.post(START, &t, json!({"equipmentNo": SERIAL})).await;
+    assert_err(&v, "E0079");
+    let e = s.requests_to(START).pop().unwrap();
+    assert!(e["flags"].to_string().contains("empty_account"), "{e}");
+    assert_eq!(s.state.sync_locks.holder("jordi", s.state.now_ms()), None);
+    // One file is enough: the device compares against a tree that holds something.
+    s.put("INBOX/a.pdf", b"a");
+    assert_ok(&s.post(START, &t, json!({"equipmentNo": SERIAL})).await);
+    // With the marker an empty account syncs (an import of an empty device).
+    std::fs::remove_file(s.files().join("INBOX/a.pdf")).unwrap();
+    assert_ok(
+        &s.post(END, &t, json!({"equipmentNo": SERIAL, "flag": "Y"}))
+            .await,
+    );
+    s.mark_imported();
+    assert_ok(&s.post(START, &t, json!({"equipmentNo": SERIAL})).await);
 }

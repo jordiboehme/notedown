@@ -1257,3 +1257,103 @@ fn a_date_that_does_not_parse_is_counted_in_the_report() {
     assert_eq!(json["warnings"][0]["path"], "Note/a.note");
     assert_eq!(std::fs::read(dir.join("Note/a.note")).unwrap(), b"a");
 }
+
+// ------------------------------------------------------------------ damaged store, native events
+
+fn folder_created(data: &Path) -> Vec<(String, Origin)> {
+    events(data)
+        .into_iter()
+        .filter_map(|e| match e.body {
+            EventBody::FolderCreated { path, .. } => Some((path, e.origin)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn only_the_import_rebuilds_a_store_whose_files_folder_is_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (backup, files, _) = backup_tree(tmp.path());
+    let data = data_with_account();
+    run_import(data.path(), &backup, false).unwrap();
+    let account = data.path().join("accounts/jordi");
+    std::fs::rename(account.join("files"), account.join("files-lost")).unwrap();
+    // Nothing else may recreate files/: the store refuses to open.
+    let err = Store::open(data.path(), "jordi").unwrap_err();
+    assert!(matches!(err, Error::StoreDamaged { .. }), "{err}");
+    assert!(!account.join("files").exists());
+    // The import rebuilds it (the account lists no file now, so no --replace is needed).
+    let report = run_import(data.path(), &backup, false).unwrap();
+    assert_eq!(report.files, files.len() as u64);
+    let (listed, _) = store_view(data.path());
+    assert_eq!(listed.len(), files.len());
+    assert!(
+        Accounts::new(data.path())
+            .get("jordi")
+            .unwrap()
+            .unwrap()
+            .imported
+            .is_some()
+    );
+}
+
+#[test]
+fn import_journals_native_folders_that_have_no_event_yet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (backup, _, _) = backup_tree(tmp.path());
+    let data = data_with_account();
+    // Native folders made without events (by hand, or by an older bindEquipment).
+    let store = Store::open(data.path(), "jordi").unwrap();
+    {
+        let g = store.lock().unwrap();
+        store.ensure_native_folders(&g).unwrap();
+    }
+    drop(store);
+    assert!(folder_created(data.path()).is_empty());
+    run_import(data.path(), &backup, false).unwrap();
+    let created = folder_created(data.path());
+    for native in notedown_cloud::store::NATIVE_FOLDERS {
+        let n = created.iter().filter(|(p, _)| p == native).count();
+        assert_eq!(n, 1, "{native}: {created:?}");
+    }
+    // A second import (with --replace) adds none for them.
+    run_import(data.path(), &backup, true).unwrap();
+    let again = folder_created(data.path());
+    for native in notedown_cloud::store::NATIVE_FOLDERS {
+        let n = again.iter().filter(|(p, _)| p == native).count();
+        assert_eq!(n, 1, "{native}: {again:?}");
+    }
+}
+
+#[tokio::test]
+async fn bind_journals_the_native_folders_and_the_import_adds_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (backup, _, _) = backup_tree(tmp.path());
+    let data = data_with_account();
+    let clock = Arc::new(TestClock(AtomicI64::new(T0)));
+    let config = Config {
+        protect: true,
+        ..Config::default()
+    };
+    let state = AppState::open_with_clock(config, data.path(), clock).unwrap();
+    login(&state).await;
+    let created = folder_created(data.path());
+    assert_eq!(created.len(), 8, "{created:?}");
+    let devices: Vec<_> = events(data.path())
+        .into_iter()
+        .filter(|e| matches!(e.body, EventBody::FolderCreated { .. }))
+        .map(|e| (e.origin, e.device))
+        .collect();
+    assert!(
+        devices
+            .iter()
+            .all(|(o, d)| *o == Origin::Device && d.as_deref() == Some(SERIAL)),
+        "{devices:?}"
+    );
+    run_import(data.path(), &backup, false).unwrap();
+    let after = folder_created(data.path());
+    for native in notedown_cloud::store::NATIVE_FOLDERS {
+        let n = after.iter().filter(|(p, _)| p == native).count();
+        assert_eq!(n, 1, "{native}: {after:?}");
+    }
+}

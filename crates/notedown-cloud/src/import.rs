@@ -529,7 +529,8 @@ pub fn import(
                 .into(),
         ));
     }
-    let store = Store::open(data, slug)?;
+    // Only the import may create a missing `files/` or rebuild a damaged tree.
+    let store = Store::open_for_import(data, slug)?;
     let guard = store.lock_recovered(journal)?;
     let present = listed_files(&store, &guard)?;
     if present > 0 && !options.replace {
@@ -556,6 +557,9 @@ pub fn import(
             folders_created += 1;
         }
     }
+    // Native folders made before the import without an event (by hand, or by an older
+    // version) get their `folder.created` now, so the journal knows every listed folder.
+    store.journal_native_folders(&guard, journal)?;
 
     let staging = store
         .account_dir()

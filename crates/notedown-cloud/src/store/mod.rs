@@ -46,7 +46,8 @@ pub const STORE_LOCK_FILE: &str = ".store.lock";
 pub const FILES_DIR: &str = "files";
 
 /// The device's native folders and their parents, parents first (`docs/sync-protocol.md` 3.3).
-/// They are created by [`Store::ensure_native_folders`] and are never pruned.
+/// They are created by [`Store::create_native_folders`] (with `folder.created` events) and are
+/// never pruned.
 pub const NATIVE_FOLDERS: [&str; 8] = [
     "NOTE",
     "NOTE/Note",
@@ -169,6 +170,65 @@ pub struct Store {
     account_dir: PathBuf,
     files: PathBuf,
     state: Mutex<State>,
+    /// Opened by `notedown cloud import`: [`Store::lock`] may create a missing `files/` and
+    /// does not check the tree behind the `imported` marker (the import rebuilds it).
+    import_mode: bool,
+    /// Print a line on stderr when the store lock is busy before waiting for it.
+    announce_wait: bool,
+    /// Whether the probe at open found that the file system keeps names byte-exact.
+    names_preserved: bool,
+}
+
+/// Take the store lock file of an account (`accounts/<slug>/.store.lock`, exclusive). It tries
+/// first; when another process holds it and `announce` names the account, it prints "waiting
+/// for the store lock of account <slug>" on stderr, then blocks. No state is read and the tree
+/// is not checked, so a damaged account can still be removed.
+pub fn take_store_lock(account_dir: &Path, announce: Option<&str>) -> Result<std::fs::File> {
+    let path = account_dir.join(STORE_LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(io_err(&path))?;
+    match file.try_lock() {
+        Ok(()) => return Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            if let Some(slug) = announce {
+                eprintln!("waiting for the store lock of account {slug}");
+            }
+        }
+        Err(std::fs::TryLockError::Error(e)) => return Err(io_err(&path)(e)),
+    }
+    file.lock().map_err(io_err(&path))?;
+    Ok(file)
+}
+
+/// The name of the normalization probe: `é` as one code point (NFC). A file system that
+/// stores names in NFD (HFS+, some network shares) gives it back as `e` plus a combining
+/// accent.
+const PROBE_NFC_NAME: &str = "\u{e9}";
+
+/// Create a file with an NFC name in `dir` and check that the folder lists it with exactly
+/// these bytes. The file is removed again. An error of the probe itself counts as preserved
+/// (nothing is known); only a changed name is a finding.
+fn probe_names_preserved(dir: &Path) -> bool {
+    let name = format!(
+        ".nd-probe-{}-{}-{PROBE_NFC_NAME}.tmp",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let path = dir.join(&name);
+    if std::fs::File::create(&path).is_err() {
+        return true;
+    }
+    let found = std::fs::read_dir(dir).map(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.file_name().as_encoded_bytes() == name.as_bytes())
+    });
+    let _ = std::fs::remove_file(&path);
+    found.unwrap_or(true)
 }
 
 impl std::fmt::Debug for Store {
@@ -181,15 +241,39 @@ impl std::fmt::Debug for Store {
 
 impl Store {
     /// Open the store of account `slug` in the data folder `data_dir`. Under the store lock it
-    /// creates `files/` if needed and compacts `ids.jsonl` into `ids.json`.
+    /// creates `files/` if needed (never for an account with an `imported` marker, see
+    /// [`Store::lock`]) and compacts `ids.jsonl` into `ids.json`. It also probes once whether the
+    /// file system keeps names byte-exact and warns on stderr if not
+    /// ([`Store::names_preserved`]).
     pub fn open(data_dir: &Path, slug: &str) -> Result<Store> {
+        Self::open_with(data_dir, slug, false, false)
+    }
+
+    /// [`Store::open`] for `notedown cloud import`: the import may create a missing `files/` and
+    /// rebuild the tree of an account whose store is damaged.
+    pub fn open_for_import(data_dir: &Path, slug: &str) -> Result<Store> {
+        Self::open_with(data_dir, slug, true, false)
+    }
+
+    /// [`Store::open`] that prints "waiting for the store lock of account <slug>" when the lock
+    /// is busy (a running import), for the recovery of every command.
+    pub fn open_announced(data_dir: &Path, slug: &str) -> Result<Store> {
+        Self::open_with(data_dir, slug, false, true)
+    }
+
+    fn open_with(
+        data_dir: &Path,
+        slug: &str,
+        import_mode: bool,
+        announce_wait: bool,
+    ) -> Result<Store> {
         validate_slug(slug)?;
         let account_dir = Accounts::new(data_dir).account_dir(slug);
         if !account_dir.is_dir() {
             return Err(Error::NoAccount(slug.to_string()));
         }
         let files = account_dir.join(FILES_DIR);
-        let store = Store {
+        let mut store = Store {
             slug: slug.to_string(),
             account_dir,
             files,
@@ -199,7 +283,14 @@ impl Store {
                 hashes: HashCache::default(),
                 hashes_stamp: None,
             }),
+            import_mode,
+            announce_wait,
+            names_preserved: true,
         };
+        store.names_preserved = probe_names_preserved(&store.account_dir);
+        if !store.names_preserved {
+            eprintln!("warning: {}", store.names_warning());
+        }
         let guard = store.lock()?;
         {
             let mut state = store.state();
@@ -210,6 +301,23 @@ impl Store {
         }
         drop(guard);
         Ok(store)
+    }
+
+    /// Whether the file system of the data folder kept an NFC name byte-exact in the probe at
+    /// open. When false, names from the device may come back in another spelling (HFS+ stores
+    /// NFD), and lookups after a commit can fail.
+    pub fn names_preserved(&self) -> bool {
+        self.names_preserved
+    }
+
+    /// The warning for a file system that changes names (see [`Store::names_preserved`]).
+    pub fn names_warning(&self) -> String {
+        format!(
+            "account {}: the file system of {} changes the Unicode normalization of file names; \
+             keep the data folder on a file system that keeps names as they are (APFS on macOS)",
+            self.slug,
+            self.account_dir.display()
+        )
     }
 
     /// The account slug.
@@ -233,25 +341,24 @@ impl Store {
     }
 
     /// Take the store lock (exclusive, blocking) and bring the in-memory registry and hash
-    /// cache up to date with the disk. A torn last line of `ids.jsonl` is cut here, and a
-    /// missing `files/` is created (only ever under the lock).
+    /// cache up to date with the disk. A torn last line of `ids.jsonl` is cut here.
+    ///
+    /// The tree is checked first, so nothing is ever listed from a tree the server did not
+    /// make (`Error::StoreDamaged`, fail closed):
+    ///
+    /// - `files/` must be a real folder, never a symlink or a file.
+    /// - A missing `files/` is created only for an account without an `imported` marker, or by
+    ///   the import ([`Store::open_for_import`]).
+    /// - With the marker, every native folder must be a real folder ([`NATIVE_FOLDERS`]). The
+    ///   server never deletes or moves them, so a missing one means the tree broke outside it.
     pub fn lock(&self) -> Result<StoreGuard> {
-        let path = self.account_dir.join(STORE_LOCK_FILE);
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .map_err(io_err(&path))?;
-        file.lock().map_err(io_err(&path))?;
+        let announce = self.announce_wait.then_some(self.slug.as_str());
+        let file = take_store_lock(&self.account_dir, announce)?;
         let guard = StoreGuard {
             _file: file,
             account_dir: self.account_dir.clone(),
         };
-        if !self.files.is_dir() {
-            std::fs::create_dir_all(&self.files).map_err(io_err(&self.files))?;
-            crate::fsutil::fsync_dir(&self.account_dir)?;
-        }
+        self.check_tree()?;
         let mut state = self.state();
         self.refresh_ids(&mut state, true)?;
         let hs = stamp(&self.account_dir.join(hashes::HASHES_FILE));
@@ -261,6 +368,67 @@ impl Store {
         }
         drop(state);
         Ok(guard)
+    }
+
+    fn damaged(&self, reason: String) -> Error {
+        Error::StoreDamaged {
+            slug: self.slug.clone(),
+            reason,
+        }
+    }
+
+    /// Whether `account.json` carries the `imported` marker.
+    fn has_import_marker(&self) -> Result<bool> {
+        let path = self.account_dir.join(crate::auth::ACCOUNT_FILE);
+        match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice::<crate::auth::Account>(&bytes)
+                .map(|a| a.imported.is_some())
+                .map_err(|e| Error::Config {
+                    path,
+                    message: e.to_string(),
+                }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(io_err(&path)(e)),
+        }
+    }
+
+    /// The tree check of [`Store::lock`] (the lock is held).
+    fn check_tree(&self) -> Result<()> {
+        let imported = !self.import_mode && self.has_import_marker()?;
+        match std::fs::symlink_metadata(&self.files) {
+            Ok(m) if m.file_type().is_dir() => {}
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(self.damaged(format!(
+                    "{} is a symlink; keep files/ as a real folder in the data folder",
+                    self.files.display()
+                )));
+            }
+            Ok(_) => {
+                return Err(self.damaged(format!("{} is not a folder", self.files.display())));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if imported {
+                    return Err(self.damaged(format!(
+                        "{} is missing although the account was imported",
+                        self.files.display()
+                    )));
+                }
+                std::fs::create_dir_all(&self.files).map_err(io_err(&self.files))?;
+                crate::fsutil::fsync_dir(&self.account_dir)?;
+            }
+            Err(e) => return Err(io_err(&self.files)(e)),
+        }
+        if imported {
+            for folder in NATIVE_FOLDERS {
+                let path = WirePath::parse_named(folder)?;
+                if !list::resolve(&self.files, &path)?.is_some_and(|f| f.kind == Kind::Folder) {
+                    return Err(self.damaged(format!(
+                        "the native folder {folder} is missing or no real folder"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -560,7 +728,9 @@ impl Store {
     // ------------------------------------------------------------------ folders and names
 
     /// Create the native folders and their parents under `files/` (idempotent) and give them
-    /// ids. Called by `bindEquipment` and by import.
+    /// ids, without journal events. Test hook only: `bindEquipment` and the import use
+    /// [`Store::create_native_folders`], which journals `folder.created`.
+    #[doc(hidden)]
     pub fn ensure_native_folders(&self, guard: &StoreGuard) -> Result<()> {
         self.check_guard(guard)?;
         for folder in NATIVE_FOLDERS {

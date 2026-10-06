@@ -10,8 +10,14 @@
 //! - `finishing-<opId>`: the data, renamed by `upload/finish` before it verifies and commits
 //!   it, so no other request can change the bytes in between.
 //!
-//! The entry is named by the signed `innerName` (a UUID from `upload/apply`), never by a value
-//! the device chose: `uploadId` is not signed, and `upload/finish` names only `innerName`.
+//! - `apply.json`: `{"device", "parent", "fileName", "appliedAtMs", "seq"}`, written by
+//!   `upload/apply`, so `upload/finish` can find the entry by its file name.
+//!
+//! The entry is named by an internal id (a UUID that `upload/apply` signs into the upload URLs),
+//! never by a value the device chose: `uploadId` is not signed. `upload/apply` answers
+//! `innerName` = `fileName`, as in Ratta's traffic, so `upload/finish` may name the upload by
+//! its file name ([`find_applied`]: the latest apply of this device for this parent folder and
+//! name wins) or by the internal id.
 //! Every file is written to a temp file first (fsync, rename), so a cut transfer never counts
 //! as a part or as data. Staged data is never listed (everything outside `files/` is hidden).
 //! [`sweep`] removes entries older than [`STAGING_MAX_AGE_MS`] on start and every hour.
@@ -51,6 +57,82 @@ const WRITE_STEP: usize = 256 * 1024;
 pub const STATUS_UPLOADING: &str = "uploading";
 /// `chunk status` once the parts are merged into `data`.
 pub const STATUS_MERGED: &str = "merged";
+
+/// The apply record of an entry.
+pub const APPLY_FILE: &str = "apply.json";
+
+/// `apply.json`: who applied for the upload, for which parent folder and name, and when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyRecord {
+    pub device: String,
+    pub parent: String,
+    pub file_name: String,
+    pub applied_at_ms: u64,
+    /// Orders two applies in the same millisecond (within one server run).
+    pub seq: u64,
+}
+
+static APPLY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Write the apply record of a new upload (blocking): creates the entry folder and
+/// `apply.json`.
+pub fn record_apply(
+    entry: &Path,
+    device: &str,
+    parent: &str,
+    file_name: &str,
+    now_ms: u64,
+) -> Result<()> {
+    create_entry(entry)?;
+    let record = ApplyRecord {
+        device: device.to_string(),
+        parent: parent.to_string(),
+        file_name: file_name.to_string(),
+        applied_at_ms: now_ms,
+        seq: APPLY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    };
+    crate::store::write_atomic_short(&entry.join(APPLY_FILE), &crate::fsutil::json_bytes(&record))
+}
+
+/// The entry of the latest `upload/apply` of `device` for `file_name` in the folder `parent`
+/// (the form `upload/finish` uses when its `innerName` is the file name). `None` when there is
+/// none.
+pub fn find_applied(
+    account_dir: &Path,
+    device: &str,
+    parent: &str,
+    file_name: &str,
+) -> Result<Option<PathBuf>> {
+    let dir = staging_dir(account_dir);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_err(&dir)(e)),
+    };
+    let mut best: Option<((u64, u64), PathBuf)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !valid_inner_name(&name.to_string_lossy()) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(bytes) = std::fs::read(path.join(APPLY_FILE)) else {
+            continue;
+        };
+        let Ok(r) = serde_json::from_slice::<ApplyRecord>(&bytes) else {
+            continue;
+        };
+        if r.device != device || r.parent != parent || r.file_name != file_name {
+            continue;
+        }
+        let key = (r.applied_at_ms, r.seq);
+        if best.as_ref().is_none_or(|(k, _)| key > *k) {
+            best = Some((key, path));
+        }
+    }
+    Ok(best.map(|(_, p)| p))
+}
 
 /// A UUID in its 36-character text form (lowercase or uppercase hex), as `upload/apply`
 /// issues for `innerName`.
@@ -360,7 +442,7 @@ impl StagingLocks {
                 .any(|e| {
                     let name = e.file_name();
                     let name = name.to_string_lossy();
-                    !(name.starts_with(".nd-") && name.ends_with(".tmp"))
+                    !(name.starts_with(".nd-") && name.ends_with(".tmp")) && name != APPLY_FILE
                 });
             if used {
                 return Ok(SingleOutcome::Refused);

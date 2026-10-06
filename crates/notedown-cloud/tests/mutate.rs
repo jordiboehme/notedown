@@ -24,6 +24,7 @@ use time::OffsetDateTime;
 use tower::ServiceExt;
 
 const SERIAL: &str = "SN078C10000000";
+const OTHER: &str = "SN078C10000001";
 const EMAIL: &str = "jordi@example.org";
 const T0: i64 = 1_791_270_000_000;
 
@@ -65,6 +66,26 @@ fn test1() -> Vec<u8> {
     std::fs::read(root.join("tests/fixtures/notes/test1.note")).unwrap()
 }
 
+/// The account as after an import: the native folders exist (with ids) and `account.json`
+/// carries the `imported` marker. A store with the marker must keep its tree, and an account
+/// without marker and without files gets no sync, so most tests start here.
+fn seed_imported(data: &std::path::Path) {
+    let store = notedown_cloud::store::Store::open(data, "jordi").unwrap();
+    {
+        let g = store.lock().unwrap();
+        store.ensure_native_folders(&g).unwrap();
+    }
+    let accounts = notedown_cloud::auth::Accounts::new(data);
+    let mut a = accounts.get("jordi").unwrap().unwrap();
+    a.imported = Some(notedown_cloud::auth::Imported {
+        at: "2026-10-06T10:00:00Z".into(),
+        source: "/backup/Supernote".into(),
+        files: 0,
+        bytes: 0,
+    });
+    accounts.save(&a).unwrap();
+}
+
 fn assert_ok(v: &Value) {
     assert_eq!(v["success"], true, "{v}");
     assert!(v["errorCode"].is_null(), "{v}");
@@ -102,6 +123,7 @@ impl Server {
             protect: false,
             ..Config::default()
         };
+        seed_imported(dir.path());
         let state = AppState::open_with_clock(config, dir.path(), clock.clone()).unwrap();
         Server { dir, state, clock }
     }
@@ -191,6 +213,10 @@ impl Server {
     }
 
     async fn login(&self) -> String {
+        self.login_as(SERIAL).await
+    }
+
+    async fn login_as(&self, serial: &str) -> String {
         let addr: SocketAddr = "192.168.1.50:40000".parse().unwrap();
         let call = |uri: &str, body: Value| {
             Request::builder()
@@ -220,7 +246,7 @@ impl Server {
         let hash = expected_login_hash(&md5_hex("secret"), code);
         let login = send(call(
             "/api/official/user/account/login/equipment",
-            json!({"account": EMAIL, "password": hash, "equipmentNo": SERIAL,
+            json!({"account": EMAIL, "password": hash, "equipmentNo": serial,
                    "equipment": 3, "loginMethod": "2",
                    "timestamp": ch["timestamp"], "version": "202407"}),
         ))
@@ -231,7 +257,7 @@ impl Server {
             .post(
                 "/api/terminal/user/bindEquipment",
                 &token,
-                json!({"account": EMAIL, "equipmentNo": SERIAL, "flag": "1",
+                json!({"account": EMAIL, "equipmentNo": serial, "flag": "1",
                        "name": "Supernote Nomad", "totalCapacity": "25485312",
                        "version": "202407"}),
             )
@@ -1220,7 +1246,11 @@ async fn every_mutation_needs_the_sync_lock() {
     let t = s.session().await;
     s.put("INBOX/a.pdf", b"a");
     let a = s.id_of(&t, "INBOX/a.pdf").await;
-    s.advance_ms(31_000); // the lock lapses
+    // The session ended: nothing takes the lock back without synchronous/start.
+    assert_ok(
+        &s.post(END, &t, json!({"equipmentNo": SERIAL, "flag": "Y"}))
+            .await,
+    );
     let n = s.events().len();
     for (path, body) in [
         (CREATE, json!({"path": "/INBOX/F", "autorename": false})),
@@ -1241,6 +1271,59 @@ async fn every_mutation_needs_the_sync_lock() {
     assert_eq!(s.events().len(), n);
     assert!(s.files().join("INBOX/a.pdf").is_file());
     assert!(!s.files().join("INBOX/F").exists());
+}
+
+#[tokio::test]
+async fn a_pause_longer_than_the_lock_inside_a_session_takes_the_lock_again() {
+    let s = Server::new();
+    let t = s.session().await;
+    s.put("INBOX/a.pdf", b"a");
+    let a = s.id_of(&t, "INBOX/a.pdf").await;
+    // The device hashes a large file for 45 s: the lock lapses without a call.
+    s.advance_ms(45_000);
+    assert_eq!(s.state.sync_locks.holder("jordi", s.state.now_ms()), None);
+    let v = s.mkdir(&t, "/INBOX/F", false).await;
+    assert_ok(&v);
+    assert!(s.files().join("INBOX/F").is_dir());
+    assert_eq!(
+        s.state
+            .sync_locks
+            .holder("jordi", s.state.now_ms())
+            .as_deref(),
+        Some(SERIAL)
+    );
+    // Again a pause, then a move: the write works without a new synchronous/start.
+    s.advance_ms(31_000);
+    let v = s
+        .post(MOVE, &t, json!({"id": a, "to_path": "/INBOX/b.pdf"}))
+        .await;
+    assert_ok(&v);
+    assert!(s.files().join("INBOX/b.pdf").is_file());
+}
+
+#[tokio::test]
+async fn a_lapsed_lock_is_not_taken_back_while_another_device_holds_it() {
+    let s = Server::new();
+    let t = s.session().await;
+    s.advance_ms(31_000);
+    let other = s.login_as(OTHER).await;
+    assert_ok(&s.post(START, &other, json!({"equipmentNo": OTHER})).await);
+    let v = s.mkdir(&t, "/INBOX/F", false).await;
+    assert_err(&v, "E0079");
+    assert!(
+        s.log_flags(CREATE)
+            .last()
+            .unwrap()
+            .contains(&"no_sync_lock".to_string())
+    );
+    assert!(!s.files().join("INBOX/F").exists());
+    assert_eq!(
+        s.state
+            .sync_locks
+            .holder("jordi", s.state.now_ms())
+            .as_deref(),
+        Some(OTHER)
+    );
 }
 
 #[tokio::test]

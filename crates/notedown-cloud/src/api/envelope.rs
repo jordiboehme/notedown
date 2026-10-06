@@ -29,6 +29,11 @@ pub const MSG_INTERNAL: &str = "Internal server error";
 #[derive(Debug, Clone, Default)]
 pub struct LogFlags(pub Vec<String>);
 
+/// A note for people in the request log entry (`message`), such as why the store of the
+/// account is refused.
+#[derive(Debug, Clone)]
+pub struct LogMessage(pub String);
+
 /// The device serial for the request log when the body does not name it (token requests).
 #[derive(Debug, Clone)]
 pub struct LogDevice(pub String);
@@ -45,6 +50,7 @@ pub struct Reply {
     body: Map<String, Value>,
     flags: Vec<String>,
     device: Option<String>,
+    message: Option<String>,
 }
 
 impl Reply {
@@ -62,6 +68,7 @@ impl Reply {
             body,
             flags: Vec::new(),
             device: None,
+            message: None,
         }
     }
 
@@ -75,6 +82,7 @@ impl Reply {
             body,
             flags: Vec::new(),
             device: None,
+            message: None,
         }
     }
 
@@ -109,6 +117,12 @@ impl Reply {
         self
     }
 
+    /// A note for the request log entry (`message`); the device never sees it.
+    pub fn message(mut self, text: &str) -> Reply {
+        self.message = Some(text.to_string());
+        self
+    }
+
     pub fn device(mut self, serial: &str) -> Reply {
         self.device = Some(serial.to_string());
         self
@@ -123,6 +137,9 @@ impl IntoResponse for Reply {
         }
         if let Some(d) = self.device {
             resp.extensions_mut().insert(LogDevice(d));
+        }
+        if let Some(m) = self.message {
+            resp.extensions_mut().insert(LogMessage(m));
         }
         resp
     }

@@ -76,6 +76,23 @@ impl SyncLocks {
         }
     }
 
+    /// The lock for a file call of `serial` at `now_ms`, after the protect gate passed: the
+    /// device that last held the lock keeps it. A live lock of this device is extended; a lapsed
+    /// one is taken again silently (a long pause inside a session, such as hashing a large file
+    /// on the device). Returns whether `serial` holds the live lock now. Another device's live
+    /// lock is never touched, and nothing is taken after `synchronous/end` released the lock or
+    /// when another device held it last.
+    pub fn retake(&self, slug: &str, serial: &str, now_ms: u64) -> bool {
+        let mut map = self.map();
+        match map.get_mut(slug) {
+            Some(h) if h.owner == serial => {
+                h.expires_at_ms = h.expires_at_ms.max(now_ms + SYNC_LOCK_TTL_MS);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// `synchronous/end`: release the lock when `serial` holds it (or it lapsed). Returns whether
     /// a lock of this device was released. Another device's live lock stays.
     pub fn end(&self, slug: &str, serial: &str, now_ms: u64) -> bool {

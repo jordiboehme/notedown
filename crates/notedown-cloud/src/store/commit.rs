@@ -1022,6 +1022,74 @@ impl Store {
         Ok(Commit::new(origin, device, op, vec![event]))
     }
 
+    /// Create every missing native folder and parent ([`super::NATIVE_FOLDERS`], parents
+    /// first), one `plan_create_folder` commit each, so each gets its `folder.created` event
+    /// with this origin. Existing folders are kept. A file or another spelling in the way is an
+    /// error. Returns how many folders were created.
+    pub fn create_native_folders(
+        &self,
+        guard: &WriteGuard,
+        journal: &Journal,
+        origin: Origin,
+        device: Option<String>,
+    ) -> Result<u64> {
+        let mut created = 0;
+        for folder in super::NATIVE_FOLDERS {
+            let path = WirePath::parse_named(folder)?;
+            if self.resolve(&path)?.is_some_and(|f| f.kind == Kind::Folder) {
+                continue;
+            }
+            let commit = self.plan_create_folder(guard, &path, origin, device.clone())?;
+            self.commit(guard, commit, journal)?;
+            created += 1;
+        }
+        Ok(created)
+    }
+
+    /// Journal `folder.created` (`origin: "cli"`, one `opId`) for each native folder of this
+    /// account whose id has no `folder.created` event yet (folders made before the events
+    /// existed, or by hand). Nothing on disk changes. Returns how many events were appended.
+    pub fn journal_native_folders(&self, guard: &WriteGuard, journal: &Journal) -> Result<u64> {
+        self.check_write(guard)?;
+        let mut native = Vec::new();
+        for folder in super::NATIVE_FOLDERS {
+            let path = WirePath::parse_named(folder)?;
+            if let Some(e) = self.entry(guard, &path)?
+                && e.tag == Kind::Folder
+            {
+                native.push((e.id, e.path_display));
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for event in journal.read_from(0)? {
+            let event = event?;
+            if event.account == self.slug
+                && let EventBody::FolderCreated { id, .. } = event.body
+            {
+                seen.insert(id);
+            }
+        }
+        let op_id = new_op_id();
+        let mut events: Vec<Event> = native
+            .into_iter()
+            .filter(|(id, _)| !seen.contains(id))
+            .map(|(id, path)| {
+                Event::new(
+                    &self.slug,
+                    Origin::Cli,
+                    None,
+                    &op_id,
+                    EventBody::FolderCreated { id, path },
+                )
+            })
+            .collect();
+        if events.is_empty() {
+            return Ok(0);
+        }
+        journal.append(&mut events)?;
+        Ok(events.len() as u64)
+    }
+
     // ------------------------------------------------------------------ commit
 
     /// Run the commit protocol (see the module docs) and return the `seq` values of its events.

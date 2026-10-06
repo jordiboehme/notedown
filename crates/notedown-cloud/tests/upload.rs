@@ -13,7 +13,7 @@ use axum::body::Body;
 use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request, StatusCode};
 use md5::{Digest, Md5};
-use notedown_cloud::auth::{Accounts, Imported, expected_login_hash, md5_hex};
+use notedown_cloud::auth::{Accounts, expected_login_hash, md5_hex};
 use notedown_cloud::journal::Origin;
 use notedown_cloud::server::{AppState, router};
 use notedown_cloud::store::{
@@ -33,6 +33,7 @@ const EMAIL: &str = "jordi@example.org";
 const T0: i64 = 1_791_270_000_000;
 
 const START: &str = "/api/file/2/files/synchronous/start";
+const END: &str = "/api/file/2/files/synchronous/end";
 const LIST: &str = "/api/file/2/files/list_folder";
 const APPLY: &str = "/api/file/3/files/upload/apply";
 const FINISH: &str = "/api/file/2/files/upload/finish";
@@ -136,6 +137,36 @@ fn query_value(url: &str, key: &str) -> String {
         .to_string()
 }
 
+/// The account as after an import: the native folders exist (with ids) and `account.json`
+/// carries the `imported` marker. A store with the marker must keep its tree, and an account
+/// without marker and without files gets no sync, so most tests start here.
+fn seed_imported(data: &std::path::Path) {
+    let store = notedown_cloud::store::Store::open(data, "jordi").unwrap();
+    {
+        let g = store.lock().unwrap();
+        store.ensure_native_folders(&g).unwrap();
+    }
+    let accounts = notedown_cloud::auth::Accounts::new(data);
+    let mut a = accounts.get("jordi").unwrap().unwrap();
+    a.imported = Some(notedown_cloud::auth::Imported {
+        at: "2026-10-06T10:00:00Z".into(),
+        source: "/backup/Supernote".into(),
+        files: 0,
+        bytes: 0,
+    });
+    accounts.save(&a).unwrap();
+}
+
+/// The internal id of an upload: signed into the URLs of `upload/apply`, it names the staging
+/// entry (`innerName` in the answer is the file name).
+fn internal_id(apply: &Value) -> String {
+    let url = apply["fullUploadUrl"].as_str().unwrap();
+    SignedTarget::decode(&query_value(url, "path"))
+        .unwrap()
+        .inner
+        .unwrap()
+}
+
 fn assert_ok(v: &Value) {
     assert_eq!(v["success"], true, "{v}");
     assert!(v["errorCode"].is_null(), "{v}");
@@ -157,10 +188,12 @@ fn assert_err(v: &Value, code: &str) {
 
 impl Server {
     fn new() -> Server {
-        Self::with_config(Config {
+        let s = Self::with_config(Config {
             protect: false,
             ..Config::default()
-        })
+        });
+        seed_imported(s.data());
+        s
     }
 
     /// Protect mode with the import marker set (the gate is open, overwrites are recycled).
@@ -169,15 +202,7 @@ impl Server {
             protect: true,
             ..Config::default()
         });
-        let accounts = Accounts::new(s.data());
-        let mut a = accounts.get("jordi").unwrap().unwrap();
-        a.imported = Some(Imported {
-            at: "2026-10-06T10:00:00Z".into(),
-            source: "/backup/Supernote".into(),
-            files: 0,
-            bytes: 0,
-        });
-        accounts.save(&a).unwrap();
+        seed_imported(s.data());
         s
     }
 
@@ -380,10 +405,17 @@ impl Server {
             .collect()
     }
 
+    /// Staging entries that hold anything besides the apply record (bytes, parts, state).
     fn staging_entries(&self) -> Vec<String> {
         match std::fs::read_dir(self.account().join("staging")) {
             Ok(d) => d
-                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .map(|e| e.unwrap())
+                .filter(|e| {
+                    std::fs::read_dir(e.path()).is_ok_and(|mut files| {
+                        files.any(|f| f.unwrap().file_name() != staging::APPLY_FILE)
+                    })
+                })
+                .map(|e| e.file_name().to_string_lossy().into_owned())
                 .collect(),
             Err(_) => Vec::new(),
         }
@@ -430,7 +462,9 @@ async fn a_new_note_under_a_new_folder_lands_with_folder_file_and_page_events() 
     );
     assert_eq!(a["bucketName"], "Meeting.note");
     assert_eq!(a["authorization"], "");
-    let inner = a["innerName"].as_str().unwrap().to_string();
+    // As in Ratta's traffic, innerName is the file name; the internal id is in the URLs.
+    assert_eq!(a["innerName"], "Meeting.note");
+    let inner = internal_id(&a);
     assert!(staging::valid_inner_name(&inner), "{inner}");
     assert_eq!(a["xamzDate"], T0.to_string());
     let full = a["fullUploadUrl"].as_str().unwrap();
@@ -790,7 +824,7 @@ async fn three_parts_out_of_order_with_a_retry_merge_once() {
         )
         .await;
     let url = a["partUploadUrl"].as_str().unwrap();
-    let inner = a["innerName"].as_str().unwrap();
+    let inner = &internal_id(&a);
     let id = "1791270000000_0a1b2c3d-1111-4222-8333-444455556666";
     let send = |n: usize| {
         let extra = format!("&uploadId={id}&partNumber={n}&totalChunks=3");
@@ -847,7 +881,7 @@ async fn a_missing_part_means_no_merge_and_finish_refuses() {
     let t = s.session().await;
     let a = s.apply(&t, "/INBOX/p.pdf", "p.pdf", 6).await;
     let url = a["partUploadUrl"].as_str().unwrap();
-    let inner = a["innerName"].as_str().unwrap();
+    let inner = &internal_id(&a);
     for n in [1, 3] {
         let r = s
             .send(
@@ -910,16 +944,14 @@ async fn limits_refuse_large_parts_and_files() {
         .await;
     assert_err(&r.json(), "E0324");
     assert!(r.json().to_string().len() < 200);
-    let entry = s
-        .account()
-        .join("staging")
-        .join(a["innerName"].as_str().unwrap());
+    let entry = s.account().join("staging").join(internal_id(&a));
     assert!(!entry.join("data").exists());
-    assert_eq!(
-        std::fs::read_dir(&entry).unwrap().count(),
-        0,
-        "no temp file is left"
-    );
+    let left: Vec<_> = std::fs::read_dir(&entry)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|n| n != staging::APPLY_FILE)
+        .collect();
+    assert!(left.is_empty(), "no temp file is left: {left:?}");
     // At the limit it is fine.
     let r = s
         .send(
@@ -959,10 +991,7 @@ async fn limits_refuse_large_parts_and_files() {
             assert_err(&r, "E0324");
         }
     }
-    let entry = s
-        .account()
-        .join("staging")
-        .join(p["innerName"].as_str().unwrap());
+    let entry = s.account().join("staging").join(internal_id(&p));
     assert!(!entry.join("data").exists());
     assert!(!entry.join("part-1").exists());
 }
@@ -1019,8 +1048,11 @@ async fn every_upload_route_needs_the_live_sync_lock() {
     let t = s.session().await;
     let a = s.apply(&t, "/INBOX/l.pdf", "l.pdf", 1).await;
     assert_ok(&a);
-    // The lock lapses (no call for 31 s).
-    s.advance_ms(31_000);
+    // The session ended: no write without a new synchronous/start.
+    assert_ok(
+        &s.post(END, &t, json!({"equipmentNo": SERIAL, "flag": "Y"}))
+            .await,
+    );
     assert_err(&s.apply(&t, "/INBOX/l.pdf", "l.pdf", 1).await, "E0079");
     let r = s
         .send(a["fullUploadUrl"].as_str().unwrap(), "", "l.pdf", b"l")
@@ -1663,6 +1695,7 @@ async fn finish_must_name_the_parent_signed_at_apply() {
     assert_eq!(target.path, "NOTE/Note");
     s.send(a["fullUploadUrl"].as_str().unwrap(), "", "x.note", b"x")
         .await;
+    // By file name the upload is looked up under the parent the finish names: none there.
     let f = s
         .finish(
             &t,
@@ -1671,6 +1704,14 @@ async fn finish_must_name_the_parent_signed_at_apply() {
             a["innerName"].as_str().unwrap(),
             b"x",
         )
+        .await;
+    assert_err(&f, "E0324");
+    let e = s.requests_to(FINISH).pop().unwrap();
+    assert!(e["flags"].to_string().contains("upload_missing"), "{e}");
+    assert!(!s.files().join("NOTE/Note/x.note").exists());
+    // By the internal id the entry is found, and its signed parent does not match.
+    let f = s
+        .finish(&t, "/NOTE/Note/x.note/", "x.note", &internal_id(&a), b"x")
         .await;
     assert_err(&f, "E0324");
     let e = s.requests_to(FINISH).pop().unwrap();
@@ -1723,14 +1764,14 @@ async fn an_upload_url_takes_one_set_of_bytes_and_answers_its_retry() {
     let t = s.session().await;
     let a = s.apply(&t, "/INBOX/once.pdf", "once.pdf", 4).await;
     let url = a["fullUploadUrl"].as_str().unwrap();
-    let inner = a["innerName"].as_str().unwrap();
+    let inner = &internal_id(&a);
     let first = s.send(url, "", "once.pdf", b"good").await.json();
     assert_ok(&first);
     // The answer was lost: the device sends the same bytes again and gets the same answer.
     let again = s.send(url, "", "once.pdf", b"good").await.json();
     assert_ok(&again);
     assert_eq!(again["md5"], first["md5"]);
-    assert_eq!(again["innerName"], inner);
+    assert_eq!(again["innerName"], inner.as_str());
     let entry = s.account().join("staging").join(inner);
     let names: Vec<String> = std::fs::read_dir(&entry)
         .unwrap()
@@ -1948,7 +1989,7 @@ async fn a_finish_that_fails_before_its_commit_can_be_retried() {
     let s = Server::new();
     let t = s.session().await;
     let a = s.apply(&t, "/INBOX/retry.pdf", "retry.pdf", 5).await;
-    let inner = a["innerName"].as_str().unwrap();
+    let inner = &internal_id(&a);
     s.send(
         a["fullUploadUrl"].as_str().unwrap(),
         "",
@@ -1992,7 +2033,7 @@ async fn a_finish_whose_intent_names_the_bytes_leaves_them_to_recovery() {
     let ro = std::fs::Permissions::from_mode(0o444);
     std::fs::set_permissions(&newest, ro).unwrap();
     let a = s.apply(&t, "/INBOX/intent.pdf", "intent.pdf", 5).await;
-    let inner = a["innerName"].as_str().unwrap().to_string();
+    let inner = internal_id(&a);
     s.send(
         a["fullUploadUrl"].as_str().unwrap(),
         "",
@@ -2228,4 +2269,92 @@ async fn an_upload_for_a_vanished_account_is_no_protect_refusal() {
     assert!(!e["flags"].to_string().contains("protect_refused"), "{e}");
     assert_ne!(r.json()["errorCode"], "E0079", "{}", r.json());
     assert_eq!(r.json()["success"], false);
+}
+
+// ------------------------------------------------------------------ innerName forms
+
+#[tokio::test]
+async fn finish_takes_the_file_name_or_the_internal_id_as_inner_name() {
+    let s = Server::new();
+    let t = s.session().await;
+    // By file name, as apply answers it (Ratta's traffic).
+    let a = s.apply(&t, "/INBOX/n.pdf", "n.pdf", 1).await;
+    assert_eq!(a["innerName"], "n.pdf");
+    s.send(a["fullUploadUrl"].as_str().unwrap(), "", "n.pdf", b"n")
+        .await;
+    let f = s.finish(&t, "/INBOX/", "n.pdf", "n.pdf", b"n").await;
+    assert_ok(&f);
+    assert_eq!(f["path_display"], "INBOX/n.pdf");
+    let e = s.requests_to(FINISH).pop().unwrap();
+    assert!(
+        e["flags"].to_string().contains("inner_name_file_name"),
+        "{e}"
+    );
+    // By the internal id from the signed URL.
+    let a = s.apply(&t, "/INBOX/i.pdf", "i.pdf", 1).await;
+    s.send(a["fullUploadUrl"].as_str().unwrap(), "", "i.pdf", b"i")
+        .await;
+    let f = s
+        .finish(&t, "/INBOX/", "i.pdf", &internal_id(&a), b"i")
+        .await;
+    assert_ok(&f);
+    assert_eq!(f["path_display"], "INBOX/i.pdf");
+    let e = s.requests_to(FINISH).pop().unwrap();
+    assert!(e["flags"].to_string().contains("inner_name_id"), "{e}");
+    assert_eq!(std::fs::read(s.files().join("INBOX/i.pdf")).unwrap(), b"i");
+    assert!(s.staging_entries().is_empty(), "{:?}", s.staging_entries());
+}
+
+#[tokio::test]
+async fn by_file_name_the_latest_apply_wins_and_other_names_are_unknown() {
+    let s = Server::new();
+    let t = s.session().await;
+    // Two applies for the same file; the bytes go to the URL of the second one.
+    let first = s.apply(&t, "/INBOX/r.pdf", "r.pdf", 2).await;
+    let second = s.apply(&t, "/INBOX/r.pdf", "r.pdf", 2).await;
+    assert_ne!(internal_id(&first), internal_id(&second));
+    s.send(
+        second["fullUploadUrl"].as_str().unwrap(),
+        "",
+        "r.pdf",
+        b"r2",
+    )
+    .await;
+    let f = s.finish(&t, "/INBOX/", "r.pdf", "r.pdf", b"r2").await;
+    assert_ok(&f);
+    assert_eq!(std::fs::read(s.files().join("INBOX/r.pdf")).unwrap(), b"r2");
+    // The other way round: bytes at the first URL, a later apply without bytes wins and has
+    // no data, so the finish is refused and nothing is written.
+    let a = s.apply(&t, "/INBOX/q.pdf", "q.pdf", 1).await;
+    s.send(a["fullUploadUrl"].as_str().unwrap(), "", "q.pdf", b"q")
+        .await;
+    assert_ok(&s.apply(&t, "/INBOX/q.pdf", "q.pdf", 1).await);
+    let f = s.finish(&t, "/INBOX/", "q.pdf", "q.pdf", b"q").await;
+    assert_err(&f, "E0324");
+    assert!(!s.files().join("INBOX/q.pdf").exists());
+    // An innerName that is neither the file name nor an internal id: unknown.
+    let a = s.apply(&t, "/INBOX/u.pdf", "u.pdf", 1).await;
+    s.send(a["fullUploadUrl"].as_str().unwrap(), "", "u.pdf", b"u")
+        .await;
+    for inner in ["other.pdf", "", "../u.pdf"] {
+        let f = s.finish(&t, "/INBOX/", "u.pdf", inner, b"u").await;
+        assert_err(&f, "E0324");
+    }
+    let e = s.requests_to(FINISH).pop().unwrap();
+    assert!(e["flags"].to_string().contains("upload_missing"), "{e}");
+    assert!(!s.files().join("INBOX/u.pdf").exists());
+    // Another device does not hold the lock and gets nothing.
+    let other = s.login(OTHER).await;
+    let f = s
+        .post(
+            FINISH,
+            &other,
+            json!({"equipmentNo": OTHER, "path": "/INBOX/", "fileName": "u.pdf",
+                   "content_hash": md5_of(b"u"), "innerName": "u.pdf", "size": "1"}),
+        )
+        .await;
+    assert_err(&f, "E0079");
+    // The right device and name still works.
+    let f = s.finish(&t, "/INBOX/", "u.pdf", "u.pdf", b"u").await;
+    assert_ok(&f);
 }

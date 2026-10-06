@@ -608,12 +608,24 @@ async fn bind_in_accept_mode_creates_the_native_folders_and_journals_once() {
         );
     }
     let lines = journal_lines(s.data());
-    assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0]["type"], "device.bound");
-    assert_eq!(lines[0]["account"], "jordi");
-    assert_eq!(lines[0]["device"], SERIAL);
-    assert_eq!(lines[0]["seq"], 1);
-    assert_eq!(lines[0]["ts"], T0);
+    assert_eq!(lines.len(), 9);
+    // the native folders, parents first, each a commit of the device
+    let created: Vec<&str> = lines[..8]
+        .iter()
+        .map(|l| {
+            assert_eq!(l["type"], "folder.created", "{l}");
+            assert_eq!(l["origin"], "device", "{l}");
+            assert_eq!(l["device"], SERIAL, "{l}");
+            l["path"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(created, notedown_cloud::store::NATIVE_FOLDERS);
+    let bound = &lines[8];
+    assert_eq!(bound["type"], "device.bound");
+    assert_eq!(bound["account"], "jordi");
+    assert_eq!(bound["device"], SERIAL);
+    assert_eq!(bound["seq"], 9);
+    assert_eq!(bound["ts"], T0);
     let v = s
         .call(
             "POST",
@@ -634,13 +646,13 @@ async fn bind_in_accept_mode_creates_the_native_folders_and_journals_once() {
         .await;
     assert_ok(&v);
     let lines = journal_lines(s.data());
-    assert_eq!(lines.len(), 2);
-    assert_eq!(lines[1]["type"], "device.unbound");
-    assert_eq!(lines[1]["seq"], 2);
+    assert_eq!(lines.len(), 10);
+    assert_eq!(lines[9]["type"], "device.unbound");
+    assert_eq!(lines[9]["seq"], 10);
     // bound again after the unlink: journaled again
     s.login("secret", SERIAL, "202407").await;
     assert_ok(&s.bind(SERIAL, "202407").await);
-    assert_eq!(journal_lines(s.data()).len(), 3);
+    assert_eq!(journal_lines(s.data()).len(), 11);
 }
 
 #[tokio::test]

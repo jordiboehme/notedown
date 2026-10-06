@@ -48,6 +48,16 @@ pub const MSG_PATH_MISSING: &str = "The path does not exist";
 pub const MSG_DEVICE_MISMATCH: &str = "The device is not linked to this account";
 pub const MSG_NO_FILE: &str = "The file does not exist";
 
+/// Log flag: the store of an imported account is damaged (`files/` missing, a symlink or no
+/// folder, or a native folder missing). Every file route answers `E0079` instead of a listing.
+pub const FLAG_STORE_DAMAGED: &str = "store_damaged";
+/// Log flag: `synchronous/start` with protect off for an account without an `imported` marker
+/// and without files, refused (`E0079`): the device would compare against an empty tree.
+pub const FLAG_EMPTY_ACCOUNT: &str = "empty_account";
+/// Log flag: `upload/finish` named the upload by its file name (as in Ratta's traffic).
+pub const FLAG_INNER_NAME_FILE: &str = "inner_name_file_name";
+/// Log flag: `upload/finish` named the upload by the internal staging id.
+pub const FLAG_INNER_NAME_ID: &str = "inner_name_id";
 /// Log flag: `synchronous/start` refused by the protect gate (no import yet).
 pub const FLAG_PROTECT_REFUSED: &str = "protect_refused";
 /// Log flag: `synchronous/end` with `flag` `Y`.
@@ -170,6 +180,7 @@ where
     match tokio::task::spawn_blocking(f).await {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(Error::GateClosed(_))) => Err(protect_refused(serial)),
+        Ok(Err(e @ Error::StoreDamaged { .. })) => Err(store_damaged(serial, &e)),
         Ok(Err(e)) => {
             eprintln!("notedown cloud: {e}");
             Err(Reply::internal().device(serial))
@@ -222,25 +233,43 @@ pub fn gate_locked(state: &AppState, slug: &str) -> crate::Result<()> {
     }
 }
 
+/// The answer for a damaged store (`Error::StoreDamaged`): `E0079` with flag `store_damaged`,
+/// the reason in the log entry's `message`, and a warning on stderr. Never a listing.
+pub fn store_damaged(serial: &str, e: &Error) -> Reply {
+    let text = e.to_string();
+    eprintln!("notedown cloud: warning: {text}");
+    Reply::sync_busy()
+        .flag(FLAG_STORE_DAMAGED)
+        .message(&text)
+        .device(serial)
+}
+
 /// The answer of a closed protect gate: `E0079` with flag `protect_refused`.
 pub fn protect_refused(serial: &str) -> Reply {
     Reply::sync_busy().flag(FLAG_PROTECT_REFUSED).device(serial)
 }
 
-/// [`device_request!`] followed by the protect gate.
+/// [`device_request!`] followed by the protect gate, then a lapsed sync lock of this device is
+/// taken again.
 macro_rules! gated_request {
     ($state:expr, $headers:expr, $bytes:expr) => {{
         let req = device_request!($state, $headers, $bytes);
         if let Some(reply) = protect_gate(&$state, &req.account, &req.serial) {
             return reply;
         }
+        // The device that held the sync lock last keeps it across a pause in its session.
+        $state
+            .sync_locks
+            .retake(&req.slug, &req.serial, $state.now_ms());
         req
     }};
 }
 
 /// `POST /api/file/2/files/synchronous/start`. Order: device check, the protect gate (accept
 /// mode with `protect = true` refuses with `E0079` until the account has an `imported` marker),
-/// then the lock (`E0078` while another device holds it). Answers `synType: true`.
+/// the store check (`E0079` with `store_damaged` for a damaged tree, and with `empty_account`
+/// for an account without marker and without files), then the lock (`E0078` while another
+/// device holds it). Answers `synType: true`.
 pub async fn sync_start(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -249,6 +278,35 @@ pub async fn sync_start(
     let req = device_request!(state, headers, bytes);
     if let Some(reply) = protect_gate(&state, &req.account, &req.serial) {
         return reply;
+    }
+    // The store is checked before the lock is taken: a damaged tree (`store_damaged`) or, with
+    // protect off, an account that was never imported and holds no file (`empty_account`) gets
+    // no sync, so the device never compares against an empty tree.
+    let (st, slug) = (state.clone(), req.slug.clone());
+    let empty = blocking(&req.serial, move || {
+        let store = st.store(&slug)?;
+        let guard = store.lock_recovered(&st.journal)?;
+        gate_locked(&st, store.slug())?;
+        let imported = st
+            .auth
+            .accounts()
+            .get(store.slug())?
+            .is_some_and(|a| a.imported.is_some());
+        if imported {
+            return Ok(false);
+        }
+        let entries = store.list(&guard, &WirePath::root(), true)?;
+        Ok(!entries.iter().any(|e| e.tag == Kind::File))
+    })
+    .await;
+    match empty {
+        Ok(false) => {}
+        Ok(true) => {
+            return Reply::sync_busy()
+                .flag(FLAG_EMPTY_ACCOUNT)
+                .device(&req.serial);
+        }
+        Err(r) => return r,
     }
     match state
         .sync_locks
@@ -333,11 +391,17 @@ pub async fn list_folder(
     };
     let recursive = flag_arg(&req.body, "recursive");
     let (st, slug) = (state.clone(), req.slug.clone());
-    match blocking(&req.serial, move || {
-        list_folder_of(&st, &slug, Folder::Path(path), recursive)
-    })
-    .await
-    {
+    // A first listing after a hash-cache reset hashes the whole tree: keep the lock alive.
+    let listed = keep_lock(
+        &state,
+        &req.slug,
+        &req.serial,
+        blocking(&req.serial, move || {
+            list_folder_of(&st, &slug, Folder::Path(path), recursive)
+        }),
+    )
+    .await;
+    match listed {
         Ok(Some(entries)) => req.ok(json!({"entries": entries_value(&entries)})),
         Ok(None) => req.error(E_PATH_MISSING, MSG_PATH_MISSING),
         Err(r) => r,
@@ -369,9 +433,14 @@ pub async fn list_folder_v3(
     let recursive = flag_arg(&req.body, "recursive");
     let (st, slug) = (state.clone(), req.slug.clone());
     let folder = id.map_or(Folder::Path(WirePath::root()), Folder::Id);
-    let r = blocking(&req.serial, move || {
-        list_folder_of(&st, &slug, folder, recursive)
-    })
+    let r = keep_lock(
+        &state,
+        &req.slug,
+        &req.serial,
+        blocking(&req.serial, move || {
+            list_folder_of(&st, &slug, folder, recursive)
+        }),
+    )
     .await;
     match r {
         Ok(Some(entries)) => req.ok(json!({"entries": entries_value(&entries)})),
@@ -526,9 +595,11 @@ pub async fn space_usage(
 // ------------------------------------------------------------------ uploads
 
 /// Whether `serial` holds the live sync lock of `slug`. Every write needs it, so no write can
-/// pass around `synchronous/start` and its protect gate.
+/// pass around `synchronous/start`. Call it after the protect gate: the device that held the
+/// lock last takes a lapsed lock again ([`SyncLocks::retake`](crate::sync::SyncLocks::retake)),
+/// while another device's live lock answers `E0079`.
 pub fn holds_sync_lock(state: &AppState, slug: &str, serial: &str) -> bool {
-    state.sync_locks.holder(slug, state.now_ms()).as_deref() == Some(serial)
+    state.sync_locks.retake(slug, serial, state.now_ms())
 }
 
 /// How often [`keep_lock`] extends the sync lock (well inside its 30 s TTL).
@@ -663,8 +734,10 @@ fn check_target(
 
 /// `POST /api/file/3/files/upload/apply` `{path (full path with the name), fileName, size}`:
 /// the signed upload URLs. Needs the sync lock (`E0079`). The name is checked first (`E0322`
-/// on a collision, `E0324` on a dot-name). `innerName` is a fresh UUID; the URLs sign the
-/// account, the device, its token generation, the parent folder, `innerName` and `size`.
+/// on a collision, `E0324` on a dot-name). `innerName` is `fileName`, as in Ratta's traffic.
+/// The upload gets a fresh internal id (a UUID) that names its staging entry; the URLs sign the
+/// account, the device, its token generation, the parent folder, that id and `size`. The apply
+/// is recorded in the entry, so `upload/finish` finds it by device, parent and name.
 pub async fn upload_apply(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -691,12 +764,27 @@ pub async fn upload_apply(
     if size > state.file_max() {
         return Refusal::Cannot(FLAG_UPLOAD_TOO_LARGE).reply(&req.serial);
     }
+    // The internal id of the upload: signed into the URLs, names the staging entry.
+    let inner = crate::journal::new_op_id();
+    let parent = target.parent().unwrap_or_default().display();
     let (st, slug, t) = (state.clone(), req.slug.clone(), target.clone());
+    let (serial, inner_c, parent_c, name_c, now) = (
+        req.serial.clone(),
+        inner.clone(),
+        parent.clone(),
+        file_name.clone(),
+        state.now_ms(),
+    );
     let checked = blocking(&req.serial, move || {
         let store = st.store(&slug)?;
         let guard = store.lock_recovered(&st.journal)?;
         gate_locked(&st, store.slug())?;
-        check_target(&store, &guard, &t)
+        let refused = check_target(&store, &guard, &t)?;
+        if refused.is_none() {
+            let entry = staging::entry_dir(store.account_dir(), &inner_c)?;
+            staging::record_apply(&entry, &serial, &parent_c, &name_c, now)?;
+        }
+        Ok(refused)
     })
     .await;
     match checked {
@@ -704,14 +792,13 @@ pub async fn upload_apply(
         Ok(Some(refusal)) => return refusal.reply(&req.serial),
         Err(r) => return r,
     }
-    let inner = crate::journal::new_op_id();
     let signed_target = SignedTarget {
         account: req.slug.clone(),
         device: req.serial.clone(),
         generation: req.generation,
-        path: target.parent().unwrap_or_default().display(),
+        path: parent,
         id: None,
-        inner: Some(inner.clone()),
+        inner: Some(inner),
         size,
     }
     .encode();
@@ -728,7 +815,8 @@ pub async fn upload_apply(
     let base = base_url(state.config.external_base_url.as_deref(), host);
     req.ok(json!({
         "bucketName": file_name,
-        "innerName": inner,
+        // As in Ratta's traffic: the file name. The internal id is only in the signed URLs.
+        "innerName": file_name,
         "xamzDate": signed.timestamp.to_string(),
         "authorization": "",
         "fullUploadUrl": upload_url(&base, "upload", &signed_target, &signed),
@@ -760,10 +848,26 @@ struct FinishArgs {
 fn finish_upload(state: &AppState, a: FinishArgs) -> crate::Result<Finished> {
     let cannot = |flag| Ok(Finished::Refused(Refusal::Cannot(flag)));
     let store = state.store(&a.slug)?;
-    let entry = staging::entry_dir(store.account_dir(), &a.inner)?;
     let Some((parent, target)) = upload_target(&a.path, &a.file_name) else {
-        staging::remove_entry(&entry);
+        if staging::valid_inner_name(&a.inner) {
+            staging::remove_entry(&staging::entry_dir(store.account_dir(), &a.inner)?);
+        }
         return cannot(FLAG_BAD_NAME);
+    };
+    // `innerName` is the internal id, or the file name (then the latest apply of this device
+    // for this parent and name).
+    let entry = if staging::valid_inner_name(&a.inner) {
+        staging::entry_dir(store.account_dir(), &a.inner)?
+    } else {
+        match staging::find_applied(
+            store.account_dir(),
+            &a.serial,
+            &parent.display(),
+            &a.file_name,
+        )? {
+            Some(entry) => entry,
+            None => return cannot(FLAG_UPLOAD_MISSING),
+        }
     };
     // Take the bytes away from every other request first: from here on only this finish
     // reads them, so what is verified is what is committed.
@@ -859,7 +963,9 @@ fn finish_claimed(
 }
 
 /// `POST /api/file/2/files/upload/finish` `{path (parent folder + "/"), fileName,
-/// content_hash, innerName, size (string)}`: claims the staged data (no other request can change
+/// content_hash, innerName, size (string)}`: `innerName` is the file name (the latest apply of
+/// this device for this parent folder and name) or the internal id of the upload (log flags
+/// `inner_name_file_name` / `inner_name_id`). It claims the staged data (no other request can change
 /// it afterwards), checks that the parent is the one signed at apply, verifies size and MD5
 /// (`E0324` and nothing kept on a mismatch), creates missing parent folders
 /// (`folder.created`), writes the file (`file.created`, or `file.modified` with `prevMd5` and
@@ -879,8 +985,15 @@ pub async fn upload_finish(
     let Some(file_name) = text("fileName").filter(|n| !n.is_empty()) else {
         return Reply::bad_params("fileName").device(&req.serial);
     };
-    let Some(inner) = text("innerName").filter(|i| staging::valid_inner_name(i)) else {
+    // The file name (what `upload/apply` answers) or the internal id; anything else is unknown.
+    let Some(inner) = text("innerName").filter(|i| *i == file_name || staging::valid_inner_name(i))
+    else {
         return Refusal::Cannot(FLAG_UPLOAD_MISSING).reply(&req.serial);
+    };
+    let form = if inner == file_name {
+        FLAG_INNER_NAME_FILE
+    } else {
+        FLAG_INNER_NAME_ID
     };
     let (Some(content_hash), Some(size)) = (text("content_hash"), size_arg(&req.body, "size"))
     else {
@@ -906,7 +1019,7 @@ pub async fn upload_finish(
     )
     .await;
     state.invalidate_usage(&req.slug);
-    match r {
+    let reply = match r {
         Ok(Finished::Done(e)) => req.ok(json!({
             "path_display": e.path_display,
             "id": e.id.to_string(),
@@ -916,7 +1029,9 @@ pub async fn upload_finish(
         })),
         Ok(Finished::Refused(refusal)) => refusal.reply(&req.serial),
         Err(r) => r,
-    }
+    };
+    // Which form of `innerName` the device sent, for the log.
+    reply.flag(form)
 }
 
 // ------------------------------------------------------------------ folders, delete, move, copy

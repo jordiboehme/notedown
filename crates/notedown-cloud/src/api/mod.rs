@@ -484,6 +484,9 @@ fn finish_entry(
     if let Some(LogFlags(flags)) = rparts.extensions.remove::<LogFlags>() {
         entry.flags.extend(flags);
     }
+    if let Some(envelope::LogMessage(m)) = rparts.extensions.remove::<envelope::LogMessage>() {
+        entry.message = Some(m);
+    }
     if entry.device.is_none()
         && let Some(LogDevice(d)) = rparts.extensions.remove::<LogDevice>()
     {

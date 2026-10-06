@@ -54,6 +54,15 @@ pub enum Error {
     /// import cleared the `imported` marker). Routes answer `E0079` with `protect_refused`.
     #[error("the protect gate of account {0} is closed (no imported marker)")]
     GateClosed(String),
+    /// The tree of an imported account is not what the import left: `files/` is missing, a
+    /// symlink or no folder, or a native folder is missing. The server never answers a listing
+    /// from such a tree (the device would delete its own files); routes answer `E0079` with
+    /// `store_damaged`.
+    #[error(
+        "the store of account {slug} is damaged: {reason}. Restore the data folder from a \
+         backup, or import the device again with --replace"
+    )]
+    StoreDamaged { slug: String, reason: String },
     #[error("cannot listen on {addr}: {source}")]
     Bind {
         addr: std::net::SocketAddr,

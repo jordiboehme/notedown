@@ -251,6 +251,13 @@ pub struct Page {
     pub page_text_box: Option<u32>,
     /// `DISABLE`; `None` for `none`.
     pub disable: Option<String>,
+    /// `PAGETEXTBOX` as a flag (docs/note-format.md 4.3, 7.4): `Some(true)` for any
+    /// non-zero value; `None` when the key is absent.
+    pub text_box_flag: Option<bool>,
+    /// `DISABLE` as rects `left, top, width, height` (4.3): regions drawn by the
+    /// device with no ink strokes, such as text boxes. `none` gives an empty
+    /// list; a malformed entry is skipped with a warning and stays in `meta`.
+    pub disabled_rects: Vec<[u32; 4]>,
     /// Raw `FIVESTAR` value; present only on starred pages (docs/note-format.md 4.3).
     pub five_star: Option<String>,
     /// Vector freshness indicator (docs/note-format.md 9.7): `Some(true)` when the

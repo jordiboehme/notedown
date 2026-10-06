@@ -8,7 +8,7 @@ use crate::meta::Meta;
 use crate::model::{BlockRef, Layer, LayerInfo, LayerSlot, Page};
 use crate::recognition::decode_recogn_text;
 use crate::resolve::Resolver;
-use crate::values::{id_timestamp, text, uint};
+use crate::values::{Warnings, id_timestamp, parse_rect, text, uint};
 
 /// Parses the page block `block` of footer key `key` (e.g. `PAGE1`) at the
 /// 0-based position `index`. Messages name the footer key.
@@ -85,6 +85,8 @@ pub(crate) fn parse_page(
     };
 
     let w = &mut rx.warnings;
+    let page_text_box = uint(w, &what, &meta, "PAGETEXTBOX");
+    let disabled_rects = parse_disabled_rects(w, &what, text(&meta, "DISABLE").as_deref());
     Ok(Page {
         index,
         address: block.address,
@@ -110,12 +112,30 @@ pub(crate) fn parse_page(
         thumbnail_type: uint(w, &what, &meta, "THUMBNAILTYPE"),
         external_link_info,
         id_table,
-        page_text_box: uint(w, &what, &meta, "PAGETEXTBOX"),
+        page_text_box,
+        text_box_flag: page_text_box.map(|n| n != 0),
+        disabled_rects,
         disable: text(&meta, "DISABLE"),
         five_star: meta.get("FIVESTAR").map(str::to_owned),
         vectors_current,
         meta,
     })
+}
+
+/// `DISABLE`: rects `left,top,width,height`, each followed by `|`
+/// (docs/note-format.md 4.3). A malformed entry is skipped with a warning.
+fn parse_disabled_rects(w: &mut Warnings, what: &str, value: Option<&str>) -> Vec<[u32; 4]> {
+    let mut rects = Vec::new();
+    for entry in value.unwrap_or_default().split('|') {
+        if entry.trim().is_empty() {
+            continue;
+        }
+        match parse_rect(entry) {
+            Some(rect) => rects.push(rect),
+            None => w.push(format!("{what} DISABLE: {entry:?} is not a rect")),
+        }
+    }
+    rects
 }
 
 fn parse_layer(

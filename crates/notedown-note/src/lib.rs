@@ -29,6 +29,7 @@ mod recognition;
 mod render;
 mod resolve;
 mod strokes;
+mod textbox;
 mod titles;
 mod values;
 
@@ -54,3 +55,4 @@ pub use strokes::{
     OutlineRing, Polyline, RecordKind, StrokeBox, StrokeRecord, StrokeStatus, StrokeTrailer,
     decode_totalpath,
 };
+pub use textbox::{DigestRef, TextBox, decode_text_boxes};

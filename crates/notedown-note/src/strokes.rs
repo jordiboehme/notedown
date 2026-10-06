@@ -20,6 +20,9 @@ pub enum StrokeStatus {
     Live,
     /// `-99`: the stroke was erased.
     Erased,
+    /// `-5`: the handwriting was converted into a text box and is hidden
+    /// (9.3 G, 7.4). The stroke is not drawn.
+    ReplacedByTextBox,
     /// Any other code (others report -16, -4, -3, -2).
     Other(i32),
 }
@@ -29,6 +32,7 @@ impl StrokeStatus {
         match code {
             0 => StrokeStatus::Live,
             -99 => StrokeStatus::Erased,
+            -5 => StrokeStatus::ReplacedByTextBox,
             other => StrokeStatus::Other(other),
         }
     }
@@ -46,6 +50,13 @@ pub enum RecordKind {
     Lasso,
     /// Kind name `0000`: a link box (9.6). The rectangle is not drawn.
     LinkBox,
+    /// Kind name `0000` with operation 52: a text box (7.4, 9.3 H). Not drawn;
+    /// the device renders its text into the bitmap.
+    TextBox,
+    /// Operation 52 with any other kind name (`others`, tool 4): the group
+    /// record that ties source strokes to a text box (7.4). It holds only
+    /// referenced ids; it is never drawn and its ranges are not used.
+    Group,
     /// Kind name `0001`: a filled rectangle (heading background) \[others\].
     FilledRect,
     /// Kind name `straightLine`: a ruler line between two points \[others\].
@@ -212,6 +223,8 @@ impl StrokeRecord {
     /// What the record is (docs/note-format.md 9.5 skip rules).
     pub fn kind(&self) -> RecordKind {
         match self.kind_name.as_str() {
+            "0000" if self.operation == TEXT_BOX_OPERATION => RecordKind::TextBox,
+            _ if self.operation == TEXT_BOX_OPERATION => RecordKind::Group,
             "0000" => RecordKind::LinkBox,
             _ if self.tool == 3 || self.color == 255 => RecordKind::Eraser,
             _ if self.class == -5 || self.tool == 4 => RecordKind::Lasso,
@@ -262,6 +275,9 @@ pub struct Polyline {
     /// above 255 are clamped to 255.
     pub color: u8,
 }
+
+/// Part H operation of a text box record and of its group record (7.4, 9.3 H).
+const TEXT_BOX_OPERATION: i32 = 52;
 
 /// Size of the fixed head including the disable-area count (9.3 A).
 const HEAD_LEN: usize = 212;
@@ -408,7 +424,11 @@ fn to_pixels(points: &[(u32, u32)], max_a: u32, max_b: u32, size: (u32, u32)) ->
 }
 
 /// Parses one record (docs/note-format.md 9.3). `size` is the portrait page size.
-fn parse_record(index: usize, data: &[u8], size: (u32, u32)) -> Result<StrokeRecord, String> {
+pub(crate) fn parse_record(
+    index: usize,
+    data: &[u8],
+    size: (u32, u32),
+) -> Result<StrokeRecord, String> {
     let mut r = Reader::new(data);
     if data.len() < HEAD_LEN {
         return Err(format!(

@@ -369,7 +369,9 @@ fn cloud_import_dry_run_import_and_put() {
     std::fs::write(backup.join("Note/Work/a.note"), b"note").unwrap();
     std::fs::create_dir_all(backup.join("Document")).unwrap();
     std::fs::write(backup.join("Document/b.pdf"), b"pdf").unwrap();
-    std::fs::create_dir_all(backup.join("REMOVABLE0")).unwrap();
+    for f in ["MyStyle", "EXPORT", "SCREENSHOT", "INBOX", "REMOVABLE0"] {
+        std::fs::create_dir_all(backup.join(f)).unwrap();
+    }
     let data = d.to_str().unwrap();
     let b = backup.to_str().unwrap();
 
@@ -392,7 +394,11 @@ fn cloud_import_dry_run_import_and_put() {
         stdout(&out),
         "dry run, nothing is written\n\
          Document -> DOCUMENT/Document: 1 file, 0 folders, 0.0 MB\n\
+         EXPORT -> EXPORT: 0 files, 0 folders, 0.0 MB\n\
+         INBOX -> INBOX: 0 files, 0 folders, 0.0 MB\n\
+         MyStyle -> NOTE/MyStyle: 0 files, 0 folders, 0.0 MB\n\
          Note -> NOTE/Note: 1 file, 1 folder, 0.0 MB\n\
+         SCREENSHOT -> SCREENSHOT: 0 files, 0 folders, 0.0 MB\n\
          skipped REMOVABLE0 (SD card)\n\
          account jordi holds 0 files now\n\
          would import 2 files (0.0 MB)\n"
@@ -458,4 +464,32 @@ fn cloud_import_dry_run_import_and_put() {
     for o in [&out, &again] {
         assert!(!String::from_utf8_lossy(&o.stderr).contains('\u{2014}'));
     }
+}
+
+#[test]
+fn cloud_backup_device_exits_non_zero_when_the_device_does_not_answer() {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("nomad");
+    let out = notedown(&[
+        "cloud",
+        "backup-device",
+        &format!("http://127.0.0.1:{port}"),
+        target.to_str().unwrap(),
+        "--utc-offset",
+        "+02:00",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(target.join("backup.json")).unwrap()).unwrap();
+    assert_eq!(report["errors"].as_array().unwrap().len(), 1);
+    assert!(stdout(&out).contains("with 1 error"), "{}", stdout(&out));
 }

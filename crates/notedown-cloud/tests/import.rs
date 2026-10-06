@@ -399,6 +399,74 @@ fn a_backup_with_errors_in_backup_json_is_refused() {
     run_import(data.path(), &backup, false).unwrap();
 }
 
+#[test]
+fn a_wrong_or_partial_backup_folder_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (backup, _, _) = backup_tree(tmp.path());
+    let data = data_with_account();
+    // one level too deep: every entry would be "not a device folder"
+    let err = run_import(data.path(), &backup.join("Note"), false).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("INBOX: the backup has no such folder"),
+        "{err}"
+    );
+    // a backup without INBOX
+    std::fs::remove_dir_all(backup.join("INBOX")).unwrap();
+    let err = run_import(data.path(), &backup, false).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("INBOX: the backup has no such folder"),
+        "{err}"
+    );
+    assert!(!err.to_string().contains("Note:"), "{err}");
+    let plan = import::dry_run(data.path(), "jordi", &backup).unwrap();
+    assert_eq!(plan.scan.errors.len(), 1, "{:?}", plan.scan.errors);
+    // a device folder that is a file
+    write(&backup.join("INBOX"), b"not a folder");
+    let err = run_import(data.path(), &backup, false).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("INBOX: a device folder that is not a plain folder"),
+        "{err}"
+    );
+    assert!(!data.path().join("accounts/jordi/files").exists());
+    assert!(
+        Accounts::new(data.path())
+            .get("jordi")
+            .unwrap()
+            .unwrap()
+            .imported
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_import_closes_the_gate_even_on_an_account_without_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (backup, _, _) = backup_tree(tmp.path());
+    let data = data_with_account();
+    let accounts = Accounts::new(data.path());
+    let mut a = accounts.get("jordi").unwrap().unwrap();
+    a.imported = Some(notedown_cloud::auth::Imported {
+        at: "2026-10-06T10:00:00Z".into(),
+        source: "/old".into(),
+        files: 1,
+        bytes: 1,
+    });
+    accounts.save(&a).unwrap();
+    // the scan only reads metadata; the copy fails later
+    let locked = backup.join("SCREENSHOT/s.png");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let err = run_import(data.path(), &backup, false);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let err = err.unwrap_err();
+    assert!(err.to_string().contains("SCREENSHOT/s.png"), "{err}");
+    assert!(accounts.get("jordi").unwrap().unwrap().imported.is_none());
+}
+
 // ------------------------------------------------------------------ protect gate, routes
 
 struct TestClock(AtomicI64);

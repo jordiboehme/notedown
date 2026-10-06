@@ -6,10 +6,13 @@
 //!   `NOTE/MyStyle`, `Document` to `DOCUMENT/Document`; `EXPORT`, `SCREENSHOT` and `INBOX` keep
 //!   their names. `REMOVABLE0` (the SD card), `backup.json`, `*.snbak` and dot-files are
 //!   skipped; any other top-level entry is reported and skipped.
+//! - All six device folders must be in the backup (the device root always holds them), so a
+//!   wrong folder or a partial backup is refused instead of importing too little.
 //! - Anything the store cannot hold (a name that is no valid wire name, a symlink, two names
 //!   that differ only in case or Unicode normalization) refuses the whole import before
 //!   anything is written.
-//! - The whole run holds the store lock. Every folder and every file is its own commit
+//! - The whole run holds the store lock. The `imported` marker is cleared before the first
+//!   write, so a failed import always leaves the protect gate closed. Every folder and every file is its own commit
 //!   (`folder.created` / `file.created`, `origin: "cli"`), with the page index of notes.
 //! - Afterwards every file is hashed again at the source and compared with the store listing
 //!   (wire path, MD5, size). Only then the `imported` marker goes into `account.json` (under
@@ -168,8 +171,13 @@ pub fn scan(backup: &Path) -> Result<Scan> {
             Some(SkipReason::DotFile)
         } else if name.ends_with(SNBAK_EXT) {
             Some(SkipReason::Snbak)
-        } else if !ftype.is_dir() || wire_folder_of(&name).is_none() {
+        } else if wire_folder_of(&name).is_none() {
             Some(SkipReason::Unknown)
+        } else if !ftype.is_dir() {
+            scan.errors.push(format!(
+                "{name}: a device folder that is not a plain folder (a symlink?)"
+            ));
+            continue;
         } else {
             None
         };
@@ -178,6 +186,21 @@ pub fn scan(backup: &Path) -> Result<Scan> {
             continue;
         }
         found.push((name, path));
+    }
+    // The device root always holds all six folders: a missing one means a wrong or partial
+    // backup, which would make the device delete everything in that folder.
+    for (device, _) in FOLDER_MAP {
+        if !found.iter().any(|(name, _)| name == device)
+            && !scan
+                .errors
+                .iter()
+                .any(|e| e.starts_with(&format!("{device}:")))
+        {
+            scan.errors.push(format!(
+                "{device}: the backup has no such folder; give the folder that holds all of {}",
+                FOLDER_MAP.map(|(d, _)| d).join(", ")
+            ));
+        }
     }
     for (name, path) in found {
         let target = WirePath::parse_named(wire_folder_of(&name).expect("checked"))?;
@@ -415,17 +438,17 @@ pub fn import(
     let store = Store::open(data, slug)?;
     let guard = store.lock_recovered(journal)?;
     let present = listed_files(&store, &guard)?;
+    if present > 0 && !options.replace {
+        return Err(failed(format!(
+            "account {slug} already holds {present} files; use --replace to move them to the \
+             recycle bin first"
+        )));
+    }
+    // Close the protect gate before the first write: an import that fails must not leave it
+    // open on a half tree (also when an earlier marker is left on an account without files).
+    set_marker(&accounts, slug, None)?;
     let mut replaced = 0;
     if present > 0 {
-        if !options.replace {
-            return Err(failed(format!(
-                "account {slug} already holds {present} files; use --replace to move them to \
-                 the recycle bin first"
-            )));
-        }
-        // Close the protect gate first: a replace that fails must not leave it open on a half
-        // tree.
-        set_marker(&accounts, slug, None)?;
         progress(&format!(
             "moving the {present} files of account {slug} to the recycle bin"
         ));

@@ -245,6 +245,26 @@ fn event_lines_have_the_fixed_field_order() {
     );
     assert_eq!(serde_json::from_str::<Event>(&d.to_line()).unwrap(), d);
 
+    // Lines written before `snapshot` existed keep parsing, and a snapshot line says so.
+    let old = r#"{"seq":5,"ts":6,"account":"jordi","origin":"cli","type":"folder.created","id":2,"path":"INBOX","opId":"op-d"}"#;
+    assert_eq!(
+        serde_json::from_str::<Event>(old).unwrap().origin,
+        Origin::Cli
+    );
+    let mut s = Event::new(
+        "jordi",
+        Origin::Snapshot,
+        None,
+        "op-e",
+        EventBody::FolderCreated {
+            id: 2,
+            path: "INBOX".into(),
+        },
+    );
+    s.seq = 5;
+    s.ts = 6;
+    assert!(s.to_line().contains(r#""origin":"snapshot""#));
+
     let c = Event::new(
         "jordi",
         Origin::Repair,
@@ -1046,7 +1066,7 @@ fn snapshot_journals_the_current_state() {
     );
     assert!(
         ev.iter()
-            .all(|e| e.origin == Origin::Cli && e.op_id == ev[0].op_id)
+            .all(|e| e.origin == Origin::Snapshot && e.op_id == ev[0].op_id)
     );
     let a = ev
         .iter()

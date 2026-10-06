@@ -12,12 +12,14 @@ use serde::{Deserialize, Serialize};
 pub enum Origin {
     /// A request of a device.
     Device,
-    /// A CLI command (`put`, `import`, `journal snapshot`).
+    /// A CLI command (`put`, `import`).
     Cli,
     /// The scan of out-of-band changes.
     Scan,
     /// Crash repair: the change was applied, but its events were missing from the journal.
     Repair,
+    /// An event of `notedown cloud journal snapshot`: the state at that time, not a change.
+    Snapshot,
 }
 
 /// The kind of a file, by its extension (case-insensitive).

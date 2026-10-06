@@ -617,7 +617,7 @@ fn snapshot_journals_the_pages_of_every_note() {
         .collect();
     assert!(
         ev.iter()
-            .all(|e| e.origin == Origin::Cli && e.op_id == ev[0].op_id)
+            .all(|e| e.origin == Origin::Snapshot && e.op_id == ev[0].op_id)
     );
     let t1_at = ev
         .iter()

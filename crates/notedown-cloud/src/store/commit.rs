@@ -1737,7 +1737,7 @@ impl Store {
     }
 
     /// Journal the current state for a new consumer: `folder.created` and `file.created` for
-    /// every listed entry (parents first), as one batch with one `opId` and `origin: "cli"`.
+    /// every listed entry (parents first), as one batch with one `opId` and `origin: "snapshot"`.
     /// A `.note` gets `pagesChanged` and one `page.added` per page right after its
     /// `file.created` (or `page.index_failed`), and its page record is written now, under the
     /// same guard and before the append, so the records agree with the journal. Returns the
@@ -1781,7 +1781,7 @@ impl Store {
             events.extend(
                 bodies
                     .into_iter()
-                    .map(|body| Event::new(&self.slug, Origin::Cli, None, &op_id, body)),
+                    .map(|body| Event::new(&self.slug, Origin::Snapshot, None, &op_id, body)),
             );
         }
         journal.append(&mut events)

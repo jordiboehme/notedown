@@ -2,7 +2,7 @@
 //!
 //! This crate currently holds the configuration, the always-on protocol log, the accounts, login
 //! codes and tokens, the HTTP routes of the capture server (login, server queries, refusal of
-//! every file operation) and the auto-sync socket.
+//! every file operation), the auto-sync socket and the file store of each account.
 
 pub mod fsutil;
 
@@ -12,6 +12,7 @@ pub mod config;
 pub mod diag;
 pub mod server;
 pub mod socket;
+pub mod store;
 
 pub use config::{Config, SyncMode};
 pub use diag::{Clock, LogEntry, LogKind, ProtocolLog, SystemClock};
@@ -37,6 +38,10 @@ pub enum Error {
     EmailInUse { email: String, slug: String },
     #[error("account {0} does not exist")]
     NoAccount(String),
+    #[error(
+        "{new:?} collides with {existing:?}: the names differ only in case or Unicode normalization"
+    )]
+    NameCollision { existing: String, new: String },
     #[error("cannot listen on {addr}: {source}")]
     Bind {
         addr: std::net::SocketAddr,

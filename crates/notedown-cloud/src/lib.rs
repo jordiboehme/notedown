@@ -23,7 +23,7 @@ pub mod socket;
 pub mod store;
 pub mod sync;
 
-pub use config::{Config, SyncMode};
+pub use config::{Config, PushMode, SyncMode};
 pub use diag::{Clock, LogEntry, LogKind, ProtocolLog, SystemClock};
 
 /// Errors of the cloud crate.

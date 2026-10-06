@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use notedown_cloud::diag::{MAX_BODY_BYTES, Origin, cut_body, mask_headers, mask_json, mask_query};
-use notedown_cloud::{Clock, Config, LogEntry, LogKind, ProtocolLog, SyncMode};
+use notedown_cloud::{Clock, Config, LogEntry, LogKind, ProtocolLog, PushMode, SyncMode};
 use serde_json::{Value, json};
 use time::{Date, Month, OffsetDateTime, Time};
 
@@ -488,6 +488,7 @@ fn config_defaults_created_and_round_trip() {
     assert!(c.protect);
     assert!(!c.capture);
     assert_eq!(c.sync, SyncMode::Accept);
+    assert_eq!(c.push, PushMode::Startsync);
     assert_eq!(c.log_retention_days, 30);
     assert_eq!(c.log_max_bytes, 1 << 30);
     let text = std::fs::read_to_string(dir.path().join("server.toml")).unwrap();
@@ -506,6 +507,7 @@ fn config_defaults_created_and_round_trip() {
         trusted_proxies: vec!["10.0.0.1".parse().unwrap(), "::1".parse().unwrap()],
         protect: false,
         sync: SyncMode::Refuse,
+        push: PushMode::Off,
         capture: true,
         log_retention_days: 7,
         log_max_bytes: 123,
@@ -514,6 +516,43 @@ fn config_defaults_created_and_round_trip() {
     assert_eq!(Config::load_or_create(dir.path()).unwrap(), custom);
     let text = std::fs::read_to_string(dir.path().join("server.toml")).unwrap();
     assert!(text.contains("\nsync = \"refuse\"\n"), "{text}");
+    assert!(text.contains("\npush = \"off\"\n"), "{text}");
+}
+
+#[test]
+fn config_push_key_defaults_to_startsync_and_parses() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = Config::load_or_create(dir.path()).unwrap();
+    assert_eq!(c.push, PushMode::Startsync);
+    let text = std::fs::read_to_string(dir.path().join("server.toml")).unwrap();
+    assert!(text.contains("\npush = \"startsync\"\n"), "{text}");
+    assert!(
+        text.find("\nsync = ").unwrap() < text.find("\npush = ").unwrap(),
+        "{text}"
+    );
+
+    // An older file without the key loads as startsync and is not rewritten.
+    let path = dir.path().join("server.toml");
+    let old = "listen = [\"127.0.0.1:0\"]\nsync = \"accept\"\n";
+    std::fs::write(&path, old).unwrap();
+    assert_eq!(
+        Config::load_or_create(dir.path()).unwrap().push,
+        PushMode::Startsync
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+
+    std::fs::write(&path, "push = \"off\"\n").unwrap();
+    assert_eq!(
+        Config::load_or_create(dir.path()).unwrap().push,
+        PushMode::Off
+    );
+    std::fs::write(&path, "push = \"detail\"\n").unwrap();
+    assert_eq!(
+        Config::load_or_create(dir.path()).unwrap().push,
+        PushMode::Detail
+    );
+    std::fs::write(&path, "push = \"sometimes\"\n").unwrap();
+    assert!(Config::load_or_create(dir.path()).is_err());
 }
 
 #[test]

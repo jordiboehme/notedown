@@ -24,6 +24,19 @@ pub enum SyncMode {
     Refuse,
 }
 
+/// What the server pushes to connected devices after a server-side change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PushMode {
+    /// One `STARTSYNC` message: the device starts a sync.
+    #[default]
+    Startsync,
+    /// One item per changed file or folder (falls back to `startsync` until it is built).
+    Detail,
+    /// No pushes; the device syncs on its own schedule.
+    Off,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -43,6 +56,11 @@ pub struct Config {
     /// `"accept"` (default) exchanges files with the device. `"refuse"` answers every sync
     /// with a busy error (capture only). `notedown serve --refuse-sync` sets it for one run.
     pub sync: SyncMode,
+    /// `"startsync"` (default) tells a connected device to sync after a change it did not make
+    /// itself (a `notedown cloud put`, another device's upload). `"detail"` sends the changed
+    /// items instead, `"off"` sends nothing.
+    #[serde(default)]
+    pub push: PushMode,
     /// Write full, masked dumps of every request and frame to `capture/`. For one capture
     /// session only: the dumps have no size cap and no rotation. The `--capture` flag of
     /// `serve` is the usual way; it counts for one run.
@@ -61,6 +79,7 @@ impl Default for Config {
             trusted_proxies: Vec::new(),
             protect: true,
             sync: SyncMode::Accept,
+            push: PushMode::Startsync,
             capture: false,
             log_retention_days: 30,
             log_max_bytes: 1024 * 1024 * 1024,

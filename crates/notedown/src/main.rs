@@ -983,10 +983,20 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
             notedown_cloud::SyncMode::Refuse => {
                 println!("sync mode: refuse (capture only, no files are exchanged)");
             }
-            notedown_cloud::SyncMode::Accept => println!(
-                "sync mode: accept (protect: {})",
-                if config.protect { "on" } else { "off" }
-            ),
+            notedown_cloud::SyncMode::Accept => {
+                println!(
+                    "sync mode: accept (protect: {})",
+                    if config.protect { "on" } else { "off" }
+                );
+                println!(
+                    "push mode: {}",
+                    match config.push {
+                        notedown_cloud::PushMode::Startsync => "startsync",
+                        notedown_cloud::PushMode::Detail => "detail",
+                        notedown_cloud::PushMode::Off => "off (devices sync on their own schedule)",
+                    }
+                );
+            }
         }
         println!("press Ctrl-C to stop");
         std::io::stdout().flush()?;

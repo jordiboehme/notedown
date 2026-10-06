@@ -12,6 +12,7 @@ use crate::api::limit::{RateLimiter, RetryTracker};
 use crate::auth::Auth;
 use crate::diag::{Capture, Clock, LogEntry, LogKind, ProtocolLog, SystemClock};
 use crate::journal::{Journal, JournalOptions};
+use crate::push::{PushPlanner, PushTiming};
 use crate::store::{Store, WirePath};
 use crate::sync::staging::{self, StagingLocks};
 use crate::sync::{SyncLocks, UrlSigner};
@@ -38,6 +39,8 @@ pub struct AppState {
     pub sync_locks: SyncLocks,
     /// The live auto-sync socket sessions (pushes are handed to them).
     pub sockets: crate::socket::SocketRegistry,
+    /// Which device gets a push and when (fed by the journal follower, `crate::push::run`).
+    pub push: Mutex<PushPlanner>,
     /// Signs and checks the transfer URLs of `/api/oss/*` (`keys/url.key`).
     pub url_signer: UrlSigner,
     /// One open [`Store`] per account, shared by the requests.
@@ -113,6 +116,7 @@ impl AppState {
             url_signer: UrlSigner::load_or_create(data_dir)?,
             sync_locks: SyncLocks::new(),
             sockets: crate::socket::SocketRegistry::new(),
+            push: Mutex::new(PushPlanner::new(PushTiming::default())),
             stores: Mutex::new(HashMap::new()),
             usage: Mutex::new(HashMap::new()),
             staging_locks: StagingLocks::default(),
@@ -266,7 +270,8 @@ pub async fn serve_listeners(listeners: Vec<TcpListener>, state: Arc<AppState>) 
     serve_until(listeners, state, std::future::pending()).await
 }
 
-/// Aborts a background task when dropped (the hourly sweep, the lock keeper of a request).
+/// Aborts a background task when dropped (the hourly sweep, the push loop, the lock keeper of a
+/// request).
 pub(crate) struct AbortOnDrop(pub(crate) tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -286,6 +291,10 @@ pub async fn serve_until(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let app = router(state.clone());
+    // The journal follower and the push tick (D8, D11); stopped when this returns. Its start
+    // position is taken before the listeners serve.
+    let follower = crate::push::Follower::start(state.clone()).await;
+    let _pusher = AbortOnDrop(tokio::spawn(follower.run()));
     // The hourly staging and temp file sweep (the first one ran at start); stopped when this
     // returns.
     let _sweeper = AbortOnDrop(tokio::spawn(async move {

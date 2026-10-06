@@ -11,6 +11,7 @@ mod import;
 mod journal;
 mod mutate;
 mod pages;
+mod push;
 mod serve;
 mod socket;
 mod store;

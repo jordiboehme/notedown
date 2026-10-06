@@ -282,38 +282,57 @@ pub async fn sync_start(
     // The store is checked before the lock is taken: a damaged tree (`store_damaged`) or, with
     // protect off, an account that was never imported and holds no file (`empty_account`) gets
     // no sync, so the device never compares against an empty tree.
+    // The journal position is read here too (store lock, then journal lock): the sync lists
+    // the tree after it, so pushes for the changes up to it are covered (D7). It is only a hint,
+    // so a failure to read it is logged and never fails the sync.
     let (st, slug) = (state.clone(), req.slug.clone());
-    let empty = blocking(&req.serial, move || {
+    let checked = blocking(&req.serial, move || {
         let store = st.store(&slug)?;
         let guard = store.lock_recovered(&st.journal)?;
         gate_locked(&st, store.slug())?;
+        let last_seq = match st.journal.last_seq() {
+            Ok(seq) => Some(seq),
+            Err(e) => {
+                eprintln!("notedown cloud: account {slug}: journal position for pushes: {e}");
+                None
+            }
+        };
         let imported = st
             .auth
             .accounts()
             .get(store.slug())?
             .is_some_and(|a| a.imported.is_some());
         if imported {
-            return Ok(false);
+            return Ok((false, last_seq));
         }
         let entries = store.list(&guard, &WirePath::root(), true)?;
-        Ok(!entries.iter().any(|e| e.tag == Kind::File))
+        Ok((!entries.iter().any(|e| e.tag == Kind::File), last_seq))
     })
     .await;
-    match empty {
-        Ok(false) => {}
-        Ok(true) => {
+    let last_seq = match checked {
+        Ok((false, last_seq)) => last_seq,
+        Ok((true, _)) => {
             return Reply::sync_busy()
                 .flag(FLAG_EMPTY_ACCOUNT)
                 .device(&req.serial);
         }
         Err(r) => return r,
-    }
+    };
     match state
         .sync_locks
         .start(&req.slug, &req.serial, state.now_ms())
     {
         StartOutcome::Busy { .. } => req.error(E_SYNC_LOCKED, MSG_SYNC_LOCKED),
-        StartOutcome::Taken | StartOutcome::Renewed => req.ok(json!({"synType": true})),
+        StartOutcome::Taken | StartOutcome::Renewed => {
+            if let Some(seq) = last_seq {
+                state
+                    .push
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .covered(&req.slug, &req.serial, seq);
+            }
+            req.ok(json!({"synType": true}))
+        }
     }
 }
 

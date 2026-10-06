@@ -47,7 +47,7 @@ impl SocketRegistry {
             (sid.to_string(), tx),
         );
         if let Some((_, old_tx)) = old {
-            // A full channel drops the notice; the old session then ends with its connection.
+            // A full channel drops the notice; the dropped sender then closes the old session.
             let _ = old_tx.try_send(Outbound::Close("replaced"));
         }
         rx

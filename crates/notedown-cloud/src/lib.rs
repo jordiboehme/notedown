@@ -16,6 +16,7 @@ pub mod diag;
 pub mod import;
 pub mod journal;
 pub mod pages;
+pub mod push;
 pub mod put;
 pub mod server;
 pub mod socket;

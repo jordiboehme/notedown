@@ -1532,12 +1532,66 @@ fn a_rename_whose_target_was_taken_or_whose_entry_vanished_is_never_journaled() 
     assert_eq!(std::fs::read(dir.join(&via)).unwrap(), b"bike");
     assert_eq!(std::fs::read(dir.join("Bike.note")).unwrap(), b"other");
     assert!(f.types().is_empty());
-    // neither the old nor the temp name is there any more (and nothing at the new one)
+    // the entry is gone from every name (removed out of band): recovery drops the change,
+    // journals nothing, and the account is writable again
     std::fs::remove_file(dir.join(&via)).unwrap();
     std::fs::remove_file(dir.join("Bike.note")).unwrap();
-    assert!(store.lock_recovered(&f.journal).is_err());
-    assert!(f.store.account_dir().join(PENDING_FILE).exists());
+    let g = store.lock_recovered(&f.journal).unwrap();
+    drop(g);
+    assert!(!f.store.account_dir().join(PENDING_FILE).exists());
     assert!(f.types().is_empty());
+    assert!(names_in(&f, "NOTE/Note").is_empty());
+}
+
+#[test]
+fn a_target_taken_between_the_renames_is_never_journaled_as_the_move() {
+    let f = Fixture::new();
+    let id = f.put("NOTE/Note/bike.note", b"bike");
+    if !case_insensitive(&f.store.fs_path(&wp("NOTE/Note"))) {
+        return;
+    }
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    let c = f
+        .store
+        .plan_move(
+            &g,
+            &wp("NOTE/Note/bike.note"),
+            &wp("NOTE/Note/Bike.note"),
+            Origin::Device,
+            None,
+        )
+        .unwrap();
+    // the live commit: a file lands at the target while the entry is under the temp name
+    assert!(
+        f.store
+            .commit_until(
+                &g,
+                c,
+                &f.journal,
+                Some(CrashPoint::TakeTargetBetweenRenames)
+            )
+            .is_err()
+    );
+    drop(g);
+    assert!(
+        f.types().is_empty(),
+        "no file.moved for bytes that are not at the target"
+    );
+    assert!(f.store.account_dir().join(PENDING_FILE).exists());
+    let names = names_in(&f, "NOTE/Note");
+    let dir = f.store.fs_path(&wp("NOTE/Note"));
+    assert_eq!(
+        std::fs::read(dir.join("Bike.note")).unwrap(),
+        b"out of band"
+    );
+    let via = names.iter().find(|n| n.starts_with(".nd-move-")).unwrap();
+    assert_eq!(std::fs::read(dir.join(via)).unwrap(), b"bike");
+    // the id did not move onto the other file
+    assert_eq!(
+        f.store.path_of(id).unwrap(),
+        Some(wp("NOTE/Note/bike.note"))
+    );
+    assert_ne!(f.store.id_of(&wp("NOTE/Note/Bike.note")).unwrap(), Some(id));
 }
 
 #[test]

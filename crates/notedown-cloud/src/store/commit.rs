@@ -309,6 +309,9 @@ pub enum CrashPoint {
     /// A move through a temp name: the second rename fails, so the apply step returns an error
     /// while the entry is under the temp name.
     FailSecondRename,
+    /// A move through a temp name: between its two renames, a file appears at the target (as
+    /// an out-of-band write would place it), then the second rename runs.
+    TakeTargetBetweenRenames,
     /// After the journal append, before `pending.json` is deleted.
     BeforeClear,
 }
@@ -559,6 +562,10 @@ impl Store {
             Some(_) => return Err(invalid("path", format!("{path} is a folder"))),
             None => None,
         };
+        // The folders first: planning them drops stale rows (with their subtree) at their
+        // paths, so the file's id must be assigned after that. With missing folders there is no
+        // current file, so this is never an unchanged put.
+        let (mut events, folders) = self.plan_folders(guard, &missing)?;
         let id = self.assign(guard, path, Kind::File)?;
         let display = path.display();
         if prev.as_deref() == Some(md5.as_str()) {
@@ -569,7 +576,6 @@ impl Store {
             };
             return Ok(Commit::new(origin, device, op, Vec::new()));
         }
-        let (mut events, folders) = self.plan_folders(guard, &missing)?;
         let recycle = match (&prev, options.recycle_at_ms) {
             (Some(prev_md5), Some(at)) => Some(RecycleEntry {
                 id,
@@ -900,8 +906,9 @@ impl Store {
     /// line (`reason: "deleted"`). Events: for a folder first `file.deleted` / `folder.deleted`
     /// for everything inside it (children before their folder), then `file.deleted` or
     /// `folder.deleted` for `path`, then `folder.deleted` for each folder the delete leaves empty
-    /// (deepest first, never a native folder; they are removed for good, without a recycle
-    /// entry). Native folders cannot be deleted. Plan and commit one delete at a time: the slot
+    /// (deepest first, never a native folder). Empty pruned folders are removed for good; when
+    /// they hold dot-files, the topmost one moves with them to its own recycle slot
+    /// (`prune_at`) and gets an index line. Native folders cannot be deleted. Plan and commit one delete at a time: the slot
     /// is picked by probing, so two planned deletes could pick the same one.
     pub fn plan_delete(
         &self,
@@ -1049,8 +1056,7 @@ impl Store {
         }
         // 2. data change, then the registry
         let stop = crash == Some(CrashPoint::BeforeRename) && has_rename_stop(&commit.op);
-        let fail = crash == Some(CrashPoint::FailSecondRename);
-        if let Err(e) = self.apply(&commit.op, stop, fail) {
+        if let Err(e) = self.apply(&commit.op, stop, crash) {
             match self.is_applied(guard, &commit.op) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -1126,13 +1132,13 @@ impl Store {
 
     /// Perform the data change durably. `stop_before_rename` (test hook) ends a `put` after its
     /// folders and recycle copy, and a move through a temp name between its two renames, as a
-    /// crash there would. `fail_second_rename` (test hook) makes the second rename of such a
-    /// move fail.
+    /// crash there would. `hook` (test hook) can also make the second rename of such a move
+    /// fail, or place a file at its target first.
     fn apply(
         &self,
         op: &PendingOp,
         stop_before_rename: bool,
-        fail_second_rename: bool,
+        hook: Option<CrashPoint>,
     ) -> Result<()> {
         match op {
             PendingOp::Put {
@@ -1212,11 +1218,17 @@ impl Store {
                 if stop_before_rename {
                     return Ok(());
                 }
-                if fail_second_rename {
-                    return Err(invalid(
-                        "move",
-                        "the second rename failed (test hook)".into(),
-                    ));
+                match hook {
+                    Some(CrashPoint::FailSecondRename) => {
+                        return Err(invalid(
+                            "move",
+                            "the second rename failed (test hook)".into(),
+                        ));
+                    }
+                    Some(CrashPoint::TakeTargetBetweenRenames) => {
+                        std::fs::write(&to, b"out of band").map_err(io_err(&to))?;
+                    }
+                    _ => {}
                 }
                 self.finish_via(&to_path, &via)
             }
@@ -1271,8 +1283,15 @@ impl Store {
                     _ => false,
                 }
             }
-            PendingOp::Move { from, to, .. } => {
-                self.resolve(&wire(from)?)?.is_none() && self.resolve(&wire(to)?)?.is_some()
+            PendingOp::Move { from, to, via, .. } => {
+                let from = wire(from)?;
+                // An entry still under the temp name of a rename is not at `to`, whatever is
+                // there: the move is not done.
+                let at_via = match via {
+                    Some(via) => std::fs::symlink_metadata(self.via_path(&from, via)?).is_ok(),
+                    None => false,
+                };
+                !at_via && self.resolve(&from)?.is_none() && self.resolve(&wire(to)?)?.is_some()
             }
             PendingOp::Delete { path, recycle, .. } => {
                 let target = self
@@ -1448,6 +1467,25 @@ impl Store {
         }
     }
 
+    /// Whether the entry of a move through a temp name is under none of its names (old, temp,
+    /// new): removed out of band while the intent was pending.
+    fn vanished(&self, op: &PendingOp) -> Result<bool> {
+        let PendingOp::Move {
+            from,
+            to,
+            via: Some(via),
+            ..
+        } = op
+        else {
+            return Ok(false);
+        };
+        let (from, to) = (wire(from)?, wire(to)?);
+        let via = self.via_path(&from, via)?;
+        Ok(self.resolve(&from)?.is_none()
+            && self.resolve(&to)?.is_none()
+            && std::fs::symlink_metadata(via).is_err())
+    }
+
     /// Finish a move through a temp name that stopped between its two renames (recovery runs
     /// this before it checks whether the change is applied).
     fn resume(&self, op: &PendingOp) -> Result<()> {
@@ -1460,9 +1498,12 @@ impl Store {
         {
             let (from, to) = (wire(from)?, wire(to)?);
             let via = self.via_path(&from, via)?;
-            if self.resolve(&from)?.is_none() {
-                self.finish_via(&to, &via)?;
+            if self.resolve(&from)?.is_some() || self.vanished(op)? {
+                // Not started, or the entry is gone from every name: nothing to finish, and
+                // the change is discarded.
+                return Ok(());
             }
+            self.finish_via(&to, &via)?;
         }
         Ok(())
     }
@@ -1590,6 +1631,18 @@ impl Store {
         };
         self.resume(&commit.op)?;
         if !self.is_applied(guard, &commit.op)? {
+            if self.vanished(&commit.op)?
+                && let PendingOp::Move { from, to, via, .. } = &commit.op
+            {
+                eprintln!(
+                    "warning: account {}: the change {} renamed {from} to {to} through {}, but \
+                     the entry is under none of these names (removed outside the server); the \
+                     change is dropped and nothing is journaled",
+                    self.slug,
+                    commit.op_id,
+                    via.as_deref().unwrap_or_default()
+                );
+            }
             self.undo_unapplied(&commit.op)?;
             self.clear_pending()?;
             return Ok(Recovery::Discarded {

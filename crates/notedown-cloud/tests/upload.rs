@@ -2027,3 +2027,48 @@ async fn a_finish_whose_intent_names_the_bytes_leaves_them_to_recovery() {
     assert_eq!(created.len(), 1, "{created:?}");
     assert_eq!(created[0]["origin"], "repair");
 }
+
+#[tokio::test]
+async fn an_upload_into_a_folder_removed_out_of_band_answers_the_listed_id() {
+    let s = Server::new();
+    let t = s.session().await;
+    // the folder gets ids through a listing, then vanishes by hand with its content
+    s.put("NOTE/Note/Work/old.pdf", b"old");
+    let tree = s
+        .post(LIST, &t, json!({"path": "/", "recursive": true}))
+        .await;
+    assert_ok(&tree);
+    std::fs::remove_dir_all(s.files().join("NOTE/Note/Work")).unwrap();
+    let n = s.events().len();
+    let v = s
+        .upload(&t, "NOTE/Note/Work", "new.pdf", b"new bytes")
+        .await;
+    assert_ok(&v);
+    let answered = v["id"].as_str().unwrap().to_string();
+    let ev: Vec<Value> = s.events().into_iter().skip(n).collect();
+    assert_eq!(types(&ev), ["folder.created", "file.created"]);
+    assert_eq!(ev[1]["id"].as_u64().unwrap().to_string(), answered);
+    let tree = s
+        .post(LIST, &t, json!({"path": "/", "recursive": true}))
+        .await;
+    let listed = tree["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path_display"] == "NOTE/Note/Work/new.pdf")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(listed, answered);
+    let folder = tree["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path_display"] == "NOTE/Note/Work")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(ev[0]["id"].as_u64().unwrap().to_string(), folder);
+}

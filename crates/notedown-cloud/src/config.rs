@@ -31,7 +31,8 @@ pub enum PushMode {
     /// One `STARTSYNC` message: the device starts a sync.
     #[default]
     Startsync,
-    /// One item per changed file or folder (falls back to `startsync` until it is built).
+    /// One item per changed file or folder. Falls back to `startsync` when the message cannot be
+    /// built or the list of changes was cut at its cap.
     Detail,
     /// No pushes; the device syncs on its own schedule.
     Off,
@@ -59,7 +60,6 @@ pub struct Config {
     /// `"startsync"` (default) tells a connected device to sync after a change it did not make
     /// itself (a `notedown cloud put`, another device's upload). `"detail"` sends the changed
     /// items instead, `"off"` sends nothing.
-    #[serde(default)]
     pub push: PushMode,
     /// Write full, masked dumps of every request and frame to `capture/`. For one capture
     /// session only: the dumps have no size cap and no rotation. The `--capture` flag of

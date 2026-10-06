@@ -51,6 +51,9 @@ pub struct Pending {
     pub cause: Option<String>,
     /// The pending relevant events, oldest first (for the detail mode), capped at 200.
     pub events: Vec<Event>,
+    /// The cap dropped events, so `events` is not the full list: the detail mode sends
+    /// `STARTSYNC` instead.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Default)]
@@ -118,12 +121,14 @@ impl PushPlanner {
                 max_seq: 0,
                 cause: None,
                 events: Vec::new(),
+                truncated: false,
             });
             p.last_ms = now_ms;
             p.max_seq = p.max_seq.max(event.seq);
             p.cause = event.device.clone();
             if p.events.len() == MAX_PENDING_EVENTS {
                 p.events.remove(0);
+                p.truncated = true;
             }
             p.events.push(event.clone());
         }
@@ -440,6 +445,25 @@ mod tests {
         assert_eq!(pd.events.len(), 200);
         assert_eq!(pd.events[0].seq, 51);
         assert_eq!(pd.events[199].seq, 250);
+        assert!(pd.truncated);
+    }
+
+    #[test]
+    fn exactly_200_events_are_not_truncated_and_201_are() {
+        let mut p = planner();
+        let t = vec!["B".to_string()];
+        for i in 1..=200u64 {
+            p.observe(&ev(Origin::Cli, None, i, created()), &t, i);
+        }
+        assert!(!p.pending("acc", "B").unwrap().truncated);
+        p.observe(&ev(Origin::Cli, None, 201, created()), &t, 201);
+        let pd = p.pending("acc", "B").unwrap();
+        assert!(pd.truncated);
+        assert_eq!(pd.events.len(), 200);
+        // A push that was sent starts a new, complete list.
+        p.sent("acc", "B", 300);
+        p.observe(&ev(Origin::Cli, None, 202, created()), &t, 400);
+        assert!(!p.pending("acc", "B").unwrap().truncated);
     }
 
     #[test]

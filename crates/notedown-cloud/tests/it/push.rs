@@ -17,7 +17,7 @@ use notedown_cloud::auth::{Accounts, Imported, expected_login_hash, md5_hex};
 use notedown_cloud::journal::{Event, EventBody, FileKind, Origin, new_op_id};
 use notedown_cloud::push::{follow_once, server_message_frame, start_seq, startsync_message, tick};
 use notedown_cloud::server::{AppState, router, serve_listeners};
-use notedown_cloud::socket::Outbound;
+use notedown_cloud::socket::{LIVENESS_MS, LastInbound, Outbound};
 use notedown_cloud::store::Store;
 use notedown_cloud::{Clock, Config, PushMode, SyncMode};
 use serde_json::{Value, json};
@@ -51,6 +51,8 @@ struct Fixture {
     clock: Arc<TestClock>,
     cursor: u64,
     rx: HashMap<&'static str, Receiver<Outbound>>,
+    /// The last inbound time of each session, as the socket handler sets it per frame.
+    inbound: HashMap<&'static str, LastInbound>,
 }
 
 /// The account as after an import: native folders and, when asked, the `imported` marker.
@@ -105,6 +107,7 @@ impl Fixture {
             clock,
             cursor,
             rx: HashMap::new(),
+            inbound: HashMap::new(),
         };
         f.connect(A);
         f.connect(B);
@@ -115,13 +118,19 @@ impl Fixture {
         self.dir.path()
     }
 
-    /// Register a session of `serial` and keep its receiver (a dropped one disconnects).
+    /// Register a session of `serial` now and keep its receiver (a dropped one disconnects).
     fn connect(&mut self, serial: &'static str) {
-        let rx = self
-            .state
-            .sockets
-            .register("jordi", serial, &format!("sid-{serial}"));
+        let (rx, inbound) =
+            self.state
+                .sockets
+                .register("jordi", serial, &format!("sid-{serial}"), self.now());
         self.rx.insert(serial, rx);
+        self.inbound.insert(serial, inbound);
+    }
+
+    /// A frame from `serial` arrives now (a heartbeat).
+    fn heartbeat(&self, serial: &str) {
+        self.inbound[serial].store(self.now(), Ordering::SeqCst);
     }
 
     fn now(&self) -> u64 {
@@ -421,7 +430,8 @@ fn a_snapshot_is_no_change() {
     assert!(!store.snapshot(&g, &f.state.journal).unwrap().is_empty());
     drop(g);
     assert!(f.follow() > 0);
-    assert_eq!(tick(&f.state, f.now() + 60_000), 0);
+    // Past the quiet time and the 5 s gap, but within the liveness limit of the sessions.
+    assert_eq!(tick(&f.state, f.now() + 7000), 0);
     assert!(!f.pending(A) && !f.pending(B));
 }
 
@@ -440,6 +450,64 @@ fn a_device_that_is_not_connected_gets_the_push_after_it_connects() {
     assert_eq!(tick(&f.state, t + 500), 1);
     assert_eq!(f.frames(B), vec![startsync(None, t + 500)]);
     assert!(!f.pending(B));
+}
+
+#[test]
+fn a_silent_session_keeps_the_push_until_a_frame_arrives() {
+    let mut f = Fixture::new();
+    // Both devices went quiet after the handshake (a sleeping device leaves the socket open).
+    f.advance_ms(LIVENESS_MS as i64 + 1000);
+    f.put("a.note");
+    f.follow();
+    f.advance_ms(2000);
+    assert_eq!(tick(&f.state, f.now()), 0);
+    assert!(f.frames(A).is_empty() && f.frames(B).is_empty());
+    assert!(f.pending(A) && f.pending(B));
+    // A heartbeat from A: A is live again and gets the push, B stays pending.
+    f.heartbeat(A);
+    assert_eq!(tick(&f.state, f.now()), 1);
+    assert_eq!(f.frames(A), vec![startsync(None, f.now())]);
+    assert!(!f.pending(A) && f.pending(B));
+    // B comes back with a new session (same serial) and gets the push there.
+    f.advance_ms(500);
+    f.connect(B);
+    assert_eq!(tick(&f.state, f.now()), 1);
+    assert_eq!(f.frames(B), vec![startsync(None, f.now())]);
+    assert!(!f.pending(B));
+}
+
+#[test]
+fn a_truncated_detail_push_sends_startsync() {
+    let config = Config {
+        push: PushMode::Detail,
+        ..Config::default()
+    };
+    let mut f = Fixture::with(config, true);
+    // One event more than the 200 a pending push keeps.
+    let mut events: Vec<Event> = (0..201u64)
+        .map(|i| {
+            Event::new(
+                "jordi",
+                Origin::Cli,
+                None,
+                &new_op_id(),
+                EventBody::FileCreated {
+                    id: 1000 + i,
+                    path: format!("/NOTE/Note/n{i}.note"),
+                    kind: FileKind::Note,
+                    md5: "0".repeat(32),
+                    size: 1,
+                    pages_changed: None,
+                },
+            )
+        })
+        .collect();
+    f.state.journal.append(&mut events).unwrap();
+    assert_eq!(f.follow(), 201);
+    let t = f.now() + 2000;
+    assert_eq!(tick(&f.state, t), 2);
+    assert_eq!(f.frames(A), vec![startsync(None, t)]);
+    assert_eq!(f.frames(B), vec![startsync(None, t)]);
 }
 
 #[test]
@@ -473,11 +541,11 @@ fn the_follower_starts_at_the_end_of_the_journal() {
             .update("jordi", serial, |d| d.bound = true)
             .unwrap();
     }
-    let mut rx = state.sockets.register("jordi", A, "sid-a");
+    let (mut rx, _inbound) = state.sockets.register("jordi", A, "sid-a", state.now_ms());
     let mut cursor = start_seq(&state).unwrap();
     assert!(cursor > 0);
     assert_eq!(follow_once(&state, &mut cursor).unwrap(), 0);
-    assert_eq!(tick(&state, state.now_ms() + 60_000), 0);
+    assert_eq!(tick(&state, state.now_ms() + 2000), 0);
     assert!(rx.try_recv().is_err());
 }
 

@@ -39,7 +39,7 @@ pub struct AppState {
     pub sync_locks: SyncLocks,
     /// The live auto-sync socket sessions (pushes are handed to them).
     pub sockets: crate::socket::SocketRegistry,
-    /// Which device gets a push and when (fed by the journal follower, `crate::push::run`).
+    /// Which device gets a push and when (fed by the journal follower, `crate::push::Follower`).
     pub push: Mutex<PushPlanner>,
     /// Signs and checks the transfer URLs of `/api/oss/*` (`keys/url.key`).
     pub url_signer: UrlSigner,

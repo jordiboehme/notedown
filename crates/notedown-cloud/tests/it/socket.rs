@@ -10,6 +10,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use notedown_cloud::auth::{Accounts, expected_login_hash, md5_hex};
 use notedown_cloud::server::{AppState, serve_listeners};
+use notedown_cloud::socket::LIVENESS_MS;
 use notedown_cloud::{Clock, Config, SystemClock};
 use serde_json::Value;
 use tokio::net::{TcpListener, TcpStream};
@@ -691,7 +692,11 @@ async fn a_device_that_stops_reading_is_dropped_after_the_send_timeout() {
 /// Wait (under 3 s) until the registry says `connected` for the test device.
 async fn wait_connected(s: &Server, connected: bool) {
     for _ in 0..60 {
-        if s.state.sockets.is_connected("jordi", SERIAL) == connected {
+        if s.state
+            .sockets
+            .is_connected("jordi", SERIAL, s.state.now_ms())
+            == connected
+        {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -705,13 +710,36 @@ async fn a_registered_session_receives_a_pushed_frame_and_logs_it() {
     let mut ws = s.session().await;
     sync(&mut ws).await;
     let frame = notedown_cloud::push::server_message_frame("{\"x\":1}");
-    assert!(s.state.sockets.send("jordi", SERIAL, frame.clone()));
+    assert!(
+        s.state
+            .sockets
+            .send("jordi", SERIAL, frame.clone(), s.state.now_ms())
+    );
     assert_eq!(recv(&mut ws).await, frame);
     sync(&mut ws).await;
     assert!(
         s.frames()
             .iter()
             .any(|(dir, payload, _)| dir == "out" && *payload == frame)
+    );
+    close(ws).await;
+}
+
+#[tokio::test]
+async fn a_frame_from_the_device_keeps_the_session_live() {
+    let s = Server::start().await;
+    let mut ws = s.session().await;
+    wait_connected(&s, true).await;
+    // Registered at or before `t1`: without a newer frame it is stale at `late`.
+    let t1 = s.state.now_ms();
+    let late = t1 + LIVENESS_MS + 1;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    sync(&mut ws).await;
+    assert!(s.state.sockets.is_connected("jordi", SERIAL, late));
+    assert!(
+        !s.state
+            .sockets
+            .is_connected("jordi", SERIAL, s.state.now_ms() + LIVENESS_MS + 1)
     );
     close(ws).await;
 }
@@ -731,7 +759,11 @@ async fn a_second_session_of_the_same_device_replaces_the_first() {
     }
     expect_closed(&mut first).await;
     let frame = notedown_cloud::push::server_message_frame("{}");
-    assert!(s.state.sockets.send("jordi", SERIAL, frame.clone()));
+    assert!(
+        s.state
+            .sockets
+            .send("jordi", SERIAL, frame.clone(), s.state.now_ms())
+    );
     assert_eq!(recv(&mut second).await, frame);
     close(second).await;
 }
@@ -745,7 +777,11 @@ async fn the_replaced_sessions_end_keeps_the_new_registration() {
     sync(&mut second).await;
     close(first).await;
     sync(&mut second).await;
-    assert!(s.state.sockets.is_connected("jordi", SERIAL));
+    assert!(
+        s.state
+            .sockets
+            .is_connected("jordi", SERIAL, s.state.now_ms())
+    );
     close(second).await;
     wait_connected(&s, false).await;
 }
@@ -755,6 +791,14 @@ async fn a_rejected_session_is_never_registered() {
     let s = Server::start().await;
     let mut ws = s.connect(Some("garbage")).await;
     expect_rejected(&mut ws).await;
-    assert!(!s.state.sockets.is_connected("jordi", SERIAL));
-    assert!(!s.state.sockets.send("jordi", SERIAL, "x".into()));
+    assert!(
+        !s.state
+            .sockets
+            .is_connected("jordi", SERIAL, s.state.now_ms())
+    );
+    assert!(
+        !s.state
+            .sockets
+            .send("jordi", SERIAL, "x".into(), s.state.now_ms())
+    );
 }

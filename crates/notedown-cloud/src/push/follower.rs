@@ -93,19 +93,21 @@ pub fn tick(state: &AppState, now_ms: u64) -> usize {
             .or_insert_with(|| gate_open(state, &slug));
         if !open
             || state.sync_locks.holder(&slug, now_ms).is_some()
-            || !state.sockets.is_connected(&slug, &serial)
+            || !state.sockets.is_connected(&slug, &serial, now_ms)
         {
             continue;
         }
-        // Held from the look at the pending push to `sent`: nothing in between blocks, and a
-        // `covered` of a sync start cannot slip in and be wiped.
+        // Held from the look at the pending push to `sent`, so a `covered` of a sync start cannot
+        // slip in and be wiped. In detail mode the message is built under the lock, and that can
+        // read the store's id registry from disk: a sync start and the follower wait for it.
         let mut planner = planner(state);
         let Some(pending) = planner.pending(&slug, &serial) else {
             continue;
         };
         let cause = pending.cause.as_deref();
-        // `detail` falls back to `STARTSYNC` when its message cannot be built.
-        let detail = (state.config.push == PushMode::Detail)
+        // `detail` falls back to `STARTSYNC` when the cap dropped events (the list would be
+        // partial) or when its message cannot be built.
+        let detail = (state.config.push == PushMode::Detail && !pending.truncated)
             .then(|| {
                 let store = state.store(&slug).ok()?;
                 detail_message(&pending.events, cause, &store, now_ms).ok()
@@ -113,7 +115,7 @@ pub fn tick(state: &AppState, now_ms: u64) -> usize {
             .flatten();
         let message = detail.unwrap_or_else(|| startsync_message(cause, now_ms));
         let frame = server_message_frame(&message);
-        if state.sockets.send(&slug, &serial, frame) {
+        if state.sockets.send(&slug, &serial, frame, now_ms) {
             planner.sent(&slug, &serial, now_ms);
             sent += 1;
         }

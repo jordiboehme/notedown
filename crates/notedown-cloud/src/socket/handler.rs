@@ -1,6 +1,7 @@
 //! One socket session: the handshake, the heartbeat answers, server pushes and the frame log.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, close_code};
@@ -143,18 +144,23 @@ pub async fn run(mut ws: WebSocket, session: Session, access: Access) {
         return;
     }
     // The registration guard lives until the session ends, whatever the exit path.
-    let (_registration, mut rx) = match (&session.slug, &session.device) {
+    // The last inbound time tells the registry that the device is still there (LIVENESS_MS).
+    let (_registration, mut rx, last_inbound) = match (&session.slug, &session.device) {
         (Some(slug), Some(serial)) => {
-            let rx = session.state.sockets.register(slug, serial, &session.sid);
+            let (rx, last_inbound) =
+                session
+                    .state
+                    .sockets
+                    .register(slug, serial, &session.sid, session.state.now_ms());
             let guard = Registration {
                 state: session.state.clone(),
                 slug: slug.clone(),
                 serial: serial.clone(),
                 sid: session.sid.clone(),
             };
-            (Some(guard), Some(rx))
+            (Some(guard), Some(rx), Some(last_inbound))
         }
-        _ => (None, None),
+        _ => (None, None, None),
     };
     // The idle rule counts frames from the device only: the deadline moves when a message
     // arrives, never when the server pushes, so a half-open session cannot swallow pushes forever.
@@ -174,6 +180,9 @@ pub async fn run(mut ws: WebSocket, session: Session, access: Access) {
                 }
                 Ok(Some(Ok(msg))) => {
                     deadline = tokio::time::Instant::now() + IDLE_LIMIT;
+                    if let Some(last) = &last_inbound {
+                        last.store(session.state.now_ms(), Ordering::Relaxed);
+                    }
                     msg
                 }
             },

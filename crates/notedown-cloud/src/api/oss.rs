@@ -43,8 +43,9 @@ pub const FLAG_UPLOAD_BROKEN: &str = "upload_broken";
 /// Log flag: a part that does not fit its upload (bad numbers, another `uploadId`).
 pub const FLAG_PART_MISMATCH: &str = "part_mismatch";
 
-/// Bytes of multipart fields other than `file` that are read (and dropped) at most.
-const OTHER_FIELD_MAX: usize = 64 * 1024;
+/// Bytes of all multipart fields other than `file` together that are read (and dropped) at
+/// most; more answers `E0324` (`upload_broken`).
+pub const OTHER_FIELDS_MAX: usize = 256 * 1024;
 
 /// Bytes read per step while a download streams.
 const CHUNK: usize = 256 * 1024;
@@ -409,7 +410,7 @@ enum Recv {
 }
 
 /// Stream the multipart field `file` into a temp file in `dir`, at most `cap` bytes. Other
-/// fields are read and dropped (64 KiB at most). Each step extends the sync lock. On any error
+/// fields are read and dropped (256 KiB at most, all together). Each step extends the sync lock. On any error
 /// the temp file is removed.
 async fn receive_file(
     state: &AppState,
@@ -419,6 +420,8 @@ async fn receive_file(
     cap: u64,
 ) -> Result<StreamFile, Recv> {
     let mut file: Option<StreamFile> = None;
+    // Bytes of the other fields, all together.
+    let mut seen = 0usize;
     let fail = |file: Option<StreamFile>, why: Recv| {
         if let Some(f) = file {
             f.abort();
@@ -462,12 +465,11 @@ async fn receive_file(
             }
             file = Some(f);
         } else {
-            let mut seen = 0usize;
             loop {
                 match field.chunk().await {
                     Ok(Some(chunk)) => {
                         seen += chunk.len();
-                        if seen > OTHER_FIELD_MAX {
+                        if seen > OTHER_FIELDS_MAX {
                             return fail(file, Recv::Broken);
                         }
                     }
@@ -513,7 +515,9 @@ async fn open_entry(state: &AppState, target: &SignedTarget) -> crate::Result<st
 }
 
 /// `POST /api/oss/upload?path&signature&timestamp&nonce` (multipart field `file`): the bytes
-/// of a whole file into `staging/<innerName>/data`, at most 1 GiB (`E0324`). Answers
+/// of a whole file into `staging/<innerName>/data`, at most 1 GiB (`E0324`). An upload URL
+/// takes bytes once: a second POST (also one during `upload/finish`) or one after parts is
+/// refused (`E0324`, `part_mismatch`), so the bytes a finish verifies cannot change. Answers
 /// `{innerName, md5}`.
 pub async fn upload(
     State(state): State<Arc<AppState>>,
@@ -533,25 +537,39 @@ pub async fn upload(
         Ok(e) => e,
         Err(e) => return recv_refused(Recv::Failed(e), &serial),
     };
+    // Each upload URL takes bytes once (checked again under the entry's lock below).
+    if entry.join(staging::META_FILE).exists() {
+        return upload_refused(FLAG_PART_MISMATCH, &serial);
+    }
     let file = match receive_file(&state, &target, &mut multipart, &entry, state.file_max()).await {
         Ok(f) => f,
         Err(why) => return recv_refused(why, &serial),
     };
-    let finished = keep_lock(
+    let (tmp, _, md5) = match file.close().await {
+        Ok(c) => c,
+        Err(e) => return recv_refused(Recv::Failed(e), &serial),
+    };
+    let (st, e, parent) = (state.clone(), entry.clone(), target.path.clone());
+    let stored = keep_lock(
         &state,
         &target.account,
         &serial,
-        file.finish(entry.join(staging::DATA_FILE)),
+        tokio::task::spawn_blocking(move || st.staging_locks.store_single(&e, &tmp, &parent)),
     )
     .await;
-    match finished {
-        Ok((_, md5)) => Reply::ok(serde_json::json!({
+    match stored {
+        Ok(Ok(true)) => Reply::ok(serde_json::json!({
             "innerName": target.inner,
             "md5": md5,
         }))
         .device(&serial)
         .into_response(),
-        Err(e) => recv_refused(Recv::Failed(e), &serial),
+        Ok(Ok(false)) => upload_refused(FLAG_PART_MISMATCH, &serial),
+        Ok(Err(e)) => recv_refused(Recv::Failed(e), &serial),
+        Err(e) => {
+            eprintln!("notedown cloud: upload failed: {e}");
+            Reply::internal().device(&serial).into_response()
+        }
     }
 }
 
@@ -603,8 +621,9 @@ pub async fn upload_part(
         Err(e) => return recv_refused(Recv::Failed(e), &serial),
     };
     let meta = UploadMeta {
-        upload_id: upload_id.to_string(),
-        total_chunks: total,
+        parent: target.path.clone(),
+        upload_id: Some(upload_id.to_string()),
+        total_chunks: Some(total),
     };
     let (st, e, file_max) = (state.clone(), entry.clone(), state.file_max());
     let stored = keep_lock(

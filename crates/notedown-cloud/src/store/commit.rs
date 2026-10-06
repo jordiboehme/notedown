@@ -109,14 +109,21 @@ pub struct PlannedFolder {
 }
 
 /// Options of [`Store::plan_put_with`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PutOptions {
     /// Create missing parent folders (each gets `folder.created` before the file event).
     pub create_parents: bool,
     /// Keep the current bytes of a replaced file in `recycle/<ms>/<path>` (protect mode); the
     /// value is the time of the overwrite in ms.
     pub recycle_at_ms: Option<u64>,
+    /// The MD5 the staged file must have (case-insensitive). A mismatch is refused with
+    /// `Error::Invalid { what: "content hash" }` before anything is planned or assigned, so the
+    /// caller hashes the staged file only once (here, under the store lock).
+    pub expect_md5: Option<String>,
 }
+
+/// The `what` of the error [`Store::plan_put_with`] returns for a wrong `expect_md5`.
+pub const CONTENT_HASH_MISMATCH: &str = "content hash";
 
 /// A planned commit, the content of `pending.json`. Build it with a `Store::plan_*` method,
 /// then add events if needed (the page indexer pushes its page events right after the file
@@ -256,6 +263,8 @@ impl Deref for WriteGuard {
 pub enum CrashPoint {
     /// After `pending.json` is written, before the data change.
     BeforeApply,
+    /// A `put`: after its new folders and its recycle copy, before the rename.
+    BeforeRename,
     /// After the data change, before the registry update and the journal append.
     BeforeAppend,
     /// After the journal append, before `pending.json` is deleted.
@@ -438,6 +447,14 @@ impl Store {
             ));
         }
         let md5 = super::hashes::md5_file(staged).map_err(io_err(staged))?;
+        if let Some(want) = &options.expect_md5
+            && !want.trim().eq_ignore_ascii_case(&md5)
+        {
+            return Err(invalid(
+                CONTENT_HASH_MISMATCH,
+                format!("the staged file has MD5 {md5}, not {want}"),
+            ));
+        }
         let size = meta.len();
         let prev = match self.resolve(path)? {
             Some(f) if f.kind == Kind::File => Some(self.md5_of(guard, path)?),
@@ -733,7 +750,8 @@ impl Store {
             return Ok(Vec::new());
         }
         // 2. data change, then the registry
-        if let Err(e) = self.apply(&commit.op) {
+        let stop = crash == Some(CrashPoint::BeforeRename);
+        if let Err(e) = self.apply(&commit.op, stop) {
             match self.is_applied(guard, &commit.op) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -745,7 +763,7 @@ impl Store {
                 Err(_) => return Err(e),
             }
         }
-        if crash == Some(CrashPoint::BeforeAppend) {
+        if stop || crash == Some(CrashPoint::BeforeAppend) {
             return Ok(Vec::new());
         }
         self.finish_registry(guard, &commit.op)?;
@@ -800,8 +818,9 @@ impl Store {
         super::write_atomic_short(&w.path, bytes)
     }
 
-    /// Perform the data change durably.
-    fn apply(&self, op: &PendingOp) -> Result<()> {
+    /// Perform the data change durably. `stop_before_rename` (test hook) ends a `put` after its
+    /// folders and recycle copy, as a crash there would.
+    fn apply(&self, op: &PendingOp, stop_before_rename: bool) -> Result<()> {
         match op {
             PendingOp::Put {
                 path,
@@ -825,6 +844,9 @@ impl Store {
                 if let Some(entry) = recycle {
                     // A copy: the old version stays listed until the rename replaces it.
                     self.copy_into_recycle(&target, entry)?;
+                }
+                if stop_before_rename {
+                    return Ok(());
                 }
                 std::fs::File::open(&staged)
                     .and_then(|f| f.sync_all())

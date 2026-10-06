@@ -236,8 +236,8 @@ pub async fn serve_listeners(listeners: Vec<TcpListener>, state: Arc<AppState>) 
     serve_until(listeners, state, std::future::pending()).await
 }
 
-/// Aborts a background task when dropped.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+/// Aborts a background task when dropped (the hourly sweep, the lock keeper of a request).
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {

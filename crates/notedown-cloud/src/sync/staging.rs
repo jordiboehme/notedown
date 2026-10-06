@@ -4,8 +4,11 @@
 //! - `data`: the complete file. A single upload (`/api/oss/upload`) writes it directly; a
 //!   chunked upload writes it when the last part arrives.
 //! - `part-<n>`: one part of a chunked upload (`/api/oss/upload/part`, `n` from 1).
-//! - `upload.json`: `{"uploadId", "totalChunks"}` of a chunked upload, written with its first
-//!   part. A part with another `uploadId` or `totalChunks` is refused.
+//! - `upload.json`: `{"parent", "uploadId", "totalChunks"}`, written with the first bytes: the
+//!   parent folder signed at apply, and for a chunked upload its id and part count. A part with
+//!   another `uploadId` or `totalChunks` is refused, and so is a second single upload.
+//! - `finishing-<opId>`: the data, renamed by `upload/finish` before it verifies and commits
+//!   it, so no other request can change the bytes in between.
 //!
 //! The entry is named by the signed `innerName` (a UUID from `upload/apply`), never by a value
 //! the device chose: `uploadId` is not signed, and `upload/finish` names only `innerName`.
@@ -117,9 +120,9 @@ pub fn remove_entry(entry: &Path) {
 }
 
 /// Bytes streamed into a temp file of a staging entry: buffered in memory up to 256 KiB, then
-/// written (and hashed) in a blocking task. [`StreamFile::finish`] makes it durable under its
-/// final name; dropping it without `finish` leaves a temp file that [`StreamFile::abort`] or the
-/// sweep removes.
+/// written (and hashed) in a blocking task. [`StreamFile::close`] makes it durable (the caller
+/// renames it under the entry's lock); dropping it leaves a temp file that
+/// [`StreamFile::abort`] or the sweep removes.
 pub struct StreamFile {
     file: Option<std::fs::File>,
     hasher: Option<Md5>,
@@ -182,34 +185,14 @@ impl StreamFile {
         Ok(())
     }
 
-    /// Write the rest, fsync, rename onto `target`, fsync the folder. Returns the size and the
-    /// lowercase hex MD5.
-    pub async fn finish(mut self, target: PathBuf) -> Result<(u64, String)> {
-        self.flush().await?;
-        let (Some(file), Some(hasher)) = (self.file.take(), self.hasher.take()) else {
-            return Err(io_err(&self.tmp)(std::io::Error::other(
-                "the file is closed",
-            )));
-        };
-        let tmp = self.tmp.clone();
-        let len = self.len;
-        tokio::task::spawn_blocking(move || -> Result<(u64, String)> {
-            file.sync_all().map_err(io_err(&tmp))?;
-            drop(file);
-            crate::fsutil::rename_durable(&tmp, &target)?;
-            Ok((len, const_hex::encode(hasher.finalize())))
-        })
-        .await
-        .map_err(|e| io_err(&self.tmp)(std::io::Error::other(e.to_string())))?
-    }
-
     /// Drop the bytes and remove the temp file.
     pub fn abort(mut self) {
         self.file.take();
         let _ = std::fs::remove_file(&self.tmp);
     }
 
-    /// The temp file (for a caller that renames it itself under a lock).
+    /// Write the rest and fsync. Returns the temp file (the caller renames it under the entry's
+    /// lock), the size and the lowercase hex MD5.
     pub async fn close(mut self) -> Result<(PathBuf, u64, String)> {
         self.flush().await?;
         let (Some(file), Some(hasher)) = (self.file.take(), self.hasher.take()) else {
@@ -228,12 +211,17 @@ impl StreamFile {
     }
 }
 
-/// `upload.json` of a chunked upload.
+/// `upload.json` of a staging entry, written under the entry's lock by the first request that
+/// sends bytes: the parent folder signed at `upload/apply` (finish must name the same one), and
+/// for a chunked upload its `uploadId` and `totalChunks`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UploadMeta {
-    pub upload_id: String,
-    pub total_chunks: u64,
+    pub parent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_chunks: Option<u64>,
 }
 
 /// What became of a received part.
@@ -243,14 +231,54 @@ pub enum PartOutcome {
     Uploading,
     /// All parts were there and are merged into `data` (now or by an earlier request).
     Merged,
-    /// The part does not belong to this upload (another `uploadId` or `totalChunks`).
+    /// The part does not belong to this upload (another `uploadId` or `totalChunks`, or the
+    /// entry holds a single upload).
     Mismatch,
     /// The merged file would be larger than the limit; the parts are removed.
     TooLarge,
 }
 
-/// Serializes the "store the part, merge when complete" step per staging entry, so two last
-/// parts arriving together merge once.
+/// What `upload/finish` found in a staging entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Claim {
+    /// No complete data (unknown upload, or parts missing). The entry is kept.
+    Missing,
+    /// The finish names another parent folder than the one signed at apply. The entry is
+    /// removed.
+    ParentMismatch,
+    /// The data now belongs to this finish alone, under this name.
+    Claimed(PathBuf),
+}
+
+/// The name of data claimed by a finish: `finishing-<opId>`.
+fn finishing_path(entry: &Path, op_id: &str) -> PathBuf {
+    entry.join(format!("finishing-{op_id}"))
+}
+
+/// Whether a finish claimed the data of the entry already.
+fn is_finishing(entry: &Path) -> bool {
+    std::fs::read_dir(entry).is_ok_and(|d| {
+        d.flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("finishing-"))
+    })
+}
+
+fn read_meta(entry: &Path) -> Result<Option<UploadMeta>> {
+    let path = entry.join(META_FILE);
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io_err(&path)(e)),
+    }
+}
+
+fn write_meta(entry: &Path, meta: &UploadMeta) -> Result<()> {
+    crate::store::write_atomic_short(&entry.join(META_FILE), &crate::fsutil::json_bytes(meta))
+}
+
+/// Serializes every change of one staging entry: the single upload's `data`, storing a part and
+/// merging (two last parts arriving together merge once), and the claim of the data by
+/// `upload/finish`.
 #[derive(Debug, Default)]
 pub struct StagingLocks {
     held: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
@@ -265,8 +293,44 @@ impl StagingLocks {
         map.entry(entry.to_path_buf()).or_default().clone()
     }
 
-    /// Store the closed temp file `tmp` as part `n` of `total` of the entry and merge when every
-    /// part is present (blocking). A part that arrives after the merge is dropped (`Merged`).
+    /// Run `f` under the entry's lock (blocking).
+    fn with<T>(&self, entry: &Path, f: impl FnOnce() -> T) -> T {
+        let lock = self.get(entry);
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+
+    /// Make the closed temp file `tmp` the `data` of a single upload (blocking). Refused
+    /// (`false`, the temp file removed) when the entry already has `upload.json`, `data`, a
+    /// part or claimed data: each upload URL takes bytes once, so nothing can change them while
+    /// a finish verifies and commits them.
+    pub fn store_single(&self, entry: &Path, tmp: &Path, parent: &str) -> Result<bool> {
+        self.with(entry, || {
+            let used = std::fs::read_dir(entry)
+                .map_err(io_err(entry))?
+                .flatten()
+                .any(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    !(name.starts_with(".nd-") && name.ends_with(".tmp"))
+                });
+            if used {
+                let _ = std::fs::remove_file(tmp);
+                return Ok(false);
+            }
+            let meta = UploadMeta {
+                parent: parent.to_string(),
+                upload_id: None,
+                total_chunks: None,
+            };
+            write_meta(entry, &meta)?;
+            crate::fsutil::rename_durable(tmp, &entry.join(DATA_FILE))?;
+            Ok(true)
+        })
+    }
+
+    /// Store the closed temp file `tmp` as part `n` of the entry and merge when every part is
+    /// present (blocking). A part that arrives after the merge is dropped (`Merged`).
     pub fn store_part(
         &self,
         entry: &Path,
@@ -275,53 +339,72 @@ impl StagingLocks {
         meta: &UploadMeta,
         file_max: u64,
     ) -> Result<PartOutcome> {
-        let lock = self.get(entry);
-        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let drop_tmp = || {
-            let _ = std::fs::remove_file(tmp);
-        };
-        let meta_path = entry.join(META_FILE);
-        match std::fs::read(&meta_path) {
-            Ok(bytes) => match serde_json::from_slice::<UploadMeta>(&bytes) {
-                Ok(m) if m == *meta => {}
-                _ => {
+        self.with(entry, || {
+            let drop_tmp = || {
+                let _ = std::fs::remove_file(tmp);
+            };
+            let total_chunks = meta.total_chunks.unwrap_or(0);
+            match read_meta(entry)? {
+                Some(m) if m == *meta => {}
+                Some(_) => {
                     drop_tmp();
                     return Ok(PartOutcome::Mismatch);
                 }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if entry.join(DATA_FILE).exists() {
-                    // A single upload went to this entry already.
-                    drop_tmp();
-                    return Ok(PartOutcome::Mismatch);
+                None => {
+                    if entry.join(DATA_FILE).exists() || is_finishing(entry) {
+                        drop_tmp();
+                        return Ok(PartOutcome::Mismatch);
+                    }
+                    write_meta(entry, meta)?;
                 }
-                crate::store::write_atomic_short(&meta_path, &crate::fsutil::json_bytes(meta))?;
             }
-            Err(e) => return Err(io_err(&meta_path)(e)),
-        }
-        if entry.join(DATA_FILE).exists() {
-            drop_tmp();
-            return Ok(PartOutcome::Merged);
-        }
-        crate::fsutil::rename_durable(tmp, &part_path(entry, n))?;
-        let mut total = 0u64;
-        for i in 1..=meta.total_chunks {
-            match std::fs::metadata(part_path(entry, i)) {
-                Ok(m) => total += m.len(),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(PartOutcome::Uploading);
+            if entry.join(DATA_FILE).exists() || is_finishing(entry) {
+                drop_tmp();
+                return Ok(PartOutcome::Merged);
+            }
+            crate::fsutil::rename_durable(tmp, &part_path(entry, n))?;
+            let mut total = 0u64;
+            for i in 1..=total_chunks {
+                match std::fs::metadata(part_path(entry, i)) {
+                    Ok(m) => total += m.len(),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(PartOutcome::Uploading);
+                    }
+                    Err(e) => return Err(io_err(&part_path(entry, i))(e)),
                 }
-                Err(e) => return Err(io_err(&part_path(entry, i))(e)),
             }
-        }
-        if total > file_max {
-            for i in 1..=meta.total_chunks {
-                let _ = std::fs::remove_file(part_path(entry, i));
+            if total > file_max {
+                for i in 1..=total_chunks {
+                    let _ = std::fs::remove_file(part_path(entry, i));
+                }
+                return Ok(PartOutcome::TooLarge);
             }
-            return Ok(PartOutcome::TooLarge);
-        }
-        merge(entry, meta.total_chunks)?;
-        Ok(PartOutcome::Merged)
+            merge(entry, total_chunks)?;
+            Ok(PartOutcome::Merged)
+        })
+    }
+
+    /// Give the entry's `data` to one `upload/finish` (blocking): check that `parent` is the
+    /// folder signed at apply, then rename `data` to `finishing-<op_id>`. From then on no upload
+    /// request can change those bytes (they refuse an entry with `upload.json`), and a second
+    /// finish finds no `data`.
+    pub fn claim(&self, entry: &Path, parent: &str, op_id: &str) -> Result<Claim> {
+        self.with(entry, || {
+            let Some(meta) = read_meta(entry)? else {
+                return Ok(Claim::Missing);
+            };
+            if meta.parent != parent {
+                remove_entry(entry);
+                return Ok(Claim::ParentMismatch);
+            }
+            let data = entry.join(DATA_FILE);
+            if !std::fs::symlink_metadata(&data).is_ok_and(|m| m.is_file()) {
+                return Ok(Claim::Missing);
+            }
+            let claimed = finishing_path(entry, op_id);
+            crate::fsutil::rename_durable(&data, &claimed)?;
+            Ok(Claim::Claimed(claimed))
+        })
     }
 }
 

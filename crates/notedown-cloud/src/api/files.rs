@@ -68,6 +68,8 @@ pub const FLAG_SIZE_MISMATCH: &str = "size_mismatch";
 pub const FLAG_UPLOAD_MISSING: &str = "upload_missing";
 /// Log flag: a file or part above the size limit.
 pub const FLAG_UPLOAD_TOO_LARGE: &str = "upload_too_large";
+/// Log flag: `upload/finish` names another parent folder than the one signed at apply.
+pub const FLAG_PARENT_MISMATCH: &str = "parent_mismatch";
 /// Log flag: a target path or name the store does not take.
 pub const FLAG_BAD_NAME: &str = "bad_name";
 
@@ -489,27 +491,38 @@ pub fn holds_sync_lock(state: &AppState, slug: &str, serial: &str) -> bool {
 }
 
 /// How often [`keep_lock`] extends the sync lock (well inside its 30 s TTL).
-const KEEP_LOCK_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+pub const KEEP_LOCK_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Await `work` (a long blocking step: a merge, hashing, a commit) while extending the device's
-/// sync lock every 10 s, so the lock does not lapse inside one request.
+/// sync lock every 10 s, so the lock does not lapse inside one request. The keeper task is
+/// aborted when `work` ends and also when this future is dropped (a cut connection).
 pub async fn keep_lock<F: std::future::Future>(
     state: &Arc<AppState>,
     slug: &str,
     serial: &str,
     work: F,
 ) -> F::Output {
+    keep_lock_every(state, slug, serial, KEEP_LOCK_EVERY, work).await
+}
+
+/// [`keep_lock`] with another interval. Test hook.
+#[doc(hidden)]
+pub async fn keep_lock_every<F: std::future::Future>(
+    state: &Arc<AppState>,
+    slug: &str,
+    serial: &str,
+    every: std::time::Duration,
+    work: F,
+) -> F::Output {
     let (st, slug, serial) = (state.clone(), slug.to_string(), serial.to_string());
-    let keeper = tokio::spawn(async move {
-        let mut every = tokio::time::interval(KEEP_LOCK_EVERY);
+    let _keeper = crate::server::AbortOnDrop(tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(every);
         loop {
-            every.tick().await;
+            ticks.tick().await;
             st.sync_locks.touch(&slug, &serial, st.now_ms());
         }
-    });
-    let out = work.await;
-    keeper.abort();
-    out
+    }));
+    work.await
 }
 
 /// `E0079` with the log flag `no_sync_lock`.
@@ -531,43 +544,26 @@ pub fn size_arg(body: &Value, key: &str) -> Option<u64> {
     }
 }
 
-/// The target of `upload/apply`: `path` is the full path including the name
-/// (`/NOTE/Note/Work/x.note`). A `path` whose last segment is not `fileName` is taken as the
-/// folder. `None` for a path or name the store cannot take.
-pub fn apply_target(path: &str, file_name: &str) -> Option<WirePath> {
+/// The parent folder and the target of an upload, by one rule for `upload/apply` and
+/// `upload/finish` (`docs/sync-protocol.md` 7.3):
+///
+/// - A trailing slash means `path` is the folder (finish sends `/NOTE/Note/Work/`).
+/// - Without it, a `path` whose last segment is `fileName` is the full path (apply sends
+///   `/NOTE/Note/Work/x.note`); any other `path` is the folder.
+///
+/// Double slashes are fine. `None` for a path or name the store cannot take. Finish must arrive
+/// at the parent signed at apply, so a `/NOTE/Note/x.note/` finish after a
+/// `/NOTE/Note/x.note` apply is refused and never writes `x.note/x.note`.
+pub fn upload_target(path: &str, file_name: &str) -> Option<(WirePath, WirePath)> {
     let p = WirePath::parse(path).ok()?;
-    let parent = if p.name() == Some(file_name) {
+    let folder = path.trim_end().ends_with('/');
+    let parent = if !folder && p.name() == Some(file_name) {
         p.parent()?
     } else {
         p
     };
-    parent.join(file_name).ok()
-}
-
-/// The target of `upload/finish`: `path` is the parent folder with a trailing slash
-/// (`/NOTE/Note/Work/`), so the target is parent + `fileName`, never `x.note/x.note`. A `path`
-/// without the trailing slash that already ends in `fileName` and is no folder is taken as the
-/// full path.
-fn finish_target(
-    store: &Store,
-    guard: &StoreGuard,
-    path: &str,
-    file_name: &str,
-) -> crate::Result<Option<WirePath>> {
-    let Ok(parent) = WirePath::parse(path) else {
-        return Ok(None);
-    };
-    let full_path_form = !path.trim_end().ends_with('/') && parent.name() == Some(file_name);
-    let parent = if full_path_form
-        && !store
-            .entry(guard, &parent)?
-            .is_some_and(|e| e.tag == Kind::Folder)
-    {
-        parent.parent().unwrap_or_default()
-    } else {
-        parent
-    };
-    Ok(parent.join(file_name).ok())
+    let target = parent.join(file_name).ok()?;
+    Some((parent, target))
 }
 
 /// Why an upload target is refused.
@@ -647,7 +643,7 @@ pub async fn upload_apply(
         return Reply::bad_params("fileName").device(&req.serial);
     };
     let path = req.body.get("path").and_then(Value::as_str).unwrap_or("");
-    let Some(target) = apply_target(path, &file_name) else {
+    let Some((_, target)) = upload_target(path, &file_name) else {
         return Refusal::Cannot(FLAG_BAD_NAME).reply(&req.serial);
     };
     let size = size_arg(&req.body, "size").unwrap_or(0);
@@ -723,29 +719,28 @@ fn finish_upload(state: &AppState, a: FinishArgs) -> crate::Result<Finished> {
     let cannot = |flag| Ok(Finished::Refused(Refusal::Cannot(flag)));
     let store = state.store(&a.slug)?;
     let entry = staging::entry_dir(store.account_dir(), &a.inner)?;
-    let data = entry.join(staging::DATA_FILE);
-    let len = match std::fs::symlink_metadata(&data) {
-        Ok(m) if m.is_file() => m.len(),
-        // Unknown upload, or parts still missing: the entry stays for a retry of the part.
-        _ => return cannot(FLAG_UPLOAD_MISSING),
-    };
-    if len != a.size {
-        staging::remove_entry(&entry);
-        return cannot(FLAG_SIZE_MISMATCH);
-    }
-    let md5 = crate::store::md5_file(&data).map_err(|e| Error::Io {
-        path: data.clone(),
-        source: e,
-    })?;
-    if !md5.eq_ignore_ascii_case(a.content_hash.trim()) {
-        staging::remove_entry(&entry);
-        return cannot(FLAG_HASH_MISMATCH);
-    }
-    let guard = store.lock_recovered(&state.journal)?;
-    let Some(target) = finish_target(&store, &guard, &a.path, &a.file_name)? else {
+    let Some((parent, target)) = upload_target(&a.path, &a.file_name) else {
         staging::remove_entry(&entry);
         return cannot(FLAG_BAD_NAME);
     };
+    // Take the bytes away from every other request first: from here on only this finish
+    // reads them, so what is verified is what is committed.
+    let op = crate::journal::new_op_id();
+    let data = match state.staging_locks.claim(&entry, &parent.display(), &op)? {
+        staging::Claim::Claimed(data) => data,
+        // Unknown upload, or parts still missing: the entry stays for a retry of the part.
+        staging::Claim::Missing => return cannot(FLAG_UPLOAD_MISSING),
+        staging::Claim::ParentMismatch => return cannot(FLAG_PARENT_MISMATCH),
+    };
+    let len = std::fs::metadata(&data).map_err(|e| Error::Io {
+        path: data.clone(),
+        source: e,
+    })?;
+    if len.len() != a.size {
+        staging::remove_entry(&entry);
+        return cannot(FLAG_SIZE_MISMATCH);
+    }
+    let guard = store.lock_recovered(&state.journal)?;
     if let Some(refusal) = check_target(&store, &guard, &target)? {
         staging::remove_entry(&entry);
         return Ok(Finished::Refused(refusal));
@@ -753,6 +748,8 @@ fn finish_upload(state: &AppState, a: FinishArgs) -> crate::Result<Finished> {
     let options = PutOptions {
         create_parents: true,
         recycle_at_ms: a.protect.then_some(a.now_ms),
+        // The one hash of the staged bytes, under the store lock, before any id is assigned.
+        expect_md5: Some(a.content_hash.clone()),
     };
     let planned = store.plan_put_with(
         &guard,
@@ -764,6 +761,10 @@ fn finish_upload(state: &AppState, a: FinishArgs) -> crate::Result<Finished> {
     );
     let mut commit = match planned {
         Ok(c) => c,
+        Err(Error::Invalid { what, .. }) if what == crate::store::CONTENT_HASH_MISMATCH => {
+            staging::remove_entry(&entry);
+            return cannot(FLAG_HASH_MISMATCH);
+        }
         Err(e) => match refusal_of(&e) {
             Some(refusal) => {
                 staging::remove_entry(&entry);
@@ -787,7 +788,8 @@ fn finish_upload(state: &AppState, a: FinishArgs) -> crate::Result<Finished> {
 }
 
 /// `POST /api/file/2/files/upload/finish` `{path (parent folder + "/"), fileName,
-/// content_hash, innerName, size (string)}`: verifies MD5 and size of the staged data
+/// content_hash, innerName, size (string)}`: claims the staged data (no other request can change
+/// it afterwards), checks that the parent is the one signed at apply, verifies size and MD5
 /// (`E0324` and nothing kept on a mismatch), creates missing parent folders
 /// (`folder.created`), writes the file (`file.created`, or `file.modified` with `prevMd5` and
 /// the same id), journals the page diff of a note, all in one commit. In protect mode the

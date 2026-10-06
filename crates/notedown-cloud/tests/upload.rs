@@ -84,6 +84,29 @@ fn test1() -> Vec<u8> {
     std::fs::read(root().join("tests/fixtures/notes/test1.note")).unwrap()
 }
 
+/// A multipart body with these extra text fields, then the `file` field.
+fn multipart_with(fields: &[(&str, Vec<u8>)], name: &str, bytes: &[u8]) -> (String, Vec<u8>) {
+    let b = "notedownTestBoundary7MA4YWxk";
+    let mut body = Vec::new();
+    for (field, value) in fields {
+        body.extend_from_slice(
+            format!("--{b}\r\nContent-Disposition: form-data; name=\"{field}\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(value);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(
+        format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n\
+             Content-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{b}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={b}"), body)
+}
+
 /// A multipart body with one `file` field (and an extra text field before it).
 fn multipart(name: &str, bytes: &[u8]) -> (String, Vec<u8>) {
     let b = "notedownTestBoundary7MA4YWxk";
@@ -1395,7 +1418,16 @@ impl StoreFixture {
 const NEW_PARENTS: PutOptions = PutOptions {
     create_parents: true,
     recycle_at_ms: None,
+    expect_md5: None,
 };
+
+fn protect_at(ms: u64) -> PutOptions {
+    PutOptions {
+        create_parents: true,
+        recycle_at_ms: Some(ms),
+        expect_md5: None,
+    }
+}
 
 #[test]
 fn a_put_with_parents_plans_folder_events_first_and_keeps_old_intents_readable() {
@@ -1442,42 +1474,28 @@ fn a_put_with_parents_plans_folder_events_first_and_keeps_old_intents_readable()
 fn a_crash_before_the_rename_removes_the_new_folders_and_the_recycle_copy() {
     let f = StoreFixture::new();
     f.put("NOTE/Note/r.note", b"old", PutOptions::default(), None);
-    let protect = PutOptions {
-        create_parents: true,
-        recycle_at_ms: Some(1000),
-    };
     let before = f.types().len();
-    // A new file under two new folders: crash after the intent, before anything is applied.
+    // New folders made, then a crash before the rename.
     f.put(
         "NOTE/Note/X/Y/n.pdf",
         b"n",
         NEW_PARENTS,
-        Some(CrashPoint::BeforeApply),
+        Some(CrashPoint::BeforeRename),
     );
-    // Simulate the half-applied state: the folders exist, the file does not.
-    std::fs::create_dir_all(f.acct().join("files/NOTE/Note/X/Y")).unwrap();
+    assert!(f.acct().join("files/NOTE/Note/X/Y").is_dir());
     assert!(matches!(f.recover(), Recovery::Discarded { .. }));
     assert!(!f.acct().join("files/NOTE/Note/X").exists());
-    // An overwrite with a recycle copy made, then a crash before the rename.
+    // The recycle copy made, then a crash before the rename: the copy goes, the old bytes stay.
     f.put(
         "NOTE/Note/r.note",
         b"new",
-        protect,
-        Some(CrashPoint::BeforeApply),
+        protect_at(1000),
+        Some(CrashPoint::BeforeRename),
     );
-    let g = f.store.lock().unwrap();
-    let entry = RecycleEntry {
-        id: 0,
-        path: "NOTE/Note/r.note".into(),
-        md5: md5_of(b"old"),
-        deleted_at: 1000,
-        reason: RecycleReason::Overwritten,
-    };
-    f.store
-        .copy_to_recycle(&g, &f.acct().join("files/NOTE/Note/r.note"), &entry)
-        .unwrap();
-    drop(g);
-    assert!(f.acct().join("recycle/1000/NOTE/Note/r.note").is_file());
+    assert_eq!(
+        std::fs::read(f.acct().join("recycle/1000/NOTE/Note/r.note")).unwrap(),
+        b"old"
+    );
     assert!(matches!(f.recover(), Recovery::Discarded { .. }));
     assert!(!f.acct().join("recycle/1000/NOTE/Note/r.note").exists());
     assert_eq!(
@@ -1489,15 +1507,72 @@ fn a_crash_before_the_rename_removes_the_new_folders_and_the_recycle_copy() {
 }
 
 #[test]
+fn a_failed_rename_in_commit_undoes_the_folders_and_the_copy() {
+    let f = StoreFixture::new();
+    f.put("NOTE/Note/r.note", b"old", PutOptions::default(), None);
+    let before = f.types().len();
+    for (path, options) in [
+        ("NOTE/Note/X/Y/n.pdf", NEW_PARENTS),
+        ("NOTE/Note/r.note", protect_at(3000)),
+    ] {
+        let g = f.store.lock_recovered(&f.journal).unwrap();
+        let staged = f.stage(b"new bytes");
+        let c = f
+            .store
+            .plan_put_with(
+                &g,
+                &WirePath::parse_named(path).unwrap(),
+                &staged,
+                Origin::Device,
+                None,
+                options,
+            )
+            .unwrap();
+        // The staged file vanishes: the folders and the copy are made, the rename fails.
+        std::fs::remove_file(&staged).unwrap();
+        assert!(f.store.commit(&g, c, &f.journal).is_err(), "{path}");
+        assert!(f.store.pending().unwrap().is_none(), "{path}");
+    }
+    assert!(!f.acct().join("files/NOTE/Note/X").exists());
+    assert!(!f.acct().join("recycle/3000/NOTE/Note/r.note").exists());
+    assert_eq!(
+        std::fs::read(f.acct().join("files/NOTE/Note/r.note")).unwrap(),
+        b"old"
+    );
+    assert!(f.index().is_empty());
+    assert_eq!(f.types().len(), before);
+}
+
+#[test]
+fn a_wrong_expected_md5_plans_nothing() {
+    let f = StoreFixture::new();
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    let staged = f.stage(b"bytes");
+    let path = WirePath::parse_named("NOTE/Note/New/h.pdf").unwrap();
+    let mut options = NEW_PARENTS;
+    options.expect_md5 = Some(md5_of(b"other"));
+    let e = f
+        .store
+        .plan_put_with(&g, &path, &staged, Origin::Device, None, options.clone())
+        .unwrap_err();
+    assert!(e.to_string().contains("content hash"), "{e}");
+    // No id was assigned for the file or the folder.
+    assert_eq!(f.store.id_of(&path).unwrap(), None);
+    assert_eq!(f.store.id_of(&path.parent().unwrap()).unwrap(), None);
+    options.expect_md5 = Some(md5_of(b"bytes").to_uppercase());
+    assert!(
+        f.store
+            .plan_put_with(&g, &path, &staged, Origin::Device, None, options)
+            .is_ok()
+    );
+}
+
+#[test]
 fn a_crash_after_the_rename_journals_and_indexes_exactly_once() {
     for crash in [CrashPoint::BeforeAppend, CrashPoint::BeforeClear] {
         let f = StoreFixture::new();
         f.put("NOTE/Note/r.note", b"old", PutOptions::default(), None);
-        let protect = PutOptions {
-            create_parents: true,
-            recycle_at_ms: Some(2000),
-        };
-        f.put("NOTE/Note/r.note", b"new", protect, Some(crash));
+        f.put("NOTE/Note/r.note", b"new", protect_at(2000), Some(crash));
         assert!(
             matches!(f.recover(), Recovery::Repaired { .. }),
             "{crash:?}"
@@ -1572,4 +1647,219 @@ fn the_recycle_index_is_idempotent_and_cuts_a_torn_line() {
         std::fs::read(f.acct().join("recycle/9/NOTE/Note/m.note")).unwrap(),
         b"m"
     );
+}
+
+// ------------------------------------------------------------------ fix round 1
+
+#[tokio::test]
+async fn finish_must_name_the_parent_signed_at_apply() {
+    let s = Server::new();
+    let t = s.session().await;
+    // apply names NOTE/Note/x.note; a finish with "/NOTE/Note/x.note/" would mean the folder
+    // x.note: refused, and no x.note/x.note appears.
+    let a = s.apply(&t, "/NOTE/Note/x.note", "x.note", 1).await;
+    let target =
+        SignedTarget::decode(&query_value(a["fullUploadUrl"].as_str().unwrap(), "path")).unwrap();
+    assert_eq!(target.path, "NOTE/Note");
+    s.send(a["fullUploadUrl"].as_str().unwrap(), "", "x.note", b"x")
+        .await;
+    let f = s
+        .finish(
+            &t,
+            "/NOTE/Note/x.note/",
+            "x.note",
+            a["innerName"].as_str().unwrap(),
+            b"x",
+        )
+        .await;
+    assert_err(&f, "E0324");
+    let e = s.requests_to(FINISH).pop().unwrap();
+    assert!(e["flags"].to_string().contains("parent_mismatch"), "{e}");
+    assert!(!s.files().join("NOTE/Note/x.note").exists());
+    assert!(s.staging_entries().is_empty());
+    // Another folder entirely is refused too.
+    let a = s.apply(&t, "/NOTE/Note/x.note", "x.note", 1).await;
+    s.send(a["fullUploadUrl"].as_str().unwrap(), "", "x.note", b"x")
+        .await;
+    let f = s
+        .finish(
+            &t,
+            "/INBOX/",
+            "x.note",
+            a["innerName"].as_str().unwrap(),
+            b"x",
+        )
+        .await;
+    assert_err(&f, "E0324");
+    assert!(!s.files().join("INBOX/x.note").exists());
+
+    // A real folder named like the file: apply with the full path, finish with the folder.
+    std::fs::create_dir_all(s.files().join("NOTE/Note/y.note")).unwrap();
+    let a = s.apply(&t, "/NOTE/Note/y.note/y.note", "y.note", 1).await;
+    s.send(a["fullUploadUrl"].as_str().unwrap(), "", "y.note", b"y")
+        .await;
+    let f = s
+        .finish(
+            &t,
+            "/NOTE/Note/y.note/",
+            "y.note",
+            a["innerName"].as_str().unwrap(),
+            b"y",
+        )
+        .await;
+    assert_ok(&f);
+    assert_eq!(f["path_display"], "NOTE/Note/y.note/y.note");
+
+    // apply honours a trailing slash: the path is the folder.
+    let a = s.apply(&t, "/NOTE/Note/Work/", "Work", 1).await;
+    let target =
+        SignedTarget::decode(&query_value(a["fullUploadUrl"].as_str().unwrap(), "path")).unwrap();
+    assert_eq!(target.path, "NOTE/Note/Work");
+}
+
+#[tokio::test]
+async fn an_upload_url_takes_bytes_once() {
+    let s = Server::new();
+    let t = s.session().await;
+    let a = s.apply(&t, "/INBOX/once.pdf", "once.pdf", 4).await;
+    let url = a["fullUploadUrl"].as_str().unwrap();
+    let inner = a["innerName"].as_str().unwrap();
+    assert_ok(&s.send(url, "", "once.pdf", b"good").await.json());
+    let r = s.send(url, "", "once.pdf", b"evil").await;
+    assert_err(&r.json(), "E0324");
+    let data = s.account().join("staging").join(inner).join("data");
+    assert_eq!(std::fs::read(&data).unwrap(), b"good");
+    // Not after parts either, and parts not after a single upload.
+    let b = s.apply(&t, "/INBOX/p.pdf", "p.pdf", 4).await;
+    let r = s
+        .send(
+            b["partUploadUrl"].as_str().unwrap(),
+            "&uploadId=u&partNumber=1&totalChunks=2",
+            "p.pdf",
+            b"ab",
+        )
+        .await;
+    assert_ok(&r.json());
+    assert_err(
+        &s.send(b["fullUploadUrl"].as_str().unwrap(), "", "p.pdf", b"abab")
+            .await
+            .json(),
+        "E0324",
+    );
+    let r = s
+        .send(
+            a["partUploadUrl"].as_str().unwrap(),
+            "&uploadId=u&partNumber=1&totalChunks=1",
+            "once.pdf",
+            b"good",
+        )
+        .await;
+    assert_err(&r.json(), "E0324");
+    // finish commits what was uploaded first.
+    assert_ok(&s.finish(&t, "/INBOX/", "once.pdf", inner, b"good").await);
+    assert_eq!(
+        std::fs::read(s.files().join("INBOX/once.pdf")).unwrap(),
+        b"good"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn posts_during_finish_are_refused_and_the_journal_matches_the_bytes() {
+    let s = Arc::new(Server::new());
+    let t = s.session().await;
+    for round in 0..6u8 {
+        let name = format!("race{round}.pdf");
+        let good = vec![round; 300_000];
+        let a = s
+            .apply(&t, &format!("/INBOX/{name}"), &name, good.len() as u64)
+            .await;
+        let url = a["fullUploadUrl"].as_str().unwrap().to_string();
+        let inner = a["innerName"].as_str().unwrap().to_string();
+        assert_ok(&s.send(&url, "", &name, &good).await.json());
+        let finish = {
+            let (s, t, name, inner, good) =
+                (s.clone(), t.clone(), name.clone(), inner, good.clone());
+            tokio::spawn(async move { s.finish(&t, "/INBOX/", &name, &inner, &good).await })
+        };
+        let posts: Vec<_> = (0..3u8)
+            .map(|i| {
+                let (s, url, name) = (s.clone(), url.clone(), name.clone());
+                tokio::spawn(async move {
+                    s.send(&url, "", &name, &vec![200 + i; 300_000])
+                        .await
+                        .json()
+                })
+            })
+            .collect();
+        assert_ok(&finish.await.unwrap());
+        for p in posts {
+            assert_err(&p.await.unwrap(), "E0324");
+        }
+        let on_disk = std::fs::read(s.files().join(format!("INBOX/{name}"))).unwrap();
+        assert_eq!(on_disk, good);
+        let created = s
+            .events()
+            .into_iter()
+            .rfind(|e| e["type"] == "file.created" && e["path"] == format!("INBOX/{name}"))
+            .unwrap();
+        assert_eq!(created["md5"], md5_of(&on_disk));
+    }
+}
+
+#[tokio::test]
+async fn other_multipart_fields_are_capped_together() {
+    let s = Server::new();
+    let t = s.session().await;
+    let a = s.apply(&t, "/INBOX/f.pdf", "f.pdf", 1).await;
+    let uri = path_and_query(a["fullUploadUrl"].as_str().unwrap());
+    let send = |fields: Vec<(&'static str, Vec<u8>)>| {
+        let (ct, body) = multipart_with(&fields, "f.pdf", b"f");
+        let (s, uri) = (&s, uri.clone());
+        async move {
+            s.raw("POST", &uri, &[("content-type", &ct)], Body::from(body))
+                .await
+                .json()
+        }
+    };
+    // Two fields of 150 KiB: each is small, together they are above 256 KiB.
+    let r = send(vec![
+        ("a", vec![b'a'; 150 * 1024]),
+        ("b", vec![b'b'; 150 * 1024]),
+    ])
+    .await;
+    assert_err(&r, "E0324");
+    let e = s.requests_to(UPLOAD).pop().unwrap();
+    assert!(e["flags"].to_string().contains("upload_broken"), "{e}");
+    // 200 KiB in one field is fine.
+    let r = send(vec![("a", vec![b'a'; 200 * 1024])]).await;
+    assert_ok(&r);
+}
+
+#[tokio::test]
+async fn a_dropped_request_stops_extending_the_lock() {
+    use notedown_cloud::api::files::keep_lock_every;
+    let s = Server::new();
+    s.session().await; // the lock lives until T0 + 30 s
+    let holder = || s.state.sync_locks.holder("jordi", s.state.now_ms());
+    let every = Duration::from_millis(5);
+    s.advance_ms(20_000);
+    // While the work runs, the keeper extends the lock (to T0 + 50 s) ...
+    let work = keep_lock_every(
+        &s.state,
+        "jordi",
+        SERIAL,
+        every,
+        std::future::pending::<()>(),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), work)
+            .await
+            .is_err()
+    );
+    s.advance_ms(15_000); // T0 + 35 s
+    assert_eq!(holder().as_deref(), Some(SERIAL));
+    // ... and the request future is dropped: no keeper is left to extend it further.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    s.advance_ms(20_000); // T0 + 55 s
+    assert_eq!(holder(), None);
 }

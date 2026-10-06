@@ -169,7 +169,7 @@ Do this only after the capture session. Take your time. A wrong step can make th
    notedown cloud backup-device http://<nomad ip>:8089 ~/nomad-backup
    ```
 
-   Use a new, empty folder for this final backup. The final backup must be a fresh run, not a run with `--resume` into an older backup. It copies every file and writes `backup.json` with the result. It skips the SD card (`REMOVABLE0`) unless you add `--include-sd`. If any file failed, run it again with `--resume` into the same folder. With `--resume` it also removes stale `.part` files. It also lists local files that the device no longer has (in `backup.json` and on the screen). The import refuses such a backup.
+   Use a new, empty folder for this final backup. It copies every file and writes `backup.json` with the result. It skips the SD card (`REMOVABLE0`) unless you add `--include-sd`. If any file failed, run it again with `--resume` into the same folder. Use `--resume` only to finish this same backup, never on an older backup folder. With `--resume` it also removes stale `.part` files. It also lists local files that the device no longer has (in `backup.json` and on the screen). The import refuses such a backup.
 3. **Import the backup.** First look at what would happen. Nothing is written with `--dry-run`.
 
    ```
@@ -203,7 +203,7 @@ What to expect:
 - To add a file from the Mac, use `notedown cloud put report.pdf --data ~/notedown-cloud --account jordi --to DOCUMENT/Document/Inbox`. The Nomad downloads it at its next sync. A later version will push a message that starts the sync.
 - Do not delete or change files in the data folder directly. The device would see that as a delete and remove its own copy too. Use `put`, or change files on the device.
 - Keep the data folder on the Mac's own disk with APFS. The file system must keep file names exactly as they are (APFS does, HFS+ and some network shares do not). The server warns at start if it does not.
-- Do not move `files/` in the data folder, and do not replace it with a symlink. If `files/` or one of the device folders is missing or is a symlink, the server refuses every file request (`E0079`). The device then keeps all of its files. Move the folder back, or import the device again with `--replace`.
+- Do not move `files/` in the data folder, and do not replace it with a symlink. If `files/` or one of the device folders is missing or is a symlink, the server refuses every file request (`E0079`). The device then keeps all of its files. Move the folder back (a real folder, not a link), or import the device again with `--replace`.
 
 ## Format documentation and tests
 

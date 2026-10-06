@@ -59,8 +59,8 @@ pub enum Error {
     /// from such a tree (the device would delete its own files); routes answer `E0079` with
     /// `store_damaged`.
     #[error(
-        "the store of account {slug} is damaged: {reason}. Restore the data folder from a \
-         backup, or import the device again with --replace"
+        "the store of account {slug} is damaged: {reason}. Put the real files/ folder back \
+         (no symlink), or import the device again with --replace"
     )]
     StoreDamaged { slug: String, reason: String },
     #[error("cannot listen on {addr}: {source}")]

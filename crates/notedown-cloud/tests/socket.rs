@@ -510,6 +510,10 @@ async fn garbage_token_is_rejected_with_403_and_closed() {
     assert_eq!(out[3].1, "41");
     assert!(out[4].1.starts_with("<close"), "{out:?}");
     assert!(!s.log_text().contains("Zm9yZ2Vk"));
+    let hs = s.handshakes();
+    assert_eq!(hs.len(), 1, "{hs:?}");
+    assert_eq!(hs[0]["response_status"], 101);
+    assert_eq!(hs[0]["device"], SERIAL);
 }
 
 #[tokio::test]

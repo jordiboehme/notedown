@@ -284,6 +284,16 @@ fn run_device(base: String) -> Device {
     );
     let (ct, body) = multipart("book.pdf", &book_v2);
     let url = a["fullUploadUrl"].as_str().unwrap().to_string();
+    // The signature of this second upload URL must not reach the log either.
+    d.secrets.extend(
+        url.split_once('?')
+            .unwrap()
+            .1
+            .split('&')
+            .filter_map(|p| p.strip_prefix("signature="))
+            .map(String::from),
+    );
+    assert_eq!(a["innerName"], "book.pdf");
     let (status, _) = {
         let req = d.http.post(&url).header("content-type", ct).body(body);
         d.send(req)

@@ -128,8 +128,14 @@ impl Accounts {
         validate_slug(slug)?;
         validate_email(email)?;
         validate_password(password)?;
-        if self.get(slug)?.is_some() || self.find_by_email(email)?.is_some() {
+        if self.get(slug)?.is_some() {
             return Err(Error::AccountExists(slug.to_string()));
+        }
+        if let Some(other) = self.find_by_email(email)? {
+            return Err(Error::EmailInUse {
+                email: email.to_string(),
+                slug: other.slug,
+            });
         }
         let account = Account {
             slug: slug.to_string(),

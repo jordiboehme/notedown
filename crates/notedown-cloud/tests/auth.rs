@@ -49,7 +49,7 @@ fn create_list_find_remove() {
     ));
     assert!(matches!(
         accounts.create("other", "anna@example.org", "pw"),
-        Err(Error::AccountExists(_))
+        Err(Error::EmailInUse { .. })
     ));
     accounts.remove("anna").unwrap();
     assert!(!d.path().join("accounts/anna").exists());
@@ -583,4 +583,25 @@ fn set_password_clears_the_lock_time() {
     accounts.save(&a).unwrap();
     accounts.set_password("jordi", "new").unwrap();
     assert_eq!(accounts.get("jordi").unwrap().unwrap().locked_at_ms, None);
+}
+
+#[test]
+fn duplicate_email_is_reported_as_such() {
+    let d = data();
+    let accounts = Accounts::new(d.path());
+    accounts
+        .create("jordi", "jordi@example.org", "secret")
+        .unwrap();
+    let err = accounts
+        .create("jordi2", "JORDI@example.org", "secret")
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::EmailInUse { slug, .. } if slug == "jordi"),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "email JORDI@example.org is already used by account jordi"
+    );
+    assert!(accounts.get("jordi2").unwrap().is_none());
 }

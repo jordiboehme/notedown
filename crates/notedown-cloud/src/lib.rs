@@ -33,6 +33,8 @@ pub enum Error {
     Invalid { what: &'static str, message: String },
     #[error("account {0} already exists")]
     AccountExists(String),
+    #[error("email {email} is already used by account {slug}")]
+    EmailInUse { email: String, slug: String },
     #[error("account {0} does not exist")]
     NoAccount(String),
     #[error("cannot listen on {addr}: {source}")]

@@ -944,6 +944,44 @@ async fn limits_refuse_large_parts_and_files() {
     assert!(!entry.join("part-1").exists());
 }
 
+#[tokio::test]
+async fn the_real_limits_take_device_sized_parts_and_files_past_the_default_body_limits() {
+    let s = Server::new();
+    let t = s.session().await;
+    // A single upload of 10 MiB: above axum's 2 MB default and the log's 8 MiB buffer.
+    let big: Vec<u8> = (0..10 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let f = s.upload(&t, "DOCUMENT/Document", "big.pdf", &big).await;
+    assert_ok(&f);
+    assert_eq!(f["content_hash"], md5_of(&big));
+    let e = s.requests_to(UPLOAD).pop().unwrap();
+    let (_, body) = multipart("big.pdf", &big);
+    assert_eq!(
+        e["request_body"],
+        format!("<{} bytes, not logged>", body.len())
+    );
+    // The device's part size (8 MiB) works; a part above 9 MiB does not.
+    let a = s.apply(&t, "/INBOX/parts.pdf", "parts.pdf", 0).await;
+    let url = a["partUploadUrl"].as_str().unwrap();
+    let r = s
+        .send(
+            url,
+            "&uploadId=u&partNumber=1&totalChunks=2",
+            "parts.pdf",
+            &big[..8 * 1024 * 1024],
+        )
+        .await;
+    assert_eq!(r.json()["status"], "uploading", "{}", r.text());
+    let r = s
+        .send(
+            url,
+            "&uploadId=u&partNumber=2&totalChunks=2",
+            "parts.pdf",
+            &vec![1u8; 9 * 1024 * 1024 + 1],
+        )
+        .await;
+    assert_err(&r.json(), "E0324");
+}
+
 #[test]
 fn the_real_limits_are_9_mib_per_part_and_1_gib_per_file() {
     assert_eq!(staging::PART_MAX, 9 * 1024 * 1024);

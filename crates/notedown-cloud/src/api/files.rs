@@ -488,6 +488,30 @@ pub fn holds_sync_lock(state: &AppState, slug: &str, serial: &str) -> bool {
     state.sync_locks.holder(slug, state.now_ms()).as_deref() == Some(serial)
 }
 
+/// How often [`keep_lock`] extends the sync lock (well inside its 30 s TTL).
+const KEEP_LOCK_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Await `work` (a long blocking step: a merge, hashing, a commit) while extending the device's
+/// sync lock every 10 s, so the lock does not lapse inside one request.
+pub async fn keep_lock<F: std::future::Future>(
+    state: &Arc<AppState>,
+    slug: &str,
+    serial: &str,
+    work: F,
+) -> F::Output {
+    let (st, slug, serial) = (state.clone(), slug.to_string(), serial.to_string());
+    let keeper = tokio::spawn(async move {
+        let mut every = tokio::time::interval(KEEP_LOCK_EVERY);
+        loop {
+            every.tick().await;
+            st.sync_locks.touch(&slug, &serial, st.now_ms());
+        }
+    });
+    let out = work.await;
+    keeper.abort();
+    out
+}
+
 /// `E0079` with the log flag `no_sync_lock`.
 pub fn no_sync_lock(serial: &str) -> Reply {
     Reply::sync_busy().flag(FLAG_NO_SYNC_LOCK).device(serial)
@@ -801,7 +825,13 @@ pub async fn upload_finish(
         now_ms: state.now_ms(),
     };
     let st = state.clone();
-    let r = blocking(&req.serial, move || finish_upload(&st, args)).await;
+    let r = keep_lock(
+        &state,
+        &req.slug,
+        &req.serial,
+        blocking(&req.serial, move || finish_upload(&st, args)),
+    )
+    .await;
     state.invalidate_usage(&req.slug);
     match r {
         Ok(Finished::Done(e)) => req.ok(json!({

@@ -18,7 +18,9 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use super::envelope::{LogDevice, LogFlags, Reply, Streamed};
-use super::files::{E_UPLOAD, FLAG_UPLOAD_TOO_LARGE, MSG_UPLOAD, holds_sync_lock, no_sync_lock};
+use super::files::{
+    E_UPLOAD, FLAG_UPLOAD_TOO_LARGE, MSG_UPLOAD, holds_sync_lock, keep_lock, no_sync_lock,
+};
 use crate::server::AppState;
 use crate::store::WirePath;
 use crate::sync::staging::{
@@ -535,7 +537,14 @@ pub async fn upload(
         Ok(f) => f,
         Err(why) => return recv_refused(why, &serial),
     };
-    match file.finish(entry.join(staging::DATA_FILE)).await {
+    let finished = keep_lock(
+        &state,
+        &target.account,
+        &serial,
+        file.finish(entry.join(staging::DATA_FILE)),
+    )
+    .await;
+    match finished {
         Ok((_, md5)) => Reply::ok(serde_json::json!({
             "innerName": target.inner,
             "md5": md5,
@@ -598,9 +607,14 @@ pub async fn upload_part(
         total_chunks: total,
     };
     let (st, e, file_max) = (state.clone(), entry.clone(), state.file_max());
-    let stored = tokio::task::spawn_blocking(move || {
-        st.staging_locks.store_part(&e, &tmp, part, &meta, file_max)
-    })
+    let stored = keep_lock(
+        &state,
+        &target.account,
+        &serial,
+        tokio::task::spawn_blocking(move || {
+            st.staging_locks.store_part(&e, &tmp, part, &meta, file_max)
+        }),
+    )
     .await;
     let status = match stored {
         Ok(Ok(PartOutcome::Uploading)) => STATUS_UPLOADING,

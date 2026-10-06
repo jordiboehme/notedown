@@ -685,3 +685,72 @@ async fn a_device_that_stops_reading_is_dropped_after_the_send_timeout() {
     assert!(started.elapsed() <= SEND_TIMEOUT + Duration::from_secs(5));
     drop(ws);
 }
+
+// registry and pushes
+
+/// Wait (under 3 s) until the registry says `connected` for the test device.
+async fn wait_connected(s: &Server, connected: bool) {
+    for _ in 0..60 {
+        if s.state.sockets.is_connected("jordi", SERIAL) == connected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("is_connected never became {connected}");
+}
+
+#[tokio::test]
+async fn a_registered_session_receives_a_pushed_frame_and_logs_it() {
+    let s = Server::start().await;
+    let mut ws = s.session().await;
+    wait_connected(&s, true).await;
+    let frame = notedown_cloud::push::server_message_frame("{\"x\":1}");
+    assert!(s.state.sockets.send("jordi", SERIAL, frame.clone()));
+    assert_eq!(recv(&mut ws).await, frame);
+    sync(&mut ws).await;
+    assert!(
+        s.frames()
+            .iter()
+            .any(|(dir, payload, _)| dir == "out" && *payload == frame)
+    );
+    close(ws).await;
+}
+
+#[tokio::test]
+async fn a_second_session_of_the_same_device_replaces_the_first() {
+    let s = Server::start().await;
+    let mut first = s.session().await;
+    wait_connected(&s, true).await;
+    let mut second = s.session().await;
+    match next(&mut first).await {
+        Some(Message::Close(Some(f))) => assert_eq!(f.reason.as_str(), "replaced"),
+        other => panic!("expected the close with reason replaced, got {other:?}"),
+    }
+    expect_closed(&mut first).await;
+    let frame = notedown_cloud::push::server_message_frame("{}");
+    assert!(s.state.sockets.send("jordi", SERIAL, frame.clone()));
+    assert_eq!(recv(&mut second).await, frame);
+    close(second).await;
+}
+
+#[tokio::test]
+async fn the_replaced_sessions_end_keeps_the_new_registration() {
+    let s = Server::start().await;
+    let first = s.session().await;
+    wait_connected(&s, true).await;
+    let mut second = s.session().await;
+    close(first).await;
+    sync(&mut second).await;
+    assert!(s.state.sockets.is_connected("jordi", SERIAL));
+    close(second).await;
+    wait_connected(&s, false).await;
+}
+
+#[tokio::test]
+async fn a_rejected_session_is_never_registered() {
+    let s = Server::start().await;
+    let mut ws = s.connect(Some("garbage")).await;
+    expect_rejected(&mut ws).await;
+    assert!(!s.state.sockets.is_connected("jordi", SERIAL));
+    assert!(!s.state.sockets.send("jordi", SERIAL, "x".into()));
+}

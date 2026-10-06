@@ -36,6 +36,8 @@ pub struct AppState {
     pub(crate) retries: RetryTracker,
     /// The sync session of each account (`synchronous/start|end`).
     pub sync_locks: SyncLocks,
+    /// The live auto-sync socket sessions (pushes are handed to them).
+    pub sockets: crate::socket::SocketRegistry,
     /// Signs and checks the transfer URLs of `/api/oss/*` (`keys/url.key`).
     pub url_signer: UrlSigner,
     /// One open [`Store`] per account, shared by the requests.
@@ -110,6 +112,7 @@ impl AppState {
             auth: Auth::open(data_dir)?,
             url_signer: UrlSigner::load_or_create(data_dir)?,
             sync_locks: SyncLocks::new(),
+            sockets: crate::socket::SocketRegistry::new(),
             stores: Mutex::new(HashMap::new()),
             usage: Mutex::new(HashMap::new()),
             staging_locks: StagingLocks::default(),

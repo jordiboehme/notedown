@@ -1,4 +1,4 @@
-//! One socket session: the handshake, the heartbeat answers and the frame log.
+//! One socket session: the handshake, the heartbeat answers, server pushes and the frame log.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,6 +8,7 @@ use rand::RngExt;
 use serde_json::Value;
 
 use super::eio::{self, Action};
+use super::registry::Outbound;
 use crate::diag::{LogEntry, LogKind};
 use crate::server::AppState;
 
@@ -50,6 +51,8 @@ pub struct Session {
     pub state: Arc<AppState>,
     pub sid: String,
     pub device: Option<String>,
+    /// The account slug of a granted session; it is the registry key with the device serial.
+    pub slug: Option<String>,
     pub path: String,
 }
 
@@ -105,6 +108,22 @@ impl Session {
     }
 }
 
+/// Removes the session from the registry on every exit path (only if the entry is still its own).
+struct Registration {
+    state: Arc<AppState>,
+    slug: String,
+    serial: String,
+    sid: String,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        self.state
+            .sockets
+            .unregister(&self.slug, &self.serial, &self.sid);
+    }
+}
+
 /// Run one session until the device or the server ends it.
 pub async fn run(mut ws: WebSocket, session: Session, access: Access) {
     // Server speaks first: open packet, then the connect packet (4.2).
@@ -123,19 +142,47 @@ pub async fn run(mut ws: WebSocket, session: Session, access: Access) {
         }
         return;
     }
+    // The registration guard lives until the session ends, whatever the exit path.
+    let (_registration, mut rx) = match (&session.slug, &session.device) {
+        (Some(slug), Some(serial)) => {
+            let rx = session.state.sockets.register(slug, serial, &session.sid);
+            let guard = Registration {
+                state: session.state.clone(),
+                slug: slug.clone(),
+                serial: serial.clone(),
+                sid: session.sid.clone(),
+            };
+            (Some(guard), Some(rx))
+        }
+        _ => (None, None),
+    };
     loop {
-        let msg = match tokio::time::timeout(IDLE_LIMIT, ws.recv()).await {
-            Err(_) => {
-                session.close(&mut ws, close_code::AWAY, "idle").await;
-                return;
-            }
-            Ok(None) => return,
-            Ok(Some(Err(e))) => {
-                // A dropped connection, a frame above MAX_FRAME_BYTES or a protocol error.
-                session.log("in", Value::String(format!("<connection ended: {e}>")), &[]);
-                return;
-            }
-            Ok(Some(Ok(msg))) => msg,
+        let msg = tokio::select! {
+            received = tokio::time::timeout(IDLE_LIMIT, ws.recv()) => match received {
+                Err(_) => {
+                    session.close(&mut ws, close_code::AWAY, "idle").await;
+                    return;
+                }
+                Ok(None) => return,
+                Ok(Some(Err(e))) => {
+                    // A dropped connection, a frame above MAX_FRAME_BYTES or a protocol error.
+                    session.log("in", Value::String(format!("<connection ended: {e}>")), &[]);
+                    return;
+                }
+                Ok(Some(Ok(msg))) => msg,
+            },
+            out = recv_outbound(&mut rx) => match out {
+                Outbound::Frame(frame) => {
+                    if !session.send(&mut ws, frame).await {
+                        return;
+                    }
+                    continue;
+                }
+                Outbound::Close(reason) => {
+                    session.close(&mut ws, close_code::AWAY, reason).await;
+                    return;
+                }
+            },
         };
         match msg {
             Message::Text(text) => {
@@ -193,5 +240,17 @@ pub async fn run(mut ws: WebSocket, session: Session, access: Access) {
                 return;
             }
         }
+    }
+}
+
+/// The next server instruction. Pends forever when the session has no channel or the registry
+/// dropped its sender (the session then ends with its connection).
+async fn recv_outbound(rx: &mut Option<tokio::sync::mpsc::Receiver<Outbound>>) -> Outbound {
+    match rx {
+        Some(rx) => match rx.recv().await {
+            Some(out) => out,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
     }
 }

@@ -6,11 +6,14 @@
 //! entry, token and sign masked); every frame in both directions is logged as `kind: frame`. The
 //! token is checked for signature and generation; `sign` is accepted and ignored (4.2). A bad
 //! token still gets the open and connect packets, then `ServerMessage` `{"code":"403",...}` and
-//! the close, as Ratta does. The server sends no pushes yet: the device only gets the
-//! heartbeat answers of 4.3.
+//! the close, as Ratta does. A granted session registers in the [`SocketRegistry`] and gets the
+//! heartbeat answers of 4.3 plus the pushes the server hands to the registry.
 
 pub mod eio;
 pub mod handler;
+pub mod registry;
+
+pub use registry::{Outbound, SocketRegistry};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,12 +50,16 @@ pub async fn upgrade(
     };
     let query = query.map(|Query(q)| q).unwrap_or_default();
     let token = query.get("token").map(String::as_str).unwrap_or("");
-    let (access, device) = if token.is_empty() {
-        (Access::Denied("Token missing"), None)
+    let (access, device, slug) = if token.is_empty() {
+        (Access::Denied("Token missing"), None, None)
     } else {
         match state.auth.authenticate(token) {
-            Ok(a) => (Access::Granted, Some(a.claims.equipment_no)),
-            Err(_) => (Access::Denied("Token verification failed"), None),
+            Ok(a) => (
+                Access::Granted,
+                Some(a.claims.equipment_no),
+                Some(a.account.slug),
+            ),
+            Err(_) => (Access::Denied("Token verification failed"), None, None),
         }
     };
     // Without a valid token the device stays unnamed: the serial it claims is visible in the
@@ -62,6 +69,7 @@ pub async fn upgrade(
         state,
         sid: handler::new_sid(),
         device: device.clone(),
+        slug,
         path: uri.path().to_string(),
     };
     let ws = ws

@@ -2,8 +2,9 @@
 //!
 //! This crate currently holds the configuration, the always-on protocol log, the accounts, login
 //! codes and tokens, the HTTP routes (login, server queries, in accept mode the sync session,
-//! listing, queries and signed downloads, refusal of every other file operation), the auto-sync
-//! socket, the file store of each account, the change journal and the page index of notes.
+//! listing, queries, signed downloads and uploads, refusal of every other file operation), the
+//! auto-sync socket, the file store of each account with its recycle bin and upload staging, the
+//! change journal and the page index of notes.
 
 pub mod fsutil;
 

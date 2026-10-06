@@ -9,8 +9,8 @@
 //!
 //! - `method`: `GET` for downloads, `POST` for uploads.
 //! - `path_b64`: the `path` query value, base64url without padding of a [`SignedTarget`]
-//!   (account, device, wire path). The GET carries no token, so everything the transfer acts on
-//!   is inside the signed value.
+//!   (account, device, token generation, wire path, file id or `innerName`, size). Transfers
+//!   carry no token, so everything they act on is inside the signed value.
 //! - `timestamp`: ms since the epoch at signing; `nonce`: 32 random hex characters.
 //! - `purpose`: `download` or `upload`; `size`: the byte count the URL is for (`0` for
 //!   downloads).
@@ -228,32 +228,68 @@ impl UrlSigner {
     }
 }
 
-/// What a signed URL acts on: the account, the device it was issued to (its sync lock is
-/// extended while the bytes flow) and the wire path. Encoded as the URL's `path` value.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// What a signed URL acts on, encoded as the URL's `path` value (so all of it is signed):
+///
+/// - `account`, `device`: the account and the device the URL was issued to (the GET or the
+///   upload carries no token; the device's sync lock is checked and extended with this serial).
+/// - `generation`: the device's token generation at signing. A logout or a new login raises it,
+///   and the URL stops working (`E1306`).
+/// - `path`: downloads: the file's wire path; uploads: the target's parent folder.
+/// - `id`: downloads: the file id, which must still resolve to `path` at GET time (`E1307`).
+/// - `inner`: uploads: the `innerName` (a UUID) that names the staging entry.
+/// - `size`: uploads: the size announced in `upload/apply` (also the signer's `size`); `0` for
+///   downloads.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SignedTarget {
     pub account: String,
     pub device: String,
+    pub generation: u64,
     pub path: String,
+    pub id: Option<u64>,
+    pub inner: Option<String>,
+    pub size: u64,
 }
 
+type Wire = (
+    String,
+    String,
+    u64,
+    String,
+    Option<u64>,
+    Option<String>,
+    u64,
+);
+
 impl SignedTarget {
-    /// base64url without padding of the JSON array `[account, device, path]`.
+    /// base64url without padding of the JSON array
+    /// `[account, device, generation, path, id, inner, size]`.
     pub fn encode(&self) -> String {
-        let json = serde_json::to_vec(&(&self.account, &self.device, &self.path))
-            .expect("strings serialize");
+        let json = serde_json::to_vec(&(
+            &self.account,
+            &self.device,
+            self.generation,
+            &self.path,
+            self.id,
+            &self.inner,
+            self.size,
+        ))
+        .expect("plain values serialize");
         URL_SAFE_NO_PAD.encode(json)
     }
 
     /// The inverse of [`SignedTarget::encode`]; `None` for anything else.
     pub fn decode(path_b64: &str) -> Option<SignedTarget> {
         let bytes = URL_SAFE_NO_PAD.decode(path_b64).ok()?;
-        let (account, device, path): (String, String, String) =
+        let (account, device, generation, path, id, inner, size): Wire =
             serde_json::from_slice(&bytes).ok()?;
         Some(SignedTarget {
             account,
             device,
+            generation,
             path,
+            id,
+            inner,
+            size,
         })
     }
 }
@@ -278,6 +314,16 @@ pub fn base_url(external_base_url: Option<&str>, host: Option<&str>) -> String {
         Some(h) if host_ok(h) => format!("http://{h}"),
         _ => "http://localhost".to_string(),
     }
+}
+
+/// `<base>/api/oss/upload?path=..&signature=..&timestamp=..&nonce=..` (`endpoint` is
+/// `upload` or `upload/part`; the device appends `&uploadId=..&partNumber=..&totalChunks=..` to
+/// the part URL). Every value is URL-safe as it is.
+pub fn upload_url(base: &str, endpoint: &str, path_b64: &str, signed: &Signed) -> String {
+    format!(
+        "{base}/api/oss/{endpoint}?path={path_b64}&signature={}&timestamp={}&nonce={}",
+        signed.signature, signed.timestamp, signed.nonce
+    )
 }
 
 /// `<base>/api/oss/download?path=..&signature=..&timestamp=..&nonce=..&pathId=..`. Every value

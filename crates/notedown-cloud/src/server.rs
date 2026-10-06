@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::net::TcpListener;
@@ -12,6 +13,7 @@ use crate::auth::Auth;
 use crate::diag::{Capture, Clock, LogEntry, LogKind, ProtocolLog, SystemClock};
 use crate::journal::{Journal, JournalOptions};
 use crate::store::{Store, WirePath};
+use crate::sync::staging::{self, StagingLocks};
 use crate::sync::{SyncLocks, UrlSigner};
 use crate::{Config, Error, Result};
 
@@ -40,6 +42,12 @@ pub struct AppState {
     stores: Mutex<HashMap<String, Arc<Store>>>,
     /// `usedCapacity` per account: (computed at ms, bytes).
     usage: Mutex<HashMap<String, (u64, u64)>>,
+    /// Serializes the part merge of each staging entry.
+    pub(crate) staging_locks: StagingLocks,
+    /// The largest part of a chunked upload ([`staging::PART_MAX`]).
+    part_max: AtomicU64,
+    /// The largest single upload or merged file ([`staging::FILE_MAX`]).
+    file_max: AtomicU64,
 }
 
 /// How long a computed `usedCapacity` is reused (ms).
@@ -88,12 +96,20 @@ impl AppState {
                 }
             }
         }
+        match staging::sweep(data_dir, now_ms_of(clock.as_ref())) {
+            Ok(0) => {}
+            Ok(n) => eprintln!("notedown cloud: removed {n} stale upload staging entries"),
+            Err(e) => eprintln!("notedown cloud: staging sweep failed: {e}"),
+        }
         Ok(Arc::new(AppState {
             auth: Auth::open(data_dir)?,
             url_signer: UrlSigner::load_or_create(data_dir)?,
             sync_locks: SyncLocks::new(),
             stores: Mutex::new(HashMap::new()),
             usage: Mutex::new(HashMap::new()),
+            staging_locks: StagingLocks::default(),
+            part_max: AtomicU64::new(staging::PART_MAX),
+            file_max: AtomicU64::new(staging::FILE_MAX),
             journal,
             log,
             clock,
@@ -151,11 +167,46 @@ impl AppState {
         Ok(used)
     }
 
+    /// Forget the cached `usedCapacity` of `slug` (after an upload or another change).
+    pub fn invalidate_usage(&self, slug: &str) {
+        self.usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(slug);
+    }
+
+    /// The largest part of a chunked upload in bytes.
+    pub fn part_max(&self) -> u64 {
+        self.part_max.load(Ordering::Relaxed)
+    }
+
+    /// The largest single upload or merged file in bytes.
+    pub fn file_max(&self) -> u64 {
+        self.file_max.load(Ordering::Relaxed)
+    }
+
+    /// Lower the upload limits (tests). Not for production use.
+    #[doc(hidden)]
+    pub fn set_upload_limits(&self, part_max: u64, file_max: u64) {
+        self.part_max.store(part_max, Ordering::Relaxed);
+        self.file_max.store(file_max, Ordering::Relaxed);
+    }
+
+    /// Remove staging entries older than 24 h (by the clock). Blocking. The server runs it on
+    /// start and every hour.
+    pub fn sweep_staging(&self) -> Result<usize> {
+        staging::sweep(&self.data_dir, self.now_ms())
+    }
+
     /// Milliseconds since the epoch, from the clock.
     pub fn now_ms(&self) -> u64 {
-        let ns = self.clock.now().unix_timestamp_nanos();
-        u64::try_from(ns / 1_000_000).unwrap_or(0)
+        now_ms_of(self.clock.as_ref())
     }
+}
+
+fn now_ms_of(clock: &dyn Clock) -> u64 {
+    let ns = clock.now().unix_timestamp_nanos();
+    u64::try_from(ns / 1_000_000).unwrap_or(0)
 }
 
 /// Bind every address of `config.listen`.
@@ -185,6 +236,15 @@ pub async fn serve_listeners(listeners: Vec<TcpListener>, state: Arc<AppState>) 
     serve_until(listeners, state, std::future::pending()).await
 }
 
+/// Aborts a background task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// How long open connections (a device keeps its socket open) get to finish after `shutdown`.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -195,7 +255,22 @@ pub async fn serve_until(
     state: Arc<AppState>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
-    let app = router(state);
+    let app = router(state.clone());
+    // The hourly staging sweep (the first one ran at start); stopped when this returns.
+    let _sweeper = AbortOnDrop(tokio::spawn(async move {
+        let mut every = tokio::time::interval(crate::sync::staging::SWEEP_INTERVAL);
+        every.tick().await;
+        loop {
+            every.tick().await;
+            let st = state.clone();
+            match tokio::task::spawn_blocking(move || st.sweep_staging()).await {
+                Ok(Ok(0)) => {}
+                Ok(Ok(n)) => eprintln!("notedown cloud: removed {n} stale upload staging entries"),
+                Ok(Err(e)) => eprintln!("notedown cloud: staging sweep failed: {e}"),
+                Err(e) => eprintln!("notedown cloud: staging sweep failed: {e}"),
+            }
+        }
+    }));
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let mut set = tokio::task::JoinSet::new();
     for l in listeners {

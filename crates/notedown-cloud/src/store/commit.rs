@@ -26,6 +26,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use super::recycle::{RecycleEntry, RecycleReason};
 use super::{Kind, Store, StoreGuard, WirePath, is_native_folder, list};
 use crate::journal::{Event, EventBody, FileKind, Journal, Origin, new_op_id};
 use crate::{Error, Result, io_err};
@@ -41,14 +42,18 @@ pub const STALE_TEMP_AGE: Duration = Duration::from_secs(60 * 60);
 /// relative to the account folder and to `recycle/`.
 ///
 /// "Applied" (checked by recovery) per operation:
-/// - `put`, `copy`: the target is a file with the intended `md5`.
+/// - `put`, `copy`: the target is a file with the intended `md5` (for a `put` this implies its
+///   `folders` exist and its `recycle` copy is in place, both are done before the rename).
 /// - `move`: the source is gone and the target exists.
 /// - `delete`: the source is gone and `recycle/<recycle>` exists.
 /// - `createFolder`: the target is a folder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum PendingOp {
-    /// Create or replace the file `path` by renaming the staged file onto it.
+    /// Create or replace the file `path` by renaming the staged file onto it. First the
+    /// missing parent `folders` are created (parents first), and with `recycle` the current
+    /// bytes at `path` are copied into the recycle bin; its index line is written after the
+    /// rename (also by recovery).
     #[serde(rename_all = "camelCase")]
     Put {
         id: u64,
@@ -56,6 +61,10 @@ pub enum PendingOp {
         staged: String,
         md5: String,
         size: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        folders: Vec<PlannedFolder>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recycle: Option<RecycleEntry>,
     },
     /// Copy the file `source` to the new file `path`.
     #[serde(rename_all = "camelCase")]
@@ -90,6 +99,23 @@ pub enum PendingOp {
     /// intent, no data and no event for it and returns no `seq`. Never in `pending.json`.
     #[serde(rename_all = "camelCase")]
     Unchanged { id: u64, path: String, md5: String },
+}
+
+/// A folder a `put` creates (its id is assigned while planning).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedFolder {
+    pub id: u64,
+    pub path: String,
+}
+
+/// Options of [`Store::plan_put_with`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PutOptions {
+    /// Create missing parent folders (each gets `folder.created` before the file event).
+    pub create_parents: bool,
+    /// Keep the current bytes of a replaced file in `recycle/<ms>/<path>` (protect mode); the
+    /// value is the time of the overwrite in ms.
+    pub recycle_at_ms: Option<u64>,
 }
 
 /// A planned commit, the content of `pending.json`. Build it with a `Store::plan_*` method,
@@ -367,11 +393,31 @@ impl Store {
         origin: Origin,
         device: Option<String>,
     ) -> Result<Commit> {
+        self.plan_put_with(guard, path, staged, origin, device, PutOptions::default())
+    }
+
+    /// [`Store::plan_put`] with options: create missing parent folders in the same commit
+    /// (`folder.created` for each, parents first, before the file event), and keep the replaced
+    /// bytes in the recycle bin (protect mode).
+    pub fn plan_put_with(
+        &self,
+        guard: &WriteGuard,
+        path: &WirePath,
+        staged: &Path,
+        origin: Origin,
+        device: Option<String>,
+        options: PutOptions,
+    ) -> Result<Commit> {
         self.check_write(guard)?;
         let parent = path
             .parent()
             .ok_or_else(|| invalid("path", "the root is not a file".into()))?;
-        self.require_folder(&parent, "parent folder")?;
+        let missing = if options.create_parents {
+            self.missing_folders(&parent)?
+        } else {
+            self.require_folder(&parent, "parent folder")?;
+            Vec::new()
+        };
         self.check_path(guard, path)?;
         let rel = staged.strip_prefix(&self.account_dir).map_err(|_| {
             invalid(
@@ -408,6 +454,29 @@ impl Store {
             };
             return Ok(Commit::new(origin, device, op, Vec::new()));
         }
+        let mut events = Vec::new();
+        let mut folders = Vec::new();
+        for folder in &missing {
+            let folder_id = self.assign(guard, folder, Kind::Folder)?;
+            events.push(EventBody::FolderCreated {
+                id: folder_id,
+                path: folder.display(),
+            });
+            folders.push(PlannedFolder {
+                id: folder_id,
+                path: folder.display(),
+            });
+        }
+        let recycle = match (&prev, options.recycle_at_ms) {
+            (Some(prev_md5), Some(at)) => Some(RecycleEntry {
+                id,
+                path: display.clone(),
+                md5: prev_md5.clone(),
+                deleted_at: self.recycle_slot(guard, path, at)?,
+                reason: RecycleReason::Overwritten,
+            }),
+            _ => None,
+        };
         let kind = FileKind::of(path.name().unwrap_or_default());
         let event = match prev {
             None => EventBody::FileCreated {
@@ -428,14 +497,37 @@ impl Store {
                 pages_changed: None,
             },
         };
+        events.push(event);
         let op = PendingOp::Put {
             id,
             path: display,
             staged: rel,
             md5,
             size,
+            folders,
+            recycle,
         };
-        Ok(Commit::new(origin, device, op, vec![event]))
+        Ok(Commit::new(origin, device, op, events))
+    }
+
+    /// The folders of `parent` (itself included) that do not exist yet, parents first. Each is
+    /// checked for name collisions. A file on the way is refused.
+    fn missing_folders(&self, parent: &WirePath) -> Result<Vec<WirePath>> {
+        let mut missing = Vec::new();
+        let mut cur = WirePath::root();
+        for segment in parent.segments() {
+            cur = cur.join(segment)?;
+            if !missing.is_empty() {
+                missing.push(cur.clone());
+                continue;
+            }
+            match self.resolve(&cur)? {
+                Some(f) if f.kind == Kind::Folder => {}
+                Some(_) => return Err(invalid("parent folder", format!("{cur} is a file"))),
+                None => missing.push(cur.clone()),
+            }
+        }
+        Ok(missing)
     }
 
     /// Plan copying the file `source` to the new path `target` (new id): `file.copied`.
@@ -645,6 +737,7 @@ impl Store {
             match self.is_applied(guard, &commit.op) {
                 Ok(true) => {}
                 Ok(false) => {
+                    self.undo_unapplied(&commit.op);
                     self.clear_pending()?;
                     return Err(e);
                 }
@@ -656,6 +749,7 @@ impl Store {
             return Ok(Vec::new());
         }
         self.finish_registry(guard, &commit.op)?;
+        self.finish_recycle(&commit.op)?;
         for w in &commit.side_writes {
             if let Err(e) = self.write_side(w) {
                 eprintln!("warning: account {}: {e}", self.slug);
@@ -709,9 +803,29 @@ impl Store {
     /// Perform the data change durably.
     fn apply(&self, op: &PendingOp) -> Result<()> {
         match op {
-            PendingOp::Put { path, staged, .. } => {
+            PendingOp::Put {
+                path,
+                staged,
+                folders,
+                recycle,
+                ..
+            } => {
                 let target = self.fs_path(&wire(path)?);
                 let staged = self.account_dir.join(safe_relative(staged, "staged file")?);
+                for folder in folders {
+                    let dir = self.fs_path(&wire(&folder.path)?);
+                    match std::fs::create_dir(&dir) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {
+                        }
+                        Err(e) => return Err(io_err(&dir)(e)),
+                    }
+                    crate::fsutil::fsync_dir(dir.parent().unwrap_or(&self.files))?;
+                }
+                if let Some(entry) = recycle {
+                    // A copy: the old version stays listed until the rename replaces it.
+                    self.copy_into_recycle(&target, entry)?;
+                }
                 std::fs::File::open(&staged)
                     .and_then(|f| f.sync_all())
                     .map_err(io_err(&staged))?;
@@ -766,7 +880,7 @@ impl Store {
     }
 
     /// `create_dir_all` below the account folder, with an fsync of each new folder's parent.
-    fn create_dirs_durable(&self, dir: &Path) -> Result<()> {
+    pub(super) fn create_dirs_durable(&self, dir: &Path) -> Result<()> {
         let mut missing = Vec::new();
         let mut cur = dir.to_path_buf();
         while !cur.is_dir() {
@@ -849,6 +963,43 @@ impl Store {
         }
     }
 
+    /// Write the recycle index line of an applied change (idempotent, see
+    /// [`Store::record_recycled`]).
+    fn finish_recycle(&self, op: &PendingOp) -> Result<()> {
+        if let PendingOp::Put {
+            recycle: Some(entry),
+            ..
+        } = op
+        {
+            self.append_recycled(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Clean up after a change that was not applied: remove the recycle copy it made and the
+    /// folders it created while they are empty (deepest first). Their registry rows stay, as for
+    /// any discarded intent; a retry reuses them. Failures are ignored (the leftovers are
+    /// harmless: an extra copy, an empty folder).
+    fn undo_unapplied(&self, op: &PendingOp) {
+        if let PendingOp::Put {
+            folders, recycle, ..
+        } = op
+        {
+            if let Some(entry) = recycle {
+                self.discard_recycled(entry);
+            }
+            for folder in folders.iter().rev() {
+                let Ok(path) = wire(&folder.path) else {
+                    continue;
+                };
+                let dir = self.fs_path(&path);
+                if std::fs::remove_dir(&dir).is_ok() {
+                    let _ = crate::fsutil::fsync_dir(dir.parent().unwrap_or(&self.files));
+                }
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ recovery
 
     /// Finish or discard an unfinished commit and sweep stale temp files (see the module docs).
@@ -863,12 +1014,14 @@ impl Store {
             return Ok(Recovery::Clean);
         };
         if !self.is_applied(guard, &commit.op)? {
+            self.undo_unapplied(&commit.op);
             self.clear_pending()?;
             return Ok(Recovery::Discarded {
                 op_id: commit.op_id,
             });
         }
         self.finish_registry(guard, &commit.op)?;
+        self.finish_recycle(&commit.op)?;
         let seqs = {
             let lock = journal.lock()?;
             let have = lock.count_op_after(&commit.op_id, commit.journal_seq.unwrap_or(0))?;

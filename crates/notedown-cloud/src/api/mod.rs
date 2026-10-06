@@ -2,7 +2,8 @@
 //!
 //! Every request passes [`log_request`], which writes exactly one protocol-log line for it.
 //! Routes: login and binding ([`login`]), server queries ([`server`]), in accept mode the sync
-//! session, listing, queries, capacity ([`files`]) and signed downloads ([`oss`]), the refusal of
+//! session, listing, queries, capacity, upload apply and finish ([`files`]) and signed downloads
+//! and uploads ([`oss`]), the refusal of
 //! every other file operation ([`refuse`]), the socket handshake ([`crate::socket`]) and the
 //! catch-all ([`catchall`]).
 
@@ -17,12 +18,13 @@ pub mod server;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::connect_info::MockConnectInfo;
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -69,7 +71,22 @@ const ACCEPT_IMPLEMENTED: &[(&str, &str)] = &[
     ("GET", "/api/oss/download"),
     ("POST", "/api/file/capacity/query"),
     ("POST", "/api/file/2/users/get_space_usage"),
+    ("POST", "/api/file/3/files/upload/apply"),
+    ("POST", "/api/file/2/files/upload/finish"),
+    ("POST", UPLOAD_PATH),
+    ("POST", UPLOAD_PART_PATH),
 ];
+
+/// The byte uploads: their bodies stream to staging and are never read by the request log.
+pub const UPLOAD_PATH: &str = "/api/oss/upload";
+pub const UPLOAD_PART_PATH: &str = "/api/oss/upload/part";
+
+/// Whether accept mode streams this request's body to disk (the log does not read it).
+fn is_streamed_upload(state: &AppState, method: &axum::http::Method, path: &str) -> bool {
+    state.sync_mode() == SyncMode::Accept
+        && method == axum::http::Method::POST
+        && (path == UPLOAD_PATH || path == UPLOAD_PART_PATH)
+}
 
 fn is_implemented(method: &axum::http::Method, path: &str) -> bool {
     IMPLEMENTED
@@ -161,9 +178,25 @@ fn accept_routes() -> Router<Arc<AppState>> {
         .route("/api/file/3/files/download_v3", p(files::download_v3))
         .route("/api/file/capacity/query", p(files::capacity_query))
         .route("/api/file/2/users/get_space_usage", p(files::space_usage))
+        .route("/api/file/3/files/upload/apply", p(files::upload_apply))
+        .route("/api/file/2/files/upload/finish", p(files::upload_finish))
         .route(
             "/api/oss/download",
             get(oss::download).fallback(refuse::refuse),
+        )
+        // The byte uploads lift axum's body limit (2 MB); the handlers stream the field to disk
+        // and enforce their own limits (9 MiB per part, 1 GiB per file).
+        .route(
+            UPLOAD_PATH,
+            post(oss::upload)
+                .fallback(refuse::refuse)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            UPLOAD_PART_PATH,
+            post(oss::upload_part)
+                .fallback(refuse::refuse)
+                .layer(DefaultBodyLimit::disable()),
         )
 }
 
@@ -274,7 +307,8 @@ fn raw_json(bytes: &[u8]) -> Option<String> {
 
 /// Writes one [`LogEntry`] per request: method, path, query, headers, masked bodies, status,
 /// envelope result, duration, device, firmware and flags. The request body is read up to
-/// [`MAX_REQUEST_BODY`]; a larger one is not passed on (the answer is still an envelope).
+/// [`MAX_REQUEST_BODY`]; a larger one is not passed on (the answer is still an envelope). The
+/// byte uploads of accept mode are passed on unread and logged as `<N bytes, not logged>`.
 pub async fn log_request(
     State(state): State<Arc<AppState>>,
     request: Request,
@@ -310,49 +344,68 @@ pub async fn log_request(
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let response = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
-        Ok(bytes) => {
-            entry.request_body = body_for_log(&bytes, &content_type);
-            entry.request_body_raw = raw_json(&bytes);
-            if let Some(Value::Object(m)) = &entry.request_body {
-                let text = |k: &str| match m.get(k) {
-                    Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
-                    _ => None,
-                };
-                entry.device = text("equipmentNo");
-                entry.firmware = text("version");
+    let response = if is_streamed_upload(&state, &parts.method, parts.uri.path()) {
+        // Counted while the handler streams it; never buffered here.
+        let seen = Arc::new(AtomicU64::new(0));
+        let counter = seen.clone();
+        let stream = futures_util::StreamExt::map(body.into_data_stream(), move |chunk| {
+            if let Ok(b) = &chunk {
+                counter.fetch_add(b.len() as u64, Ordering::Relaxed);
             }
-            let request = Request::from_parts(parts, Body::from(bytes));
-            next.run(request).await
-        }
-        Err(_) => {
-            entry.request_body = Some(Value::String(format!(
-                "<body not read: larger than {MAX_REQUEST_BODY} bytes or broken; content-type {}>",
-                if content_type.is_empty() {
-                    "none"
-                } else {
-                    &content_type
+            chunk
+        });
+        let request = Request::from_parts(parts, Body::from_stream(stream));
+        let response = next.run(request).await;
+        entry.request_body = Some(Value::String(format!(
+            "<{} bytes, not logged>",
+            seen.load(Ordering::Relaxed)
+        )));
+        response
+    } else {
+        match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
+            Ok(bytes) => {
+                entry.request_body = body_for_log(&bytes, &content_type);
+                entry.request_body_raw = raw_json(&bytes);
+                if let Some(Value::Object(m)) = &entry.request_body {
+                    let text = |k: &str| match m.get(k) {
+                        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+                        _ => None,
+                    };
+                    entry.device = text("equipmentNo");
+                    entry.firmware = text("version");
                 }
-            )));
-            let normalized = refuse::normalize(parts.uri.path());
-            let accepted = state.sync_mode() == SyncMode::Accept
-                && is_accept_implemented(&parts.method, parts.uri.path());
-            let reply = if accepted {
-                // An implemented route: the note in request_body explains the refusal.
-                Reply::bad_params("body too large")
-            } else if refuse::is_refused_path(&normalized) {
-                refuse::refusal(&parts.method, &parts.uri)
-            } else {
-                // The note in request_body explains the refusal; only a path no route takes is
-                // unknown.
-                let reply = Reply::bad_params("body too large");
-                if is_implemented(&parts.method, parts.uri.path()) {
-                    reply
+                let request = Request::from_parts(parts, Body::from(bytes));
+                next.run(request).await
+            }
+            Err(_) => {
+                entry.request_body = Some(Value::String(format!(
+                    "<body not read: larger than {MAX_REQUEST_BODY} bytes or broken; content-type {}>",
+                    if content_type.is_empty() {
+                        "none"
+                    } else {
+                        &content_type
+                    }
+                )));
+                let normalized = refuse::normalize(parts.uri.path());
+                let accepted = state.sync_mode() == SyncMode::Accept
+                    && is_accept_implemented(&parts.method, parts.uri.path());
+                let reply = if accepted {
+                    // An implemented route: the note in request_body explains the refusal.
+                    Reply::bad_params("body too large")
+                } else if refuse::is_refused_path(&normalized) {
+                    refuse::refusal(&parts.method, &parts.uri)
                 } else {
-                    reply.flag(FLAG_UNKNOWN)
-                }
-            };
-            reply.into_response()
+                    // The note in request_body explains the refusal; only a path no route takes is
+                    // unknown.
+                    let reply = Reply::bad_params("body too large");
+                    if is_implemented(&parts.method, parts.uri.path()) {
+                        reply
+                    } else {
+                        reply.flag(FLAG_UNKNOWN)
+                    }
+                };
+                reply.into_response()
+            }
         }
     };
 

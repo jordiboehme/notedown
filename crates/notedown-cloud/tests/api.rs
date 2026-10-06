@@ -953,7 +953,7 @@ async fn accept_mode_without_m3_routes_still_refuses_digests_and_todos() {
     for path in [
         "/api/file/query/summary/group",
         "/api/file/schedule/group/all",
-        "/api/oss/upload",
+        "/api/file/terminal/upload/apply",
     ] {
         let v = s
             .call(

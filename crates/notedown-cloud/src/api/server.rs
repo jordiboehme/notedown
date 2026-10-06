@@ -15,7 +15,7 @@ use crate::server::AppState;
 const TOTAL_CAPACITY: &str = "25485312";
 /// `FILE_TYPE` and `FILE_MAX` as read from Ratta's server (3.3).
 const FILE_TYPES: &str = "note,mark,pdf,epub,doc,docx,txt,png,jpg,jpeg,webp,bmp,gif,tif,tga,psd,cbz,fb2,xps,chm,rtf,ppt,pptx,xls,xlsx,zip,rar,gz,tar.gz,zz,apk,snstk,snbak,read,spd,otf,ttf,ttc,eot,dfont,woff";
-const FILE_MAX: u64 = 1 << 30;
+const FILE_MAX: u64 = crate::sync::staging::FILE_MAX;
 
 /// Token from `x-access-token`, checked for signature, account and device generation.
 pub(crate) fn authenticate(

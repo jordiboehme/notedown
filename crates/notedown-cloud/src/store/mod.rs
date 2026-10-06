@@ -14,6 +14,7 @@ mod hashes;
 mod ids;
 mod list;
 mod path;
+pub mod recycle;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -24,14 +25,16 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 pub use commit::{
-    Commit, CrashPoint, PENDING_FILE, PendingOp, RECYCLE_DIR, Recovery, STALE_TEMP_AGE, SideWrite,
-    WriteGuard, recover_all,
+    Commit, CrashPoint, PENDING_FILE, PendingOp, PlannedFolder, PutOptions, RECYCLE_DIR, Recovery,
+    STALE_TEMP_AGE, SideWrite, WriteGuard, recover_all,
 };
 pub use ids::FIRST_ID;
 pub use list::Entry;
 pub use path::WirePath;
+pub use recycle::{RECYCLE_INDEX, RecycleEntry, RecycleReason};
 
 use hashes::HashCache;
+pub(crate) use hashes::md5_file;
 use ids::{Op, Registry};
 use list::Found;
 

@@ -1,0 +1,240 @@
+//! The recycle bin `accounts/<slug>/recycle/`: old versions and deleted files, so every
+//! overwrite and every delete can be undone by hand.
+//!
+//! Layout:
+//!
+//! - `recycle/<deletedAt>/<wire path>`: the bytes (or the folder) as they were. `deletedAt` is
+//!   ms since the epoch; [`Store::recycle_slot`] picks a later ms when that path is taken, so a
+//!   slot is never reused.
+//! - `recycle/index.jsonl`: one line per recycled item, [`RecycleEntry`]
+//!   `{"id","path","md5","deletedAt","reason"}`. The slot of a line is
+//!   `recycle/<deletedAt>/<path>` ([`RecycleEntry::location`]).
+//!
+//! Use inside the commit protocol ([`super::commit`]), under the store lock:
+//!
+//! 1. While planning, pick the slot with [`Store::recycle_slot`] and put the [`RecycleEntry`]
+//!    into the intent (`PendingOp::Put { recycle }` does this for an overwrite).
+//! 2. In the apply step, put the bytes into the slot: [`Store::copy_to_recycle`] (an overwrite:
+//!    the file stays listed until the new bytes replace it) or [`Store::move_to_recycle`] (a
+//!    delete).
+//! 3. After the apply step (where the registry is updated, also on recovery), append the index
+//!    line with [`Store::record_recycled`]. It is idempotent: a line that is already the last
+//!    one is not written again, so recovery can call it after a crash at any point.
+//!
+//! A commit that is discarded (not applied) removes its copy with
+//! [`Store::discard_recycled`]; no line was written for it.
+
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use super::commit::RECYCLE_DIR;
+use super::{Store, StoreGuard, WirePath};
+use crate::{Error, Result, io_err};
+
+/// `recycle/index.jsonl`.
+pub const RECYCLE_INDEX: &str = "index.jsonl";
+
+/// How far back from the end of the index the last line is searched (a line holds one path).
+const TAIL_BYTES: u64 = 64 * 1024;
+
+/// Why something is in the recycle bin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecycleReason {
+    /// An older version replaced by an upload (protect mode).
+    Overwritten,
+    /// A deleted file or folder.
+    Deleted,
+}
+
+/// One line of `recycle/index.jsonl`. Field order is the line order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecycleEntry {
+    /// The store id the item had.
+    pub id: u64,
+    /// Its wire path (`NOTE/Note/x.note`).
+    pub path: String,
+    /// The MD5 of the recycled bytes (empty for a folder).
+    pub md5: String,
+    /// ms since the epoch; also the first segment of the slot.
+    pub deleted_at: u64,
+    pub reason: RecycleReason,
+}
+
+impl RecycleEntry {
+    /// The slot, relative to `recycle/`: `<deletedAt>/<path>`.
+    pub fn location(&self) -> String {
+        format!("{}/{}", self.deleted_at, self.path)
+    }
+
+    fn line(&self) -> String {
+        let mut line = serde_json::to_string(self).expect("plain struct serializes");
+        line.push('\n');
+        line
+    }
+}
+
+impl Store {
+    /// `accounts/<slug>/recycle`.
+    pub fn recycle_dir(&self) -> PathBuf {
+        self.account_dir.join(RECYCLE_DIR)
+    }
+
+    /// Where the slot of `entry` is on disk. The path is checked again (it may come from an
+    /// intent file).
+    pub fn recycle_path(&self, entry: &RecycleEntry) -> Result<PathBuf> {
+        let path = WirePath::parse_named(&entry.path)?;
+        Ok(path.to_fs(&self.recycle_dir().join(entry.deleted_at.to_string())))
+    }
+
+    /// The first ms at or after `at_ms` whose slot `recycle/<ms>/<path>` is free.
+    pub fn recycle_slot(&self, guard: &StoreGuard, path: &WirePath, at_ms: u64) -> Result<u64> {
+        self.check_guard(guard)?;
+        let mut ms = at_ms;
+        loop {
+            let slot = path.to_fs(&self.recycle_dir().join(ms.to_string()));
+            if std::fs::symlink_metadata(&slot).is_err() {
+                return Ok(ms);
+            }
+            ms += 1;
+        }
+    }
+
+    /// Copy the file `from` into the slot of `entry` durably (temp file, fsync, rename, fsync
+    /// of the folder). The source stays where it is.
+    pub fn copy_to_recycle(
+        &self,
+        guard: &StoreGuard,
+        from: &Path,
+        entry: &RecycleEntry,
+    ) -> Result<()> {
+        self.check_guard(guard)?;
+        self.copy_into_recycle(from, entry)
+    }
+
+    pub(super) fn copy_into_recycle(&self, from: &Path, entry: &RecycleEntry) -> Result<()> {
+        let target = self.recycle_path(entry)?;
+        let dir = target.parent().unwrap_or(&self.account_dir).to_path_buf();
+        self.create_dirs_durable(&dir)?;
+        let (tmp, mut out) = super::create_temp(&dir).map_err(io_err(&dir))?;
+        let copied = (|| -> std::io::Result<()> {
+            let mut input = std::fs::File::open(from)?;
+            std::io::copy(&mut input, &mut out)?;
+            out.sync_all()?;
+            std::fs::rename(&tmp, &target)
+        })();
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(io_err(&target)(e));
+        }
+        crate::fsutil::fsync_dir(&dir)
+    }
+
+    /// Move the file or folder `from` into the slot of `entry` durably (the slot's folders are
+    /// created and synced, then `rename_durable`).
+    pub fn move_to_recycle(
+        &self,
+        guard: &StoreGuard,
+        from: &Path,
+        entry: &RecycleEntry,
+    ) -> Result<()> {
+        self.check_guard(guard)?;
+        let target = self.recycle_path(entry)?;
+        let dir = target.parent().unwrap_or(&self.account_dir).to_path_buf();
+        self.create_dirs_durable(&dir)?;
+        crate::fsutil::rename_durable(from, &target)
+    }
+
+    /// Append the index line of `entry` (write, fsync) unless it is the last line already.
+    /// A torn last line (a crash while writing it) is cut first. Returns whether a line was
+    /// written.
+    pub fn record_recycled(&self, guard: &StoreGuard, entry: &RecycleEntry) -> Result<bool> {
+        self.check_guard(guard)?;
+        self.append_recycled(entry)
+    }
+
+    pub(super) fn append_recycled(&self, entry: &RecycleEntry) -> Result<bool> {
+        let dir = self.recycle_dir();
+        self.create_dirs_durable(&dir)?;
+        let path = dir.join(RECYCLE_INDEX);
+        let existed = path.exists();
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(io_err(&path))?;
+        let (complete, last) = tail(&mut f).map_err(io_err(&path))?;
+        if last.as_ref() == Some(entry) {
+            return Ok(false);
+        }
+        let len = f.metadata().map_err(io_err(&path))?.len();
+        if complete != len {
+            f.set_len(complete).map_err(io_err(&path))?;
+        }
+        f.seek(SeekFrom::Start(complete)).map_err(io_err(&path))?;
+        f.write_all(entry.line().as_bytes())
+            .and_then(|()| f.sync_data())
+            .map_err(io_err(&path))?;
+        if !existed {
+            crate::fsutil::fsync_dir(&dir)?;
+        }
+        Ok(true)
+    }
+
+    /// Remove the copy of a discarded commit from its slot (nothing else is touched). A missing
+    /// copy is fine.
+    pub(super) fn discard_recycled(&self, entry: &RecycleEntry) {
+        if let Ok(p) = self.recycle_path(entry)
+            && std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file())
+        {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    /// Every complete line of `recycle/index.jsonl`, oldest first. A missing index is empty.
+    pub fn recycle_index(&self, guard: &StoreGuard) -> Result<Vec<RecycleEntry>> {
+        self.check_guard(guard)?;
+        let path = self.recycle_dir().join(RECYCLE_INDEX);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(io_err(&path)(e)),
+        };
+        let complete = text.rfind('\n').map_or(0, |i| i + 1);
+        text[..complete]
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                serde_json::from_str(l).map_err(|e| Error::Config {
+                    path: path.clone(),
+                    message: e.to_string(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// The length of the complete part of the index (up to and including the last newline) and
+/// its last complete line, parsed (`None` when empty or not a [`RecycleEntry`]).
+fn tail(f: &mut std::fs::File) -> std::io::Result<(u64, Option<RecycleEntry>)> {
+    let len = f.metadata()?.len();
+    let start = len.saturating_sub(TAIL_BYTES);
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    let Some(end) = buf.iter().rposition(|b| *b == b'\n') else {
+        // No newline at all: an empty file or a single torn line, cut it. A tail of 64 KiB
+        // without a newline in a longer file is no line of ours; leave the file as it is.
+        return Ok((if start == 0 { 0 } else { len }, None));
+    };
+    let complete = start + end as u64 + 1;
+    let body = &buf[..end];
+    let begin = body.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    let last = serde_json::from_slice(&body[begin..]).ok();
+    Ok((complete, last))
+}

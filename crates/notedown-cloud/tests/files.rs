@@ -819,12 +819,9 @@ async fn tampered_or_expired_signatures_get_plain_e1306() {
     let mut flipped = sig.clone().into_bytes();
     flipped[0] = if flipped[0] == b'0' { b'1' } else { b'0' };
     let bad_sig = pq.replace(&sig, std::str::from_utf8(&flipped).unwrap());
-    let other_target = SignedTarget {
-        account: "jordi".into(),
-        device: SERIAL.into(),
-        path: "INBOX/other.txt".into(),
-    }
-    .encode();
+    let mut other = SignedTarget::decode(&q[0].1).unwrap();
+    other.path = "INBOX/other.txt".into();
+    let other_target = other.encode();
     let bad_path = pq.replace(&q[0].1, &other_target);
     let bad_ts = pq.replace(&q[2].1, &(q[2].1.parse::<u64>().unwrap() + 1).to_string());
     for uri in [
@@ -951,7 +948,7 @@ async fn other_methods_and_refuse_mode_still_answer_e0079() {
     assert_err(&r.json(), "E0079");
     let r = s.raw("POST", "/api/oss/download", &[], Body::empty()).await;
     assert_err(&r.json(), "E0079");
-    // not implemented yet in accept mode
+    // without the sync lock (no synchronous/start)
     assert_err(
         &s.post("/api/file/3/files/upload/apply", &a, json!({}))
             .await,
@@ -1129,16 +1126,33 @@ fn signed_targets_round_trip() {
     let t = SignedTarget {
         account: "jordi".into(),
         device: SERIAL.into(),
+        generation: 3,
         path: "NOTE/Note/a|b ü.note".into(),
+        id: Some(1008),
+        inner: None,
+        size: 0,
     };
     let enc = t.encode();
     assert!(
         enc.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     );
-    assert_eq!(SignedTarget::decode(&enc), Some(t));
+    assert_eq!(SignedTarget::decode(&enc), Some(t.clone()));
     assert_eq!(SignedTarget::decode("!!"), None);
     assert_eq!(SignedTarget::decode("e30"), None);
+    let upload = SignedTarget {
+        inner: Some("0a1b2c3d-1111-4222-8333-444455556666".into()),
+        id: None,
+        size: 1135077,
+        ..t
+    };
+    assert_eq!(SignedTarget::decode(&upload.encode()), Some(upload));
+    // The Task 5 form (account, device, path) is no longer accepted.
+    let old = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        br#"["jordi","SN078C10000000","NOTE/Note/a.note"]"#,
+    );
+    assert_eq!(SignedTarget::decode(&old), None);
 }
 
 #[tokio::test]

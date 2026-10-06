@@ -628,6 +628,7 @@ pub fn plan_page_events_with_limit(
             staged,
             md5,
             size,
+            ..
         } => (*id, path, store.account_dir().join(staged), md5, *size),
         PendingOp::Copy {
             id,

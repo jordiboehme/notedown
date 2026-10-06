@@ -176,8 +176,8 @@ If the device doesn't sync after a `put`, start a manual sync. The `push` settin
 ## What to expect
 
 - Digests and to-dos don't sync yet. The server answers them with "busy", so the device shows "App Data Sync Failed". Your files still sync.
-- A file you add with `put` arrives a few seconds later when "Auto Sync" is on. Without it, the file arrives at the next manual sync. notedown sends no message while a sync runs or while protect mode is closed.
-- The `push` setting in `server.toml` has three values: `startsync` (the default) tells the device to start a sync, `detail` sends one message per changed file and `off` sends nothing. `notedown serve` prints the active value. Restart the server after you change it.
+- A file you add with `put` arrives a few seconds later when "Auto Sync" is on. Without it, the file arrives at the next manual sync. notedown sends no message while a sync runs or while protect mode is closed. A change you make while `notedown serve` is stopped isn't pushed later. The device gets it at its next sync.
+- The `push` setting in `server.toml` has three values: `startsync` (the default) tells the device to start a sync, `detail` sends one message with one item per changed file or folder and `off` sends nothing. `notedown serve` prints the active value. Restart the server after you change it.
 - Don't change files in the data folder directly. The server doesn't notice such a change yet. A removed file looks like a delete to the device, and it removes its own copy too. Use `put`, or change files on the device.
 - Don't move `files/` in the data folder and don't replace it with a symlink. If `files/` or a device folder is missing or is a symlink, the server refuses every file request, and the device keeps all of its files. The error message says how to repair it.
 

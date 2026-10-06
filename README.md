@@ -154,8 +154,8 @@ files as real files in a data folder and writes every change to a journal.
 
 - Protect mode is on by default. The server refuses every file request until `notedown cloud import`
   has filled the account, and it keeps a recycle bin for every delete and overwrite.
-- `notedown cloud put` adds a file from the computer. notedown tells the connected devices to sync, so the
-  file arrives a few seconds later.
+- `notedown cloud put` adds a file from the computer. notedown then tells the connected devices to sync.
+  With "Auto Sync" on, the file usually arrives a few seconds later. If it doesn't, start a manual sync.
 - `notedown cloud journal tail` prints the changes as JSON lines.
 - `notedown serve --refuse-sync` refuses every sync and exchanges no files. It's for recording the
   protocol only.

@@ -61,6 +61,11 @@ impl AppState {
         }))
     }
 
+    /// Whether this run exchanges files or refuses every sync.
+    pub fn sync_mode(&self) -> crate::SyncMode {
+        self.config.sync
+    }
+
     /// Milliseconds since the epoch, from the clock.
     pub fn now_ms(&self) -> u64 {
         let ns = self.clock.now().unix_timestamp_nanos();

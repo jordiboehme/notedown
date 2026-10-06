@@ -27,6 +27,7 @@ use axum::routing::{any, get, post};
 use serde_json::Value;
 use tower_http::catch_panic::CatchPanicLayer;
 
+use crate::SyncMode;
 use crate::auth::Device;
 use crate::diag::{LogEntry, LogKind};
 use crate::server::{AppState, MAX_REQUEST_BODY};
@@ -66,7 +67,7 @@ pub struct ClientAddr(pub IpAddr);
 
 /// The router with all routes, the catch-all, panic protection and the request log.
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let base = Router::new()
         .route("/api/terminal/equipment/unlink", post(login::unlink))
         .route(
             "/api/official/user/check/exists/server",
@@ -94,7 +95,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/official/system/base/param", post(server::base_param))
         // The auto-sync socket: the handshake passes the request log like any request.
-        .route(crate::socket::PATH, get(crate::socket::upgrade))
+        .route(crate::socket::PATH, get(crate::socket::upgrade));
+    // In accept mode the implemented file routes come first: a concrete route wins over the
+    // wildcard refusal below, which keeps every family that is not implemented refused. In
+    // refuse mode there are none, so every file and oss path answers `E0079` as in M2.
+    let base = match state.sync_mode() {
+        SyncMode::Accept => base.merge(accept_routes()),
+        SyncMode::Refuse => base,
+    };
+    base
         // Safety: every other file, digest, task, oss, recycle, share and convert path.
         .route("/api/file/{*rest}", any(refuse::refuse))
         .route("/api/oss/{*rest}", any(refuse::refuse))
@@ -103,6 +112,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(CatchPanicLayer::custom(panic_reply))
         .layer(middleware::from_fn_with_state(state.clone(), log_request))
         .with_state(state)
+}
+
+/// The file sync routes of accept mode. None yet: later tasks add them family by family.
+fn accept_routes() -> Router<Arc<AppState>> {
+    Router::new()
 }
 
 fn panic_reply(_: Box<dyn std::any::Any + Send + 'static>) -> Response {

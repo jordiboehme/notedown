@@ -133,13 +133,13 @@ Follow these steps in this order.
      add jordi --email you@example.org
    ```
 
-3. **Start the server.** The script builds the release binary when it is needed and starts the server in capture mode.
+3. **Start the server.** The script builds the release binary when it is needed and starts the server in capture mode with sync refused.
 
    ```
    scripts/capture-session.sh ~/notedown-cloud
    ```
 
-   The script turns on capture mode for this run only. `server.toml` also has a `capture` key. It is for one capture session only, because the dumps in `capture/` have no size cap. Leave it at `false`. The server prints a warning when it is on.
+   The script turns on capture mode and passes `--refuse-sync`, for this run only. That keeps this guide true: every sync is refused and no files are exchanged. `server.toml` has a `sync` key (`"accept"` is the default, `"refuse"` refuses every sync). The flag overrides it for one run and never rewrites the file. `server.toml` also has a `capture` key. It is for one capture session only, because the dumps in `capture/` have no size cap. Leave it at `false`. The server prints a warning when it is on.
 
    You can start the script from any folder. macOS may ask if notedown may accept incoming connections. Allow it. The Mac and the Nomad must be on the same network.
 4. **Find the IP address of the Mac.** The startup output shows one or more lines like `device URL: http://192.168.1.20:19072`. Use the address of your home network.

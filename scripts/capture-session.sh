@@ -48,4 +48,4 @@ if [ -z "$accounts" ]; then
   exit 1
 fi
 
-exec "$bin" serve --data "$data" --capture
+exec "$bin" serve --data "$data" --capture --refuse-sync

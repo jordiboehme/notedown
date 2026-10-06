@@ -12,7 +12,7 @@ use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request, StatusCode};
 use notedown_cloud::auth::{Accounts, expected_login_hash, md5_hex};
 use notedown_cloud::server::{AppState, MAX_REQUEST_BODY, router};
-use notedown_cloud::{Clock, Config};
+use notedown_cloud::{Clock, Config, SyncMode};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use tower::ServiceExt;
@@ -37,7 +37,16 @@ struct Server {
 }
 
 impl Server {
+    /// Refuse mode: the M2 behaviour, every file and oss path answers `E0079`.
     fn new() -> Server {
+        Self::with_config(Config {
+            sync: SyncMode::Refuse,
+            ..Config::default()
+        })
+    }
+
+    /// Accept mode (the default configuration).
+    fn accept() -> Server {
         Self::with_config(Config::default())
     }
 
@@ -784,6 +793,51 @@ async fn every_documented_file_endpoint_is_refused() {
             assert!(!e["flags"].to_string().contains("unknown_endpoint"), "{e}");
         }
     }
+}
+
+#[tokio::test]
+async fn accept_mode_without_m3_routes_still_refuses_digests_and_todos() {
+    let s = Server::accept();
+    assert_eq!(s.state.sync_mode(), SyncMode::Accept);
+    let (login, _, _) = s.login("secret", SERIAL, "202407").await;
+    let token = login["token"].as_str().unwrap();
+    for path in [
+        "/api/file/query/summary/group",
+        "/api/file/schedule/group/all",
+        "/api/oss/upload",
+    ] {
+        let v = s
+            .call(
+                "POST",
+                path,
+                &[("x-access-token", token)],
+                Some(json!({"equipmentNo": SERIAL})),
+            )
+            .await;
+        assert_err(&v, "E0079");
+    }
+    // query/server stays answered
+    assert_ok(&s.call("POST", "/api/file/query/server", &[], None).await);
+}
+
+#[tokio::test]
+async fn signature_in_a_logged_query_is_masked() {
+    let s = Server::new();
+    s.call(
+        "GET",
+        "/api/oss/download?path=a&signature=sEcReT-sig-value&timestamp=1&nonce=n",
+        &[],
+        None,
+    )
+    .await;
+    let text = s.log_text();
+    assert!(!text.contains("sEcReT-sig-value"), "{text}");
+    let q = s.requests_to("/api/oss/download")[0]["query"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(q.contains("signature=<masked:"), "{q}");
+    assert!(q.contains("path=a"), "{q}");
 }
 
 #[tokio::test]

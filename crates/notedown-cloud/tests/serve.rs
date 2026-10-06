@@ -3,9 +3,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use notedown_cloud::Config;
 use notedown_cloud::auth::{Accounts, expected_login_hash, md5_hex};
 use notedown_cloud::server::{AppState, bind, serve_until};
+use notedown_cloud::{Config, SyncMode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -25,6 +25,7 @@ fn config(capture: bool) -> Config {
     Config {
         listen: vec!["127.0.0.1:0".parse().unwrap()],
         capture,
+        sync: SyncMode::Refuse,
         ..Config::default()
     }
 }

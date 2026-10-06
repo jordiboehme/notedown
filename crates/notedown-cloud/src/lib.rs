@@ -4,7 +4,7 @@
 //! codes and tokens, the HTTP routes of the capture server (login, server queries, refusal of
 //! every file operation) and the auto-sync socket.
 
-pub(crate) mod fsutil;
+pub mod fsutil;
 
 pub mod api;
 pub mod auth;
@@ -13,7 +13,7 @@ pub mod diag;
 pub mod server;
 pub mod socket;
 
-pub use config::Config;
+pub use config::{Config, SyncMode};
 pub use diag::{Clock, LogEntry, LogKind, ProtocolLog, SystemClock};
 
 /// Errors of the cloud crate.

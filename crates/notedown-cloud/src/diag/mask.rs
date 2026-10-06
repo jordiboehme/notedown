@@ -11,13 +11,14 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_FIELD_BYTES: usize = 4 * 1024;
 
 /// A key is sensitive when its lowercase name contains one of these ...
-const SENSITIVE_PARTS: [&str; 8] = [
+const SENSITIVE_PARTS: [&str; 9] = [
     "password",
     "token",
     "secret",
     "authorization",
     "cookie",
     "sign",
+    "signature",
     "randomcode",
     "validcode",
 ];

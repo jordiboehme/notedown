@@ -148,3 +148,49 @@ fn cloud_account_add_list_passwd_remove() {
     );
     assert!(!out.status.success());
 }
+
+/// Start `notedown serve` on a loopback port and return the startup lines up to the stop hint.
+fn serve_startup(data: &std::path::Path, extra: &[&str]) -> String {
+    use std::io::BufRead;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["serve", "--data"])
+        .arg(data)
+        .args(extra)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut lines = String::new();
+    let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        lines.push_str(&line);
+        if line.starts_with("press Ctrl-C") {
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    lines
+}
+
+#[test]
+fn serve_refuse_sync_flag_counts_for_one_run_and_keeps_server_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    let toml = dir.path().join("server.toml");
+    std::fs::write(&toml, "listen = [\"127.0.0.1:0\"]\n").unwrap();
+    let out = serve_startup(dir.path(), &["--refuse-sync"]);
+    assert!(
+        out.contains("sync mode: refuse (capture only, no files are exchanged)"),
+        "{out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&toml).unwrap(),
+        "listen = [\"127.0.0.1:0\"]\n"
+    );
+    let out = serve_startup(dir.path(), &[]);
+    assert!(out.contains("sync mode: accept (protect: on)"), "{out}");
+}

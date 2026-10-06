@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use notedown_cloud::diag::{MAX_BODY_BYTES, Origin, cut_body, mask_headers, mask_json, mask_query};
-use notedown_cloud::{Clock, Config, LogEntry, LogKind, ProtocolLog};
+use notedown_cloud::{Clock, Config, LogEntry, LogKind, ProtocolLog, SyncMode};
 use serde_json::{Value, json};
 use time::{Date, Month, OffsetDateTime, Time};
 
@@ -487,6 +487,7 @@ fn config_defaults_created_and_round_trip() {
     assert_eq!(c.external_base_url, None);
     assert!(c.protect);
     assert!(!c.capture);
+    assert_eq!(c.sync, SyncMode::Accept);
     assert_eq!(c.log_retention_days, 30);
     assert_eq!(c.log_max_bytes, 1 << 30);
     let text = std::fs::read_to_string(dir.path().join("server.toml")).unwrap();
@@ -504,12 +505,33 @@ fn config_defaults_created_and_round_trip() {
         external_base_url: Some("https://notes.example.org".into()),
         trusted_proxies: vec!["10.0.0.1".parse().unwrap(), "::1".parse().unwrap()],
         protect: false,
+        sync: SyncMode::Refuse,
         capture: true,
         log_retention_days: 7,
         log_max_bytes: 123,
     };
     custom.save(dir.path()).unwrap();
     assert_eq!(Config::load_or_create(dir.path()).unwrap(), custom);
+    let text = std::fs::read_to_string(dir.path().join("server.toml")).unwrap();
+    assert!(text.contains("\nsync = \"refuse\"\n"), "{text}");
+}
+
+#[test]
+fn config_sync_key_parses_and_rejects_other_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.toml");
+    std::fs::write(&path, "sync = \"refuse\"\n").unwrap();
+    assert_eq!(
+        Config::load_or_create(dir.path()).unwrap().sync,
+        SyncMode::Refuse
+    );
+    std::fs::write(&path, "sync = \"accept\"\n").unwrap();
+    assert_eq!(
+        Config::load_or_create(dir.path()).unwrap().sync,
+        SyncMode::Accept
+    );
+    std::fs::write(&path, "sync = \"maybe\"\n").unwrap();
+    assert!(Config::load_or_create(dir.path()).is_err());
 }
 
 #[test]

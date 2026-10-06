@@ -34,7 +34,7 @@ enum Command {
         #[command(subcommand)]
         action: ModelAction,
     },
-    /// Run the capture server for a Supernote device (sync is refused, no files are exchanged)
+    /// Run the Supernote Private Cloud server (--refuse-sync: capture only, no files are exchanged)
     Serve(ServeArgs),
     /// The Supernote cloud server and its data folder
     Cloud {
@@ -51,6 +51,10 @@ struct ServeArgs {
     /// Also write every request and frame, masked, to <data>/capture/ (this run only)
     #[arg(long)]
     capture: bool,
+    /// Refuse every sync, whatever server.toml says: capture only, no files are exchanged (this
+    /// run only)
+    #[arg(long)]
+    refuse_sync: bool,
 }
 
 #[derive(Subcommand)]
@@ -513,6 +517,9 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
     // The flag counts for this run only; server.toml is not rewritten.
     let capture_from_file = config.capture && !args.capture;
     config.capture |= args.capture;
+    if args.refuse_sync {
+        config.sync = notedown_cloud::SyncMode::Refuse;
+    }
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         let listeners = bind(&config).await?;
@@ -546,7 +553,15 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
                  session only, the dumps have no size cap. Set capture = false and use --capture."
             );
         }
-        println!("capture mode: sync is refused, no files are exchanged");
+        match config.sync {
+            notedown_cloud::SyncMode::Refuse => {
+                println!("sync mode: refuse (capture only, no files are exchanged)");
+            }
+            notedown_cloud::SyncMode::Accept => println!(
+                "sync mode: accept (protect: {})",
+                if config.protect { "on" } else { "off" }
+            ),
+        }
         println!("press Ctrl-C to stop");
         std::io::stdout().flush()?;
         serve_until(listeners, state.clone(), async {

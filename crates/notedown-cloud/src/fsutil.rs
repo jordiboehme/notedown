@@ -1,16 +1,55 @@
-//! Atomic file writes: temp file, fsync, rename.
+//! Durable file writes: unique temp file, fsync, rename, fsync of the folder.
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{Result, io_err};
 
-/// Write `bytes` to `path` atomically. With `private` the file has mode 0600 from its creation on.
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Flush a folder's entries (a created or renamed file) to disk. A no-op where a folder cannot be
+/// opened for this (non-Unix).
+pub fn fsync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)
+            .and_then(|f| f.sync_all())
+            .map_err(io_err(dir))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// Rename `from` to `to`, then fsync the folder of `to` and, when it is another one, the folder
+/// of `from`.
+pub fn rename_durable(from: &Path, to: &Path) -> Result<()> {
+    std::fs::rename(from, to).map_err(io_err(to))?;
+    let dir_of = |p: &Path| match p.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => Path::new(".").to_path_buf(),
+    };
+    let (to_dir, from_dir) = (dir_of(to), dir_of(from));
+    fsync_dir(&to_dir)?;
+    if from_dir != to_dir {
+        fsync_dir(&from_dir)?;
+    }
+    Ok(())
+}
+
+/// Write `bytes` to `path` atomically: a temp file `.<name>.<pid>.<counter>.tmp` in the same
+/// folder (unique, so concurrent writers never share one), fsync, rename, fsync of the folder.
+/// With `private` the file has mode 0600 from its creation on.
+pub fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).map_err(io_err(dir))?;
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let tmp = dir.join(format!(".{name}.tmp"));
+    let tmp = dir.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     let write = || -> std::io::Result<()> {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
@@ -33,7 +72,8 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<(
     write().map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         io_err(path)(e)
-    })
+    })?;
+    fsync_dir(dir)
 }
 
 /// JSON with two-space indent and a trailing newline.

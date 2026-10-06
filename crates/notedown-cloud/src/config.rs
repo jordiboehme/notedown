@@ -1,6 +1,5 @@
 //! `<data>/server.toml`: created with defaults on first start.
 
-use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
@@ -13,6 +12,17 @@ pub const CONFIG_FILE: &str = "server.toml";
 /// The comment above `capture` in the written `server.toml`.
 pub const CAPTURE_COMMENT: &str = "# For one capture session only. The dumps in capture/ have no size cap \
      and no rotation.\n# Prefer `notedown serve --capture`, which counts for one run.";
+
+/// Whether the server exchanges files with the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncMode {
+    /// Serve the file sync routes that are implemented; refuse the rest.
+    #[default]
+    Accept,
+    /// Refuse every file and oss request with `E0079`: capture only, no files are exchanged.
+    Refuse,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -27,6 +37,9 @@ pub struct Config {
     pub trusted_proxies: Vec<IpAddr>,
     /// Log and refuse device deletes, moves and overwrites.
     pub protect: bool,
+    /// `"accept"` (default) exchanges files with the device. `"refuse"` answers every sync
+    /// with a busy error (capture only). `notedown serve --refuse-sync` sets it for one run.
+    pub sync: SyncMode,
     /// Write full, masked dumps of every request and frame to `capture/`. For one capture
     /// session only: the dumps have no size cap and no rotation. The `--capture` flag of
     /// `serve` is the usual way; it counts for one run.
@@ -44,6 +57,7 @@ impl Default for Config {
             external_base_url: None,
             trusted_proxies: Vec::new(),
             protect: true,
+            sync: SyncMode::Accept,
             capture: false,
             log_retention_days: 30,
             log_max_bytes: 1024 * 1024 * 1024,
@@ -73,7 +87,7 @@ impl Config {
         }
     }
 
-    /// Atomic write: temp file, fsync, rename.
+    /// Atomic write: unique temp file, fsync, rename, fsync of the folder.
     pub fn save(&self, data_dir: &Path) -> Result<()> {
         let path = Self::path(data_dir);
         std::fs::create_dir_all(data_dir).map_err(io_err(data_dir))?;
@@ -86,13 +100,6 @@ impl Config {
             &format!("\n{CAPTURE_COMMENT}\ncapture = "),
             1,
         );
-        let tmp = data_dir.join(format!(".{CONFIG_FILE}.tmp"));
-        let write = || -> std::io::Result<()> {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(text.as_bytes())?;
-            f.sync_all()?;
-            std::fs::rename(&tmp, &path)
-        };
-        write().map_err(io_err(&path))
+        crate::fsutil::write_atomic(&path, text.as_bytes(), false)
     }
 }

@@ -2,7 +2,8 @@
 //!
 //! Every request passes [`log_request`], which writes exactly one protocol-log line for it.
 //! Routes: login and binding ([`login`]), server queries ([`server`]), in accept mode the sync
-//! session, listing, queries, capacity, upload apply and finish ([`files`]) and signed downloads
+//! session, listing, queries, capacity, upload apply and finish, folders, delete, move and copy
+//! ([`files`]) and signed downloads
 //! and uploads ([`oss`]), the refusal of
 //! every other file operation ([`refuse`]), the socket handshake ([`crate::socket`]) and the
 //! catch-all ([`catchall`]).
@@ -75,6 +76,10 @@ const ACCEPT_IMPLEMENTED: &[(&str, &str)] = &[
     ("POST", "/api/file/2/files/upload/finish"),
     ("POST", UPLOAD_PATH),
     ("POST", UPLOAD_PART_PATH),
+    ("POST", "/api/file/2/files/create_folder_v2"),
+    ("POST", "/api/file/3/files/delete_folder_v3"),
+    ("POST", "/api/file/3/files/move_v3"),
+    ("POST", "/api/file/3/files/copy_v3"),
 ];
 
 /// The byte uploads: their bodies stream to staging and are never read by the request log.
@@ -180,6 +185,16 @@ fn accept_routes() -> Router<Arc<AppState>> {
         .route("/api/file/2/users/get_space_usage", p(files::space_usage))
         .route("/api/file/3/files/upload/apply", p(files::upload_apply))
         .route("/api/file/2/files/upload/finish", p(files::upload_finish))
+        .route(
+            "/api/file/2/files/create_folder_v2",
+            p(files::create_folder_v2),
+        )
+        .route(
+            "/api/file/3/files/delete_folder_v3",
+            p(files::delete_folder_v3),
+        )
+        .route("/api/file/3/files/move_v3", p(files::move_v3))
+        .route("/api/file/3/files/copy_v3", p(files::copy_v3))
         .route(
             "/api/oss/download",
             get(oss::download).fallback(refuse::refuse),

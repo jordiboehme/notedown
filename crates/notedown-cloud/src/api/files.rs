@@ -1,6 +1,7 @@
-//! The file sync session, listing, queries, download URLs, capacity and the upload apply and
-//! finish steps of accept mode (`docs/sync-protocol.md` 3.4, 3.5). Uploads also need the
-//! calling device to hold the live sync lock (`E0079`, flag `no_sync_lock`).
+//! The file sync session, listing, queries, download URLs, capacity, the upload apply and
+//! finish steps, and folder creation, delete, move and copy of accept mode
+//! (`docs/sync-protocol.md` 3.4, 3.5). Every write also needs the calling device to hold the
+//! live sync lock (`E0079`, flag `no_sync_lock`).
 //!
 //! Every route needs the device token. The body's `equipmentNo`, when present, must be the
 //! token's device (`E0312` otherwise). Every call of the device that holds the account's sync
@@ -874,4 +875,499 @@ pub async fn upload_finish(
         Ok(Finished::Refused(refusal)) => refusal.reply(&req.serial),
         Err(r) => r,
     }
+}
+
+// ------------------------------------------------------------------ folders, delete, move, copy
+
+/// The id to delete is unknown (or its file is gone).
+pub const E_DELETE_MISSING: &str = "E0318";
+/// The move source is unknown (or gone).
+pub const E_MOVE_MISSING: &str = "E0320";
+/// The copy source is unknown (or gone).
+pub const E_COPY_MISSING: &str = "E0308";
+/// A folder cannot be moved (or copied) into itself.
+pub const E_INTO_ITSELF: &str = "E0358";
+
+pub const MSG_DELETE_MISSING: &str = "The file or folder to delete does not exist";
+pub const MSG_MOVE_MISSING: &str = "The file or folder to move does not exist";
+pub const MSG_COPY_MISSING: &str = "The file or folder to copy does not exist";
+pub const MSG_INTO_ITSELF: &str = "A folder cannot be moved into itself";
+pub const MSG_NATIVE_FOLDER: &str = "The system folders cannot be deleted or moved";
+
+/// Log flag: a delete or move of a native folder (or one of their parents), refused.
+pub const FLAG_NATIVE_FOLDER: &str = "native_folder";
+
+/// The result of a folder, delete, move or copy call.
+enum Outcome {
+    /// Success with these payload fields.
+    Done(Value),
+    /// An error envelope with this code and message, and maybe a log flag.
+    Refused(&'static str, &'static str, Option<&'static str>),
+}
+
+impl Outcome {
+    fn taken() -> crate::Result<Outcome> {
+        Ok(Outcome::Refused(E_NAME_TAKEN, MSG_NAME_TAKEN, None))
+    }
+
+    fn refused(code: &'static str, msg: &'static str) -> crate::Result<Outcome> {
+        Ok(Outcome::Refused(code, msg, None))
+    }
+
+    fn native() -> crate::Result<Outcome> {
+        Ok(Outcome::Refused(
+            super::envelope::E_BAD_PARAMS,
+            MSG_NATIVE_FOLDER,
+            Some(FLAG_NATIVE_FOLDER),
+        ))
+    }
+}
+
+/// Run a mutation for a device that holds the sync lock: in a blocking task, with the lock kept
+/// alive while it runs; the usage cache is cleared afterwards.
+async fn mutate<F>(state: &Arc<AppState>, req: &DeviceRequest, work: F) -> Reply
+where
+    F: FnOnce(&AppState, &str, &str) -> crate::Result<Outcome> + Send + 'static,
+{
+    if !holds_sync_lock(state, &req.slug, &req.serial) {
+        return no_sync_lock(&req.serial);
+    }
+    let (st, slug, serial) = (state.clone(), req.slug.clone(), req.serial.clone());
+    let r = keep_lock(
+        state,
+        &req.slug,
+        &req.serial,
+        blocking(&req.serial, move || work(&st, &slug, &serial)),
+    )
+    .await;
+    state.invalidate_usage(&req.slug);
+    match r {
+        Ok(Outcome::Done(fields)) => req.ok(fields),
+        Ok(Outcome::Refused(code, msg, flag)) => {
+            let reply = req.error(code, msg);
+            match flag {
+                Some(f) => reply.flag(f),
+                None => reply,
+            }
+        }
+        Err(r) => r,
+    }
+}
+
+/// Whether a name in a folder can be used.
+enum NameState {
+    Free,
+    /// Something has this name (also in another case or Unicode normalization).
+    Taken,
+    /// The store never takes this name (a dot-name, not a single segment).
+    Refused,
+}
+
+/// The state of `name` in `parent` (which may not exist yet). `source` is the name of the entry
+/// that is renamed in place, if `parent` is its folder: it does not count as taken.
+fn name_state(
+    store: &Store,
+    guard: &StoreGuard,
+    parent: &WirePath,
+    name: &str,
+    source: Option<&str>,
+) -> crate::Result<NameState> {
+    let checked = match source {
+        Some(src) => store.check_rename(guard, parent, name, src),
+        None => store.check_name(guard, parent, name),
+    };
+    match checked {
+        Err(Error::NameCollision { .. }) => return Ok(NameState::Taken),
+        Err(Error::Invalid { .. }) => return Ok(NameState::Refused),
+        Err(e) => return Err(e),
+        Ok(()) => {}
+    }
+    // check_name lets an entry with exactly this name pass (an upload replaces it); here that
+    // entry takes the name, also when the registry does not know it yet.
+    let on_disk = std::fs::symlink_metadata(store.fs_path(parent).join(name)).is_ok();
+    Ok(if source.is_none() && on_disk {
+        NameState::Taken
+    } else {
+        NameState::Free
+    })
+}
+
+/// `name(n)`: for a file the suffix goes before the extension (`Bike(1).note`), for a folder
+/// at the end (`Work(1)`).
+pub fn numbered_name(name: &str, n: u32, kind: Kind) -> String {
+    match (kind, name.rfind('.')) {
+        (Kind::File, Some(dot)) if dot > 0 => {
+            format!("{}({n}){}", &name[..dot], &name[dot..])
+        }
+        _ => format!("{name}({n})"),
+    }
+}
+
+/// The name to use for `name` in `parent`: `name` itself when it is free; with `autorename`
+/// the first free `name(1)`, `name(2)`, ...; `None` when it is taken (without `autorename`) or
+/// refused.
+fn pick_name(
+    store: &Store,
+    guard: &StoreGuard,
+    parent: &WirePath,
+    name: &str,
+    kind: Kind,
+    autorename: bool,
+    source: Option<&str>,
+) -> crate::Result<Option<String>> {
+    match name_state(store, guard, parent, name, source)? {
+        NameState::Free => return Ok(Some(name.to_string())),
+        NameState::Refused => return Ok(None),
+        NameState::Taken if !autorename => return Ok(None),
+        NameState::Taken => {}
+    }
+    for n in 1..=10_000 {
+        let candidate = numbered_name(name, n, kind);
+        match name_state(store, guard, parent, &candidate, source)? {
+            NameState::Free => return Ok(Some(candidate)),
+            NameState::Refused => return Ok(None),
+            NameState::Taken => {}
+        }
+    }
+    Ok(None)
+}
+
+/// Whether the folders of `parent` can hold a new entry: every existing segment is a folder
+/// spelled exactly so (no case or normalization variant of an existing name, no dot-name, no
+/// file on the way). Missing folders are fine (they are created).
+fn way_is_open(store: &Store, guard: &StoreGuard, parent: &WirePath) -> crate::Result<bool> {
+    match store.check_path(guard, parent) {
+        Err(Error::NameCollision { .. } | Error::Invalid { .. }) => return Ok(false),
+        Err(e) => return Err(e),
+        Ok(()) => {}
+    }
+    let mut cur = WirePath::root();
+    for segment in parent.segments() {
+        cur = cur.join(segment)?;
+        match store.entry(guard, &cur)? {
+            Some(e) if e.tag == Kind::File => return Ok(false),
+            Some(_) => {}
+            None => break,
+        }
+    }
+    Ok(true)
+}
+
+/// Create the folder `path` and each missing folder above it, parents first, one commit each
+/// (`folder.created`). Existing folders are kept.
+fn create_folders(
+    state: &AppState,
+    store: &Store,
+    guard: &crate::store::WriteGuard,
+    path: &WirePath,
+    serial: &str,
+) -> crate::Result<()> {
+    let mut cur = WirePath::root();
+    for segment in path.segments() {
+        cur = cur.join(segment)?;
+        if store
+            .entry(guard, &cur)?
+            .is_some_and(|e| e.tag == Kind::Folder)
+        {
+            continue;
+        }
+        let c = store.plan_create_folder(guard, &cur, Origin::Device, Some(serial.into()))?;
+        store.commit(guard, c, &state.journal)?;
+    }
+    Ok(())
+}
+
+/// The listed entry at `path` after a commit.
+fn entry_after(store: &Store, guard: &StoreGuard, path: &WirePath) -> crate::Result<Entry> {
+    store.entry(guard, path)?.ok_or_else(|| Error::Invalid {
+        what: "path",
+        message: format!("{path} is not listed after the commit"),
+    })
+}
+
+/// The entry of `id` when it is known and on disk. A registry row whose file or folder is gone
+/// is dropped (it was removed out of band) and counts as unknown.
+fn source_of(store: &Store, guard: &StoreGuard, id: u64) -> crate::Result<Option<Entry>> {
+    let Some(path) = store.path_of(id)? else {
+        return Ok(None);
+    };
+    if let Some(e) = store.entry(guard, &path)?.filter(|e| e.id == id) {
+        return Ok(Some(e));
+    }
+    if store.path_of(id)?.is_some() && std::fs::symlink_metadata(store.fs_path(&path)).is_err() {
+        store.removed(guard, id)?;
+    }
+    Ok(None)
+}
+
+/// `{tag, id, name, path_display}` of an entry.
+fn metadata_value(e: &Entry) -> Value {
+    json!({
+        "tag": e.tag,
+        "id": e.id.to_string(),
+        "name": e.name,
+        "path_display": e.path_display,
+    })
+}
+
+/// `POST /api/file/2/files/create_folder_v2` `{path, autorename}`: creates the folder (and any
+/// missing folder above it) and answers `metadata {tag: "folder", id, name, path_display}` with
+/// its real id. A taken name (also in another case or Unicode normalization, or by a file)
+/// answers `E0322`, or with `autorename` becomes `name(1)`, `name(2)`, ... A dot-name answers
+/// `E0322`. Needs the sync lock (`E0079`). Event: `folder.created` per new folder.
+pub async fn create_folder_v2(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Reply {
+    let req = device_request!(state, headers, bytes);
+    let Some(text) = req
+        .body
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return Reply::bad_params("path").device(&req.serial);
+    };
+    let autorename = flag_arg(&req.body, "autorename");
+    mutate(&state, &req, move |st, slug, serial| {
+        let Ok(path) = WirePath::parse_named(&text) else {
+            return Outcome::taken();
+        };
+        let (parent, name) = match (path.parent(), path.name()) {
+            (Some(p), Some(n)) => (p, n.to_string()),
+            _ => return Outcome::taken(),
+        };
+        let store = st.store(slug)?;
+        let guard = store.lock_recovered(&st.journal)?;
+        if !way_is_open(&store, &guard, &parent)? {
+            return Outcome::taken();
+        }
+        let Some(name) = pick_name(
+            &store,
+            &guard,
+            &parent,
+            &name,
+            Kind::Folder,
+            autorename,
+            None,
+        )?
+        else {
+            return Outcome::taken();
+        };
+        let target = parent.join(&name)?;
+        create_folders(st, &store, &guard, &target, serial)?;
+        let e = entry_after(&store, &guard, &target)?;
+        Ok(Outcome::Done(json!({"metadata": metadata_value(&e)})))
+    })
+    .await
+}
+
+/// `POST /api/file/3/files/delete_folder_v3` `{id}`: moves the file or folder to
+/// `recycle/<ms>/<path>` with an index line (`reason: "deleted"`) and answers `metadata {tag, id,
+/// name, path_display}`. Events `file.deleted` / `folder.deleted` (for a folder with content,
+/// its content first), then `folder.deleted` for each user folder the delete leaves empty
+/// (never a native folder): the device deletes a folder one file at a time. Unknown id:
+/// `E0318`. A native folder is refused. One delete per commit. Needs the sync lock (`E0079`).
+pub async fn delete_folder_v3(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Reply {
+    let req = device_request!(state, headers, bytes);
+    let id = id_arg(&req.body, "id");
+    let now = state.now_ms();
+    mutate(&state, &req, move |st, slug, serial| {
+        let IdArg::Id(id) = id else {
+            return Outcome::refused(E_DELETE_MISSING, MSG_DELETE_MISSING);
+        };
+        let store = st.store(slug)?;
+        let guard = store.lock_recovered(&st.journal)?;
+        let Some(e) = source_of(&store, &guard, id)? else {
+            return Outcome::refused(E_DELETE_MISSING, MSG_DELETE_MISSING);
+        };
+        if crate::store::is_native_folder(&e.path) {
+            return Outcome::native();
+        }
+        let c = store.plan_delete(&guard, &e.path, now, Origin::Device, Some(serial.into()))?;
+        store.commit(&guard, c, &st.journal)?;
+        Ok(Outcome::Done(json!({"metadata": metadata_value(&e)})))
+    })
+    .await
+}
+
+/// The parsed request of `move_v3` and `copy_v3`.
+struct Transfer {
+    id: IdArg,
+    to_path: Option<String>,
+    autorename: bool,
+}
+
+impl Transfer {
+    fn of(body: &Value) -> Transfer {
+        Transfer {
+            id: id_arg(body, "id"),
+            to_path: body
+                .get("to_path")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            autorename: flag_arg(body, "autorename"),
+        }
+    }
+}
+
+/// The checked target of a move or copy.
+enum Target {
+    Path(WirePath),
+    Refused(Outcome),
+}
+
+/// The target of moving or copying `source` to `to_path` (the full path with the name):
+/// `E0322` for an unusable path, a blocked way or a taken name (without `autorename`), `E0358`
+/// for a folder into itself. `in_place` names the source when the target folder is its own
+/// folder and the source itself does not take the name (a move, which may rename in place).
+fn target_of(
+    store: &Store,
+    guard: &StoreGuard,
+    source: &Entry,
+    to_path: &str,
+    autorename: bool,
+    in_place: bool,
+) -> crate::Result<Target> {
+    let taken = || {
+        Ok(Target::Refused(Outcome::Refused(
+            E_NAME_TAKEN,
+            MSG_NAME_TAKEN,
+            None,
+        )))
+    };
+    let Ok(to) = WirePath::parse_named(to_path) else {
+        return taken();
+    };
+    if source.tag == Kind::Folder && to != source.path && to.starts_with(&source.path) {
+        return Ok(Target::Refused(Outcome::Refused(
+            E_INTO_ITSELF,
+            MSG_INTO_ITSELF,
+            None,
+        )));
+    }
+    let (Some(parent), Some(name)) = (to.parent(), to.name()) else {
+        return taken();
+    };
+    if !way_is_open(store, guard, &parent)? {
+        return taken();
+    }
+    let own = (in_place && source.path.parent().as_ref() == Some(&parent))
+        .then_some(source.name.as_str());
+    match pick_name(store, guard, &parent, name, source.tag, autorename, own)? {
+        Some(name) => Ok(Target::Path(parent.join(&name)?)),
+        None => taken(),
+    }
+}
+
+/// `POST /api/file/3/files/move_v3` `{id, to_path (the full new path with the name),
+/// autorename}`: moves or renames the file or folder, keeps its id and answers `entriesVO`.
+/// Missing folders on the way are created (`folder.created`), then `file.moved` /
+/// `folder.moved`, then `folder.deleted` for each source folder the move leaves empty (never a
+/// native folder). A rename that only changes case is allowed. A taken target (also one the
+/// registry does not know yet) answers `E0322`, or with `autorename` becomes `name(1)`, ...;
+/// an unknown source `E0320`; a folder into itself `E0358`; a native folder is refused. Needs
+/// the sync lock (`E0079`).
+pub async fn move_v3(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Reply {
+    let req = device_request!(state, headers, bytes);
+    let t = Transfer::of(&req.body);
+    mutate(&state, &req, move |st, slug, serial| {
+        let IdArg::Id(id) = t.id else {
+            return Outcome::refused(E_MOVE_MISSING, MSG_MOVE_MISSING);
+        };
+        let store = st.store(slug)?;
+        let guard = store.lock_recovered(&st.journal)?;
+        let Some(src) = source_of(&store, &guard, id)? else {
+            return Outcome::refused(E_MOVE_MISSING, MSG_MOVE_MISSING);
+        };
+        let Some(to_path) = t.to_path else {
+            return Outcome::taken();
+        };
+        if crate::store::is_native_folder(&src.path) {
+            return Outcome::native();
+        }
+        if WirePath::parse_named(&to_path).ok().as_ref() == Some(&src.path) {
+            // The same path: nothing to do.
+            return Ok(Outcome::Done(json!({"entriesVO": entry_value(Some(&src))})));
+        }
+        let to = match target_of(&store, &guard, &src, &to_path, t.autorename, true)? {
+            Target::Path(p) => p,
+            Target::Refused(o) => return Ok(o),
+        };
+        let mut c = store.plan_move(&guard, &src.path, &to, Origin::Device, Some(serial.into()))?;
+        crate::pages::plan_page_move(&store, &guard, &mut c);
+        store.commit(&guard, c, &st.journal)?;
+        let e = entry_after(&store, &guard, &to)?;
+        Ok(Outcome::Done(json!({"entriesVO": entry_value(Some(&e))})))
+    })
+    .await
+}
+
+/// `POST /api/file/3/files/copy_v3` `{id, to_path (the full path of the copy), autorename}`:
+/// copies the file or folder and answers `entriesVO` of the copy, which gets a new id (in a
+/// folder copy every descendant does). Missing folders on the way are created
+/// (`folder.created`). Events: `file.copied` (`sourceId`) per file, with the page events of a
+/// note, and `folder.created` per folder. A taken target answers `E0322`, or with `autorename`
+/// becomes `name(1)`, ...; an unknown source `E0308`; a folder into itself `E0358`. Needs the
+/// sync lock (`E0079`). A folder copy is a series of commits (one per folder and file).
+pub async fn copy_v3(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Reply {
+    let req = device_request!(state, headers, bytes);
+    let t = Transfer::of(&req.body);
+    mutate(&state, &req, move |st, slug, serial| {
+        let IdArg::Id(id) = t.id else {
+            return Outcome::refused(E_COPY_MISSING, MSG_COPY_MISSING);
+        };
+        let store = st.store(slug)?;
+        let guard = store.lock_recovered(&st.journal)?;
+        let Some(src) = source_of(&store, &guard, id)? else {
+            return Outcome::refused(E_COPY_MISSING, MSG_COPY_MISSING);
+        };
+        let Some(to_path) = t.to_path else {
+            return Outcome::taken();
+        };
+        let to = match target_of(&store, &guard, &src, &to_path, t.autorename, false)? {
+            Target::Path(p) => p,
+            Target::Refused(o) => return Ok(o),
+        };
+        let device = Some(serial.to_string());
+        let copy_file = |from: &WirePath, to: &WirePath| -> crate::Result<()> {
+            let mut c = store.plan_copy(&guard, from, to, Origin::Device, device.clone())?;
+            crate::pages::plan_page_events(&store, &guard, &mut c);
+            store.commit(&guard, c, &st.journal)?;
+            Ok(())
+        };
+        match src.tag {
+            Kind::File => copy_file(&src.path, &to)?,
+            Kind::Folder => {
+                // What to copy is fixed before anything is created.
+                let inside = store.list(&guard, &src.path, true)?;
+                create_folders(st, &store, &guard, &to, serial)?;
+                for e in inside {
+                    let Some(target) = e.path.rebase(&src.path, &to) else {
+                        continue;
+                    };
+                    match e.tag {
+                        Kind::Folder => create_folders(st, &store, &guard, &target, serial)?,
+                        Kind::File => copy_file(&e.path, &target)?,
+                    }
+                }
+            }
+        }
+        let e = entry_after(&store, &guard, &to)?;
+        Ok(Outcome::Done(json!({"entriesVO": entry_value(Some(&e))})))
+    })
+    .await
 }

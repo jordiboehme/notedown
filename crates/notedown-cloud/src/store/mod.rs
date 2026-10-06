@@ -648,6 +648,62 @@ impl Store {
         Ok(())
     }
 
+    /// Whether the sibling `source` of the folder `parent` may be renamed to `name` in place: like
+    /// [`Store::check_name`], but `source` itself is no collision (a rename that only changes
+    /// case or Unicode normalization), and an entry with exactly the bytes of `name` is one (a
+    /// rename never replaces). The file system judges last: if it finds an entry under `name`
+    /// that is not `source`, the name is taken.
+    pub fn check_rename(
+        &self,
+        guard: &StoreGuard,
+        parent: &WirePath,
+        name: &str,
+        source: &str,
+    ) -> Result<()> {
+        self.check_guard(guard)?;
+        parent.join(name)?;
+        if name.starts_with('.') {
+            return Err(Error::Invalid {
+                what: "name",
+                message: format!("{name:?} starts with a dot; such names are not stored"),
+            });
+        }
+        let taken = |existing: String| Error::NameCollision {
+            existing,
+            new: name.to_string(),
+        };
+        let Some(dir) = list::resolve(&self.files, parent)? else {
+            return Ok(());
+        };
+        if dir.kind != Kind::Folder {
+            return Ok(());
+        }
+        let entries = std::fs::read_dir(&dir.fs_path).map_err(io_err(&dir.fs_path))?;
+        let key = fold(name);
+        for entry in entries {
+            let entry = entry.map_err(io_err(&dir.fs_path))?;
+            let sibling = entry.file_name();
+            let sibling = sibling.to_string_lossy();
+            if sibling == source {
+                continue;
+            }
+            if sibling == name || fold(&sibling) == key {
+                return Err(taken(sibling.into_owned()));
+            }
+        }
+        let target = dir.fs_path.join(name);
+        if let Ok(found) = std::fs::symlink_metadata(&target) {
+            let same = std::fs::symlink_metadata(dir.fs_path.join(source))
+                .is_ok_and(|src| same_file(&found, &src));
+            if !same {
+                return Err(taken(
+                    "an entry the file system treats as the same name".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// [`Store::check_name`] for every segment of `path`, so a folder spelled differently from
     /// an existing one (`NOTE/note` next to `NOTE/Note`) is refused too.
     pub fn check_path(&self, guard: &StoreGuard, path: &WirePath) -> Result<()> {
@@ -658,6 +714,40 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// Whether two metadata records describe the same file system entry.
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        a.dev() == b.dev() && a.ino() == b.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        a.file_type() == b.file_type() && a.len() == b.len()
+    }
+}
+
+/// The prefix of the temp name a rename that only changes case passes through
+/// (`.nd-move-<pid>-<counter>`). It does not end in `.tmp`, so the temp sweep never removes
+/// it; recovery finishes the rename from the name stored in the intent.
+pub const MOVE_TEMP_PREFIX: &str = ".nd-move-";
+
+/// A fresh name for the middle step of a rename that only changes case.
+fn move_temp_name() -> String {
+    format!(
+        "{MOVE_TEMP_PREFIX}{}-{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// True for a name [`move_temp_name`] makes (checked again when it comes from an intent file).
+fn is_move_temp_name(name: &str) -> bool {
+    name.strip_prefix(MOVE_TEMP_PREFIX).is_some_and(|rest| {
+        !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+    })
 }
 
 fn unknown_id(id: u64) -> Error {

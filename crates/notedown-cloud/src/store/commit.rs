@@ -42,11 +42,17 @@ pub const STALE_TEMP_AGE: Duration = Duration::from_secs(60 * 60);
 /// relative to the account folder and to `recycle/`.
 ///
 /// "Applied" (checked by recovery) per operation:
-/// - `put`, `copy`: the target is a file with the intended `md5` (for a `put` this implies its
-///   `folders` exist and its `recycle` copy is in place, both are done before the rename).
-/// - `move`: the source is gone and the target exists.
+/// - `put`, `copy`: the target is a file with the intended `md5` (this implies its `folders`
+///   exist and the recycle copy of a `put` is in place, both are done before the rename).
+/// - `move`: the source is gone and the target exists. A move `via` a temp name (a rename that
+///   only changes case on a file system that ignores case) stopped between its two renames is
+///   finished first, so the file never stays under the hidden temp name.
 /// - `delete`: the source is gone and `recycle/<recycle>` exists.
 /// - `createFolder`: the target is a folder.
+///
+/// A `move` or `delete` that empties folders lists them in `prune` (deepest first). They are
+/// removed after the apply step (also by recovery); a folder that is not empty then stays, and
+/// its `folder.deleted` event is dropped before the journal append.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum PendingOp {
@@ -66,7 +72,8 @@ pub enum PendingOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recycle: Option<RecycleEntry>,
     },
-    /// Copy the file `source` to the new file `path`.
+    /// Copy the file `source` to the new file `path`, after creating the missing parent
+    /// `folders` (parents first).
     #[serde(rename_all = "camelCase")]
     Copy {
         id: u64,
@@ -75,22 +82,39 @@ pub enum PendingOp {
         path: String,
         md5: String,
         size: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        folders: Vec<PlannedFolder>,
     },
-    /// Rename a file or folder; the id stays.
+    /// Rename a file or folder; the id stays. The missing parent `folders` of `to` are created
+    /// first (parents first). With `via` (a name in the source folder) the rename goes through
+    /// that temp name: a rename that only changes case on a file system that ignores case.
+    /// Afterwards the emptied source folders in `prune` are removed.
     #[serde(rename_all = "camelCase")]
     Move {
         id: u64,
         kind: Kind,
         from: String,
         to: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        folders: Vec<PlannedFolder>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        prune: Vec<PlannedFolder>,
     },
-    /// Move a file or folder into `recycle/<recycle>`; the id is dropped.
+    /// Move a file or folder into `recycle/<recycle>`; the id is dropped. `entry` is its line
+    /// for `recycle/index.jsonl` (written after the apply step, also by recovery). Afterwards
+    /// the emptied folders in `prune` are removed.
     #[serde(rename_all = "camelCase")]
     Delete {
         id: u64,
         kind: Kind,
         path: String,
         recycle: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry: Option<RecycleEntry>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        prune: Vec<PlannedFolder>,
     },
     /// Create the folder `path`.
     #[serde(rename_all = "camelCase")]
@@ -101,7 +125,8 @@ pub enum PendingOp {
     Unchanged { id: u64, path: String, md5: String },
 }
 
-/// A folder a `put` creates (its id is assigned while planning).
+/// A folder a `put`, `copy` or `move` creates, or a folder a `move` or `delete` prunes (its id
+/// is assigned while planning).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedFolder {
     pub id: u64,
@@ -263,12 +288,32 @@ impl Deref for WriteGuard {
 pub enum CrashPoint {
     /// After `pending.json` is written, before the data change.
     BeforeApply,
-    /// A `put`: after its new folders and its recycle copy, before the rename.
+    /// A `put`: after its new folders and its recycle copy, before the rename. A move through a
+    /// temp name: between its two renames.
     BeforeRename,
     /// After the data change, before the registry update and the journal append.
     BeforeAppend,
     /// After the journal append, before `pending.json` is deleted.
     BeforeClear,
+}
+
+/// Whether a [`CrashPoint::BeforeRename`] can stop `op`: a put, and a move through a temp name.
+fn has_rename_stop(op: &PendingOp) -> bool {
+    matches!(
+        op,
+        PendingOp::Put { .. } | PendingOp::Move { via: Some(_), .. }
+    )
+}
+
+/// `folder.deleted` for each pruned folder, in the given order.
+fn prune_events(prune: &[PlannedFolder]) -> Vec<EventBody> {
+    prune
+        .iter()
+        .map(|p| EventBody::FolderDeleted {
+            id: p.id,
+            path: p.path.clone(),
+        })
+        .collect()
 }
 
 fn invalid(what: &'static str, message: String) -> Error {
@@ -547,7 +592,9 @@ impl Store {
         Ok(missing)
     }
 
-    /// Plan copying the file `source` to the new path `target` (new id): `file.copied`.
+    /// Plan copying the file `source` to the new path `target` (a new id, also when a stale
+    /// registry row of a vanished file names `target`): `folder.created` for each missing parent
+    /// folder (parents first), then `file.copied`.
     pub fn plan_copy(
         &self,
         guard: &WriteGuard,
@@ -569,19 +616,21 @@ impl Store {
         let parent = target
             .parent()
             .ok_or_else(|| invalid("path", "the root is not a file".into()))?;
-        self.require_folder(&parent, "parent folder")?;
+        let missing = self.missing_folders(&parent)?;
         self.require_free(guard, target)?;
         let md5 = self.md5_of(guard, source)?;
         let size = std::fs::metadata(self.fs_path(source))
             .map_err(io_err(&self.fs_path(source)))?
             .len();
         let source_id = self.assign(guard, source, Kind::File)?;
+        self.drop_stale_row(guard, target, None)?;
+        let (mut events, folders) = self.plan_folders(guard, &missing)?;
         let id = self.assign(guard, target, Kind::File)?;
-        let event = EventBody::FileCopied {
+        events.push(EventBody::FileCopied {
             id,
             source_id,
             path: target.display(),
-        };
+        });
         let op = PendingOp::Copy {
             id,
             source_id,
@@ -589,12 +638,129 @@ impl Store {
             path: target.display(),
             md5,
             size,
+            folders,
         };
-        Ok(Commit::new(origin, device, op, vec![event]))
+        Ok(Commit::new(origin, device, op, events))
+    }
+
+    /// Ids and `folder.created` events for folders to create (parents first).
+    fn plan_folders(
+        &self,
+        guard: &StoreGuard,
+        missing: &[WirePath],
+    ) -> Result<(Vec<EventBody>, Vec<PlannedFolder>)> {
+        let mut events = Vec::new();
+        let mut folders = Vec::new();
+        for folder in missing {
+            let id = self.assign(guard, folder, Kind::Folder)?;
+            events.push(EventBody::FolderCreated {
+                id,
+                path: folder.display(),
+            });
+            folders.push(PlannedFolder {
+                id,
+                path: folder.display(),
+            });
+        }
+        Ok((events, folders))
+    }
+
+    /// Drop the registry row of `path` (and its subtree) when nothing is on disk there: the
+    /// row of a file or folder removed out of band. `keep` is never dropped.
+    fn drop_stale_row(&self, guard: &StoreGuard, path: &WirePath, keep: Option<u64>) -> Result<()> {
+        if let Some(other) = self.id_of(path)?
+            && Some(other) != keep
+            && std::fs::symlink_metadata(self.fs_path(path)).is_err()
+        {
+            self.removed(guard, other)?;
+        }
+        Ok(())
+    }
+
+    /// The folders that are empty once `gone` has left them, deepest first: the parent of
+    /// `gone` if `gone` is its only entry (dot-files count), then its parent if that folder is
+    /// its only entry, and so on. It stops at the root, at a native folder or one of their
+    /// parents ([`is_native_folder`]), and at a folder that `keep` (a move target) lies in.
+    fn plan_prune(
+        &self,
+        guard: &StoreGuard,
+        gone: &WirePath,
+        keep: Option<&WirePath>,
+    ) -> Result<Vec<PlannedFolder>> {
+        let mut out = Vec::new();
+        let mut cur = gone.clone();
+        while let Some(parent) = cur.parent() {
+            if parent.is_root()
+                || is_native_folder(&parent)
+                || keep.is_some_and(|k| k.starts_with(&parent))
+            {
+                break;
+            }
+            match self.resolve(&parent)? {
+                Some(f) if f.kind == Kind::Folder => {}
+                _ => break,
+            }
+            let dir = self.fs_path(&parent);
+            let mut names = Vec::new();
+            for entry in std::fs::read_dir(&dir).map_err(io_err(&dir))? {
+                names.push(entry.map_err(io_err(&dir))?.file_name());
+                if names.len() > 1 {
+                    break;
+                }
+            }
+            let only = matches!(names.as_slice(), [n] if Some(n.as_os_str()) == cur.name().map(std::ffi::OsStr::new));
+            if !only {
+                break;
+            }
+            let id = self.assign(guard, &parent, Kind::Folder)?;
+            out.push(PlannedFolder {
+                id,
+                path: parent.display(),
+            });
+            cur = parent;
+        }
+        Ok(out)
+    }
+
+    /// For a rename within one folder that only changes case or Unicode normalization: check the
+    /// new name against the other entries ([`Store::check_rename`]) and return `Some(via)`,
+    /// where `via` is a temp name when the file system ignores the difference (it finds the
+    /// source under the new name), else `None`. `None` for any other move.
+    fn plan_case_rename(
+        &self,
+        guard: &StoreGuard,
+        from: &WirePath,
+        to: &WirePath,
+    ) -> Result<Option<Option<String>>> {
+        let (Some(parent), Some(to_parent)) = (from.parent(), to.parent()) else {
+            return Ok(None);
+        };
+        let (Some(old), Some(new)) = (from.name(), to.name()) else {
+            return Ok(None);
+        };
+        if parent != to_parent || old == new || super::fold(old) != super::fold(new) {
+            return Ok(None);
+        }
+        self.check_rename(guard, &parent, new, old)?;
+        if std::fs::symlink_metadata(self.fs_path(to)).is_err() {
+            return Ok(Some(None));
+        }
+        let dir = self.fs_path(&parent);
+        loop {
+            let via = super::move_temp_name();
+            if std::fs::symlink_metadata(dir.join(&via)).is_err() {
+                return Ok(Some(Some(via)));
+            }
+        }
     }
 
     /// Plan renaming the file or folder `from` to the free path `to` (the id stays):
-    /// `file.moved` or `folder.moved`. Native folders cannot be moved.
+    /// `folder.created` for each missing parent of `to` (parents first), `file.moved` or
+    /// `folder.moved`, then `folder.deleted` for each source folder the move leaves empty
+    /// (deepest first, never a native folder). A stale registry row of a vanished entry at `to`
+    /// is dropped first. A rename that only changes case or Unicode normalization is allowed;
+    /// on a file system that ignores the difference it goes through a temp name. Native folders
+    /// cannot be moved.
     pub fn plan_move(
         &self,
         guard: &WriteGuard,
@@ -622,26 +788,45 @@ impl Store {
         let parent = to
             .parent()
             .ok_or_else(|| invalid("path", "no parent".into()))?;
-        self.require_folder(&parent, "parent folder")?;
-        self.require_free(guard, to)?;
+        let case = self.plan_case_rename(guard, from, to)?;
+        let missing = match case {
+            Some(_) => Vec::new(),
+            None => {
+                let missing = self.missing_folders(&parent)?;
+                self.require_free(guard, to)?;
+                missing
+            }
+        };
         let id = self.assign(guard, from, found.kind)?;
+        self.drop_stale_row(guard, to, Some(id))?;
+        let prune = self.plan_prune(guard, from, Some(to))?;
+        let (mut events, folders) = self.plan_folders(guard, &missing)?;
         let (path, old_path) = (to.display(), from.display());
-        let event = match found.kind {
+        events.push(match found.kind {
             Kind::File => EventBody::FileMoved { id, path, old_path },
             Kind::Folder => EventBody::FolderMoved { id, path, old_path },
-        };
+        });
+        events.extend(prune_events(&prune));
         let op = PendingOp::Move {
             id,
             kind: found.kind,
             from: from.display(),
             to: to.display(),
+            folders,
+            via: case.flatten(),
+            prune,
         };
-        Ok(Commit::new(origin, device, op, vec![event]))
+        Ok(Commit::new(origin, device, op, events))
     }
 
-    /// Plan moving the file or folder `path` into `recycle/<deleted_at_ms>/<path>` (a later
-    /// millisecond if that is taken): `file.deleted` or `folder.deleted`. Native folders cannot
-    /// be deleted.
+    /// Plan moving the file or folder `path` into `recycle/<ms>/<path>`, where `ms` is
+    /// `deleted_at_ms` or the next free millisecond ([`Store::recycle_slot`]), with its index
+    /// line (`reason: "deleted"`). Events: for a folder first `file.deleted` / `folder.deleted`
+    /// for everything inside it (children before their folder), then `file.deleted` or
+    /// `folder.deleted` for `path`, then `folder.deleted` for each folder the delete leaves empty
+    /// (deepest first, never a native folder; they are removed for good, without a recycle
+    /// entry). Native folders cannot be deleted. Plan and commit one delete at a time: the slot
+    /// is picked by probing, so two planned deletes could pick the same one.
     pub fn plan_delete(
         &self,
         guard: &WriteGuard,
@@ -658,37 +843,58 @@ impl Store {
             return Err(invalid("path", format!("{path} is a native folder")));
         }
         let display = path.display();
-        let mut ms = deleted_at_ms;
-        let recycle = loop {
-            let rel = format!("{ms}/{display}");
-            let abs = self
-                .account_dir
-                .join(RECYCLE_DIR)
-                .join(safe_relative(&rel, "recycle path")?);
-            if std::fs::symlink_metadata(&abs).is_err() {
-                break rel;
-            }
-            ms += 1;
+        let ms = self.recycle_slot(guard, path, deleted_at_ms)?;
+        let md5 = match found.kind {
+            Kind::File => self.md5_of(guard, path)?,
+            Kind::Folder => String::new(),
         };
         let id = self.assign(guard, path, found.kind)?;
-        let event = match found.kind {
+        let mut events = Vec::new();
+        if found.kind == Kind::Folder {
+            // The listing comes parents first; reversed, every child precedes its folder.
+            for e in self.list(guard, path, true)?.into_iter().rev() {
+                events.push(match e.tag {
+                    Kind::File => EventBody::FileDeleted {
+                        id: e.id,
+                        recycle: format!("{ms}/{}", e.path_display),
+                        path: e.path_display,
+                    },
+                    Kind::Folder => EventBody::FolderDeleted {
+                        id: e.id,
+                        path: e.path_display,
+                    },
+                });
+            }
+        }
+        let entry = RecycleEntry {
+            id,
+            path: display.clone(),
+            md5,
+            deleted_at: ms,
+            reason: RecycleReason::Deleted,
+        };
+        events.push(match found.kind {
             Kind::File => EventBody::FileDeleted {
                 id,
                 path: display.clone(),
-                recycle: recycle.clone(),
+                recycle: entry.location(),
             },
             Kind::Folder => EventBody::FolderDeleted {
                 id,
                 path: display.clone(),
             },
-        };
+        });
+        let prune = self.plan_prune(guard, path, None)?;
+        events.extend(prune_events(&prune));
         let op = PendingOp::Delete {
             id,
             kind: found.kind,
             path: display,
-            recycle,
+            recycle: entry.location(),
+            entry: Some(entry),
+            prune,
         };
-        Ok(Commit::new(origin, device, op, vec![event]))
+        Ok(Commit::new(origin, device, op, events))
     }
 
     /// Plan creating the folder `path` (its parent must exist): `folder.created`.
@@ -750,7 +956,7 @@ impl Store {
             return Ok(Vec::new());
         }
         // 2. data change, then the registry
-        let stop = crash == Some(CrashPoint::BeforeRename);
+        let stop = crash == Some(CrashPoint::BeforeRename) && has_rename_stop(&commit.op);
         if let Err(e) = self.apply(&commit.op, stop) {
             match self.is_applied(guard, &commit.op) {
                 Ok(true) => {}
@@ -765,6 +971,10 @@ impl Store {
         }
         if stop || crash == Some(CrashPoint::BeforeAppend) {
             return Ok(Vec::new());
+        }
+        if self.settle_prune(&mut commit.op, &mut commit.events)? {
+            // A folder to prune was not empty: the intent must not promise its event.
+            super::write_atomic_short(&self.pending_path(), &crate::fsutil::json_bytes(&commit))?;
         }
         self.finish_registry(guard, &commit.op)?;
         self.finish_recycle(&commit.op)?;
@@ -831,16 +1041,7 @@ impl Store {
             } => {
                 let target = self.fs_path(&wire(path)?);
                 let staged = self.account_dir.join(safe_relative(staged, "staged file")?);
-                for folder in folders {
-                    let dir = self.fs_path(&wire(&folder.path)?);
-                    match std::fs::create_dir(&dir) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {
-                        }
-                        Err(e) => return Err(io_err(&dir)(e)),
-                    }
-                    crate::fsutil::fsync_dir(dir.parent().unwrap_or(&self.files))?;
-                }
+                self.create_planned(folders)?;
                 if let Some(entry) = recycle {
                     // A copy: the old version stays listed until the rename replaces it.
                     self.copy_into_recycle(&target, entry)?;
@@ -853,7 +1054,13 @@ impl Store {
                     .map_err(io_err(&staged))?;
                 crate::fsutil::rename_durable(&staged, &target)
             }
-            PendingOp::Copy { source, path, .. } => {
+            PendingOp::Copy {
+                source,
+                path,
+                folders,
+                ..
+            } => {
+                self.create_planned(folders)?;
                 let from = self.fs_path(&wire(source)?);
                 let target = self.fs_path(&wire(path)?);
                 let dir = target.parent().unwrap_or(&self.files).to_path_buf();
@@ -876,13 +1083,33 @@ impl Store {
                 }
                 crate::fsutil::fsync_dir(&dir)
             }
-            PendingOp::Move { from, to, .. } => {
-                let from = self.fs_path(&wire(from)?);
-                let to = self.fs_path(&wire(to)?);
-                if std::fs::symlink_metadata(&to).is_ok() {
-                    return Err(invalid("move", format!("{} exists", to.display())));
+            PendingOp::Move {
+                from,
+                to,
+                folders,
+                via,
+                ..
+            } => {
+                self.create_planned(folders)?;
+                let (from_path, to_path) = (wire(from)?, wire(to)?);
+                let to = self.fs_path(&to_path);
+                let Some(via) = via else {
+                    if std::fs::symlink_metadata(&to).is_ok() {
+                        return Err(invalid("move", format!("{} exists", to.display())));
+                    }
+                    return crate::fsutil::rename_durable(&self.fs_path(&from_path), &to);
+                };
+                // A rename that only changes case, on a file system that ignores case: from
+                // the old name to the temp name, then to the new name. Each step is durable,
+                // and recovery finishes a move that stopped between them.
+                let via = self.via_path(&from_path, via)?;
+                if self.resolve(&from_path)?.is_some() {
+                    crate::fsutil::rename_durable(&self.fs_path(&from_path), &via)?;
                 }
-                crate::fsutil::rename_durable(&from, &to)
+                if stop_before_rename {
+                    return Ok(());
+                }
+                self.finish_via(&to_path, &via)
             }
             PendingOp::Delete { path, recycle, .. } => {
                 let from = self.fs_path(&wire(path)?);
@@ -959,28 +1186,146 @@ impl Store {
             | PendingOp::Copy { .. }
             | PendingOp::CreateFolder { .. }
             | PendingOp::Unchanged { .. } => Ok(()),
-            PendingOp::Move { id, to, .. } => {
+            PendingOp::Move { id, to, prune, .. } => {
                 let to = wire(to)?;
-                if self.path_of(*id)?.as_ref() == Some(&to) {
-                    return Ok(());
+                let known = self.path_of(*id)?;
+                // An unknown id (a registry reset): the new path gets an id at the next listing.
+                if known.is_some() && known.as_ref() != Some(&to) {
+                    if let Some(other) = self.id_of(&to)?
+                        && other != *id
+                    {
+                        // A stale row of something that was at `to` before (the path was free).
+                        self.removed(guard, other)?;
+                    }
+                    self.moved(guard, *id, &to)?;
                 }
-                if self.path_of(*id)?.is_none() {
-                    // Unknown id (a registry reset); the new path gets an id at the next listing.
-                    return Ok(());
-                }
-                if let Some(other) = self.id_of(&to)?
-                    && other != *id
-                {
-                    // A stale row of something that was at `to` before (the path was free).
-                    self.removed(guard, other)?;
-                }
-                self.moved(guard, *id, &to)
+                self.finish_prune_rows(guard, prune)
             }
-            PendingOp::Delete { id, .. } => {
+            PendingOp::Delete { id, prune, .. } => {
                 if self.path_of(*id)?.is_some() {
                     self.removed(guard, *id)?;
                 }
-                Ok(())
+                self.finish_prune_rows(guard, prune)
+            }
+        }
+    }
+
+    /// Drop the registry rows of the pruned folders that still name them. Idempotent.
+    fn finish_prune_rows(&self, guard: &StoreGuard, prune: &[PlannedFolder]) -> Result<()> {
+        for p in prune {
+            let Ok(path) = wire(&p.path) else {
+                continue;
+            };
+            if self.path_of(p.id)?.as_ref() == Some(&path) {
+                self.removed(guard, p.id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove the folders a `move` or `delete` left empty (`prune`, deepest first), each with an
+    /// fsync of its parent. A folder that cannot be removed (it is not empty any more) stays,
+    /// and so do the folders above it: they are taken out of `prune`, and their `folder.deleted`
+    /// events out of `events`. Returns whether anything was taken out. Idempotent: a folder
+    /// that is gone already counts as removed.
+    fn settle_prune(&self, op: &mut PendingOp, events: &mut Vec<EventBody>) -> Result<bool> {
+        let (PendingOp::Move { prune, .. } | PendingOp::Delete { prune, .. }) = op else {
+            return Ok(false);
+        };
+        let mut stays = None;
+        for (i, p) in prune.iter().enumerate() {
+            let Ok(path) = wire(&p.path) else {
+                stays = Some(i);
+                break;
+            };
+            let dir = self.fs_path(&path);
+            match std::fs::remove_dir(&dir) {
+                Ok(()) => crate::fsutil::fsync_dir(dir.parent().unwrap_or(&self.files))?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    stays = Some(i);
+                    break;
+                }
+            }
+        }
+        let Some(i) = stays else {
+            return Ok(false);
+        };
+        let kept = prune.split_off(i);
+        events.retain(|e| {
+            !matches!(e, EventBody::FolderDeleted { id, path }
+                if kept.iter().any(|k| k.id == *id && k.path == *path))
+        });
+        Ok(true)
+    }
+
+    /// The temp name of a rename that only changes case, as a path next to the source. The name
+    /// comes from the intent, so it is checked again.
+    fn via_path(&self, from: &WirePath, via: &str) -> Result<PathBuf> {
+        if !super::is_move_temp_name(via) {
+            return Err(invalid(
+                "move",
+                format!("{via:?} is not a temp name of ours"),
+            ));
+        }
+        let parent = from
+            .parent()
+            .ok_or_else(|| invalid("move", "the root has no folder".into()))?;
+        Ok(self.fs_path(&parent).join(via))
+    }
+
+    /// The second step of a rename through a temp name: from the temp name to `to`, if the
+    /// temp name is there and `to` is not listed yet.
+    fn finish_via(&self, to: &WirePath, via: &Path) -> Result<()> {
+        if std::fs::symlink_metadata(via).is_err() || self.resolve(to)?.is_some() {
+            return Ok(());
+        }
+        crate::fsutil::rename_durable(via, &self.fs_path(to))
+    }
+
+    /// Finish a move through a temp name that stopped between its two renames (recovery runs
+    /// this before it checks whether the change is applied).
+    fn resume(&self, op: &PendingOp) -> Result<()> {
+        if let PendingOp::Move {
+            from,
+            to,
+            via: Some(via),
+            ..
+        } = op
+        {
+            let (from, to) = (wire(from)?, wire(to)?);
+            let via = self.via_path(&from, via)?;
+            if self.resolve(&from)?.is_none() {
+                self.finish_via(&to, &via)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Create the planned folders (parents first) with an fsync of each parent. An existing
+    /// folder is fine.
+    fn create_planned(&self, folders: &[PlannedFolder]) -> Result<()> {
+        for folder in folders {
+            let dir = self.fs_path(&wire(&folder.path)?);
+            match std::fs::create_dir(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+                Err(e) => return Err(io_err(&dir)(e)),
+            }
+            crate::fsutil::fsync_dir(dir.parent().unwrap_or(&self.files))?;
+        }
+        Ok(())
+    }
+
+    /// Remove planned folders while they are empty (deepest first). Failures are ignored.
+    fn remove_planned(&self, folders: &[PlannedFolder]) {
+        for folder in folders.iter().rev() {
+            let Ok(path) = wire(&folder.path) else {
+                continue;
+            };
+            let dir = self.fs_path(&path);
+            if std::fs::remove_dir(&dir).is_ok() {
+                let _ = crate::fsutil::fsync_dir(dir.parent().unwrap_or(&self.files));
             }
         }
     }
@@ -991,6 +1336,9 @@ impl Store {
         if let PendingOp::Put {
             recycle: Some(entry),
             ..
+        }
+        | PendingOp::Delete {
+            entry: Some(entry), ..
         } = op
         {
             self.append_recycled(entry)?;
@@ -998,27 +1346,35 @@ impl Store {
         Ok(())
     }
 
-    /// Clean up after a change that was not applied: remove the recycle copy it made and the
-    /// folders it created while they are empty (deepest first). Their registry rows stay, as for
-    /// any discarded intent; a retry reuses them. Failures are ignored (the leftovers are
-    /// harmless: an extra copy, an empty folder).
+    /// Clean up after a change that was not applied: put a file or folder that a rename through
+    /// a temp name left under that name back to its old name, remove the recycle copy the change
+    /// made and the folders it created while they are empty (deepest first). Their registry rows
+    /// stay, as for any discarded intent; a retry reuses them. Failures are ignored (the
+    /// leftovers are harmless: an extra copy, an empty folder).
     fn undo_unapplied(&self, op: &PendingOp) {
-        if let PendingOp::Put {
-            folders, recycle, ..
-        } = op
-        {
-            if let Some(entry) = recycle {
-                self.discard_recycled(entry);
-            }
-            for folder in folders.iter().rev() {
-                let Ok(path) = wire(&folder.path) else {
-                    continue;
-                };
-                let dir = self.fs_path(&path);
-                if std::fs::remove_dir(&dir).is_ok() {
-                    let _ = crate::fsutil::fsync_dir(dir.parent().unwrap_or(&self.files));
+        match op {
+            PendingOp::Put {
+                folders, recycle, ..
+            } => {
+                if let Some(entry) = recycle {
+                    self.discard_recycled(entry);
                 }
+                self.remove_planned(folders);
             }
+            PendingOp::Copy { folders, .. } => self.remove_planned(folders),
+            PendingOp::Move {
+                from, folders, via, ..
+            } => {
+                if let (Some(via), Ok(from)) = (via, wire(from))
+                    && let Ok(via) = self.via_path(&from, via)
+                    && std::fs::symlink_metadata(&via).is_ok()
+                    && matches!(self.resolve(&from), Ok(None))
+                {
+                    let _ = crate::fsutil::rename_durable(&via, &self.fs_path(&from));
+                }
+                self.remove_planned(folders);
+            }
+            _ => {}
         }
     }
 
@@ -1032,9 +1388,10 @@ impl Store {
     }
 
     fn recover_pending(&self, guard: &StoreGuard, journal: &Journal) -> Result<Recovery> {
-        let Some(commit) = self.pending()? else {
+        let Some(mut commit) = self.pending()? else {
             return Ok(Recovery::Clean);
         };
+        self.resume(&commit.op)?;
         if !self.is_applied(guard, &commit.op)? {
             self.undo_unapplied(&commit.op);
             self.clear_pending()?;
@@ -1042,6 +1399,7 @@ impl Store {
                 op_id: commit.op_id,
             });
         }
+        self.settle_prune(&mut commit.op, &mut commit.events)?;
         self.finish_registry(guard, &commit.op)?;
         self.finish_recycle(&commit.op)?;
         let seqs = {

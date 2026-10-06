@@ -148,6 +148,13 @@ fn stamp(path: &Path) -> Stamp {
     }
 }
 
+/// What the tree check found: whether the account counts as imported, and then `files/` and
+/// every native folder with its metadata (a label for messages first).
+struct TreeCheck {
+    imported: bool,
+    folders: Vec<(String, std::fs::Metadata)>,
+}
+
 struct State {
     ids: Registry,
     /// Stamps of `ids.json` and `ids.jsonl` when `ids` was loaded; `None` forces a reload.
@@ -352,6 +359,8 @@ impl Store {
     ///   the import ([`Store::open_for_import`]).
     /// - With the marker, every native folder must be a real folder ([`NATIVE_FOLDERS`]). The
     ///   server never deletes or moves them, so a missing one means the tree broke outside it.
+    ///
+    /// [`Store::list`] repeats the check around its reads, for a tree that breaks later.
     pub fn lock(&self) -> Result<StoreGuard> {
         let announce = self.announce_wait.then_some(self.slug.as_str());
         let file = take_store_lock(&self.account_dir, announce)?;
@@ -393,13 +402,49 @@ impl Store {
         }
     }
 
+    /// The repair advice for a missing `files/` (`path` is the root) or native folder.
+    fn missing_reason(&self, path: &WirePath) -> String {
+        if path.is_root() {
+            format!(
+                "{} is missing although the account was imported. Put the real folder back, \
+                 or import the device again with --replace",
+                self.files.display()
+            )
+        } else {
+            format!(
+                "the device folder {} is missing or no real folder. Put it back, \
+                 or import the device again with --replace",
+                path.display()
+            )
+        }
+    }
+
+    /// For [`list::walk`]: a folder that vanishes during the walk is damage if the tree check
+    /// would refuse its absence (`files/` or a native folder of an imported account), else a
+    /// deletion.
+    fn vanished_damage(&self, imported: bool) -> impl Fn(&WirePath) -> Option<Error> + '_ {
+        move |path: &WirePath| {
+            (imported && (path.is_root() || is_native_folder(path)))
+                .then(|| self.damaged(self.missing_reason(path)))
+        }
+    }
+
     /// The tree check of [`Store::lock`] (the lock is held). `create_missing` creates a missing
-    /// `files/` where that is allowed (no marker, or an import); [`Store::list`] checks again
-    /// after its walk without it, so a tree that vanished meanwhile is never listed as empty.
-    fn check_tree(&self, create_missing: bool) -> Result<()> {
+    /// `files/` where that is allowed (no marker, or an import). [`Store::list`] runs it without
+    /// that before and after it reads the tree and compares the two [`TreeCheck`]s, so a tree
+    /// that vanished or was swapped meanwhile is never listed.
+    fn check_tree(&self, create_missing: bool) -> Result<TreeCheck> {
         let imported = !self.import_mode && self.has_import_marker()?;
+        let mut check = TreeCheck {
+            imported,
+            folders: Vec::new(),
+        };
         match std::fs::symlink_metadata(&self.files) {
-            Ok(m) if m.file_type().is_dir() => {}
+            Ok(m) if m.file_type().is_dir() => {
+                if imported {
+                    check.folders.push((self.files.display().to_string(), m));
+                }
+            }
             Ok(m) if m.file_type().is_symlink() => {
                 return Err(self.damaged(format!(
                     "{} is a symlink. Remove the link and put the real folder back in its place. \
@@ -415,11 +460,7 @@ impl Store {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if imported {
-                    return Err(self.damaged(format!(
-                        "{} is missing although the account was imported. Put the real folder back, \
-                         or import the device again with --replace",
-                        self.files.display()
-                    )));
+                    return Err(self.damaged(self.missing_reason(&WirePath::root())));
                 }
                 if create_missing {
                     std::fs::create_dir_all(&self.files).map_err(io_err(&self.files))?;
@@ -431,12 +472,29 @@ impl Store {
         if imported {
             for folder in NATIVE_FOLDERS {
                 let path = WirePath::parse_named(folder)?;
-                if !list::resolve(&self.files, &path)?.is_some_and(|f| f.kind == Kind::Folder) {
-                    return Err(self.damaged(format!(
-                        "the device folder {folder} is missing or no real folder. Put it back, \
-                         or import the device again with --replace"
-                    )));
+                match list::resolve(&self.files, &path)? {
+                    Some(f) if f.kind == Kind::Folder => {
+                        check
+                            .folders
+                            .push((format!("the device folder {folder}"), f.meta));
+                    }
+                    _ => return Err(self.damaged(self.missing_reason(&path))),
                 }
+            }
+        }
+        Ok(check)
+    }
+
+    /// Refuse a tree whose `files/` or native folders are other folders at `after` than at
+    /// `before` (replaced, or removed and put back, while the tree was read).
+    fn check_same_tree(&self, before: &TreeCheck, after: &TreeCheck) -> Result<()> {
+        for (label, meta) in &before.folders {
+            let now = after.folders.iter().find(|(l, _)| l == label);
+            if !now.is_some_and(|(_, m)| same_file(meta, m)) {
+                return Err(self.damaged(format!(
+                    "{label} was replaced while it was read. Put the real folder back, \
+                     or import the device again with --replace"
+                )));
             }
         }
         Ok(())
@@ -665,19 +723,27 @@ impl Store {
     /// never an empty or partial list.
     pub fn list(&self, guard: &StoreGuard, path: &WirePath, recursive: bool) -> Result<Vec<Entry>> {
         self.check_guard(guard)?;
+        // `files/` or a native folder may vanish or be swapped by another process after the
+        // lock checked the tree: an empty or partial listing would make the device delete its
+        // files. So the tree is checked before the walk and again after the last read of
+        // `files/` (the hashing in `entries`), and the folders must be the same ones.
+        let before = self.check_tree(false)?;
         let mut all = Vec::new();
         if let Some(found) = list::resolve(&self.files, path)?
             && found.kind == Kind::Folder
         {
-            list::walk(&found, recursive, &mut all)?;
+            list::walk(
+                &found,
+                recursive,
+                &mut all,
+                &self.vanished_damage(before.imported),
+            )?;
         }
-        // `files/` or a native folder may have vanished since the lock checked the tree
-        // (another process): an empty or partial listing would make the device delete its
-        // files, so the same check runs again before anything is listed or the cache pruned.
-        self.check_tree(false)?;
         all.sort_by(|a, b| a.path.cmp(&b.path));
         let full = path.is_root() && recursive;
         let entries = self.entries(all)?;
+        let after = self.check_tree(false)?;
+        self.check_same_tree(&before, &after)?;
         if full {
             let seen: HashSet<String> = entries
                 .iter()
@@ -968,4 +1034,104 @@ fn plan_assign(
             path: path.display(),
         }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An imported account with its native folders, and its store.
+    fn imported_store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let accounts = Accounts::new(dir.path());
+        accounts
+            .create("jordi", "jordi@example.org", "secret")
+            .unwrap();
+        let store = Store::open(dir.path(), "jordi").unwrap();
+        {
+            let g = store.lock().unwrap();
+            store.ensure_native_folders(&g).unwrap();
+        }
+        let mut a = accounts.get("jordi").unwrap().unwrap();
+        a.imported = Some(crate::auth::Imported {
+            at: "2026-10-06T10:00:00Z".into(),
+            source: "/backup/Supernote".into(),
+            files: 0,
+            bytes: 0,
+        });
+        accounts.save(&a).unwrap();
+        (dir, store)
+    }
+
+    fn reason(r: Result<()>) -> String {
+        match r {
+            Err(Error::StoreDamaged { reason, .. }) => reason,
+            other => panic!("expected StoreDamaged, got {other:?}"),
+        }
+    }
+
+    /// A native folder that vanishes between the resolve and its `read_dir` (the root of the
+    /// walk) ends the walk with the reason of the tree check; a user folder is a deletion.
+    #[test]
+    fn the_walk_refuses_a_vanished_native_folder() {
+        let (_dir, store) = imported_store();
+        let _g = store.lock().unwrap();
+        let note = WirePath::parse_named("NOTE/Note").unwrap();
+        std::fs::create_dir(store.fs_path(&note).join("Work")).unwrap();
+        let user = list::resolve(&store.files, &note.join("Work").unwrap())
+            .unwrap()
+            .unwrap();
+        let native = list::resolve(&store.files, &note).unwrap().unwrap();
+        std::fs::remove_dir_all(store.fs_path(&note)).unwrap();
+        let damage = store.vanished_damage(true);
+        let mut out = Vec::new();
+        assert!(list::walk(&user, true, &mut out, &damage).is_ok());
+        let r = reason(list::walk(&native, true, &mut out, &damage));
+        assert!(r.contains("the device folder NOTE/Note is missing"), "{r}");
+        // The walk of `files/` itself.
+        let root = list::resolve(&store.files, &WirePath::root())
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(&store.files).unwrap();
+        let r = reason(list::walk(&root, false, &mut out, &damage));
+        assert!(
+            r.contains("is missing although the account was imported"),
+            "{r}"
+        );
+        // Before the import marker, the same is no damage.
+        assert!(list::walk(&root, false, &mut out, &store.vanished_damage(false)).is_ok());
+    }
+
+    /// A native folder or `files/` that is removed and put back while the tree is read is
+    /// another folder afterwards: refused, although both checks alone pass.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_swapped_while_the_tree_is_read_is_refused() {
+        let (_dir, store) = imported_store();
+        let _g = store.lock().unwrap();
+        let note = store.fs_path(&WirePath::parse_named("NOTE/Note").unwrap());
+        let before = store.check_tree(false).unwrap();
+        std::fs::rename(&note, note.with_file_name("Note.old")).unwrap();
+        std::fs::create_dir(&note).unwrap();
+        let after = store.check_tree(false).unwrap();
+        let r = reason(store.check_same_tree(&before, &after));
+        assert!(
+            r.contains("the device folder NOTE/Note was replaced"),
+            "{r}"
+        );
+        // `files/` swapped as a whole.
+        let before = store.check_tree(false).unwrap();
+        let copy = store.files.with_file_name("files-copy");
+        std::fs::rename(&store.files, &copy).unwrap();
+        std::fs::create_dir(&store.files).unwrap();
+        for folder in NATIVE_FOLDERS {
+            std::fs::create_dir_all(store.files.join(folder)).unwrap();
+        }
+        let after = store.check_tree(false).unwrap();
+        let r = reason(store.check_same_tree(&before, &after));
+        assert!(r.contains("files was replaced"), "{r}");
+        // Nothing swapped: the same tree.
+        let again = store.check_tree(false).unwrap();
+        assert!(store.check_same_tree(&after, &again).is_ok());
+    }
 }

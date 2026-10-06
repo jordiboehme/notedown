@@ -135,12 +135,25 @@ pub fn find_applied(
 }
 
 /// Whether the apply record of `entry` names `device`. An entry without a readable record
-/// belongs to no device.
+/// belongs to no device; a record that cannot be read for another reason than its absence is
+/// reported on stderr.
 pub fn applied_by(entry: &Path, device: &str) -> bool {
-    std::fs::read(entry.join(APPLY_FILE))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<ApplyRecord>(&bytes).ok())
-        .is_some_and(|r| r.device == device)
+    let path = entry.join(APPLY_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(e) => {
+            eprintln!("notedown cloud: cannot read {}: {e}", path.display());
+            return false;
+        }
+    };
+    match serde_json::from_slice::<ApplyRecord>(&bytes) {
+        Ok(r) => r.device == device,
+        Err(e) => {
+            eprintln!("notedown cloud: cannot read {}: {e}", path.display());
+            false
+        }
+    }
 }
 
 /// A UUID in its 36-character text form (lowercase or uppercase hex), as `upload/apply`

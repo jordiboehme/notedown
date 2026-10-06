@@ -6,7 +6,7 @@ use serde::{Serialize, Serializer};
 
 use super::Kind;
 use super::path::WirePath;
-use crate::{Result, io_err};
+use crate::{Error, Result, io_err};
 
 /// One file or folder as the device sees it (`EntriesVO`, `docs/sync-protocol.md` 3.5).
 /// Field order is the wire order.
@@ -112,12 +112,21 @@ pub(crate) fn resolve(files: &Path, path: &WirePath) -> Result<Option<Found>> {
 
 /// The listable children of the folder `found` (and their descendants with `recursive`).
 /// Dot-entries, non-UTF-8 names, names the wire cannot carry, symlinks and special files are
-/// skipped. An entry that vanishes during the walk was deleted and is skipped too.
-pub(crate) fn walk(found: &Found, recursive: bool, out: &mut Vec<Found>) -> Result<()> {
+/// skipped. An entry that vanishes during the walk was deleted and is skipped too, unless
+/// `vanished` answers an error for its path (a folder that must not be missing): then the walk
+/// ends with that error.
+pub(crate) fn walk(
+    found: &Found,
+    recursive: bool,
+    out: &mut Vec<Found>,
+    vanished: &dyn Fn(&WirePath) -> Option<Error>,
+) -> Result<()> {
     let dir = &found.fs_path;
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return vanished(&found.path).map_or(Ok(()), Err);
+        }
         Err(e) => return Err(io_err(dir)(e)),
     };
     for entry in entries {
@@ -134,7 +143,10 @@ pub(crate) fn walk(found: &Found, recursive: bool, out: &mut Vec<Found>) -> Resu
         let fs_path = entry.path();
         let meta = match std::fs::symlink_metadata(&fs_path) {
             Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match vanished(&path) {
+                Some(err) => return Err(err),
+                None => continue,
+            },
             Err(e) => return Err(io_err(&fs_path)(e)),
         };
         let Some(kind) = listable(&meta) else {
@@ -147,7 +159,7 @@ pub(crate) fn walk(found: &Found, recursive: bool, out: &mut Vec<Found>) -> Resu
             meta,
         };
         if recursive && kind == Kind::Folder {
-            walk(&child, true, out)?;
+            walk(&child, true, out, vanished)?;
         }
         out.push(child);
     }

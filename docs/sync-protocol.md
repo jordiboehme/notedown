@@ -23,6 +23,7 @@ Every statement carries one or more tags:
 | [inferred] | Our conclusion from the evidence, not seen directly |
 | [unknown] | Not known; see section 9 |
 | [proposal] | Design proposal for notedown, not observed protocol |
+| [capture:nomad-3.29.42] | Observed by notedown's capture server (`notedown serve --capture`) with a Nomad on firmware Chauvet 3.29.42, 2026-10-06; see 9.1 |
 
 "Device-confirmed" means a community project reports it from traffic of a real device. Facts confirmed by two independent sources are marked with both tags.
 
@@ -132,7 +133,7 @@ POST /api/official/user/query/random/code
 
 Observed sequences on a Nomad [community:ultrabridge]:
 
-1. Variant A (fresh login after logout): `unlink` -> `check/exists/server` -> `query/random/code` -> `login/equipment` -> `bindEquipment` -> `POST /api/user/query` -> socket.io connect.
+1. Variant A (fresh login after logout): `unlink` -> `check/exists/server` -> `query/random/code` -> `login/equipment` -> `bindEquipment` -> `POST /api/user/query` -> socket.io connect. Firmware 3.29.42 uses this variant; after a failed `check/exists/server` (`E0018`) the device starts again with `unlink` [capture:nomad-3.29.42].
 2. Variant B: `check/exists/server` -> `query/random/code` -> `login/equipment` -> `bindEquipment` -> `user/query`.
 
 The server must not depend on the order and must answer each call on its own [inferred].
@@ -490,7 +491,7 @@ The sources disagree on what the device sends [community:ultrabridge docs contra
 | `42["ClientMessage","status"]` | `42["ServerMessage","true"]` | [ratta-server strings `status`, `true`] [community:allenporter] [community:opennotecloud] |
 | `42["ClientMessage","Received"]` | nothing; marks pending file messages delivered | [ratta-server] [community:allenporter] |
 
-Whether the device sends `ratta_ping` at all on firmware 3.29.42 is [unknown]: one ultrabridge note says never, a later one says the device sends only `ratta_ping`.
+Firmware 3.29.42 sends, every 5 s, both an Engine.IO `2` and `42["ratta_ping"]` (no argument), right after each other; it sends no `ClientMessage "status"` and no `40` [capture:nomad-3.29.42].
 
 ### 4.4 Channels and event names
 
@@ -1012,3 +1013,32 @@ Two mappers reference tables that the shipped schema does not create (`f_composi
 | 13 | Firmware 3.29.42 differences from the firmware used by the community traces (not stated there) | All of the above captures on Jordi's device |
 
 Plan [proposal]: build the logging stub first (it is also the skeleton of the server), capture items 1, 2, 3, 8, 11, 12 in one session, then run the Ratta test stack for items 4 to 7 and save the captures as test fixtures with personal data removed.
+
+### 9.1 Capture results [capture:nomad-3.29.42]
+
+Session of 2026-10-06 (about 15 minutes, one login, one manual sync) against the capture server, which answers login and server calls and refuses every sync call with `E0079`. Plain HTTP on `http://<lan ip>:19072` was used.
+
+Answered unknowns:
+
+| # | Answer |
+|---|---|
+| 1 | Variant A of 2.4: `GET /api/file/query/server` when the address is entered, then `unlink` -> `check/exists/server` -> `query/random/code` -> `login/equipment` -> `bindEquipment`, then (after the account dialog, see below) `POST /api/user/query` -> socket connect. `query/token` and `activateEquipment` were not called. `version` is `"202407"` in bodies and in a `version` header; it is an API version, not the firmware version. `bindEquipment` carried the documented `label` list, `name` `"Supernote"` and `totalCapacity` `"25485312"`; it was sent with the login token. |
+| 2 | Heartbeat every 5 s: EIO `2` plus `42["ratta_ping"]` (see 4.3). The connection stayed up for the whole session (127 heartbeat pairs, no reconnect) with the open packet values of 4.2. |
+| 8 | HTTP 200 with `success:false` is accepted. For `E0079` on `synchronous/start` the device shows "Private Cloud Sync Failed" with the text "Synchronization in progress, please wait", identical to the `errorMsg` sent; whether the device shows the server's `errorMsg` or its own text for the code is still open. Digest and to-do refusals show a separate "App Data Sync Failed: Sync errors occurred". |
+| 12 | Plain HTTP works on 3.29.42; HTTPS is not required. |
+
+Further observations:
+
+- Before logging in to a new account the device asks how to handle digest and to-do data of the previous account: "Retain locally" or "Delete locally" (the latter removes the cloud-synced digests and to-dos from the device). Keep "Retain locally" when switching servers.
+- Right after the socket connects, and again after every manual sync, the device calls `POST /api/file/query/summary/group` (`{"page":0,"size":0}`) and `POST /api/file/schedule/group/all` (`{"maxResults":"200"}`): digests and to-dos are a second sync channel next to files.
+- A manual sync sends `POST /api/file/2/files/synchronous/start` with `{"equipmentNo": "..."}`. After `E0079` the device did not retry on its own (8 minutes observed); only `user/query` followed when settings screens were opened.
+- Socket handshake query, in this order: `sign`, `random` (ms), `EIO=3`, `transport=websocket`, `type=<equipmentNo>`, `token`.
+- The device uses several HTTP clients, told apart by `User-Agent`:
+  - login and account calls: `okhttp/4.12.0` with a `version` header;
+  - socket: `okhttp/3.12.12`;
+  - digest and to-do calls: `okhttp/4.8.0` with `equipmentno`, `version` and a `channel` header (228 characters on digest calls);
+  - file sync: `okhttp/5.1.0` with an empty `channel` header and no `version` header.
+- `x-access-token` is sent on every call after login; `user/query` also sends `language: en`.
+- No request outside the documented endpoints was seen.
+
+Still open after this session: 3 (the file listing calls, not reached because `synchronous/start` was refused), 4 to 7, 9, 11 and 13. They need a server that accepts the sync (milestone 3, with protect mode) or the Ratta test stack.

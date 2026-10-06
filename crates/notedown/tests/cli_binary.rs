@@ -288,7 +288,7 @@ fn cloud_journal_recovers_snapshots_and_tails() {
     );
     assert_eq!(ev[3]["path"], "INBOX/a.pdf");
     assert_eq!(ev[3]["kind"], "document");
-    assert_eq!(ev[3]["origin"], "cli");
+    assert_eq!(ev[3]["origin"], "snapshot");
     let ev = lines(&journal(d, &["tail", "--from", "3"]));
     assert_eq!(
         ev.iter()

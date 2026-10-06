@@ -120,7 +120,15 @@ a note has no digests.
 
 ## Private Cloud (experimental)
 
-notedown can run a small server that the Supernote Nomad accepts as its Private Cloud. This first step is a capture session only. The server records how the device talks to it, so the protocol can be documented. **No files are exchanged.** Every sync is refused with a "busy" answer, and the device keeps all of its files.
+notedown can run a small server that the Supernote Nomad accepts as its Private Cloud. It stores your files as real files in a data folder.
+
+The server has two run modes. `sync = "accept"` in `server.toml` is the default: the device syncs its files. `--refuse-sync` is the capture-only mode: every sync is refused and no files are exchanged. Protect mode is on by default. It keeps a recycle bin for deletes and overwrites, and it refuses every file request until `notedown cloud import` has filled the account.
+
+Start with the capture session below. Switch your Nomad over only after that, with the second guide.
+
+### Capture session
+
+This session only records how the device talks to the server, so the protocol can be documented. **No files are exchanged.** Every sync is refused with a "busy" answer, and the device keeps all of its files.
 
 Follow these steps in this order.
 
@@ -147,6 +155,49 @@ Follow these steps in this order.
 6. **Leave it idle for 10 minutes.** Then try one manual sync on the device. It will show that the sync is busy or failed. This is expected. The server refuses the sync on purpose.
 7. **Stop the server.** Press Ctrl-C in the terminal. Then log back in to Ratta's cloud on the Nomad.
 8. **The logs.** Everything the device sent is in `~/notedown-cloud/logs/` (one file per day) and, in capture mode, in `~/notedown-cloud/capture/`. Passwords, login codes and tokens are masked in the logs. They are replaced by `<masked:N chars>` before anything is written. Please keep these folders. They are the result of the session.
+
+### Switching the Nomad to notedown
+
+Do this only after the capture session. Take your time. A wrong step can make the Nomad delete its own files, so follow the order.
+
+1. **Stop writing on the Nomad** until the switch is done. Anything you write now is not in the backup.
+2. **Back up the device** right before the switch. Turn on "Browse & Access" on the Nomad, then run this on the Mac.
+
+   ```
+   notedown cloud backup-device http://<nomad ip>:8089 ~/nomad-backup
+   ```
+
+   It copies every file and writes `backup.json` with the result. It skips the SD card (`REMOVABLE0`) unless you add `--include-sd`. If the folder is not empty, add `--resume` to continue. Then it removes stale `.part` files. If any file failed, the command exits with an error. Run it again with `--resume`.
+3. **Import the backup.** First look at what would happen. Nothing is written with `--dry-run`.
+
+   ```
+   notedown cloud import ~/nomad-backup --data ~/notedown-cloud --account jordi --dry-run
+   notedown cloud import ~/nomad-backup --data ~/notedown-cloud --account jordi
+   ```
+
+   The dry run shows the mapping and the counts. The import opens the protect gate only after it checked every file. Until then every file request of the device is refused with `E0079`. The import refuses when:
+   - a `.part` file is present;
+   - the report is missing or incomplete (a copy made over USB needs `--no-report`);
+   - a name starting with a dot is found inside the device folders (`.DS_Store`, `._*` and `.localized` are fine);
+   - there are 0 files (that needs `--allow-empty`);
+   - the account already has files (that needs `--replace`).
+4. **Start the server** with `--capture` and with protect on (the default).
+
+   ```
+   target/release/notedown serve --data ~/notedown-cloud --capture
+   ```
+
+   Do not add `--refuse-sync`. Leave `protect` at `true` in `server.toml`.
+5. **Log out on the Nomad** from Ratta's cloud. The device asks what to do with digests and to-dos: "Retain locally" or "Delete locally". **Always choose "Retain locally".**
+6. **Log in to the private cloud** with the address `http://<mac ip>:19072`, and start one manual sync.
+7. **Send the logs to Claude** before you do anything else. They are in `~/notedown-cloud/logs/` and `~/notedown-cloud/capture/`. Continue only if the log shows no unexpected delete.
+8. **The way back.** Log out of the private cloud, choose "Retain locally", and log in to Ratta's cloud again.
+
+What to expect:
+
+- Digests and to-dos are not served yet. The server answers `E0079` for them, so the Nomad shows "App Data Sync Failed". This is expected until a later version. Your files still sync.
+- To add a file from the Mac, use `notedown cloud put report.pdf --data ~/notedown-cloud --account jordi --to DOCUMENT/Document/Inbox`. The Nomad downloads it at its next sync. A later version will push a message that starts the sync.
+- Do not delete or change files in the data folder directly. The device would see that as a delete and remove its own copy too. Use `put`, or change files on the device.
 
 ## Format documentation and tests
 

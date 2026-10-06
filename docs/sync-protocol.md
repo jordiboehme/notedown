@@ -1,0 +1,1014 @@
+# Supernote Private Cloud sync protocol
+
+Status: protocol description for a clean-room reimplementation (notedown server, Rust, AGPL-3.0). Written 2026-10-06 from Ratta's Private Cloud image `supernote/supernote-service:26.06.04`, its web frontend, its database schema, and four open-source implementations. Target device: Supernote A6 X2 Nomad, firmware Chauvet 3.29.42.
+
+This document describes the protocol as a protocol. It contains no code from any implementation. Example request and response bodies are constructed from the field lists and from published device traces; ids, hashes and names in examples are made up unless stated otherwise.
+
+## 0. Conventions
+
+### 0.1 Source tags
+
+Every statement carries one or more tags:
+
+| Tag | Meaning |
+|---|---|
+| [ratta-server] | Seen in Ratta's server artifacts: route strings, DTO/VO field names, constant values, mapper SQL, `application.properties`, nginx config, database schema |
+| [ratta-web] | Seen in Ratta's Vue 2 web frontend (`home/supernote/cloud/src`) |
+| [community:allenporter] | allenporter/supernote (Python server, Apache-2.0) and its docs |
+| [community:ultrabridge] | jdkruzr/ultrabridge (Go, Apache-2.0); its docs include device traces from a Nomad (`SN078C...`) |
+| [community:opennotecloud] | k4z4n0v4/opennotecloud (Go, AGPL-3.0) |
+| [community:sncloud] | rnbennett/supernote-cloud (continuation of julianprester/sncloud, Python, Apache-2.0), client of Ratta's public cloud |
+| [community:supernote-sync] | dylanmazurek/supernote-sync (Go, MIT), client of Ratta's public cloud |
+| [doc] | Ratta's public documentation (support.supernote.com) |
+| [inferred] | Our conclusion from the evidence, not seen directly |
+| [unknown] | Not known; see section 9 |
+| [proposal] | Design proposal for notedown, not observed protocol |
+
+"Device-confirmed" means a community project reports it from traffic of a real device. Facts confirmed by two independent sources are marked with both tags.
+
+### 0.2 Secrets
+
+Ratta's server contains hard-coded keys (JWT signing string, URL signing key, socket `sign` key, Redis and database passwords). They are deliberately **not** reproduced here. None of them is needed for interoperability (sections 2.5, 3.9, 4.2): the device does not validate the JWT, the server both creates and checks its own signed URLs, and the socket `sign` value can be accepted without checking. notedown generates its own keys [inferred from community:ultrabridge, community:opennotecloud, community:allenporter].
+
+### 0.3 Notation
+
+- All REST calls are `POST` with a JSON body unless stated otherwise; `Content-Type: application/json; charset=UTF-8` [community:allenporter trace].
+- Field names are given exactly as they appear on the wire. They mix camelCase (`equipmentNo`) and snake_case (`content_hash`, `path_display`, `to_path`); do not "fix" them [ratta-server] [community:ultrabridge].
+- Times are milliseconds since the Unix epoch unless stated otherwise [ratta-server] [community:ultrabridge].
+- "Envelope" means the three fields `success`, `errorCode`, `errorMsg` (section 7).
+
+## 1. Overview
+
+### 1.1 Components of Ratta's Private Cloud
+
+| Component | Role | Source |
+|---|---|---|
+| `supernote-service` container | nginx (container port 8080, optional 443), Spring Boot backend on 19071, socket.io (netty-socketio) on 18072 (file and digest channel) and 18073 (task channel), Node.js web UI on 9888 | [ratta-server] [doc] |
+| MariaDB `supernotedb` | metadata: users, files, digests, tasks, devices, logs | [ratta-server] |
+| Redis | tokens, random login codes, sync lock, socket message queues, counters | [ratta-server] [community:ultrabridge] |
+| `notelib` container (TCP 6000) | renders `.note` to PDF/PNG for the web UI and conversion requests; length-prefixed JSON over raw TCP with business codes `T01` (note to PDF), `T02` (note to PNG), `T03` (page count) | [ratta-server] [community:allenporter] |
+| Data volume `/home/supernote/data` | the user's files as real files, `/home/supernote/data/<email>/Supernote/...` | [ratta-server] |
+| `/home/supernote/convert`, `/home/supernote/part`, `/home/supernote/recycle` | conversion output, chunk staging, recycle bin | [ratta-server] |
+
+### 1.2 Ports and routing
+
+| Port | What | Source |
+|---|---|---|
+| 19072 (host) to 8080 (container nginx) | everything the device and browser use: `/` web UI (to 9888), `/api/` backend (to 19071), `/socket.io/` auto sync (to 18072) | [doc] [ratta-server nginx.conf] |
+| 19071 | backend directly (also published by the compose file) | [ratta-server] |
+| 18072 | socket.io for auto sync; Ratta's doc calls it optional ("needed only for automatic sync") | [doc] [ratta-server] |
+| 18073 | second socket.io server for the task channel; nginx does not route to it, the device never opens it | [ratta-server] [community:ultrabridge] |
+| 443 / 19443 | HTTPS; Ratta ships nginx with an optional `listen 443 ssl` and recommends a reverse proxy with a public certificate | [doc] [ratta-server] |
+
+nginx forwards `X-Forwarded-Host`, `X-Forwarded-Port` and `X-Forwarded-Proto` to the backend, and the backend builds absolute upload and download URLs (`<scheme>://<host>:<port>/api/oss/...`) from them [ratta-server]. A reimplementation must therefore build URLs that the device can reach, from the request's Host header or from configuration [community:opennotecloud uses a configured base URL] [inferred].
+
+`/socket.io/` is proxied with WebSocket upgrade and a 3600 s read timeout; `/api/` with 3000 s timeouts; `client_max_body_size` is effectively unlimited [ratta-server].
+
+The device sends one base address (host and port, or an HTTPS domain) in its Private Cloud settings; REST and socket.io both go to that address [doc] [community:ultrabridge: all `/socket.io/*` arrives on the same external port]. A device accepts a public Let's Encrypt certificate (no pinning observed) [community:ultrabridge].
+
+### 1.3 Transports
+
+- REST over HTTP or HTTPS, JSON bodies, auth header `x-access-token` [ratta-server] [ratta-web] [community:allenporter trace].
+- Binary transfer over signed URLs: `POST /api/oss/upload` (multipart), `POST /api/oss/upload/part` (multipart chunks), `GET /api/oss/download` (Range support) [ratta-server] [community:ultrabridge] [community:allenporter].
+- Auto sync over socket.io (Engine.IO protocol 3), WebSocket transport, at `/socket.io/` [ratta-server] [community:ultrabridge] [community:allenporter].
+
+The device runs several HTTP clients (user agents `okhttp/5.1.0` for file sync, `okhttp/4.12.0` for metadata, `okhttp/4.8.0` for task deletion, `okhttp/3.12.12` for the socket) [community:ultrabridge]; `okhttp/5.1.0` for sync is also seen by [community:allenporter].
+
+### 1.4 Private cloud versus Ratta's public cloud
+
+- Both use the same API family under `/api/...` (for example `/api/official/user/query/random/code`, `/api/official/user/account/login/new`, `/api/file/list/query`, `/api/file/upload/apply`) [community:sncloud] [community:supernote-sync] [ratta-server].
+- The private server contains "Local" variants of the device file controller (`F_FileLocalController`: `/api/file/2/...` and `/api/file/3/...`) and a local object store (`/api/oss/...`). The DTOs of the public cloud variants (S3 / UFile signatures: `xAmzDate`, `s3Authorization`, `postAuthorization`, `fileServer` "0 ufile, 1 S3") are still in the jar but have no route in the private build [ratta-server]. The upload apply response of the private server keeps S3-style field names (`bucketName`, `xAmzDate`, `authorization`) [ratta-server] [community:ultrabridge].
+- The public cloud adds email OTP login for new browsers (`/user/validcode/pre-auth`, `/official/user/sms/login`, CSRF cookie) [community:sncloud]. The private server has the MFA (TOTP) option instead (`/api/user/mfa/*`, `/api/official/user/account/login/mfa/verify`) for the web UI [ratta-server].
+- Whether the device's public-cloud sync uses the same `/3/` endpoints with S3 URLs or other endpoints is [unknown]; it does not matter for a private server.
+
+## 2. Account and device login
+
+### 2.1 Endpoints the device calls versus web-only endpoints
+
+| Endpoint | Caller | Auth | Source |
+|---|---|---|---|
+| `POST /api/terminal/equipment/unlink` | device (on logout, and before login in one trace) | none | [ratta-server] [community:ultrabridge] |
+| `POST /api/official/user/check/exists/server` | device | none | [ratta-server] [community:ultrabridge] |
+| `POST /api/official/user/query/random/code` | device, web | none | [ratta-server] [ratta-web] [community:ultrabridge] |
+| `POST /api/official/user/account/login/equipment` | device | none | [ratta-server] [community:ultrabridge] |
+| `POST /api/terminal/user/bindEquipment` | device, right after login | none | [ratta-server] [community:ultrabridge] |
+| `POST /api/user/query` | device (first authenticated call), web | token | [ratta-server] [community:ultrabridge] |
+| `POST /api/equipment/bind/status` | device (about 4 times per sync session), Partner app (every few seconds), web | token | [ratta-server] [ratta-web] [community:ultrabridge] |
+| `GET /api/file/query/server` | device at boot (reachability); one trace shows `POST` | [unknown]; treat as public | [ratta-server] [community:ultrabridge] |
+| `POST /api/user/query/token` | web after reload; device [unknown] | cookie or token | [ratta-server] [ratta-web] |
+| `POST /api/user/logout` | web; device [unknown] | token | [ratta-server] |
+| `POST /api/official/user/account/login/new` | web UI and Partner app | none | [ratta-server] [ratta-web] |
+| `POST /api/official/system/base/param` | web before login | none | [ratta-server] [ratta-web] |
+| `POST /api/user/mail/validcode`, `POST /api/user/check/validcode`, `POST /api/user/register` | web registration only | none | [ratta-server] [ratta-web] |
+| `POST /api/official/user/retrieve/password` | web password reset | none | [ratta-server] [ratta-web] |
+| `/api/save/email/config`, `/api/send/email/test`, `/api/query/email/config`, `/api/query/email/publickey` | web admin (SMTP settings) | token | [ratta-server] [ratta-web] |
+
+The device does not register accounts and does not send verification codes. Registration with email verification exists only in the web UI [ratta-web] [community:ultrabridge: none of these endpoints seen in device traces] [inferred].
+
+### 2.2 Why Ratta's server needs SMTP, and how to avoid it
+
+Registration in the web UI runs: `POST /api/user/mail/validcode {email, language}` (the server mails a code and returns `validCodeKey`), then `POST /api/user/check/validcode {validCodeKey, validCode}`, then `POST /api/user/register {email, password, userName}` with `password` = lowercase hex MD5 of the plain password [ratta-web]. The server's register step checks that the email was validated before [ratta-server: register logic references the validated-code cache keys]. Password reset (`retrieve/password`) also depends on the mail code [ratta-server] [ratta-web]. Error `E0101`/`E0102` are expired/wrong codes [ratta-server].
+
+A server without SMTP creates accounts out of band (admin CLI or a config file) and does not offer the registration or reset endpoints, or offers them with a different second factor [proposal]. allenporter disables public registration and password reset by default and creates users with a CLI; opennotecloud creates users with a CLI from an MD5 password hash [community:allenporter] [community:opennotecloud].
+
+### 2.3 Password encoding
+
+- Stored credential: `MD5_hex(plain_password)` (32 lowercase hex characters; column `u_user.password varchar(32)`) [ratta-server] [ratta-web: register sends MD5] [community:ultrabridge] [community:allenporter].
+- Challenge: `POST /api/official/user/query/random/code` with `{"account": "<email>", "countryCode": null}` returns `randomCode` (8 characters in samples) and `timestamp` (ms) [ratta-server] [community:ultrabridge] [community:allenporter]. The device also sends `version` (for example `"202407"`) [community:ultrabridge].
+- Login password: `SHA256_hex( MD5_hex(plain_password) + randomCode )`, lowercase hex, 64 characters [ratta-web] [community:ultrabridge, device-confirmed] [community:allenporter] [community:sncloud].
+- The `timestamp` from the challenge is echoed in the login request but is not part of the hash [community:ultrabridge] [community:allenporter]. The server keeps the random code per account (Redis, one-time use, deleted after the check) [community:ultrabridge]. allenporter keys it by account and checks that the echoed timestamp matches [community:allenporter].
+
+Example challenge:
+
+```json
+POST /api/official/user/query/random/code
+{"countryCode": null, "account": "jordi@example.org", "version": "202407"}
+
+{"success": true, "errorCode": null, "errorMsg": null,
+ "randomCode": "a1B2c3D4", "timestamp": 1791270000000}
+```
+
+### 2.4 Device login sequence
+
+Observed sequences on a Nomad [community:ultrabridge]:
+
+1. Variant A (fresh login after logout): `unlink` -> `check/exists/server` -> `query/random/code` -> `login/equipment` -> `bindEquipment` -> `POST /api/user/query` -> socket.io connect.
+2. Variant B: `check/exists/server` -> `query/random/code` -> `login/equipment` -> `bindEquipment` -> `user/query`.
+
+The server must not depend on the order and must answer each call on its own [inferred].
+
+`check/exists/server` request: `{"email": "...", "version": "..."}` or `{}`; response adds `dms` (`"ALL"`), `userId` (number) and `uniqueMachineId` (a server instance id) to the envelope [ratta-server: UserCheckVO fields dms, userId, uniqueMachineId] [community:ultrabridge]. allenporter answers success when the user exists and an error otherwise [community:allenporter].
+
+`login/equipment` request (`LoginDTO`) [ratta-server] [community:ultrabridge]:
+
+| Field | Value from device | Source |
+|---|---|---|
+| `account` | email | [ratta-server] [community:ultrabridge] |
+| `password` | 64 hex, see 2.3 | same |
+| `equipmentNo` | device serial, for example `SN078C1000xxxx` | same |
+| `equipment` | `3` (number) = terminal; web sends `"1"`, Partner app `2`, user platform `4` | [ratta-server] [ratta-web] [community:ultrabridge] |
+| `loginMethod` | `"2"` = email (`"1"` phone, `"3"` WeChat; the web UI sends `"1"`) | [ratta-server] [ratta-web] [community:ultrabridge] |
+| `timestamp` | echoed from the challenge | same |
+| `version` | firmware API version string | [community:ultrabridge] |
+| `countryCode`, `browser`, `language` | optional, web only | [ratta-server] [ratta-web] |
+
+`login/equipment` response (`LoginVO`, envelope plus): `token`, `counts` (failed attempts, string), `userName`, `avatarsUrl`, `lastUpdateTime`, `isBind` (`"Y"`/`"N"`: user has any bound device), `isBindEquipment` (`"Y"`/`"N"`: this device is bound to this user), `soldOutCount` (int), `mfaRequired`, `mfaToken` [ratta-server] [community:ultrabridge]. Observed device-side answer: `{"success":true,"token":"eyJ...","counts":"0","userName":"<email>","isBind":"N","isBindEquipment":"N","soldOutCount":0}` [community:ultrabridge].
+
+Failures: `E0018` account not found, `E0019` wrong password, `E0045` locked; lockout after `MAX_ERR_COUNTS` (6) attempts [ratta-server] [community:ultrabridge].
+
+`bindEquipment` request (`BindEquipmentDTO`) [ratta-server] [community:ultrabridge, device-confirmed values]:
+
+```json
+{"account": "jordi@example.org", "equipmentNo": "SN078C10000000", "flag": "1",
+ "name": "Supernote Nomad", "totalCapacity": "25485312", "version": "202407",
+ "label": ["DOCUMENT/Document", "NOTE/Note", "NOTE/MyStyle", "EXPORT", "SCREENSHOT", "INBOX"]}
+```
+
+`label` is the folder manifest the server creates for the user; the same six names and the capacity value `25485312` are constants in Ratta's user service [ratta-server]. Response: envelope only. Errors `E0075` already bound, `E0083`/`E0503` bound to another account, `E0077` logged-in account differs from bound account [ratta-server].
+
+`unlink` request: `{"equipmentNo": "...", "version": "..."}`; response: envelope [ratta-server] [community:ultrabridge].
+
+`bind/status` response: envelope plus `bindStatus: true` [ratta-server] [community:ultrabridge] [community:allenporter]. It must always succeed for a logged-in device [community:ultrabridge].
+
+`/api/user/query` response (`UserQueryByIdVO`): `userId`, `userName`, `email`, `telephone`, `countryCode`, `avatarsUrl`, `sex`, `birthday`, `personalSign`, `hobby`, `education`, `job`, `address`, `totalCapacity` (string), `fileServer` (`"0"`), `isNormal` (`"Y"`) [ratta-server]. Which of these the device needs is [unknown]; return all with harmless values [proposal].
+
+### 2.5 Tokens
+
+- Header on every authenticated REST call: `x-access-token: <JWT>` [ratta-server] [ratta-web] [community:allenporter trace]. The device trace also carries an empty header `channel` [community:allenporter trace]; another source describes `channel` as `<JWT>_<equipmentNo>_<timestamp>` [community:ultrabridge]. Ignoring it works [community:opennotecloud] [inferred].
+- Format: JWT, HS256 [ratta-server] [community:ultrabridge]. Ratta's claims: `userId` (string), `createTime` (seconds), `key` (`<userId>_<createTime>_<ms>` plus `_<equipmentNo>` for device tokens), `equipmentNo` (device tokens), and `exp` only on web tokens [ratta-server] [community:ultrabridge]. A captured socket handshake also showed an `exp`-bearing token without `equipmentNo` [community:ultrabridge]. The server must accept tokens without `exp` [community:ultrabridge].
+- Lifetime: device tokens never expire on their own; Ratta tracks validity in Redis under the `key` claim, so logout or a new device login can invalidate them. A new `login/equipment` for the same account displaces the device session [ratta-server: TTL constants and Redis token keys] [community:ultrabridge]. Ratta constants: 1 h, 8 h, 30 days, refresh interval 55 min [ratta-server]. Web tokens: 30 days [community:ultrabridge].
+- The device does not validate the token: it stores and echoes whatever `token` it receives; a token minted by a different server with a different key was accepted, and the device opened its socket with it [community:ultrabridge, device-confirmed]. So the claim layout and key are free for notedown [inferred]. allenporter uses its own claims (`sub`, `equipment_no`, `iat`, `exp` with 10-year device lifetime) and syncs fine [community:allenporter].
+- Refresh: there is no refresh call in the device flow; `POST /api/user/query/token` returns `token` (QueryTokenVO) for the web UI [ratta-server] [ratta-web] [community:sncloud]. If the token becomes invalid the device must log in again [inferred].
+- Unauthenticated access: Ratta answers with error `E0712` ("You are not logged in or your login has expired") [ratta-server enum] [community:ultrabridge] [community:opennotecloud]; HTTP status 200 with `success:false` (Ratta) or 401 (opennotecloud, allenporter) both appear to work [community:ultrabridge] [community:opennotecloud] [inferred]. The web UI treats `S0016`/`S0073` as "go to login" [ratta-web].
+
+### 2.6 Device binding
+
+- One device is bound to one account (`e_user_equipment`: `equipment_number`, `user_id`, `name`, `status` `Y`/`N`) [ratta-server].
+- `bindEquipment` on login, `unlink` on logout; `query/by/equipmentno {equipmentNo}` returns `equipmentNumber`, `userId`, `name`, `status` [ratta-server].
+- `activateEquipment {equipmentNo}` exists; not seen in device traces [ratta-server] [community:ultrabridge]. opennotecloud warns that first-time activation of a never-registered tablet is untested [community:opennotecloud].
+- `POST /api/terminal/send/password/unlock/code {equipmentNo, language, code, type}` mails a reset code for the device lock screen or file protection password; it needs email and is reachable from the device [ratta-server]. Not seen in traces [unknown].
+
+## 3. File sync protocol
+
+### 3.1 The model
+
+- The server is a passive file store with a catalog. The device drives every sync decision [community:opennotecloud] [community:ultrabridge] [community:allenporter].
+- The device keeps its own sync database (last known server id, path and hash per file). On each sync it lists the whole server tree, classifies every file on both sides as no change, create, delete, modify, move or move+modify, and applies a reconciliation matrix [community:opennotecloud]:
+
+| Local \ Cloud | no change | create | delete | modify | move |
+|---|---|---|---|---|---|
+| no change | skip | download | delete local | download | local move |
+| create | upload | conflict | upload | upload | upload |
+| delete | delete cloud | skip | skip | skip | skip |
+| modify | upload | upload | upload | conflict | upload |
+| move | cloud move | upload | upload | upload | conflict |
+
+- Consequence: if the server stops listing a file that the device synced before and the device copy is unchanged, the device **deletes its local copy** [community:opennotecloud]. The device has safety checks: no delete if the file is open, locally changed, or if a PDF's `.mark` changed (then it re-uploads) [community:opennotecloud].
+- Files are uploaded whole, no delta, no compression; change detection is by MD5 (`content_hash`) [community:ultrabridge].
+- Ratta's server watches its data directory and reconciles out-of-band changes into its catalog, but skips that while a sync or upload is in progress [ratta-server: watch service and "skipping compareWithNas" log strings].
+
+### 3.2 What identifies a file
+
+| Item | Meaning | Source |
+|---|---|---|
+| `id` | server id of a file or folder (Ratta: 64-bit snowflake; any stable integer works). Stable across rename and move; a copy gets a new id. Sent by the device as a JSON **string** (`"id":"819922212654940160"`), returned as string in `EntriesVO` | [ratta-server] [community:ultrabridge, device-confirmed] |
+| `path_display` | path relative to the user's root, for example `NOTE/Note/Work/x.note` (Ratta returns it without leading slash in listings) | [ratta-server] [community:ultrabridge] |
+| `parent_path` | parent directory with leading slash, `/NOTE/Note/Work` | [community:ultrabridge] [ratta-server field] |
+| `content_hash` | lowercase hex MD5 of the bytes | [ratta-server] [community:ultrabridge] [community:allenporter] |
+| `size` | bytes | same |
+| `lastUpdateTime` | ms | same |
+| `innerName` | storage name chosen at upload apply (Ratta: equal to the file name in observed traffic) | [ratta-server] [community:ultrabridge] |
+| root | id `0` (or null) means the user root | [ratta-server] [community:ultrabridge] |
+
+Folders exist as catalog rows (`is_folder` `Y`) with size 0 [ratta-server].
+
+### 3.3 Which folders the device syncs
+
+- Server-side folder manifest, sent by `bindEquipment` and also hard-coded in Ratta: `NOTE/Note`, `NOTE/MyStyle`, `DOCUMENT/Document`, `EXPORT`, `SCREENSHOT`, `INBOX` [ratta-server] [community:ultrabridge, device-confirmed].
+- Wire paths use the two-level form (`/NOTE/Note/...`, `/DOCUMENT/Document/...`) [community:allenporter trace] [community:ultrabridge]. Ratta maps between this form and a flat form (`Supernote/Note`, `Supernote/Document`, `Supernote/MyStyle`) in several places; which form it uses on disk varies [ratta-server] [community:opennotecloud maps `NOTE/Note` to disk `Supernote/Note`].
+- Ratta's on-disk root is `/home/supernote/data/<email>/Supernote/` [ratta-server].
+- The user selects which folders sync in the device settings [community:allenporter README].
+- PDF/EPUB annotations live in sidecar files `<document>.mark` (for example `book.pdf.mark`) next to the document and sync as normal files [community:ultrabridge]. `.doc` files written by the device's Word app sync like other files [community:ultrabridge].
+- Allowed file types (reference parameter `FILE_TYPE`): `note, mark, pdf, epub, doc, docx, txt, png, jpg, jpeg, webp, bmp, gif, tif, tga, psd, cbz, fb2, xps, chm, rtf, ppt, pptx, xls, xlsx, zip, rar, gz, tar.gz, zz, apk, snstk, snbak, read, spd, otf, ttf, ttc, eot, dfont, woff`; max file size 1 GiB (`FILE_MAX`) [community:ultrabridge, read from `/api/official/system/base/param`]. Whether the device enforces this list is [unknown].
+- Digests are not files in this tree; they sync over the summary API (section 5) [ratta-server] [community:ultrabridge].
+
+### 3.4 Sequence of a sync run
+
+Observed on devices [community:allenporter trace] [community:ultrabridge 0b trace, Nomad]:
+
+```
+POST /api/file/2/files/synchronous/start      lock
+POST /api/file/2/files/list_folder            {"path":"/","recursive":true}  whole tree
+  per file to upload:
+    POST /api/file/3/files/query/by/path_v3   exists?
+    POST /api/file/2/files/create_folder_v2   for new folders, before their files
+    POST /api/file/3/files/upload/apply       get signed URLs
+    POST /api/oss/upload                      bytes (or /api/oss/upload/part chunks)
+    POST /api/file/2/files/upload/finish      commit
+  per file to download:
+    POST /api/file/3/files/download_v3        get signed URL
+    GET  /api/oss/download                    bytes
+  per local delete / move / copy:
+    POST /api/file/3/files/query_v3           source exists?
+    POST /api/file/3/files/delete_folder_v3 | move_v3 | copy_v3
+POST /api/file/2/files/synchronous/end        {"flag":"Y"} success, {"flag":"N"} failure
+```
+
+Around the file sync the device also calls `bind/status`, `capacity/query`, `query/summary/hash|group|id`, `schedule/group/all`, `schedule/task/all` and `PUT schedule/task/list` [community:ultrabridge 0b endpoint counts].
+
+One community reference states that device firmware does not call `synchronous/start|end` and lists with `/api/file/3/files/list`; both device traces contradict this, and Ratta's server has no `/3/files/list` route [community:allenporter trace] [community:ultrabridge 0b] [ratta-server]. Treat that statement as wrong.
+
+### 3.5 Endpoint reference (device file API)
+
+All under `F_FileLocalController`, prefix `/api/file`, token required, every body carries `equipmentNo` [ratta-server].
+
+#### synchronous/start
+
+```json
+POST /api/file/2/files/synchronous/start
+{"equipmentNo": "SN078C10000000"}
+
+{"success": true, "errorCode": null, "errorMsg": null,
+ "equipmentNo": "SN078C10000000", "synType": true}
+```
+
+- `synType` true = normal compare; false = the device should upload all its files without comparing (used when the server is empty) [ratta-server field description] [community:allenporter returns false for an empty account].
+- Locking: one sync per account. Another device starting a sync while the lock is held gets `E0078` ("A device is currently synchronizing") [ratta-server] [community:allenporter]. Ratta's lock lives `lock_cloud_time` = 30 s and every sync endpoint extends it; uploads and downloads extend it by an amount based on file size [ratta-server: config and log strings]. allenporter uses a 5 min lock [community:allenporter].
+- Ratta also pushes `STARTSYNC` (or `WAITING`) to the user's other connected devices over socket.io (section 4) [ratta-server].
+
+#### synchronous/end
+
+`{"equipmentNo": "...", "flag": "Y"|"N"}` -> envelope + `equipmentNo`. Releases the lock [ratta-server] [community:allenporter trace shows `flag:"N"` after a failed sync].
+
+#### list_folder (v2, used by the device)
+
+```json
+POST /api/file/2/files/list_folder
+{"path": "/", "recursive": true, "equipmentNo": "SN078C10000000"}
+
+{"success": true, "errorCode": null, "errorMsg": null, "equipmentNo": "SN078C10000000",
+ "entries": [
+  {"tag": "folder", "id": "101", "name": "NOTE", "path_display": "NOTE", "size": 0},
+  {"tag": "folder", "id": "102", "name": "Note", "path_display": "NOTE/Note", "size": 0,
+   "parent_path": "/NOTE"},
+  {"tag": "file", "id": "4711", "name": "20261006_090000 Bike.note",
+   "path_display": "NOTE/Note/20261006_090000 Bike.note",
+   "content_hash": "0cc175b9c0f1b6a831c399e269772661", "size": 1135077,
+   "lastUpdateTime": 1791270408000, "parent_path": "/NOTE/Note",
+   "is_downloadable": true}
+ ]}
+```
+
+- Request `ListFolderV2DTO`: `equipmentNo`, `path` (empty or `/` for root), `recursive` [ratta-server] [community:allenporter trace].
+- Entry `EntriesVO`: `tag` (`"file"`/`"folder"`), `id`, `name`, `path_display`, `content_hash`, `is_downloadable`, `size`, `lastUpdateTime`, `parent_path` [ratta-server]. On Ratta's wire the downloadable flag appeared as `_downloadable` (a serializer artifact of the field name) [community:ultrabridge]; other servers send `is_downloadable` and the device syncs [community:allenporter] [community:opennotecloud]. Sending both is harmless [inferred].
+- The listing returns the whole tree, flat, O(n) [community:ultrabridge].
+- Hidden server folders (recycle, staging, digest blobs) must not be listed [community:ultrabridge] [inferred].
+
+#### list_folder_v3
+
+`{"equipmentNo", "id", "recursive"}` -> same `entries` list for the folder with that id [ratta-server] [community:allenporter]. Whether firmware 3.29.42 calls it is [unknown]; implement it [proposal].
+
+#### query/by/path_v3
+
+```json
+POST /api/file/3/files/query/by/path_v3
+{"path": "/NOTE/Note/Work", "equipmentNo": "SN078C10000000"}
+
+{"success": true, "errorCode": null, "errorMsg": null,
+ "equipmentNo": "SN078C10000000", "entriesVO": null}
+```
+
+`entriesVO` is null when the path does not exist, else one `EntriesVO` [ratta-server] [community:ultrabridge]. It must answer HTTP 200 with `entriesVO: null`; a 404 for an unknown path made the device abort the sync (`synchronous/end` with `flag:"N"`) [community:allenporter failed-sync trace].
+
+#### query_v3
+
+`{"equipmentNo", "id": "<string>"}` -> envelope + `equipmentNo` + `entriesVO` (null if unknown) [ratta-server] [community:ultrabridge]. The device uses it before delete and move, and for files it has locally that may not exist on this server [community:ultrabridge].
+
+#### create_folder_v2
+
+```json
+POST /api/file/2/files/create_folder_v2
+{"equipmentNo": "SN078C10000000", "path": "/NOTE/Note/Work", "autorename": false}
+
+{"success": true, "errorCode": null, "errorMsg": null, "equipmentNo": "SN078C10000000",
+ "metadata": {"tag": "folder", "id": "5120", "name": "Work", "path_display": "NOTE/Note/Work"}}
+```
+
+The response must contain a real `metadata.id`: the device needs it for the following uploads; with an empty stub it ends the sync right after this call [community:ultrabridge, device-confirmed]. Name collision with `autorename:false` -> `E0322` [community:ultrabridge] [ratta-server enum]. The device first calls `query/by/path_v3` for the folder [community:ultrabridge].
+
+#### upload/apply
+
+```json
+POST /api/file/3/files/upload/apply
+{"equipmentNo": "SN078C10000000", "path": "/NOTE/Note/Work/Bike.note",
+ "fileName": "Bike.note", "size": 1135077}
+
+{"success": true, "errorCode": null, "errorMsg": null,
+ "equipmentNo": "SN078C10000000", "bucketName": "Bike.note", "innerName": "Bike.note",
+ "xamzDate": "1791270408879", "authorization": "<signature>",
+ "fullUploadUrl": "https://notes.example.org/api/oss/upload?signature=<sig>&timestamp=1791270408879&nonce=<uuid>&path=<b64url>",
+ "partUploadUrl": "https://notes.example.org/api/oss/upload/part?signature=<sig>&timestamp=1791270408879&nonce=<uuid>&path=<b64url>"}
+```
+
+- Request `FileUploadApplyLocalDTO`: `equipmentNo`, `path`, `fileName`, `size` [ratta-server]. On the wire `path` is the **full destination path including the file name**, and `size` is a JSON **number** [community:ultrabridge, device-confirmed].
+- Response `FileUploadApplyLocalVO`: `equipmentNo`, `bucketName`, `innerName`, `xAmzDate`, `authorization`, `fullUploadUrl`, `partUploadUrl` [ratta-server]. Ratta's wire spelling of the date field is `xamzDate` [community:ultrabridge] [inferred: serializer lowercases the leading capitals]. `bucketName` and `innerName` equal the file name in Ratta's traffic [community:ultrabridge]; allenporter returns the file name as `bucketName` because a reference check expects that [community:allenporter].
+- In Ratta's URLs `path` is the base64url (no padding) of the target **directory** (for example `L05PVEUvTm90ZQ` = `/NOTE/Note`) [community:ultrabridge]. notedown can encode anything it can later resolve, since it signs and verifies its own URLs [community:ultrabridge] [community:allenporter] [community:opennotecloud].
+
+#### Byte upload: /api/oss/upload
+
+- `POST <fullUploadUrl>`, `multipart/form-data` with one part named `file` (filename = file name) [ratta-server: request parameters `file`, `signature`, `timestamp`, `nonce`, `path`] [community:ultrabridge] [community:allenporter].
+- Response `UploadFileVO`: envelope + `innerName`, `md5` (Ratta returned both null in traffic) [ratta-server] [community:ultrabridge].
+- Ratta's handler also reads `x-access-token` if present [ratta-server string]; the signature is the real gate [community:ultrabridge] [community:opennotecloud] [inferred].
+- Ratta's signature: SHA-256 hex over base64url path + timestamp + nonce + file size (`0`) + a server key, valid 30 min; download signature is the same without size, valid 24 h; no nonce replay tracking [community:ultrabridge, reproduced byte for byte from device traffic]. notedown may use any scheme (for example HMAC with its own key, single-use nonces) [inferred].
+- A bad signature on Ratta's OSS endpoints yields HTTP 500 with plain text, not a JSON envelope [community:ultrabridge] [ratta-server: `E1306` "Signature verification failed."].
+
+#### Chunked upload: /api/oss/upload/part
+
+- `POST <partUploadUrl>&uploadId=<id>&partNumber=<n>&totalChunks=<N>`, multipart part `file` [ratta-server: parameters `partNumber`, `totalChunks`, `uploadId`] [community:allenporter] [community:opennotecloud].
+- Used for files of 8 MiB and more, chunk size 8 MiB, `uploadId` = `<ms>_<uuid>`, `partNumber` 1-based [community:ultrabridge] [community:allenporter].
+- Response `FileChunkVO`: `uploadId`, `partNumber`, `totalChunks`, `chunkMd5`, `status` [ratta-server].
+- The server merges when all chunks are present (Ratta keeps a status file per upload, skips chunks already received, checks the merged size) [ratta-server strings]. allenporter merges when `partNumber == totalChunks` [community:allenporter]; ultrabridge tolerates retries and out-of-order parts [community:ultrabridge]. There is no separate "merge" call [ratta-server] [inferred].
+- Error `E1305` / `E0355`..`E0357` on chunk failure [ratta-server].
+
+#### upload/finish
+
+```json
+POST /api/file/2/files/upload/finish
+{"equipmentNo": "SN078C10000000", "path": "/NOTE/Note/Work/", "fileName": "Bike.note",
+ "content_hash": "0cc175b9c0f1b6a831c399e269772661", "innerName": "Bike.note", "size": "1135077"}
+
+{"success": true, "errorCode": null, "errorMsg": null, "equipmentNo": "SN078C10000000",
+ "path_display": "NOTE/Note/Work/Bike.note", "id": "4711", "size": 1135077,
+ "name": "Bike.note", "content_hash": "0cc175b9c0f1b6a831c399e269772661"}
+```
+
+- Request `FileUploadFinishLocalDTO`: `equipmentNo`, `path`, `size` (string), `fileName`, `content_hash`, `innerName` [ratta-server]. Here `path` is the **parent directory with a trailing slash** and `size` a **string** [community:ultrabridge, device-confirmed]. Target = parent + `fileName`; joining the apply path with the file name creates `X.note/X.note` [community:ultrabridge].
+- The server verifies MD5 and size, then creates or replaces the catalog entry. Replacing keeps the id [ratta-server: finish updates an existing row by name and folder] [community:allenporter].
+- Errors: `E0324` cannot be uploaded (ultrabridge uses it for hash mismatch), `E0309`/`E0333` capacity, `E0310`/`E0082` identical MD5 exists, `E0325` file name too long [ratta-server] [community:ultrabridge].
+- Ratta pushes a socket message to the user's other devices after finish (section 4) [ratta-server].
+- One reference names `/api/file/3/files/upload/confirm`; no such route exists in Ratta's server, devices use `2/files/upload/finish` [ratta-server] [community:ultrabridge 0b].
+
+#### download_v3
+
+```json
+POST /api/file/3/files/download_v3
+{"equipmentNo": "SN078C10000000", "id": "4711"}
+
+{"success": true, "errorCode": null, "errorMsg": null, "equipmentNo": "SN078C10000000",
+ "id": "4711", "url": "https://notes.example.org/api/oss/download?path=<b64url>&signature=<sig>&timestamp=1791270408879&nonce=<uuid>&pathId=4711",
+ "name": "Bike.note", "path_display": "NOTE/Note/Work/Bike.note",
+ "content_hash": "0cc175b9c0f1b6a831c399e269772661", "size": 1135077, "is_downloadable": true}
+```
+
+`id` arrives as a string; a server that parses it only as a number fails every download (`E0321`) [community:ultrabridge, device-confirmed]. Unknown id -> `E0321` [community:ultrabridge] [community:opennotecloud].
+
+#### Byte download: GET /api/oss/download
+
+- Query `path`, `signature`, `timestamp`, `nonce`, `pathId` [ratta-server]. No token needed; the signature is the auth [community:ultrabridge] [community:allenporter].
+- Supports `Range: bytes=a-b` with `206`, `Content-Range`, `Accept-Ranges: bytes`, `Content-Disposition: attachment; filename*=UTF-8''...` [ratta-server strings] [community:allenporter]. The Partner app always sends `Range: bytes=0-` [community:ultrabridge].
+- Device paths can contain double slashes (`NOTE/Note/Personal//IMG.jpg`); tolerate them everywhere [community:ultrabridge, device-confirmed].
+
+#### delete_folder_v3
+
+`{"equipmentNo", "id"}` -> envelope + `equipmentNo` + `metadata {tag, id, name, path_display}` [ratta-server] [community:ultrabridge]. Works for files and folders [community:ultrabridge]. The device deletes a folder by deleting each contained file by id and never sends a delete for the folder itself; an emptied folder that stays listed comes back on the device as a "zombie" folder, so the server must prune folders a delete or move left empty (but never the six native folders) [community:ultrabridge, device-confirmed]. Unknown id -> `E0318` [community:ultrabridge] [ratta-server enum]. Whether Ratta moves device deletes to its recycle bin is [unknown]: one reference says hard delete [community:ultrabridge]; the recycle bin is fed at least from the web UI [ratta-server] [ratta-web].
+
+#### move_v3 (also rename)
+
+```json
+POST /api/file/3/files/move_v3
+{"equipmentNo": "SN078C10000000", "id": "4711",
+ "to_path": "/NOTE/Note/Archive/Bike 2026.note", "autorename": false}
+```
+
+- Response: envelope + `equipmentNo` + `entriesVO` [ratta-server].
+- `to_path` is the **full destination path including the new name**, despite the field description "target parent directory" [community:ultrabridge, device-confirmed]. The id stays the same [community:ultrabridge].
+- The device calls `query_v3` (source) and `query/by/path_v3` (target) first [community:ultrabridge].
+- Errors: `E0320` source missing, `E0322` name exists with `autorename:false`, `E0358` folder into itself [ratta-server] [community:ultrabridge].
+
+#### copy_v3
+
+Same request as `move_v3`; the copy gets a new id; `E0308` source missing [ratta-server] [community:ultrabridge]. With `autorename:true` Ratta-style names are `name(1)`, `name(2)` [community:opennotecloud].
+
+#### Capacity
+
+- `POST /api/file/2/users/get_space_usage {"equipmentNo"}` -> envelope + `equipmentNo`, `used` (bytes), `allocationVO {tag, allocated}` [ratta-server]. Ratta uses tag `individual` [ratta-server string near the capacity handler]; allenporter sends `personal` and 10 GiB [community:allenporter].
+- `POST /api/file/capacity/query` (no body) -> envelope + `usedCapacity`, `totalCapacity`; the Nomad called this one in a sync session [ratta-server] [community:ultrabridge 0b]. Must return sane numbers; opennotecloud reports real filesystem numbers [community:opennotecloud].
+
+### 3.6 Conflicts
+
+Conflict resolution happens on the device (matrix in 3.1); on a conflict the device renames with a conflict suffix or re-uploads [community:opennotecloud]. The server only refuses name collisions (`E0322`/`E0304`) and stale operations (`E0303` already deleted, `E0305` already moved, `E0342` "data has expired, re-sync") [ratta-server].
+
+### 3.7 Request deduplication
+
+Ratta rejects identical POST bodies repeated within about 1 s (`409`, "Please do not resubmit the data") on some handlers [ratta-server] [community:ultrabridge]. Not required for the device [inferred].
+
+### 3.8 Older and other upload paths
+
+`/api/file/terminal/upload/apply|finish` (fields `filePath`, `fileSize`, `md5`, `modifyTime`, `uploadTime`) exist but the Nomad does not use them [ratta-server] [community:ultrabridge 0b]. The web UI uses `/api/file/upload/apply` (`directoryId`, `fileName`, `size`, `md5`) + `/api/oss/upload` + `/api/file/upload/finish` (`directoryId`, `fileName`, `fileSize`, `md5`, `innerName`, `type`) [ratta-server] [ratta-web] [community:ultrabridge].
+
+### 3.9 Signed URL key
+
+The device never computes a signature; it uses the URLs as given [community:ultrabridge] [community:allenporter] [community:opennotecloud]. So notedown uses its own key and scheme [inferred].
+
+## 4. Auto sync (socket.io)
+
+### 4.1 Transport
+
+- Engine.IO protocol 3 (socket.io 2.x wire), WebSocket transport, path `/socket.io/`, default namespace `/` [ratta-server: netty-socketio] [community:ultrabridge] [community:allenporter] [community:opennotecloud].
+- On Ratta's setup it reaches port 18072 through the same external port as the REST API (nginx `location /socket.io/`) [ratta-server] [doc].
+- Ratta settings: `socket.pinginterval=5000`, `socket.pingtimeout=25000` (ms) [ratta-server]. opennotecloud announces the values swapped (25000/5000) and still works [community:opennotecloud]; use Ratta's values [inferred].
+- permessage-deflate is not needed [community:ultrabridge, device-confirmed].
+
+### 4.2 Handshake and auth
+
+```
+GET /socket.io/?token=<JWT>&type=<equipmentNo>&random=<ms>&sign=<sig>&EIO=3&transport=websocket
+```
+
+| Query parameter | Meaning | Source |
+|---|---|---|
+| `token` | the login JWT (in the query string, not a header) | [ratta-server] [community:ultrabridge] [community:allenporter] |
+| `type` | device serial in device traces; `ANDROID<uuid>` in another trace (probably another client app) | [community:ultrabridge] [community:allenporter] |
+| `random` | client time in ms, used as nonce | same |
+| `sign` | keyed hash over token, type and random; checked by Ratta, failure closes the connection | [ratta-server] [community:allenporter] [community:ultrabridge] |
+| `EIO`, `transport` | `3`, `websocket` | same |
+
+- `sign` can be accepted and ignored: the token check is enough and devices connect fine [community:ultrabridge] [community:opennotecloud]. The key for `sign` is a Ratta secret and is not given here (0.2).
+- Ratta rejects a bad token or sign by emitting `ServerMessage` with `{"code":"403","msg":"..."}` and disconnecting [ratta-server strings] [community:allenporter] [community:opennotecloud].
+- Server speaks first: Engine.IO open packet `0{"sid":"<id>","upgrades":[],"pingInterval":5000,"pingTimeout":25000}`, then immediately the Socket.IO connect packet `40`. The device does not send its own `40` for the default namespace; without the server's `40` it never considers itself connected and reconnects with growing back-off (30/60/120/240 s) [community:ultrabridge, from the device's socket library and hardware] [community:opennotecloud sends the same].
+- If the client sends `40` anyway, answer `40` [community:ultrabridge].
+- After login the device retries the socket about every 5 s until it connects [community:ultrabridge]. Connections last minutes and get re-established [community:ultrabridge].
+
+### 4.3 Heartbeats and acknowledgements
+
+The sources disagree on what the device sends [community:ultrabridge docs contradict each other; community:allenporter; community:opennotecloud]. A server must answer all of these [inferred]:
+
+| Client sends | Server answers | Source |
+|---|---|---|
+| Engine.IO ping `2` | pong `3` | [community:ultrabridge] [community:opennotecloud] |
+| `42["ratta_ping", ...]` | `42["ratta_ping","Received"]` | [ratta-server event names] [community:allenporter] [community:opennotecloud] [community:ultrabridge code] |
+| `42["ClientMessage","status"]` | `42["ServerMessage","true"]` | [ratta-server strings `status`, `true`] [community:allenporter] [community:opennotecloud] |
+| `42["ClientMessage","Received"]` | nothing; marks pending file messages delivered | [ratta-server] [community:allenporter] |
+
+Whether the device sends `ratta_ping` at all on firmware 3.29.42 is [unknown]: one ultrabridge note says never, a later one says the device sends only `ratta_ping`.
+
+### 4.4 Channels and event names
+
+| Channel | Event (server to device) | `msgType` | Triggers | Source |
+|---|---|---|---|---|
+| file | `ServerMessage` | `FILE-SYN` | file/folder added, changed, moved, copied, deleted by another client; sync started elsewhere | [ratta-server] [community:ultrabridge] [community:allenporter] |
+| task | `to-do` | `TASK-SYN` | tasks or task sort changed | [ratta-server] [community:ultrabridge] |
+| digest | `digest` | `DIGEST-SYN` | digest added, updated, deleted elsewhere | [ratta-server] [community:ultrabridge] |
+
+- The event name decides the handler on the device, not `msgType`: the device's task service listens on `to-do` and starts a task sync on any message [community:ultrabridge].
+- The payload is sent as one **string** argument holding JSON (`42["ServerMessage","{\"code\":\"200\",...}"]`); the device parses `args[0]` [community:ultrabridge] [ratta-server] [inferred for to-do].
+- Ratta queues messages per connection in Redis and sends them when the next heartbeat arrives; it drops a push if the previous push to that client was less than 5 s ago [ratta-server log strings]. A server can also push immediately [community:ultrabridge task push works].
+- Ratta runs the task channel on a second socket server (18073) that nginx does not expose; the device opens only one socket. Task pushes on the `to-do` event over the main socket work [community:ultrabridge, device-confirmed].
+
+### 4.5 Payloads
+
+File channel (`SocketMessageData`, items `SocketIoMessageTemplate`) [ratta-server] [community:ultrabridge example]:
+
+```json
+{"code": "200", "msg": "", "timestamp": 1791270408879, "msgType": "FILE-SYN",
+ "data": [{"messageType": "MOVEFILE", "equipmentNo": "SN078C10000001", "fileType": "FILE",
+           "id": 4711, "newId": null, "originalName": "Bike.note", "newName": "Bike 2026.note",
+           "md5": "0cc175b9c0f1b6a831c399e269772661", "size": 1135077,
+           "directoryId": 102, "goDirectoryId": 5120,
+           "originalPath": "NOTE/Note/", "newPath": "NOTE/Note/Archive/", "timestamp": 1791270408000}]}
+```
+
+| `messageType` | Meaning | Source |
+|---|---|---|
+| `DOWNLOADFILE` | new file on the server (constant named ADDFILE) | [ratta-server] |
+| `ADDFOLDER` | new folder | [ratta-server] |
+| `MODIFYFILE` / `MODIFYFOLDER` | renamed or content changed | [ratta-server] [community:ultrabridge web rename] |
+| `MOVEFILE` / `MOVEFOLDER` | moved | [ratta-server] |
+| `COPYFILE` / `COPYFOLDER` | copied (`newId`, `goDirectoryId` set) | [ratta-server] [community:ultrabridge] |
+| `DELETEFILE` / `DELETEFOLDER` | deleted | [ratta-server] |
+| `STARTSYNC` / `WAITING` | another device started a sync / must wait | [ratta-server] [community:ultrabridge] |
+
+`fileType` is `FILE` or `FOLDE` (sic) [ratta-server]. For web UI actions `equipmentNo` was `"null-null"` [community:ultrabridge]. Sending `STARTSYNC` makes a connected device run a sync; this is how a server can make the device pick up server-side changes [community:ultrabridge] [community:opennotecloud] [inferred].
+
+Task channel (`SocketTaskMessageData`, items `ScheduleMessageTemplate`): `{"code":"200","msg":"","timestamp":...,"msgType":"TASK-SYN","data":[{"messageType":"QUERY"|"SORT","equipmentNo":"...","taskListId":"...","taskId":"...","timestamp":...}]}` [ratta-server]. `taskListId` must be numeric-looking (the device parses it as a long) [community:ultrabridge].
+
+Digest channel (`SocketDigestMessageData`, items `DigestMessageTemplate`): `code`, `msg`, `timestamp`, `msgType:"DIGEST-SYN"`, `data[]` with `messageType` (`ADD_DIGEST`, `UPDATE_DIGEST`, `DELETE_DIGEST`), `dataType`, `equipmentNo`, `summaryGroupId`, `summaryId`, `timestamp` and all digest record fields of section 5 [ratta-server]. A delete with only `messageType`, `dataType`, `equipmentNo`, `timestamp` and `id` was honored by a Nomad; the device keys on `id` and did not care about `equipmentNo` or the `dataType` value [community:ultrabridge, device-confirmed]. Ratta uses `dataType` `"3"` in its delete path [ratta-server string]; its meaning is [unknown]. The device sends no acknowledgement for a digest push [community:ultrabridge].
+
+### 4.6 Direction summary
+
+- Device to server: only heartbeats and acknowledgements on the socket. All changes go over REST [ratta-server] [community:ultrabridge] [community:allenporter].
+- Server to device: hints only. If a hint is lost nothing breaks, the device's next REST sync reconciles [community:allenporter]. Exception: a server-side digest delete is only learned through a `DELETE_DIGEST` push, so it must be queued durably per device until sent (5.7) [community:ultrabridge].
+
+## 5. Digests ("summary")
+
+A digest is an excerpt the user makes on the device: lasso on handwriting in a note ("recognize as text") or a text selection in a PDF/EPUB, optionally with a typed comment and a handwritten comment, sorted into groups ("categories") [doc via our note-format.md 7.4] [community:ultrabridge]. The server stores them as records (`t_summary`); the handwritten comment is a separate `.mark` file [ratta-server] [community:ultrabridge].
+
+### 5.1 Record
+
+`SummaryDO`, the record returned by queries [ratta-server]; all names camelCase on the wire, no snake_case [community:ultrabridge]:
+
+| Field | Type | Meaning | Source |
+|---|---|---|---|
+| `id` | long | server id (Ratta snowflake) | [ratta-server] |
+| `fileId` | long | unused, always null | [ratta-server] [community:ultrabridge] |
+| `name` | string | group name (groups only) | [ratta-server] |
+| `userId` | long | owner | [ratta-server] |
+| `uniqueIdentifier` | string | 32-hex id; set on groups; **empty on items** from the device | [ratta-server] [community:ultrabridge, device-confirmed] |
+| `parentUniqueIdentifier` | string | group of an item; empty = no group | [ratta-server] [community:ultrabridge] |
+| `content` | string | excerpt text | [ratta-server] [community:ultrabridge] |
+| `sourcePath` | string | source file, relative to the device storage root, for example `Note/x.note` or `Document/Books/y.epub` | [community:ultrabridge] |
+| `dataSource` | string | [unknown] | [ratta-server] |
+| `sourceType` | int | `1` document (PDF/EPUB), `2` note | [community:ultrabridge] |
+| `isSummaryGroup` | `"Y"`/`"N"` | group or item | [ratta-server] [community:ultrabridge] |
+| `description` | string | group description | [ratta-server] |
+| `tags` | string | comma-separated tag names | [ratta-server] [community:allenporter] |
+| `md5Hash` | string | 32-hex hash of the record, computed by the device, changes on every edit; used for diffing | [ratta-server] [community:ultrabridge] |
+| `metadata` | string | JSON object as a string, see 5.2 | [ratta-server] [community:ultrabridge] |
+| `commentStr` | string | typed comment | same |
+| `commentHandwriteName` | string | file name of the handwritten comment on the device, `<32hex>.mark` | same |
+| `handwriteInnerName` | string | server name of the `.mark` blob (same value in traffic) | same |
+| `handwriteMD5` | string | MD5 of the `.mark` bytes | same |
+| `creationTime`, `lastModifiedTime` | long ms | device times | same |
+| `isDeleted` | `"Y"`/`"N"` | soft delete | [ratta-server] |
+| `createTime`, `updateTime` | ms numbers on the wire | server times | [community:ultrabridge, device-confirmed] |
+| `author` | string | author (the device puts it in `metadata.author`) | [ratta-server] [community:ultrabridge] |
+
+### 5.2 Metadata and the link to the source
+
+Note digest (`sourceType` 2) [community:ultrabridge]:
+
+```json
+{"author": "Jordi", "note_page": "3",
+ "note_fileId": "F20261006090648...", "note_pageId": "P20261006090648...",
+ "unique_identifier": "56672a0bcc5e4955552e2e45b18c0dfc"}
+```
+
+- `note_fileId` is the `FILE_ID` header value of the `.note`, `note_pageId` the page's `PAGEID`, `note_page` the 1-based page number as a string [community:ultrabridge] [our note-format.md 7.4].
+- The `.note` side: the text box that replaced the handwriting carries `{"digest_source":"1","digest_id":"<32 hex>","digest_time":"<ms>"}` [our note-format.md 7.4, verified]. That `digest_id` has the form of `metadata.unique_identifier`; that they are equal is [inferred], not yet verified.
+- `FILE_ID` and `PAGEID` survive rename and move; `sourcePath` does not [community:ultrabridge task links analogy] [inferred].
+
+Document digest (`sourceType` 1) [community:ultrabridge]:
+
+```json
+{"document_location_data": "[{\"chapter\":2,\"endPosition\":995,\"page\":0,\"startPosition\":940}]",
+ "source_size": 3344196, "unique_identifier": "f6444dce52bc2460c932d42aba0f7133", "author": "Jordi"}
+```
+
+`document_location_data` is itself a JSON string; EPUB addresses by `chapter` (page 0), PDF by 0-based `page` (chapter 0); positions are character offsets; `source_size` is the document size in bytes. The link to the document is `sourcePath` plus `source_size` [community:ultrabridge].
+
+- The item's stable identity is `metadata.unique_identifier`, not the top-level `uniqueIdentifier` [community:ultrabridge, device-confirmed].
+- `metadataMap` in the hash query must keep numbers as numbers (`source_size: 18992668`, not `1.8992668e+07`) [community:ultrabridge, device-confirmed].
+
+### 5.3 Endpoints
+
+All under `/api/file`, token required [ratta-server]. Note that two deletes are HTTP `DELETE` with a JSON body.
+
+| Method and path | Request fields | Response (envelope plus) | Source |
+|---|---|---|---|
+| `POST /add/summary` | `uniqueIdentifier`, `fileId`, `parentUniqueIdentifier`, `content`, `dataSource`, `sourcePath`, `sourceType`, `tags`, `md5Hash`, `metadata`, `commentStr`, `commentHandwriteName`, `handwriteInnerName`, `handwriteMD5`, `creationTime`, `lastModifiedTime`, `author` | `id` | [ratta-server] [community:ultrabridge] |
+| `PUT /update/summary` | `id` (required) and the same mutable fields, no `creationTime`/`fileId`/`uniqueIdentifier`; the device sends the full record each time | envelope | same |
+| `DELETE /delete/summary` | `{"id": N}` | envelope (soft delete) | same |
+| `POST /query/summary` | `page`, `size`, `parentUniqueIdentifier`, `ids` | `totalRecords`, `totalPages`, `currentPage`, `pageSize`, `summaryDOList` | same |
+| `POST /query/summary/hash` | same as above | paging fields + `summaryInfoVOList` of `{id, userId, md5Hash, handwriteMd5, commentHandwriteName, lastModifiedTime, metadataMap}` (note lowercase `Md5` here) | [ratta-server] [community:ultrabridge] |
+| `POST /query/summary/id` | `{"ids": [..]}` | `summaryDOList` | same |
+| `POST /add/summary/group` | `uniqueIdentifier`, `name`, `description`, `md5Hash` (required), `creationTime`, `lastModifiedTime` | `id` | [ratta-server] |
+| `PUT /update/summary/group` | `id`, `uniqueIdentifier`, `name`, `description`, `metadata`, `commentStr`, `commentHandwriteName`, `handwriteInnerName`, `md5Hash`, `lastModifiedTime` | envelope | [ratta-server] |
+| `DELETE /delete/summary/group` | `{"id": N}` | envelope; soft-deletes the group and its items | [ratta-server mapper] [community:ultrabridge] |
+| `POST /query/summary/group` | `page`, `size` | paging fields + `summaryDOList` (groups) | [ratta-server] |
+| `POST /add/summary/tag` | `name` | `id` | [ratta-server] |
+| `PUT /update/summary/tag` | `id`, `name` | envelope | [ratta-server] |
+| `DELETE /delete/summary/tag` | `id` | envelope | [ratta-server] |
+| `GET /query/summary/tag` | none | `summaryTagDOList` of `{id, name, userId, uniqueIdentifier, createdAt}` | [ratta-server] |
+| `POST /upload/apply/summary` | `fileName`, `equipmentNo` | `fullUploadUrl`, `partUploadUrl`, `innerName` | [ratta-server] [community:ultrabridge] |
+| `POST /download/summary` | `id` (digest id) | `url` | [ratta-server] [community:ultrabridge] |
+
+- `page` is 1-based; queries return only `isDeleted = 'N'` rows and order by creation time descending [ratta-server mapper]. The device's paging sizes are [unknown] (servers in the community use 20).
+- Errors: `E0335` tag name exists, `E0336` tag missing, `E0338` unique identifier exists, `E0339` group missing, `E0340` digest missing [ratta-server]. ultrabridge treats re-adds with a known identity as updates (idempotent) to survive full re-syncs [community:ultrabridge].
+- Whether the device uses tags at all is [unknown]; no trace shows tag calls.
+
+### 5.4 Sync flow
+
+Observed on a Nomad [community:ultrabridge 0b and Phase D]:
+
+1. `POST /query/summary/group` (all groups), `POST /query/summary/hash` (id + md5 of every item), then `POST /query/summary/id` for items whose hash differs or that are new on the server.
+2. New item on the device: `POST /add/summary` (empty handwriting fields, top-level `uniqueIdentifier` empty) -> `id`.
+3. Handwritten comment: `POST /upload/apply/summary {"fileName": "<32hex>.mark", "equipmentNo": ...}` -> `fullUploadUrl` + `innerName`; `POST <fullUploadUrl>` multipart `file`; then `PUT /update/summary` with `commentHandwriteName` = `handwriteInnerName` = the `.mark` name and `handwriteMD5`. A 29 KB `.mark` used the single-shot URL; `partUploadUrl:""` was accepted [community:ultrabridge, device-confirmed].
+4. Each later edit (typed comment, group change, author) sends a full `PUT /update/summary` [community:ultrabridge].
+5. Pulling a handwritten comment: `POST /download/summary {"id": N}` -> `url`, then `GET` [community:ultrabridge, device-confirmed]. No handwriting -> `E0321` [community:ultrabridge].
+6. Delete on the device: `DELETE /delete/summary {"id": N}` [community:ultrabridge, device-confirmed].
+
+The device polls `query/summary/hash` every sync, so the round trip works without socket pushes [community:ultrabridge].
+
+### 5.5 The handwritten comment file (`.mark`)
+
+- Name: `<32 hex>.mark`. In the one published sample the name differs from `handwriteMD5`, so the name is not the MD5 of the file content [community:ultrabridge sample]. opennotecloud returns the device's `fileName` as `innerName` [community:opennotecloud]. Whether Ratta renames is [unknown]; returning the device's name keeps `commentHandwriteName == handwriteInnerName` as observed [inferred].
+- Ratta stores them in a per-server `digest` directory (`.../data//digest/` in a decoded upload URL: note the double slash) [ratta-server: constant `/digest/`] [community:ultrabridge].
+- Its internal format is the Supernote `.mark` annotation format [unknown details]; transfer is opaque bytes.
+- Distinct from document sidecars `<doc>.pdf.mark`, which sync as normal files in the file tree (3.3) [community:ultrabridge].
+
+### 5.6 Which device files hold digests
+
+Digests are records of the device's Digest app, not files in the synced tree [community:ultrabridge] [our note-format.md 7.4]. The device-side storage location is [unknown].
+
+### 5.7 Deletion semantics
+
+- Server-side: soft delete (`isDeleted:"Y"`); Ratta purges soft-deleted rows later by date [ratta-server mapper].
+- Device-authoritative: if the server deletes an item on its own, the device sees it missing in `query/summary/hash` and pushes it back with `PUT /update/summary`. To make a server-side delete stick, the server must send `DELETE_DIGEST` on the `digest` event; ultrabridge keeps a durable per-device queue and sends it on the next heartbeat after reconnect, and the Nomad removed the digest [community:ultrabridge, device-confirmed]. Group delete pushes are [unknown].
+
+## 6. Other device-facing features
+
+### 6.1 Schedules and tasks (To-Do app)
+
+Tasks sync as records, not files, over REST polling plus the `to-do` socket nudge [ratta-server] [community:ultrabridge, device-confirmed]. All under `/api/file`, token required [ratta-server].
+
+| Method and path | Request | Response (envelope plus) | Source |
+|---|---|---|---|
+| `POST /schedule/group/all` | `maxResults` (string, default 20), `pageToken` | `pageToken`, `scheduleTaskGroup[]` of `{taskListId, userId, title, lastModified, isDeleted, createTime}` | [ratta-server] [community:ultrabridge] |
+| `POST /schedule/group` | `taskListId`, `title`, `lastModified`, `createTime` | `taskListId` | [ratta-server] |
+| `PUT /schedule/group` | `taskListId`, `title`, `lastModified` | envelope | [ratta-server] |
+| `DELETE /schedule/group/{taskListId}` | none | envelope | [ratta-server] |
+| `POST /schedule/group/clear` | `taskListId`, `lastModified` | envelope | [ratta-server] |
+| `GET /schedule/group/{taskListId}` | none | group fields | [ratta-server] |
+| `POST /schedule/task/all` | `maxResults`, `nextPageTokens` (plural), `nextSyncToken` (ms) | `nextPageToken` (singular), `nextSyncToken`, `scheduleTask[]` | [ratta-server] [community:ultrabridge] |
+| `POST /schedule/task` | task fields | `taskId` | [ratta-server] [community:ultrabridge] |
+| `PUT /schedule/task` | task fields | `taskId` | [ratta-server] |
+| `PUT /schedule/task/list` | `{taskListId, updateScheduleTaskList: [task, ...]}` | envelope | [ratta-server] [community:ultrabridge] |
+| `DELETE /schedule/task/{taskId}` | none | envelope (hard delete) | [ratta-server] [community:ultrabridge] |
+| `GET /schedule/task/{taskId}` | none | task fields + `scheduleRecurTask[]` | [ratta-server] |
+| `POST /schedule/sort`, `PUT /schedule/sort` | `taskListId`, `title`, `lastModify` (no "d"), `content` | envelope | [ratta-server] [community:ultrabridge] |
+| `DELETE /schedule/sort/{taskListId}` | none | envelope | [ratta-server] |
+| `POST /query/schedule/sort` | `nextIndexNumber` (null on first call) | `taskListId`, `title`, `lastModify`, `content`, `nextIndexNumber` (null = end) | [ratta-server] |
+
+Task fields: `taskId` (32 hex, made by the device), `taskListId`, `recurrenceId`, `title`, `detail`, `lastModified`, `recurrence` (RFC 5545 rule), `isReminderOn`, `status` (`needsAction`/`completed`), `importance`, `dueTime`, `completedTime`, `links` (base64 of JSON `{appName, fileId, filePath, page, pageId}` pointing to a note page), `isDeleted`, `sort`, `sortCompleted`, `planerSort`, `allSort`, `allSortCompleted`, `sortTime`, `planerSortTime`, `allSortTime` [ratta-server] [community:ultrabridge].
+
+- Incremental sync: with a `nextSyncToken` younger than 5 days the server returns changes, older -> `E0330` and the device does a full pull [ratta-server: `next.sync.tiamout=5`, enum E0330] [community:ultrabridge].
+- Tasks with `lastModified` 0 or without sort fields are hidden on the device [community:ultrabridge]. Empty page tokens must be omitted, an empty string made the device loop [community:ultrabridge].
+- The Nomad called `task/all` 7 times, `group/all` 3 times and `PUT task/list` twice in one session [community:ultrabridge 0b].
+
+### 6.2 Equipment
+
+See 2.4 and 2.6. Minimal answers: `bindEquipment`, `unlink`, `activateEquipment` -> envelope success; `bind/status` -> `bindStatus: true`; `query/by/equipmentno` -> device row [ratta-server] [community:allenporter] [community:ultrabridge] [inferred for activate].
+
+### 6.3 Capacity
+
+See 3.5. Ratta's default quota per user is a value in `f_capacity`; the device's own `totalCapacity` arrives in `bindEquipment` [ratta-server].
+
+### 6.4 Recycle bin
+
+`/api/file/recycle/list/query` (`order`, `sequence`, `pageNo`, `pageSize` -> `total`, `recycleFileVOList[]` of `{fileId, isFolder, fileName, size, updateTime}`), `/recycle/clear`, `/recycle/delete {idList}`, `/recycle/revert {idList}` [ratta-server] [ratta-web]. Web UI only; never seen from the device [community:ultrabridge]. A revert pushes file messages to devices [ratta-server]. `E0311` already restored or deleted [ratta-server].
+
+### 6.5 Sharing
+
+`POST /api/file/share/record/add {fileId, shareWay}` (`0` PDF, `1` PNG) only records a share [ratta-server]. Device-side share and the device conversion DTOs (`TerminalUploadConvert*`, share URL with `ttl`) exist in the jar without routes in this build [ratta-server]. Whether the Nomad calls the share route is [unknown]; untested on hardware by any source [community:ultrabridge].
+
+### 6.6 File conversion requests
+
+| Path | Request | Response | Source |
+|---|---|---|---|
+| `POST /api/file/note/to/pdf` | `id`, `host`, `pageNoList` | `url` | [ratta-server] [ratta-web] |
+| `POST /api/file/note/to/png` | `id`, `host` | `pngPageVOList[]` of `{pageNo, url}` | [ratta-server] [ratta-web] |
+| `POST /api/file/pdfwithmark/to/pdf` | `id` | `url` (PDF with its `.mark` annotations merged) | [ratta-server] [ratta-web] [community:ultrabridge] |
+
+Ratta delegates to `notelib`; errors `E0314` parse failure, `E0315` wrong type, `E0316` already converting [ratta-server]. Not seen during device syncs [community:ultrabridge 0b]. A server without a renderer can answer with an error envelope [inferred]; notedown can render `.note` itself [proposal].
+
+### 6.7 Server info and parameters
+
+- `GET /api/file/query/server` -> envelope; reachability check at boot [ratta-server] [community:ultrabridge].
+- `POST /api/official/system/base/param` (no auth) -> `paramList[]` of `{serial, name, value}` (`COPY_MAX`, `DOWNLOAD_MAX_NUMBER`, `EMAIL_CODE_TIME`, `FILE_MAX`, `FILE_TYPE`, `MAX_ERR_COUNTS`, `UPLOAD_MAX`) and `random` [ratta-server] [community:ultrabridge]. Used by the web UI [ratta-web]; device use [unknown].
+
+### 6.8 Web management UI API
+
+The web UI uses `/api/file/list/query` (by `directoryId`, paged, `order` filename/time/size), `/folder/list/query`, `/capacity/query`, `/delete {idList, directoryId}`, `/folder/add {fileName, directoryId}`, `/move` and `/copy {idList, directoryId, goDirectoryId}`, `/rename {id, newName}`, `/list/search`, `/path/query {id}` -> `{path, idPath}`, `/download/url {id, type}` -> `{url, md5}`, the upload trio of 3.8, the recycle bin, conversions, user profile (`/api/user/query`, `/update`, `/update/name`, `PUT /password`, `PUT /email`, `/account/clear`), MFA (`/api/user/mfa/setup|enable|disable|recovery/regenerate|status`), registration restriction (`GET|PUT /api/user/register/restriction`), email server config and log level (`GET|PUT /api/system/log/level`) [ratta-server] [ratta-web]. Web file actions push `FILE-SYN` messages to devices with `equipmentNo` `"null-null"` [ratta-server] [community:ultrabridge].
+
+## 7. Response envelope and errors
+
+### 7.1 Envelope
+
+Every JSON response object carries three fields at the top level, payload fields beside them (never under a `data` key) [ratta-server] [community:ultrabridge]:
+
+```json
+{"success": false, "errorCode": "E0322", "errorMsg": "A file with the same name already exists"}
+```
+
+- `errorCode` and `errorMsg` are null (or empty) on success [community:ultrabridge traces].
+- Business errors come with HTTP 200 on Ratta [community:ultrabridge]. The global error handler also emits the envelope with codes `401` (unauthorized), `409` (resubmitted), `422` (bad parameters), `500` (generic), and plain text 500 for failed OSS signature checks [ratta-server] [community:ultrabridge].
+
+### 7.2 Error codes relevant to the device
+
+| Code | Message (shortened) | Where | Source |
+|---|---|---|---|
+| `E0018` | account does not exist / wrong account or password | login | [ratta-server] |
+| `E0019` | password error | login | [ratta-server] [community:ultrabridge] |
+| `E0045` | user locked | login | [ratta-server] |
+| `E0075` | device already bound to this account | bind | [ratta-server] |
+| `E0077` | logged-in account differs from bound account | bind/login | [ratta-server] |
+| `E0078` | another device is synchronizing | sync start | [ratta-server] [community:allenporter] |
+| `E0079` | synchronization in progress, wait | file ops | [ratta-server] |
+| `E0081` | path does not exist | file ops | [ratta-server] |
+| `E0082` / `E0310` | identical MD5 exists, no need to upload | upload | [ratta-server] |
+| `E0083` / `E0503` | device bound to another account | bind | [ratta-server] |
+| `E0085` | token invalid | any | [ratta-server] |
+| `E0101` / `E0102` | verification code expired / wrong | web registration | [ratta-server] [ratta-web] |
+| `E0303` / `E0305` / `E0306` | already deleted / moved / target deleted | file ops | [ratta-server] |
+| `E0304` / `E0322` | same name exists | create/move/copy | [ratta-server] [community:ultrabridge] |
+| `E0307` / `E0309` / `E0333` | capacity exceeded | copy/upload | [ratta-server] |
+| `E0308` / `E0321` | file does not exist | copy / download | [ratta-server] [community:ultrabridge] |
+| `E0312` | device not linked to an account | file ops | [ratta-server] |
+| `E0318` / `E0320` | delete / move source missing | delete / move | [ratta-server] [community:ultrabridge] |
+| `E0324` | file cannot be uploaded | upload finish | [ratta-server] [community:ultrabridge] |
+| `E0328` / `E0329` / `E0330` / `E0331` | task group missing / task missing / sync token too old / sort exists | tasks | [ratta-server] [community:ultrabridge] |
+| `E0332` | upgrade to the latest version to sync | sync | [ratta-server] |
+| `E0334` | path empty | file ops | [ratta-server] |
+| `E0335`..`E0340` | tag/unique id/group/digest errors | digests | [ratta-server] |
+| `E0342` | data expired, re-sync | file ops | [ratta-server] |
+| `E0347`..`E0358` | private storage disk errors, chunk errors, folder into itself | file ops | [ratta-server] |
+| `E0712` | not logged in or login expired | auth | [ratta-server] [community:ultrabridge] [community:opennotecloud] |
+| `E1301`..`E1307` | OSS delete/URL/missing/empty/upload/signature/download failures | `/api/oss/*` | [ratta-server] |
+| `E9999` | network error | any | [ratta-server] |
+
+How the device reacts to each code is [unknown] except: `E0078` and any failure make it end the sync with `flag:"N"` [community:allenporter trace] [inferred]; `E0330` triggers a full task pull [community:ultrabridge].
+
+### 7.3 Device wire quirks (implement exactly)
+
+| Quirk | Source |
+|---|---|
+| File ids arrive as JSON strings (`"id":"16"`) in `download_v3`, `query_v3`, move, copy, delete | [community:ultrabridge, device-confirmed] |
+| `upload/apply`: `path` = full path incl. name, `size` = number. `upload/finish`: `path` = parent dir with trailing slash, `size` = string | [community:ultrabridge, device-confirmed] |
+| `move_v3`/`copy_v3` `to_path` = full destination path incl. name | [community:ultrabridge, device-confirmed] |
+| Paths with double slashes (`Personal//IMG.jpg`) | [community:ultrabridge, device-confirmed] |
+| `query/by/path_v3` for a missing path must be 200 + `entriesVO:null`, never 404 | [community:allenporter trace] [community:ultrabridge] |
+| `create_folder_v2` must return a real `metadata.id` | [community:ultrabridge, device-confirmed] |
+| Folder delete arrives as one `delete_folder_v3` per contained file; the server prunes emptied folders | [community:ultrabridge, device-confirmed] |
+| File DTOs mix snake_case (`content_hash`, `path_display`, `to_path`, `parent_path`, `is_downloadable`) and camelCase (`equipmentNo`, `lastUpdateTime`, `entriesVO`, `xamzDate`) | [ratta-server] [community:ultrabridge] |
+| Digest DTOs are camelCase; `handwriteMD5` in requests and records, `handwriteMd5` in `summaryInfoVOList` | [ratta-server] [community:ultrabridge] |
+| Digest item identity = `metadata.unique_identifier`; top-level `uniqueIdentifier` empty | [community:ultrabridge, device-confirmed] |
+| `metadataMap` numbers must stay numbers | [community:ultrabridge, device-confirmed] |
+| Y/N strings, not booleans: `isSummaryGroup`, `isDeleted`, `isBind`, `isBindEquipment`, `isReminderOn` | [ratta-server] [community:ultrabridge] |
+| Task: `nextPageTokens` in, `nextPageToken` out; `lastModify` in sort DTOs; `taskListId` numeric | [ratta-server] [community:ultrabridge] |
+| `bindEquipment` sends the six-folder `label` manifest and `totalCapacity "25485312"` | [ratta-server] [community:ultrabridge] |
+| Socket: server sends `40` right after the open packet | [community:ultrabridge] [community:opennotecloud] |
+| Socket push payload is a JSON string argument | [community:ultrabridge] |
+| Never list a file the server cannot serve; never drop a listed file unless it was deleted (the device deletes its local copy) | [community:opennotecloud] [community:ultrabridge] |
+
+## 8. Open-source implementations and implications
+
+### 8.1 Survey
+
+| Project | Kind, language | License | Last commit seen | Storage | Source |
+|---|---|---|---|---|---|
+| allenporter/supernote | server + client + MCP + AI layer (Gemini), Python 3.13, aiohttp, python-socketio | Apache-2.0 | 2026-10-05 | SQLite (SQLAlchemy, Alembic) for catalog and records; blobs stored content-addressed by MD5 | [community:allenporter] |
+| jdkruzr/ultrabridge | multi-device note bridge; "SPC server mode" for Supernote, Go | Apache-2.0 | 2026-09-08 | device tree as real files under a configured root, with hidden `.staging/`, `.recycle/`, `.digests/`; SQLite for id registry, digests, tasks, tombstones | [community:ultrabridge] |
+| k4z4n0v4/opennotecloud | tablet-only sync server, Go (~2900 lines, stdlib) | AGPL-3.0 | 2026-03-20 | files on disk `<data>/<email>/Supernote/...`; SQLite for catalog, digests, tasks | [community:opennotecloud] |
+| rnbennett/supernote-cloud (sncloud) | client of Ratta's public cloud, Python | Apache-2.0 | 2026-06-08 | none | [community:sncloud] |
+| dylanmazurek/supernote-sync | client of Ratta's public cloud (listing), Go | MIT | 2025-01-04 | none | [community:supernote-sync] |
+
+Protocol coverage of the servers:
+
+| Area | allenporter | ultrabridge | opennotecloud |
+|---|---|---|---|
+| device login, bind, unlink | yes | yes, device-validated | yes (fresh activation untested) |
+| web login, registration | yes (registration off by default) | partial (Partner/web out of scope) | no (CLI users) |
+| sync lock start/end | yes (in-memory, 5 min) | yes | yes |
+| list_folder v2/v3, query, by-path | yes | yes, device-validated | yes |
+| create folder, move, copy, delete | yes | yes, device-validated (prunes empty folders) | yes (permanent delete) |
+| upload apply/oss/finish, chunked | yes, implicit merge on last part | yes, staging + verify; chunking built, rarely exercised | yes, chunked |
+| download with Range | yes | yes | yes |
+| capacity | yes (fixed 10 GiB) | yes (du-style) | yes (filesystem) |
+| socket.io heartbeat | yes | yes, device-validated | yes |
+| socket pushes | FILE-SYN on changes | to-do task push, FILE-SYN, durable DELETE_DIGEST | none |
+| digests items/groups/tags/.mark | yes | yes, device-validated both directions | yes |
+| schedules/tasks | yes | yes (CalDAV bridge), device-validated | yes |
+| recycle bin | web API | soft delete to `.recycle/`, web restore partial | no |
+| conversion note to PDF/PNG | yes (own renderer) | partial | no |
+| web UI | own UI | own UI | none |
+| sharing | stub | no | no |
+
+Known compatibility notes:
+
+- allenporter: a sync failed when `query/by/path_v3` answered 404 for a missing path (`failed-sync.md`) [community:allenporter].
+- ultrabridge: its wire gotchas (7.3) were all found on a Nomad; several analyzed field descriptions were wrong (`path`, `to_path`) [community:ultrabridge]. The device firmware version of its tests is not stated.
+- opennotecloud: tested by moving a device that was already registered with Ratta's private cloud; a brand-new device may fail on activation endpoints [community:opennotecloud].
+- No source reports firmware Chauvet 3.29.42 specifically [unknown].
+
+Most useful for the clean-room spec: ultrabridge's docs (`docs/spc-protocol.md`, `docs/PRIVATE_CLOUD_REFERENCE.md`), because they hold device traces from a Nomad and record each wire surprise; its reference document contains a few statements that its own later traces correct (3.4, 3.5). For a compact picture of the device-facing surface, opennotecloud (AGPL-3.0, same license as notedown; still clean-room rules apply).
+
+### 8.2 Minimal endpoint set for a Nomad sync
+
+[inferred from 2 to 6 and the device traces]
+
+- Login: `check/exists/server`, `query/random/code`, `login/equipment`, `terminal/user/bindEquipment`, `terminal/equipment/unlink`, `user/query`, `equipment/bind/status`, `file/query/server`.
+- Files: `synchronous/start|end`, `2/files/list_folder` (and `3/files/list_folder_v3`), `3/files/query_v3`, `3/files/query/by/path_v3`, `2/files/create_folder_v2`, `3/files/upload/apply`, `oss/upload`, `oss/upload/part`, `2/files/upload/finish`, `3/files/download_v3`, `oss/download`, `3/files/delete_folder_v3`, `3/files/move_v3`, `3/files/copy_v3`, `file/capacity/query`, `2/users/get_space_usage`.
+- Digests: `query/summary/group|hash|id` (must never 404), `add|update|delete summary`, `upload/apply/summary`, `download/summary`, group add/update/delete.
+- Tasks: `schedule/group/all`, `schedule/task/all`, `schedule/task` (POST/PUT), `PUT schedule/task/list`, `DELETE schedule/task/{id}`.
+- Socket: `/socket.io/` with open + `40`, pong, `ratta_ping` and `ClientMessage` answers.
+
+### 8.3 Proposal: a full Private Cloud on plain files
+
+Goal set by Jordi: every device-facing feature of Ratta's server, no email, no database, no Redis, no other service; state mostly in files that a person can read. Everything in this subsection is [proposal].
+
+#### 8.3.1 Principles
+
+1. The user's device tree is stored as real files with their real names and paths. A backup of the data directory is a backup of everything.
+2. Every record type is one JSON file per entity (rewritten atomically: write temp, fsync, rename), or an append-only JSONL log when the data is a history.
+3. Short-lived state (random login codes, the sync lock, socket sessions, upload progress counters) lives in memory with a TTL. Losing it on restart only forces a re-login or a retried upload.
+4. Durable state that the protocol needs and that a file tree cannot express: the id registry (ids survive moves, copies get new ids) and the per-device push queue (digest deletes).
+5. Data-loss rule: never list a file that cannot be served, and never stop listing a file unless it was really deleted. The device deletes its local copy in both cases (3.1). Out-of-band changes (a person edits the tree) are detected by a scan (at start and on a timer or file watcher), assigned ids, and journaled.
+6. A change journal (8.3.5) records every change for consumers such as the Crystalline ingestion pipeline.
+
+#### 8.3.2 On-disk layout
+
+```
+<data>/
+  server.toml                       listen address, external base URL, socket on/off, limits
+  keys/                             url-signing key, token key (mode 0600, generated on first start)
+  accounts/<account>/               <account> = email address (as Ratta), or a slug
+    account.json                    userId, email, userName, passwordMd5, admin flag, quotaBytes,
+                                    createdAt, locked, failedLogins
+    devices/<equipmentNo>.json      name, totalCapacity, label manifest, boundAt, lastLogin,
+                                    tokenGeneration, status
+    files/                          the device tree, real files
+      NOTE/Note/...  NOTE/MyStyle/...  DOCUMENT/Document/...  EXPORT/  SCREENSHOT/  INBOX/
+    ids.jsonl                       id registry log: {"id":4711,"kind":"file","path":"NOTE/Note/x.note"}
+                                    plus move/delete entries; compacted into ids.json on start
+    hashes.json                     cache path -> {size, mtimeNs, md5} to avoid rehashing
+    digests/
+      groups/<uniqueIdentifier>.json
+      tags.json                     [{id, name, uniqueIdentifier, createdAt}]
+      notes/<note FILE_ID>/         one folder per source note (stable across renames)
+        source.json                 last sourcePath, FILE_ID, page ids seen
+        <unique_identifier>.json    the digest record (wire fields + server id + isDeleted)
+        <unique_identifier>.mark    handwritten comment, if any (original name kept in the JSON)
+      documents/<docKey>/           docKey = sanitized sourcePath (+ source_size), see note below
+        source.json
+        <unique_identifier>.json
+        <unique_identifier>.mark
+      unassigned/                   digests whose source cannot be resolved
+    tasks/
+      groups/<taskListId>.json
+      items/<taskId>.json
+      sort/<taskListId>.json
+    recycle/<deletedAtMs>/<original relative path>   deleted files, restorable
+    recycle/index.jsonl             {id, path, deletedAt, by}
+    shares.jsonl                    share records
+    outbox/<equipmentNo>.jsonl      pending socket pushes (DELETE_DIGEST and others), cleared when sent
+    logins.jsonl                    login history (optional)
+    staging/<uploadId>/             chunks and single uploads before finish (hidden from listings)
+    convert/                        cached PDF/PNG renderings (deletable)
+  journal/
+    journal-<firstSeq>.jsonl        change journal, all accounts
+    consumers/<name>.cursor         {"seq": 1234, "updatedAt": ...}
+```
+
+Notes:
+- Document digests have no stable file id in the protocol; the key is the `sourcePath` (plus `source_size`); a rename of the PDF makes a new key, so `source.json` records the old path and the server can re-key on `move_v3` of the document.
+- The digest's server `id` (a long the device uses in `update/summary`, `delete/summary`, `download/summary` and `query/summary/hash`) is stored inside each digest JSON; an in-memory index id -> file is built at start.
+- `.mark` blobs are stored under the digest's `unique_identifier` so the pair JSON + `.mark` sits together per source; the device-facing name (`commentHandwriteName`/`handwriteInnerName`) stays in the JSON and is returned unchanged.
+
+#### 8.3.3 Feature table
+
+| Feature | Endpoints | Persistent state and file mapping | Ephemeral state |
+|---|---|---|---|
+| Accounts (no email) | `check/exists/server`, `random/code`, `login/equipment`, `login/new`, `user/query`, `user/query/token`, `logout`, `PUT user/password`, `user/update`, `update/name` | `account.json` with `passwordMd5`; created by an admin CLI (`notedown-server user add <email>`) or a `[[users]]` list in `server.toml`; password reset by the admin CLI; registration, `mail/validcode`, `check/validcode`, `retrieve/password` answer with an error envelope (or registration only for the first user) | random codes (5 min, one-time), failed-login counters |
+| Tokens | all authenticated calls, socket `token` | `devices/<n>.json tokenGeneration`; token = JWT with userId, equipmentNo, generation; logout/unlink/new login increments the generation; no `exp` for device tokens | none |
+| Device binding | `bindEquipment`, `unlink`, `activateEquipment`, `bind/status`, `query/by/equipmentno` | `devices/<equipmentNo>.json`; `bindEquipment` creates the `label` folders under `files/` | none |
+| File tree | 3.5 endpoints | real files under `files/`; ids in `ids.jsonl`; MD5 cache in `hashes.json`; folders are real directories | sync lock per account (TTL, extended by each call), upload progress |
+| Uploads | `upload/apply`, `oss/upload`, `oss/upload/part`, `upload/finish` | `staging/<uploadId>/`, then atomic rename into `files/`; journal event after rename | signed URL nonces |
+| Downloads | `download_v3`, `oss/download` | read from `files/` | signed URL nonces |
+| Delete, move, copy | `delete_folder_v3`, `move_v3`, `copy_v3`, web `file/delete`, `move`, `copy`, `rename`, `folder/add` | delete = move into `recycle/<ms>/...` + `recycle/index.jsonl`; move keeps the id; copy mints an id; empty user folders are pruned | none |
+| Recycle bin | `recycle/list/query`, `revert`, `delete`, `clear` | `recycle/` + `recycle/index.jsonl`; revert moves back and journals a create | none |
+| Capacity | `get_space_usage`, `capacity/query` | `account.json quotaBytes`; usage computed from `files/` (+ `recycle/`) and cached | usage cache |
+| Auto sync | `/socket.io/` | `outbox/<equipmentNo>.jsonl` for pushes that must not be lost | connection registry |
+| Digests | 5.3 endpoints | `digests/` tree, one JSON per record, `.mark` beside it, `groups/`, `tags.json`; soft delete = `isDeleted:"Y"` kept until purged | id index (rebuilt at start) |
+| Tasks | 6.1 endpoints | `tasks/groups`, `tasks/items`, `tasks/sort`; each JSON = the wire record; `nextSyncToken` = max `lastModified` served | none |
+| Sharing | `share/record/add` | append to `shares.jsonl` | none |
+| Conversion | `note/to/pdf`, `note/to/png`, `pdfwithmark/to/pdf` | notedown's own `.note` renderer; outputs cached in `convert/` and served by signed `oss/download` URLs | job state |
+| System parameters | `official/system/base/param`, `file/query/server` | constants from `server.toml` | none |
+| Web UI API | 6.8 endpoints | same state as above; web MFA (TOTP) secrets, if offered, in `account.json` | web sessions |
+| Login history | none required | `logins.jsonl` | none |
+| Email server config, SMS, WeChat, server migration, avatars | `save/email/config` and others | not offered; answer with an error envelope | none |
+
+#### 8.3.4 Integrity rules
+
+- A file is listed only after it is completely written and renamed into place [proposal].
+- The server hashes files lazily and caches by size and mtime; a changed file found by the scan gets a `file.modified` journal entry and appears with its new hash at the next device listing [proposal].
+- One account, one writer: the sync lock serializes device syncs; web actions take the same lock briefly [proposal, matches Ratta's E0079 behavior].
+- Out-of-band deletes are dangerous (the device deletes its copy); the scan journals them as `file.deleted` with `origin:"fs"` and keeps a copy in `recycle/` only if it still has the bytes (it usually will not), so the operator documentation must say: delete through the server, not the file system [proposal].
+
+#### 8.3.5 Change journal for ingestion
+
+Append-only JSONL, one event per line, written after the change is durable (data file fsynced and renamed, then the journal line appended and fsynced) [proposal]:
+
+```json
+{"seq": 1842, "ts": 1791270408879, "account": "jordi@example.org", "origin": "device",
+ "device": "SN078C10000000", "type": "file.modified", "kind": "note",
+ "id": 4711, "path": "NOTE/Note/Work/Bike.note",
+ "md5": "0cc175b9c0f1b6a831c399e269772661", "prevMd5": "92eb5ffee6ae2fec3ad71c777531578f",
+ "size": 1135077}
+{"seq": 1843, "ts": 1791270409120, "account": "jordi@example.org", "origin": "device",
+ "device": "SN078C10000000", "type": "digest.created",
+ "digestId": 9001, "uniqueIdentifier": "56672a0bcc5e4955552e2e45b18c0dfc",
+ "sourceType": 2, "sourcePath": "Note/Work/Bike.note",
+ "noteFileId": "F20261006090648...", "notePageId": "P20261006090648...", "notePage": 3,
+ "record": "accounts/jordi@example.org/digests/notes/F20261006090648.../56672a0bcc5e4955552e2e45b18c0dfc.json",
+ "mark": null, "md5Hash": "ca055a657650fc93c1b2927e1400eb56"}
+```
+
+- Event types: `file.created`, `file.modified`, `file.moved` (`path`, `oldPath`), `file.copied` (`id`, `sourceId`), `file.deleted`, `file.restored`, `folder.created`, `folder.moved`, `folder.deleted`, `digest.created`, `digest.updated`, `digest.deleted`, `digest.mark.stored`, `digest.group.created|updated|deleted`, `digest.tag.*`, `task.created|updated|deleted`, `device.bound`, `device.unlinked`.
+- `kind` for files: `note`, `document` (pdf, epub, doc...), `mark` (document sidecar), `image`, `other`, derived from the extension.
+- `seq` is a server-wide counter, strictly increasing, never reused; it is recovered at start from the last line of the newest journal file.
+- Rotation: a new file `journal-<firstSeq>.jsonl` when the current one passes a size (for example 64 MiB) or at a month change; old files are kept until all registered consumers passed them (then they may be compressed or removed by the admin).
+- Consumers: each consumer has `journal/consumers/<name>.cursor` with the last fully processed `seq`, written atomically after processing. A consumer reads from `cursor + 1`, processes in order, and may re-process after a crash, so it must be idempotent: it keys notes by `id` + `md5` and digests by `uniqueIdentifier` + `md5Hash` and skips work it already has. When an event points to a file whose current MD5 differs from the event's (a newer change happened), the consumer skips it and waits for the newer event.
+- Bootstrap: a consumer with no cursor starts at the oldest kept `seq`; the server can write a `snapshot` set of `file.created`/`digest.created` events on demand (`notedown-server journal snapshot`) so a new consumer sees the full state.
+- For Crystalline: the pipeline tails the journal, ingests new or changed notes (using the notedown parser), documents and digests; it links a note digest to its note by `noteFileId` (= the note's `FILE_ID`) and page id, and a document digest by `sourcePath`; deletes retire the engram or mark it superseded.
+
+#### 8.3.6 Which Ratta tables the device features need
+
+From the mapper files and the endpoints above [ratta-server] [inferred]:
+
+| Table | Used for | Device needs it | File-based replacement [proposal] |
+|---|---|---|---|
+| `u_user` | accounts, password MD5 | yes | `account.json` |
+| `e_user_equipment` | device to user binding | yes | `devices/<n>.json` |
+| `e_equipment` | device inventory (joined by equipment queries) | no (Ratta inventory) | none |
+| `e_user_equipment_record` | bind history | no | journal `device.*` events |
+| `f_user_file` | file catalog (id, parent, name, inner name, md5, size, folder flag) | yes | real files + `ids.jsonl` + `hashes.json` |
+| `f_file_action` | per-file change log (A, D, U, M, R...) | indirectly (pushes, history) | journal |
+| `f_capacity` | quota and usage | yes | `account.json quotaBytes` + computed usage |
+| `f_sync_record` | sync statistics | no | optional journal events |
+| `t_summary` | digests and digest groups | yes | `digests/` tree |
+| `t_summary_tag` | digest tags | yes (API exists; device use unknown) | `digests/tags.json` |
+| `t_schedule_task`, `t_schedule_task_group`, `t_schedule_sort`, `t_schedule_recur_task` | tasks | yes | `tasks/` tree |
+| `u_login_record` | login history | no | `logins.jsonl` |
+| `f_recycle_file` | recycle bin | web only | `recycle/` |
+| `f_share_record`, `f_terminal_share_file` | shares | device use unknown | `shares.jsonl` |
+| `f_file_convert`, `f_terminal_file_convert` | conversion jobs | web, device use unknown | in-memory jobs + `convert/` cache |
+| `f_file_his_sync` | legacy history sync | no (no route) | none |
+| `f_file_server_change` | migration between Ratta storage backends | no | none |
+| `t_machine_id` | server instance id (`uniqueMachineId` in `check/exists/server`) | maybe | one value in `server.toml` |
+| `t_user_mfa` | web MFA | web only | `account.json` if MFA is offered |
+| `u_email_config` | SMTP settings | web only | none |
+| `u_sensitive_record`, `u_commonly_area`, `u_commonly_equipment`, `u_user_history`, `u_user_sold_out`, `u_data_migration_record` | security audit, login areas, history, closed accounts, migration | no | none |
+| `b_*` (`b_user`, `b_role`, `b_resource`, `b_dictionary`, `b_reference`, `b_pwd_his`, `b_schedule_*`) | Ratta's admin backend, dictionaries, parameters (`b_reference` feeds `system/base/param`) | no (parameters only for the web UI) | constants |
+| `e_equipment_*` (authorize, log, manual, warranty), `e_language`, `e_task`, `e_task_his`, `e_temp`, `e_temp_now` | device logs, manuals, warranty, language packs, device command queue, staging tables | no route in this build | none |
+
+Two mappers reference tables that the shipped schema does not create (`f_composite_image`, `f_deleted_user_file`, plus `t_language*`), which suggests unused code paths [ratta-server].
+
+## 9. Unknowns and how to resolve them
+
+| # | Unknown | How to resolve |
+|---|---|---|
+| 1 | Exact first requests and their order on Nomad firmware 3.29.42 (unlink first or check-exists first; the `version` value; whether `query/token` or `activateEquipment` is called) | Logging stub server: answers every request with a plausible success envelope, logs method, path, headers and body; point the Nomad at it and log in |
+| 2 | Heartbeat: EIO `2`, `ratta_ping`, or `ClientMessage "status"`; push delivery timing | The stub's socket endpoint logs every frame for 10 minutes of idle connection |
+| 3 | `list_folder` vs `list_folder_v3`; what the device expects at the root (the `NOTE` and `DOCUMENT` parent entries) | Capture against Ratta's own test stack (`~/supernote-private-cloud-test`, its nginx JSON log has a `req_body` field) and against the stub |
+| 4 | Whether device deletes go to Ratta's recycle bin | Delete a file on the device against the Ratta test stack, then check `recycle/list/query` and `f_recycle_file` |
+| 5 | `.mark` name for digest handwriting (device name echoed or server name), `digest_id` in the `.note` = `metadata.unique_identifier`? | Create a note digest with a handwritten comment on the Nomad, sync to the Ratta stack, compare the `.note` text box JSON with `t_summary` and the `digest` directory |
+| 6 | Device use of digest tags, paging sizes, group delete push | Same capture, plus deleting a group in the web UI (Ratta web UI has no digest view: use the database) |
+| 7 | Device use of share and conversion endpoints and of `send/password/unlock/code` | Trigger share/export and "forgot lock password" on the device during a capture |
+| 8 | Which HTTP status codes the device accepts for errors (200 + `success:false` vs 4xx) | Stub returns chosen errors; observe retries and `flag` |
+| 9 | Moving an already synced device from Ratta's server to notedown: the device's sync database holds Ratta ids | Test with a copy of the data: the device should see new ids and treat files by path and hash; confirm no deletes happen (opennotecloud reports this works) |
+| 10 | Device-side storage of digests and tasks | Not needed for the server; optional via ADB file listing |
+| 11 | When the device drops a token (logout, server says `E0712`, `E0085`) and how it re-logs in | Stub returns `E0712` once and logs the following requests |
+| 12 | HTTP vs HTTPS: Ratta's doc shows plain `http://IP:19072`; does 3.29.42 require HTTPS for private cloud? | Try plain HTTP first with the stub |
+| 13 | Firmware 3.29.42 differences from the firmware used by the community traces (not stated there) | All of the above captures on Jordi's device |
+
+Plan [proposal]: build the logging stub first (it is also the skeleton of the server), capture items 1, 2, 3, 8, 11, 12 in one session, then run the Ratta test stack for items 4 to 7 and save the captures as test fixtures with personal data removed.

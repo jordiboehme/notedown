@@ -96,7 +96,7 @@ impl Registry {
         {
             self.by_path.remove(&old_path);
         }
-        self.next = self.next.max(id + 1);
+        self.next = self.next.max(id.saturating_add(1));
     }
 
     fn drop_id(&mut self, id: u64) {
@@ -107,45 +107,67 @@ impl Registry {
         }
     }
 
-    /// The ids at `path` and below it (segment-aware), `path` itself first.
+    /// The ids at `path` and below it (segment-aware), shallowest first.
     fn subtree(&self, path: &WirePath) -> Vec<u64> {
-        let mut ids: Vec<u64> = self
+        let mut ids: Vec<(usize, u64)> = self
             .by_id
             .iter()
             .filter(|(_, (_, p))| p.starts_with(path))
-            .map(|(id, _)| *id)
+            .map(|(id, (_, p))| (p.segments().len(), *id))
             .collect();
-        ids.sort_by_key(|id| self.by_id[id].1.segments().len());
-        ids
+        ids.sort();
+        ids.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Why a move of `id` to `to` is not allowed, if it is not: an unknown id, a folder moved
+    /// into its own subtree, or a target that holds another id.
+    pub fn check_move(&self, id: u64, to: &WirePath) -> Option<String> {
+        let Some((kind, from)) = self.by_id.get(&id) else {
+            return Some(format!("id {id} is not known"));
+        };
+        if *kind == Kind::Folder && to != from && to.starts_with(from) {
+            return Some(format!("cannot move folder {from} into itself ({to})"));
+        }
+        match self.by_path.get(to) {
+            Some(other) if *other != id => Some(format!("{to} is taken by id {other}")),
+            _ => None,
+        }
     }
 
     pub fn apply(&mut self, op: &Op) {
         match op {
             Op::Assign { id, kind, path } => match WirePath::parse_named(path) {
                 Ok(path) => self.insert(*id, *kind, path),
-                Err(_) => self.next = self.next.max(id + 1),
+                Err(_) => self.next = self.next.max(id.saturating_add(1)),
             },
             Op::Move { id, path } => {
+                // Total: a line that `check_move` would refuse (written by an older build or by
+                // hand) is skipped, never a panic, so a bad line cannot brick an open.
                 let Ok(to) = WirePath::parse_named(path) else {
                     return;
                 };
                 let Some((kind, from)) = self.by_id.get(id).cloned() else {
                     return;
                 };
-                if from == to {
+                if from == to || (kind == Kind::Folder && to.starts_with(&from)) {
                     return;
                 }
-                if kind == Kind::Folder {
-                    for moved in self.subtree(&from) {
-                        let (k, p) = self.by_id[&moved].clone();
-                        if let Some(new) = p.rebase(&from, &to) {
-                            self.drop_id(moved);
-                            self.insert(moved, k, new);
-                        }
-                    }
+                let moves: Vec<(u64, Kind, WirePath)> = if kind == Kind::Folder {
+                    self.subtree(&from)
+                        .into_iter()
+                        .filter_map(|m| {
+                            let (k, p) = self.by_id.get(&m)?;
+                            Some((m, *k, p.rebase(&from, &to)?))
+                        })
+                        .collect()
                 } else {
-                    self.drop_id(*id);
-                    self.insert(*id, kind, to);
+                    vec![(*id, kind, to)]
+                };
+                for (m, _, _) in &moves {
+                    self.drop_id(*m);
+                }
+                for (m, k, p) in moves {
+                    self.insert(m, k, p);
                 }
             }
             Op::Remove { id } => {

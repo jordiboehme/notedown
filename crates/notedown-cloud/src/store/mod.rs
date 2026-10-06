@@ -78,17 +78,33 @@ pub fn temp_path_in(dir: &Path) -> PathBuf {
     ))
 }
 
+/// Create a new temp file in `dir` with `create_new`. A name that exists (a stale temp file of
+/// a crashed process with the same pid) is left alone and the next counter is tried.
+pub fn create_temp(dir: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let mut last = None;
+    for _ in 0..1000 {
+        let tmp = temp_path_in(dir);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => return Ok((tmp, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.expect("the loop ran"))
+}
+
 /// Write `bytes` to `path` atomically with a short temp name ([`temp_path_in`]): write, fsync,
 /// rename, fsync of the folder. The folder must exist.
 pub fn write_atomic_short(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = temp_path_in(dir);
-    let write = || -> std::io::Result<()> {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+    let (tmp, mut f) = create_temp(dir).map_err(io_err(dir))?;
+    // From here on the temp file is ours: only it is removed on failure.
+    let mut write = || -> std::io::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)
@@ -100,10 +116,11 @@ pub fn write_atomic_short(path: &Path, bytes: &[u8]) -> Result<()> {
     crate::fsutil::fsync_dir(dir)
 }
 
-/// The comparison key for name collisions: NFC, lowercase, NFC again.
+/// The comparison key for name collisions, Unicode canonical caseless matching: NFD, full case
+/// folding (`ß` and `SS`, final sigma, ligatures such as `ﬁ`), then NFC.
 fn fold(name: &str) -> String {
-    let nfc: String = name.nfc().collect();
-    nfc.to_lowercase().nfc().collect()
+    let nfd: String = name.nfd().collect();
+    unicase::UniCase::new(nfd).to_folded_case().nfc().collect()
 }
 
 /// Identity of a file on disk, to notice changes by another process.
@@ -155,8 +172,8 @@ impl std::fmt::Debug for Store {
 }
 
 impl Store {
-    /// Open the store of account `slug` in the data folder `data_dir`. Creates `files/` if
-    /// needed and, under the store lock, compacts `ids.jsonl` into `ids.json`.
+    /// Open the store of account `slug` in the data folder `data_dir`. Under the store lock it
+    /// creates `files/` if needed and compacts `ids.jsonl` into `ids.json`.
     pub fn open(data_dir: &Path, slug: &str) -> Result<Store> {
         validate_slug(slug)?;
         let account_dir = Accounts::new(data_dir).account_dir(slug);
@@ -164,10 +181,6 @@ impl Store {
             return Err(Error::NoAccount(slug.to_string()));
         }
         let files = account_dir.join(FILES_DIR);
-        if !files.is_dir() {
-            std::fs::create_dir_all(&files).map_err(io_err(&files))?;
-            crate::fsutil::fsync_dir(&account_dir)?;
-        }
         let store = Store {
             account_dir,
             files,
@@ -206,7 +219,8 @@ impl Store {
     }
 
     /// Take the store lock (exclusive, blocking) and bring the in-memory registry and hash
-    /// cache up to date with the disk. A torn last line of `ids.jsonl` is cut here.
+    /// cache up to date with the disk. A torn last line of `ids.jsonl` is cut here, and a
+    /// missing `files/` is created (only ever under the lock).
     pub fn lock(&self) -> Result<StoreGuard> {
         let path = self.account_dir.join(STORE_LOCK_FILE);
         let file = std::fs::OpenOptions::new()
@@ -220,6 +234,10 @@ impl Store {
             _file: file,
             account_dir: self.account_dir.clone(),
         };
+        if !self.files.is_dir() {
+            std::fs::create_dir_all(&self.files).map_err(io_err(&self.files))?;
+            crate::fsutil::fsync_dir(&self.account_dir)?;
+        }
         let mut state = self.state();
         self.refresh_ids(&mut state, true)?;
         let hs = stamp(&self.account_dir.join(hashes::HASHES_FILE));
@@ -326,7 +344,9 @@ impl Store {
         Ok(id)
     }
 
-    /// `id` now lives at `new_path`. For a folder every descendant moves with it.
+    /// `id` now lives at `new_path`. For a folder every descendant moves with it. Refused
+    /// (`Error::Invalid`, nothing written) for an unknown id, a folder moved into its own
+    /// subtree, and a target path that holds another id: remove that one first.
     pub fn moved(&self, guard: &StoreGuard, id: u64, new_path: &WirePath) -> Result<()> {
         self.check_guard(guard)?;
         if new_path.is_root() {
@@ -339,6 +359,15 @@ impl Store {
         let Some((_, old)) = state.ids.get(id).cloned() else {
             return Err(unknown_id(id));
         };
+        if &old == new_path {
+            return Ok(());
+        }
+        if let Some(message) = state.ids.check_move(id, new_path) {
+            return Err(Error::Invalid {
+                what: "move",
+                message,
+            });
+        }
         self.append(
             &mut state,
             &[Op::Move {
@@ -475,7 +504,13 @@ impl Store {
                 is_downloadable: true,
                 size,
                 last_update_time: hashes::mtime_ms(&f.meta),
-                parent_path: f.path.parent_path(),
+                // Ruling: a file directly at the root has parent_path "/"; top-level folders
+                // omit it.
+                parent_path: match (f.path.parent_path(), f.kind) {
+                    (Some(p), _) => Some(p),
+                    (None, Kind::File) => Some("/".to_string()),
+                    (None, Kind::Folder) => None,
+                },
                 path: f.path,
             });
         }
@@ -520,8 +555,8 @@ impl Store {
     }
 
     /// Refuse `name` in the folder `parent` if a sibling with different bytes has the same
-    /// case-folded NFC form (`Error::NameCollision`). The same bytes are no collision (a
-    /// replace). Names starting with `.` are refused (`Error::Invalid`): listings hide them, so
+    /// caseless form (`Error::NameCollision`, see `fold`), or if the file system finds an entry
+    /// under `name` that has other bytes. The same bytes are no collision (a replace). Names starting with `.` are refused (`Error::Invalid`): listings hide them, so
     /// the device would see the file vanish and delete its copy.
     pub fn check_name(&self, guard: &StoreGuard, parent: &WirePath, name: &str) -> Result<()> {
         self.check_guard(guard)?;
@@ -540,16 +575,36 @@ impl Store {
         }
         let entries = std::fs::read_dir(&dir.fs_path).map_err(io_err(&dir.fs_path))?;
         let key = fold(name);
+        let mut exact = false;
+        let mut existing = None;
         for entry in entries {
             let entry = entry.map_err(io_err(&dir.fs_path))?;
             let sibling = entry.file_name();
             let sibling = sibling.to_string_lossy();
-            if sibling != name && fold(&sibling) == key {
-                return Err(Error::NameCollision {
-                    existing: sibling.into_owned(),
-                    new: name.to_string(),
-                });
+            if sibling == name {
+                exact = true;
+            } else if existing.is_none() && fold(&sibling) == key {
+                existing = Some(sibling.into_owned());
             }
+        }
+        if let Some(existing) = existing {
+            return Err(Error::NameCollision {
+                existing,
+                new: name.to_string(),
+            });
+        }
+        // The file system is the final judge: if it finds something under `name` but no entry
+        // has exactly these bytes, it merges the two spellings (its folding differs from ours).
+        let target = dir.fs_path.join(name);
+        if !exact && std::fs::symlink_metadata(&target).is_ok() {
+            let existing = std::fs::canonicalize(&target)
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "an entry the file system treats as the same name".into());
+            return Err(Error::NameCollision {
+                existing,
+                new: name.to_string(),
+            });
         }
         Ok(())
     }

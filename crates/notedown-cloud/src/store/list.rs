@@ -27,7 +27,8 @@ pub struct Entry {
     /// mtime in ms since the epoch.
     #[serde(rename = "lastUpdateTime")]
     pub last_update_time: u64,
-    /// `/NOTE/Note`; `None` (omitted) for top-level entries.
+    /// `/NOTE/Note`; `"/"` for a file directly at the root; `None` (omitted) for top-level
+    /// folders.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_path: Option<String>,
     /// The parsed path (not on the wire).

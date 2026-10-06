@@ -43,3 +43,4 @@ tower = { version = "=0.5.3", features = ["util"] }
 tokio-tungstenite = "=0.30.0"
 futures-util = { version = "=0.3.34", default-features = false, features = ["std", "sink"] }
 unicode-normalization = "=0.1.25"
+unicase = "=2.10.0"

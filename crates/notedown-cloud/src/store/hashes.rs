@@ -10,7 +10,7 @@ use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 
 use super::path::WirePath;
-use crate::{Error, Result, io_err};
+use crate::{Result, io_err};
 
 pub(crate) const HASHES_FILE: &str = "hashes.json";
 
@@ -63,13 +63,21 @@ impl HashCache {
     pub fn load(dir: &Path) -> Result<HashCache> {
         let path = dir.join(HASHES_FILE);
         match std::fs::read(&path) {
-            Ok(bytes) => {
-                let rows = serde_json::from_slice(&bytes).map_err(|e| Error::Config {
-                    path: path.clone(),
-                    message: e.to_string(),
-                })?;
-                Ok(HashCache { rows, dirty: false })
-            }
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(rows) => Ok(HashCache { rows, dirty: false }),
+                Err(e) => {
+                    // Only a cache: start empty (every file is hashed again) and rewrite it at
+                    // the next flush, instead of making the account unusable.
+                    eprintln!(
+                        "notedown cloud: {} is corrupt ({e}); starting with an empty hash cache",
+                        path.display()
+                    );
+                    Ok(HashCache {
+                        rows: Default::default(),
+                        dirty: true,
+                    })
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashCache::default()),
             Err(e) => Err(io_err(&path)(e)),
         }

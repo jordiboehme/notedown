@@ -6,7 +6,9 @@ use std::time::{Duration, SystemTime};
 
 use notedown_cloud::Error;
 use notedown_cloud::auth::Accounts;
-use notedown_cloud::store::{Entry, Kind, NATIVE_FOLDERS, Store, WirePath};
+use notedown_cloud::store::{
+    Entry, Kind, NATIVE_FOLDERS, Store, WirePath, temp_path_in, write_atomic_short,
+};
 
 const SLUG: &str = "jordi";
 
@@ -631,13 +633,18 @@ fn a_normalization_variant_is_refused() {
     assert!(matches!(err, Error::NameCollision { .. }), "{err:?}");
 }
 
+/// Needs a case-sensitive temp file system. On macOS: create a case-sensitive APFS image
+/// (`hdiutil create -size 40m -fs "Case-sensitive APFS" -volname cs cs.dmg`, then
+/// `hdiutil attach cs.dmg -mountpoint <dir>`) and run
+/// `TMPDIR=<dir>/ cargo test -p notedown-cloud --test store -- --ignored`.
 #[test]
+#[ignore = "needs a case-sensitive file system"]
 fn on_a_case_sensitive_file_system_both_variants_list_and_a_third_is_refused() {
     let (dir, store) = setup();
-    if !fs_is_case_sensitive(&files_dir(dir.path())) {
-        eprintln!("skipped: the temp file system is case-insensitive");
-        return;
-    }
+    assert!(
+        fs_is_case_sensitive(&files_dir(dir.path())),
+        "TMPDIR must be on a case-sensitive file system"
+    );
     put(dir.path(), "INBOX/a.txt", b"1");
     put(dir.path(), "INBOX/A.txt", b"2");
     let g = store.lock().unwrap();
@@ -718,4 +725,218 @@ fn open_refuses_an_unknown_account() {
         Store::open(dir.path(), "nobody"),
         Err(Error::NoAccount(_))
     ));
+}
+
+// ---------------------------------------------------------------- fix round 1
+
+#[test]
+fn a_folder_move_into_its_own_subtree_is_refused_and_nothing_is_logged() {
+    let (dir, store) = setup();
+    let log = account_dir(dir.path()).join("ids.jsonl");
+    {
+        let g = store.lock().unwrap();
+        let f = store.assign(&g, &wp("A/F"), Kind::Folder).unwrap();
+        store.assign(&g, &wp("A/F/x"), Kind::File).unwrap();
+        let before = std::fs::read_to_string(&log).unwrap();
+        for target in ["A/F/Sub", "A/F/Sub/Deeper"] {
+            assert!(matches!(
+                store.moved(&g, f, &wp(target)),
+                Err(Error::Invalid { .. })
+            ));
+        }
+        // a move onto itself is a no-op
+        store.moved(&g, f, &wp("A/F")).unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), before);
+        assert_eq!(store.path_of(f).unwrap(), Some(wp("A/F")));
+    }
+    drop(store);
+    let store = Store::open(dir.path(), SLUG).unwrap();
+    assert_eq!(store.id_of(&wp("A/F/x")).unwrap(), Some(1001));
+}
+
+#[test]
+fn bad_move_lines_in_the_log_do_not_panic_an_open() {
+    let (dir, store) = setup();
+    {
+        let g = store.lock().unwrap();
+        store.assign(&g, &wp("A/F"), Kind::Folder).unwrap();
+        store.assign(&g, &wp("A/F/x"), Kind::File).unwrap();
+        store.assign(&g, &wp("A/G"), Kind::File).unwrap();
+    }
+    drop(store);
+    let log = account_dir(dir.path()).join("ids.jsonl");
+    let mut text = std::fs::read_to_string(&log).unwrap();
+    for line in [
+        r#"{"op":"move","id":1000,"path":"A/F/Sub"}"#,
+        r#"{"op":"move","id":1000,"path":"A/F"}"#,
+        r#"{"op":"move","id":4711,"path":"A/Z"}"#,
+        r#"{"op":"move","id":1000,"path":"../x"}"#,
+        r#"{"op":"remove","id":4711}"#,
+        r#"{"op":"assign","id":18446744073709551615,"kind":"file","path":"A/max"}"#,
+    ] {
+        text.push_str(line);
+        text.push('\n');
+    }
+    std::fs::write(&log, text).unwrap();
+    let store = Store::open(dir.path(), SLUG).unwrap();
+    assert_eq!(store.id_of(&wp("A/F")).unwrap(), Some(1000));
+    assert_eq!(store.id_of(&wp("A/F/x")).unwrap(), Some(1001));
+    assert_eq!(store.id_of(&wp("A/G")).unwrap(), Some(1002));
+}
+
+#[test]
+fn a_move_onto_a_path_that_holds_another_id_is_refused() {
+    let (_dir, store) = setup();
+    let g = store.lock().unwrap();
+    let a = store.assign(&g, &wp("A/a"), Kind::File).unwrap();
+    let b = store.assign(&g, &wp("A/b"), Kind::File).unwrap();
+    let f = store.assign(&g, &wp("A/F"), Kind::Folder).unwrap();
+    let fx = store.assign(&g, &wp("A/F/x"), Kind::File).unwrap();
+    let h = store.assign(&g, &wp("A/H"), Kind::Folder).unwrap();
+    assert!(matches!(
+        store.moved(&g, a, &wp("A/b")),
+        Err(Error::Invalid { .. })
+    ));
+    assert!(matches!(
+        store.moved(&g, h, &wp("A/F")),
+        Err(Error::Invalid { .. })
+    ));
+    assert_eq!(store.path_of(b).unwrap(), Some(wp("A/b")));
+    assert_eq!(store.path_of(f).unwrap(), Some(wp("A/F")));
+    assert_eq!(store.path_of(fx).unwrap(), Some(wp("A/F/x")));
+    // after the target is removed, the move works
+    store.removed(&g, b).unwrap();
+    store.moved(&g, a, &wp("A/b")).unwrap();
+    assert_eq!(store.id_of(&wp("A/b")).unwrap(), Some(a));
+}
+
+#[test]
+fn full_case_folding_pairs_are_refused() {
+    let (dir, store) = setup();
+    for (existing, new) in [
+        ("Stra\u{df}e.note", "STRASSE.note"),
+        (
+            "\u{3bf}\u{3b4}\u{3bf}\u{3c2}.note",
+            "\u{3bf}\u{3b4}\u{3bf}\u{3c3}.note",
+        ),
+        ("\u{fb01}le.note", "FILE.note"),
+    ] {
+        let folder = format!("INBOX/{}", new.len());
+        put(dir.path(), &format!("{folder}/{existing}"), b"x");
+        let g = store.lock().unwrap();
+        match store.check_name(&g, &wp(&folder), new) {
+            Err(Error::NameCollision {
+                existing: e,
+                new: n,
+            }) => {
+                assert_eq!(e, existing);
+                assert_eq!(n, new);
+            }
+            other => panic!("{existing:?} / {new:?}: expected a collision, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn open_creates_files_only_under_the_lock() {
+    let (dir, store) = setup();
+    drop(store);
+    let files = files_dir(dir.path());
+    std::fs::remove_dir(&files).unwrap();
+    // another process holds the store lock
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .open(account_dir(dir.path()).join(".store.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let data = dir.path().to_path_buf();
+    let handle = std::thread::spawn(move || Store::open(&data, SLUG).unwrap());
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!files.exists(), "files/ was created without the lock");
+    drop(lock);
+    let store = handle.join().unwrap();
+    assert!(files.is_dir());
+    drop(store);
+}
+
+#[test]
+fn a_stale_temp_file_is_skipped_and_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    // learn this process's next temp counter, then leave "crash" debris on the next names
+    let probe = temp_path_in(dir.path());
+    let name = probe.file_name().unwrap().to_str().unwrap().to_string();
+    let parts: Vec<&str> = name.trim_end_matches(".tmp").split('-').collect();
+    let (pid, counter): (&str, u64) = (parts[1], parts[2].parse().unwrap());
+    let stale: Vec<_> = (counter + 1..counter + 50)
+        .map(|c| dir.path().join(format!(".nd-{pid}-{c}.tmp")))
+        .collect();
+    for p in &stale {
+        std::fs::write(p, b"stale").unwrap();
+    }
+    let target = dir.path().join("ids.json");
+    write_atomic_short(&target, b"{}\n").unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"{}\n");
+    for p in &stale {
+        assert_eq!(std::fs::read(p).unwrap(), b"stale", "{}", p.display());
+    }
+}
+
+#[test]
+fn a_corrupt_hash_cache_is_reset() {
+    let (dir, store) = setup();
+    drop(store);
+    put(dir.path(), "INBOX/a.txt", b"aaaa");
+    let cache = account_dir(dir.path()).join("hashes.json");
+    std::fs::write(&cache, b"{ not json").unwrap();
+    let store = Store::open(dir.path(), SLUG).unwrap();
+    let g = store.lock().unwrap();
+    assert_eq!(
+        store.md5_of(&g, &wp("INBOX/a.txt")).unwrap(),
+        md5_hex(b"aaaa")
+    );
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+    assert_eq!(v["INBOX/a.txt"]["md5"], md5_hex(b"aaaa"));
+}
+
+#[test]
+fn a_file_at_the_root_has_parent_path_slash() {
+    let (dir, store) = setup();
+    put(dir.path(), "loose.pdf", b"x");
+    std::fs::create_dir_all(files_dir(dir.path()).join("EXPORT")).unwrap();
+    let g = store.lock().unwrap();
+    let all = store.list(&g, &WirePath::root(), true).unwrap();
+    let file = all.iter().find(|e| e.path_display == "loose.pdf").unwrap();
+    assert_eq!(file.parent_path.as_deref(), Some("/"));
+    let v = serde_json::to_value(file).unwrap();
+    assert_eq!(v["parent_path"], "/");
+    let folder = all.iter().find(|e| e.path_display == "EXPORT").unwrap();
+    assert_eq!(folder.parent_path, None);
+}
+
+fn cache_keys(data: &Path) -> Vec<String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(account_dir(data).join("hashes.json")).unwrap())
+            .unwrap();
+    v.as_object().unwrap().keys().cloned().collect()
+}
+
+#[test]
+fn moved_and_removed_carry_the_hash_rows() {
+    let (dir, store) = setup();
+    put(dir.path(), "A/F/x.txt", b"x");
+    put(dir.path(), "A/Fy.txt", b"y");
+    put(dir.path(), "A/z.txt", b"z");
+    let g = store.lock().unwrap();
+    store.list(&g, &WirePath::root(), true).unwrap();
+    assert_eq!(cache_keys(dir.path()), ["A/F/x.txt", "A/Fy.txt", "A/z.txt"]);
+    let f = store.id_of(&wp("A/F")).unwrap().unwrap();
+    store.moved(&g, f, &wp("A/G")).unwrap();
+    assert_eq!(cache_keys(dir.path()), ["A/Fy.txt", "A/G/x.txt", "A/z.txt"]);
+    let z = store.id_of(&wp("A/z.txt")).unwrap().unwrap();
+    store.moved(&g, z, &wp("A/w.txt")).unwrap();
+    assert_eq!(cache_keys(dir.path()), ["A/Fy.txt", "A/G/x.txt", "A/w.txt"]);
+    let fy = store.id_of(&wp("A/Fy.txt")).unwrap().unwrap();
+    store.removed(&g, fy).unwrap();
+    store.removed(&g, f).unwrap();
+    assert_eq!(cache_keys(dir.path()), ["A/w.txt"]);
 }

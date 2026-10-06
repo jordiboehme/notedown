@@ -1,8 +1,9 @@
 //! The capture server: state, router and listeners.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::net::TcpListener;
 
@@ -10,6 +11,8 @@ use crate::api::limit::{RateLimiter, RetryTracker};
 use crate::auth::Auth;
 use crate::diag::{Capture, Clock, LogEntry, LogKind, ProtocolLog, SystemClock};
 use crate::journal::{Journal, JournalOptions};
+use crate::store::{Store, WirePath};
+use crate::sync::{SyncLocks, UrlSigner};
 use crate::{Config, Error, Result};
 
 pub use crate::api::router;
@@ -29,7 +32,18 @@ pub struct AppState {
     pub journal: Journal,
     pub(crate) limiter: RateLimiter,
     pub(crate) retries: RetryTracker,
+    /// The sync session of each account (`synchronous/start|end`).
+    pub sync_locks: SyncLocks,
+    /// Signs and checks the transfer URLs of `/api/oss/*` (`keys/url.key`).
+    pub url_signer: UrlSigner,
+    /// One open [`Store`] per account, shared by the requests.
+    stores: Mutex<HashMap<String, Arc<Store>>>,
+    /// `usedCapacity` per account: (computed at ms, bytes).
+    usage: Mutex<HashMap<String, (u64, u64)>>,
 }
+
+/// How long a computed `usedCapacity` is reused (ms).
+pub const USAGE_CACHE_MS: u64 = 60_000;
 
 impl AppState {
     pub fn open(config: Config, data_dir: &Path) -> Result<Arc<AppState>> {
@@ -76,6 +90,10 @@ impl AppState {
         }
         Ok(Arc::new(AppState {
             auth: Auth::open(data_dir)?,
+            url_signer: UrlSigner::load_or_create(data_dir)?,
+            sync_locks: SyncLocks::new(),
+            stores: Mutex::new(HashMap::new()),
+            usage: Mutex::new(HashMap::new()),
             journal,
             log,
             clock,
@@ -89,6 +107,48 @@ impl AppState {
     /// Whether this run exchanges files or refuses every sync.
     pub fn sync_mode(&self) -> crate::SyncMode {
         self.config.sync
+    }
+
+    /// The store of account `slug`, opened on first use and then shared. Blocking (it may take
+    /// the store lock): call it from a blocking task.
+    pub fn store(&self, slug: &str) -> Result<Arc<Store>> {
+        let stores = || self.stores.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = stores().get(slug) {
+            return Ok(s.clone());
+        }
+        // Opened without the map lock: `Store::open` waits for the account's store lock (a CLI
+        // import may hold it), and other accounts must not wait behind that.
+        let store = Arc::new(Store::open(&self.data_dir, slug)?);
+        Ok(stores().entry(slug.to_string()).or_insert(store).clone())
+    }
+
+    /// The bytes of every file the account's listing shows, reused for [`USAGE_CACHE_MS`].
+    /// Blocking: it may list (and hash) the whole tree under the store lock.
+    pub fn used_bytes(&self, slug: &str) -> Result<u64> {
+        let now = self.now_ms();
+        if let Some((at, used)) = self
+            .usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(slug)
+            .copied()
+            && now.saturating_sub(at) < USAGE_CACHE_MS
+        {
+            return Ok(used);
+        }
+        let store = self.store(slug)?;
+        let guard = store.lock_recovered(&self.journal)?;
+        let used = store
+            .list(&guard, &WirePath::root(), true)?
+            .iter()
+            .map(|e| e.size)
+            .sum();
+        drop(guard);
+        self.usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(slug.to_string(), (now, used));
+        Ok(used)
     }
 
     /// Milliseconds since the epoch, from the clock.

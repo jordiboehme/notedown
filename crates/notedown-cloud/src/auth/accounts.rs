@@ -32,11 +32,36 @@ pub struct Account {
     pub password_md5: String,
     pub created: String,
     pub locked: bool,
+    /// Set by `notedown cloud import` when a device backup was imported and verified. In accept
+    /// mode with `protect = true`, `synchronous/start` answers `E0079` until it is set. Absent in
+    /// files written before it existed and in accounts without an import.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported: Option<Imported>,
     /// When the lock was set (ms since the epoch); `None` while unlocked. Files written before
     /// this field existed read as `None`.
     #[serde(default)]
     pub locked_at_ms: Option<u64>,
     pub failed_logins: u32,
+    /// Storage quota in bytes (`totalCapacity`); absent means the default
+    /// ([`DEFAULT_QUOTA_BYTES`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_bytes: Option<u64>,
+}
+
+/// The default storage quota when `account.json` has no `quota_bytes`: 64 GiB.
+pub const DEFAULT_QUOTA_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// The import marker in `account.json`. Field order is the file order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Imported {
+    /// When the import finished, RFC 3339 (like `created`).
+    pub at: String,
+    /// The imported backup folder, as given on the command line.
+    pub source: String,
+    /// Number of imported files.
+    pub files: u64,
+    /// Total bytes of the imported files.
+    pub bytes: u64,
 }
 
 /// `md5_hex(password)`, 32 lowercase hex characters.
@@ -156,8 +181,10 @@ impl Accounts {
                 .format(&Rfc3339)
                 .expect("rfc3339 formatting"),
             locked: false,
+            imported: None,
             locked_at_ms: None,
             failed_logins: 0,
+            quota_bytes: None,
         };
         self.save(&account)?;
         Ok(account)

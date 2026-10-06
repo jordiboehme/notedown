@@ -1,14 +1,17 @@
 //! HTTP routes of the capture server and the request log.
 //!
 //! Every request passes [`log_request`], which writes exactly one protocol-log line for it.
-//! Routes: login and binding ([`login`]), server queries ([`server`]), the refusal of every file
-//! operation ([`refuse`]), the socket handshake ([`crate::socket`]) and the catch-all
-//! ([`catchall`]).
+//! Routes: login and binding ([`login`]), server queries ([`server`]), in accept mode the sync
+//! session, listing, queries, capacity ([`files`]) and signed downloads ([`oss`]), the refusal of
+//! every other file operation ([`refuse`]), the socket handshake ([`crate::socket`]) and the
+//! catch-all ([`catchall`]).
 
 pub mod catchall;
 pub mod envelope;
+pub mod files;
 pub mod limit;
 pub mod login;
+pub mod oss;
 pub mod refuse;
 pub mod server;
 
@@ -31,7 +34,7 @@ use crate::SyncMode;
 use crate::auth::Device;
 use crate::diag::{LogEntry, LogKind};
 use crate::server::{AppState, MAX_REQUEST_BODY};
-use envelope::{LogDevice, LogFlags, Reply};
+use envelope::{LogDevice, LogFlags, Reply, Streamed};
 
 pub const FLAG_UNKNOWN: &str = "unknown_endpoint";
 pub const FLAG_RETRY: &str = "retry_suspected";
@@ -54,8 +57,29 @@ const IMPLEMENTED: &[(&str, &str)] = &[
     ("GET", crate::socket::PATH),
 ];
 
+/// The file and oss routes served in accept mode (in refuse mode they answer `E0079`).
+const ACCEPT_IMPLEMENTED: &[(&str, &str)] = &[
+    ("POST", "/api/file/2/files/synchronous/start"),
+    ("POST", "/api/file/2/files/synchronous/end"),
+    ("POST", "/api/file/2/files/list_folder"),
+    ("POST", "/api/file/3/files/list_folder_v3"),
+    ("POST", "/api/file/3/files/query_v3"),
+    ("POST", "/api/file/3/files/query/by/path_v3"),
+    ("POST", "/api/file/3/files/download_v3"),
+    ("GET", "/api/oss/download"),
+    ("POST", "/api/file/capacity/query"),
+    ("POST", "/api/file/2/users/get_space_usage"),
+];
+
 fn is_implemented(method: &axum::http::Method, path: &str) -> bool {
     IMPLEMENTED
+        .iter()
+        .any(|(m, p)| method.as_str() == *m && path == *p)
+}
+
+/// Whether accept mode serves this method and path (see [`ACCEPT_IMPLEMENTED`]).
+fn is_accept_implemented(method: &axum::http::Method, path: &str) -> bool {
+    ACCEPT_IMPLEMENTED
         .iter()
         .any(|(m, p)| method.as_str() == *m && path == *p)
 }
@@ -114,9 +138,33 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// The file sync routes of accept mode. None yet: later tasks add them family by family.
+/// The file sync routes of accept mode. Another method on one of these paths is refused like
+/// any file path (`E0079`), not answered by the catch-all.
 fn accept_routes() -> Router<Arc<AppState>> {
+    fn p<H, T>(handler: H) -> axum::routing::MethodRouter<Arc<AppState>>
+    where
+        H: axum::handler::Handler<T, Arc<AppState>>,
+        T: 'static,
+    {
+        post(handler).fallback(refuse::refuse)
+    }
     Router::new()
+        .route("/api/file/2/files/synchronous/start", p(files::sync_start))
+        .route("/api/file/2/files/synchronous/end", p(files::sync_end))
+        .route("/api/file/2/files/list_folder", p(files::list_folder))
+        .route("/api/file/3/files/list_folder_v3", p(files::list_folder_v3))
+        .route("/api/file/3/files/query_v3", p(files::query_v3))
+        .route(
+            "/api/file/3/files/query/by/path_v3",
+            p(files::query_by_path_v3),
+        )
+        .route("/api/file/3/files/download_v3", p(files::download_v3))
+        .route("/api/file/capacity/query", p(files::capacity_query))
+        .route("/api/file/2/users/get_space_usage", p(files::space_usage))
+        .route(
+            "/api/oss/download",
+            get(oss::download).fallback(refuse::refuse),
+        )
 }
 
 fn panic_reply(_: Box<dyn std::any::Any + Send + 'static>) -> Response {
@@ -287,7 +335,12 @@ pub async fn log_request(
                 }
             )));
             let normalized = refuse::normalize(parts.uri.path());
-            let reply = if refuse::is_refused_path(&normalized) {
+            let accepted = state.sync_mode() == SyncMode::Accept
+                && is_accept_implemented(&parts.method, parts.uri.path());
+            let reply = if accepted {
+                // An implemented route: the note in request_body explains the refusal.
+                Reply::bad_params("body too large")
+            } else if refuse::is_refused_path(&normalized) {
                 refuse::refusal(&parts.method, &parts.uri)
             } else {
                 // The note in request_body explains the refusal; only a path no route takes is
@@ -303,19 +356,26 @@ pub async fn log_request(
         }
     };
 
+    if response.extensions().get::<Streamed>().is_some() {
+        // A download: one entry with status and size, written before the bytes flow (its
+        // duration is the time to the headers). The body is passed on untouched.
+        let (mut rparts, rbody) = response.into_parts();
+        let len = rparts
+            .headers
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("?")
+            .to_string();
+        entry.response_body = Some(Value::String(format!("<{len} bytes streamed>")));
+        finish_entry(&state, entry, &mut rparts, client, started, false);
+        return Response::from_parts(rparts, rbody);
+    }
+
     let (mut rparts, rbody) = response.into_parts();
     let rbytes = axum::body::to_bytes(rbody, usize::MAX)
         .await
         .unwrap_or_else(|_| Bytes::new());
     let rjson = serde_json::from_slice::<Value>(&rbytes).ok();
-    if let Some(LogFlags(flags)) = rparts.extensions.remove::<LogFlags>() {
-        entry.flags.extend(flags);
-    }
-    if entry.device.is_none()
-        && let Some(LogDevice(d)) = rparts.extensions.remove::<LogDevice>()
-    {
-        entry.device = Some(d);
-    }
     let success = rjson
         .as_ref()
         .and_then(|v| v.get("success"))
@@ -326,13 +386,43 @@ pub async fn log_request(
         .and_then(|v| v.get("errorCode"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    entry.response_status = Some(rparts.status.as_u16());
     entry.response_body_raw = rjson.as_ref().and_then(|_| raw_json(&rbytes));
     entry.response_body = rjson.or_else(|| {
         (!rbytes.is_empty()).then(|| Value::String(String::from_utf8_lossy(&rbytes).into_owned()))
     });
 
-    let failed = success == Some(false) || rparts.status.as_u16() >= 400;
+    finish_entry(
+        &state,
+        entry,
+        &mut rparts,
+        client,
+        started,
+        success == Some(false),
+    );
+    rparts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    Response::from_parts(rparts, Body::from(rbytes))
+}
+
+/// Complete and write the log entry of a request: flags and device from the response, status,
+/// the retry check and the duration.
+fn finish_entry(
+    state: &AppState,
+    mut entry: LogEntry,
+    rparts: &mut axum::http::response::Parts,
+    client: IpAddr,
+    started: Instant,
+    envelope_failed: bool,
+) {
+    if let Some(LogFlags(flags)) = rparts.extensions.remove::<LogFlags>() {
+        entry.flags.extend(flags);
+    }
+    if entry.device.is_none()
+        && let Some(LogDevice(d)) = rparts.extensions.remove::<LogDevice>()
+    {
+        entry.device = Some(d);
+    }
+    entry.response_status = Some(rparts.status.as_u16());
+    let failed = envelope_failed || rparts.status.as_u16() >= 400;
     let key = format!(
         "{} {} {}",
         entry.method.as_deref().unwrap_or(""),
@@ -344,6 +434,4 @@ pub async fn log_request(
     }
     entry.duration_ms = Some(started.elapsed().as_millis() as u64);
     state.log.record(entry);
-    rparts.headers.remove(axum::http::header::CONTENT_LENGTH);
-    Response::from_parts(rparts, Body::from(rbytes))
 }

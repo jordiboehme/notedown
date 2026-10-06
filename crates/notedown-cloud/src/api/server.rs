@@ -18,7 +18,10 @@ const FILE_TYPES: &str = "note,mark,pdf,epub,doc,docx,txt,png,jpg,jpeg,webp,bmp,
 const FILE_MAX: u64 = 1 << 30;
 
 /// Token from `x-access-token`, checked for signature, account and device generation.
-fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<(Authenticated, String), Reply> {
+pub(crate) fn authenticate(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(Authenticated, String), Reply> {
     let token = headers
         .get("x-access-token")
         .and_then(|v| v.to_str().ok())

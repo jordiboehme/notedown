@@ -1,0 +1,449 @@
+//! The file sync session, listing, queries, download URLs and capacity of accept mode
+//! (`docs/sync-protocol.md` 3.4, 3.5).
+//!
+//! Every route needs the device token. The body's `equipmentNo`, when present, must be the
+//! token's device (`E0312` otherwise). Every call of the device that holds the account's sync
+//! lock extends it. Store and journal work runs in blocking tasks under
+//! [`Store::lock_recovered`](crate::store::Store::lock_recovered), so nothing is listed or
+//! answered from an unrecovered registry.
+
+use std::sync::Arc;
+
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::HeaderMap;
+use serde_json::{Map, Value, json};
+
+use super::envelope::{Reply, field, parse_body};
+use crate::auth::{Account, DEFAULT_QUOTA_BYTES};
+use crate::server::AppState;
+use crate::store::{Entry, Kind, WirePath};
+use crate::sync::urls::{base_url, download_url};
+use crate::sync::{Purpose, SignedTarget, StartOutcome};
+
+/// Another device holds the sync lock.
+pub const E_SYNC_LOCKED: &str = "E0078";
+/// The path (or folder id) does not exist.
+pub const E_PATH_MISSING: &str = "E0081";
+/// The body names another device than the token.
+pub const E_DEVICE_MISMATCH: &str = "E0312";
+/// The file to download does not exist.
+pub const E_NO_FILE: &str = "E0321";
+
+pub const MSG_SYNC_LOCKED: &str = "A device is currently synchronizing";
+pub const MSG_PATH_MISSING: &str = "The path does not exist";
+pub const MSG_DEVICE_MISMATCH: &str = "The device is not linked to this account";
+pub const MSG_NO_FILE: &str = "The file does not exist";
+
+/// Log flag: `synchronous/start` refused by the protect gate (no import yet).
+pub const FLAG_PROTECT_REFUSED: &str = "protect_refused";
+/// Log flag: `synchronous/end` with `flag` `Y`.
+pub const FLAG_SYNC_END_OK: &str = "sync_end_ok";
+/// Log flag: `synchronous/end` with `flag` `N` (the device saw a failure).
+pub const FLAG_SYNC_END_FAILED: &str = "sync_end_failed";
+/// Log flag: `synchronous/end` with a missing or unknown `flag`.
+pub const FLAG_SYNC_END_UNKNOWN: &str = "sync_end_unknown_flag";
+/// Log flag: `synchronous/end` from a device that did not hold the lock.
+pub const FLAG_SYNC_LOCK_NOT_HELD: &str = "sync_lock_not_held";
+
+/// A checked device request: the token's account and device and the parsed body.
+#[derive(Debug)]
+pub struct DeviceRequest {
+    pub slug: String,
+    pub serial: String,
+    pub account: Account,
+    pub body: Value,
+}
+
+impl DeviceRequest {
+    /// Success envelope with `equipmentNo` and these payload fields (`fields` must be an
+    /// object), attributed to the device in the log.
+    pub fn ok(&self, fields: Value) -> Reply {
+        let mut m = Map::new();
+        m.insert("equipmentNo".into(), json!(self.serial));
+        if let Value::Object(f) = fields {
+            m.extend(f);
+        }
+        Reply::ok(Value::Object(m)).device(&self.serial)
+    }
+
+    pub fn error(&self, code: &str, msg: &str) -> Reply {
+        Reply::error(code, msg).device(&self.serial)
+    }
+}
+
+/// Authenticate the token, parse the body, check `equipmentNo` against the token's device
+/// (`E0312`; a body without it is accepted) and extend the sync lock when this device holds
+/// it. Every file route of accept mode starts here.
+pub fn device_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    bytes: &[u8],
+) -> Result<DeviceRequest, Reply> {
+    let (a, _) = super::server::authenticate(state, headers)?;
+    let serial = a.claims.equipment_no;
+    let body = parse_body(bytes).map_err(|r| r.device(&serial))?;
+    if let Some(sent) = field(&body, "equipmentNo")
+        && sent != serial
+    {
+        return Err(Reply::error(E_DEVICE_MISMATCH, MSG_DEVICE_MISMATCH).device(&serial));
+    }
+    let slug = a.account.slug.clone();
+    state.sync_locks.touch(&slug, &serial, state.now_ms());
+    Ok(DeviceRequest {
+        slug,
+        serial,
+        account: a.account,
+        body,
+    })
+}
+
+/// An id argument as the device sends it: a JSON string (`"4711"`) or a number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdArg {
+    /// Absent or `null`.
+    Missing,
+    Id(u64),
+    /// Any other type, or text that is no unsigned integer.
+    Bad,
+}
+
+pub fn id_arg(body: &Value, key: &str) -> IdArg {
+    match body.get(key) {
+        None | Some(Value::Null) => IdArg::Missing,
+        Some(Value::String(s)) => s.trim().parse().map_or(IdArg::Bad, IdArg::Id),
+        Some(Value::Number(n)) => n.as_u64().map_or(IdArg::Bad, IdArg::Id),
+        Some(_) => IdArg::Bad,
+    }
+}
+
+/// `recursive` as a boolean, or the strings `true` / `Y`. Default false.
+fn flag_arg(body: &Value, key: &str) -> bool {
+    match body.get(key) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => {
+            s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("y") || s == "1"
+        }
+        Some(Value::Number(n)) => n.as_u64() == Some(1),
+        _ => false,
+    }
+}
+
+/// Run blocking store work; an error becomes an internal-error envelope (and a line on stderr).
+pub async fn blocking<T, F>(serial: &str, f: F) -> Result<T, Reply>
+where
+    T: Send + 'static,
+    F: FnOnce() -> crate::Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => {
+            eprintln!("notedown cloud: {e}");
+            Err(Reply::internal().device(serial))
+        }
+        Err(e) => {
+            eprintln!("notedown cloud: blocking task failed: {e}");
+            Err(Reply::internal().device(serial))
+        }
+    }
+}
+
+fn entries_value(entries: &[Entry]) -> Value {
+    serde_json::to_value(entries).unwrap_or_else(|_| Value::Array(Vec::new()))
+}
+
+fn entry_value(entry: Option<&Entry>) -> Value {
+    entry
+        .and_then(|e| serde_json::to_value(e).ok())
+        .unwrap_or(Value::Null)
+}
+
+macro_rules! device_request {
+    ($state:expr, $headers:expr, $bytes:expr) => {
+        match device_request(&$state, &$headers, &$bytes) {
+            Ok(r) => r,
+            Err(reply) => return reply,
+        }
+    };
+}
+
+/// `POST /api/file/2/files/synchronous/start`. Order: device check, the protect gate (accept
+/// mode with `protect = true` refuses with `E0079` until the account has an `imported` marker),
+/// then the lock (`E0078` while another device holds it). Answers `synType: true`.
+pub async fn sync_start(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Reply {
+    let req = device_request!(state, headers, bytes);
+    if state.config.protect && req.account.imported.is_none() {
+        return Reply::sync_busy()
+            .flag(FLAG_PROTECT_REFUSED)
+            .device(&req.serial);
+    }
+    match state
+        .sync_locks
+        .start(&req.slug, &req.serial, state.now_ms())
+    {
+        StartOutcome::Busy { .. } => req.error(E_SYNC_LOCKED, MSG_SYNC_LOCKED),
+        StartOutcome::Taken | StartOutcome::Renewed => req.ok(json!({"synType": true})),
+    }
+}
+
+/// `POST /api/file/2/files/synchronous/end` (`flag` `Y` or `N`): releases this device's lock.
+/// The flag is logged (`sync_end_ok`, `sync_end_failed`).
+pub async fn sync_end(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Reply {
+    let req = device_request!(state, headers, bytes);
+    let released = state.sync_locks.end(&req.slug, &req.serial, state.now_ms());
+    let mut reply = req.ok(json!({}));
+    reply = match field(&req.body, "flag").as_deref() {
+        Some("Y") | Some("y") => reply.flag(FLAG_SYNC_END_OK),
+        Some("N") | Some("n") => reply.flag(FLAG_SYNC_END_FAILED),
+        _ => reply.flag(FLAG_SYNC_END_UNKNOWN),
+    };
+    if !released {
+        reply = reply.flag(FLAG_SYNC_LOCK_NOT_HELD);
+    }
+    reply
+}
+
+/// The folder a listing is for.
+enum Folder {
+    Path(WirePath),
+    /// A folder id, resolved under the recovered store lock.
+    Id(u64),
+}
+
+/// The listing of a folder (the root included). `None` when it is not a folder. The id or path
+/// is resolved after `lock_recovered`, so an unfinished commit is repaired first.
+fn list_folder_of(
+    state: &AppState,
+    slug: &str,
+    folder: Folder,
+    recursive: bool,
+) -> crate::Result<Option<Vec<Entry>>> {
+    let store = state.store(slug)?;
+    let guard = store.lock_recovered(&state.journal)?;
+    let path = match folder {
+        Folder::Path(p) => p,
+        Folder::Id(id) => match store.kind_and_path_of(id)? {
+            Some((Kind::Folder, p)) => p,
+            _ => return Ok(None),
+        },
+    };
+    if !path.is_root() {
+        match store.entry(&guard, &path)? {
+            Some(e) if e.tag == Kind::Folder => {}
+            _ => return Ok(None),
+        }
+    }
+    store.list(&guard, &path, recursive).map(Some)
+}
+
+/// `POST /api/file/2/files/list_folder` `{path, recursive}`: `entries`. `""` or `/` is the
+/// root. A path that is not a folder answers `E0081` (never an empty list, which the device
+/// could read as "everything deleted").
+pub async fn list_folder(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Reply {
+    let req = device_request!(state, headers, bytes);
+    let text = match req.body.get("path") {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(_) => return req.error(E_PATH_MISSING, MSG_PATH_MISSING),
+    };
+    let Ok(path) = WirePath::parse(&text) else {
+        return req.error(E_PATH_MISSING, MSG_PATH_MISSING);
+    };
+    let recursive = flag_arg(&req.body, "recursive");
+    let (st, slug) = (state.clone(), req.slug.clone());
+    match blocking(&req.serial, move || {
+        list_folder_of(&st, &slug, Folder::Path(path), recursive)
+    })
+    .await
+    {
+        Ok(Some(entries)) => req.ok(json!({"entries": entries_value(&entries)})),
+        Ok(None) => req.error(E_PATH_MISSING, MSG_PATH_MISSING),
+        Err(r) => r,
+    }
+}
+
+/// `POST /api/file/3/files/list_folder_v3` `{id, recursive}`: the entries of the folder with
+/// that id; id `0` or null is the root. An unknown id or a file id (also a string or number that
+/// is no valid id) answers `E0081`; an id of another JSON type answers `422`.
+pub async fn list_folder_v3(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Reply {
+    let req = device_request!(state, headers, bytes);
+    let id = match id_arg(&req.body, "id") {
+        IdArg::Missing | IdArg::Id(0) => None,
+        IdArg::Id(n) => Some(n),
+        IdArg::Bad
+            if matches!(
+                req.body.get("id"),
+                Some(Value::String(_) | Value::Number(_))
+            ) =>
+        {
+            return req.error(E_PATH_MISSING, MSG_PATH_MISSING);
+        }
+        IdArg::Bad => return Reply::bad_params("id").device(&req.serial),
+    };
+    let recursive = flag_arg(&req.body, "recursive");
+    let (st, slug) = (state.clone(), req.slug.clone());
+    let folder = id.map_or(Folder::Path(WirePath::root()), Folder::Id);
+    let r = blocking(&req.serial, move || {
+        list_folder_of(&st, &slug, folder, recursive)
+    })
+    .await;
+    match r {
+        Ok(Some(entries)) => req.ok(json!({"entries": entries_value(&entries)})),
+        Ok(None) => req.error(E_PATH_MISSING, MSG_PATH_MISSING),
+        Err(r) => r,
+    }
+}
+
+/// The entry with `id`, if the id is known and something listable is at its path.
+fn entry_by_id(state: &AppState, slug: &str, id: u64) -> crate::Result<Option<Entry>> {
+    let store = state.store(slug)?;
+    let guard = store.lock_recovered(&state.journal)?;
+    let Some(path) = store.path_of(id)? else {
+        return Ok(None);
+    };
+    Ok(store.entry(&guard, &path)?.filter(|e| e.id == id))
+}
+
+/// `POST /api/file/3/files/query_v3` `{id}`: `entriesVO`, or null for an unknown id (or one
+/// that is no id at all).
+pub async fn query_v3(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Reply {
+    let req = device_request!(state, headers, bytes);
+    let IdArg::Id(id) = id_arg(&req.body, "id") else {
+        return req.ok(json!({"entriesVO": null}));
+    };
+    let (st, slug) = (state.clone(), req.slug.clone());
+    match blocking(&req.serial, move || entry_by_id(&st, &slug, id)).await {
+        Ok(e) => req.ok(json!({"entriesVO": entry_value(e.as_ref())})),
+        Err(r) => r,
+    }
+}
+
+/// `POST /api/file/3/files/query/by/path_v3` `{path}`: `entriesVO` or null, always HTTP 200
+/// (a missing, unparsable or hidden path and the root give null).
+pub async fn query_by_path_v3(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Reply {
+    let req = device_request!(state, headers, bytes);
+    let Some(path) = req
+        .body
+        .get("path")
+        .and_then(Value::as_str)
+        .and_then(|t| WirePath::parse(t).ok())
+        .filter(|p| !p.is_root())
+    else {
+        return req.ok(json!({"entriesVO": null}));
+    };
+    let (st, slug) = (state.clone(), req.slug.clone());
+    let r = blocking(&req.serial, move || {
+        let store = st.store(&slug)?;
+        let guard = store.lock_recovered(&st.journal)?;
+        store.entry(&guard, &path)
+    })
+    .await;
+    match r {
+        Ok(e) => req.ok(json!({"entriesVO": entry_value(e.as_ref())})),
+        Err(r) => r,
+    }
+}
+
+/// `POST /api/file/3/files/download_v3` `{id}`: a signed download URL (valid 24 h) and the
+/// file's entry fields. Unknown id, a folder, a vanished file or an id of another type: `E0321`.
+pub async fn download_v3(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Reply {
+    let req = device_request!(state, headers, bytes);
+    let IdArg::Id(id) = id_arg(&req.body, "id") else {
+        return req.error(E_NO_FILE, MSG_NO_FILE);
+    };
+    let (st, slug) = (state.clone(), req.slug.clone());
+    let entry = match blocking(&req.serial, move || entry_by_id(&st, &slug, id)).await {
+        Ok(Some(e)) if e.tag == Kind::File => e,
+        Ok(_) => return req.error(E_NO_FILE, MSG_NO_FILE),
+        Err(r) => return r,
+    };
+    let target = SignedTarget {
+        account: req.slug.clone(),
+        device: req.serial.clone(),
+        path: entry.path_display.clone(),
+    }
+    .encode();
+    let signed = state
+        .url_signer
+        .sign("GET", &target, Purpose::Download, 0, state.now_ms());
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok());
+    let base = base_url(state.config.external_base_url.as_deref(), host);
+    req.ok(json!({
+        "id": entry.id.to_string(),
+        "url": download_url(&base, &target, &signed, entry.id),
+        "name": entry.name,
+        "path_display": entry.path_display,
+        "content_hash": entry.content_hash,
+        "size": entry.size,
+        "is_downloadable": entry.is_downloadable,
+    }))
+}
+
+/// `POST /api/file/capacity/query`: `usedCapacity` (bytes of every listed file, cached for
+/// 60 s) and `totalCapacity` (`quota_bytes` of `account.json`, else 64 GiB).
+pub async fn capacity_query(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Reply {
+    let req = device_request!(state, headers, bytes);
+    let (st, slug) = (state.clone(), req.slug.clone());
+    match blocking(&req.serial, move || st.used_bytes(&slug)).await {
+        Ok(used) => req.ok(json!({
+            "usedCapacity": used,
+            "totalCapacity": req.account.quota_bytes.unwrap_or(DEFAULT_QUOTA_BYTES),
+        })),
+        Err(r) => r,
+    }
+}
+
+/// `POST /api/file/2/users/get_space_usage`: `used` and `allocationVO {tag: "individual",
+/// allocated}`, the same numbers as `capacity/query`.
+pub async fn space_usage(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Reply {
+    let req = device_request!(state, headers, bytes);
+    let (st, slug) = (state.clone(), req.slug.clone());
+    match blocking(&req.serial, move || st.used_bytes(&slug)).await {
+        Ok(used) => req.ok(json!({
+            "used": used,
+            "allocationVO": {
+                "tag": "individual",
+                "allocated": req.account.quota_bytes.unwrap_or(DEFAULT_QUOTA_BYTES),
+            },
+        })),
+        Err(r) => r,
+    }
+}

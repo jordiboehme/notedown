@@ -1,9 +1,9 @@
 //! notedown-cloud: a file-based Supernote Private Cloud server.
 //!
 //! This crate currently holds the configuration, the always-on protocol log, the accounts, login
-//! codes and tokens, the HTTP routes of the capture server (login, server queries, refusal of
-//! every file operation), the auto-sync socket, the file store of each account, the change
-//! journal and the page index of notes.
+//! codes and tokens, the HTTP routes (login, server queries, in accept mode the sync session,
+//! listing, queries and signed downloads, refusal of every other file operation), the auto-sync
+//! socket, the file store of each account, the change journal and the page index of notes.
 
 pub mod fsutil;
 
@@ -16,6 +16,7 @@ pub mod pages;
 pub mod server;
 pub mod socket;
 pub mod store;
+pub mod sync;
 
 pub use config::{Config, SyncMode};
 pub use diag::{Clock, LogEntry, LogKind, ProtocolLog, SystemClock};

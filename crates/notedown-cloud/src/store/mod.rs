@@ -451,6 +451,31 @@ impl Store {
         Ok(entries.pop())
     }
 
+    /// Open the file at `path` for reading, resolved by exact names like a listing (no other
+    /// spelling, no symlink, nothing hidden). `None` when no such file is there. The handle stays
+    /// valid after the guard is dropped, so a download streams without the store lock.
+    pub fn open_file(
+        &self,
+        guard: &StoreGuard,
+        path: &WirePath,
+    ) -> Result<Option<(std::fs::File, u64)>> {
+        self.check_guard(guard)?;
+        let Some(found) = list::resolve(&self.files, path)? else {
+            return Ok(None);
+        };
+        if found.kind != Kind::File {
+            return Ok(None);
+        }
+        match std::fs::File::open(&found.fs_path) {
+            Ok(f) => {
+                let len = f.metadata().map_err(io_err(&found.fs_path))?.len();
+                Ok(Some((f, len)))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io_err(&found.fs_path)(e)),
+        }
+    }
+
     /// The entries below `path` (direct children, or every descendant with `recursive`), flat
     /// and sorted by path segments, so a folder's descendants follow it. Folders are entries of
     /// their own. Dot-entries and everything outside `files/` never appear. A missing path or a

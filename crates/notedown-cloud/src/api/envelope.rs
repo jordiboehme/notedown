@@ -33,6 +33,11 @@ pub struct LogFlags(pub Vec<String>);
 #[derive(Debug, Clone)]
 pub struct LogDevice(pub String);
 
+/// Marks a response whose body streams (a download): the request log records its status and
+/// headers and passes the body through without reading it.
+#[derive(Debug, Clone, Copy)]
+pub struct Streamed;
+
 /// One answer: an envelope plus what the request log should know about it.
 #[derive(Debug)]
 pub struct Reply {

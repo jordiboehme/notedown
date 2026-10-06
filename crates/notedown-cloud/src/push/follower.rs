@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, MutexGuard};
 use std::time::Duration;
 
-use super::{PushPlanner, server_message_frame, startsync_message};
+use super::{PushPlanner, detail_message, server_message_frame, startsync_message};
 use crate::diag::{LogEntry, LogKind};
 use crate::server::AppState;
 use crate::{PushMode, SyncMode};
@@ -103,8 +103,16 @@ pub fn tick(state: &AppState, now_ms: u64) -> usize {
         let Some(pending) = planner.pending(&slug, &serial) else {
             continue;
         };
-        // `detail` falls back to `STARTSYNC` until it is built.
-        let frame = server_message_frame(&startsync_message(pending.cause.as_deref(), now_ms));
+        let cause = pending.cause.as_deref();
+        // `detail` falls back to `STARTSYNC` when its message cannot be built.
+        let detail = (state.config.push == PushMode::Detail)
+            .then(|| {
+                let store = state.store(&slug).ok()?;
+                detail_message(&pending.events, cause, &store, now_ms).ok()
+            })
+            .flatten();
+        let message = detail.unwrap_or_else(|| startsync_message(cause, now_ms));
+        let frame = server_message_frame(&message);
         if state.sockets.send(&slug, &serial, frame) {
             planner.sent(&slug, &serial, now_ms);
             sent += 1;

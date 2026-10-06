@@ -144,6 +144,11 @@ impl PushPlanner {
         {
             t.pending = None;
         }
+        // A push that stays pending keeps only the events the sync did not see.
+        if let Some(p) = &mut t.pending {
+            let covered = t.covered_seq;
+            p.events.retain(|e| e.seq > covered);
+        }
     }
 
     /// The targets `(slug, serial)`, sorted, whose debounce and rate rules allow a push at
@@ -337,6 +342,25 @@ mod tests {
         p.observe(&ev(Origin::Cli, None, 12, created()), &targets(), 0);
         p.covered("acc", "B", 10);
         assert!(is_pending(&p, "B"));
+    }
+
+    #[test]
+    fn covered_drops_the_seen_events_from_a_pending_push_that_stays() {
+        let mut p = planner();
+        for seq in [8, 9, 12] {
+            p.observe(&ev(Origin::Cli, None, seq, created()), &targets(), 0);
+        }
+        p.covered("acc", "B", 10);
+        let seqs: Vec<u64> = p
+            .pending("acc", "B")
+            .unwrap()
+            .events
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(seqs, [12]);
+        // the other target's pending push is untouched
+        assert_eq!(p.pending("acc", "A").unwrap().events.len(), 3);
     }
 
     #[test]

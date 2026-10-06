@@ -378,7 +378,7 @@ fn refused_sync_sends_nothing() {
 }
 
 #[test]
-fn detail_mode_sends_startsync_for_now() {
+fn detail_mode_sends_one_item_per_change() {
     let config = Config {
         push: PushMode::Detail,
         ..Config::default()
@@ -388,7 +388,24 @@ fn detail_mode_sends_startsync_for_now() {
     f.follow();
     let t = f.now() + 2000;
     assert_eq!(tick(&f.state, t), 2);
-    assert_eq!(f.frames(A), vec![startsync(None, t)]);
+    let frames = f.frames(A);
+    assert_eq!(frames.len(), 1);
+    let v: Value = serde_json::from_str(&frames[0][2..]).unwrap();
+    assert_eq!(v[0], "ServerMessage");
+    let m: Value = serde_json::from_str(v[1].as_str().unwrap()).unwrap();
+    assert_eq!(m["msgType"], "FILE-SYN");
+    let items = m["data"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    assert_eq!(item["messageType"], "DOWNLOADFILE");
+    assert_eq!(item["fileType"], "FILE");
+    assert_eq!(item["equipmentNo"], "null-null");
+    assert_eq!(item["originalName"], "a.note");
+    assert_eq!(item["originalPath"], "NOTE/Note/");
+    assert_eq!(item["md5"], md5_hex("bytes of a.note"));
+    assert_eq!(item["size"], "bytes of a.note".len());
+    assert!(item["directoryId"].is_u64());
+    assert_eq!(f.frames(B).len(), 1);
 }
 
 #[test]

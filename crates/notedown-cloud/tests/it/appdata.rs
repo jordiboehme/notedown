@@ -775,3 +775,114 @@ fn app_import_without_groups_file_and_with_an_unreadable_record_in_the_account()
     );
     assert!(e.is_err());
 }
+
+#[test]
+fn app_import_dry_run_takes_no_lock_leaves_a_pending_commit_and_creates_no_journal() {
+    let f = import_fixture();
+    let file = f.data().join("device.snbak");
+    snbak(&file, &backup_entries());
+    let pending = f.store.account_dir().join("pending.json");
+    std::fs::write(&pending, b"an unfinished commit").unwrap();
+    std::fs::remove_dir_all(f.data().join("journal")).unwrap();
+    let r =
+        notedown_cloud::appdata::dry_run_app_data(f.data(), "jordi", Some(&file), false).unwrap();
+    assert_eq!((r.digests, r.groups, r.marks), (3, 1, 2));
+    assert_eq!(std::fs::read(&pending).unwrap(), b"an unfinished commit");
+    assert!(!f.data().join("journal").exists());
+    assert!(!f.store.account_dir().join("digests").exists());
+    // The options form with dry_run takes the same path.
+    let r2 = run(
+        &f,
+        Some(&file),
+        &AppImportOptions {
+            dry_run: true,
+            replace: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(r2, r);
+    assert_eq!(std::fs::read(&pending).unwrap(), b"an unfinished commit");
+}
+
+#[test]
+fn app_import_dry_run_sees_the_records_of_the_account() {
+    let f = import_fixture();
+    let file = f.data().join("device.snbak");
+    snbak(&file, &backup_entries());
+    {
+        let app = AppData::new(&f.store);
+        let g = f.store.lock_recovered(&f.journal).unwrap();
+        app.put_digest(
+            &g,
+            &digest(900_000_000_000_000_000, "old"),
+            Origin::Device,
+            None,
+            &f.journal,
+        )
+        .unwrap();
+    }
+    let e = notedown_cloud::appdata::dry_run_app_data(f.data(), "jordi", Some(&file), false)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("1 digests") && e.contains("--replace"), "{e}");
+    let r =
+        notedown_cloud::appdata::dry_run_app_data(f.data(), "jordi", Some(&file), true).unwrap();
+    assert_eq!(r.replaced, 1);
+    // New ids sit above the account's own largest id, as in the real import.
+    assert_eq!(
+        r.new_ids,
+        vec!["Note/y.note: 900000000000000001".to_string()]
+    );
+}
+
+#[test]
+fn app_import_replace_removes_task_sorts_and_a_group_without_service_id_gets_a_new_id() {
+    use notedown_cloud::appdata::TaskSort;
+    let f = import_fixture();
+    {
+        let app = AppData::new(&f.store);
+        let g = f.store.lock_recovered(&f.journal).unwrap();
+        app.put_task_sort(
+            &g,
+            &TaskSort {
+                task_list_id: "l1".into(),
+                ..TaskSort::default()
+            },
+        )
+        .unwrap();
+    }
+    let file = f.data().join("device.snbak");
+    let mut entries = backup_entries();
+    for (n, b) in &mut entries {
+        if n.ends_with("knowledge_bases.json") {
+            *b = json_bytes(json!([
+                {"id": 1, "uniqueIdentifier": "g1", "name": "Ideas", "md5Hash": "gm"}
+            ]));
+        }
+    }
+    snbak(&file, &entries);
+    assert!(run(&f, Some(&file), &no_options()).is_err());
+    let r = run(
+        &f,
+        Some(&file),
+        &AppImportOptions {
+            dry_run: false,
+            replace: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(r.replaced, 1);
+    // The digest without a cloud id and the group take the next two ids, in that order.
+    assert_eq!(
+        r.new_ids,
+        vec![
+            "Note/y.note: 895334188016730201".to_string(),
+            "group Ideas: 895334188016730202".to_string()
+        ]
+    );
+    let app = AppData::new(&f.store);
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    assert!(app.task_sorts(&g).unwrap().is_empty());
+    let groups = app.digest_groups(&g).unwrap();
+    assert_eq!(groups[0].id, 895_334_188_016_730_202);
+}

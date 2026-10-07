@@ -43,7 +43,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub use digests::{Digest, DigestGroup, DigestTag};
-pub use import::{AppImportOptions, AppImportReport, import_app_data};
+pub use import::{AppImportOptions, AppImportReport, dry_run_app_data, import_app_data};
 pub use tasks::{Task, TaskGroup, TaskSort};
 
 use crate::journal::{Event, EventBody, Journal, Origin, new_op_id};

@@ -294,6 +294,155 @@ fn excerpt(content: Option<&str>) -> String {
         .collect()
 }
 
+/// The refusal for an account that holds records; `counts` are digests, digest groups, to-dos,
+/// to-do groups and to-do sorts.
+fn present_refusal(slug: &str, c: [usize; 5]) -> Error {
+    failed(format!(
+        "account {slug} already holds {} digests, {} digest groups, {} to-dos, {} to-do groups \
+         and {} to-do sorts; use --replace to clear them first",
+        c[0], c[1], c[2], c[3], c[4]
+    ))
+}
+
+/// Give the records without a cloud id new ids above `next` and above the backup's ids, set
+/// the owner, and describe the digests. Returns the `new_ids` and `mapping` lines.
+fn assign_ids(backup: &mut Backup, mut next: u64, user_id: u64) -> (Vec<String>, Vec<String>) {
+    for id in backup
+        .digests
+        .iter()
+        .map(|d| d.id)
+        .chain(backup.groups.iter().map(|g| g.id))
+    {
+        next = next.max(id.saturating_add(1));
+    }
+    let mut new_ids = Vec::new();
+    let mut mapping = Vec::new();
+    for d in &mut backup.digests {
+        if d.id == 0 {
+            d.id = next;
+            next += 1;
+            new_ids.push(format!(
+                "{}: {}",
+                d.source_path.as_deref().unwrap_or(""),
+                d.id
+            ));
+        }
+        d.user_id = user_id;
+        mapping.push(format!(
+            "{}  {}  {}",
+            d.id,
+            d.source_path.as_deref().unwrap_or(""),
+            excerpt(d.content.as_deref())
+        ));
+    }
+    for g in &mut backup.groups {
+        if g.id == 0 {
+            g.id = next;
+            next += 1;
+            new_ids.push(format!(
+                "group {}: {}",
+                g.name.as_deref().unwrap_or(""),
+                g.id
+            ));
+        }
+    }
+    (new_ids, mapping)
+}
+
+/// Live records and the largest file-name id in `dir` (`<id>.json` files), read without the
+/// store lock. A file that cannot be read or parsed is an error, as in the strict lists. A
+/// missing folder is empty.
+fn scan_records(dir: &Path) -> Result<(usize, u64)> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) => return Err(io_err(dir)(e)),
+    };
+    let (mut live, mut max_id) = (0, 0);
+    for e in entries {
+        let path = e.map_err(io_err(dir))?.path();
+        let Some(stem) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".json"))
+            .filter(|n| !n.starts_with('.'))
+        else {
+            continue;
+        };
+        let bytes = std::fs::read(&path).map_err(io_err(&path))?;
+        let record: Map<String, Value> = serde_json::from_slice(&bytes)
+            .map_err(|e| failed(format!("{}: {e}", path.display())))?;
+        if record.get("isDeleted").and_then(Value::as_str) != Some("Y") {
+            live += 1;
+        }
+        if let Ok(id) = stem.parse::<u64>() {
+            max_id = max_id.max(id);
+        }
+    }
+    Ok((live, max_id))
+}
+
+/// The read-only check of [`import_app_data`] for `--dry-run`: the same refusals and counts,
+/// and nothing is written. It takes no lock and needs no journal, so a pending commit stays
+/// as it is and no folder is created. `replace` says whether `--replace` was given.
+pub fn dry_run_app_data(
+    data: &Path,
+    slug: &str,
+    snbak: Option<&Path>,
+    replace: bool,
+) -> Result<AppImportReport> {
+    let account = Accounts::new(data)
+        .get(slug)?
+        .ok_or_else(|| Error::NoAccount(slug.to_string()))?;
+    if account.imported.is_none() {
+        return Err(failed(
+            "import the device files first (notedown cloud import)",
+        ));
+    }
+    let mut backup = match snbak {
+        Some(path) => read_backup(path)?,
+        None => Backup {
+            digests: Vec::new(),
+            groups: Vec::new(),
+            marks: BTreeMap::new(),
+            skipped: Vec::new(),
+        },
+    };
+    let dir = data.join("accounts").join(slug);
+    let (digests, max_item) = scan_records(&dir.join(super::DIGESTS_DIR).join("items"))?;
+    let (groups, max_group) = scan_records(&dir.join(super::DIGESTS_DIR).join("groups"))?;
+    let (tasks, _) = scan_records(&dir.join(super::TASKS_DIR).join("items"))?;
+    let (task_groups, _) = scan_records(&dir.join(super::TASKS_DIR).join("groups"))?;
+    let sorts = std::fs::read_dir(dir.join(super::TASKS_DIR).join("sort"))
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+                .count()
+        })
+        .unwrap_or(0);
+    let present = digests + groups + tasks + task_groups + sorts;
+    if present > 0 && !replace {
+        return Err(present_refusal(
+            slug,
+            [digests, groups, tasks, task_groups, sorts],
+        ));
+    }
+    let next = max_item
+        .max(max_group)
+        .saturating_add(1)
+        .max(super::FIRST_DIGEST_ID);
+    let (new_ids, mapping) = assign_ids(&mut backup, next, account.user_id);
+    Ok(AppImportReport {
+        digests: backup.digests.len() as u64,
+        groups: backup.groups.len() as u64,
+        marks: backup.marks.len() as u64,
+        new_ids,
+        skipped: backup.skipped,
+        mapping,
+        replaced: present as u64,
+    })
+}
+
 /// Fill the account `slug` from the `.snbak` at `snbak`, or, with `None`, import nothing and
 /// only set the marker (an account whose device has no digests). See the module docs.
 pub fn import_app_data(
@@ -303,6 +452,9 @@ pub fn import_app_data(
     options: &AppImportOptions,
     journal: &Journal,
 ) -> Result<AppImportReport> {
+    if options.dry_run {
+        return dry_run_app_data(data, slug, snbak, options.replace);
+    }
     let accounts = Accounts::new(data);
     let account = accounts
         .get(slug)?
@@ -349,58 +501,21 @@ pub fn import_app_data(
     let present =
         live_digests.len() + live_groups.len() + live_tasks.len() + task_groups.len() + sorts.len();
     if present > 0 && !options.replace {
-        return Err(failed(format!(
-            "account {slug} already holds {} digests, {} digest groups, {} to-dos, {} to-do              groups and {} to-do sorts; use --replace to clear them first",
-            live_digests.len(),
-            live_groups.len(),
-            live_tasks.len(),
-            task_groups.len(),
-            sorts.len()
-        )));
-    }
-
-    // New ids start above everything the account has ever used and above the backup's ids.
-    let mut next = app.next_digest_id(&guard)?;
-    for id in backup
-        .digests
-        .iter()
-        .map(|d| d.id)
-        .chain(backup.groups.iter().map(|g| g.id))
-    {
-        next = next.max(id.saturating_add(1));
-    }
-    let mut new_ids = Vec::new();
-    let mut mapping = Vec::new();
-    for d in &mut backup.digests {
-        if d.id == 0 {
-            d.id = next;
-            next += 1;
-            new_ids.push(format!(
-                "{}: {}",
-                d.source_path.as_deref().unwrap_or(""),
-                d.id
-            ));
-        }
-        d.user_id = account.user_id;
-        mapping.push(format!(
-            "{}  {}  {}",
-            d.id,
-            d.source_path.as_deref().unwrap_or(""),
-            excerpt(d.content.as_deref())
+        return Err(present_refusal(
+            slug,
+            [
+                live_digests.len(),
+                live_groups.len(),
+                live_tasks.len(),
+                task_groups.len(),
+                sorts.len(),
+            ],
         ));
     }
-    for g in &mut backup.groups {
-        if g.id == 0 {
-            g.id = next;
-            next += 1;
-            new_ids.push(format!(
-                "group {}: {}",
-                g.name.as_deref().unwrap_or(""),
-                g.id
-            ));
-        }
-    }
-    let mut report = AppImportReport {
+
+    let next = app.next_digest_id(&guard)?;
+    let (new_ids, mapping) = assign_ids(&mut backup, next, account.user_id);
+    let report = AppImportReport {
         digests: backup.digests.len() as u64,
         groups: backup.groups.len() as u64,
         marks: backup.marks.len() as u64,
@@ -409,10 +524,6 @@ pub fn import_app_data(
         mapping,
         replaced: present as u64,
     };
-    if options.dry_run {
-        report.replaced = if options.replace { present as u64 } else { 0 };
-        return Ok(report);
-    }
 
     // Close the gate before the first write: a failed import must not leave it open.
     set_marker(&accounts, slug, None)?;

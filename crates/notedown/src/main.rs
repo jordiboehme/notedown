@@ -695,23 +695,30 @@ fn import_command(args: ImportArgs) -> Result<ExitCode> {
 }
 
 fn import_app_data_command(args: ImportAppDataArgs) -> Result<ExitCode> {
-    use notedown_cloud::appdata::{AppImportOptions, import_app_data};
-    let options = AppImportOptions {
-        dry_run: args.dry_run,
-        replace: args.replace,
+    use notedown_cloud::appdata::{AppImportOptions, dry_run_app_data, import_app_data};
+    let report = if args.dry_run {
+        // No lock and no journal: a dry run writes nothing, not even a folder.
+        dry_run_app_data(
+            &args.data,
+            &args.account,
+            args.snbak.as_deref(),
+            args.replace,
+        )?
+    } else {
+        let journal = notedown_cloud::journal::Journal::open(&args.data)?;
+        import_app_data(
+            &args.data,
+            &args.account,
+            args.snbak.as_deref(),
+            &AppImportOptions {
+                dry_run: false,
+                replace: args.replace,
+            },
+            &journal,
+        )?
     };
-    let journal = notedown_cloud::journal::Journal::open(&args.data)?;
-    let report = import_app_data(
-        &args.data,
-        &args.account,
-        args.snbak.as_deref(),
-        &options,
-        &journal,
-    )?;
     if args.dry_run {
         println!("dry run, nothing is written");
-    }
-    if args.dry_run {
         for line in &report.mapping {
             println!("{line}");
         }

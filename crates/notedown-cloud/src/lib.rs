@@ -4,11 +4,12 @@
 //! codes and tokens, the HTTP routes (login, server queries, in accept mode the sync session,
 //! listing, queries, signed downloads and uploads, refusal of every other file operation), the
 //! auto-sync socket, the file store of each account with its recycle bin and upload staging, the
-//! change journal and the page index of notes.
+//! change journal, the page index of notes and the app data (digests and to-dos).
 
 pub mod fsutil;
 
 pub mod api;
+pub mod appdata;
 pub mod auth;
 pub mod config;
 pub mod device_backup;

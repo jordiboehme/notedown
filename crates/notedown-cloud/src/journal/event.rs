@@ -158,6 +158,77 @@ pub enum EventBody {
         path: String,
         reason: String,
     },
+    /// A new digest, or a deleted one that came back (see [`crate::appdata`]).
+    #[serde(rename = "digest.created")]
+    DigestCreated(DigestInfo),
+    /// A changed digest.
+    #[serde(rename = "digest.updated")]
+    DigestUpdated(DigestInfo),
+    /// A digest was soft-deleted; the record stays with `isDeleted: "Y"`.
+    #[serde(rename = "digest.deleted")]
+    DigestDeleted(DigestInfo),
+    #[serde(rename = "digest_group.created")]
+    DigestGroupCreated(DigestGroupInfo),
+    #[serde(rename = "digest_group.updated")]
+    DigestGroupUpdated(DigestGroupInfo),
+    /// A digest group was soft-deleted.
+    #[serde(rename = "digest_group.deleted")]
+    DigestGroupDeleted(DigestGroupInfo),
+    #[serde(rename = "task.created")]
+    TaskCreated(TaskInfo),
+    #[serde(rename = "task.updated")]
+    TaskUpdated(TaskInfo),
+    /// A to-do was deleted; the event keeps its title and status, the record is only a
+    /// tombstone until it is swept.
+    #[serde(rename = "task.deleted")]
+    TaskDeleted(TaskInfo),
+    #[serde(rename = "task_group.created")]
+    TaskGroupCreated(TaskGroupInfo),
+    #[serde(rename = "task_group.updated")]
+    TaskGroupUpdated(TaskGroupInfo),
+    #[serde(rename = "task_group.deleted")]
+    TaskGroupDeleted(TaskGroupInfo),
+}
+
+/// The fields of `digest.*` events. `uniqueIdentifier` is the digest's identity,
+/// `metadata.unique_identifier` (the top-level field of the record is empty on items), or
+/// empty when the metadata has none. `sourcePath` is empty and `sourceType` null when the
+/// record has none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DigestInfo {
+    pub id: u64,
+    pub unique_identifier: String,
+    pub source_path: String,
+    #[serde(default)]
+    pub source_type: Option<i64>,
+    pub md5_hash: String,
+}
+
+/// The fields of `digest_group.*` events; `name` is empty when the group has none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DigestGroupInfo {
+    pub id: u64,
+    pub name: String,
+}
+
+/// The fields of `task.*` events; `title` and `status` are empty when the task has none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskInfo {
+    pub task_id: String,
+    pub task_list_id: String,
+    pub title: String,
+    pub status: String,
+}
+
+/// The fields of `task_group.*` events; `title` is empty when the group has none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskGroupInfo {
+    pub task_list_id: String,
+    pub title: String,
 }
 
 /// One changed part of a page in `page.modified`: its name (`strokes`, `layers`, `textboxes`,
@@ -189,6 +260,18 @@ impl EventBody {
             EventBody::PageRemoved { .. } => "page.removed",
             EventBody::PageMoved { .. } => "page.moved",
             EventBody::PageIndexFailed { .. } => "page.index_failed",
+            EventBody::DigestCreated(_) => "digest.created",
+            EventBody::DigestUpdated(_) => "digest.updated",
+            EventBody::DigestDeleted(_) => "digest.deleted",
+            EventBody::DigestGroupCreated(_) => "digest_group.created",
+            EventBody::DigestGroupUpdated(_) => "digest_group.updated",
+            EventBody::DigestGroupDeleted(_) => "digest_group.deleted",
+            EventBody::TaskCreated(_) => "task.created",
+            EventBody::TaskUpdated(_) => "task.updated",
+            EventBody::TaskDeleted(_) => "task.deleted",
+            EventBody::TaskGroupCreated(_) => "task_group.created",
+            EventBody::TaskGroupUpdated(_) => "task_group.updated",
+            EventBody::TaskGroupDeleted(_) => "task_group.deleted",
         }
     }
 }

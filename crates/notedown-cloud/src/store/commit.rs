@@ -1740,8 +1740,9 @@ impl Store {
     /// every listed entry (parents first), as one batch with one `opId` and `origin: "snapshot"`.
     /// A `.note` gets `pagesChanged` and one `page.added` per page right after its
     /// `file.created` (or `page.index_failed`), and its page record is written now, under the
-    /// same guard and before the append, so the records agree with the journal. Returns the
-    /// `seq` values.
+    /// same guard and before the append, so the records agree with the journal. After the
+    /// files come `digest.created` for every live digest and `task.created` for every live task
+    /// (see [`crate::appdata`]). Returns the `seq` values.
     pub fn snapshot(&self, guard: &WriteGuard, journal: &Journal) -> Result<Vec<u64>> {
         self.check_write(guard)?;
         let entries = self.list(guard, &WirePath::root(), true)?;
@@ -1784,6 +1785,12 @@ impl Store {
                     .map(|body| Event::new(&self.slug, Origin::Snapshot, None, &op_id, body)),
             );
         }
+        let app_data = crate::appdata::AppData::new(self).snapshot_bodies(guard)?;
+        events.extend(
+            app_data
+                .into_iter()
+                .map(|body| Event::new(&self.slug, Origin::Snapshot, None, &op_id, body)),
+        );
         journal.append(&mut events)
     }
 

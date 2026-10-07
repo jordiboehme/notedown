@@ -37,6 +37,11 @@ pub struct Account {
     /// files written before it existed and in accounts without an import.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imported: Option<Imported>,
+    /// Set by `notedown cloud import-app-data` when the digests of a device backup were
+    /// imported. With `protect = true` every digest and to-do route answers `E0079` until it is
+    /// set. Absent in files written before it existed and in accounts without that import.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_data_imported: Option<AppDataImported>,
     /// When the lock was set (ms since the epoch); `None` while unlocked. Files written before
     /// this field existed read as `None`.
     #[serde(default)]
@@ -62,6 +67,22 @@ pub struct Imported {
     pub files: u64,
     /// Total bytes of the imported files.
     pub bytes: u64,
+}
+
+/// The app data import marker in `account.json`. Field order is the file order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppDataImported {
+    /// When the import finished, RFC 3339 (like `created`).
+    pub at: String,
+    /// The imported backup (`.snbak`), as given on the command line; empty for an import of
+    /// nothing (`--empty`).
+    pub source: String,
+    /// Number of imported digests.
+    pub digests: u64,
+    /// Number of imported digest groups.
+    pub groups: u64,
+    /// Number of imported handwritten comments (`.mark` files).
+    pub marks: u64,
 }
 
 /// `md5_hex(password)`, 32 lowercase hex characters.
@@ -182,6 +203,7 @@ impl Accounts {
                 .expect("rfc3339 formatting"),
             locked: false,
             imported: None,
+            app_data_imported: None,
             locked_at_ms: None,
             failed_logins: 0,
             quota_bytes: None,

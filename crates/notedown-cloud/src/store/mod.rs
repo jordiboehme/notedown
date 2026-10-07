@@ -534,7 +534,8 @@ impl Store {
         })
     }
 
-    fn check_guard(&self, guard: &StoreGuard) -> Result<()> {
+    /// An error unless `guard` is the lock of this store.
+    pub(crate) fn check_guard(&self, guard: &StoreGuard) -> Result<()> {
         if guard.account_dir == self.account_dir {
             Ok(())
         } else {

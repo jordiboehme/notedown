@@ -2,6 +2,7 @@
 //! file, which keeps `cargo test` fast and the target folder small.
 
 mod api;
+mod appdata;
 mod auth;
 mod diag;
 mod fake_device;

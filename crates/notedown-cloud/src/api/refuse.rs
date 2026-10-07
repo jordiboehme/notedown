@@ -145,7 +145,8 @@ pub fn is_refused_path(normalized: &str) -> bool {
         .any(|p| normalized == *p || normalized.starts_with(&format!("{p}/")))
 }
 
-fn matches(pattern: &str, path: &str) -> bool {
+/// Whether `path` matches `pattern`, where a `{}` segment matches one non-empty segment.
+pub(crate) fn matches(pattern: &str, path: &str) -> bool {
     let mut p = pattern.split('/');
     let mut q = path.split('/');
     loop {

@@ -3,9 +3,9 @@
 //! Every request passes [`log_request`], which writes exactly one protocol-log line for it.
 //! Routes: login and binding ([`login`]), server queries ([`server`]), in accept mode the sync
 //! session, listing, queries, capacity, upload apply and finish, folders, delete, move and copy
-//! ([`files`]), signed downloads and uploads ([`oss`]), the digests ([`digests`]), the refusal
-//! of every other file operation ([`refuse`]), the socket handshake ([`crate::socket`]) and the
-//! catch-all ([`catchall`]).
+//! ([`files`]), signed downloads and uploads ([`oss`]), the digests ([`digests`]), the to-dos
+//! ([`tasks`]), the refusal of every other file operation ([`refuse`]), the socket handshake
+//! ([`crate::socket`]) and the catch-all ([`catchall`]).
 
 pub mod catchall;
 pub mod digests;
@@ -16,6 +16,7 @@ pub mod login;
 pub mod oss;
 pub mod refuse;
 pub mod server;
+pub mod tasks;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -60,7 +61,8 @@ const IMPLEMENTED: &[(&str, &str)] = &[
     ("GET", crate::socket::PATH),
 ];
 
-/// The file, oss and digest routes served in accept mode (in refuse mode they answer `E0079`).
+/// The file, oss, digest and to-do routes served in accept mode (in refuse mode they answer
+/// `E0079`). `{}` matches one path segment.
 const ACCEPT_IMPLEMENTED: &[(&str, &str)] = &[
     ("POST", "/api/file/2/files/synchronous/start"),
     ("POST", "/api/file/2/files/synchronous/end"),
@@ -98,6 +100,22 @@ const ACCEPT_IMPLEMENTED: &[(&str, &str)] = &[
     ("POST", "/api/file/download/summary"),
     ("POST", UPLOAD_SUMMARY_PATH),
     ("GET", DOWNLOAD_SUMMARY_PATH),
+    ("POST", "/api/file/schedule/group/all"),
+    ("POST", "/api/file/schedule/group"),
+    ("PUT", "/api/file/schedule/group"),
+    ("DELETE", "/api/file/schedule/group/{}"),
+    ("POST", "/api/file/schedule/group/clear"),
+    ("GET", "/api/file/schedule/group/{}"),
+    ("POST", "/api/file/schedule/task/all"),
+    ("POST", "/api/file/schedule/task"),
+    ("PUT", "/api/file/schedule/task"),
+    ("PUT", "/api/file/schedule/task/list"),
+    ("DELETE", "/api/file/schedule/task/{}"),
+    ("GET", "/api/file/schedule/task/{}"),
+    ("POST", "/api/file/schedule/sort"),
+    ("PUT", "/api/file/schedule/sort"),
+    ("DELETE", "/api/file/schedule/sort/{}"),
+    ("POST", "/api/file/query/schedule/sort"),
 ];
 
 /// The byte uploads: their bodies stream to staging and are never read by the request log.
@@ -125,7 +143,7 @@ fn is_implemented(method: &axum::http::Method, path: &str) -> bool {
 fn is_accept_implemented(method: &axum::http::Method, path: &str) -> bool {
     ACCEPT_IMPLEMENTED
         .iter()
-        .any(|(m, p)| method.as_str() == *m && path == *p)
+        .any(|(m, p)| method.as_str() == *m && refuse::matches(p, path))
 }
 
 /// The client address used for rate limits: the peer, or the `X-Forwarded-For` client when the
@@ -182,7 +200,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// The file sync and digest routes of accept mode. Another method on one of these paths is
+/// The file sync, digest and to-do routes of accept mode. Another method on one of these paths is
 /// refused like any file path (`E0079`), not answered by the catch-all.
 fn accept_routes() -> Router<Arc<AppState>> {
     fn p<H, T>(handler: H) -> axum::routing::MethodRouter<Arc<AppState>>
@@ -260,6 +278,48 @@ fn accept_routes() -> Router<Arc<AppState>> {
             p(digests::upload_apply_summary),
         )
         .route("/api/file/download/summary", p(digests::download_summary))
+        .route("/api/file/schedule/group/all", p(tasks::group_all))
+        .route(
+            "/api/file/schedule/group",
+            post(tasks::add_group)
+                .put(tasks::update_group)
+                .fallback(refuse::refuse),
+        )
+        .route(
+            "/api/file/schedule/group/{task_list_id}",
+            get(tasks::get_group)
+                .delete(tasks::delete_group)
+                .fallback(refuse::refuse),
+        )
+        .route("/api/file/schedule/group/clear", p(tasks::clear_group))
+        .route("/api/file/schedule/task/all", p(tasks::task_all))
+        .route(
+            "/api/file/schedule/task",
+            post(tasks::save_task)
+                .put(tasks::save_task)
+                .fallback(refuse::refuse),
+        )
+        .route(
+            "/api/file/schedule/task/list",
+            put(tasks::save_task_list).fallback(refuse::refuse),
+        )
+        .route(
+            "/api/file/schedule/task/{task_id}",
+            get(tasks::get_task)
+                .delete(tasks::delete_task)
+                .fallback(refuse::refuse),
+        )
+        .route(
+            "/api/file/schedule/sort",
+            post(tasks::save_sort)
+                .put(tasks::save_sort)
+                .fallback(refuse::refuse),
+        )
+        .route(
+            "/api/file/schedule/sort/{task_list_id}",
+            delete(tasks::delete_sort).fallback(refuse::refuse),
+        )
+        .route("/api/file/query/schedule/sort", p(tasks::query_sort))
         .route(
             "/api/oss/download",
             get(oss::download).fallback(refuse::refuse),

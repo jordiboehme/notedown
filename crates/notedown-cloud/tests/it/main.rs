@@ -17,4 +17,5 @@ mod push;
 mod serve;
 mod socket;
 mod store;
+mod tasks;
 mod upload;

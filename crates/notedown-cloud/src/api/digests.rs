@@ -88,7 +88,8 @@ pub struct AppRequest {
 }
 
 impl AppRequest {
-    fn bad_params(&self, what: &str) -> Reply {
+    /// `422` for a missing or malformed field, logged with the device.
+    pub(crate) fn bad_params(&self, what: &str) -> Reply {
         Reply::bad_params(what).device(&self.serial)
     }
 }
@@ -156,11 +157,11 @@ pub struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
-    fn ok(&self, fields: Value) -> Reply {
+    pub(crate) fn ok(&self, fields: Value) -> Reply {
         Reply::ok(fields).device(self.serial)
     }
 
-    fn error(&self, code: &str, msg: &str) -> Reply {
+    pub(crate) fn error(&self, code: &str, msg: &str) -> Reply {
         Reply::error(code, msg).device(self.serial)
     }
 

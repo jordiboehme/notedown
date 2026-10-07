@@ -285,7 +285,7 @@ fn content_links_resolve_to_converted_bike() {
     }
     let md = std::fs::read_to_string(out.join("Content.md")).unwrap();
     assert!(
-        md.contains("target_file_id: F20240708174639550429bHksqaP2wKQ8"),
+        md.contains("target_file_id: \"F20240708174639550429bHksqaP2wKQ8\""),
         "{md}"
     );
     assert!(md.contains("[Bike](Bike.md)"), "{md}");

@@ -1895,3 +1895,67 @@ fn a_crlf_header_keeps_its_line_endings_comments_and_added_keys() {
     assert_eq!(body, text.split_once("\r\n---\r\n").unwrap().1);
     assert_eq!(engine.calls, 0);
 }
+
+#[test]
+fn an_unknown_value_in_a_flow_generated_map_still_counts_as_notedowns() {
+    let (dir, src) = setup();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let note = src.join("Test 2.note");
+    let at = pin_mtime(&note);
+    let md_path = out.join("Test 2.md");
+    let text =
+        crystalline_form(&note, at).replace("model: \"fake-model\"", "model: !!str fake-model");
+    assert!(text.contains("model: !!str fake-model, at: "), "{text}");
+    std::fs::write(&md_path, &text).unwrap();
+    assert!(
+        notedown::document::Header::read(&text)
+            .unwrap()
+            .is_notedown()
+    );
+    assert_eq!(Frontmatter::parse(&text), None);
+    let mut engine = FakeEngine { calls: 0 };
+    assert!(matches!(
+        convert_note(&note, &out, &mut engine),
+        pipeline::Outcome::Converted { .. }
+    ));
+    assert_eq!(engine.calls, 1);
+    let md = std::fs::read_to_string(&md_path).unwrap();
+    assert!(md.contains(", model: \"fake-model\", at: "), "{md}");
+    assert!(md.contains("\nverified:\n- by: human:jordi\n"), "{md}");
+}
+
+#[test]
+fn a_kept_keep_chomping_block_scalar_survives_a_rewrite() {
+    let (dir, src) = setup();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let note = src.join("Test 2.note");
+    let at = pin_mtime(&note);
+    let md_path = out.join("Test 2.md");
+    let kept = "note: |+\n  a\n\n\n";
+    let text = crystalline_form(&note, at)
+        .replace("resource: ../in/", "resource: ../old/")
+        .replace("verified:\n", &format!("{kept}verified:\n"));
+    std::fs::write(&md_path, &text).unwrap();
+    let mut engine = FakeEngine { calls: 0 };
+    assert_eq!(
+        convert_note(&note, &out, &mut engine),
+        pipeline::Outcome::HeaderUpdated
+    );
+    let md = std::fs::read_to_string(&md_path).unwrap();
+    assert!(
+        md.contains(&format!("{kept}verified:\n- by: human:jordi\n")),
+        "{md}"
+    );
+    // and again: the value stays "a\n\n\n"
+    let moved = dir.path().join("moved");
+    std::fs::rename(&src, &moved).unwrap();
+    assert_eq!(
+        convert_note(&moved.join("Test 2.note"), &out, &mut engine),
+        pipeline::Outcome::HeaderUpdated
+    );
+    let md = std::fs::read_to_string(&md_path).unwrap();
+    assert!(md.contains(&format!("{kept}verified:\n")), "{md}");
+    assert_eq!(engine.calls, 0);
+}

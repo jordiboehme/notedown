@@ -113,12 +113,9 @@ pub(crate) fn top_level(lines: &[&str]) -> Option<Block> {
         {
             j += 1;
         }
-        let mut end = j;
-        while end > i + 1 && is_blank(lines[end - 1]) {
-            end -= 1;
-        }
         let value = value_of(rest, &lines[i + 1..j], 0);
-        let raw = lines[i..end].iter().map(|l| format!("{l}\n")).collect();
+        // trailing blank lines stay: they can be part of the value (`|+`)
+        let raw = lines[i..j].iter().map(|l| format!("{l}\n")).collect();
         entries.push(Entry {
             key,
             value,
@@ -510,6 +507,40 @@ fn flow_plain(chars: &[char], pos: &mut usize, key: bool) -> String {
     fold(&lines)
 }
 
+/// A value inside a flow collection; a value that does not fit is [`Node::Unknown`] as
+/// long as the collection around it still ends where it should. `None` when it does not.
+fn flow_or_unknown(chars: &[char], pos: &mut usize, in_list: bool) -> Option<Node> {
+    let start = *pos;
+    if let Some(node) = flow(chars, pos, in_list) {
+        return Some(node);
+    }
+    *pos = start;
+    skip_value(chars, pos).then_some(Node::Unknown)
+}
+
+/// Moves past one flow value to the `,`, `}` or `]` that ends it, minding quotes and
+/// nested collections. `false` when there is no such end.
+fn skip_value(chars: &[char], pos: &mut usize) -> bool {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    while let Some(&c) = chars.get(*pos) {
+        match quote {
+            Some('"') if c == '\\' => *pos += 1,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                '"' | '\'' => quote = Some(c),
+                '{' | '[' => depth += 1,
+                '}' | ']' | ',' if depth == 0 => return true,
+                '}' | ']' => depth -= 1,
+                _ => {}
+            },
+        }
+        *pos += 1;
+    }
+    false
+}
+
 /// A value inside a flow collection, or a quoted / flow value at the start of a line.
 /// `None` when it does not fit.
 fn flow(chars: &[char], pos: &mut usize, in_list: bool) -> Option<Node> {
@@ -541,7 +572,7 @@ fn flow(chars: &[char], pos: &mut usize, in_list: bool) -> Option<Node> {
                     if matches!(chars.get(*pos)?, ',' | '}') {
                         Node::Scalar(String::new())
                     } else {
-                        flow(chars, pos, false)?
+                        flow_or_unknown(chars, pos, false)?
                     }
                 } else {
                     Node::Scalar(String::new())
@@ -568,7 +599,7 @@ fn flow(chars: &[char], pos: &mut usize, in_list: bool) -> Option<Node> {
                     ',' => return None,
                     _ => {}
                 }
-                items.push(flow(chars, pos, true)?);
+                items.push(flow_or_unknown(chars, pos, true)?);
                 skip_ws(chars, pos);
                 match chars.get(*pos)? {
                     ',' => *pos += 1,
@@ -743,7 +774,7 @@ mod tests {
         assert_eq!(b.entries[0].lead, "# about the note\n");
         assert_eq!(
             b.entries[0].raw,
-            "verified:\n  - { by: human:jordi, at: 2026-10-06T09:00:00+02:00 }\n"
+            "verified:\n  - { by: human:jordi, at: 2026-10-06T09:00:00+02:00 }\n\n"
         );
         assert_eq!(b.entries[1].value, s("a\u{2028}b \"q\" \\"));
         assert_eq!(b.entries[2].value, s("x"));
@@ -821,7 +852,6 @@ mod tests {
             "t: &a x\n",
             "t: *a\n",
             "t: { a: b\n",
-            "t: { by: !!str x }\n",
             "t: |x\n  a\n",
             "t: a: b\n",
             "t: \"bad \\q\"\n",
@@ -832,6 +862,28 @@ mod tests {
         // the rest of the header stays readable
         let r = read("a: !tag x\nb: y\n");
         assert_eq!(r[1].1, s("y"));
+        // and the rest of a flow map
+        let g = one("g: { by: notedown/1, model: !!str x, at: \"t\" }\n");
+        assert_eq!(g.get("by"), Some(&s("notedown/1")));
+        assert_eq!(g.get("model"), Some(&Node::Unknown));
+        assert_eq!(g.get("at"), Some(&s("t")));
+        assert_eq!(
+            one("t: { by: !!str x }\n"),
+            Node::Map(vec![("by".into(), Node::Unknown)])
+        );
+        let l = one("l: [a, *x, \"bad \\q\", b]\n");
+        assert_eq!(
+            l,
+            Node::List(vec![s("a"), Node::Unknown, Node::Unknown, s("b")])
+        );
+    }
+
+    #[test]
+    fn kept_keys_keep_trailing_blank_lines() {
+        let lines = ["x: |+", "  a", "", "", "y: z"];
+        let b = top_level(&lines).unwrap();
+        assert_eq!(b.entries[0].raw, "x: |+\n  a\n\n\n");
+        assert_eq!(b.entries[0].value, s("a\n\n\n"));
     }
 
     #[test]

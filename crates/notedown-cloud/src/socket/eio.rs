@@ -55,6 +55,9 @@ pub enum Action {
     Close,
     /// Unknown frame: log it with `unknown_event`, do not answer, keep the connection.
     Unknown,
+    /// Several frames in this order, or an unknown event that still carried an ack id: send the
+    /// frames and, when `unknown`, log the incoming frame with `unknown_event`.
+    Reply { frames: Vec<String>, unknown: bool },
 }
 
 /// Parse one text frame.
@@ -127,16 +130,41 @@ pub fn answer(frame: &str) -> Action {
         Inbound::Ignored => Action::Nothing,
         Inbound::Close => Action::Close,
         Inbound::Connect => Action::Answer(CONNECT.to_string()),
-        Inbound::Event { name, args, .. } => match (name.as_str(), args.first()) {
-            (EVENT_RATTA_PING, _) => Action::Answer(event(EVENT_RATTA_PING, "Received")),
-            (EVENT_CLIENT_MESSAGE, Some(Value::String(s))) if s == "status" => {
-                Action::Answer(event(EVENT_SERVER_MESSAGE, "true"))
-            }
-            // Marks pending file messages delivered; this server sends none yet.
-            (EVENT_CLIENT_MESSAGE, Some(Value::String(s))) if s == "Received" => Action::Nothing,
-            _ => Action::Unknown,
-        },
+        Inbound::Event { name, args, ack } => answer_event(&name, &args, ack),
         Inbound::Unknown => Action::Unknown,
+    }
+}
+
+/// The answer to an event: its own answer first, then the ack when the packet carried an id
+/// (`43<id>[]`, or `43<id>["Received"]` for a `ClientMessage` that is not `Received` or `status`).
+fn answer_event(name: &str, args: &[Value], ack: Option<u64>) -> Action {
+    let mut frames = Vec::new();
+    let mut unknown = false;
+    let mut ack_arg = None;
+    match (name, args.first()) {
+        (EVENT_RATTA_PING, _) => frames.push(event(EVENT_RATTA_PING, "Received")),
+        (EVENT_CLIENT_MESSAGE, Some(Value::String(s))) if s == "status" => {
+            frames.push(event(EVENT_SERVER_MESSAGE, "true"));
+        }
+        // Marks pending file messages delivered; this server sends none yet.
+        (EVENT_CLIENT_MESSAGE, Some(Value::String(s))) if s == "Received" => {}
+        (EVENT_CLIENT_MESSAGE, _) => {
+            unknown = true;
+            ack_arg = Some("Received");
+        }
+        _ => unknown = true,
+    }
+    if let Some(id) = ack {
+        frames.push(match ack_arg {
+            Some(arg) => format!("43{id}{}", Value::from(vec![arg])),
+            None => format!("43{id}[]"),
+        });
+    }
+    match (frames.len(), unknown) {
+        (0, true) => Action::Unknown,
+        (0, false) => Action::Nothing,
+        (1, false) => Action::Answer(frames.remove(0)),
+        _ => Action::Reply { frames, unknown },
     }
 }
 
@@ -184,13 +212,51 @@ mod tests {
         assert_eq!(answer("2probe"), Action::Answer("3probe".into()));
         let rp = Action::Answer(r#"42["ratta_ping","Received"]"#.into());
         assert_eq!(answer(r#"42["ratta_ping"]"#), rp);
-        assert_eq!(answer(r#"427["ratta_ping",{"a":1}]"#), rp);
+        assert_eq!(
+            answer(r#"427["ratta_ping",{"a":1}]"#),
+            Action::Reply {
+                frames: vec![r#"42["ratta_ping","Received"]"#.into(), "437[]".into()],
+                unknown: false
+            }
+        );
         assert_eq!(answer(r#"42/,["ratta_ping"]"#), rp);
         assert_eq!(
             answer(r#"42["ClientMessage","status"]"#),
             Action::Answer(r#"42["ServerMessage","true"]"#.into())
         );
         assert_eq!(answer(r#"42["ClientMessage","Received"]"#), Action::Nothing);
+        assert_eq!(
+            answer(r#"4212["ratta_ping"]"#),
+            Action::Reply {
+                frames: vec![r#"42["ratta_ping","Received"]"#.into(), "4312[]".into()],
+                unknown: false
+            }
+        );
+        assert_eq!(
+            answer(r#"42123["ClientMessage","status"]"#),
+            Action::Reply {
+                frames: vec![r#"42["ServerMessage","true"]"#.into(), "43123[]".into()],
+                unknown: false
+            }
+        );
+        assert_eq!(
+            answer(r#"420["ClientMessage","Received"]"#),
+            Action::Answer("430[]".into())
+        );
+        assert_eq!(
+            answer(r#"425["ClientMessage","hello"]"#),
+            Action::Reply {
+                frames: vec![r#"435["Received"]"#.into()],
+                unknown: true
+            }
+        );
+        assert_eq!(
+            answer(r#"429["mystery"]"#),
+            Action::Reply {
+                frames: vec!["439[]".into()],
+                unknown: true
+            }
+        );
         assert_eq!(answer("40"), Action::Answer("40".into()));
         assert_eq!(answer("40/,"), Action::Answer("40".into()));
         assert_eq!(answer("3"), Action::Nothing);

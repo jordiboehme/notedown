@@ -319,6 +319,7 @@ async fn ratta_ping_gets_received() {
     ask(&mut ws, r#"42["ratta_ping","{\"ts\":1}"]"#, answer).await;
     // With an ack id and with the default namespace spelled out.
     ask(&mut ws, r#"421["ratta_ping",1791270408879]"#, answer).await;
+    assert_eq!(recv(&mut ws).await, "431[]");
     ask(&mut ws, r#"42/,["ratta_ping"]"#, answer).await;
     close(ws).await;
     assert!(
@@ -339,6 +340,46 @@ async fn client_message_status_gets_true() {
     )
     .await;
     close(ws).await;
+}
+
+#[tokio::test]
+async fn event_acks_follow_the_ack_id() {
+    let s = Server::start().await;
+    let mut ws = s.session().await;
+    ask(&mut ws, r#"420["ClientMessage","Received"]"#, "430[]").await;
+    send(&mut ws, r#"4212["ratta_ping"]"#).await;
+    assert_eq!(recv(&mut ws).await, r#"42["ratta_ping","Received"]"#);
+    assert_eq!(recv(&mut ws).await, "4312[]");
+    ask(
+        &mut ws,
+        r#"425["ClientMessage","hello"]"#,
+        r#"435["Received"]"#,
+    )
+    .await;
+    // Several digits are one id.
+    send(&mut ws, r#"42123["ClientMessage","status"]"#).await;
+    assert_eq!(recv(&mut ws).await, r#"42["ServerMessage","true"]"#);
+    assert_eq!(recv(&mut ws).await, "43123[]");
+    // Without an id there is no ack: status gets its answer only, Received nothing.
+    ask(
+        &mut ws,
+        r#"42["ClientMessage","status"]"#,
+        r#"42["ServerMessage","true"]"#,
+    )
+    .await;
+    send(&mut ws, r#"42["ClientMessage","Received"]"#).await;
+    sync(&mut ws).await;
+    send(&mut ws, r#"427["ClientMessage","status"]"#).await;
+    assert_eq!(recv(&mut ws).await, r#"42["ServerMessage","true"]"#);
+    assert_eq!(recv(&mut ws).await, "437[]");
+    close(ws).await;
+    // The unknown ClientMessage is still flagged.
+    let frames = s.frames();
+    let hello = frames
+        .iter()
+        .find(|f| f.1 == r#"425["ClientMessage","hello"]"#)
+        .unwrap();
+    assert_eq!(hello.2, vec!["unknown_event".to_string()]);
 }
 
 #[tokio::test]

@@ -212,16 +212,23 @@ pub async fn run(mut ws: WebSocket, session: Session, access: Access) {
             Message::Text(text) => {
                 let text = text.as_str();
                 let action = eio::answer(text);
-                let flags: &[&str] = if action == Action::Unknown {
-                    &[FLAG_UNKNOWN_EVENT]
-                } else {
-                    &[]
-                };
+                let unknown = matches!(
+                    action,
+                    Action::Unknown | Action::Reply { unknown: true, .. }
+                );
+                let flags: &[&str] = if unknown { &[FLAG_UNKNOWN_EVENT] } else { &[] };
                 session.log("in", Value::String(text.to_string()), flags);
                 match action {
                     Action::Answer(frame) => {
                         if !session.send(&mut ws, frame).await {
                             return;
+                        }
+                    }
+                    Action::Reply { frames, .. } => {
+                        for frame in frames {
+                            if !session.send(&mut ws, frame).await {
+                                return;
+                            }
                         }
                     }
                     Action::Close => {

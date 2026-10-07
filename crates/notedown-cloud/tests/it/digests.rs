@@ -1814,3 +1814,112 @@ async fn ids_above_i64_max_are_refused() {
     assert_ok(&v);
     assert_eq!(s.stored().0[0].id, i64::MAX as u64);
 }
+
+// ------------------------------------------------------------------ import, then the device
+
+#[tokio::test]
+async fn the_device_sees_the_backup_after_the_import() {
+    use super::appdata::{MARK_A, MARK_B, backup_entries, snbak};
+    use notedown_cloud::appdata::{AppImportOptions, import_app_data};
+
+    let s = Server::with_config(Config::default());
+    s.mark_imported();
+    let file = s.data().join("device.snbak");
+    snbak(&file, &backup_entries());
+    let r = import_app_data(
+        s.data(),
+        "jordi",
+        Some(&file),
+        &AppImportOptions::default(),
+        &s.state.journal,
+    )
+    .unwrap();
+    assert_eq!((r.digests, r.groups, r.marks), (2, 1, 2));
+    let t = s.login(SERIAL).await;
+
+    // The hash query answers what the backup holds, ids exact. The digest that never reached
+    // a cloud is not there: the device adds it itself.
+    let raw = s
+        .raw("POST", HASH, Some(&t), Some(json!({"page": 0, "size": 0})))
+        .await;
+    let text = raw.text();
+    assert!(text.contains("\"id\":895334188016730112"), "{text}");
+    assert!(text.contains("\"id\":895334188016730200"), "{text}");
+    let v = raw.json();
+    assert_ok(&v);
+    assert_eq!(v["totalRecords"], 2);
+    let list = v["summaryInfoVOList"].as_array().unwrap();
+    // Newest creationTime first: the document, then the note.
+    let expect = [
+        (
+            895_334_188_016_730_200u64,
+            "m2",
+            "h2",
+            MARK_B,
+            1_700_000_003_000i64,
+        ),
+        (
+            895_334_188_016_730_112u64,
+            "m1",
+            "h1",
+            MARK_A,
+            1_700_000_001_000i64,
+        ),
+    ];
+    for (row, (id, md5, hw, name, modified)) in list.iter().zip(expect) {
+        assert_eq!(row["id"].as_u64(), Some(id), "{row}");
+        assert_eq!(row["userId"], s.user_id(), "{row}");
+        assert_eq!(row["md5Hash"], md5, "{row}");
+        assert_eq!(row["handwriteMd5"], hw, "{row}");
+        assert_eq!(row["commentHandwriteName"], name, "{row}");
+        assert_eq!(row["lastModifiedTime"], modified, "{row}");
+    }
+    assert_eq!(
+        list[1]["metadataMap"],
+        json!({"author": "Jordi", "unique_identifier": "n1", "source_size": 3344196})
+    );
+
+    // The full records.
+    let d = &s
+        .post(BY_ID, &t, json!({"ids": [895_334_188_016_730_112u64]}))
+        .await["summaryDOList"][0];
+    assert_eq!(d["parentUniqueIdentifier"], "g1");
+    assert_eq!(d["handwriteInnerName"], MARK_A);
+    assert_eq!(d["handwriteMD5"], "h1");
+    assert_eq!(d["creationTime"], 1_700_000_000_000i64);
+
+    // The handwritten comments download with their bytes and their name.
+    for (id, name, bytes) in [
+        (895_334_188_016_730_112u64, MARK_A, &b"mark A"[..]),
+        (895_334_188_016_730_200u64, MARK_B, &b"mark B"[..]),
+    ] {
+        let v = s.post(MARK_DOWNLOAD, &t, json!({"id": id})).await;
+        assert_ok(&v);
+        let r = s.fetch(v["url"].as_str().unwrap()).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert_eq!(r.body, bytes);
+        let disposition = r.headers["content-disposition"].to_str().unwrap();
+        assert!(disposition.contains(name), "{disposition}");
+    }
+
+    // The group keeps its id and its createTime through a device edit.
+    let groups = s.post(GROUP_QUERY, &t, json!({"page": 0, "size": 0})).await;
+    let g = &groups["summaryDOList"][0];
+    assert_eq!(g["id"].as_u64(), Some(895_334_188_016_730_300));
+    assert_eq!(g["uniqueIdentifier"], "g1");
+    assert_eq!(g["createTime"], 1_700_000_000_000i64);
+    s.advance_ms(1_000);
+    let v = s
+        .put(
+            GROUP_UPDATE,
+            &t,
+            json!({"id": 895_334_188_016_730_300u64, "uniqueIdentifier": "g1",
+                   "name": "Ideas 2", "md5Hash": "gm2"}),
+        )
+        .await;
+    assert_ok(&v);
+    let g = &s.post(GROUP_QUERY, &t, json!({"page": 0, "size": 0})).await["summaryDOList"][0];
+    assert_eq!(g["name"], "Ideas 2");
+    assert_eq!(g["createTime"], 1_700_000_000_000i64);
+    assert_eq!(g["updateTime"], T0 as u64 + 1_000);
+}

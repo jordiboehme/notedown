@@ -544,3 +544,111 @@ fn a_line_whose_slot_leaves_the_recycle_bin_is_kept_and_its_target_stays() {
     );
     assert_eq!(f.events().len(), 1);
 }
+
+#[test]
+fn a_corrupt_line_that_is_no_utf8_is_written_back_byte_for_byte() {
+    let f = Fixture::new();
+    let gone = entry(
+        DEAD,
+        "NOTE/Note/b.note",
+        NOW - 100 * DAY,
+        RecycleReason::Deleted,
+    );
+    let young = entry(
+        DEAD + 1,
+        "NOTE/Note/c.note",
+        NOW - DAY,
+        RecycleReason::Deleted,
+    );
+    f.add(&gone, b"b");
+    let mut bytes = std::fs::read(f.index_path()).unwrap();
+    bytes.extend_from_slice(b"\xff\xfe junk\n");
+    std::fs::write(f.index_path(), &bytes).unwrap();
+    f.add(&young, b"c");
+    let r = f.prune(NOW, Origin::Cli, false);
+    assert_eq!(r.removed, vec![gone]);
+    assert_eq!(r.unreadable_kept, 1);
+    let mut want = b"\xff\xfe junk\n".to_vec();
+    want.extend_from_slice(serde_json::to_string(&young).unwrap().as_bytes());
+    want.push(b'\n');
+    assert_eq!(std::fs::read(f.index_path()).unwrap(), want);
+}
+
+#[cfg(unix)]
+fn set_mode(p: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_slot_that_cant_be_removed_doesnt_stop_the_rest() {
+    let f = Fixture::new();
+    let stuck = entry(
+        DEAD,
+        "NOTE/Note/a.note",
+        NOW - 100 * DAY,
+        RecycleReason::Deleted,
+    );
+    let folder = folder_entry(DEAD + 1, "NOTE/Note/F", NOW - 99 * DAY);
+    let other = entry(
+        DEAD + 2,
+        "NOTE/Note/b.note",
+        NOW - 98 * DAY,
+        RecycleReason::Deleted,
+    );
+    f.add(&stuck, b"a");
+    f.add(&folder, b"");
+    f.add(&other, b"b");
+    let parent = f.slot_path(&stuck).parent().unwrap().to_path_buf();
+    set_mode(&parent, 0o555);
+    let r = f
+        .store
+        .prune_recycle(&f.journal, &RETENTION, NOW, offset(), Origin::Cli, false);
+    set_mode(&parent, 0o755);
+    let r = r.unwrap();
+    assert_eq!(
+        r.removed,
+        vec![stuck.clone(), folder.clone(), other.clone()]
+    );
+    assert_eq!(r.failed.len(), 1, "{:?}", r.failed);
+    assert_eq!(r.failed[0].location, stuck.location());
+    assert!(f.slot_path(&stuck).is_file());
+    assert!(!f.recycle().join(folder.deleted_at.to_string()).exists());
+    assert!(!f.recycle().join(other.deleted_at.to_string()).exists());
+    assert_eq!(f.index_text(), "");
+    assert_eq!(f.events().len(), 3);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_in_the_slot_path_keeps_the_line_and_is_reported() {
+    let f = Fixture::new();
+    let ms = NOW - 100 * DAY;
+    let linked = entry(DEAD, "NOTE/Note/s.note", ms, RecycleReason::Deleted);
+    let outside = f.store.account_dir().join("outside");
+    std::fs::create_dir_all(outside.join("Note")).unwrap();
+    std::fs::write(outside.join("Note/s.note"), b"keep").unwrap();
+    std::fs::create_dir_all(f.recycle().join(ms.to_string())).unwrap();
+    std::os::unix::fs::symlink(&outside, f.recycle().join(format!("{ms}/NOTE"))).unwrap();
+    f.line(&linked);
+    let gone = entry(DEAD + 1, "NOTE/Note/b.note", ms, RecycleReason::Deleted);
+    let gone = RecycleEntry {
+        deleted_at: ms + 1,
+        ..gone
+    };
+    f.add(&gone, b"b");
+    for dry_run in [true, false] {
+        let r = f.prune(NOW, Origin::Cli, dry_run);
+        assert_eq!(r.removed, vec![gone.clone()]);
+        assert_eq!(r.kept, 1);
+        assert_eq!(r.failed.len(), 1, "{:?}", r.failed);
+        assert_eq!(r.failed[0].location, linked.location());
+    }
+    assert!(outside.join("Note/s.note").is_file());
+    assert_eq!(
+        f.index_text(),
+        format!("{}\n", serde_json::to_string(&linked).unwrap())
+    );
+    assert_eq!(f.events().len(), 1);
+}

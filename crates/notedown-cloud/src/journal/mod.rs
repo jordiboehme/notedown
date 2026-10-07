@@ -192,6 +192,19 @@ impl Journal {
         Self::open_with(data_dir, JournalOptions::default())
     }
 
+    /// A handle on `<data_dir>/journal/` that creates nothing, for a run that never writes (a
+    /// dry run). An append through it fails while the folder is missing.
+    pub fn open_no_create(data_dir: &Path) -> Journal {
+        let options = JournalOptions::default();
+        let dir = data_dir.join(JOURNAL_DIR);
+        Journal {
+            consumers: dir.join(CONSUMERS_DIR),
+            dir,
+            max_file_bytes: options.max_file_bytes,
+            clock: options.clock,
+        }
+    }
+
     /// Open with explicit options.
     pub fn open_with(data_dir: &Path, options: JournalOptions) -> Result<Journal> {
         let dir = data_dir.join(JOURNAL_DIR);

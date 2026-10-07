@@ -844,10 +844,15 @@ fn recycle_prune_command(args: RecyclePruneArgs) -> Result<ExitCode> {
     use notedown_cloud::journal::{Journal, Origin};
     use notedown_cloud::store::{RecycleReason, Store};
     let store = Store::open(&args.data, &args.account)?;
-    let config = notedown_cloud::Config::load_or_create(&args.data)?;
-    let journal = Journal::open(&args.data)?;
+    // Never write server.toml here, and a dry run creates nothing at all.
+    let config = notedown_cloud::Config::load_or_default(&args.data)?;
+    let journal = if args.dry_run {
+        Journal::open_no_create(&args.data)
+    } else {
+        Journal::open(&args.data)?
+    };
     let offset = notedown_cloud::localtime::local_utc_offset().unwrap_or_else(|| {
-        eprintln!("warning: cannot read the local UTC offset; days are counted in UTC");
+        eprintln!("warning: can't read the local UTC offset; days are counted in UTC");
         time::UtcOffset::UTC
     });
     let now_ms = std::time::SystemTime::now()
@@ -889,7 +894,14 @@ fn recycle_prune_command(args: RecyclePruneArgs) -> Result<ExitCode> {
             plural(report.unreadable_kept, "index line")
         );
     }
-    Ok(ExitCode::SUCCESS)
+    for f in &report.failed {
+        eprintln!("error: recycle/{}: {}", f.location, f.message);
+    }
+    Ok(if report.failed.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
 }
 
 fn backup_device_command(args: BackupDeviceArgs) -> Result<ExitCode> {

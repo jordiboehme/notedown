@@ -832,6 +832,23 @@ fn cloud_recycle_prune_dry_run_then_real_run() {
         notedown(&args)
     };
 
+    // The two old versions, oldest first, and a line that can't be read.
+    let recycle = d.join("accounts/jordi/recycle");
+    let index = std::fs::read_to_string(recycle.join("index.jsonl")).unwrap();
+    let slots: Vec<std::path::PathBuf> = index
+        .lines()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            recycle.join(format!(
+                "{}/{}",
+                v["deletedAt"],
+                v["path"].as_str().unwrap()
+            ))
+        })
+        .collect();
+    assert_eq!(slots.len(), 2);
+    std::fs::write(recycle.join("index.jsonl"), format!("{index}{{not json\n")).unwrap();
+
     let before = tree(d);
     let out = prune(&["--dry-run"]);
     assert!(
@@ -841,10 +858,11 @@ fn cloud_recycle_prune_dry_run_then_real_run() {
     );
     let text = stdout(&out);
     let rows: Vec<&str> = text.lines().collect();
-    assert_eq!(rows.len(), 2, "{text}");
+    assert_eq!(rows.len(), 3, "{text}");
     assert!(rows[0].starts_with("would remove INBOX/c.pdf  "), "{text}");
     assert!(rows[0].ends_with("  overwritten"), "{text}");
     assert_eq!(rows[1], "would remove 1 old version (0.0 MB), kept 1");
+    assert_eq!(rows[2], "kept 1 index line that can't be read");
     assert_eq!(tree(d), before);
 
     let out = prune(&[]);
@@ -856,9 +874,13 @@ fn cloud_recycle_prune_dry_run_then_real_run() {
     let text = stdout(&out);
     assert!(text.starts_with("removed INBOX/c.pdf  "), "{text}");
     assert!(
-        text.ends_with("\nremoved 1 old version (0.0 MB), kept 1\n"),
+        text.ends_with(
+            "\nremoved 1 old version (0.0 MB), kept 1\nkept 1 index line that can't be read\n"
+        ),
         "{text}"
     );
+    assert!(!slots[0].exists());
+    assert!(slots[1].is_file());
     assert!(!text.contains('\u{2014}'));
     let ev = lines(&journal(d, &["tail"]));
     let last = ev.last().unwrap();
@@ -876,4 +898,91 @@ fn cloud_recycle_prune_dry_run_then_real_run() {
         "nobody",
     ]);
     assert_eq!(out.status.code(), Some(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn cloud_recycle_prune_without_server_toml_creates_nothing_and_reports_failures() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let out = cloud(
+        d,
+        &[
+            "add",
+            "jordi",
+            "--email",
+            "jordi@example.org",
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(out.status.success());
+    // Two deleted files from 1970: gone by the default retention, whatever the clock says.
+    let recycle = d.join("accounts/jordi/recycle");
+    let mut index = String::new();
+    for (id, ms, name) in [(900_000, 1000, "a.pdf"), (900_001, 2000, "b.pdf")] {
+        let slot = recycle.join(format!("{ms}/INBOX/{name}"));
+        std::fs::create_dir_all(slot.parent().unwrap()).unwrap();
+        std::fs::write(&slot, b"x").unwrap();
+        index.push_str(&format!(
+            "{{\"id\":{id},\"path\":\"INBOX/{name}\",\"md5\":\"m\",\"deletedAt\":{ms},\"reason\":\"deleted\"}}\n"
+        ));
+    }
+    std::fs::write(recycle.join("index.jsonl"), index).unwrap();
+    // A used account has its files folder (the store lock would create it otherwise).
+    std::fs::create_dir_all(d.join("accounts/jordi/files")).unwrap();
+    let data = d.to_str().unwrap();
+    let prune = |extra: &[&str]| {
+        let mut args = vec![
+            "cloud",
+            "recycle",
+            "prune",
+            "--data",
+            data,
+            "--account",
+            "jordi",
+        ];
+        args.extend_from_slice(extra);
+        notedown(&args)
+    };
+
+    let before = tree(d);
+    let out = prune(&["--dry-run"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout(&out).ends_with("would remove 2 old versions (0.0 MB), kept 0\n"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(tree(d), before);
+    assert!(!d.join("server.toml").exists());
+    assert!(!d.join("journal").exists());
+
+    // a.pdf can't be removed: b.pdf still goes, the run lists both and exits with 1
+    let stuck = recycle.join("1000/INBOX");
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let out = prune(&[]);
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let text = stdout(&out);
+    assert!(text.starts_with("removed INBOX/a.pdf  "), "{text}");
+    assert!(text.contains("\nremoved INBOX/b.pdf  "), "{text}");
+    assert!(
+        text.ends_with("removed 2 old versions (0.0 MB), kept 0\n"),
+        "{text}"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("recycle/1000/INBOX/a.pdf: can't remove it: "),
+        "{err}"
+    );
+    assert!(!err.contains('\u{2014}'));
+    assert!(stuck.join("a.pdf").is_file());
+    assert!(!recycle.join("2000").exists());
+    assert!(!d.join("server.toml").exists());
 }

@@ -113,6 +113,15 @@ impl Config {
         data_dir.join(CONFIG_FILE)
     }
 
+    /// Load `<data>/server.toml`, or the defaults when it does not exist. Writes nothing.
+    pub fn load_or_default(data_dir: &Path) -> Result<Config> {
+        if Self::path(data_dir).exists() {
+            Self::load_or_create(data_dir)
+        } else {
+            Ok(Config::default())
+        }
+    }
+
     /// Load `<data>/server.toml`; write the defaults when it does not exist yet.
     pub fn load_or_create(data_dir: &Path) -> Result<Config> {
         let path = Self::path(data_dir);
@@ -183,6 +192,25 @@ mod tests {
 
     fn dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn load_or_default_reads_the_file_and_never_writes_one() {
+        let d = dir();
+        assert_eq!(
+            Config::load_or_default(d.path()).unwrap(),
+            Config::default()
+        );
+        assert!(!Config::path(d.path()).exists());
+        std::fs::write(Config::path(d.path()), "recycle_keep_latest = 5\n").unwrap();
+        assert_eq!(
+            Config::load_or_default(d.path())
+                .unwrap()
+                .recycle_keep_latest,
+            5
+        );
+        std::fs::write(Config::path(d.path()), "recycle_keep_latest = 0\n").unwrap();
+        assert!(Config::load_or_default(d.path()).is_err());
     }
 
     #[test]

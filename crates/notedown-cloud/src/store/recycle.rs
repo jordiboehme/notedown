@@ -64,6 +64,19 @@ pub struct PruneReport {
     pub kept: usize,
     /// Lines that stay because they can't be read (or name a slot outside `recycle/`).
     pub unreadable_kept: usize,
+    /// Slots that couldn't be removed, and lines kept because a part of their slot path is a
+    /// symlink. The prune goes on after each.
+    pub failed: Vec<PruneFailure>,
+}
+
+/// A slot the prune couldn't remove, or a line it kept because of its slot path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneFailure {
+    /// The slot, relative to `recycle/` ([`RecycleEntry::location`]); empty for `recycle/`
+    /// itself.
+    pub location: String,
+    /// What went wrong.
+    pub message: String,
 }
 
 /// Why something is in the recycle bin.
@@ -257,16 +270,17 @@ impl Store {
         Ok(self
             .read_index_lines()?
             .into_iter()
-            .map(|(text, entry)| match entry {
+            .map(|(bytes, entry)| match entry {
                 Some(e) => IndexLine::Entry(e),
-                None => IndexLine::Raw(text),
+                None => IndexLine::Raw(String::from_utf8_lossy(&bytes).into_owned()),
             })
             .collect())
     }
 
-    /// The complete lines of the index (blank lines left out), each with its text and its
-    /// parsed entry (`None` when it doesn't parse). A missing index is empty.
-    fn read_index_lines(&self) -> Result<Vec<(String, Option<RecycleEntry>)>> {
+    /// The complete lines of the index (blank lines left out), each with its bytes (without
+    /// the newline) and its parsed entry (`None` when it doesn't parse). A missing index is
+    /// empty.
+    fn read_index_lines(&self) -> Result<Vec<(Vec<u8>, Option<RecycleEntry>)>> {
         let path = self.recycle_dir().join(RECYCLE_INDEX);
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
@@ -277,10 +291,7 @@ impl Store {
         Ok(bytes[..complete]
             .split(|b| *b == b'\n')
             .filter(|l| !l.trim_ascii().is_empty())
-            .map(|l| {
-                let text = String::from_utf8_lossy(l).into_owned();
-                (text, serde_json::from_slice(l).ok())
-            })
+            .map(|l| (l.to_vec(), serde_json::from_slice(l).ok()))
             .collect())
     }
 
@@ -289,13 +300,16 @@ impl Store {
     ///
     /// A real run recovers an unfinished commit first, plans on the index read after that,
     /// journals one `recycle.pruned` per removed line (one batch, one `opId`), writes the new
-    /// index atomically and then removes the slots: a file only when it is a file (a symlink
-    /// is never followed), a folder only when it is empty. Empty folders up to `recycle/` go
-    /// too. A dry run takes the plain lock and doesn't recover (recovery writes), so with an
-    /// unfinished commit on disk its plan can differ a little from the real run's.
+    /// index atomically and then removes the slots: a file only when it is a file, a folder
+    /// only when it is empty. Empty folders up to `recycle/` go too. A slot that can't be
+    /// removed is reported in `failed` and the prune goes on with the rest. A dry run takes
+    /// the plain lock and doesn't recover (recovery writes), so with an unfinished commit on
+    /// disk its plan can differ a little from the real run's.
     ///
     /// A line that doesn't parse, or whose slot would leave `recycle/`, is kept unchanged and
-    /// counted in `unreadable_kept`. Kept lines are written back as they were read.
+    /// counted in `unreadable_kept`. A line with a symlink anywhere in its slot path (from
+    /// `recycle/` down) is kept and reported in `failed`: no symlink is ever followed. Kept
+    /// lines are written back byte for byte.
     pub fn prune_recycle(
         &self,
         journal: &Journal,
@@ -316,13 +330,25 @@ impl Store {
         // The readable lines with a slot inside `recycle/`, and where each is in `lines`.
         let mut entries = Vec::new();
         let mut at = Vec::new();
+        let mut unreadable = 0;
+        let mut linked = Vec::new();
         for (i, (_, entry)) in lines.iter().enumerate() {
-            if let Some(e) = entry
-                && self.recycle_path(e).is_ok()
-            {
-                entries.push(e.clone());
-                at.push(i);
+            let Some((e, slot)) = entry
+                .as_ref()
+                .and_then(|e| Some((e, self.recycle_path(e).ok()?)))
+            else {
+                unreadable += 1;
+                continue;
+            };
+            if self.has_symlink(&slot) {
+                linked.push(PruneFailure {
+                    location: e.location(),
+                    message: "a part of its path is a symlink, the line is kept".into(),
+                });
+                continue;
             }
+            entries.push(e.clone());
+            at.push(i);
         }
         let mut live = HashSet::new();
         for e in &entries {
@@ -345,11 +371,12 @@ impl Store {
             .filter(|m| m.is_file())
             .map(|m| m.len())
             .sum();
-        let report = PruneReport {
-            kept: entries.len() - removed.len(),
-            unreadable_kept: lines.len() - entries.len(),
+        let mut report = PruneReport {
+            kept: entries.len() - removed.len() + linked.len(),
+            unreadable_kept: unreadable,
             removed,
             removed_bytes,
+            failed: linked,
         };
         if dry_run || report.removed.is_empty() {
             return Ok(report);
@@ -375,30 +402,36 @@ impl Store {
 
         // 2. the new index, kept lines as they were
         let gone: HashSet<usize> = remove.iter().map(|&i| at[i]).collect();
-        let mut text = String::new();
+        let mut text = Vec::new();
         for (i, (line, _)) in lines.iter().enumerate() {
             if !gone.contains(&i) {
-                text.push_str(line);
-                text.push('\n');
+                text.extend_from_slice(line);
+                text.push(b'\n');
             }
         }
-        super::write_atomic_short(&self.recycle_dir().join(RECYCLE_INDEX), text.as_bytes())?;
+        super::write_atomic_short(&self.recycle_dir().join(RECYCLE_INDEX), &text)?;
 
-        // 3. the slots: files first, then folder lines, then the emptied folders above them
-        let slots: Vec<PathBuf> = report
-            .removed
-            .iter()
-            .filter_map(|e| self.recycle_path(e).ok())
-            .collect();
+        // 3. the slots: files first, then folder lines, then the emptied folders above them.
+        // A failure is reported and the rest goes on: the index no longer names these slots.
+        let mut slots = Vec::new();
         let mut folders = Vec::new();
-        for slot in &slots {
-            match std::fs::symlink_metadata(slot) {
+        for e in &report.removed {
+            let Ok(slot) = self.recycle_path(e) else {
+                continue;
+            };
+            match std::fs::symlink_metadata(&slot) {
                 Ok(m) if m.is_file() => {
-                    std::fs::remove_file(slot).map_err(io_err(slot))?;
+                    if let Err(err) = std::fs::remove_file(&slot) {
+                        report.failed.push(PruneFailure {
+                            location: e.location(),
+                            message: format!("can't remove it: {err}"),
+                        });
+                    }
                 }
                 Ok(m) if m.is_dir() => folders.push(slot.clone()),
                 _ => {}
             }
+            slots.push(slot);
         }
         for folder in &folders {
             remove_empty_folders(folder);
@@ -413,8 +446,30 @@ impl Store {
                 dir = d.parent();
             }
         }
-        crate::fsutil::fsync_dir(&root)?;
+        if let Err(err) = crate::fsutil::fsync_dir(&root) {
+            report.failed.push(PruneFailure {
+                location: String::new(),
+                message: format!("can't sync the folder: {err}"),
+            });
+        }
         Ok(report)
+    }
+
+    /// Whether `recycle/` or any part of `slot` below it is a symlink. A missing part ends the
+    /// check (nothing below it exists).
+    fn has_symlink(&self, slot: &Path) -> bool {
+        let root = self.recycle_dir();
+        let Ok(rel) = slot.strip_prefix(&root) else {
+            return true;
+        };
+        let mut p = root.clone();
+        let mut parts = std::iter::once(None).chain(rel.components().map(Some));
+        parts.any(|c| {
+            if let Some(c) = c {
+                p.push(c);
+            }
+            std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink())
+        })
     }
 
     /// Every complete line of `recycle/index.jsonl`, oldest first. A missing index is empty.

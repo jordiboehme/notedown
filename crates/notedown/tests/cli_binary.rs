@@ -45,10 +45,11 @@ fn convert_updates_an_old_header_without_loading_the_model() {
     std::fs::write(dir.path().join("Test 2.md"), old).unwrap();
     // an empty model folder: loading the model would fail the run
     let models = tempfile::tempdir().unwrap();
+    // the usual call: a relative file name, the .md next to it
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
         .env("NOTEDOWN_MODEL_DIR", models.path())
-        .arg("convert")
-        .arg(&note)
+        .current_dir(dir.path())
+        .args(["convert", "Test 2.note"])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -62,6 +63,11 @@ fn convert_updates_an_old_header_without_loading_the_model() {
     let md = std::fs::read_to_string(dir.path().join("Test 2.md")).unwrap();
     assert!(md.starts_with("---\ntype: note\n"), "{md}");
     assert!(md.ends_with(&format!("\n---\n{body}")), "{md}");
+    assert!(md.contains("\nresource: Test 2.note\n"), "{md}");
+    assert!(
+        md.contains("\n  - { id: note, resource: Test 2.note, last_modified: "),
+        "{md}"
+    );
 }
 
 #[test]

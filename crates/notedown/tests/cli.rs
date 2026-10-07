@@ -1346,3 +1346,40 @@ fn every_written_file_is_an_okf_concept() {
     assert!(out.join("sub/Log.png.md").exists());
     assert_okf_bundle(&out);
 }
+
+#[test]
+fn file_index_reads_the_file_id_of_an_old_header() {
+    let (dir, src) = setup();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(
+        out.join("Old.md"),
+        old_header_md(&src.join("Test 2.note"), "fake-model", OLD_BODY),
+    )
+    .unwrap();
+    let index = FileIndex::build(&[], &[], Some(&out));
+    assert_eq!(
+        index.path_of("F20261005225535133622IHP5FqtIJoxD"),
+        Some(out.join("Old.md").as_path())
+    );
+}
+
+#[test]
+fn out_folder_inside_the_source_folder_points_up() {
+    let (_dir, src) = setup();
+    let note = src.join("Test 2.note");
+    let out = src.join("md");
+    let (found, _) = inputs::collect(std::slice::from_ref(&note), Some(&out));
+    let outputs = inputs::output_paths(&found, Some(&out));
+    let mut engine = FakeEngine { calls: 0 };
+    pipeline::convert_one(
+        &found[0],
+        &outputs[0],
+        &mut engine,
+        &opts(Some(out.clone())),
+        &FileIndex::default(),
+    )
+    .unwrap();
+    let md = std::fs::read_to_string(out.join("Test 2.md")).unwrap();
+    assert_eq!(Frontmatter::parse(&md).unwrap().resource, "../Test 2.note");
+}

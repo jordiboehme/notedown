@@ -1608,3 +1608,130 @@ async fn the_gate_covers_the_transfers() {
         .to_string();
     assert_ok(&s.send_mark(&up, b"x").await.json());
 }
+
+#[tokio::test]
+async fn a_mark_transfer_never_extends_a_live_sync_lock() {
+    let s = Server::new();
+    let t = s.login(SERIAL).await;
+    let id = s.post(ADD, &t, add_body("aaaa", "x")).await["id"]
+        .as_u64()
+        .unwrap();
+    assert_ok(&s.post(START, &t, json!({"equipmentNo": SERIAL})).await);
+    // 20 s into the 30 s lock: a touch here would carry it past the second step.
+    s.advance_ms(20_000);
+    let up = apply_mark(&s, &t, MARK).await["fullUploadUrl"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ok(&s.send_mark(&up, b"x").await.json());
+    assert_ok(
+        &s.put(UPDATE, &t, update_with_mark(id, MARK, &md5_of(b"x")))
+            .await,
+    );
+    let get = s.post(MARK_DOWNLOAD, &t, json!({"id": id})).await["url"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(s.fetch(&get).await.body, b"x");
+    assert_eq!(s.holder().as_deref(), Some(SERIAL));
+    s.advance_ms(10_001);
+    assert_eq!(s.holder(), None);
+}
+
+#[tokio::test]
+async fn a_mark_upload_over_32_mib_is_refused() {
+    let s = Server::new();
+    let t = s.login(SERIAL).await;
+    let up = apply_mark(&s, &t, MARK).await["fullUploadUrl"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let big = vec![7u8; 32 * 1024 * 1024 + 1];
+    let v = s.send_mark(&up, &big).await.json();
+    assert_err(&v, "E0324");
+    assert!(
+        s.last_flags(MARK_UPLOAD)
+            .contains(&"upload_too_large".to_string())
+    );
+    let marks = s.data().join("accounts/jordi/digests/marks");
+    assert_eq!(std::fs::read_dir(&marks).unwrap().count(), 0);
+    // exactly 32 MiB passes
+    let v = s.send_mark(&up, &big[1..]).await.json();
+    assert_ok(&v);
+}
+
+#[tokio::test]
+async fn a_root_file_named_like_the_mark_target_still_downloads() {
+    let s = Server::new();
+    let t = s.login(SERIAL).await;
+    let files = s.data().join("accounts/jordi/files");
+    std::fs::write(files.join("digest-mark"), b"file bytes").unwrap();
+    let all = s
+        .post(
+            "/api/file/2/files/list_folder",
+            &t,
+            json!({"path": "/", "recursive": true}),
+        )
+        .await;
+    let id = all["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path_display"] == "digest-mark")
+        .unwrap_or_else(|| panic!("no digest-mark in {all}"))["id"]
+        .clone();
+    let v = s
+        .post(
+            "/api/file/3/files/download_v3",
+            &t,
+            json!({"equipmentNo": SERIAL, "id": id}),
+        )
+        .await;
+    assert_ok(&v);
+    let url = v["url"].as_str().unwrap();
+    let r = s.fetch(url).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.body, b"file bytes");
+    // A real file URL on the mark route is no mark URL.
+    let r = s
+        .fetch(&url.replace("/api/oss/download?", "/api/oss/download/summary?"))
+        .await;
+    assert_eq!(r.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(r.text(), "E1306");
+}
+
+#[tokio::test]
+async fn a_root_folder_named_like_the_mark_target_still_takes_uploads() {
+    let s = Server::new();
+    let t = s.login(SERIAL).await;
+    std::fs::create_dir_all(s.data().join("accounts/jordi/files/digest-mark")).unwrap();
+    assert_ok(&s.post(START, &t, json!({"equipmentNo": SERIAL})).await);
+    let a = s
+        .post(
+            "/api/file/3/files/upload/apply",
+            &t,
+            json!({"equipmentNo": SERIAL, "path": "/digest-mark/x.txt",
+                   "fileName": "x.txt", "size": 1}),
+        )
+        .await;
+    assert_ok(&a);
+    let url = a["fullUploadUrl"].as_str().unwrap();
+    // A real file URL on the mark route is no mark URL.
+    let r = s
+        .send_mark(
+            &url.replace("/api/oss/upload?", "/api/oss/upload/summary?"),
+            b"x",
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(r.text(), "E1306");
+    assert!(
+        !s.data()
+            .join("accounts/jordi/digests/marks")
+            .join(MARK)
+            .exists()
+    );
+    let r = s.send_mark(url, b"x").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_ok(&r.json());
+}

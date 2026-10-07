@@ -42,6 +42,8 @@ pub const MAX_FUTURE_SKEW_MS: u64 = 5 * 60 * 1000;
 pub const E_SIGNATURE: &str = "E1306";
 /// The error text of a download whose file cannot be served (HTTP 500, plain text).
 pub const E_DOWNLOAD: &str = "E1307";
+/// The error text of an upload that failed on the server side (HTTP 500, plain text).
+pub const E_UPLOAD_FAILED: &str = "E1305";
 
 type HmacSha256 = Hmac<Sha256>;
 

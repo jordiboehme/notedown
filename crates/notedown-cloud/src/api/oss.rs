@@ -36,7 +36,7 @@ use crate::sync::staging::{
     self, MAX_CHUNKS, PartOutcome, STATUS_MERGED, STATUS_UPLOADING, SingleOutcome, StreamFile,
     UploadMeta,
 };
-use crate::sync::urls::{E_DOWNLOAD, E_SIGNATURE, content_disposition};
+use crate::sync::urls::{E_DOWNLOAD, E_SIGNATURE, E_UPLOAD_FAILED, content_disposition};
 use crate::sync::{Purpose, SignedTarget, UrlError};
 
 /// Log flag: a signed URL failed the check.
@@ -61,8 +61,13 @@ pub const OTHER_FIELDS_MAX: usize = 256 * 1024;
 const CHUNK: usize = 256 * 1024;
 
 /// The `path` of a signed target that names a handwritten comment of a digest (`inner`: the
-/// `.mark` name for uploads, `id`: the digest for downloads) instead of a file.
-pub const MARK_TARGET: &str = "digest-mark";
+/// `.mark` name for uploads, `id`: the digest for downloads) instead of a file. A file target
+/// carries a [`WirePath::display`], which never holds a backslash ([`WirePath::parse`] refuses
+/// one), so no file or folder can share this value.
+pub const MARK_TARGET: &str = "\\digest-mark";
+
+/// Log flag: a mark upload whose account or store failed on the server side.
+pub const FLAG_UPLOAD_FAILED: &str = "upload_failed";
 
 /// HTTP 500 with a plain-text error code (the OSS endpoints answer no envelope).
 pub fn plain_error(code: &str, flag: &str, device: Option<&str>) -> Response {
@@ -761,11 +766,13 @@ enum MarkGate {
 }
 
 /// The gates for the account a mark URL was signed for: the token generation (`E1306`, flag
-/// `stale_token`), the protect gate and the app data gate (`E0079`). The request that passes
-/// carries no body.
+/// `stale_token`), the protect gate and the app data gate (`E0079`). A missing account or a
+/// store error answers the plain-text `failed` (`code`, `flag`) of the route. The request that
+/// passes carries no body.
 async fn mark_request(
     state: &Arc<AppState>,
     target: &SignedTarget,
+    failed: (&str, &str),
 ) -> Result<AppRequest, Box<Response>> {
     let serial = target.device.clone();
     let (st, t) = (state.clone(), target.clone());
@@ -801,11 +808,11 @@ async fn mark_request(
         Ok(Ok(MarkGate::Refused(reply))) => Err(Box::new(reply.into_response())),
         Ok(Err(e)) => {
             eprintln!("notedown cloud: {e}");
-            Err(Box::new(Reply::internal().device(&serial).into_response()))
+            Err(Box::new(plain_error(failed.0, failed.1, Some(&serial))))
         }
         Err(e) => {
             eprintln!("notedown cloud: {e}");
-            Err(Box::new(Reply::internal().device(&serial).into_response()))
+            Err(Box::new(plain_error(failed.0, failed.1, Some(&serial))))
         }
     }
 }
@@ -829,7 +836,7 @@ pub async fn upload_summary(
     let Some(name) = target.inner.clone().filter(|n| valid_mark_name(n)) else {
         return plain_error(E_SIGNATURE, FLAG_BAD_SIGNATURE, Some(&serial));
     };
-    let req = match mark_request(&state, &target).await {
+    let req = match mark_request(&state, &target, (E_UPLOAD_FAILED, FLAG_UPLOAD_FAILED)).await {
         Ok(r) => r,
         Err(r) => return *r,
     };
@@ -894,7 +901,7 @@ pub async fn download_summary(
     let Some(id) = target.id else {
         return plain_error(E_SIGNATURE, FLAG_BAD_SIGNATURE, Some(&serial));
     };
-    let req = match mark_request(&state, &target).await {
+    let req = match mark_request(&state, &target, (E_DOWNLOAD, FLAG_DOWNLOAD_FAILED)).await {
         Ok(r) => r,
         Err(r) => return *r,
     };
@@ -915,5 +922,19 @@ pub async fn download_summary(
         Ok(Some((file, size, name))) => send_file(&headers, file, size, &name, serial, None),
         Ok(None) => plain_error(E_DOWNLOAD, FLAG_DOWNLOAD_FAILED, Some(&serial)),
         Err(refused) => refused.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_mark_target_is_no_wire_path() {
+        assert!(WirePath::parse(MARK_TARGET).is_err());
+        // and no display of one: a display never holds a backslash
+        assert!(MARK_TARGET.contains('\\'));
+        let lookalike = WirePath::parse("digest-mark").unwrap();
+        assert_ne!(lookalike.display(), MARK_TARGET);
     }
 }

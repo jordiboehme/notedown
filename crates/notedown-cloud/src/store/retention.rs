@@ -51,7 +51,7 @@ pub fn plan(
     // not representable.
     let first_day = today
         .filter(|_| retention.keep_daily > 0)
-        .map(|d| d.to_julian_day() - (retention.keep_daily as i32 - 1));
+        .map(|d| i64::from(d.to_julian_day()) - (i64::from(retention.keep_daily) - 1));
     let first_month = today
         .filter(|_| retention.keep_monthly > 0)
         .map(|d| month_of(d) - (i64::from(retention.keep_monthly) - 1));
@@ -76,17 +76,20 @@ pub fn plan(
         let mut days = HashSet::new();
         let mut months = HashSet::new();
         for i in idx {
-            if kept_latest < retention.keep_latest {
+            let latest = kept_latest < retention.keep_latest;
+            if latest {
                 kept_latest += 1;
-                continue;
             }
             // A timestamp `time` can't represent is never removed by the window rules.
             let Some(date) = local(entries[i].deleted_at) else {
                 continue;
             };
-            let mut keep = false;
-            if first_day.is_some_and(|f| date.to_julian_day() >= f) {
-                keep |= days.insert(date.to_julian_day());
+            // Every rule picks the newest line of its bucket on its own, so a line kept as one
+            // of the newest also fills its buckets.
+            let mut keep = latest;
+            let day = i64::from(date.to_julian_day());
+            if first_day.is_some_and(|f| day >= f) {
+                keep |= days.insert(day);
             }
             if first_month.is_some_and(|f| month_of(date) >= f) {
                 keep |= months.insert(month_of(date));
@@ -208,5 +211,40 @@ mod tests {
         let entries = vec![over(5, t), over(5, t)];
         let got = plan(&entries, &live5, &r(1, 0, 0, 90), now, offset());
         assert_eq!(got, vec![0]);
+    }
+
+    #[test]
+    fn a_newest_line_also_fills_its_day_and_month() {
+        let now = at(2026, 10, 7, 12, 0);
+        let entries: Vec<_> = [8, 9, 10, 11]
+            .iter()
+            .map(|&h| over(5, at(2026, 10, 7, h, 0)))
+            .collect();
+        let got = plan(&entries, &live5, &r(3, 7, 12, 90), now, offset());
+        assert_eq!(got, vec![0]);
+    }
+
+    #[test]
+    fn huge_windows_do_not_overflow() {
+        let now = at(2026, 10, 7, 12, 0);
+        let entries = vec![over(5, at(2001, 1, 1, 0, 0)), over(5, at(2026, 1, 1, 0, 0))];
+        let big = r(1, u32::MAX, u32::MAX, u32::MAX);
+        assert!(plan(&entries, &live5, &big, now, offset()).is_empty());
+    }
+
+    #[test]
+    fn unrepresentable_timestamp_is_kept() {
+        let now = at(2026, 10, 7, 12, 0);
+        let entries = vec![over(5, u64::MAX), over(5, u64::MAX - 1)];
+        let got = plan(&entries, &live5, &r(1, 7, 12, u32::MAX), now, offset());
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn keep_latest_alone() {
+        let now = at(2026, 10, 7, 12, 0);
+        let entries: Vec<_> = (1..=4).map(|d| over(5, at(2025, 1, d, 10, 0))).collect();
+        let got = plan(&entries, &live5, &r(2, 0, 0, 90), now, offset());
+        assert_eq!(got, vec![0, 1]);
     }
 }

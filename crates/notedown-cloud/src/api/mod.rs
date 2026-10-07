@@ -3,12 +3,12 @@
 //! Every request passes [`log_request`], which writes exactly one protocol-log line for it.
 //! Routes: login and binding ([`login`]), server queries ([`server`]), in accept mode the sync
 //! session, listing, queries, capacity, upload apply and finish, folders, delete, move and copy
-//! ([`files`]) and signed downloads
-//! and uploads ([`oss`]), the refusal of
-//! every other file operation ([`refuse`]), the socket handshake ([`crate::socket`]) and the
+//! ([`files`]), signed downloads and uploads ([`oss`]), the digests ([`digests`]), the refusal
+//! of every other file operation ([`refuse`]), the socket handshake ([`crate::socket`]) and the
 //! catch-all ([`catchall`]).
 
 pub mod catchall;
+pub mod digests;
 pub mod envelope;
 pub mod files;
 pub mod limit;
@@ -29,7 +29,7 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{any, delete, get, post, put};
 use serde_json::Value;
 use tower_http::catch_panic::CatchPanicLayer;
 
@@ -60,7 +60,7 @@ const IMPLEMENTED: &[(&str, &str)] = &[
     ("GET", crate::socket::PATH),
 ];
 
-/// The file and oss routes served in accept mode (in refuse mode they answer `E0079`).
+/// The file, oss and digest routes served in accept mode (in refuse mode they answer `E0079`).
 const ACCEPT_IMPLEMENTED: &[(&str, &str)] = &[
     ("POST", "/api/file/2/files/synchronous/start"),
     ("POST", "/api/file/2/files/synchronous/end"),
@@ -80,6 +80,20 @@ const ACCEPT_IMPLEMENTED: &[(&str, &str)] = &[
     ("POST", "/api/file/3/files/delete_folder_v3"),
     ("POST", "/api/file/3/files/move_v3"),
     ("POST", "/api/file/3/files/copy_v3"),
+    ("POST", "/api/file/add/summary"),
+    ("PUT", "/api/file/update/summary"),
+    ("DELETE", "/api/file/delete/summary"),
+    ("POST", "/api/file/query/summary"),
+    ("POST", "/api/file/query/summary/hash"),
+    ("POST", "/api/file/query/summary/id"),
+    ("POST", "/api/file/add/summary/group"),
+    ("PUT", "/api/file/update/summary/group"),
+    ("DELETE", "/api/file/delete/summary/group"),
+    ("POST", "/api/file/query/summary/group"),
+    ("POST", "/api/file/add/summary/tag"),
+    ("PUT", "/api/file/update/summary/tag"),
+    ("DELETE", "/api/file/delete/summary/tag"),
+    ("GET", "/api/file/query/summary/tag"),
 ];
 
 /// The byte uploads: their bodies stream to staging and are never read by the request log.
@@ -160,8 +174,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// The file sync routes of accept mode. Another method on one of these paths is refused like
-/// any file path (`E0079`), not answered by the catch-all.
+/// The file sync and digest routes of accept mode. Another method on one of these paths is
+/// refused like any file path (`E0079`), not answered by the catch-all. The digest transfers
+/// (`upload/apply/summary`, `download/summary`) are not among them yet.
 fn accept_routes() -> Router<Arc<AppState>> {
     fn p<H, T>(handler: H) -> axum::routing::MethodRouter<Arc<AppState>>
     where
@@ -195,6 +210,44 @@ fn accept_routes() -> Router<Arc<AppState>> {
         )
         .route("/api/file/3/files/move_v3", p(files::move_v3))
         .route("/api/file/3/files/copy_v3", p(files::copy_v3))
+        .route("/api/file/add/summary", p(digests::add_summary))
+        .route(
+            "/api/file/update/summary",
+            put(digests::update_summary).fallback(refuse::refuse),
+        )
+        .route(
+            "/api/file/delete/summary",
+            delete(digests::delete_summary).fallback(refuse::refuse),
+        )
+        .route("/api/file/query/summary", p(digests::query_summary))
+        .route(
+            "/api/file/query/summary/hash",
+            p(digests::query_summary_hash),
+        )
+        .route("/api/file/query/summary/id", p(digests::query_summary_id))
+        .route("/api/file/add/summary/group", p(digests::add_group))
+        .route(
+            "/api/file/update/summary/group",
+            put(digests::update_group).fallback(refuse::refuse),
+        )
+        .route(
+            "/api/file/delete/summary/group",
+            delete(digests::delete_group).fallback(refuse::refuse),
+        )
+        .route("/api/file/query/summary/group", p(digests::query_group))
+        .route("/api/file/add/summary/tag", p(digests::add_tag))
+        .route(
+            "/api/file/update/summary/tag",
+            put(digests::update_tag).fallback(refuse::refuse),
+        )
+        .route(
+            "/api/file/delete/summary/tag",
+            delete(digests::delete_tag).fallback(refuse::refuse),
+        )
+        .route(
+            "/api/file/query/summary/tag",
+            get(digests::query_tag).fallback(refuse::refuse),
+        )
         .route(
             "/api/oss/download",
             get(oss::download).fallback(refuse::refuse),

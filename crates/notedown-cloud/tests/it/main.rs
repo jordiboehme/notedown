@@ -5,6 +5,7 @@ mod api;
 mod appdata;
 mod auth;
 mod diag;
+mod digests;
 mod fake_device;
 mod files;
 mod fsutil;

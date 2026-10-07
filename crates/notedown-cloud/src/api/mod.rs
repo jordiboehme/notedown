@@ -7,6 +7,17 @@
 //! ([`tasks`]), the refusal of every other file operation ([`refuse`]), the socket handshake
 //! ([`crate::socket`]) and the catch-all ([`catchall`]).
 
+/// The checked app data request of a digest or to-do route ([`digests::app_request`]); a
+/// refusal is returned from the handler.
+macro_rules! app_request {
+    ($state:expr, $headers:expr, $bytes:expr) => {
+        match $crate::api::digests::app_request(&$state, &$headers, &$bytes) {
+            Ok(r) => r,
+            Err(reply) => return reply,
+        }
+    };
+}
+
 pub mod catchall;
 pub mod digests;
 pub mod envelope;

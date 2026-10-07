@@ -963,13 +963,6 @@ async fn bad_parameters_answer_422_and_store_nothing() {
             Some(json!({"taskListId": L1, "updateScheduleTaskList": "no"})),
         ),
         ("POST", SORT.into(), Some(json!({"title": "no id"}))),
-        ("POST", TASK_ALL.into(), Some(json!({"maxResults": "many"}))),
-        (
-            "POST",
-            TASK_ALL.into(),
-            Some(json!({"nextPageTokens": "abc"})),
-        ),
-        ("POST", GROUP_ALL.into(), Some(json!({"pageToken": "-1"}))),
         (
             "POST",
             SORT_QUERY.into(),
@@ -1184,4 +1177,155 @@ async fn an_oversized_body_on_a_route_with_an_id_is_a_bad_parameter() {
     let v: Value = serde_json::from_slice(&body).unwrap();
     assert_err(&v, "422");
     assert!(s.last_flags(&path).is_empty());
+}
+
+// ------------------------------------------------------------------ fix round 1
+
+const T4: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb4";
+const T5: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb5";
+
+#[tokio::test]
+async fn paging_arguments_of_any_shape_never_answer_422() {
+    let s = Server::new();
+    let t = s.login(SERIAL).await;
+    s.seed(&t).await;
+    // maxResults of another shape is the default 20
+    for max in [
+        json!("many"),
+        json!(2.5),
+        json!(true),
+        json!(-3),
+        json!(0),
+        json!({"a": 1}),
+        json!([]),
+        json!(["2", "3"]),
+    ] {
+        let v = s.pull(&t, json!({"maxResults": max})).await;
+        assert_eq!(ids_of(&v), vec![T1, T2, T3], "{max}");
+        assert!(!has_key(&v, "nextPageToken"), "{max}");
+    }
+    // a one-element array of a string or a number
+    for max in [json!(["2"]), json!([2])] {
+        let v = s.pull(&t, json!({"maxResults": max})).await;
+        assert_eq!(ids_of(&v), vec![T1, T2], "{max}");
+        let next = v["nextPageToken"].clone();
+        let v = s
+            .pull(&t, json!({"maxResults": max, "nextPageTokens": [next]}))
+            .await;
+        assert_eq!(ids_of(&v), vec![T3], "{max}");
+        assert!(!has_key(&v, "nextPageToken"));
+    }
+    // a page token of another shape is the first page
+    for token in [
+        json!("abc"),
+        json!(-1),
+        json!(1.5),
+        json!(true),
+        json!({"x": 1}),
+        json!(["a", "b"]),
+        json!("x:1"),
+    ] {
+        let v = s
+            .pull(&t, json!({"maxResults": "2", "nextPageTokens": token}))
+            .await;
+        assert_eq!(ids_of(&v), vec![T1, T2], "{token}");
+    }
+
+    // the same for groups
+    for id in [L2, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3"] {
+        assert_ok(&s.post(GROUP, &t, group_body(id, "g")).await);
+    }
+    for token in [json!("-1"), json!("abc"), json!(true), json!(0.5)] {
+        let v = s
+            .post(
+                GROUP_ALL,
+                &t,
+                json!({"maxResults": "2", "pageToken": token}),
+            )
+            .await;
+        assert_ok(&v);
+        assert_eq!(
+            v["scheduleTaskGroup"].as_array().unwrap().len(),
+            2,
+            "{token}"
+        );
+        assert_eq!(v["pageToken"], "2");
+    }
+    let v = s
+        .post(
+            GROUP_ALL,
+            &t,
+            json!({"maxResults": ["2"], "pageToken": ["2"]}),
+        )
+        .await;
+    assert_eq!(v["scheduleTaskGroup"].as_array().unwrap().len(), 1);
+    assert!(!has_key(&v, "pageToken"));
+    let v = s.post(GROUP_ALL, &t, json!({"maxResults": "lots"})).await;
+    assert_eq!(v["scheduleTaskGroup"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn every_page_of_a_pull_answers_the_time_of_its_first_page() {
+    let s = Server::new();
+    let t = s.login(SERIAL).await;
+    s.seed(&t).await;
+    for id in [T4, T5] {
+        assert_ok(&s.post(TASK, &t, task_body(id, L1, "x")).await);
+    }
+    s.advance_ms(1_000);
+    let first = (T0 + 1_000) as u64;
+    let v = s.pull(&t, json!({"maxResults": "2"})).await;
+    assert_eq!(ids_of(&v), vec![T1, T2]);
+    assert_eq!(v["nextSyncToken"], first);
+    let mut next = v["nextPageToken"].as_str().unwrap().to_string();
+
+    // a change between page calls, on a row of the first page
+    s.advance_ms(1_000);
+    assert_ok(&s.put(TASK, &t, task_body(T1, L1, "changed")).await);
+    s.advance_ms(1_000);
+    let mut seen = Vec::new();
+    loop {
+        let v = s
+            .pull(&t, json!({"maxResults": "2", "nextPageTokens": next}))
+            .await;
+        assert_eq!(v["nextSyncToken"], first, "{v}");
+        seen.extend(ids_of(&v));
+        match v["nextPageToken"].as_str() {
+            Some(n) => next = n.to_string(),
+            None => break,
+        }
+    }
+    assert_eq!(seen, vec![T3, T4, T5]);
+
+    // the token of the last page brings the change
+    s.advance_ms(1_000);
+    let v = s.pull(&t, json!({"nextSyncToken": first})).await;
+    assert_eq!(ids_of(&v), vec![T1]);
+    assert_eq!(tasks_of(&v)[0]["title"], "changed");
+    assert_eq!(v["nextSyncToken"], T0 + 4_000);
+}
+
+#[tokio::test]
+async fn a_tombstone_lives_exactly_as_long_as_the_token_before_its_delete() {
+    let s = Server::new();
+    let t = s.login(SERIAL).await;
+    s.seed(&t).await;
+    s.advance_ms(1_000);
+    let token = s.pull(&t, json!({})).await["nextSyncToken"]
+        .as_u64()
+        .unwrap();
+    // deleted in the millisecond of the token: the tombstone and the token age alike
+    assert_ok(&s.delete(&format!("{TASK}/{T2}"), &t).await);
+    let file = s.tasks_dir().join(format!("items/{T2}.json"));
+
+    s.advance_ms(5 * DAY);
+    let v = s.pull(&t, json!({"nextSyncToken": token})).await;
+    assert_eq!(ids_of(&v), vec![T2]);
+    assert_eq!(tasks_of(&v)[0]["isDeleted"], "Y");
+    assert!(file.is_file());
+
+    s.advance_ms(1);
+    let v = s.post(TASK_ALL, &t, json!({"nextSyncToken": token})).await;
+    assert_err(&v, "E0330");
+    assert!(!file.exists());
 }

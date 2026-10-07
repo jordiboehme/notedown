@@ -15,9 +15,11 @@
 //! the server wrote at or after that time, tombstones included (`isDeleted: "Y"`). "At or after"
 //! (not "after"): a write in the same millisecond as the answered token comes again instead of
 //! never. A token older than 5 days, in the future or no number answers `E0330` and the device
-//! pulls all. `nextSyncToken` of the answer is the server time. Tasks are ordered by `taskId`,
-//! groups by `taskListId`; `maxResults` (a number or a decimal string, default 20) pages them by
-//! an offset token, which only a page with more rows after it carries.
+//! pulls all. `nextSyncToken` of the answer is the server time of the pull's first page, carried
+//! in the page token, so a change made between page calls comes with the next pull. Tasks are
+//! ordered by `taskId`, groups by `taskListId`; `maxResults` (default 20) pages them by an
+//! opaque token, which only a page with more rows after it carries. Paging arguments of an
+//! unexpected shape never answer `422`: they read as the default or the first page.
 //!
 //! Deletes: a task delete leaves a tombstone (D5). A group delete turns every task of the group
 //! into a tombstone (one journal batch), then removes its sort and the group; `group/clear` does
@@ -32,7 +34,7 @@ use axum::http::HeaderMap;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
-use super::digests::{AppRequest, app_request, with_app_data};
+use super::digests::{AppRequest, with_app_data};
 use super::envelope::Reply;
 use crate::appdata::{NO, TOMBSTONE_TTL_MS, Task, TaskGroup, TaskSort, YES, valid_task_key};
 use crate::journal::Origin;
@@ -58,15 +60,6 @@ const NOT_STORED: &[&str] = &["equipmentNo"];
 const GROUP_SERVER_FIELDS: &[&str] = &["userId"];
 /// The `status` of a done task.
 const COMPLETED: &str = "completed";
-
-macro_rules! try_reply {
-    ($e:expr) => {
-        match $e {
-            Ok(v) => v,
-            Err(reply) => return reply,
-        }
-    };
-}
 
 // ------------------------------------------------------------------ request parsing
 
@@ -124,16 +117,55 @@ fn int_arg(body: &Value, name: &str) -> Result<Option<i64>, ()> {
     }
 }
 
-/// `maxResults`: absent or not positive is [`DEFAULT_MAX_RESULTS`].
-fn max_results(req: &AppRequest) -> Result<u64, Reply> {
-    match int_arg(&req.body, "maxResults") {
-        Ok(Some(n)) if n > 0 => Ok(n as u64),
-        Ok(_) => Ok(DEFAULT_MAX_RESULTS),
-        Err(()) => Err(req.bad_params("maxResults")),
+/// A paging argument as text: a string, a number or a one-element array of either (6.1 names
+/// the token field `nextPageTokens`, plural); `None` when absent or of another shape. Paging
+/// arguments never answer `422`: a poll that fails would fail the device's to-do sync each time.
+fn paging_text(body: &Value, name: &str) -> Option<String> {
+    let value = match body.get(name)? {
+        Value::Array(a) if a.len() == 1 => &a[0],
+        v => v,
+    };
+    match value {
+        Value::String(s) => Some(s.trim().to_string()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
     }
 }
 
-/// An offset argument (a page token or `nextIndexNumber`): absent is 0, negative is bad.
+/// `maxResults`: a positive decimal; anything else is [`DEFAULT_MAX_RESULTS`].
+fn max_results(body: &Value) -> u64 {
+    paging_text(body, "maxResults")
+        .and_then(|t| t.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_RESULTS)
+}
+
+/// `pageToken` of `group/all`: the decimal offset this server answered; anything else is the
+/// first page.
+fn group_page_token(body: &Value) -> u64 {
+    paging_text(body, "pageToken")
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(0)
+}
+
+/// `nextPageTokens` of `task/all`: `<offset>:<pull time>` as this server answers it, the pull
+/// time being the server time of the pull's first page (or a bare offset). Anything else is
+/// the first page of a new pull.
+fn task_page_token(body: &Value) -> (u64, Option<u64>) {
+    let Some(text) = paging_text(body, "nextPageTokens") else {
+        return (0, None);
+    };
+    let (offset, time) = match text.split_once(':') {
+        Some((o, t)) => (o, t.parse().ok()),
+        None => (text.as_str(), None),
+    };
+    match offset.parse() {
+        Ok(offset) => (offset, time),
+        Err(_) => (0, None),
+    }
+}
+
+/// `nextIndexNumber`: absent is 0, negative or no number is bad.
 fn offset_arg(req: &AppRequest, name: &str) -> Result<u64, Reply> {
     match int_arg(&req.body, name) {
         Ok(None) => Ok(0),
@@ -164,7 +196,7 @@ fn sync_token(body: &Value) -> SyncToken {
 // ------------------------------------------------------------------ answers
 
 /// One page of `rows` from `offset`, and the offset of the next page when rows follow.
-fn page<T>(rows: Vec<T>, offset: u64, max: u64) -> (Vec<T>, Option<String>) {
+fn page<T>(rows: Vec<T>, offset: u64, max: u64) -> (Vec<T>, Option<u64>) {
     let total = rows.len() as u64;
     let end = offset.saturating_add(max);
     let rows = rows
@@ -172,7 +204,7 @@ fn page<T>(rows: Vec<T>, offset: u64, max: u64) -> (Vec<T>, Option<String>) {
         .skip(usize::try_from(offset).unwrap_or(usize::MAX))
         .take(usize::try_from(max).unwrap_or(usize::MAX))
         .collect();
-    (rows, (end < total).then(|| end.to_string()))
+    (rows, (end < total).then_some(end))
 }
 
 /// A group as the device gets it, with the account's `userId`.
@@ -238,9 +270,9 @@ pub async fn group_all(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = try_reply!(app_request(&state, &headers, &bytes));
-    let max = try_reply!(max_results(&req));
-    let offset = try_reply!(offset_arg(&req, "pageToken"));
+    let req = app_request!(state, headers, bytes);
+    let max = max_results(&req.body);
+    let offset = group_page_token(&req.body);
     with_app_data(&state, &req, move |c| {
         let mut groups: Vec<TaskGroup> = c
             .app
@@ -253,7 +285,7 @@ pub async fn group_all(
         let list: Vec<Value> = rows.iter().map(|g| group_view(g, c.user_id)).collect();
         let mut fields = json!({"scheduleTaskGroup": list});
         if let Some(next) = next {
-            fields["pageToken"] = json!(next);
+            fields["pageToken"] = json!(next.to_string());
         }
         Ok(c.ok(fields))
     })
@@ -264,9 +296,14 @@ pub async fn group_all(
 /// (an upsert). A stored `createTime` stays (the update carries none); a new group without one
 /// gets the server time. `POST` answers `{taskListId}`.
 async fn save_group(state: Arc<AppState>, headers: HeaderMap, bytes: Bytes, create: bool) -> Reply {
-    let req = try_reply!(app_request(&state, &headers, &bytes));
-    let mut group: TaskGroup = try_reply!(record(&req, &req.body, GROUP_SERVER_FIELDS));
-    try_reply!(key(&req, &group.task_list_id, "taskListId"));
+    let req = app_request!(state, headers, bytes);
+    let mut group: TaskGroup = match record(&req, &req.body, GROUP_SERVER_FIELDS) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if let Err(r) = key(&req, &group.task_list_id, "taskListId") {
+        return r;
+    }
     with_app_data(&state, &req, move |c| {
         let old = c.app.task_group(c.guard, &group.task_list_id)?;
         if let Some(created) = old.map(|o| o.create_time).filter(|t| !t.is_null()) {
@@ -319,8 +356,11 @@ pub async fn delete_group(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = try_reply!(app_request(&state, &headers, &bytes));
-    let id = try_reply!(key(&req, &id, "taskListId"));
+    let req = app_request!(state, headers, bytes);
+    let id = match key(&req, &id, "taskListId") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     with_app_data(&state, &req, move |c| {
         let tasks = tasks_of_group(&c, &id, |_| true)?;
         tombstone(&c, tasks)?;
@@ -344,9 +384,15 @@ pub async fn clear_group(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = try_reply!(app_request(&state, &headers, &bytes));
-    let sent = try_reply!(list_id_arg(&req));
-    let id = try_reply!(key(&req, &sent, "taskListId"));
+    let req = app_request!(state, headers, bytes);
+    let sent = match list_id_arg(&req) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let id = match key(&req, &sent, "taskListId") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     let last_modified = req.body.get("lastModified").cloned().unwrap_or(Value::Null);
     with_app_data(&state, &req, move |c| {
         let done = tasks_of_group(&c, &id, |t| t.status.as_deref() == Some(COMPLETED))?;
@@ -375,8 +421,11 @@ pub async fn get_group(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = try_reply!(app_request(&state, &headers, &bytes));
-    let id = try_reply!(key(&req, &id, "taskListId"));
+    let req = app_request!(state, headers, bytes);
+    let id = match key(&req, &id, "taskListId") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     with_app_data(&state, &req, move |c| {
         Ok(
             match c.app.task_group(c.guard, &id)?.filter(TaskGroup::is_live) {
@@ -398,9 +447,9 @@ pub async fn task_all(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = try_reply!(app_request(&state, &headers, &bytes));
-    let max = try_reply!(max_results(&req));
-    let offset = try_reply!(offset_arg(&req, "nextPageTokens"));
+    let req = app_request!(state, headers, bytes);
+    let max = max_results(&req.body);
+    let (offset, pulled) = task_page_token(&req.body);
     let token = sync_token(&req.body);
     with_app_data(&state, &req, move |c| {
         let now = c.state.journal.now_ms();
@@ -422,11 +471,14 @@ pub async fn task_all(
             })
             .collect();
         tasks.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+        // Every page of one pull answers the time of its first page: a change made between
+        // page calls comes with the next incremental pull.
+        let pulled = pulled.filter(|t| *t > 0 && *t <= now).unwrap_or(now);
         let (rows, next) = page(tasks, offset, max);
         let list: Vec<Value> = rows.iter().map(task_view).collect();
-        let mut fields = json!({"scheduleTask": list, "nextSyncToken": now});
+        let mut fields = json!({"scheduleTask": list, "nextSyncToken": pulled});
         if let Some(next) = next {
-            fields["nextPageToken"] = json!(next);
+            fields["nextPageToken"] = json!(format!("{next}:{pulled}"));
         }
         Ok(c.ok(fields))
     })
@@ -440,8 +492,11 @@ pub async fn save_task(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = try_reply!(app_request(&state, &headers, &bytes));
-    let task = try_reply!(task_from(&req, &req.body));
+    let req = app_request!(state, headers, bytes);
+    let task = match task_from(&req, &req.body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     with_app_data(&state, &req, move |c| {
         c.app.put_task(
             c.guard,
@@ -463,8 +518,11 @@ pub async fn save_task_list(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = try_reply!(app_request(&state, &headers, &bytes));
-    let list = try_reply!(list_id_arg(&req));
+    let req = app_request!(state, headers, bytes);
+    let list = match list_id_arg(&req) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     let items = match req.body.get("updateScheduleTaskList") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(a)) => a.clone(),
@@ -472,7 +530,10 @@ pub async fn save_task_list(
     };
     let mut tasks = Vec::with_capacity(items.len());
     for item in &items {
-        let mut task = try_reply!(task_from(&req, item));
+        let mut task = match task_from(&req, item) {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
         if task.task_list_id.is_empty() {
             task.task_list_id = list.clone();
         }
@@ -498,8 +559,11 @@ pub async fn delete_task(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = try_reply!(app_request(&state, &headers, &bytes));
-    let id = try_reply!(key(&req, &id, "taskId"));
+    let req = app_request!(state, headers, bytes);
+    let id = match key(&req, &id, "taskId") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     with_app_data(&state, &req, move |c| {
         c.app.delete_task(
             c.guard,
@@ -521,8 +585,11 @@ pub async fn get_task(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = try_reply!(app_request(&state, &headers, &bytes));
-    let id = try_reply!(key(&req, &id, "taskId"));
+    let req = app_request!(state, headers, bytes);
+    let id = match key(&req, &id, "taskId") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     with_app_data(&state, &req, move |c| {
         Ok(match c.app.task(c.guard, &id)?.filter(Task::is_live) {
             Some(t) => c.ok(with_fields(
@@ -544,9 +611,14 @@ pub async fn save_sort(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = try_reply!(app_request(&state, &headers, &bytes));
-    let sort: TaskSort = try_reply!(record(&req, &req.body, &[]));
-    try_reply!(key(&req, &sort.task_list_id, "taskListId"));
+    let req = app_request!(state, headers, bytes);
+    let sort: TaskSort = match record(&req, &req.body, &[]) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if let Err(r) = key(&req, &sort.task_list_id, "taskListId") {
+        return r;
+    }
     with_app_data(&state, &req, move |c| {
         c.app.put_task_sort(c.guard, &sort)?;
         Ok(c.ok(json!({})))
@@ -561,8 +633,11 @@ pub async fn delete_sort(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = try_reply!(app_request(&state, &headers, &bytes));
-    let id = try_reply!(key(&req, &id, "taskListId"));
+    let req = app_request!(state, headers, bytes);
+    let id = match key(&req, &id, "taskListId") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     with_app_data(&state, &req, move |c| {
         c.app.delete_task_sort(c.guard, &id)?;
         Ok(c.ok(json!({})))
@@ -578,8 +653,11 @@ pub async fn query_sort(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Reply {
-    let req = try_reply!(app_request(&state, &headers, &bytes));
-    let index = try_reply!(offset_arg(&req, "nextIndexNumber"));
+    let req = app_request!(state, headers, bytes);
+    let index = match offset_arg(&req, "nextIndexNumber") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     with_app_data(&state, &req, move |c| {
         let mut sorts = c.app.task_sorts(c.guard)?;
         sorts.sort_by(|a, b| a.task_list_id.cmp(&b.task_list_id));

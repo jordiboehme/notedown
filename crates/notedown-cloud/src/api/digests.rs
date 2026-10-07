@@ -138,15 +138,6 @@ pub fn app_request(
     })
 }
 
-macro_rules! app_request {
-    ($state:expr, $headers:expr, $bytes:expr) => {
-        match app_request(&$state, &$headers, &$bytes) {
-            Ok(r) => r,
-            Err(reply) => return reply,
-        }
-    };
-}
-
 /// What a route's store work sees: the app data under the store lock, and who asks.
 pub struct Ctx<'a> {
     pub state: &'a AppState,

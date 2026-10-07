@@ -13,7 +13,7 @@ pub mod eio;
 pub mod handler;
 pub mod registry;
 
-pub use registry::{LIVENESS_MS, LastInbound, Outbound, SocketRegistry};
+pub use registry::{LIVENESS_MS, LastInbound, Outbound, RESEND_MS, SocketRegistry};
 
 use std::collections::HashMap;
 use std::sync::Arc;

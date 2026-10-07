@@ -33,10 +33,13 @@ pub enum PushMode {
     /// sync on every new connection (`docs/sync-protocol.md` 9.3).
     #[default]
     Reconnect,
-    /// One `STARTSYNC` message. Firmware 3.29.42 acknowledges it but does not sync.
+    /// One `STARTSYNC` item, queued and sent after the device's next heartbeat reply as Ratta
+    /// sends its pushes (`docs/sync-protocol.md` 4.4). Firmware 3.29.42 acknowledges it but does
+    /// not sync.
     Startsync,
-    /// One item per changed file or folder. Falls back to `startsync` when the message cannot be
-    /// built or the list of changes was cut at its cap. Firmware 3.29.42 does not sync on it.
+    /// One item per changed file or folder in Ratta's form, queued and sent after the device's
+    /// next heartbeat reply, again until the device answers `Received` (4.4). Falls back to
+    /// `startsync` when the items cannot be built or the list of changes was cut at its cap.
     Detail,
     /// No pushes; the device syncs on its own schedule.
     Off,
@@ -64,7 +67,7 @@ pub struct Config {
     /// `"reconnect"` (default) closes a connected device's socket after a change it did not make
     /// itself (a `notedown cloud put`, another device's upload), so it connects again and syncs.
     /// `"startsync"` sends one `STARTSYNC` message, `"detail"` sends the changed items instead,
-    /// `"off"` sends nothing.
+    /// both after the device's next heartbeat; `"off"` sends nothing.
     pub push: PushMode,
     /// Write full, masked dumps of every request and frame to `capture/`. For one capture
     /// session only: the dumps have no size cap and no rotation. The `--capture` flag of

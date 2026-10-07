@@ -196,40 +196,68 @@ impl PushPlanner {
     }
 }
 
+/// One item of a `FILE-SYN` message, kept as JSON text: the field order is Ratta's (4.5), and a
+/// `serde_json::Value` would sort the keys. The socket registry queues items until a heartbeat
+/// of the session takes them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushItem {
+    json: String,
+    startsync: bool,
+}
+
+impl PushItem {
+    pub(crate) fn new<T: Serialize>(item: &T, startsync: bool) -> PushItem {
+        PushItem {
+            json: serde_json::to_string(item).expect("item serializes"),
+            startsync,
+        }
+    }
+
+    /// The item as JSON text.
+    pub fn json(&self) -> &str {
+        &self.json
+    }
+
+    /// Whether this is a `STARTSYNC` item: several of them merge into one.
+    pub fn is_startsync(&self) -> bool {
+        self.startsync
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Item<'a> {
+struct StartsyncItem<'a> {
     message_type: &'static str,
     equipment_no: &'a str,
     timestamp: u64,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Message<'a> {
-    code: &'static str,
-    msg: &'static str,
-    timestamp: u64,
-    msg_type: &'static str,
-    data: [Item<'a>; 1],
+/// The `STARTSYNC` item built at `now_ms`. `cause` is the serial of the device behind the
+/// change; `None` gives `null-null`, as the web UI of Ratta does for a change that no device
+/// made.
+pub fn startsync_item(cause: Option<&str>, now_ms: u64) -> PushItem {
+    let item = StartsyncItem {
+        message_type: "STARTSYNC",
+        equipment_no: cause.unwrap_or("null-null"),
+        timestamp: now_ms,
+    };
+    PushItem::new(&item, true)
 }
 
-/// The `FILE-SYN` `STARTSYNC` message as the JSON string argument of `ServerMessage`.
-/// `cause` is the serial of the device behind the change; `None` gives `null-null`, as the web
-/// UI of Ratta does for a change that no device made.
+/// The `FILE-SYN` message of `items` sent at `now_ms`, as the JSON string argument of
+/// `ServerMessage`: `code`, `timestamp` (the send time), `msgType` and `data`, without `msg`
+/// (4.5).
+pub fn file_syn_message(items: &[PushItem], now_ms: u64) -> String {
+    let data: Vec<&str> = items.iter().map(PushItem::json).collect();
+    format!(
+        r#"{{"code":"200","timestamp":{now_ms},"msgType":"FILE-SYN","data":[{}]}}"#,
+        data.join(",")
+    )
+}
+
+/// The `FILE-SYN` message with one `STARTSYNC` item, built and sent at `now_ms`.
 pub fn startsync_message(cause: Option<&str>, now_ms: u64) -> String {
-    let m = Message {
-        code: "200",
-        msg: "",
-        timestamp: now_ms,
-        msg_type: "FILE-SYN",
-        data: [Item {
-            message_type: "STARTSYNC",
-            equipment_no: cause.unwrap_or("null-null"),
-            timestamp: now_ms,
-        }],
-    };
-    serde_json::to_string(&m).expect("message serializes")
+    file_syn_message(&[startsync_item(cause, now_ms)], now_ms)
 }
 
 /// The socket.io frame `42["ServerMessage", <message string>]`.
@@ -470,9 +498,21 @@ mod tests {
     fn startsync_message_has_the_fixed_field_order() {
         assert_eq!(
             startsync_message(None, 1791270408879),
-            r#"{"code":"200","msg":"","timestamp":1791270408879,"msgType":"FILE-SYN","data":[{"messageType":"STARTSYNC","equipmentNo":"null-null","timestamp":1791270408879}]}"#
+            r#"{"code":"200","timestamp":1791270408879,"msgType":"FILE-SYN","data":[{"messageType":"STARTSYNC","equipmentNo":"null-null","timestamp":1791270408879}]}"#
         );
         assert!(startsync_message(Some("SN1"), 5).contains(r#""equipmentNo":"SN1""#));
+    }
+
+    #[test]
+    fn the_message_merges_items_and_has_the_send_time() {
+        let items = [startsync_item(None, 3), startsync_item(Some("SN1"), 4)];
+        assert_eq!(
+            file_syn_message(&items, 9),
+            r#"{"code":"200","timestamp":9,"msgType":"FILE-SYN","data":[{"messageType":"STARTSYNC","equipmentNo":"null-null","timestamp":3},{"messageType":"STARTSYNC","equipmentNo":"SN1","timestamp":4}]}"#
+        );
+        assert!(items.iter().all(PushItem::is_startsync));
+        let m: serde_json::Value = serde_json::from_str(&file_syn_message(&[], 1)).unwrap();
+        assert_eq!(m["data"], serde_json::json!([]));
     }
 
     #[test]

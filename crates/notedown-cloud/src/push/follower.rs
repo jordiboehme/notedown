@@ -3,13 +3,15 @@
 //! The follower reads the journal events after its cursor and feeds them to the planner. The
 //! cursor lives in memory only: it starts at the journal's `last_seq` when the server starts
 //! (D11), so older changes never cause a push, and a restart drops pending pushes (D6). The tick
-//! hands every due push that D8 allows to the device's socket session.
+//! hands every due push that D8 allows to the device's socket session: `reconnect` closes it,
+//! `startsync` and `detail` put their items into its queue, which the session sends after its
+//! next heartbeat reply (`docs/sync-protocol.md` 4.4).
 
 use std::collections::HashMap;
 use std::sync::{Arc, MutexGuard};
 use std::time::Duration;
 
-use super::{PushPlanner, detail_message, server_message_frame, startsync_message};
+use super::{PushPlanner, detail_items, startsync_item};
 use crate::diag::{LogEntry, LogKind};
 use crate::server::AppState;
 use crate::{PushMode, SyncMode};
@@ -81,8 +83,8 @@ pub fn follow_once(state: &AppState, last_seq: &mut u64) -> crate::Result<usize>
 /// The close reason of a `reconnect` push.
 pub const RECONNECT_REASON: &str = "sync";
 
-/// One tick at `now_ms`: send every due push that D8 allows. Returns the pushes handed over. A
-/// target that fails a gate keeps its pending push. Blocking (it reads `account.json`).
+/// One tick at `now_ms`: hand over every due push that D8 allows. Returns the pushes handed
+/// over. A target that fails a gate keeps its pending push. Blocking (it reads `account.json`).
 pub fn tick(state: &AppState, now_ms: u64) -> usize {
     if state.config.sync != SyncMode::Accept || state.config.push == PushMode::Off {
         return 0;
@@ -101,7 +103,7 @@ pub fn tick(state: &AppState, now_ms: u64) -> usize {
             continue;
         }
         // Held from the look at the pending push to `sent`, so a `covered` of a sync start cannot
-        // slip in and be wiped. In detail mode the message is built under the lock, and that can
+        // slip in and be wiped. In detail mode the items are built under the lock, and that can
         // read the store's id registry from disk: a sync start and the follower wait for it.
         let mut planner = planner(state);
         let Some(pending) = planner.pending(&slug, &serial) else {
@@ -121,16 +123,16 @@ pub fn tick(state: &AppState, now_ms: u64) -> usize {
         }
         let cause = pending.cause.as_deref();
         // `detail` falls back to `STARTSYNC` when the cap dropped events (the list would be
-        // partial) or when its message cannot be built.
+        // partial) or when its items cannot be built.
         let detail = (state.config.push == PushMode::Detail && !pending.truncated)
             .then(|| {
                 let store = state.store(&slug).ok()?;
-                detail_message(&pending.events, cause, &store, now_ms).ok()
+                detail_items(&pending.events, &store, now_ms).ok()
             })
-            .flatten();
-        let message = detail.unwrap_or_else(|| startsync_message(cause, now_ms));
-        let frame = server_message_frame(&message);
-        if state.sockets.send(&slug, &serial, frame, now_ms) {
+            .flatten()
+            .filter(|items| !items.is_empty());
+        let items = detail.unwrap_or_else(|| vec![startsync_item(cause, now_ms)]);
+        if state.sockets.queue(&slug, &serial, items, now_ms) {
             planner.sent(&slug, &serial, now_ms);
             sent += 1;
         }

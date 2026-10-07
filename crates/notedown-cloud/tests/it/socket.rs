@@ -471,6 +471,12 @@ async fn unknown_frames_are_flagged_and_the_connection_stays_open() {
         "hello",
         "42[broken",
         "",
+        // An ack id gets an ack only when a listener handled the event (4.1): not for a
+        // malformed id, an id beyond u64, another namespace or an unknown event.
+        r#"42x["ratta_ping"]"#,
+        r#"4299999999999999999999999["ratta_ping"]"#,
+        r#"42/ns,5["ratta_ping"]"#,
+        r#"425["mystery"]"#,
     ];
     for u in unknown {
         send(&mut ws, u).await;

@@ -55,8 +55,8 @@ pub enum Action {
     Close,
     /// Unknown frame: log it with `unknown_event`, do not answer, keep the connection.
     Unknown,
-    /// Several frames in this order, or an unknown event that still carried an ack id: send the
-    /// frames and, when `unknown`, log the incoming frame with `unknown_event`.
+    /// Several frames in this order, or an unknown `ClientMessage` that still carried an ack id:
+    /// send the frames and, when `unknown`, log the incoming frame with `unknown_event`.
     Reply { frames: Vec<String>, unknown: bool },
 }
 
@@ -123,36 +123,58 @@ fn parse_event(data: &str) -> Inbound {
     }
 }
 
-/// The answer to a frame (`docs/sync-protocol.md` 4.2 and 4.3).
+/// The answer to a frame (`docs/sync-protocol.md` 4.2 and 4.3) of a session without pushes.
 pub fn answer(frame: &str) -> Action {
+    answer_with(frame, || None, || {})
+}
+
+/// The answer to a frame of a registered session. After the reply to `ratta_ping` or
+/// `ClientMessage "status"` it sends what `deliver` returns (the session's queued file push),
+/// before the ack, as Ratta does (4.3). `ClientMessage "Received"` calls `received`.
+pub fn answer_with(
+    frame: &str,
+    deliver: impl FnOnce() -> Option<String>,
+    received: impl FnOnce(),
+) -> Action {
     match parse(frame) {
         Inbound::Ping(data) => Action::Answer(format!("3{data}")),
         Inbound::Ignored => Action::Nothing,
         Inbound::Close => Action::Close,
         Inbound::Connect => Action::Answer(CONNECT.to_string()),
-        Inbound::Event { name, args, ack } => answer_event(&name, &args, ack),
+        Inbound::Event { name, args, ack } => answer_event(&name, &args, ack, deliver, received),
         Inbound::Unknown => Action::Unknown,
     }
 }
 
-/// The answer to an event: its own answer first, then the ack when the packet carried an id
-/// (`43<id>[]`, or `43<id>["Received"]` for a `ClientMessage` that is not `Received` or `status`).
-fn answer_event(name: &str, args: &[Value], ack: Option<u64>) -> Action {
+/// The answer to an event: its own answer and the queued push first, then the ack when the
+/// packet carried an id (`43<id>[]`, or `43<id>["Received"]` for a `ClientMessage` that is not
+/// `Received` or `status`). An event no listener handles gets no ack (4.1).
+fn answer_event(
+    name: &str,
+    args: &[Value],
+    ack: Option<u64>,
+    deliver: impl FnOnce() -> Option<String>,
+    received: impl FnOnce(),
+) -> Action {
     let mut frames = Vec::new();
     let mut unknown = false;
     let mut ack_arg = None;
     match (name, args.first()) {
-        (EVENT_RATTA_PING, _) => frames.push(event(EVENT_RATTA_PING, "Received")),
+        (EVENT_RATTA_PING, _) => {
+            frames.push(event(EVENT_RATTA_PING, "Received"));
+            frames.extend(deliver());
+        }
         (EVENT_CLIENT_MESSAGE, Some(Value::String(s))) if s == "status" => {
             frames.push(event(EVENT_SERVER_MESSAGE, "true"));
+            frames.extend(deliver());
         }
-        // Marks pending file messages delivered; this server sends none yet.
-        (EVENT_CLIENT_MESSAGE, Some(Value::String(s))) if s == "Received" => {}
+        // Marks the sent file push delivered.
+        (EVENT_CLIENT_MESSAGE, Some(Value::String(s))) if s == "Received" => received(),
         (EVENT_CLIENT_MESSAGE, _) => {
             unknown = true;
             ack_arg = Some("Received");
         }
-        _ => unknown = true,
+        _ => return Action::Unknown,
     }
     if let Some(id) = ack {
         frames.push(match ack_arg {
@@ -250,13 +272,6 @@ mod tests {
                 unknown: true
             }
         );
-        assert_eq!(
-            answer(r#"429["mystery"]"#),
-            Action::Reply {
-                frames: vec!["439[]".into()],
-                unknown: true
-            }
-        );
         assert_eq!(answer("40"), Action::Answer("40".into()));
         assert_eq!(answer("40/,"), Action::Answer("40".into()));
         assert_eq!(answer("3"), Action::Nothing);
@@ -284,6 +299,11 @@ mod tests {
             "40/other,",
             "42/other,[\"ratta_ping\"]",
             "4299999999999999999999999[\"ratta_ping\"]",
+            // Only an event a listener handles gets an ack (4.1).
+            r#"429["mystery"]"#,
+            r#"42x["ratta_ping"]"#,
+            r#"42x5["ratta_ping"]"#,
+            r#"42/ns,5["ratta_ping"]"#,
             r#"42["mystery"]"#,
             r#"42["ClientMessage","other"]"#,
             r#"42["ClientMessage"]"#,
@@ -294,6 +314,74 @@ mod tests {
         ] {
             assert_eq!(answer(f), Action::Unknown, "{f:?}");
         }
+    }
+
+    /// `answer_with` with a queued push `P` and a counter of `Received` calls.
+    fn with_push(frame: &str) -> (Action, usize, usize) {
+        let delivered = std::cell::Cell::new(0);
+        let received = std::cell::Cell::new(0);
+        let action = answer_with(
+            frame,
+            || {
+                delivered.set(delivered.get() + 1);
+                Some("P".to_string())
+            },
+            || received.set(received.get() + 1),
+        );
+        (action, delivered.get(), received.get())
+    }
+
+    #[test]
+    fn the_push_follows_the_heartbeat_reply_and_precedes_the_ack() {
+        let reply = |frames: &[&str]| Action::Reply {
+            frames: frames.iter().map(|f| f.to_string()).collect(),
+            unknown: false,
+        };
+        assert_eq!(
+            with_push(r#"42["ratta_ping"]"#),
+            (reply(&[r#"42["ratta_ping","Received"]"#, "P"]), 1, 0)
+        );
+        assert_eq!(
+            with_push(r#"4212["ratta_ping"]"#),
+            (
+                reply(&[r#"42["ratta_ping","Received"]"#, "P", "4312[]"]),
+                1,
+                0
+            )
+        );
+        assert_eq!(
+            with_push(r#"427["ClientMessage","status"]"#),
+            (
+                reply(&[r#"42["ServerMessage","true"]"#, "P", "437[]"]),
+                1,
+                0
+            )
+        );
+        assert_eq!(
+            with_push(r#"420["ClientMessage","Received"]"#),
+            (Action::Answer("430[]".into()), 0, 1)
+        );
+        assert_eq!(
+            with_push(r#"42["ClientMessage","Received"]"#),
+            (Action::Nothing, 0, 1)
+        );
+        // Nothing else takes the queue or clears it.
+        for f in [
+            "2",
+            "40",
+            r#"425["ClientMessage","hello"]"#,
+            r#"42["mystery"]"#,
+            r#"42/ns,["ratta_ping"]"#,
+            r#"42x["ratta_ping"]"#,
+        ] {
+            let (_, d, r) = with_push(f);
+            assert_eq!((d, r), (0, 0), "{f}");
+        }
+        // An empty queue adds nothing.
+        assert_eq!(
+            answer_with(r#"42["ratta_ping"]"#, || None, || {}),
+            Action::Answer(r#"42["ratta_ping","Received"]"#.into())
+        );
     }
 
     #[test]

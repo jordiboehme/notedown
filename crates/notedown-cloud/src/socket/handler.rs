@@ -1,4 +1,6 @@
 //! One socket session: the handshake, the heartbeat answers, server pushes and the frame log.
+//! The session's queued file push goes out right after the reply to its `ratta_ping` or
+//! `status` (`docs/sync-protocol.md` 4.4).
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -154,7 +156,7 @@ pub async fn run(mut ws: WebSocket, session: Session, access: Access) {
     }
     // The registration guard lives until the session ends, whatever the exit path.
     // The last inbound time tells the registry that the device is still there (LIVENESS_MS).
-    let (_registration, mut rx, last_inbound) = match (&session.slug, &session.device) {
+    let (registration, mut rx, last_inbound) = match (&session.slug, &session.device) {
         (Some(slug), Some(serial)) => {
             let (rx, last_inbound) =
                 session
@@ -211,7 +213,18 @@ pub async fn run(mut ws: WebSocket, session: Session, access: Access) {
         match msg {
             Message::Text(text) => {
                 let text = text.as_str();
-                let action = eio::answer(text);
+                let action = match &registration {
+                    Some(r) => {
+                        let sockets = &session.state.sockets;
+                        let now = session.state.now_ms();
+                        eio::answer_with(
+                            text,
+                            || sockets.deliver(&r.slug, &r.serial, &r.sid, now),
+                            || sockets.received(&r.slug, &r.serial, &r.sid),
+                        )
+                    }
+                    None => eio::answer(text),
+                };
                 let unknown = matches!(
                     action,
                     Action::Unknown | Action::Reply { unknown: true, .. }

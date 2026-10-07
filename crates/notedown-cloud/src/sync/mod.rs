@@ -5,5 +5,5 @@ pub mod lock;
 pub mod staging;
 pub mod urls;
 
-pub use lock::{SYNC_LOCK_TTL_MS, StartOutcome, SyncLocks};
+pub use lock::{SYNC_LOCK_TTL_MS, StartOutcome, SyncLocks, WriteLock};
 pub use urls::{Purpose, Signed, SignedTarget, UrlError, UrlSigner};

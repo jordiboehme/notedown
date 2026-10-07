@@ -504,7 +504,7 @@ Firmware 3.29.42 sends, every 5 s, both an Engine.IO `2` and `42["ratta_ping"]` 
 - The event name decides the handler on the device, not `msgType`: the device's task service listens on `to-do` and starts a task sync on any message [community:ultrabridge].
 - The payload is sent as one **string** argument holding JSON (`42["ServerMessage","{\"code\":\"200\",...}"]`); the device parses `args[0]` [community:ultrabridge] [ratta-server] [inferred for to-do].
 - Ratta queues messages per connection in Redis and sends them when the next heartbeat arrives; it drops a push if the previous push to that client was less than 5 s ago [ratta-server log strings]. A server can also push immediately [community:ultrabridge task push works].
-- notedown: with `sync = "accept"` the server pushes by default one `ServerMessage` with one `STARTSYNC` item to the bound and connected devices of the account after a file or folder change by `put`, an import or another device. `equipmentNo` is the serial of the device that caused the change, or `"null-null"` for the CLI. The server pushes only while no sync lock is held, at most once per 5 s per device, and never to the device that caused the change. A session that sent no frame for more than 15 s (three heartbeats) counts as not connected: its push waits for the next session, so a push never goes into the half-open socket of a sleeping device. The `push` key of `server.toml` switches the form: `startsync` (default), `detail` (one item per changed file or folder with the fields of 4.5) or `off`. The reaction of the device to either form is not confirmed on firmware 3.29.42 yet [inferred].
+- notedown: with `sync = "accept"` the server pushes by default one `ServerMessage` with one `STARTSYNC` item to the bound and connected devices of the account after a file or folder change by `put`, an import or another device. `equipmentNo` is the serial of the device that caused the change, or `"null-null"` for the CLI. The server pushes only while no sync lock is held, at most once per 5 s per device, and never to the device that caused the change. A session that sent no frame for more than 15 s (three heartbeats) counts as not connected: its push waits for the next session, so a push never goes into the half-open socket of a sleeping device. The `push` key of `server.toml` switches the form: `startsync` (default), `detail` (one item per changed file or folder with the fields of 4.5) or `off`. Firmware 3.29.42 acknowledges the `startsync` form but does not sync on it (9.3) [capture:nomad-3.29.42]; the `detail` form is not confirmed yet [inferred].
 - Ratta runs the task channel on a second socket server (18073) that nginx does not expose; the device opens only one socket. Task pushes on the `to-do` event over the main socket work [community:ultrabridge, device-confirmed].
 
 ### 4.5 Payloads
@@ -530,7 +530,7 @@ File channel (`SocketMessageData`, items `SocketIoMessageTemplate`) [ratta-serve
 | `DELETEFILE` / `DELETEFOLDER` | deleted | [ratta-server] |
 | `STARTSYNC` / `WAITING` | another device started a sync / must wait | [ratta-server] [community:ultrabridge] |
 
-`fileType` is `FILE` or `FOLDE` (sic) [ratta-server]. For web UI actions `equipmentNo` was `"null-null"` [community:ultrabridge]. Sending `STARTSYNC` makes a connected device run a sync; this is how a server can make the device pick up server-side changes [community:ultrabridge] [community:opennotecloud] [inferred].
+`fileType` is `FILE` or `FOLDE` (sic) [ratta-server]. For web UI actions `equipmentNo` was `"null-null"` [community:ultrabridge]. Sending `STARTSYNC` makes a connected device run a sync; this is how a server can make the device pick up server-side changes [community:ultrabridge] [community:opennotecloud] [inferred]. Firmware 3.29.42 acknowledged a `STARTSYNC` push with `420["ClientMessage","Received"]` but did not start a sync (9.3) [capture:nomad-3.29.42].
 
 Task channel (`SocketTaskMessageData`, items `ScheduleMessageTemplate`): `{"code":"200","msg":"","timestamp":...,"msgType":"TASK-SYN","data":[{"messageType":"QUERY"|"SORT","equipmentNo":"...","taskListId":"...","taskId":"...","timestamp":...}]}` [ratta-server]. `taskListId` must be numeric-looking (the device parses it as a long) [community:ultrabridge].
 
@@ -1065,3 +1065,12 @@ Further observations:
 - Browse & Access (port 8089) lists the SD card at the root under the card's own name (`"name": "Extended"`) with `"uri": "/REMOVABLE0/Extended"`, not as `REMOVABLE0`.
 
 Still open: 4 to 7, 10 and 11. They need a sync with deletes and moves on the device, digests and to-dos (milestone 5), and a token loss test.
+
+### 9.3 Auto Sync results [capture:nomad-3.29.42]
+
+Device tests on 2026-10-07 with "Auto Sync" on, against notedown with socket pushes:
+
+- A `ServerMessage` push with one `STARTSYNC` item (`equipmentNo` `"null-null"`) was acknowledged within 0.2 s with `420["ClientMessage","Received"]` (an event with ack id 0). No `synchronous/start` followed in the next four minutes. Twice the same result.
+- Every new socket connection (after a server restart or a wifi reconnect) is followed within 0.2 s by a full sync run (`synchronous/start`, `list_folder`, transfers, `synchronous/end` `Y`). This is how the device picked up files added on the server side.
+- An edit of a note makes the device send it on its own within a few minutes, without `synchronous/start`: `POST /api/file/3/files/query_v3` with the file's `id`, then `3/files/upload/apply` for the same path (and then, presumably, the byte upload and `upload/finish`). A server that requires the sync lock for writes refuses this upload; notedown now takes the free sync lock for such a write (log marker `implicit_lock`) and answers `E0079` only while another device holds the lock.
+

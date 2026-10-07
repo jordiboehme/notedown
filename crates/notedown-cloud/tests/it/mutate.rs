@@ -361,6 +361,33 @@ impl Server {
         store.recycle_index(&g).unwrap()
     }
 
+    /// Every protocol log line, oldest first.
+    fn log_lines(&self) -> Vec<Value> {
+        let mut files: Vec<_> = std::fs::read_dir(self.data().join("logs"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        files.sort();
+        files
+            .iter()
+            .flat_map(|f| {
+                std::fs::read_to_string(f)
+                    .unwrap()
+                    .lines()
+                    .map(|l| serde_json::from_str::<Value>(l).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The marker lines with `flag`.
+    fn markers(&self, flag: &str) -> Vec<Value> {
+        self.log_lines()
+            .into_iter()
+            .filter(|e| e["kind"] == "marker" && e["flags"].to_string().contains(flag))
+            .collect()
+    }
+
     fn log_flags(&self, path: &str) -> Vec<Vec<String>> {
         let mut files: Vec<_> = std::fs::read_dir(self.data().join("logs"))
             .unwrap()
@@ -1241,20 +1268,57 @@ async fn ids_arrive_as_strings_or_numbers_and_paths_with_double_slashes() {
 }
 
 #[tokio::test]
-async fn every_mutation_needs_the_sync_lock() {
+async fn a_mutation_without_a_session_takes_the_free_lock() {
+    // Auto Sync sends a change without synchronous/start: the write takes the free lock.
     let s = Server::new();
     let t = s.session().await;
     s.put("INBOX/a.pdf", b"a");
     let a = s.id_of(&t, "INBOX/a.pdf").await;
-    // The session ended: nothing takes the lock back without synchronous/start.
     assert_ok(
         &s.post(END, &t, json!({"equipmentNo": SERIAL, "flag": "Y"}))
             .await,
     );
+    assert_eq!(s.state.sync_locks.holder("jordi", s.state.now_ms()), None);
+    let v = s.mkdir(&t, "/INBOX/F", false).await;
+    assert_ok(&v);
+    assert!(s.files().join("INBOX/F").is_dir());
+    assert_eq!(
+        s.state
+            .sync_locks
+            .holder("jordi", s.state.now_ms())
+            .as_deref(),
+        Some(SERIAL)
+    );
+    let markers = s.markers("implicit_lock");
+    assert_eq!(markers.len(), 1, "{markers:?}");
+    assert_eq!(markers[0]["device"], SERIAL);
+    // The lock is the device's now: the next writes need no new marker.
+    assert_ok(
+        &s.post(MOVE, &t, json!({"id": a, "to_path": "/INBOX/b.pdf"}))
+            .await,
+    );
+    assert!(s.files().join("INBOX/b.pdf").is_file());
+    assert_eq!(s.markers("implicit_lock").len(), 1);
+    // The change is the device's own: its events carry the serial.
+    let last = s.events().pop().unwrap();
+    assert_eq!(last["device"], SERIAL);
+}
+
+#[tokio::test]
+async fn a_mutation_without_a_session_waits_while_another_device_syncs() {
+    let s = Server::new();
+    let t = s.session().await;
+    s.put("INBOX/a.pdf", b"a");
+    let a = s.id_of(&t, "INBOX/a.pdf").await;
+    assert_ok(
+        &s.post(END, &t, json!({"equipmentNo": SERIAL, "flag": "Y"}))
+            .await,
+    );
+    let other = s.login_as(OTHER).await;
+    assert_ok(&s.post(START, &other, json!({"equipmentNo": OTHER})).await);
     let n = s.events().len();
     for (path, body) in [
         (CREATE, json!({"path": "/INBOX/F", "autorename": false})),
-        (CREATE, json!({})),
         (DELETE, json!({"id": a})),
         (MOVE, json!({"id": a, "to_path": "/INBOX/b.pdf"})),
         (COPY, json!({"id": a, "to_path": "/INBOX/b.pdf"})),
@@ -1271,6 +1335,7 @@ async fn every_mutation_needs_the_sync_lock() {
     assert_eq!(s.events().len(), n);
     assert!(s.files().join("INBOX/a.pdf").is_file());
     assert!(!s.files().join("INBOX/F").exists());
+    assert!(s.markers("implicit_lock").is_empty());
 }
 
 #[tokio::test]

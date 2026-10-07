@@ -1043,16 +1043,17 @@ fn the_real_limits_are_9_mib_per_part_and_1_gib_per_file() {
 // ------------------------------------------------------------------ gates and signatures
 
 #[tokio::test]
-async fn every_upload_route_needs_the_live_sync_lock() {
+async fn every_upload_route_waits_while_another_device_syncs() {
     let s = Server::new();
     let t = s.session().await;
     let a = s.apply(&t, "/INBOX/l.pdf", "l.pdf", 1).await;
     assert_ok(&a);
-    // The session ended: no write without a new synchronous/start.
     assert_ok(
         &s.post(END, &t, json!({"equipmentNo": SERIAL, "flag": "Y"}))
             .await,
     );
+    let other = s.login(OTHER).await;
+    assert_ok(&s.post(START, &other, json!({"equipmentNo": OTHER})).await);
     assert_err(&s.apply(&t, "/INBOX/l.pdf", "l.pdf", 1).await, "E0079");
     let r = s
         .send(a["fullUploadUrl"].as_str().unwrap(), "", "l.pdf", b"l")
@@ -1082,14 +1083,48 @@ async fn every_upload_route_needs_the_live_sync_lock() {
         assert!(e["flags"].to_string().contains("no_sync_lock"), "{e}");
         assert_eq!(e["device"], SERIAL, "{e}");
     }
-    // Another device holds the lock: the URL of the first device does not work either.
-    let other = s.login(OTHER).await;
-    assert_ok(&s.post(START, &other, json!({"equipmentNo": OTHER})).await);
+    assert!(!s.files().join("INBOX/l.pdf").exists());
+}
+
+#[tokio::test]
+async fn an_upload_without_a_session_takes_the_free_lock() {
+    // Auto Sync sends a changed file without synchronous/start (query_v3, then apply).
+    let s = Server::new();
+    let t = s.session().await;
+    assert_ok(
+        &s.post(END, &t, json!({"equipmentNo": SERIAL, "flag": "Y"}))
+            .await,
+    );
+    let a = s.apply(&t, "/INBOX/l.pdf", "l.pdf", 1).await;
+    assert_ok(&a);
     let r = s
         .send(a["fullUploadUrl"].as_str().unwrap(), "", "l.pdf", b"l")
         .await;
-    assert_err(&r.json(), "E0079");
-    assert!(s.staging_entries().is_empty());
+    assert_ok(&r.json());
+    let f = s
+        .finish(
+            &t,
+            "/INBOX/",
+            "l.pdf",
+            a["innerName"].as_str().unwrap(),
+            b"l",
+        )
+        .await;
+    assert_ok(&f);
+    assert_eq!(std::fs::read(s.files().join("INBOX/l.pdf")).unwrap(), b"l");
+    assert_eq!(
+        s.state
+            .sync_locks
+            .holder("jordi", s.state.now_ms())
+            .as_deref(),
+        Some(SERIAL)
+    );
+    let markers: Vec<Value> = s
+        .log()
+        .into_iter()
+        .filter(|e| e["kind"] == "marker" && e["flags"].to_string().contains("implicit_lock"))
+        .collect();
+    assert_eq!(markers.len(), 1, "{markers:?}");
 }
 
 #[tokio::test]

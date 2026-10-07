@@ -1,7 +1,8 @@
 //! The file sync session, listing, queries, download URLs, capacity, the upload apply and
 //! finish steps, and folder creation, delete, move and copy of accept mode
-//! (`docs/sync-protocol.md` 3.4, 3.5). Every write also needs the calling device to hold the
-//! live sync lock (`E0079`, flag `no_sync_lock`).
+//! (`docs/sync-protocol.md` 3.4, 3.5). Every write needs the sync lock: the device's own
+//! session, or a free lock that the write takes (Auto Sync sends a changed file without
+//! `synchronous/start`). Another device's live lock answers `E0079` (flag `no_sync_lock`).
 //!
 //! Every route needs the device token. The body's `equipmentNo`, when present, must be the
 //! token's device (`E0312` otherwise). Every call of the device that holds the account's sync
@@ -19,12 +20,13 @@ use serde_json::{Map, Value, json};
 use super::envelope::{Reply, field, parse_body};
 use crate::Error;
 use crate::auth::{Account, DEFAULT_QUOTA_BYTES};
+use crate::diag::{LogEntry, LogKind};
 use crate::journal::Origin;
 use crate::server::AppState;
 use crate::store::{Entry, Kind, PendingOp, PutOptions, Store, StoreGuard, WirePath};
 use crate::sync::staging;
 use crate::sync::urls::{base_url, download_url, upload_url};
-use crate::sync::{Purpose, SignedTarget, StartOutcome};
+use crate::sync::{Purpose, SignedTarget, StartOutcome, WriteLock};
 
 /// Another device holds the sync lock.
 pub const E_SYNC_LOCKED: &str = "E0078";
@@ -69,8 +71,11 @@ pub const FLAG_SYNC_END_UNKNOWN: &str = "sync_end_unknown_flag";
 /// Log flag: `synchronous/end` from a device that did not hold the lock.
 pub const FLAG_SYNC_LOCK_NOT_HELD: &str = "sync_lock_not_held";
 
-/// Log flag: a write (upload) from a device that does not hold the live sync lock (`E0079`).
+/// Log flag: a write while another device holds the live sync lock (`E0079`).
 pub const FLAG_NO_SYNC_LOCK: &str = "no_sync_lock";
+/// Marker flag: a device wrote without `synchronous/start` and the server took the free sync
+/// lock for it.
+pub const FLAG_IMPLICIT_LOCK: &str = "implicit_lock";
 /// Log flag: the staged bytes do not have the MD5 the device names.
 pub const FLAG_HASH_MISMATCH: &str = "hash_mismatch";
 /// Log flag: the staged bytes do not have the size the device names.
@@ -613,12 +618,31 @@ pub async fn space_usage(
 
 // ------------------------------------------------------------------ uploads
 
-/// Whether `serial` holds the live sync lock of `slug`. Every write needs it, so no write can
-/// pass around `synchronous/start`. Call it after the protect gate: the device that held the
-/// lock last takes a lapsed lock again ([`SyncLocks::retake`](crate::sync::SyncLocks::retake)),
-/// while another device's live lock answers `E0079`.
+/// Whether `serial` holds the sync lock of `slug` for a write now. Call it after the protect
+/// gate. The device that held the lock last keeps it ([`SyncLocks::retake`]). A device that
+/// writes without `synchronous/start` (Auto Sync sends a changed file this way,
+/// `docs/sync-protocol.md` 9.3) takes a free or lapsed lock; the protocol log gets a marker with
+/// the flag `implicit_lock`. Another device's live lock answers `E0079`.
+///
+/// [`SyncLocks::retake`]: crate::sync::SyncLocks::retake
 pub fn holds_sync_lock(state: &AppState, slug: &str, serial: &str) -> bool {
-    state.sync_locks.retake(slug, serial, state.now_ms())
+    match state
+        .sync_locks
+        .take_for_write(slug, serial, state.now_ms())
+    {
+        WriteLock::Held => true,
+        WriteLock::Taken => {
+            let mut m = LogEntry::new(LogKind::Marker);
+            m.device = Some(serial.to_string());
+            m.flags = vec![FLAG_IMPLICIT_LOCK.to_string()];
+            m.message = Some(format!(
+                "account {slug}: sync lock taken for a write without synchronous/start"
+            ));
+            state.log.record(m);
+            true
+        }
+        WriteLock::Busy => false,
+    }
 }
 
 /// How often [`keep_lock`] extends the sync lock (well inside its 30 s TTL).

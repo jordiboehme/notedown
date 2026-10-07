@@ -25,6 +25,18 @@ struct Held {
     expires_at_ms: u64,
 }
 
+/// The lock for a write of a device ([`SyncLocks::take_for_write`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteLock {
+    /// The device held the lock (live, or lapsed and taken again): a write of its session.
+    Held,
+    /// Nobody held a live lock: the device holds it now without `synchronous/start`. Auto Sync
+    /// sends a changed file this way (`docs/sync-protocol.md` 9.3).
+    Taken,
+    /// Another device holds the live lock.
+    Busy,
+}
+
 /// Per-account lock owners (device serials), keyed by account slug.
 #[derive(Debug, Default)]
 pub struct SyncLocks {
@@ -94,6 +106,26 @@ impl SyncLocks {
         }
     }
 
+    /// The lock for a write of `serial` at `now_ms`, after the protect gate passed. The device
+    /// that held the lock last keeps it, as in [`SyncLocks::retake`]. A device that writes
+    /// without a session takes a free or lapsed lock, as if it had sent `synchronous/start`;
+    /// another device's live lock is never touched.
+    pub fn take_for_write(&self, slug: &str, serial: &str, now_ms: u64) -> WriteLock {
+        let mut map = self.map();
+        let outcome = match map.get(slug) {
+            Some(h) if h.owner == serial => WriteLock::Held,
+            Some(h) if h.expires_at_ms > now_ms => return WriteLock::Busy,
+            _ => WriteLock::Taken,
+        };
+        let held = map.entry(slug.to_string()).or_insert(Held {
+            owner: serial.to_string(),
+            expires_at_ms: 0,
+        });
+        held.owner = serial.to_string();
+        held.expires_at_ms = held.expires_at_ms.max(now_ms + SYNC_LOCK_TTL_MS);
+        outcome
+    }
+
     /// `synchronous/end`: release the lock when `serial` holds it (or it lapsed). Returns whether
     /// a lock of this device was released. Another device's live lock stays.
     pub fn end(&self, slug: &str, serial: &str, now_ms: u64) -> bool {
@@ -117,5 +149,50 @@ impl SyncLocks {
             .get(slug)
             .filter(|h| h.expires_at_ms > now_ms)
             .map(|h| h.owner.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_write_without_a_session_takes_a_free_lock() {
+        let locks = SyncLocks::new();
+        assert_eq!(locks.take_for_write("a", "D1", 1000), WriteLock::Taken);
+        assert_eq!(locks.holder("a", 1000).as_deref(), Some("D1"));
+        assert_eq!(locks.take_for_write("a", "D1", 2000), WriteLock::Held);
+        // Another device starting a sync now waits, as for a normal session.
+        assert!(matches!(
+            locks.start("a", "D2", 3000),
+            StartOutcome::Busy { .. }
+        ));
+    }
+
+    #[test]
+    fn a_write_takes_a_lapsed_lock_of_another_device() {
+        let locks = SyncLocks::new();
+        assert_eq!(locks.start("a", "D2", 0), StartOutcome::Taken);
+        assert_eq!(locks.take_for_write("a", "D1", 10_000), WriteLock::Busy);
+        assert_eq!(locks.holder("a", 10_000).as_deref(), Some("D2"));
+        assert_eq!(
+            locks.take_for_write("a", "D1", SYNC_LOCK_TTL_MS + 1),
+            WriteLock::Taken
+        );
+        assert_eq!(
+            locks.holder("a", SYNC_LOCK_TTL_MS + 1).as_deref(),
+            Some("D1")
+        );
+    }
+
+    #[test]
+    fn a_write_after_the_end_of_a_session_takes_the_lock_again() {
+        let locks = SyncLocks::new();
+        assert_eq!(locks.start("a", "D1", 0), StartOutcome::Taken);
+        assert!(locks.end("a", "D1", 100));
+        assert!(!locks.retake("a", "D1", 200));
+        assert_eq!(locks.take_for_write("a", "D1", 200), WriteLock::Taken);
+        assert_eq!(locks.take_for_write("b", "D1", 200), WriteLock::Taken);
+        assert_eq!(locks.holder("b", 200).as_deref(), Some("D1"));
     }
 }

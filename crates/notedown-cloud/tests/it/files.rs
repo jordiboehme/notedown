@@ -962,11 +962,11 @@ async fn other_methods_and_refuse_mode_still_answer_e0079() {
     assert_err(&r.json(), "E0079");
     let r = s.raw("POST", "/api/oss/download", &[], Body::empty()).await;
     assert_err(&r.json(), "E0079");
-    // without the sync lock (no synchronous/start)
+    // A write without synchronous/start takes the free lock: the bad body is the error now.
     assert_err(
         &s.post("/api/file/3/files/upload/apply", &a, json!({}))
             .await,
-        "E0079",
+        "422",
     );
 
     let r = Server::with_config(Config {

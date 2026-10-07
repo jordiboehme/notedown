@@ -140,6 +140,27 @@ impl Server {
         self.account().join("files")
     }
 
+    /// The log flags of the last request to `path`.
+    fn last_flags(&self, path: &str) -> String {
+        let mut files: Vec<_> = std::fs::read_dir(self.data().join("logs"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        files.sort();
+        files
+            .iter()
+            .flat_map(|f| {
+                std::fs::read_to_string(f)
+                    .unwrap()
+                    .lines()
+                    .map(|l| serde_json::from_str::<Value>(l).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .rfind(|e| e["kind"] == "request" && e["path"] == path)
+            .map(|e| e["flags"].to_string())
+            .unwrap_or_default()
+    }
+
     /// A file placed by hand (it gets its id at the next listing).
     fn put(&self, path: &str, bytes: &[u8]) {
         let p = self.files().join(path);
@@ -1846,4 +1867,135 @@ fn names_in(f: &Fixture, folder: &str) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+// ---------------------------------------------------------------- case variants and long names
+
+/// The names in a folder of the server's tree, byte-exact and sorted.
+fn names_at(s: &Server, folder: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(s.files().join(folder))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn create_folder_under_a_case_variant_of_a_folder_uses_that_folder() {
+    let s = Server::new();
+    let t = s.session().await;
+    let n = s.events().len();
+    let v = s.mkdir(&t, "/note/note/Work", false).await;
+    assert_ok(&v);
+    assert_eq!(v["metadata"]["path_display"], "NOTE/Note/Work");
+    assert_eq!(v["metadata"]["name"], "Work");
+    assert_eq!(names_at(&s, "NOTE"), ["MyStyle", "Note"]);
+    assert_eq!(names_at(&s, "NOTE/Note"), ["Work"]);
+    let ev = s.events_after(n);
+    assert_eq!(types(&ev), ["folder.created"]);
+    assert_eq!(ev[0]["path"], "NOTE/Note/Work");
+    // deeper: the existing part keeps its spelling, the new part takes the device's
+    let v = s.mkdir(&t, "/NOTE/note/WORK/Sub/Deep", false).await;
+    assert_ok(&v);
+    assert_eq!(v["metadata"]["path_display"], "NOTE/Note/Work/Sub/Deep");
+    assert_eq!(names_at(&s, "NOTE/Note/Work"), ["Sub"]);
+    // the folder itself in another case is taken (C4), or renamed with autorename
+    let n = s.events().len();
+    assert_err(&s.mkdir(&t, "/note/note/WORK", false).await, "E0322");
+    assert_eq!(s.events().len(), n);
+    let v = s.mkdir(&t, "/note/note/WORK", true).await;
+    assert_ok(&v);
+    assert_eq!(v["metadata"]["path_display"], "NOTE/Note/WORK(1)");
+}
+
+#[tokio::test]
+async fn move_and_copy_into_a_case_variant_of_a_folder_use_that_folder() {
+    let s = Server::new();
+    let t = s.session().await;
+    s.put("NOTE/Note/a.pdf", b"a");
+    s.put("NOTE/Note/W/x.note", b"x");
+    let a = s.id_of(&t, "NOTE/Note/a.pdf").await;
+    let w = s.id_of(&t, "NOTE/Note/W").await;
+    let n = s.events().len();
+    let v = s.mv(&t, &a, "/inbox/a.pdf", false).await;
+    assert_ok(&v);
+    assert_eq!(v["entriesVO"]["path_display"], "INBOX/a.pdf");
+    assert_eq!(v["entriesVO"]["id"], a.as_str());
+    assert_eq!(names_at(&s, "INBOX"), ["a.pdf"]);
+    assert_eq!(types(&s.events_after(n)), ["file.moved"]);
+    let n = s.events().len();
+    let v = s.cp(&t, &a, "/note/NOTE/c.pdf", false).await;
+    assert_ok(&v);
+    assert_eq!(v["entriesVO"]["path_display"], "NOTE/Note/c.pdf");
+    assert_eq!(types(&s.events_after(n)), ["file.copied"]);
+    // a folder into itself in another case is still refused
+    let n = s.events().len();
+    assert_err(&s.mv(&t, &w, "/note/note/w/inner", false).await, "E0358");
+    assert_err(&s.cp(&t, &w, "/NOTE/NOTE/w/inner", false).await, "E0358");
+    assert_eq!(s.events().len(), n);
+    // the same path through a case variant of the parent is no move
+    let v = s.mv(&t, &w, "/note/note/W", false).await;
+    assert_ok(&v);
+    assert_eq!(v["entriesVO"]["path_display"], "NOTE/Note/W");
+    assert_eq!(s.events().len(), n);
+    // a case-only rename through a case variant of the parent keeps the id
+    let v = s.mv(&t, &w, "/note/note/w", false).await;
+    assert_ok(&v);
+    assert_eq!(v["entriesVO"]["path_display"], "NOTE/Note/w");
+    assert_eq!(v["entriesVO"]["id"], w.as_str());
+}
+
+#[tokio::test]
+async fn names_over_255_bytes_are_refused_by_create_move_and_copy() {
+    let s = Server::new();
+    let t = s.session().await;
+    s.put("INBOX/a.pdf", b"a");
+    let a = s.id_of(&t, "INBOX/a.pdf").await;
+    let ok = "b".repeat(255);
+    let long = "b".repeat(256);
+    let wide = "\u{e9}".repeat(128);
+    let n = s.events().len();
+    for name in [&long, &wide] {
+        assert_err(
+            &s.mkdir(&t, &format!("/INBOX/{name}"), false).await,
+            "E0324",
+        );
+        assert!(s.last_flags(CREATE).contains("name_too_long"));
+        assert_err(
+            &s.mkdir(&t, &format!("/INBOX/{name}/x"), false).await,
+            "E0324",
+        );
+        assert_err(
+            &s.mv(&t, &a, &format!("/INBOX/{name}"), false).await,
+            "E0324",
+        );
+        assert!(s.last_flags(MOVE).contains("name_too_long"));
+        assert_err(
+            &s.cp(&t, &a, &format!("/INBOX/{name}"), false).await,
+            "E0324",
+        );
+        assert!(s.last_flags(COPY).contains("name_too_long"));
+    }
+    assert_eq!(s.events().len(), n);
+    assert_eq!(names_at(&s, "INBOX"), ["a.pdf"]);
+    // 255 bytes pass
+    let v = s.mkdir(&t, &format!("/INBOX/{ok}"), false).await;
+    assert_ok(&v);
+    assert_eq!(v["metadata"]["name"], ok.as_str());
+    // an autorename suffix that makes the name too long is refused too
+    let n = s.events().len();
+    assert_err(&s.mkdir(&t, &format!("/INBOX/{ok}"), true).await, "E0324");
+    assert!(s.last_flags(CREATE).contains("name_too_long"));
+    assert_eq!(s.events().len(), n);
+    // a name over 255 bytes that exists already passes (APFS takes 255 characters)
+    if std::fs::create_dir(s.files().join(format!("INBOX/{wide}"))).is_ok() {
+        assert_ok(&s.mkdir(&t, &format!("/INBOX/{wide}/sub"), false).await);
+        let v = s.mv(&t, &a, &format!("/INBOX/{wide}/a.pdf"), false).await;
+        assert_ok(&v);
+        assert_eq!(
+            v["entriesVO"]["path_display"],
+            format!("INBOX/{wide}/a.pdf")
+        );
+    }
 }

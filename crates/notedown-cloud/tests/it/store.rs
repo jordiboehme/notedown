@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use notedown_cloud::Error;
 use notedown_cloud::auth::Accounts;
 use notedown_cloud::store::{
-    Entry, Kind, NATIVE_FOLDERS, Store, WirePath, temp_path_in, write_atomic_short,
+    Entry, Kind, NATIVE_FOLDERS, Store, Stored, WirePath, temp_path_in, write_atomic_short,
 };
 
 const SLUG: &str = "jordi";
@@ -636,7 +636,7 @@ fn a_normalization_variant_is_refused() {
 /// Needs a case-sensitive temp file system. On macOS: create a case-sensitive APFS image
 /// (`hdiutil create -size 40m -fs "Case-sensitive APFS" -volname cs cs.dmg`, then
 /// `hdiutil attach cs.dmg -mountpoint <dir>`) and run
-/// `TMPDIR=<dir>/ cargo test -p notedown-cloud --test store -- --ignored`.
+/// `TMPDIR=<dir>/ cargo test -p notedown-cloud --test it -- --ignored`.
 #[test]
 #[ignore = "needs a case-sensitive file system"]
 fn on_a_case_sensitive_file_system_both_variants_list_and_a_third_is_refused() {
@@ -652,6 +652,87 @@ fn on_a_case_sensitive_file_system_both_variants_list_and_a_third_is_refused() {
     assert_eq!(paths(&all), ["INBOX/A.txt", "INBOX/a.txt"]);
     assert!(matches!(
         store.check_name(&g, &wp("INBOX"), "a.TXT"),
+        Err(Error::NameCollision { .. })
+    ));
+}
+
+#[test]
+fn stored_path_takes_the_stored_spelling_of_each_existing_segment() {
+    let (dir, store) = setup();
+    put(dir.path(), "NOTE/Note/Work/Plan.note", b"p");
+    put(dir.path(), "INBOX/\u{dc}berleben.pdf", b"u");
+    let g = store.lock().unwrap();
+    let stored = |p: &str| match store.stored_path(&g, &wp(p)).unwrap() {
+        Stored::Path { path, .. } => path.display(),
+        other => panic!("{p}: {other:?}"),
+    };
+    assert_eq!(
+        stored("NOTE/Note/Work/Plan.note"),
+        "NOTE/Note/Work/Plan.note"
+    );
+    assert_eq!(
+        stored("note/NOTE/work/PLAN.note"),
+        "NOTE/Note/Work/Plan.note"
+    );
+    // the part after the first missing segment keeps the wire spelling
+    assert_eq!(stored("note/note/New/sub/X.pdf"), "NOTE/Note/New/sub/X.pdf");
+    assert!(matches!(
+        store
+            .stored_path(&g, &wp("note/note/New/sub/X.pdf"))
+            .unwrap(),
+        Stored::Path { existing: 2, .. }
+    ));
+    // a file on the way stays in the path, so the caller sees it
+    assert_eq!(
+        stored("note/note/work/plan.NOTE/x"),
+        "NOTE/Note/Work/Plan.note/x"
+    );
+    // NFD and case together
+    assert_eq!(
+        stored("inbox/u\u{308}BERLEBEN.pdf"),
+        "INBOX/\u{dc}berleben.pdf"
+    );
+    assert_eq!(stored(""), "");
+}
+
+/// Needs a case-sensitive temp file system (the recipe is above).
+#[test]
+#[ignore = "needs a case-sensitive file system"]
+fn stored_path_lets_the_exact_match_win_and_reports_two_fold_matches() {
+    let (dir, store) = setup();
+    assert!(
+        fs_is_case_sensitive(&files_dir(dir.path())),
+        "TMPDIR must be on a case-sensitive file system"
+    );
+    put(dir.path(), "INBOX/Work/a.pdf", b"1");
+    put(dir.path(), "INBOX/work/b.pdf", b"2");
+    let g = store.lock().unwrap();
+    assert_eq!(
+        store.stored_path(&g, &wp("INBOX/Work/a.pdf")).unwrap(),
+        Stored::Path {
+            path: wp("INBOX/Work/a.pdf"),
+            existing: 3
+        }
+    );
+    assert_eq!(
+        store.stored_path(&g, &wp("inbox/work/B.PDF")).unwrap(),
+        Stored::Path {
+            path: wp("INBOX/work/b.pdf"),
+            existing: 3
+        }
+    );
+    match store.stored_path(&g, &wp("INBOX/WORK/a.pdf")).unwrap() {
+        Stored::Ambiguous { folder, mut names } => {
+            names.sort();
+            assert_eq!(folder, wp("INBOX"));
+            assert_eq!(names, ["Work", "work"]);
+        }
+        other => panic!("expected an ambiguity, got {other:?}"),
+    }
+    // the exact entry is no collision for itself, the third spelling is one
+    store.check_path(&g, &wp("INBOX/Work/c.pdf")).unwrap();
+    assert!(matches!(
+        store.check_name(&g, &wp("INBOX"), "WORK"),
         Err(Error::NameCollision { .. })
     ));
 }

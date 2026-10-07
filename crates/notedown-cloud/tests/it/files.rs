@@ -676,11 +676,69 @@ async fn query_by_path_v3_answers_200_with_null_or_the_entry() {
         assert_ok(&v);
         assert!(v["entriesVO"].is_null(), "{path}: {v}");
     }
-    // another spelling of an existing name is not found
+    // another spelling of an existing name finds it, with the stored spelling (3.0)
+    let exact = s
+        .post(BY_PATH, &a, json!({"path": "/NOTE/Note/Personal/IMG.jpg"}))
+        .await;
     let v = s
-        .post(BY_PATH, &a, json!({"path": "/note/note/personal/img.jpg"}))
+        .post(BY_PATH, &a, json!({"path": "/note/note/personal/img.JPG"}))
+        .await;
+    assert_eq!(v["entriesVO"]["path_display"], "NOTE/Note/Personal/IMG.jpg");
+    assert_eq!(v["entriesVO"]["name"], "IMG.jpg");
+    assert_eq!(v["entriesVO"]["id"], exact["entriesVO"]["id"]);
+    let v = s
+        .post(BY_PATH, &a, json!({"path": "/note/NOTE/PERSONAL"}))
+        .await;
+    assert_eq!(v["entriesVO"]["path_display"], "NOTE/Note/Personal");
+    // a missing name in another spelling is still missing
+    let v = s
+        .post(BY_PATH, &a, json!({"path": "/note/note/personal/none.jpg"}))
         .await;
     assert!(v["entriesVO"].is_null(), "{v}");
+}
+
+#[tokio::test]
+async fn list_folder_finds_a_folder_spelled_in_another_case() {
+    let s = Server::new();
+    let a = s.login(SERIAL).await;
+    s.put("NOTE/Note/Work/Plan.note", b"plan");
+    s.put("NOTE/Note/Work/Sub/x.note", b"x");
+    let exact = s
+        .post(
+            LIST,
+            &a,
+            json!({"path": "/NOTE/Note/Work", "recursive": true}),
+        )
+        .await;
+    assert_ok(&exact);
+    for path in ["/note/note/work", "/NOTE/NOTE/WORK/", "note//Note/wORK"] {
+        let v = s
+            .post(LIST, &a, json!({"path": path, "recursive": true}))
+            .await;
+        assert_ok(&v);
+        let mut p = paths(&v);
+        p.sort();
+        assert_eq!(
+            p,
+            [
+                "NOTE/Note/Work/Plan.note",
+                "NOTE/Note/Work/Sub",
+                "NOTE/Note/Work/Sub/x.note"
+            ],
+            "{path}"
+        );
+        assert_eq!(v["entries"], exact["entries"], "{path}");
+    }
+    // a missing folder in any spelling, or a file, stays E0081
+    assert_err(
+        &s.post(LIST, &a, json!({"path": "/note/note/nope"})).await,
+        "E0081",
+    );
+    assert_err(
+        &s.post(LIST, &a, json!({"path": "/note/note/work/plan.note"}))
+            .await,
+        "E0081",
+    );
 }
 
 // ------------------------------------------------------------------ downloads

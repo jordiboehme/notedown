@@ -7,7 +7,9 @@
 //! process changed them on disk.
 //!
 //! Names are stored byte-exact. Lookups compare names byte by byte against the folder entries,
-//! so a case-insensitive file system (macOS APFS) cannot match a different spelling.
+//! so a case-insensitive file system (macOS APFS) cannot match a different spelling. The device
+//! routes first map a wire path to the stored spelling ([`Store::stored_path`]): names compare
+//! without case and Unicode normalization per folder, as on Ratta's server.
 
 mod commit;
 mod hashes;
@@ -133,6 +135,52 @@ pub fn write_atomic_short(path: &Path, bytes: &[u8]) -> Result<()> {
 pub(crate) fn fold(name: &str) -> String {
     let nfd: String = name.nfd().collect();
     unicase::UniCase::new(nfd).to_folded_case().nfc().collect()
+}
+
+/// What [`Store::stored_path`] found for a wire path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stored {
+    /// The path with the stored spelling of every segment that names an entry; the first
+    /// `existing` segments name entries on disk, the others keep the wire spelling.
+    Path { path: WirePath, existing: usize },
+    /// In `folder` no entry has the name exactly, and two or more have it without case.
+    Ambiguous {
+        folder: WirePath,
+        names: Vec<String>,
+    },
+}
+
+/// How a name matches the entries of one folder.
+#[derive(Debug, PartialEq, Eq)]
+enum NameMatch {
+    /// An entry has exactly these bytes.
+    Exact,
+    /// No exact entry; this one entry has the same caseless form.
+    Folded(String),
+    Missing,
+    /// No exact entry; these entries have the same caseless form.
+    Ambiguous(Vec<String>),
+}
+
+/// Match `name` against the entries of a folder (name, and whether it is a real file or
+/// folder). An exact entry always wins. Else the real files and folders with the same caseless
+/// form ([`fold`]) count; dot-names never match that way.
+fn match_name<'a>(entries: impl IntoIterator<Item = (&'a str, bool)>, name: &str) -> NameMatch {
+    let key = fold(name);
+    let mut folded = Vec::new();
+    for (entry, listable) in entries {
+        if entry == name {
+            return NameMatch::Exact;
+        }
+        if listable && !entry.starts_with('.') && fold(entry) == key {
+            folded.push(entry.to_string());
+        }
+    }
+    match folded.len() {
+        0 => NameMatch::Missing,
+        1 => NameMatch::Folded(folded.remove(0)),
+        _ => NameMatch::Ambiguous(folded),
+    }
 }
 
 /// Identity of a file on disk, to notice changes by another process.
@@ -851,7 +899,9 @@ impl Store {
 
     /// Refuse `name` in the folder `parent` if a sibling with different bytes has the same
     /// caseless form (`Error::NameCollision`, see `fold`), or if the file system finds an entry
-    /// under `name` that has other bytes. The same bytes are no collision (a replace). Names starting with `.` are refused (`Error::Invalid`): listings hide them, so
+    /// under `name` that has other bytes. An entry with the same bytes is no collision (a
+    /// replace), also next to another spelling of it. Names starting with `.` are refused
+    /// (`Error::Invalid`): listings hide them, so
     /// the device would see the file vanish and delete its copy.
     pub fn check_name(&self, guard: &StoreGuard, parent: &WirePath, name: &str) -> Result<()> {
         self.check_guard(guard)?;
@@ -882,7 +932,9 @@ impl Store {
                 existing = Some(sibling.into_owned());
             }
         }
-        if let Some(existing) = existing {
+        // An entry with exactly these bytes is the target itself, also next to another
+        // spelling of it (a store that holds both).
+        if !exact && let Some(existing) = existing {
             return Err(Error::NameCollision {
                 existing,
                 new: name.to_string(),
@@ -958,6 +1010,81 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// The wire path `path` as stored: each segment is looked up in its folder, an entry with
+    /// exactly these bytes first, else the one entry with the same caseless form (`fold`; real
+    /// files and folders only), whose spelling replaces the wire's (`docs/sync-protocol.md` 3.0).
+    /// From the first segment that names nothing on, the wire spelling stays. A file on the way
+    /// stays in the path, so the caller still sees it. Two or more caseless matches and no exact
+    /// one give [`Stored::Ambiguous`]: nothing is picked.
+    pub fn stored_path(&self, guard: &StoreGuard, path: &WirePath) -> Result<Stored> {
+        self.check_guard(guard)?;
+        let mut stored = WirePath::root();
+        let mut found = true;
+        let mut existing = 0;
+        for segment in path.segments() {
+            let name = if found {
+                match self.match_child(&stored, segment)? {
+                    NameMatch::Exact => {
+                        existing += 1;
+                        segment.clone()
+                    }
+                    NameMatch::Folded(name) => {
+                        existing += 1;
+                        name
+                    }
+                    NameMatch::Missing => {
+                        found = false;
+                        segment.clone()
+                    }
+                    NameMatch::Ambiguous(names) => {
+                        return Ok(Stored::Ambiguous {
+                            folder: stored,
+                            names,
+                        });
+                    }
+                }
+            } else {
+                segment.clone()
+            };
+            stored = stored.join(&name)?;
+        }
+        Ok(Stored::Path {
+            path: stored,
+            existing,
+        })
+    }
+
+    /// [`match_name`] against the entries of `folder` on disk. A folder that is missing or no
+    /// folder has no entries.
+    fn match_child(&self, folder: &WirePath, name: &str) -> Result<NameMatch> {
+        let dir = self.fs_path(folder);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(NameMatch::Missing);
+            }
+            Err(e) => return Err(io_err(&dir)(e)),
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(io_err(&dir))?;
+            let Ok(sibling) = entry.file_name().into_string() else {
+                continue;
+            };
+            let listable = entry.file_type().is_ok_and(|t| t.is_dir() || t.is_file());
+            names.push((sibling, listable));
+        }
+        Ok(match_name(
+            names.iter().map(|(n, listable)| (n.as_str(), *listable)),
+            name,
+        ))
     }
 
     /// [`Store::check_name`] for every segment of `path`, so a folder spelled differently from
@@ -1066,6 +1193,41 @@ mod tests {
         });
         accounts.save(&a).unwrap();
         (dir, store)
+    }
+
+    /// The exact entry wins, one caseless match is that entry, two are never picked; dot-names
+    /// and entries that are no real file or folder never match without case.
+    #[test]
+    fn a_name_matches_exactly_first_and_never_picks_one_of_two_spellings() {
+        let m = |entries: &[(&str, bool)], name: &str| match_name(entries.iter().copied(), name);
+        let both = [("Work", true), ("work", true), ("x", true)];
+        assert_eq!(m(&both, "work"), NameMatch::Exact);
+        assert_eq!(m(&both, "Work"), NameMatch::Exact);
+        assert_eq!(
+            m(&both, "WORK"),
+            NameMatch::Ambiguous(vec!["Work".into(), "work".into()])
+        );
+        assert_eq!(
+            m(&[("Report.pdf", true)], "report.PDF"),
+            NameMatch::Folded("Report.pdf".into())
+        );
+        assert_eq!(
+            m(&[("Caf\u{e9}", true)], "CAFE\u{301}"),
+            NameMatch::Folded("Caf\u{e9}".into())
+        );
+        assert_eq!(
+            m(&[("Stra\u{df}e", true)], "STRASSE"),
+            NameMatch::Folded("Stra\u{df}e".into())
+        );
+        assert_eq!(m(&[("Link", false)], "link"), NameMatch::Missing);
+        assert_eq!(m(&[("Link", false)], "Link"), NameMatch::Exact);
+        assert_eq!(m(&[(".X", true)], ".x"), NameMatch::Missing);
+        assert_eq!(m(&[("a", true)], "b"), NameMatch::Missing);
+        // one real entry and one link of the same caseless form: the real one
+        assert_eq!(
+            m(&[("Work", false), ("WORK", true)], "work"),
+            NameMatch::Folded("WORK".into())
+        );
     }
 
     fn reason(r: Result<()>) -> String {

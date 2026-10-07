@@ -23,7 +23,7 @@ use crate::auth::{Account, DEFAULT_QUOTA_BYTES};
 use crate::diag::{LogEntry, LogKind};
 use crate::journal::Origin;
 use crate::server::AppState;
-use crate::store::{Entry, Kind, PendingOp, PutOptions, Store, StoreGuard, WirePath};
+use crate::store::{Entry, Kind, PendingOp, PutOptions, Store, StoreGuard, Stored, WirePath};
 use crate::sync::staging;
 use crate::sync::urls::{base_url, download_url, oss_url};
 use crate::sync::{Purpose, SignedTarget, StartOutcome, WriteLock};
@@ -88,6 +88,48 @@ pub const FLAG_UPLOAD_TOO_LARGE: &str = "upload_too_large";
 pub const FLAG_PARENT_MISMATCH: &str = "parent_mismatch";
 /// Log flag: a target path or name the store does not take.
 pub const FLAG_BAD_NAME: &str = "bad_name";
+/// Log flag: a path segment matches no entry exactly and two or more without case (`E0322`).
+pub const FLAG_CASE_AMBIGUOUS: &str = "case_ambiguous";
+/// Log flag: a name longer than [`MAX_NAME_BYTES`] (`E0324`).
+pub const FLAG_NAME_TOO_LONG: &str = "name_too_long";
+
+/// The longest name the store takes, in UTF-8 bytes: most file systems allow 255 bytes.
+pub const MAX_NAME_BYTES: usize = 255;
+pub const MSG_NAME_TOO_LONG: &str = "The name is too long";
+
+/// A wire path with the stored spelling of each existing segment ([`stored`]).
+struct Resolved {
+    path: WirePath,
+    /// The first `existing` segments name entries on disk.
+    existing: usize,
+}
+
+impl Resolved {
+    /// Whether a name that would be new on disk is longer than [`MAX_NAME_BYTES`]. A name that
+    /// exists already passes: the file system took it.
+    fn new_name_too_long(&self) -> bool {
+        self.path.segments()[self.existing..]
+            .iter()
+            .any(|s| s.len() > MAX_NAME_BYTES)
+    }
+}
+
+/// `path` with the stored spelling of each existing segment ([`Store::stored_path`]); `None`
+/// when a segment matches two entries without case and none exactly.
+fn stored(store: &Store, guard: &StoreGuard, path: &WirePath) -> crate::Result<Option<Resolved>> {
+    Ok(match store.stored_path(guard, path)? {
+        Stored::Path { path, existing } => Some(Resolved { path, existing }),
+        Stored::Ambiguous { folder, names } => {
+            eprintln!(
+                "notedown cloud: account {}: {path} matches {} in /{folder} without case; \
+                 rename one of them",
+                store.slug(),
+                names.join(" and ")
+            );
+            None
+        }
+    })
+}
 
 /// A checked device request: the token's account and device and the parsed body.
 #[derive(Debug)]
@@ -369,36 +411,51 @@ enum Folder {
     Id(u64),
 }
 
-/// The listing of a folder (the root included). `None` when it is not a folder. The id or path
-/// is resolved after `lock_recovered`, so an unfinished commit is repaired first.
+/// What a listing found.
+enum Listing {
+    Entries(Vec<Entry>),
+    /// Not a folder (`E0081`).
+    Missing,
+    /// A segment of the path matches two entries without case (`E0322`).
+    Ambiguous,
+}
+
+/// The listing of a folder (the root included). A path is looked up with the stored spelling
+/// of each segment (3.0). The id or path is resolved after `lock_recovered`, so an unfinished
+/// commit is repaired first.
 fn list_folder_of(
     state: &AppState,
     slug: &str,
     folder: Folder,
     recursive: bool,
-) -> crate::Result<Option<Vec<Entry>>> {
+) -> crate::Result<Listing> {
     let store = state.store(slug)?;
     let guard = store.lock_recovered(&state.journal)?;
     gate_locked(state, store.slug())?;
     let path = match folder {
-        Folder::Path(p) => p,
+        Folder::Path(p) => match stored(&store, &guard, &p)? {
+            Some(r) => r.path,
+            None => return Ok(Listing::Ambiguous),
+        },
         Folder::Id(id) => match store.kind_and_path_of(id)? {
             Some((Kind::Folder, p)) => p,
-            _ => return Ok(None),
+            _ => return Ok(Listing::Missing),
         },
     };
     if !path.is_root() {
         match store.entry(&guard, &path)? {
             Some(e) if e.tag == Kind::Folder => {}
-            _ => return Ok(None),
+            _ => return Ok(Listing::Missing),
         }
     }
-    store.list(&guard, &path, recursive).map(Some)
+    store.list(&guard, &path, recursive).map(Listing::Entries)
 }
 
 /// `POST /api/file/2/files/list_folder` `{path, recursive}`: `entries`. `""` or `/` is the
-/// root. A path that is not a folder answers `E0081` (never an empty list, which the device
-/// could read as "everything deleted").
+/// root. Names compare without case: a path in another spelling lists the folder, with the
+/// stored spelling in the entries. A path that is not a folder answers `E0081` (never an empty
+/// list, which the device could read as "everything deleted"); a segment that matches two
+/// entries without case and none exactly answers `E0322` (flag `case_ambiguous`).
 pub async fn list_folder(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -426,8 +483,9 @@ pub async fn list_folder(
     )
     .await;
     match listed {
-        Ok(Some(entries)) => req.ok(json!({"entries": entries_value(&entries)})),
-        Ok(None) => req.error(E_PATH_MISSING, MSG_PATH_MISSING),
+        Ok(Listing::Entries(entries)) => req.ok(json!({"entries": entries_value(&entries)})),
+        Ok(Listing::Missing) => req.error(E_PATH_MISSING, MSG_PATH_MISSING),
+        Ok(Listing::Ambiguous) => Refusal::Ambiguous.reply(&req.serial),
         Err(r) => r,
     }
 }
@@ -467,8 +525,9 @@ pub async fn list_folder_v3(
     )
     .await;
     match r {
-        Ok(Some(entries)) => req.ok(json!({"entries": entries_value(&entries)})),
-        Ok(None) => req.error(E_PATH_MISSING, MSG_PATH_MISSING),
+        Ok(Listing::Entries(entries)) => req.ok(json!({"entries": entries_value(&entries)})),
+        Ok(Listing::Missing) => req.error(E_PATH_MISSING, MSG_PATH_MISSING),
+        Ok(Listing::Ambiguous) => Refusal::Ambiguous.reply(&req.serial),
         Err(r) => r,
     }
 }
@@ -503,7 +562,9 @@ pub async fn query_v3(
 }
 
 /// `POST /api/file/3/files/query/by/path_v3` `{path}`: `entriesVO` or null, always HTTP 200
-/// (a missing, unparsable or hidden path and the root give null).
+/// (a missing, unparsable or hidden path and the root give null). Names compare without case;
+/// the entry has the stored spelling. A segment that matches two entries without case and none
+/// exactly answers `E0322` (flag `case_ambiguous`).
 pub async fn query_by_path_v3(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -524,11 +585,15 @@ pub async fn query_by_path_v3(
         let store = st.store(&slug)?;
         let guard = store.lock_recovered(&st.journal)?;
         gate_locked(&st, store.slug())?;
-        store.entry(&guard, &path)
+        match stored(&store, &guard, &path)? {
+            Some(r) => store.entry(&guard, &r.path).map(Some),
+            None => Ok(None),
+        }
     })
     .await;
     match r {
-        Ok(e) => req.ok(json!({"entriesVO": entry_value(e.as_ref())})),
+        Ok(Some(e)) => req.ok(json!({"entriesVO": entry_value(e.as_ref())})),
+        Ok(None) => Refusal::Ambiguous.reply(&req.serial),
         Err(r) => r,
     }
 }
@@ -740,6 +805,10 @@ pub fn upload_target(path: &str, file_name: &str) -> Option<(WirePath, WirePath)
 enum Refusal {
     /// `E0322`: a name collision, or a folder at the target.
     Taken,
+    /// `E0322` with the flag `case_ambiguous`: a segment matches two entries without case.
+    Ambiguous,
+    /// `E0324` with the flag `name_too_long`.
+    TooLong,
     /// `E0324` with a log flag.
     Cannot(&'static str),
 }
@@ -748,6 +817,12 @@ impl Refusal {
     fn reply(self, serial: &str) -> Reply {
         match self {
             Refusal::Taken => Reply::error(E_NAME_TAKEN, MSG_NAME_TAKEN).device(serial),
+            Refusal::Ambiguous => Reply::error(E_NAME_TAKEN, MSG_NAME_TAKEN)
+                .flag(FLAG_CASE_AMBIGUOUS)
+                .device(serial),
+            Refusal::TooLong => Reply::error(E_UPLOAD, MSG_NAME_TOO_LONG)
+                .flag(FLAG_NAME_TOO_LONG)
+                .device(serial),
             Refusal::Cannot(flag) => Reply::error(E_UPLOAD, MSG_UPLOAD).flag(flag).device(serial),
         }
     }
@@ -762,9 +837,9 @@ fn refusal_of(e: &Error) -> Option<Refusal> {
     }
 }
 
-/// Check that `target` can take a file: no case or normalization collision on its way (`E0322`),
-/// no dot-name and no file in place of a parent folder (`E0324`), no folder at the target
-/// (`E0322`).
+/// Check that `target` (with the stored spelling, see [`stored`]) can take a file: no case or
+/// normalization collision on its way (`E0322`), no dot-name and no file in place of a parent
+/// folder (`E0324`), no folder at the target (`E0322`).
 fn check_target(
     store: &Store,
     guard: &StoreGuard,
@@ -790,8 +865,11 @@ fn check_target(
 }
 
 /// `POST /api/file/3/files/upload/apply` `{path (full path with the name), fileName, size}`:
-/// the signed upload URLs. Needs the sync lock (`E0079`). The name is checked first (`E0322`
-/// on a collision, `E0324` on a dot-name). `innerName` is `fileName`, as in Ratta's traffic.
+/// the signed upload URLs. Needs the sync lock (`E0079`). The name is checked first: a new name
+/// over 255 bytes on the way answers `E0324` (flag `name_too_long`), a dot-name `E0324`, a
+/// folder at the target `E0322`. Names compare without case (3.0): a case variant of an existing file
+/// or folder on the way is that entry; two such entries and no exact one answer `E0322` (flag
+/// `case_ambiguous`). `innerName` is `fileName`, as in Ratta's traffic.
 /// The upload gets a fresh internal id (a UUID) that names its staging entry; the URLs sign the
 /// account, the device, its token generation, the parent folder, that id and `size`. The apply
 /// is recorded in the entry, so `upload/finish` finds it by device, parent and name.
@@ -836,7 +914,15 @@ pub async fn upload_apply(
         let store = st.store(&slug)?;
         let guard = store.lock_recovered(&st.journal)?;
         gate_locked(&st, store.slug())?;
-        let refused = check_target(&store, &guard, &t)?;
+        // The staging entry and the URLs keep the device's spelling: finish looks the target
+        // up again.
+        let Some(t) = stored(&store, &guard, &t)? else {
+            return Ok(Some(Refusal::Ambiguous));
+        };
+        if t.new_name_too_long() {
+            return Ok(Some(Refusal::TooLong));
+        }
+        let refused = check_target(&store, &guard, &t.path)?;
         if refused.is_none() {
             let entry = staging::entry_dir(store.account_dir(), &inner_c)?;
             staging::record_apply(&entry, &serial, &parent_c, &name_c, now)?;
@@ -987,6 +1073,17 @@ fn finish_claimed(
     }
     let guard = store.lock_recovered(&state.journal)?;
     gate_locked(state, store.slug())?;
+    // A case variant of an existing file is that file: it is replaced and keeps its id and
+    // spelling (3.0).
+    let Some(target) = stored(store, &guard, target)? else {
+        staging::remove_entry(entry);
+        return Ok(Finished::Refused(Refusal::Ambiguous));
+    };
+    if target.new_name_too_long() {
+        staging::remove_entry(entry);
+        return Ok(Finished::Refused(Refusal::TooLong));
+    }
+    let target = &target.path;
     if let Some(refusal) = check_target(store, &guard, target)? {
         staging::remove_entry(entry);
         return Ok(Finished::Refused(refusal));
@@ -1039,7 +1136,8 @@ fn finish_claimed(
 /// applied for (log flags `inner_name_file_name` / `inner_name_id`; equal to `fileName` is
 /// always the file name). It claims the staged data (no other request can change
 /// it afterwards), checks that the parent is the one signed at apply, verifies size and MD5
-/// (`E0324` and nothing kept on a mismatch), creates missing parent folders
+/// (`E0324` and nothing kept on a mismatch), looks the target up without case (a case variant
+/// of an existing file replaces it and keeps its id and spelling), creates missing parent folders
 /// (`folder.created`), writes the file (`file.created`, or `file.modified` with `prevMd5` and
 /// the same id), journals the page diff of a note, all in one commit. In protect mode the
 /// replaced bytes go to the recycle bin first. Needs the sync lock (`E0079`). Answers
@@ -1144,6 +1242,22 @@ impl Outcome {
 
     fn refused(code: &'static str, msg: &'static str) -> crate::Result<Outcome> {
         Ok(Outcome::Refused(code, msg, None))
+    }
+
+    fn ambiguous() -> crate::Result<Outcome> {
+        Ok(Outcome::Refused(
+            E_NAME_TAKEN,
+            MSG_NAME_TAKEN,
+            Some(FLAG_CASE_AMBIGUOUS),
+        ))
+    }
+
+    fn too_long() -> crate::Result<Outcome> {
+        Ok(Outcome::Refused(
+            E_UPLOAD,
+            MSG_NAME_TOO_LONG,
+            Some(FLAG_NAME_TOO_LONG),
+        ))
     }
 
     fn native() -> crate::Result<Outcome> {
@@ -1344,9 +1458,12 @@ fn metadata_value(e: &Entry) -> Value {
 
 /// `POST /api/file/2/files/create_folder_v2` `{path, autorename}`: creates the folder (and any
 /// missing folder above it) and answers `metadata {tag: "folder", id, name, path_display}` with
-/// its real id. A taken name (also in another case or Unicode normalization, or by a file)
+/// its real id. A folder above it in another case or Unicode normalization is that folder (its
+/// spelling stays). A taken name (also in another case or Unicode normalization, or by a file)
 /// answers `E0322`, or with `autorename` becomes `name(1)`, `name(2)`, ... A dot-name answers
-/// `E0322`. Needs the sync lock (`E0079`). Event: `folder.created` per new folder.
+/// `E0322`, a new name over 255 bytes `E0324` (flag `name_too_long`), a folder above it that
+/// matches two entries without case `E0322` (flag `case_ambiguous`). Needs the sync lock
+/// (`E0079`). Event: `folder.created` per new folder.
 pub async fn create_folder_v2(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1377,6 +1494,13 @@ pub async fn create_folder_v2(
         let store = st.store(slug)?;
         let guard = store.lock_recovered(&st.journal)?;
         gate_locked(st, store.slug())?;
+        let Some(parent) = stored(&store, &guard, &parent)? else {
+            return Outcome::ambiguous();
+        };
+        if parent.new_name_too_long() {
+            return Outcome::too_long();
+        }
+        let parent = parent.path;
         if !way_is_open(&store, &guard, &parent)? {
             return Outcome::taken();
         }
@@ -1392,6 +1516,9 @@ pub async fn create_folder_v2(
         else {
             return Outcome::taken();
         };
+        if name.len() > MAX_NAME_BYTES {
+            return Outcome::too_long();
+        }
         let target = parent.join(&name)?;
         create_folders(st, &store, &guard, &target, serial)?;
         let e = entry_after(&store, &guard, &target)?;
@@ -1461,9 +1588,12 @@ enum Target {
 }
 
 /// The target of moving or copying `source` to `to_path` (the full path with the name):
-/// `E0322` for an unusable path, a blocked way or a taken name (without `autorename`), `E0358`
-/// for a folder into itself. `in_place` names the source when the target folder is its own
-/// folder and the source itself does not take the name (a move, which may rename in place).
+/// `E0324` for a new name over 255 bytes, `E0322` for an unusable path, a blocked way or a taken
+/// name (without `autorename`) or a folder on the way that matches two entries without case,
+/// `E0358` for a folder into itself. Folders on the way take their stored spelling; the last
+/// name stays as sent, so a case variant of another entry is taken. `in_place` names the
+/// source when the target folder is its own folder and the source itself does not take the
+/// name (a move, which may rename in place); then the source's own path is its target.
 fn target_of(
     store: &Store,
     guard: &StoreGuard,
@@ -1482,6 +1612,17 @@ fn target_of(
     let Ok(to) = WirePath::parse_named(to_path) else {
         return taken();
     };
+    let (Some(parent), Some(name)) = (to.parent(), to.name()) else {
+        return taken();
+    };
+    let Some(parent) = stored(store, guard, &parent)? else {
+        return Ok(Target::Refused(Outcome::ambiguous()?));
+    };
+    if parent.new_name_too_long() {
+        return Ok(Target::Refused(Outcome::too_long()?));
+    }
+    let parent = parent.path;
+    let to = parent.join(name)?;
     if source.tag == Kind::Folder && to != source.path && to.starts_with(&source.path) {
         return Ok(Target::Refused(Outcome::Refused(
             E_INTO_ITSELF,
@@ -1489,15 +1630,16 @@ fn target_of(
             None,
         )));
     }
-    let (Some(parent), Some(name)) = (to.parent(), to.name()) else {
-        return taken();
-    };
+    if in_place && to == source.path {
+        return Ok(Target::Path(to));
+    }
     if !way_is_open(store, guard, &parent)? {
         return taken();
     }
     let own = (in_place && source.path.parent().as_ref() == Some(&parent))
         .then_some(source.name.as_str());
     match pick_name(store, guard, &parent, name, source.tag, autorename, own)? {
+        Some(name) if name.len() > MAX_NAME_BYTES => Ok(Target::Refused(Outcome::too_long()?)),
         Some(name) => Ok(Target::Path(parent.join(&name)?)),
         None => taken(),
     }
@@ -1507,10 +1649,11 @@ fn target_of(
 /// autorename}`: moves or renames the file or folder, keeps its id and answers `entriesVO`.
 /// Missing folders on the way are created (`folder.created`), then `file.moved` /
 /// `folder.moved`, then `folder.deleted` for each source folder the move leaves empty (never a
-/// native folder). A rename that only changes case is allowed. A taken target (also one the
-/// registry does not know yet) answers `E0322`, or with `autorename` becomes `name(1)`, ...;
-/// an unknown source `E0320`; a folder into itself `E0358`; a native folder is refused. Needs
-/// the sync lock (`E0079`).
+/// native folder). Folders on the way in another case are those folders. A rename that only
+/// changes case is allowed. A taken target (also one the registry does not know yet, or a case
+/// variant of another entry) answers `E0322`, or with `autorename` becomes `name(1)`, ...; a
+/// new name over 255 bytes `E0324`; an unknown source `E0320`; a folder into itself `E0358`; a
+/// native folder is refused. Needs the sync lock (`E0079`).
 pub async fn move_v3(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1535,14 +1678,14 @@ pub async fn move_v3(
         if crate::store::is_native_folder(&src.path) {
             return Outcome::native();
         }
-        if WirePath::parse_named(&to_path).ok().as_ref() == Some(&src.path) {
-            // The same path: nothing to do.
-            return Ok(Outcome::Done(json!({"entriesVO": entry_value(Some(&src))})));
-        }
         let to = match target_of(&store, &guard, &src, &to_path, t.autorename, true)? {
             Target::Path(p) => p,
             Target::Refused(o) => return Ok(o),
         };
+        if to == src.path {
+            // The same path: nothing to do.
+            return Ok(Outcome::Done(json!({"entriesVO": entry_value(Some(&src))})));
+        }
         let mut c = store.plan_move_at(
             &guard,
             &src.path,
@@ -1563,9 +1706,10 @@ pub async fn move_v3(
 /// copies the file or folder and answers `entriesVO` of the copy, which gets a new id (in a
 /// folder copy every descendant does). Missing folders on the way are created
 /// (`folder.created`). Events: `file.copied` (`sourceId`) per file, with the page events of a
-/// note, and `folder.created` per folder. A taken target answers `E0322`, or with `autorename`
-/// becomes `name(1)`, ...; an unknown source `E0308`; a folder into itself `E0358`. Needs the
-/// sync lock (`E0079`). A folder copy is a series of commits (one per folder and file).
+/// note, and `folder.created` per folder. Folders on the way in another case are those folders.
+/// A taken target answers `E0322`, or with `autorename` becomes `name(1)`, ...; a new name over
+/// 255 bytes `E0324`; an unknown source `E0308`; a folder into itself `E0358`. Needs the sync lock
+/// (`E0079`). A folder copy is a series of commits (one per folder and file).
 pub async fn copy_v3(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

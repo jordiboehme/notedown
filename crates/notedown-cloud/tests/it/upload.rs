@@ -41,6 +41,8 @@ const DOWNLOAD: &str = "/api/file/3/files/download_v3";
 const CAPACITY: &str = "/api/file/capacity/query";
 const UPLOAD: &str = "/api/oss/upload";
 const PART: &str = "/api/oss/upload/part";
+const BY_PATH: &str = "/api/file/3/files/query/by/path_v3";
+const CREATE: &str = "/api/file/2/files/create_folder_v2";
 
 struct TestClock(AtomicI64);
 
@@ -756,15 +758,11 @@ async fn names_are_checked_before_anything_is_signed() {
     let s = Server::new();
     let t = s.session().await;
     s.put("NOTE/Note/Plan.note", b"p");
-    // Case collision with the file, and with a folder on the way.
-    assert_err(
-        &s.apply(&t, "/NOTE/Note/plan.note", "plan.note", 1).await,
-        "E0322",
-    );
-    assert_err(
-        &s.apply(&t, "/note/Note/x.note", "x.note", 1).await,
-        "E0322",
-    );
+    // A case variant of the file or of a folder on the way is that entry (3.0).
+    assert_ok(&s.apply(&t, "/NOTE/Note/plan.note", "plan.note", 1).await);
+    assert_ok(&s.apply(&t, "/note/Note/x.note", "x.note", 1).await);
+    // A case variant of a folder at the target stays taken.
+    assert_err(&s.apply(&t, "/NOTE/note", "note", 1).await, "E0322");
     // A dot-name and a name that is no single segment.
     assert_err(
         &s.apply(&t, "/NOTE/Note/.hidden", ".hidden", 1).await,
@@ -785,7 +783,8 @@ async fn names_are_checked_before_anything_is_signed() {
         "E0324",
     );
 
-    // The collision check runs again at finish (a file appeared meanwhile).
+    // The target is looked up again at finish: a case variant that appeared meanwhile is
+    // replaced and keeps its spelling.
     let a = s.apply(&t, "/NOTE/Note/Late.note", "Late.note", 1).await;
     s.send(a["fullUploadUrl"].as_str().unwrap(), "", "Late.note", b"l")
         .await;
@@ -799,12 +798,253 @@ async fn names_are_checked_before_anything_is_signed() {
             b"l",
         )
         .await;
+    assert_ok(&f);
+    assert_eq!(f["path_display"], "NOTE/Note/late.note");
+    let names = names_in(&s.files().join("NOTE/Note"));
+    assert!(names.contains(&"late.note".to_string()), "{names:?}");
+    assert!(!names.contains(&"Late.note".to_string()), "{names:?}");
+    // A folder that appeared meanwhile under a case variant of the name is refused.
+    let a = s.apply(&t, "/INBOX/Box", "Box", 1).await;
+    s.send(a["fullUploadUrl"].as_str().unwrap(), "", "Box", b"b")
+        .await;
+    std::fs::create_dir(s.files().join("INBOX/box")).unwrap();
+    let f = s
+        .finish(&t, "/INBOX/", "Box", a["innerName"].as_str().unwrap(), b"b")
+        .await;
     assert_err(&f, "E0322");
-    let names: Vec<String> = std::fs::read_dir(s.files().join("NOTE/Note"))
+}
+
+/// The names in a folder, byte-exact and sorted (a case-insensitive file system answers
+/// `exists` for any spelling).
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert!(!names.contains(&"Late.note".to_string()), "{names:?}");
+    names.sort();
+    names
+}
+
+/// Every entry of `staging/`, also those that hold only the apply record.
+fn all_staging(s: &Server) -> Vec<String> {
+    match std::fs::read_dir(s.account().join("staging")) {
+        Ok(d) => d
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn an_upload_over_a_case_variant_replaces_it_and_keeps_id_and_spelling() {
+    let s = Server::protected();
+    let t = s.session().await;
+    let first = s.upload(&t, "INBOX", "Report.pdf", b"first").await;
+    assert_ok(&first);
+    s.advance_ms(5_000);
+    let before = s.state.journal.last_seq().unwrap();
+    let second = s.upload(&t, "INBOX", "report.PDF", b"second").await;
+    assert_ok(&second);
+    assert_eq!(second["id"], first["id"]);
+    assert_eq!(second["path_display"], "INBOX/Report.pdf");
+    assert_eq!(second["name"], "Report.pdf");
+    assert_eq!(names_in(&s.files().join("INBOX")), ["Report.pdf"]);
+    assert_eq!(
+        std::fs::read(s.files().join("INBOX/Report.pdf")).unwrap(),
+        b"second"
+    );
+    let new: Vec<Value> = s
+        .events()
+        .into_iter()
+        .filter(|e| e["seq"].as_u64().unwrap() > before)
+        .collect();
+    assert_eq!(types(&new), ["file.modified"], "{new:?}");
+    assert_eq!(new[0]["path"], "INBOX/Report.pdf");
+    assert_eq!(new[0]["prevMd5"], md5_of(b"first"));
+    assert_eq!(new[0]["id"].to_string(), first["id"].as_str().unwrap());
+    // The old bytes are in the recycle bin under the stored spelling.
+    let at = (T0 + 5_000) as u64;
+    assert_eq!(
+        names_in(&s.account().join(format!("recycle/{at}/INBOX"))),
+        ["Report.pdf"]
+    );
+    let index = std::fs::read_to_string(s.account().join("recycle").join(RECYCLE_INDEX)).unwrap();
+    assert!(index.contains("\"path\":\"INBOX/Report.pdf\""), "{index}");
+    assert_eq!(index.lines().count(), 1);
+    // The listing shows one file with the first spelling.
+    let l = s
+        .post(LIST, &t, json!({"path": "/INBOX", "recursive": false}))
+        .await;
+    assert_eq!(l["entries"].as_array().unwrap().len(), 1, "{l}");
+    assert_eq!(l["entries"][0]["path_display"], "INBOX/Report.pdf");
+
+    // The same lock rules as any overwrite: another device's session refuses it.
+    assert_ok(
+        &s.post(END, &t, json!({"equipmentNo": SERIAL, "flag": "Y"}))
+            .await,
+    );
+    let other = s.login(OTHER).await;
+    assert_ok(&s.post(START, &other, json!({"equipmentNo": OTHER})).await);
+    assert_err(
+        &s.apply(&t, "/INBOX/REPORT.pdf", "REPORT.pdf", 1).await,
+        "E0079",
+    );
+    assert_eq!(
+        std::fs::read(s.files().join("INBOX/Report.pdf")).unwrap(),
+        b"second"
+    );
+}
+
+#[tokio::test]
+async fn a_case_variant_upload_into_a_case_variant_folder_is_one_file() {
+    let s = Server::new();
+    let t = s.session().await;
+    let first = s.upload(&t, "NOTE/Note/Work", "report.pdf", b"one").await;
+    assert_ok(&first);
+    let before = s.state.journal.last_seq().unwrap();
+    let second = s.upload(&t, "note/NOTE/work", "REPORT.pdf", b"two").await;
+    assert_ok(&second);
+    assert_eq!(second["id"], first["id"]);
+    assert_eq!(second["path_display"], "NOTE/Note/Work/report.pdf");
+    assert_eq!(
+        names_in(&s.files()),
+        ["DOCUMENT", "EXPORT", "INBOX", "NOTE", "SCREENSHOT"]
+    );
+    assert_eq!(names_in(&s.files().join("NOTE")), ["MyStyle", "Note"]);
+    assert_eq!(names_in(&s.files().join("NOTE/Note")), ["Work"]);
+    assert_eq!(names_in(&s.files().join("NOTE/Note/Work")), ["report.pdf"]);
+    let new: Vec<Value> = s
+        .events()
+        .into_iter()
+        .filter(|e| e["seq"].as_u64().unwrap() > before)
+        .collect();
+    assert_eq!(types(&new), ["file.modified"], "{new:?}");
+    assert_eq!(new[0]["path"], "NOTE/Note/Work/report.pdf");
+    // A new file into a case variant of a folder lands in that folder, no new folder.
+    let before = s.state.journal.last_seq().unwrap();
+    let f = s.upload(&t, "inbox", "new.pdf", b"n").await;
+    assert_ok(&f);
+    assert_eq!(f["path_display"], "INBOX/new.pdf");
+    assert_eq!(names_in(&s.files().join("INBOX")), ["new.pdf"]);
+    let new: Vec<Value> = s
+        .events()
+        .into_iter()
+        .filter(|e| e["seq"].as_u64().unwrap() > before)
+        .collect();
+    assert_eq!(types(&new), ["file.created"], "{new:?}");
+}
+
+#[tokio::test]
+async fn an_nfd_upload_over_the_nfc_name_replaces_it() {
+    let s = Server::new();
+    let t = s.session().await;
+    let nfc = "Caf\u{e9}.pdf";
+    let nfd = "Cafe\u{301}.pdf";
+    let first = s.upload(&t, "INBOX", nfc, b"one").await;
+    assert_ok(&first);
+    let second = s.upload(&t, "INBOX", nfd, b"two").await;
+    assert_ok(&second);
+    assert_eq!(second["id"], first["id"]);
+    assert_eq!(second["name"], nfc);
+    assert_eq!(names_in(&s.files().join("INBOX")), [nfc]);
+}
+
+#[tokio::test]
+async fn a_name_over_255_bytes_is_refused_before_anything_is_written() {
+    let s = Server::new();
+    let t = s.session().await;
+    // 255 bytes pass and land.
+    let ok = format!("{}.pdf", "a".repeat(251));
+    assert_eq!(ok.len(), 255);
+    let f = s.upload(&t, "INBOX", &ok, b"x").await;
+    assert_ok(&f);
+    assert_eq!(f["name"], ok.as_str());
+    let staged = all_staging(&s);
+    // 256 bytes fail, also as 128 characters, and also for a folder on the way.
+    let long = format!("{}.pdf", "a".repeat(252));
+    let wide = "\u{e9}".repeat(128);
+    assert_eq!(wide.len(), 256);
+    for (path, name) in [
+        (format!("/INBOX/{long}"), long.clone()),
+        (format!("/INBOX/{wide}"), wide.clone()),
+        (format!("/INBOX/{wide}/x.pdf"), "x.pdf".to_string()),
+    ] {
+        let a = s.apply(&t, &path, &name, 1).await;
+        assert_err(&a, "E0324");
+        let e = s.requests_to(APPLY).pop().unwrap();
+        assert!(e["flags"].to_string().contains("name_too_long"), "{e}");
+    }
+    assert_eq!(all_staging(&s), staged);
+    assert_eq!(names_in(&s.files().join("INBOX")), [ok]);
+    // A name over 255 bytes that exists already passes: nothing new is named (APFS takes 255
+    // characters, so such a folder can be there).
+    if std::fs::create_dir(s.files().join(format!("INBOX/{wide}"))).is_ok() {
+        let f = s.upload(&t, &format!("INBOX/{wide}"), "y.pdf", b"y").await;
+        assert_ok(&f);
+        assert_eq!(f["path_display"], format!("INBOX/{wide}/y.pdf"));
+    }
+}
+
+/// Needs a case-sensitive temp file system (the recipe is in `store.rs`).
+#[tokio::test]
+#[ignore = "needs a case-sensitive file system"]
+async fn two_stored_case_variants_are_never_picked_silently() {
+    let s = Server::new();
+    let t = s.session().await;
+    s.put("INBOX/a.pdf", b"lower");
+    s.put("INBOX/A.pdf", b"upper");
+    assert_eq!(
+        names_in(&s.files().join("INBOX")),
+        ["A.pdf", "a.pdf"],
+        "TMPDIR must be on a case-sensitive file system"
+    );
+    std::fs::create_dir(s.files().join("INBOX/Work")).unwrap();
+    std::fs::create_dir(s.files().join("INBOX/work")).unwrap();
+    let flagged = |path: &str| {
+        let e = s.requests_to(path).pop().unwrap();
+        assert!(e["flags"].to_string().contains("case_ambiguous"), "{e}");
+    };
+    // No exact match and two fold matches: E0322 with the flag, nothing changed.
+    assert_err(&s.apply(&t, "/INBOX/a.PDF", "a.PDF", 1).await, "E0322");
+    flagged(APPLY);
+    assert_err(&s.apply(&t, "/INBOX/WORK/x.pdf", "x.pdf", 1).await, "E0322");
+    flagged(APPLY);
+    assert_err(
+        &s.post(LIST, &t, json!({"path": "/INBOX/WORK"})).await,
+        "E0322",
+    );
+    flagged(LIST);
+    assert_err(
+        &s.post(BY_PATH, &t, json!({"path": "/INBOX/A.PDF"})).await,
+        "E0322",
+    );
+    flagged(BY_PATH);
+    assert_err(
+        &s.post(
+            CREATE,
+            &t,
+            json!({"path": "/INBOX/WORK/sub", "autorename": false}),
+        )
+        .await,
+        "E0322",
+    );
+    flagged(CREATE);
+    assert!(all_staging(&s).is_empty());
+    // The exact match wins.
+    let f = s.upload(&t, "INBOX", "a.pdf", b"new").await;
+    assert_ok(&f);
+    assert_eq!(f["path_display"], "INBOX/a.pdf");
+    assert_eq!(
+        std::fs::read(s.files().join("INBOX/a.pdf")).unwrap(),
+        b"new"
+    );
+    assert_eq!(
+        std::fs::read(s.files().join("INBOX/A.pdf")).unwrap(),
+        b"upper"
+    );
+    let q = s.post(BY_PATH, &t, json!({"path": "/INBOX/Work"})).await;
+    assert_eq!(q["entriesVO"]["path_display"], "INBOX/Work");
+    assert_ok(&s.post(LIST, &t, json!({"path": "/INBOX/work"})).await);
 }
 
 // ------------------------------------------------------------------ chunked uploads

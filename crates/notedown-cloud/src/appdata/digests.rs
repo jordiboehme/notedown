@@ -26,11 +26,13 @@ const TAGS_FILE: &str = "tags.json";
 #[serde(rename_all = "camelCase", default)]
 pub struct Digest {
     /// The server id (Ratta snowflake or [`AppData::next_digest_id`]); an exact integer.
+    #[serde(deserialize_with = "super::null_default")]
     pub id: u64,
     /// Unused, always null on the device; kept as sent.
     pub file_id: Value,
     pub name: Option<String>,
     /// The owner's user id; set by the caller.
+    #[serde(deserialize_with = "super::null_default")]
     pub user_id: u64,
     /// Empty on items from the device; the identity is `metadata.unique_identifier`.
     pub unique_identifier: Option<String>,
@@ -42,6 +44,7 @@ pub struct Digest {
     /// `1` document, `2` note.
     pub source_type: Option<i64>,
     /// `"N"` for items.
+    #[serde(deserialize_with = "super::null_as_no")]
     pub is_summary_group: String,
     pub description: Option<String>,
     pub tags: Option<String>,
@@ -58,10 +61,13 @@ pub struct Digest {
     /// Device time, ms.
     pub last_modified_time: Option<i64>,
     /// `"Y"` once soft-deleted.
+    #[serde(deserialize_with = "super::null_as_no")]
     pub is_deleted: String,
     /// Server time of the first write, ms; set by [`AppData::put_digest`].
+    #[serde(deserialize_with = "super::null_default")]
     pub create_time: u64,
     /// Server time of the last write, ms; set by [`AppData::put_digest`].
+    #[serde(deserialize_with = "super::null_default")]
     pub update_time: u64,
     pub author: Option<String>,
     /// Server only: when the server first stored the record (ms).
@@ -152,6 +158,7 @@ impl Digest {
 #[serde(rename_all = "camelCase", default)]
 pub struct DigestGroup {
     /// The server id, in the id space of the digests.
+    #[serde(deserialize_with = "super::null_default")]
     pub id: u64,
     /// 32 hex, made by the device; items name it in `parentUniqueIdentifier`.
     pub unique_identifier: Option<String>,
@@ -167,6 +174,7 @@ pub struct DigestGroup {
     /// Device time, ms.
     pub last_modified_time: Option<i64>,
     /// `"Y"` once soft-deleted.
+    #[serde(deserialize_with = "super::null_as_no")]
     pub is_deleted: String,
     /// Fields of the device that are not named above, sent back unchanged.
     #[serde(flatten)]

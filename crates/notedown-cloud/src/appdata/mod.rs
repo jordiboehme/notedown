@@ -33,8 +33,8 @@ mod tasks;
 
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub use digests::{Digest, DigestGroup, DigestTag};
 pub use tasks::{Task, TaskGroup, TaskSort};
@@ -83,6 +83,21 @@ pub fn valid_task_key(key: &str) -> bool {
         && key
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Read `null` as the type's default: serde's `default` covers only a missing field, and the
+/// device may send an explicit `null`.
+fn null_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
+/// Read `null` as [`NO`] (for `isDeleted` and `isSummaryGroup`).
+fn null_as_no<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_else(|| NO.to_string()))
 }
 
 /// The kind of a record change, from whether the record was live before and is live after.
@@ -350,6 +365,35 @@ mod tests {
         for bad in ["", "..", "a/b", "a.json", ".x", &"a".repeat(129)] {
             assert!(!valid_task_key(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn an_explicit_null_reads_as_the_default() {
+        let d: Digest = serde_json::from_str(
+            r#"{"id":null,"userId":null,"isSummaryGroup":null,"isDeleted":null,"createTime":null,"updateTime":null,"content":null}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (d.id, d.user_id, d.create_time, d.update_time),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(
+            (d.is_summary_group.as_str(), d.is_deleted.as_str()),
+            (NO, NO)
+        );
+        let g: DigestGroup = serde_json::from_str(r#"{"id":null,"isDeleted":null}"#).unwrap();
+        assert_eq!((g.id, g.is_deleted.as_str()), (0, NO));
+        let t: Task =
+            serde_json::from_str(r#"{"taskId":"t","taskListId":null,"isDeleted":null}"#).unwrap();
+        assert_eq!((t.task_list_id.as_str(), t.is_deleted.as_str()), ("", NO));
+        let l: TaskGroup =
+            serde_json::from_str(r#"{"taskListId":null,"userId":null,"isDeleted":null}"#).unwrap();
+        assert_eq!(
+            (l.task_list_id.as_str(), l.user_id, l.is_deleted.as_str()),
+            ("", 0, NO)
+        );
+        let s: TaskSort = serde_json::from_str(r#"{"taskListId":null}"#).unwrap();
+        assert_eq!(s.task_list_id, "");
     }
 
     #[test]

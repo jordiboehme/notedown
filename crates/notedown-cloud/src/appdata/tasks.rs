@@ -25,7 +25,9 @@ const SORT_DIR: &str = "sort";
 #[serde(rename_all = "camelCase", default)]
 pub struct Task {
     /// 32 hex, made by the device; the file name of the record.
+    #[serde(deserialize_with = "super::null_default")]
     pub task_id: String,
+    #[serde(deserialize_with = "super::null_default")]
     pub task_list_id: String,
     pub recurrence_id: Value,
     pub title: Option<String>,
@@ -42,6 +44,7 @@ pub struct Task {
     /// Base64 of a JSON link to a note page; opaque.
     pub links: Option<String>,
     /// `"Y"` for a tombstone.
+    #[serde(deserialize_with = "super::null_as_no")]
     pub is_deleted: String,
     pub sort: Value,
     pub sort_completed: Value,
@@ -126,11 +129,14 @@ impl Task {
 #[serde(rename_all = "camelCase", default)]
 pub struct TaskGroup {
     /// Made by the device; the file name of the record.
+    #[serde(deserialize_with = "super::null_default")]
     pub task_list_id: String,
     /// The owner's user id; set by the caller.
+    #[serde(deserialize_with = "super::null_default")]
     pub user_id: u64,
     pub title: Option<String>,
     pub last_modified: Value,
+    #[serde(deserialize_with = "super::null_as_no")]
     pub is_deleted: String,
     pub create_time: Value,
     /// Server only: when the server last wrote the record (ms).
@@ -183,6 +189,7 @@ impl TaskGroup {
 #[serde(rename_all = "camelCase", default)]
 pub struct TaskSort {
     /// The file name of the record.
+    #[serde(deserialize_with = "super::null_default")]
     pub task_list_id: String,
     pub title: Option<String>,
     pub last_modify: Value,

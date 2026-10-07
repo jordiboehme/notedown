@@ -1138,3 +1138,17 @@ fn keys_are_valid_file_ids_or_path_keys() {
         assert!(!pages::valid_key(bad), "{bad:?}");
     }
 }
+
+#[test]
+fn a_snapshot_that_cannot_read_app_data_writes_no_page_records() {
+    let f = Fixture::new();
+    f.put_raw("NOTE/Note/n.note", &abc(Some(FID), ["s", "s", "s"]));
+    let items = f.store.account_dir().join("digests/items");
+    std::fs::create_dir_all(&items).unwrap();
+    std::fs::write(items.join("7.json"), b"not json").unwrap();
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    let before = f.journal.last_seq().unwrap();
+    assert!(f.store.snapshot(&g, &f.journal).is_err());
+    assert_eq!(f.journal.last_seq().unwrap(), before);
+    assert!(f.record(FID).is_none(), "no page record without its events");
+}

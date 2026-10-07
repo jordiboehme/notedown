@@ -23,6 +23,11 @@
 //! space. To-do ids come from the device and are kept as sent; they must be plain file names
 //! ([`valid_task_key`]).
 //!
+//! Reads: the lists (`digests`, `tasks`, ...) and the single reads skip a record file that cannot
+//! be read or parsed, with a warning on stderr, so one bad file never stops the device's sync;
+//! a `put_*` over it replaces it (event `created`). The `*_strict` lists fail instead, for
+//! `journal snapshot` and the CLI. `tags.json` is always read strictly.
+//!
 //! Deletes: digests and groups are soft-deleted (`isDeleted: "Y"`, the file stays). A deleted
 //! task stays as a tombstone (`isDeleted: "Y"`, `deleted_at_ms`) for the incremental pull and is
 //! swept after [`TOMBSTONE_TTL_MS`] ([`AppData::sweep_tombstones`]). To-do groups and sorts are
@@ -100,6 +105,30 @@ fn null_as_no<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<String, D:
     Ok(Option::<String>::deserialize(d)?.unwrap_or_else(|| NO.to_string()))
 }
 
+/// Read a `taskId` or `taskListId`: a JSON string as it is, an integer as its decimal string,
+/// `null` as empty. Anything else is an error.
+fn string_or_int<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {
+    use serde::de::Error as _;
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Null => Ok(String::new()),
+        serde_json::Value::Number(n) if n.is_u64() || n.is_i64() => Ok(n.to_string()),
+        other => Err(D::Error::custom(format!(
+            "expected a string or an integer, got {other}"
+        ))),
+    }
+}
+
+/// How reads treat a record file that cannot be read or parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Skip it with a warning on stderr (the device routes: one bad file must not stop the
+    /// sync, and the device's next write replaces it).
+    Lenient,
+    /// Fail (`journal snapshot` and the CLI stay loud).
+    Strict,
+}
+
 /// The kind of a record change, from whether the record was live before and is live after.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Change {
@@ -143,6 +172,32 @@ impl<'a> AppData<'a> {
         self.store.account_dir().join(TASKS_DIR)
     }
 
+    /// The record in `path`, `None` when it is missing. With [`Mode::Lenient`] a record that
+    /// cannot be read or parsed is `None` too, with a warning on stderr.
+    fn load<T: DeserializeOwned>(&self, path: &Path, mode: Mode) -> Result<Option<T>> {
+        match (read_record(path), mode) {
+            (Err(e), Mode::Lenient) => {
+                eprintln!(
+                    "warning: account {}: skipping an unreadable record: {e}",
+                    self.store.slug()
+                );
+                Ok(None)
+            }
+            (r, _) => r,
+        }
+    }
+
+    /// Every record in `dir` (`<stem>.json`), in stem order; see [`AppData::load`] for `mode`.
+    fn load_all<T: DeserializeOwned>(&self, dir: &Path, mode: Mode) -> Result<Vec<T>> {
+        let mut out = Vec::new();
+        for stem in record_stems(dir)? {
+            if let Some(r) = self.load(&dir.join(format!("{stem}.json")), mode)? {
+                out.push(r);
+            }
+        }
+        Ok(out)
+    }
+
     /// Append `bodies` as one batch with one `opId`. Nothing for an empty list.
     fn journal(
         &self,
@@ -175,13 +230,13 @@ impl<'a> AppData<'a> {
     /// digest, then `task.created` for every live task. The caller holds the store lock.
     pub(crate) fn snapshot_bodies(&self, guard: &WriteGuard) -> Result<Vec<EventBody>> {
         let mut out: Vec<EventBody> = self
-            .digests(guard)?
+            .digests_strict(guard)?
             .iter()
             .filter(|d| d.is_live())
             .map(|d| EventBody::DigestCreated(d.info()))
             .collect();
         out.extend(
-            self.tasks(guard)?
+            self.tasks_strict(guard)?
                 .iter()
                 .filter(|t| t.is_live())
                 .map(|t| EventBody::TaskCreated(t.info())),
@@ -263,17 +318,6 @@ fn record_ids(dir: &Path) -> Result<Vec<u64>> {
     Ok(ids)
 }
 
-/// Every record in `dir` (`<stem>.json`), in stem order.
-fn read_records<T: DeserializeOwned>(dir: &Path) -> Result<Vec<T>> {
-    let mut out = Vec::new();
-    for stem in record_stems(dir)? {
-        if let Some(r) = read_record(&dir.join(format!("{stem}.json")))? {
-            out.push(r);
-        }
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 pub(crate) mod testutil {
     use std::sync::Arc;
@@ -340,6 +384,7 @@ pub(crate) mod testutil {
 
 #[cfg(test)]
 mod tests {
+    use super::testutil::Fixture;
     use super::*;
 
     #[test]
@@ -394,6 +439,158 @@ mod tests {
         );
         let s: TaskSort = serde_json::from_str(r#"{"taskListId":null}"#).unwrap();
         assert_eq!(s.task_list_id, "");
+    }
+
+    #[test]
+    fn task_keys_may_be_json_integers() {
+        let t: Task =
+            serde_json::from_str(r#"{"taskId":123,"taskListId":895334188016730112}"#).unwrap();
+        assert_eq!(
+            (t.task_id.as_str(), t.task_list_id.as_str()),
+            ("123", "895334188016730112")
+        );
+        let l: TaskGroup = serde_json::from_str(r#"{"taskListId":-4}"#).unwrap();
+        assert_eq!(l.task_list_id, "-4");
+        let s: TaskSort = serde_json::from_str(r#"{"taskListId":42}"#).unwrap();
+        assert_eq!(s.task_list_id, "42");
+        assert!(serde_json::from_str::<Task>(r#"{"taskId":1.5}"#).is_err());
+        assert!(serde_json::from_str::<Task>(r#"{"taskId":[1]}"#).is_err());
+    }
+
+    #[test]
+    fn lenient_reads_skip_a_garbage_record_and_a_put_replaces_it() {
+        let f = Fixture::new();
+        let app = AppData::new(&f.store);
+        let g = f.store.lock_recovered(&f.journal).unwrap();
+        let live = Digest {
+            id: 1,
+            ..Digest::default()
+        };
+        app.put_digest(&g, &live, Origin::Cli, None, &f.journal)
+            .unwrap();
+        let items = f.store.account_dir().join("digests/items");
+        std::fs::write(items.join("2.json"), b"garbage").unwrap();
+        let ids: Vec<u64> = app.digests(&g).unwrap().iter().map(|d| d.id).collect();
+        assert_eq!(ids, vec![1]);
+        assert!(app.digests_strict(&g).is_err());
+        assert_eq!(app.digest(&g, 2).unwrap(), None);
+        // The 5.7 heal: the device sends the digest again.
+        let healed = Digest {
+            id: 2,
+            content: Some("back".into()),
+            ..Digest::default()
+        };
+        app.put_digest(&g, &healed, Origin::Device, Some("SN1"), &f.journal)
+            .unwrap();
+        assert_eq!(app.digests_strict(&g).unwrap().len(), 2);
+        let last: Vec<_> = f
+            .journal
+            .read_from(0)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect();
+        assert_eq!(last.last().unwrap().body.type_name(), "digest.created");
+
+        let groups = f.store.account_dir().join("digests/groups");
+        std::fs::create_dir_all(&groups).unwrap();
+        std::fs::write(groups.join("3.json"), b"{").unwrap();
+        assert!(app.digest_groups(&g).unwrap().is_empty());
+        assert!(app.digest_groups_strict(&g).is_err());
+        let group = DigestGroup {
+            id: 3,
+            ..DigestGroup::default()
+        };
+        app.put_digest_group(&g, &group, Origin::Cli, None, &f.journal)
+            .unwrap();
+        assert_eq!(app.digest_groups_strict(&g).unwrap().len(), 1);
+
+        let tdir = f.store.account_dir().join("tasks/items");
+        std::fs::create_dir_all(&tdir).unwrap();
+        std::fs::write(tdir.join("t1.json"), b"[").unwrap();
+        assert!(app.tasks(&g).unwrap().is_empty());
+        assert!(app.tasks_strict(&g).is_err());
+        assert_eq!(app.task(&g, "t1").unwrap(), None);
+        let t = Task {
+            task_id: "t1".into(),
+            ..Task::default()
+        };
+        app.put_task(&g, &t, Origin::Cli, None, &f.journal).unwrap();
+        assert_eq!(app.tasks_strict(&g).unwrap().len(), 1);
+        let last: Vec<_> = f
+            .journal
+            .read_from(0)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect();
+        assert_eq!(last.last().unwrap().body.type_name(), "task.created");
+
+        for (dir, strict) in [("tasks/groups", true), ("tasks/sort", false)] {
+            let d = f.store.account_dir().join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("l1.json"), b"x").unwrap();
+            if strict {
+                assert!(app.task_groups(&g).unwrap().is_empty());
+                assert!(app.task_groups_strict(&g).is_err());
+            } else {
+                assert!(app.task_sorts(&g).unwrap().is_empty());
+                assert!(app.task_sorts_strict(&g).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_batch_journals_the_tasks_written_before_it() {
+        let f = Fixture::new();
+        let app = AppData::new(&f.store);
+        let g = f.store.lock_recovered(&f.journal).unwrap();
+        // A folder where t2's record goes: its write fails after t1's succeeded.
+        std::fs::create_dir_all(f.store.account_dir().join("tasks/items/t2.json/x")).unwrap();
+        let task = |id: &str| Task {
+            task_id: id.into(),
+            title: Some(id.into()),
+            ..Task::default()
+        };
+        let err = app.put_tasks(
+            &g,
+            &[task("t1"), task("t2"), task("t3")],
+            Origin::Cli,
+            None,
+            &f.journal,
+        );
+        assert!(err.is_err());
+        let ev: Vec<_> = f
+            .journal
+            .read_from(0)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect();
+        assert_eq!(ev.len(), 1);
+        assert!(
+            ev[0]
+                .to_line()
+                .contains(r#""type":"task.created","taskId":"t1""#)
+        );
+        assert!(f.store.account_dir().join("tasks/items/t1.json").is_file());
+        assert!(!f.store.account_dir().join("tasks/items/t3.json").exists());
+    }
+
+    #[test]
+    fn id_0_is_refused() {
+        let f = Fixture::new();
+        let app = AppData::new(&f.store);
+        let g = f.store.lock_recovered(&f.journal).unwrap();
+        let d = Digest::default();
+        assert!(matches!(
+            app.put_digest(&g, &d, Origin::Cli, None, &f.journal),
+            Err(Error::Invalid { .. })
+        ));
+        let grp = DigestGroup::default();
+        assert!(matches!(
+            app.put_digest_group(&g, &grp, Origin::Cli, None, &f.journal),
+            Err(Error::Invalid { .. })
+        ));
+        assert!(app.digests_strict(&g).unwrap().is_empty());
+        assert_eq!(f.journal.last_seq().unwrap(), 0);
     }
 
     #[test]

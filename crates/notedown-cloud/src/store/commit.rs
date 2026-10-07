@@ -1746,6 +1746,8 @@ impl Store {
     pub fn snapshot(&self, guard: &WriteGuard, journal: &Journal) -> Result<Vec<u64>> {
         self.check_write(guard)?;
         let entries = self.list(guard, &WirePath::root(), true)?;
+        // Read the app data first: a failure here leaves no page record without its events.
+        let app_data = crate::appdata::AppData::new(self).snapshot_bodies(guard)?;
         let op_id = new_op_id();
         let mut events: Vec<Event> = Vec::new();
         for e in entries {
@@ -1785,7 +1787,6 @@ impl Store {
                     .map(|body| Event::new(&self.slug, Origin::Snapshot, None, &op_id, body)),
             );
         }
-        let app_data = crate::appdata::AppData::new(self).snapshot_bodies(guard)?;
         events.extend(
             app_data
                 .into_iter()

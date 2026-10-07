@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::{
-    AppData, Change, NO, TOMBSTONE_TTL_MS, YES, change, read_record, read_records, remove_record,
-    valid_task_key, write_record,
+    AppData, Change, Mode, NO, TOMBSTONE_TTL_MS, YES, change, remove_record, valid_task_key,
+    write_record,
 };
 use crate::journal::{EventBody, Journal, Origin, TaskGroupInfo, TaskInfo};
 use crate::store::WriteGuard;
@@ -25,9 +25,9 @@ const SORT_DIR: &str = "sort";
 #[serde(rename_all = "camelCase", default)]
 pub struct Task {
     /// 32 hex, made by the device; the file name of the record.
-    #[serde(deserialize_with = "super::null_default")]
+    #[serde(deserialize_with = "super::string_or_int")]
     pub task_id: String,
-    #[serde(deserialize_with = "super::null_default")]
+    #[serde(deserialize_with = "super::string_or_int")]
     pub task_list_id: String,
     pub recurrence_id: Value,
     pub title: Option<String>,
@@ -129,7 +129,7 @@ impl Task {
 #[serde(rename_all = "camelCase", default)]
 pub struct TaskGroup {
     /// Made by the device; the file name of the record.
-    #[serde(deserialize_with = "super::null_default")]
+    #[serde(deserialize_with = "super::string_or_int")]
     pub task_list_id: String,
     /// The owner's user id; set by the caller.
     #[serde(deserialize_with = "super::null_default")]
@@ -189,7 +189,7 @@ impl TaskGroup {
 #[serde(rename_all = "camelCase", default)]
 pub struct TaskSort {
     /// The file name of the record.
-    #[serde(deserialize_with = "super::null_default")]
+    #[serde(deserialize_with = "super::string_or_int")]
     pub task_list_id: String,
     pub title: Option<String>,
     pub last_modify: Value,
@@ -245,16 +245,24 @@ impl AppData<'_> {
         Ok(self.tasks_dir().join(SORT_DIR).join(format!("{key}.json")))
     }
 
-    /// Every task, tombstones included, by `taskId`.
+    /// Every task, tombstones included, by `taskId`. A record file that cannot be read is
+    /// skipped with a warning.
     pub fn tasks(&self, guard: &WriteGuard) -> Result<Vec<Task>> {
         self.check(guard)?;
-        read_records(&self.tasks_dir().join(ITEMS_DIR))
+        self.load_all(&self.tasks_dir().join(ITEMS_DIR), Mode::Lenient)
     }
 
-    /// The task `task_id`, a tombstone too.
+    /// [`AppData::tasks`], but a record file that cannot be read is an error.
+    pub fn tasks_strict(&self, guard: &WriteGuard) -> Result<Vec<Task>> {
+        self.check(guard)?;
+        self.load_all(&self.tasks_dir().join(ITEMS_DIR), Mode::Strict)
+    }
+
+    /// The task `task_id`, a tombstone too; `None` also for a record file that cannot be read
+    /// (with a warning).
     pub fn task(&self, guard: &WriteGuard, task_id: &str) -> Result<Option<Task>> {
         self.check(guard)?;
-        read_record(&self.task_path(task_id)?)
+        self.load(&self.task_path(task_id)?, Mode::Lenient)
     }
 
     /// Write one task with its server times; its event, if any.
@@ -291,7 +299,9 @@ impl AppData<'_> {
     }
 
     /// [`AppData::put_task`] for several tasks, journaled as one batch (one `opId`). The
-    /// `taskId` of every task is checked before anything is written.
+    /// `taskId` of every task is checked before anything is written. When a write fails in the
+    /// middle, the events of the tasks written before it are journaled, then the error is
+    /// returned. An old record file that cannot be read counts as absent.
     pub fn put_tasks(
         &self,
         guard: &WriteGuard,
@@ -306,7 +316,19 @@ impl AppData<'_> {
         let now = journal.now_ms();
         let mut bodies = Vec::new();
         for t in tasks {
-            bodies.extend(self.store_task(guard, t, now)?);
+            match self.store_task(guard, t, now) {
+                Ok(body) => bodies.extend(body),
+                Err(e) => {
+                    // The tasks before it are written: journal them, then report the failure.
+                    if let Err(j) = self.journal(bodies, origin, device, journal) {
+                        eprintln!(
+                            "warning: account {}: journal of a partial task batch: {j}",
+                            self.store.slug()
+                        );
+                    }
+                    return Err(e);
+                }
+            }
         }
         self.journal(bodies, origin, device, journal)
     }
@@ -346,16 +368,24 @@ impl AppData<'_> {
         Ok(removed)
     }
 
-    /// Every task group, by `taskListId`.
+    /// Every task group, by `taskListId`. A record file that cannot be read is skipped with a
+    /// warning.
     pub fn task_groups(&self, guard: &WriteGuard) -> Result<Vec<TaskGroup>> {
         self.check(guard)?;
-        read_records(&self.tasks_dir().join(GROUPS_DIR))
+        self.load_all(&self.tasks_dir().join(GROUPS_DIR), Mode::Lenient)
     }
 
-    /// The task group `task_list_id`.
+    /// [`AppData::task_groups`], but a record file that cannot be read is an error.
+    pub fn task_groups_strict(&self, guard: &WriteGuard) -> Result<Vec<TaskGroup>> {
+        self.check(guard)?;
+        self.load_all(&self.tasks_dir().join(GROUPS_DIR), Mode::Strict)
+    }
+
+    /// The task group `task_list_id`; `None` also for a record file that cannot be read (with
+    /// a warning).
     pub fn task_group(&self, guard: &WriteGuard, task_list_id: &str) -> Result<Option<TaskGroup>> {
         self.check(guard)?;
-        read_record(&self.task_group_path(task_list_id)?)
+        self.load(&self.task_group_path(task_list_id)?, Mode::Lenient)
     }
 
     /// Store `group` under its `taskListId` (a full replace) with `updated_at_ms` = the journal
@@ -404,16 +434,24 @@ impl AppData<'_> {
         Ok(true)
     }
 
-    /// Every task sort, by `taskListId`.
+    /// Every task sort, by `taskListId`. A record file that cannot be read is skipped with a
+    /// warning.
     pub fn task_sorts(&self, guard: &WriteGuard) -> Result<Vec<TaskSort>> {
         self.check(guard)?;
-        read_records(&self.tasks_dir().join(SORT_DIR))
+        self.load_all(&self.tasks_dir().join(SORT_DIR), Mode::Lenient)
     }
 
-    /// The sort of the task group `task_list_id`.
+    /// [`AppData::task_sorts`], but a record file that cannot be read is an error.
+    pub fn task_sorts_strict(&self, guard: &WriteGuard) -> Result<Vec<TaskSort>> {
+        self.check(guard)?;
+        self.load_all(&self.tasks_dir().join(SORT_DIR), Mode::Strict)
+    }
+
+    /// The sort of the task group `task_list_id`; `None` also for a record file that cannot be
+    /// read (with a warning).
     pub fn task_sort(&self, guard: &WriteGuard, task_list_id: &str) -> Result<Option<TaskSort>> {
         self.check(guard)?;
-        read_record(&self.task_sort_path(task_list_id)?)
+        self.load(&self.task_sort_path(task_list_id)?, Mode::Lenient)
     }
 
     /// Store `sort` under its `taskListId` (a full replace). Sorts are not journaled.

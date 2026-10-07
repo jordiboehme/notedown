@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::{
-    AppData, Change, FIRST_DIGEST_ID, FIRST_TAG_ID, NO, YES, change, read_record, read_records,
-    record_ids, write_record,
+    AppData, Change, FIRST_DIGEST_ID, FIRST_TAG_ID, Mode, NO, YES, change, read_record, record_ids,
+    write_record,
 };
 use crate::journal::{DigestGroupInfo, DigestInfo, EventBody, Journal, Origin};
 use crate::store::WriteGuard;
@@ -226,6 +226,17 @@ pub struct DigestTag {
     pub created_at: u64,
 }
 
+/// Ids start at [`FIRST_DIGEST_ID`]; 0 is what a request without an id reads as.
+fn refuse_id_0(id: u64, what: &'static str) -> Result<()> {
+    if id == 0 {
+        return Err(Error::Invalid {
+            what,
+            message: "0 is no server id".into(),
+        });
+    }
+    Ok(())
+}
+
 fn digest_event(c: Change, info: DigestInfo) -> EventBody {
     match c {
         Change::Created => EventBody::DigestCreated(info),
@@ -255,25 +266,37 @@ impl AppData<'_> {
             .join(format!("{id}.json"))
     }
 
-    /// Every digest, live and deleted, by id.
-    pub fn digests(&self, guard: &WriteGuard) -> Result<Vec<Digest>> {
+    fn digests_with(&self, guard: &WriteGuard, mode: Mode) -> Result<Vec<Digest>> {
         self.check(guard)?;
         let dir = self.digests_dir().join(ITEMS_DIR);
-        let mut out: Vec<Digest> = read_records(&dir)?;
+        let mut out: Vec<Digest> = self.load_all(&dir, mode)?;
         out.sort_by_key(|d| d.id);
         Ok(out)
     }
 
-    /// The digest with `id`, live or deleted.
-    pub fn digest(&self, guard: &WriteGuard, id: u64) -> Result<Option<Digest>> {
-        self.check(guard)?;
-        read_record(&self.item_path(id))
+    /// Every digest, live and deleted, by id. A record file that cannot be read is skipped with
+    /// a warning.
+    pub fn digests(&self, guard: &WriteGuard) -> Result<Vec<Digest>> {
+        self.digests_with(guard, Mode::Lenient)
     }
 
-    /// Store `digest` under its id (a full replace), then journal `digest.created` (new, or
+    /// [`AppData::digests`], but a record file that cannot be read is an error.
+    pub fn digests_strict(&self, guard: &WriteGuard) -> Result<Vec<Digest>> {
+        self.digests_with(guard, Mode::Strict)
+    }
+
+    /// The digest with `id`, live or deleted; `None` also for a record file that cannot be
+    /// read (with a warning).
+    pub fn digest(&self, guard: &WriteGuard, id: u64) -> Result<Option<Digest>> {
+        self.check(guard)?;
+        self.load(&self.item_path(id), Mode::Lenient)
+    }
+
+    /// Store `digest` under its id (a full replace; an old record file that cannot be read
+    /// counts as absent), then journal `digest.created` (new, or
     /// back from a delete), `digest.updated` or `digest.deleted` (`isDeleted` turned `"Y"`).
     /// Sets `createTime` and `created_at_ms` (kept from an existing record), `updateTime` and
-    /// `updated_at_ms` to the journal clock's now.
+    /// `updated_at_ms` to the journal clock's now. Id 0 is refused (`Error::Invalid`).
     pub fn put_digest(
         &self,
         guard: &WriteGuard,
@@ -282,6 +305,7 @@ impl AppData<'_> {
         device: Option<&str>,
         journal: &Journal,
     ) -> Result<()> {
+        refuse_id_0(digest.id, "digest id")?;
         let old = self.digest(guard, digest.id)?;
         let now = journal.now_ms();
         let created = old
@@ -337,22 +361,34 @@ impl AppData<'_> {
         }
     }
 
-    /// Every digest group, live and deleted, by id.
-    pub fn digest_groups(&self, guard: &WriteGuard) -> Result<Vec<DigestGroup>> {
+    fn digest_groups_with(&self, guard: &WriteGuard, mode: Mode) -> Result<Vec<DigestGroup>> {
         self.check(guard)?;
-        let mut out: Vec<DigestGroup> = read_records(&self.digests_dir().join(GROUPS_DIR))?;
+        let mut out: Vec<DigestGroup> =
+            self.load_all(&self.digests_dir().join(GROUPS_DIR), mode)?;
         out.sort_by_key(|g| g.id);
         Ok(out)
     }
 
-    /// The digest group with `id`, live or deleted.
+    /// Every digest group, live and deleted, by id. A record file that cannot be read is
+    /// skipped with a warning.
+    pub fn digest_groups(&self, guard: &WriteGuard) -> Result<Vec<DigestGroup>> {
+        self.digest_groups_with(guard, Mode::Lenient)
+    }
+
+    /// [`AppData::digest_groups`], but a record file that cannot be read is an error.
+    pub fn digest_groups_strict(&self, guard: &WriteGuard) -> Result<Vec<DigestGroup>> {
+        self.digest_groups_with(guard, Mode::Strict)
+    }
+
+    /// The digest group with `id`, live or deleted; `None` also for a record file that cannot
+    /// be read (with a warning).
     pub fn digest_group(&self, guard: &WriteGuard, id: u64) -> Result<Option<DigestGroup>> {
         self.check(guard)?;
-        read_record(&self.group_path(id))
+        self.load(&self.group_path(id), Mode::Lenient)
     }
 
     /// Store `group` under its id (a full replace), then journal `digest_group.created`,
-    /// `.updated` or `.deleted` as [`AppData::put_digest`] does.
+    /// `.updated` or `.deleted` as [`AppData::put_digest`] does. Id 0 is refused.
     pub fn put_digest_group(
         &self,
         guard: &WriteGuard,
@@ -361,6 +397,7 @@ impl AppData<'_> {
         device: Option<&str>,
         journal: &Journal,
     ) -> Result<()> {
+        refuse_id_0(group.id, "digest group id")?;
         let old = self.digest_group(guard, group.id)?;
         write_record(&self.group_path(group.id), group)?;
         let was_live = old.as_ref().is_some_and(DigestGroup::is_live);

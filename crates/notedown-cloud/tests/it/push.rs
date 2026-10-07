@@ -12,10 +12,12 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::extract::connect_info::MockConnectInfo;
 use axum::http::Request;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use notedown_cloud::auth::{Accounts, Imported, expected_login_hash, md5_hex};
 use notedown_cloud::journal::{Event, EventBody, FileKind, Origin, new_op_id};
-use notedown_cloud::push::{follow_once, server_message_frame, start_seq, startsync_message, tick};
+use notedown_cloud::push::{
+    RECONNECT_REASON, follow_once, server_message_frame, start_seq, startsync_message, tick,
+};
 use notedown_cloud::server::{AppState, router, serve_listeners};
 use notedown_cloud::socket::{LIVENESS_MS, LastInbound, Outbound};
 use notedown_cloud::store::Store;
@@ -83,8 +85,15 @@ fn mark_imported(data: &Path) {
 }
 
 impl Fixture {
+    /// The message tests use `startsync`; `reconnect` (the default) closes the socket.
     fn new() -> Fixture {
-        Self::with(Config::default(), true)
+        Self::with(
+            Config {
+                push: PushMode::Startsync,
+                ..Config::default()
+            },
+            true,
+        )
     }
 
     fn with(config: Config, imported: bool) -> Fixture {
@@ -158,6 +167,16 @@ impl Fixture {
 
     fn follow(&mut self) -> usize {
         follow_once(&self.state, &mut self.cursor).unwrap()
+    }
+
+    /// Everything waiting for `serial`, in order.
+    fn outbound(&mut self, serial: &str) -> Vec<Outbound> {
+        let rx = self.rx.get_mut(serial).unwrap();
+        let mut out = Vec::new();
+        while let Ok(o) = rx.try_recv() {
+            out.push(o);
+        }
+        out
     }
 
     /// The frames waiting for `serial`, in order.
@@ -549,6 +568,39 @@ fn the_follower_starts_at_the_end_of_the_journal() {
     assert!(rx.try_recv().is_err());
 }
 
+// ---- reconnect ----
+
+#[test]
+fn reconnect_closes_the_socket_of_each_bound_device_once() {
+    let mut f = Fixture::with(Config::default(), true);
+    f.put("a.note");
+    f.follow();
+    f.advance_ms(2000);
+    assert_eq!(tick(&f.state, f.now()), 2);
+    for serial in [A, B] {
+        match f.outbound(serial).as_slice() {
+            [Outbound::Close(reason)] => assert_eq!(*reason, RECONNECT_REASON),
+            other => panic!("{serial}: {other:?}"),
+        }
+        assert!(!f.pending(serial));
+    }
+    f.advance_ms(6000);
+    assert_eq!(tick(&f.state, f.now()), 0);
+}
+
+#[test]
+fn reconnect_skips_a_silent_session_and_keeps_the_push() {
+    let mut f = Fixture::with(Config::default(), true);
+    f.put("a.note");
+    f.follow();
+    f.advance_ms(16_000);
+    f.heartbeat(A);
+    assert_eq!(tick(&f.state, f.now()), 1);
+    assert_eq!(f.outbound(A).len(), 1);
+    assert!(f.outbound(B).is_empty());
+    assert!(f.pending(B));
+}
+
 // ---- the real loop ----
 
 /// The server on `127.0.0.1:0` with the real clock; device A bound to an imported account.
@@ -556,7 +608,11 @@ fn the_follower_starts_at_the_end_of_the_journal() {
 async fn the_server_pushes_startsync_to_a_connected_device_after_a_put() {
     let dir = tempfile::tempdir().unwrap();
     seed_account(dir.path(), true);
-    let state = AppState::open(Config::default(), dir.path()).unwrap();
+    let config = Config {
+        push: PushMode::Startsync,
+        ..Config::default()
+    };
+    let state = AppState::open(config, dir.path()).unwrap();
     state
         .auth
         .devices()
@@ -614,5 +670,72 @@ async fn the_server_pushes_startsync_to_a_connected_device_after_a_put() {
     assert_eq!(inner["msgType"], "FILE-SYN");
     assert_eq!(inner["data"][0]["messageType"], "STARTSYNC");
     assert_eq!(inner["data"][0]["equipmentNo"], "null-null");
+    server.abort();
+}
+
+/// The default `reconnect`: the server closes the WebSocket (code 1001, reason `sync`) after a
+/// put, and sends no socket.io disconnect packet before it.
+#[tokio::test]
+async fn the_server_closes_the_socket_of_a_connected_device_after_a_put() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_account(dir.path(), true);
+    let state = AppState::open(Config::default(), dir.path()).unwrap();
+    state
+        .auth
+        .devices()
+        .update("jordi", A, |d| d.bound = true)
+        .unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let server = tokio::spawn(serve_listeners(vec![l], state.clone()));
+
+    let now = state.now_ms();
+    let (code, _) = state.auth.challenge(EMAIL, now).unwrap();
+    let hash = expected_login_hash(&md5_hex("secret"), &code);
+    let token = state.auth.login(EMAIL, &hash, A, now).unwrap().token;
+    let url = format!(
+        "ws://{addr}/socket.io/?token={token}&type={A}&random=1791270408879&sign=c2lnbmF0dXJlLXZhbHVl&EIO=3&transport=websocket"
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let mut texts = Vec::new();
+    while texts.len() < 2 {
+        if let Some(Ok(Message::Text(t))) = ws.next().await {
+            texts.push(t.to_string());
+        }
+    }
+    assert_eq!(texts[1], "40");
+
+    let src = tempfile::tempdir().unwrap();
+    let file = src.path().join("pushed.note");
+    std::fs::write(&file, b"pushed").unwrap();
+    notedown_cloud::put::put(
+        dir.path(),
+        "jordi",
+        &state.journal,
+        &file,
+        "NOTE/Note",
+        None,
+    )
+    .unwrap();
+
+    let close = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(frame))) => return frame,
+                Some(Ok(Message::Text(t))) => {
+                    assert_ne!(t.as_str(), "41", "no socket.io disconnect before the close");
+                    // Keep the session live past the liveness limit.
+                    let _ = ws.send(Message::text("2")).await;
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("connection ended without a close frame: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("a close within 15 s")
+    .expect("a close frame");
+    assert_eq!(u16::from(close.code), 1001);
+    assert_eq!(close.reason.as_str(), RECONNECT_REASON);
     server.abort();
 }

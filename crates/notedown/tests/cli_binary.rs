@@ -196,7 +196,12 @@ fn serve_refuse_sync_flag_counts_for_one_run_and_keeps_server_toml() {
     assert!(out.starts_with("notedown cloud server\n"), "{out}");
     assert!(!out.contains("capture server"), "{out}");
     assert!(out.contains("sync mode: accept (protect: on)"), "{out}");
-    assert!(out.contains("\npush mode: startsync\n"), "{out}");
+    assert!(
+        out.contains(
+            "\npush mode: reconnect (the device's socket is closed, it syncs when it connects again)\n"
+        ),
+        "{out}"
+    );
 }
 
 /// `notedown cloud journal <action> --data <dir> <rest>`, the documented argument order.

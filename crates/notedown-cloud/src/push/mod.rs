@@ -10,7 +10,7 @@ mod follower;
 mod planner;
 
 pub use detail::detail_message;
-pub use follower::{Follower, follow_once, run, start_seq, tick};
+pub use follower::{Follower, RECONNECT_REASON, follow_once, run, start_seq, tick};
 pub use planner::{
     MAX_WAIT_MS, MIN_GAP_MS, Pending, PushPlanner, PushTiming, QUIET_MS, server_message_frame,
     startsync_message,

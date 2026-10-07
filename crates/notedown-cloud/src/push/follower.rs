@@ -78,6 +78,9 @@ pub fn follow_once(state: &AppState, last_seq: &mut u64) -> crate::Result<usize>
     Ok(read)
 }
 
+/// The close reason of a `reconnect` push.
+pub const RECONNECT_REASON: &str = "sync";
+
 /// One tick at `now_ms`: send every due push that D8 allows. Returns the pushes handed over. A
 /// target that fails a gate keeps its pending push. Blocking (it reads `account.json`).
 pub fn tick(state: &AppState, now_ms: u64) -> usize {
@@ -104,6 +107,18 @@ pub fn tick(state: &AppState, now_ms: u64) -> usize {
         let Some(pending) = planner.pending(&slug, &serial) else {
             continue;
         };
+        if state.config.push == PushMode::Reconnect {
+            // Only the WebSocket is closed, without a socket.io disconnect packet (`41`): a
+            // client treats a server disconnect as final and does not connect again.
+            if state
+                .sockets
+                .close(&slug, &serial, RECONNECT_REASON, now_ms)
+            {
+                planner.sent(&slug, &serial, now_ms);
+                sent += 1;
+            }
+            continue;
+        }
         let cause = pending.cause.as_deref();
         // `detail` falls back to `STARTSYNC` when the cap dropped events (the list would be
         // partial) or when its message cannot be built.

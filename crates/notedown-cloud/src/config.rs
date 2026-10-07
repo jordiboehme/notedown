@@ -28,11 +28,14 @@ pub enum SyncMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PushMode {
-    /// One `STARTSYNC` message: the device starts a sync.
+    /// Close the device's socket. The device connects again within seconds and runs a full
+    /// sync on every new connection (`docs/sync-protocol.md` 9.3).
     #[default]
+    Reconnect,
+    /// One `STARTSYNC` message. Firmware 3.29.42 acknowledges it but does not sync.
     Startsync,
     /// One item per changed file or folder. Falls back to `startsync` when the message cannot be
-    /// built or the list of changes was cut at its cap.
+    /// built or the list of changes was cut at its cap. Firmware 3.29.42 does not sync on it.
     Detail,
     /// No pushes; the device syncs on its own schedule.
     Off,
@@ -79,7 +82,7 @@ impl Default for Config {
             trusted_proxies: Vec::new(),
             protect: true,
             sync: SyncMode::Accept,
-            push: PushMode::Startsync,
+            push: PushMode::Reconnect,
             capture: false,
             log_retention_days: 30,
             log_max_bytes: 1024 * 1024 * 1024,

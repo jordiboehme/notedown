@@ -99,6 +99,16 @@ impl SocketRegistry {
         }
     }
 
+    /// Close the live session at `now_ms` with `reason` (`Outbound::Close`): the device connects
+    /// again. Same liveness rule as [`SocketRegistry::send`]. Never blocks.
+    pub fn close(&self, slug: &str, serial: &str, reason: &'static str, now_ms: u64) -> bool {
+        let map = self.lock();
+        match map.get(&(slug.to_string(), serial.to_string())) {
+            Some(e) if e.is_live(now_ms) => e.tx.try_send(Outbound::Close(reason)).is_ok(),
+            _ => false,
+        }
+    }
+
     /// Hand a frame to the live session at `now_ms`. `false` when there is none, its channel is
     /// closed or full, or the device sent nothing for longer than [`LIVENESS_MS`]. Never blocks.
     pub fn send(&self, slug: &str, serial: &str, frame: String, now_ms: u64) -> bool {
@@ -133,6 +143,17 @@ mod tests {
         assert!(r.is_connected("jordi", "SN1", 0));
         assert!(r.send("jordi", "SN1", "f".into(), 0));
         assert_eq!(rx.try_recv().unwrap(), frame("f"));
+    }
+
+    #[test]
+    fn close_reaches_only_a_live_session() {
+        let r = SocketRegistry::new();
+        let mut rx = r.register("jordi", "SN1", "a", 0).0;
+        assert!(!r.close("jordi", "SN1", "sync", LIVENESS_MS + 1));
+        assert!(rx.try_recv().is_err());
+        assert!(r.close("jordi", "SN1", "sync", LIVENESS_MS));
+        assert_eq!(rx.try_recv().unwrap(), Outbound::Close("sync"));
+        assert!(!r.close("jordi", "SN2", "sync", 0));
     }
 
     #[test]

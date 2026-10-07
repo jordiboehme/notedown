@@ -991,6 +991,9 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
                 println!(
                     "push mode: {}",
                     match config.push {
+                        notedown_cloud::PushMode::Reconnect => {
+                            "reconnect (the device's socket is closed, it syncs when it connects again)"
+                        }
                         notedown_cloud::PushMode::Startsync => "startsync",
                         notedown_cloud::PushMode::Detail => "detail",
                         notedown_cloud::PushMode::Off => "off (devices sync on their own schedule)",

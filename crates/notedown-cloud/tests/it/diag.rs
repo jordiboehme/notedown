@@ -488,7 +488,7 @@ fn config_defaults_created_and_round_trip() {
     assert!(c.protect);
     assert!(!c.capture);
     assert_eq!(c.sync, SyncMode::Accept);
-    assert_eq!(c.push, PushMode::Startsync);
+    assert_eq!(c.push, PushMode::Reconnect);
     assert_eq!(c.log_retention_days, 30);
     assert_eq!(c.log_max_bytes, 1 << 30);
     let text = std::fs::read_to_string(dir.path().join("server.toml")).unwrap();
@@ -520,25 +520,33 @@ fn config_defaults_created_and_round_trip() {
 }
 
 #[test]
-fn config_push_key_defaults_to_startsync_and_parses() {
+fn config_push_key_defaults_to_reconnect_and_parses() {
     let dir = tempfile::tempdir().unwrap();
     let c = Config::load_or_create(dir.path()).unwrap();
-    assert_eq!(c.push, PushMode::Startsync);
+    assert_eq!(c.push, PushMode::Reconnect);
     let text = std::fs::read_to_string(dir.path().join("server.toml")).unwrap();
-    assert!(text.contains("\npush = \"startsync\"\n"), "{text}");
+    assert!(text.contains("\npush = \"reconnect\"\n"), "{text}");
     assert!(
         text.find("\nsync = ").unwrap() < text.find("\npush = ").unwrap(),
         "{text}"
     );
 
-    // An older file without the key loads as startsync and is not rewritten.
+    // An older file without the key loads as reconnect and is not rewritten.
     let path = dir.path().join("server.toml");
     let old = "listen = [\"127.0.0.1:0\"]\nsync = \"accept\"\n";
     std::fs::write(&path, old).unwrap();
     assert_eq!(
         Config::load_or_create(dir.path()).unwrap().push,
+        PushMode::Reconnect
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+
+    std::fs::write(&path, "push = \"startsync\"\n").unwrap();
+    assert_eq!(
+        Config::load_or_create(dir.path()).unwrap().push,
         PushMode::Startsync
     );
+    std::fs::write(&path, old).unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
 
     std::fs::write(&path, "push = \"off\"\n").unwrap();

@@ -74,6 +74,8 @@ enum CloudAction {
     },
     /// Fill an account with a device backup and open its protect gate
     Import(ImportArgs),
+    /// Fill an account's digests from the device's .snbak backup, before its first digest sync
+    ImportAppData(ImportAppDataArgs),
     /// Copy one file into an account (connected devices are told to sync)
     Put(PutArgs),
     /// Copy every file of the device over Browse & Access (port 8089) into a folder
@@ -104,6 +106,28 @@ struct ImportArgs {
     /// Accept a backup without any files (the device is really empty)
     #[arg(long)]
     allow_empty: bool,
+}
+
+#[derive(clap::Args)]
+struct ImportAppDataArgs {
+    /// The device backup (.snbak, made by the device's backup function)
+    #[arg(value_name = "SNBAK", required_unless_present = "empty")]
+    snbak: Option<PathBuf>,
+    /// The data folder
+    #[arg(long, value_name = "DIR")]
+    data: PathBuf,
+    /// The account slug
+    #[arg(long)]
+    account: String,
+    /// Import nothing and only open the gate for the digests (the device has none)
+    #[arg(long, conflicts_with = "snbak")]
+    empty: bool,
+    /// Clear the digests and to-dos the account holds now first
+    #[arg(long)]
+    replace: bool,
+    /// Print the mapping and the counts, write nothing
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(clap::Args)]
@@ -559,6 +583,12 @@ fn cloud_command(action: CloudAction) -> Result<ExitCode> {
             }
             import_command(args)
         }
+        CloudAction::ImportAppData(args) => {
+            if !args.dry_run {
+                recover_accounts(&args.data)?;
+            }
+            import_app_data_command(args)
+        }
         CloudAction::Put(args) => {
             recover_accounts(&args.data)?;
             put_command(args)
@@ -659,6 +689,61 @@ fn import_command(args: ImportArgs) -> Result<ExitCode> {
         "imported {} ({}), protect gate open for {}",
         plural(report.files as usize, "file"),
         mb(report.bytes),
+        args.account
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn import_app_data_command(args: ImportAppDataArgs) -> Result<ExitCode> {
+    use notedown_cloud::appdata::{AppImportOptions, import_app_data};
+    let options = AppImportOptions {
+        dry_run: args.dry_run,
+        replace: args.replace,
+    };
+    let journal = notedown_cloud::journal::Journal::open(&args.data)?;
+    let report = import_app_data(
+        &args.data,
+        &args.account,
+        args.snbak.as_deref(),
+        &options,
+        &journal,
+    )?;
+    if args.dry_run {
+        println!("dry run, nothing is written");
+    }
+    if args.dry_run {
+        for line in &report.mapping {
+            println!("{line}");
+        }
+    }
+    for id in &report.new_ids {
+        println!("no cloud id on the device, new id: {id}");
+    }
+    for name in &report.skipped {
+        println!("skipped {name} (no digest names it)");
+    }
+    if report.replaced > 0 {
+        println!(
+            "{} {} of the account {}",
+            if args.dry_run {
+                "would clear"
+            } else {
+                "cleared"
+            },
+            plural(report.replaced as usize, "record"),
+            args.account
+        );
+    }
+    println!(
+        "{} {}, {}, {} into account {}",
+        if args.dry_run {
+            "would import"
+        } else {
+            "imported"
+        },
+        plural(report.digests as usize, "digest"),
+        plural(report.groups as usize, "group"),
+        plural(report.marks as usize, "handwritten comment"),
         args.account
     );
     Ok(ExitCode::SUCCESS)

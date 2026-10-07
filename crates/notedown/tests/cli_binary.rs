@@ -572,3 +572,145 @@ fn cloud_commands_say_when_they_wait_for_a_store_lock() {
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("jordi"));
 }
+
+#[test]
+fn cloud_import_app_data_dry_run_import_and_refusals() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let data = d.to_str().unwrap();
+    assert!(
+        cloud(
+            d,
+            &[
+                "add",
+                "jordi",
+                "--email",
+                "jordi@example.org",
+                "--password-stdin"
+            ],
+            Some("secret\n"),
+        )
+        .status
+        .success()
+    );
+    let snbak = d.join("device.snbak");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&snbak).unwrap());
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    zip.start_file("backup/DIGEST/knowledge.json", options)
+        .unwrap();
+    zip.write_all(
+        br#"[{"serviceId": 42, "content": "an excerpt", "sourcePath": "Note/x.note",
+              "sourceType": 2, "commentHandwriteName": "", "metadata": "{}"}]"#,
+    )
+    .unwrap();
+    zip.finish().unwrap();
+    let s = snbak.to_str().unwrap();
+    let args = |extra: &[&'static str]| -> Vec<String> {
+        let mut v: Vec<String> = [
+            "cloud",
+            "import-app-data",
+            s,
+            "--data",
+            data,
+            "--account",
+            "jordi",
+        ]
+        .map(String::from)
+        .to_vec();
+        v.extend(extra.iter().map(|e| e.to_string()));
+        v
+    };
+    let run = |v: Vec<String>| notedown(&v.iter().map(String::as_str).collect::<Vec<_>>());
+
+    // The device files come first.
+    let out = run(args(&["--dry-run"]));
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("import the device files first"));
+
+    let backup = d.join("backup");
+    std::fs::create_dir_all(backup.join("Note")).unwrap();
+    std::fs::write(backup.join("Note/a.note"), b"note").unwrap();
+    for f in ["Document", "MyStyle", "EXPORT", "SCREENSHOT", "INBOX"] {
+        std::fs::create_dir_all(backup.join(f)).unwrap();
+    }
+    let out = notedown(&[
+        "cloud",
+        "import",
+        backup.to_str().unwrap(),
+        "--data",
+        data,
+        "--account",
+        "jordi",
+        "--no-report",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run(args(&["--dry-run"]));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout(&out),
+        "dry run, nothing is written\n\
+         42  Note/x.note  an excerpt\n\
+         would import 1 digest, 0 groups, 0 handwritten comments into account jordi\n"
+    );
+    assert!(!d.join("accounts/jordi/digests").exists());
+
+    let out = run(args(&[]));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout(&out),
+        "imported 1 digest, 0 groups, 0 handwritten comments into account jordi\n"
+    );
+    assert!(d.join("accounts/jordi/digests/items/42.json").is_file());
+    let again = run(args(&[]));
+    assert_eq!(again.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&again.stderr).contains("--replace"));
+
+    // --empty and a file are mutually exclusive; one of them is required.
+    let both = run(args(&["--empty"]));
+    assert_eq!(both.status.code(), Some(2));
+    let none = notedown(&[
+        "cloud",
+        "import-app-data",
+        "--data",
+        data,
+        "--account",
+        "jordi",
+    ]);
+    assert_eq!(none.status.code(), Some(2));
+    let out = notedown(&[
+        "cloud",
+        "import-app-data",
+        "--empty",
+        "--replace",
+        "--data",
+        data,
+        "--account",
+        "jordi",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout(&out)
+            .ends_with("imported 0 digests, 0 groups, 0 handwritten comments into account jordi\n"),
+        "{}",
+        stdout(&out)
+    );
+}

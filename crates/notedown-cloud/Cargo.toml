@@ -26,6 +26,7 @@ toml.workspace = true
 unicode-normalization.workspace = true
 unicase.workspace = true
 notedown-note.workspace = true
+zip.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
 

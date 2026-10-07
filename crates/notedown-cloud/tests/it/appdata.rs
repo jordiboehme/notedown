@@ -367,3 +367,411 @@ fn account_json_without_the_app_data_marker_still_loads() {
     ));
     assert_eq!(accounts.get("jordi").unwrap().unwrap(), a);
 }
+
+// ---- import-app-data ----
+
+use notedown_cloud::appdata::{AppImportOptions, AppImportReport, import_app_data};
+use serde_json::{Value, json};
+use std::io::Write;
+
+const MARK_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.mark";
+const MARK_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.mark";
+
+/// A fixture whose account holds the device files (a real, tiny `notedown cloud import`).
+fn import_fixture() -> Fixture {
+    let f = Fixture::new();
+    let backup = f.data().join("device-files");
+    std::fs::create_dir_all(backup.join("Note")).unwrap();
+    std::fs::write(backup.join("Note/a.note"), b"note").unwrap();
+    for d in ["Document", "MyStyle", "EXPORT", "SCREENSHOT", "INBOX"] {
+        std::fs::create_dir_all(backup.join(d)).unwrap();
+    }
+    notedown_cloud::import::import(
+        f.data(),
+        "jordi",
+        &backup,
+        &notedown_cloud::import::ImportOptions {
+            no_report: true,
+            ..Default::default()
+        },
+        &f.journal,
+        &mut |_| {},
+    )
+    .unwrap();
+    f
+}
+
+/// Write a `.snbak` (a ZIP with deflate) with the given (name, bytes) entries.
+fn snbak(path: &Path, entries: &[(&str, Vec<u8>)]) {
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, bytes) in entries {
+        zip.start_file(*name, options).unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
+fn json_bytes(v: Value) -> Vec<u8> {
+    serde_json::to_vec(&v).unwrap()
+}
+
+/// Two digests (a note with a `.mark` and a group, a document with `source_size` and a
+/// `.mark`), one without cloud id, one group.
+fn backup_entries() -> Vec<(&'static str, Vec<u8>)> {
+    let note_meta = r#"{"author":"Jordi","unique_identifier":"n1","source_size":3344196}"#;
+    let doc_meta = r#"{"unique_identifier":"d1"}"#;
+    vec![
+        (
+            "backup/DIGEST/metadata.json",
+            json_bytes(json!({"backupVersion": 1})),
+        ),
+        (
+            "backup/DIGEST/knowledge.json",
+            json_bytes(json!([
+                {"id": 1, "serviceId": 895334188016730112u64,
+                 "content": "A line from the note that is longer than forty characters in total",
+                 "commentStr": "typed", "commentHandwriteName": MARK_A,
+                 "handwriteMD5": "h1", "dataMD5": "m1", "creationTime": 1700000000000i64,
+                 "lastModifiedTime": 1700000001000i64, "sourcePath": "Note/x.note",
+                 "sourcePage": 3, "sourceType": 2, "state": 0, "syncState": 1,
+                 "knowledgeBaseUniqueAttribute": "g1", "metadata": note_meta},
+                {"id": 2, "serviceId": 895334188016730200u64, "content": "From the doc\nsecond line",
+                 "commentHandwriteName": MARK_B, "handwriteMD5": "h2", "dataMD5": "m2",
+                 "creationTime": 1700000002000i64, "lastModifiedTime": 1700000003000i64,
+                 "sourcePath": "Document/b.pdf", "sourceType": 1,
+                 "knowledgeBaseUniqueAttribute": "", "metadata": doc_meta},
+                {"id": 3, "serviceId": 0, "content": "never synced", "commentHandwriteName": "",
+                 "sourcePath": "Note/y.note", "sourceType": 2, "metadata": "{}"}
+            ])),
+        ),
+        (
+            "backup/DIGEST/knowledge_bases.json",
+            json_bytes(json!([
+                {"id": 1, "serviceId": 895334188016730300u64, "uniqueIdentifier": "g1",
+                 "name": "Ideas", "description": "d", "md5Hash": "gm",
+                 "creationTime": 1700000000000i64, "lastModifiedTime": 1700000000500i64}
+            ])),
+        ),
+        (
+            "backup/DIGEST/handwrite/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.mark",
+            b"mark A".to_vec(),
+        ),
+        (
+            "backup/DIGEST/handwrite/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.mark",
+            b"mark B".to_vec(),
+        ),
+        (
+            "backup/DIGEST/handwrite/cccccccccccccccccccccccccccccccc.mark",
+            b"unused".to_vec(),
+        ),
+        ("backup/DIGEST/digest.db", b"sqlite".to_vec()),
+        ("backup/Plugin/x", b"x".to_vec()),
+    ]
+}
+
+/// The digest and to-do events (the file import before them is not of interest).
+fn app_events(f: &Fixture) -> Vec<Event> {
+    f.events()
+        .into_iter()
+        .filter(|e| {
+            let n = e.body.type_name();
+            n.starts_with("digest") || n.starts_with("task")
+        })
+        .collect()
+}
+
+fn run(
+    f: &Fixture,
+    file: Option<&Path>,
+    options: &AppImportOptions,
+) -> notedown_cloud::Result<AppImportReport> {
+    import_app_data(f.data(), "jordi", file, options, &f.journal)
+}
+
+fn no_options() -> AppImportOptions {
+    AppImportOptions::default()
+}
+
+#[test]
+fn app_import_maps_digests_groups_and_marks() {
+    let f = import_fixture();
+    let file = f.data().join("device.snbak");
+    snbak(&file, &backup_entries());
+    let r = run(&f, Some(&file), &no_options()).unwrap();
+    assert_eq!((r.digests, r.groups, r.marks), (3, 1, 2));
+    assert_eq!(r.new_ids.len(), 1);
+    assert_eq!(
+        r.skipped,
+        vec!["backup/DIGEST/handwrite/cccccccccccccccccccccccccccccccc.mark"]
+    );
+
+    let app = AppData::new(&f.store);
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    let note = app.digest(&g, 895_334_188_016_730_112).unwrap().unwrap();
+    let wire = serde_json::to_value(note.wire()).unwrap();
+    assert_eq!(
+        wire,
+        json!({
+            "id": 895334188016730112u64, "fileId": null, "name": null, "userId": 1_000_001,
+            "uniqueIdentifier": "", "parentUniqueIdentifier": "g1",
+            "content": "A line from the note that is longer than forty characters in total",
+            "sourcePath": "Note/x.note", "dataSource": null, "sourceType": 2,
+            "isSummaryGroup": "N", "description": null, "tags": null, "md5Hash": "m1",
+            "metadata": r#"{"author":"Jordi","unique_identifier":"n1","source_size":3344196}"#,
+            "commentStr": "typed", "commentHandwriteName": MARK_A,
+            "handwriteInnerName": MARK_A, "handwriteMD5": "h1",
+            "creationTime": 1700000000000i64, "lastModifiedTime": 1700000001000i64,
+            "isDeleted": "N", "createTime": T0, "updateTime": T0, "author": "Jordi"
+        })
+    );
+    let doc = app.digest(&g, 895_334_188_016_730_200).unwrap().unwrap();
+    assert_eq!(doc.author, None);
+    assert_eq!(doc.parent_unique_identifier.as_deref(), Some(""));
+    assert!(
+        doc.metadata
+            .as_deref()
+            .unwrap()
+            .contains("unique_identifier")
+    );
+    // The digest without a cloud id gets an id above everything in the account.
+    let all = app.digests(&g).unwrap();
+    let fresh = all
+        .iter()
+        .find(|d| d.content.as_deref() == Some("never synced"))
+        .unwrap();
+    assert_eq!(fresh.id, 895_334_188_016_730_301);
+    assert_ne!(fresh.id, 0);
+    assert_eq!(r.new_ids, vec![format!("Note/y.note: {}", fresh.id)]);
+
+    let groups = app.digest_groups(&g).unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].id, 895_334_188_016_730_300);
+    assert_eq!(groups[0].unique_identifier.as_deref(), Some("g1"));
+    assert_eq!(groups[0].name.as_deref(), Some("Ideas"));
+    assert_eq!(groups[0].md5_hash.as_deref(), Some("gm"));
+    assert_eq!(groups[0].last_modified_time, Some(1_700_000_000_500));
+
+    assert_eq!(app.mark(&g, MARK_A).unwrap().unwrap(), b"mark A");
+    assert_eq!(app.mark(&g, MARK_B).unwrap().unwrap(), b"mark B");
+    assert_eq!(
+        app.mark(&g, &format!("{}.mark", "c".repeat(32))).unwrap(),
+        None
+    );
+    drop(g);
+
+    let a = Accounts::new(f.data()).get("jordi").unwrap().unwrap();
+    let m = a.app_data_imported.unwrap();
+    assert_eq!((m.digests, m.groups, m.marks), (3, 1, 2));
+    assert_eq!(m.source, file.display().to_string());
+
+    // One batch per record, origin cli, no device.
+    let events = app_events(&f);
+    let types: Vec<_> = kinds(&events).into_iter().collect();
+    assert_eq!(types.len(), 4);
+    assert_eq!(types[0].0, "digest_group.created");
+    assert!(types[1..].iter().all(|t| t.0 == "digest.created"));
+    assert!(types.iter().all(|t| t.1 == Origin::Cli && t.2.is_none()));
+    let ops: std::collections::BTreeSet<_> = events.iter().map(|e| e.op_id.clone()).collect();
+    assert_eq!(ops.len(), 4);
+}
+
+#[test]
+fn app_import_dry_run_writes_nothing_and_prints_the_mapping() {
+    let f = import_fixture();
+    let file = f.data().join("device.snbak");
+    snbak(&file, &backup_entries());
+    let r = run(
+        &f,
+        Some(&file),
+        &AppImportOptions {
+            dry_run: true,
+            replace: false,
+        },
+    )
+    .unwrap();
+    assert_eq!((r.digests, r.groups, r.marks), (3, 1, 2));
+    assert_eq!(
+        r.mapping[0],
+        "895334188016730112  Note/x.note  A line from the note that is longer than"
+    );
+    assert_eq!(
+        r.mapping[1],
+        "895334188016730200  Document/b.pdf  From the doc second line"
+    );
+    assert!(!f.store.account_dir().join("digests").exists());
+    assert!(app_events(&f).is_empty());
+    let a = Accounts::new(f.data()).get("jordi").unwrap().unwrap();
+    assert_eq!(a.app_data_imported, None);
+}
+
+#[test]
+fn app_import_refuses_without_the_file_marker_with_protect_on_or_off() {
+    let f = Fixture::new();
+    let file = f.data().join("device.snbak");
+    snbak(&file, &backup_entries());
+    let e = run(&f, Some(&file), &no_options()).unwrap_err().to_string();
+    assert!(
+        e.contains("import the device files first (notedown cloud import)"),
+        "{e}"
+    );
+    let e = run(&f, None, &no_options()).unwrap_err().to_string();
+    assert!(e.contains("import the device files first"), "{e}");
+    assert!(app_events(&f).is_empty());
+}
+
+#[test]
+fn app_import_refuses_missing_marks_missing_knowledge_and_duplicate_ids() {
+    let f = import_fixture();
+    let file = f.data().join("device.snbak");
+
+    let mut entries = backup_entries();
+    entries.retain(|(n, _)| !n.ends_with(MARK_A) && !n.ends_with(MARK_B));
+    snbak(&file, &entries);
+    let e = run(&f, Some(&file), &no_options()).unwrap_err().to_string();
+    assert!(e.contains(MARK_A) && e.contains(MARK_B), "{e}");
+
+    let mut entries = backup_entries();
+    entries.retain(|(n, _)| *n != "backup/DIGEST/knowledge.json");
+    snbak(&file, &entries);
+    let e = run(&f, Some(&file), &no_options()).unwrap_err().to_string();
+    assert!(e.contains("knowledge.json"), "{e}");
+
+    let mut entries = backup_entries();
+    for (n, b) in &mut entries {
+        if *n == "backup/DIGEST/knowledge.json" {
+            *b = json_bytes(json!([
+                {"serviceId": 7, "content": "a", "sourcePath": "p"},
+                {"serviceId": 7, "content": "b", "sourcePath": "q"}
+            ]));
+        }
+    }
+    snbak(&file, &entries);
+    let e = run(&f, Some(&file), &no_options()).unwrap_err().to_string();
+    assert!(e.contains("more than once") && e.contains('7'), "{e}");
+
+    std::fs::write(&file, b"not a zip").unwrap();
+    assert!(run(&f, Some(&file), &no_options()).is_err());
+
+    // Nothing was written by any refusal, and the marker is not set.
+    assert!(!f.store.account_dir().join("digests").exists());
+    assert!(app_events(&f).is_empty());
+    let a = Accounts::new(f.data()).get("jordi").unwrap().unwrap();
+    assert_eq!(a.app_data_imported, None);
+}
+
+#[test]
+fn app_import_refuses_an_account_with_records_unless_replace() {
+    let f = import_fixture();
+    let file = f.data().join("device.snbak");
+    snbak(&file, &backup_entries());
+    {
+        let app = AppData::new(&f.store);
+        let g = f.store.lock_recovered(&f.journal).unwrap();
+        app.put_digest(&g, &digest(5, "old"), Origin::Device, None, &f.journal)
+            .unwrap();
+        app.put_task(
+            &g,
+            &task("t1", "l1", "buy"),
+            Origin::Device,
+            None,
+            &f.journal,
+        )
+        .unwrap();
+        app.put_task_group(
+            &g,
+            &TaskGroup {
+                task_list_id: "l1".into(),
+                title: Some("Inbox".into()),
+                ..TaskGroup::default()
+            },
+            Origin::Device,
+            None,
+            &f.journal,
+        )
+        .unwrap();
+    }
+    let e = run(&f, Some(&file), &no_options()).unwrap_err().to_string();
+    assert!(e.contains("--replace"), "{e}");
+    assert!(run(&f, None, &no_options()).is_err());
+
+    let before = app_events(&f).len();
+    let r = run(
+        &f,
+        Some(&file),
+        &AppImportOptions {
+            dry_run: false,
+            replace: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(r.replaced, 3);
+    let events = app_events(&f);
+    let new: Vec<_> = kinds(&events[before..]).into_iter().map(|k| k.0).collect();
+    assert_eq!(
+        new,
+        vec![
+            "digest.deleted",
+            "task.deleted",
+            "task_group.deleted",
+            "digest_group.created",
+            "digest.created",
+            "digest.created",
+            "digest.created",
+        ]
+    );
+    let app = AppData::new(&f.store);
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    let live: Vec<_> = app
+        .digests(&g)
+        .unwrap()
+        .into_iter()
+        .filter(|d| d.is_live())
+        .collect();
+    assert_eq!(live.len(), 3);
+    assert!(!app.digest(&g, 5).unwrap().unwrap().is_live());
+    assert!(app.tasks(&g).unwrap().iter().all(|t| !t.is_live()));
+    assert!(app.task_groups(&g).unwrap().is_empty());
+    // The old record's id stays used: the new ids are above it.
+    assert!(live.iter().all(|d| d.id != 5));
+}
+
+#[test]
+fn app_import_empty_sets_only_the_marker() {
+    let f = import_fixture();
+    let r = run(&f, None, &no_options()).unwrap();
+    assert_eq!(r, AppImportReport::default());
+    assert!(app_events(&f).is_empty());
+    let a = Accounts::new(f.data()).get("jordi").unwrap().unwrap();
+    let m = a.app_data_imported.unwrap();
+    assert_eq!(
+        (m.source.as_str(), m.digests, m.groups, m.marks),
+        ("", 0, 0, 0)
+    );
+    // A second import is not refused: the account holds no records.
+    run(&f, None, &no_options()).unwrap();
+}
+
+#[test]
+fn app_import_without_groups_file_and_with_an_unreadable_record_in_the_account() {
+    let f = import_fixture();
+    let file = f.data().join("device.snbak");
+    let mut entries = backup_entries();
+    entries.retain(|(n, _)| !n.ends_with("knowledge_bases.json"));
+    snbak(&file, &entries);
+    let r = run(&f, Some(&file), &no_options()).unwrap();
+    assert_eq!((r.digests, r.groups), (3, 0));
+    // A broken record in the account stops a strict read: the import refuses it.
+    let items = f.store.account_dir().join("digests/items");
+    std::fs::write(items.join("99.json"), b"{broken").unwrap();
+    let e = run(
+        &f,
+        Some(&file),
+        &AppImportOptions {
+            dry_run: false,
+            replace: true,
+        },
+    );
+    assert!(e.is_err());
+}

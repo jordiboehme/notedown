@@ -125,16 +125,20 @@ notedown cloud import-app-data Supernote_<date>_<time>.snbak --data ~/notedown-d
 notedown cloud import-app-data Supernote_<date>_<time>.snbak --data ~/notedown-data --account me
 ```
 
-Why this matters: the device treats a digest that's missing in the cloud the same way as a file. The import makes the cloud hold the digests the device holds, with the ids the device knows. The dry run lists every digest with its id, its source file and the start of its text.
+Why this matters: the device compares its digests with the cloud by id. The import puts the digests into the cloud with the ids the device knows, so the device finds nothing to change at the first sync. The dry run lists every digest with its id, its source file and the start of its text.
 
 Until this import is done, the server refuses every digest and to-do request of the device, and the device shows "App Data Sync Failed". Your files still sync. The import needs the file import first. It refuses a `.snbak` file that looks wrong:
 
 - it has no digest list (`backup/DIGEST/knowledge.json`);
 - a digest names a handwritten comment that isn't in the file;
 - two digests have the same id;
-- the account already has digests or to-dos (that needs `--replace`).
+- the account already has digests (that needs `--replace`).
 
-A digest that never reached a cloud has no id yet. It gets a new one, and the import prints it. A device without any digests needs no `.snbak` file: run `notedown cloud import-app-data --empty --data ~/notedown-data --account me` instead.
+A digest that never reached a cloud has no id yet. The import leaves it out and lists it. The device adds it itself at the first sync. The import also lists a digest whose group isn't in the file.
+
+`import-app-data` doesn't touch to-dos. It doesn't count them, and `--replace` doesn't clear them.
+
+A device without any digests needs no `.snbak` file: run `notedown cloud import-app-data --empty --data ~/notedown-data --account me` instead.
 
 ### 5. Start the server
 
@@ -168,7 +172,7 @@ Then check that nothing was deleted before you do anything else:
 notedown cloud journal tail --data ~/notedown-data
 ```
 
-The import wrote one `file.created` line per file and one `digest.created` line per digest. After this sync there must be no `file.deleted` and no `digest.deleted` line. Go on only then. The full protocol log is in `~/notedown-data/logs/` (one file per day, passwords and tokens masked) if someone helps you look into a problem.
+The import wrote one `file.created` line per file and one `digest.created` line per digest. This sync must add no `file.deleted` line and no `digest.deleted` line from the device (`"origin":"device"`). An earlier import with `--replace` wrote `digest.deleted` lines with `"origin":"cli"`. Those are fine. Go on only then. The full protocol log is in `~/notedown-data/logs/` (one file per day, passwords and tokens masked) if someone helps you look into a problem.
 
 ### 10. Try one change
 

@@ -4,14 +4,18 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use notedown_cloud::auth::Accounts;
 use notedown_cloud::journal::{Event, EventBody, Journal, Origin};
+use notedown_cloud::push::{PushPlanner, PushTiming};
+use notedown_cloud::server::AppState;
 use notedown_cloud::store::retention::Retention;
 use notedown_cloud::store::{
     CrashPoint, IndexLine, PENDING_FILE, PutOptions, RecycleEntry, RecycleReason, Store, WirePath,
 };
-use time::UtcOffset;
+use notedown_cloud::{Clock, Config};
+use time::{OffsetDateTime, UtcOffset};
 
 const EMAIL: &str = "jordi@example.org";
 const DAY: u64 = 86_400_000;
@@ -651,4 +655,139 @@ fn a_symlink_in_the_slot_path_keeps_the_line_and_is_reported() {
         format!("{}\n", serde_json::to_string(&linked).unwrap())
     );
     assert_eq!(f.events().len(), 1);
+}
+
+// ------------------------------------------------------------------ the server's hourly prune
+
+struct FixedClock(u64);
+
+impl Clock for FixedClock {
+    fn now(&self) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp_nanos(i128::from(self.0) * 1_000_000).unwrap()
+    }
+}
+
+/// A data folder with accounts `slugs`, each with one live file and five versions of it: the
+/// two old ones (more than 12 months back) go, the three recent ones stay. Returns the state, with
+/// the clock at `NOW`, and the old entry of each account.
+fn server_with(slugs: &[&str], config: Config) -> (tempfile::TempDir, Arc<AppState>) {
+    let dir = tempfile::tempdir().unwrap();
+    for slug in slugs {
+        Accounts::new(dir.path())
+            .create(slug, &format!("{slug}@example.org"), "secret")
+            .unwrap();
+        let store = Store::open(dir.path(), slug).unwrap();
+        {
+            let g = store.lock().unwrap();
+            store.ensure_native_folders(&g).unwrap();
+        }
+        let p = store.fs_path(&wp("NOTE/Note/a.note"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"now").unwrap();
+        let id = {
+            let g = store.lock().unwrap();
+            store
+                .entry(&g, &wp("NOTE/Note/a.note"))
+                .unwrap()
+                .unwrap()
+                .id
+        };
+        let ow = RecycleReason::Overwritten;
+        for ms in [
+            NOW - 400 * DAY,
+            NOW - 399 * DAY,
+            NOW - 3 * HOUR,
+            NOW - 2 * HOUR,
+            NOW - HOUR,
+        ] {
+            let e = entry(id, "NOTE/Note/a.note", ms, ow);
+            let slot = store.recycle_dir().join(e.location());
+            std::fs::create_dir_all(slot.parent().unwrap()).unwrap();
+            std::fs::write(&slot, b"old").unwrap();
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(store.recycle_dir().join("index.jsonl"))
+                .unwrap();
+            writeln!(f, "{}", serde_json::to_string(&e).unwrap()).unwrap();
+        }
+    }
+    let state = AppState::open_with_clock(config, dir.path(), Arc::new(FixedClock(NOW))).unwrap();
+    (dir, state)
+}
+
+fn journal_events(state: &AppState) -> Vec<Event> {
+    state
+        .journal
+        .read_from(1)
+        .unwrap()
+        .map(|e| e.unwrap())
+        .collect()
+}
+
+#[test]
+fn the_server_prune_covers_every_account_and_journals_origin_retention() {
+    let (_dir, state) = server_with(&["anna", "ben"], Config::default());
+    assert_eq!(state.prune_recycle_all().unwrap(), 4);
+    let events = journal_events(&state);
+    assert_eq!(events.len(), 4);
+    for e in &events {
+        assert_eq!(e.origin, Origin::Retention);
+        assert!(matches!(e.body, EventBody::RecyclePruned { .. }));
+    }
+    for slug in ["anna", "ben"] {
+        assert_eq!(events.iter().filter(|e| e.account == slug).count(), 2);
+    }
+    assert_eq!(state.prune_recycle_all().unwrap(), 0);
+}
+
+#[test]
+fn the_hourly_prune_does_nothing_when_recycle_prune_is_off() {
+    let off = Config {
+        recycle_prune: false,
+        ..Config::default()
+    };
+    let (_dir, state) = server_with(&["anna"], off);
+    assert!(state.hourly_recycle_prune().is_none());
+    assert!(journal_events(&state).is_empty());
+
+    let (_dir, state) = server_with(&["anna"], Config::default());
+    assert_eq!(state.hourly_recycle_prune().unwrap().unwrap(), 2);
+}
+
+#[test]
+fn an_account_whose_prune_fails_doesnt_stop_the_others() {
+    let (_dir, state) = server_with(&["anna", "ben"], Config::default());
+    // The index of anna is a folder: it can't be read.
+    let store = Store::open(&state.data_dir, "anna").unwrap();
+    let index = store.recycle_dir().join("index.jsonl");
+    std::fs::remove_file(&index).unwrap();
+    std::fs::create_dir(&index).unwrap();
+    assert_eq!(state.prune_recycle_all().unwrap(), 2);
+    let events = journal_events(&state);
+    assert!(events.iter().all(|e| e.account == "ben"));
+}
+
+#[test]
+fn a_recycle_pruned_event_plans_no_push() {
+    let event = Event {
+        seq: 1,
+        ts: NOW,
+        account: "jordi".into(),
+        origin: Origin::Retention,
+        device: None,
+        body: EventBody::RecyclePruned {
+            id: 7,
+            path: "NOTE/Note/a.note".into(),
+            md5: "0".repeat(32),
+            deleted_at: NOW - 400 * DAY,
+            reason: RecycleReason::Overwritten,
+        },
+        op_id: "op".into(),
+    };
+    let mut planner = PushPlanner::new(PushTiming::default());
+    planner.observe(&event, &["SN100".to_string()], NOW);
+    assert!(planner.pending("jordi", "SN100").is_none());
+    assert!(planner.due(NOW + 24 * HOUR).is_empty());
 }

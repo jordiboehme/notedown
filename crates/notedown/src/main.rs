@@ -1192,6 +1192,17 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
                 );
             }
         }
+        if config.recycle_prune {
+            println!(
+                "recycle bin: keeps {} newest, {} daily, {} monthly, deleted files {} days",
+                config.recycle_keep_latest,
+                config.recycle_keep_daily,
+                config.recycle_keep_monthly,
+                config.recycle_keep_deleted_days
+            );
+        } else {
+            println!("recycle bin: never pruned");
+        }
         println!("press Ctrl-C to stop");
         std::io::stdout().flush()?;
         serve_until(listeners, state.clone(), async {

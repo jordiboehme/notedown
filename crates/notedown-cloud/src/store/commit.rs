@@ -1871,6 +1871,50 @@ pub fn sweep_all_temps(data_dir: &Path) -> Result<usize> {
     Ok(removed)
 }
 
+/// [`Store::prune_recycle`] for every account with a `files/` folder, with origin
+/// [`Origin::Retention`]: the server's hourly prune. An account whose prune fails (a store that
+/// can't be opened, an unreadable index) is reported on stderr and skipped; the others still
+/// run. A slot that can't be removed is reported the same way. Returns how many lines were
+/// removed.
+pub fn prune_all_recycle(
+    data_dir: &Path,
+    journal: &Journal,
+    retention: &super::retention::Retention,
+    now_ms: u64,
+    offset: time::UtcOffset,
+) -> Result<usize> {
+    let accounts = crate::auth::Accounts::new(data_dir);
+    let mut removed = 0;
+    for account in accounts.list()? {
+        if !accounts
+            .account_dir(&account.slug)
+            .join(super::FILES_DIR)
+            .is_dir()
+        {
+            continue;
+        }
+        let pruned = Store::open(data_dir, &account.slug).and_then(|store| {
+            store.prune_recycle(journal, retention, now_ms, offset, Origin::Retention, false)
+        });
+        match pruned {
+            Ok(report) => {
+                removed += report.removed.len();
+                for f in &report.failed {
+                    eprintln!(
+                        "notedown cloud: account {}: recycle bin prune: recycle/{}: {}",
+                        account.slug, f.location, f.message
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "notedown cloud: account {}: recycle bin prune failed: {e}",
+                account.slug
+            ),
+        }
+    }
+    Ok(removed)
+}
+
 /// Run [`Store::recover`] for every account that may need it: one with a `pending.json` or with
 /// a `files/` folder (an account that never synced is not touched, so no `files/` appears).
 /// When an account's store lock is busy (an import runs), it prints "waiting for the store lock

@@ -27,7 +27,8 @@ use unicode_normalization::UnicodeNormalization;
 
 pub use commit::{
     CONTENT_HASH_MISMATCH, Commit, CrashPoint, PENDING_FILE, PendingOp, PlannedFolder, PutOptions,
-    RECYCLE_DIR, Recovery, STALE_TEMP_AGE, SideWrite, WriteGuard, recover_all, sweep_all_temps,
+    RECYCLE_DIR, Recovery, STALE_TEMP_AGE, SideWrite, WriteGuard, prune_all_recycle, recover_all,
+    sweep_all_temps,
 };
 pub use ids::FIRST_ID;
 pub use list::Entry;

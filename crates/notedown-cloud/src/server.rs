@@ -224,6 +224,31 @@ impl AppState {
         crate::store::sweep_all_temps(&self.data_dir)
     }
 
+    /// Prune the recycle bin of every account by the `recycle_keep_*` settings, journaled with
+    /// origin `retention`. Blocking. The offset for local days is read at each run (UTC, with a
+    /// warning, when it can't be read). Returns how many old versions were removed.
+    pub fn prune_recycle_all(&self) -> Result<usize> {
+        let offset = crate::localtime::local_utc_offset().unwrap_or_else(|| {
+            eprintln!(
+                "notedown cloud: can't read the local UTC offset; recycle days are counted in UTC"
+            );
+            time::UtcOffset::UTC
+        });
+        crate::store::prune_all_recycle(
+            &self.data_dir,
+            &self.journal,
+            &self.config.retention(),
+            self.now_ms(),
+            offset,
+        )
+    }
+
+    /// The prune of the hourly sweep: `None` when `recycle_prune` is off, else
+    /// [`AppState::prune_recycle_all`]. Blocking.
+    pub fn hourly_recycle_prune(&self) -> Option<Result<usize>> {
+        self.config.recycle_prune.then(|| self.prune_recycle_all())
+    }
+
     /// Milliseconds since the epoch, from the clock.
     pub fn now_ms(&self) -> u64 {
         now_ms_of(self.clock.as_ref())
@@ -295,8 +320,8 @@ pub async fn serve_until(
     // position is taken before the listeners serve.
     let follower = crate::push::Follower::start(state.clone()).await;
     let _pusher = AbortOnDrop(tokio::spawn(follower.run()));
-    // The hourly staging and temp file sweep (the first one ran at start); stopped when this
-    // returns.
+    // The hourly staging and temp file sweep (the first one ran at start) and the recycle bin
+    // prune (its first run is the first tick); stopped when this returns.
     let _sweeper = AbortOnDrop(tokio::spawn(async move {
         let mut every = tokio::time::interval(crate::sync::staging::SWEEP_INTERVAL);
         every.tick().await;
@@ -313,6 +338,17 @@ pub async fn serve_until(
             match tokio::task::spawn_blocking(move || st.sweep_temps()).await {
                 Ok(r) => report_temp_sweep(r),
                 Err(e) => eprintln!("notedown cloud: temp file sweep failed: {e}"),
+            }
+            // The first prune is this first tick, an hour after start, so a dry run with a new
+            // binary can come first.
+            let st = state.clone();
+            match tokio::task::spawn_blocking(move || st.hourly_recycle_prune()).await {
+                Ok(None) | Ok(Some(Ok(0))) => {}
+                Ok(Some(Ok(n))) => {
+                    eprintln!("notedown cloud: removed {n} old versions from the recycle bin")
+                }
+                Ok(Some(Err(e))) => eprintln!("notedown cloud: recycle bin prune failed: {e}"),
+                Err(e) => eprintln!("notedown cloud: recycle bin prune failed: {e}"),
             }
         }
     }));

@@ -1022,7 +1022,7 @@ Two mappers reference tables that the shipped schema does not create (`f_composi
 | 11 | When the device drops a token (logout, server says `E0712`, `E0085`) and how it re-logs in | Stub returns `E0712` once and logs the following requests |
 | 12 | HTTP vs HTTPS: Ratta's doc shows plain `http://IP:19072`; does 3.29.42 require HTTPS for private cloud? | Try plain HTTP first with the stub |
 | 13 | Firmware 3.29.42 differences from the firmware used by the community traces (not stated there) | All of the above captures on Jordi's device |
-| 14 | The real body of the device's first `schedule/task/all` request (which `maxResults`, whether `nextSyncToken` and `nextPageTokens` are absent, `null` or empty, and their JSON types); notedown parses them leniently until it is known | The protocol log of the first to-do sync against notedown |
+| 14 | The real body of the device's first `schedule/task/all` request (which `maxResults`, whether `nextSyncToken` and `nextPageTokens` are absent, `null` or empty, and their JSON types) | Answered in 9.4: `{"maxResults":"200"}`, no tokens |
 
 Plan [proposal]: build the logging stub first (it is also the skeleton of the server), capture items 1, 2, 3, 8, 11, 12 in one session, then run the Ratta test stack for items 4 to 7 and save the captures as test fixtures with personal data removed.
 
@@ -1087,3 +1087,15 @@ Device tests on 2026-10-07 with "Auto Sync" on, against notedown with socket pus
 - Every new socket connection (after a server restart or a wifi reconnect) is followed within 0.2 s by a full sync run (`synchronous/start`, `list_folder`, transfers, `synchronous/end` `Y`). This is how the device picked up files added on the server side.
 - An edit of a note makes the device send it on its own within a few minutes, without `synchronous/start`: `POST /api/file/3/files/query_v3` with the file's `id`, then `3/files/upload/apply` for the same path (and then, presumably, the byte upload and `upload/finish`). A server that requires the sync lock for writes refuses this upload; notedown now takes the free sync lock for such a write (log marker `implicit_lock`) and answers `E0079` only while another device holds the lock.
 
+
+### 9.4 Digest and to-do results [capture:nomad-3.29.42]
+
+Device test on 2026-10-07 (times UTC), "Auto Sync" on, against notedown with digest and to-do sync:
+
+- A fresh `.snbak` held 7 digests and 6 `.mark` files. All 7 digests had no `serviceId` (they were made after the switch to the Private Cloud), so `import-app-data` imported none and only opened app-data sync. The backup held no to-dos.
+- First full sync after the server restart (18:34:18 to 18:34:21): `query/summary/group` and `query/summary/hash` with `{"page":0,"size":0}`, then for each local digest `add/summary` followed by `upload/apply/summary` and the signed `.mark` upload, then `schedule/group/all` and `schedule/task/all`, then `schedule/group` and `schedule/task` for the device's one to-do group and its 2 tasks. Result: 7 digests, 6 `.mark` files, 1 group, 2 tasks. No delete, no duplicate, every request answered with success. The device showed "App Data Sync Completed".
+- The device's `schedule/task/all` body is `{"maxResults":"200"}`, the same on every pull; `schedule/group/all` sends the same. The device never sent `nextSyncToken`, `nextPageTokens` or `pageToken` in this test, so every to-do pull is a full pull (answers unknown 14).
+- No tag call and no `query/schedule/sort` call was seen.
+- With "Auto Sync" on, digest changes go out on their own within seconds, without `synchronous/start`: a new note digest went out as `add/summary` at 18:36:05; a handwritten comment as `upload/apply/summary`, the `.mark` upload and `update/summary` with `commentHandwriteName`, `handwriteInnerName` and `handwriteMD5` (18:36:36); a new category as `add/summary/group` (18:36:53); moving the digest into it as `update/summary` with `parentUniqueIdentifier` (18:36:57). The stored `.mark` matched `handwriteMD5`. The device's `fileName` is used as the `.mark` name and echoed as `innerName`; the device accepted that (part of unknown 5). The author set on the device travels in `metadata.author`.
+- A new to-do (19:06:07) went out as `schedule/group/all` and `schedule/task/all` (pull first), then `POST schedule/task` for the new task and `PUT schedule/task/list` with the other tasks of the group (their `sort` and `sortTime` changed).
+- Device paging for digests is `{"page":0,"size":0}` for both group and hash queries (part of unknown 6).

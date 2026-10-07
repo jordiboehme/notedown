@@ -36,8 +36,6 @@ const CHANNEL_CAPACITY: usize = 8;
 /// What the server tells a live session to do.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outbound {
-    /// Send this socket.io frame (already built) and log it.
-    Frame(String),
     /// Close the session with `close_code::AWAY` and this reason (D10).
     Close(&'static str),
 }
@@ -76,7 +74,9 @@ impl Queue {
     /// newest `STARTSYNC`. `None` when there is nothing, or when the last send is less than
     /// [`RESEND_MS`] ago and not acknowledged (the new items wait for the next heartbeat).
     fn take(&mut self, now_ms: u64) -> Option<&[PushItem]> {
-        if !self.sent.is_empty() && now_ms.saturating_sub(self.sent_ms) < RESEND_MS {
+        // A clock that stepped back behind the last send does not hold the items.
+        let waiting = now_ms >= self.sent_ms && now_ms - self.sent_ms < RESEND_MS;
+        if !self.sent.is_empty() && waiting {
             return None;
         }
         if self.sent.is_empty() && self.new.is_empty() {
@@ -164,7 +164,8 @@ impl SocketRegistry {
     }
 
     /// Close the live session at `now_ms` with `reason` (`Outbound::Close`): the device connects
-    /// again. Same liveness rule as [`SocketRegistry::send`]. Never blocks.
+    /// again. `false` when there is none, its channel is closed or full, or the device sent
+    /// nothing for longer than [`LIVENESS_MS`]. Never blocks.
     pub fn close(&self, slug: &str, serial: &str, reason: &'static str, now_ms: u64) -> bool {
         let map = self.lock();
         match map.get(&(slug.to_string(), serial.to_string())) {
@@ -173,18 +174,8 @@ impl SocketRegistry {
         }
     }
 
-    /// Hand a frame to the live session at `now_ms`. `false` when there is none, its channel is
-    /// closed or full, or the device sent nothing for longer than [`LIVENESS_MS`]. Never blocks.
-    pub fn send(&self, slug: &str, serial: &str, frame: String, now_ms: u64) -> bool {
-        let map = self.lock();
-        match map.get(&(slug.to_string(), serial.to_string())) {
-            Some(e) if e.is_live(now_ms) => e.tx.try_send(Outbound::Frame(frame)).is_ok(),
-            _ => false,
-        }
-    }
-
     /// Put `items` into the queue of the live session at `now_ms` (same liveness rule as
-    /// [`SocketRegistry::send`]). `false` when there is none. Never blocks.
+    /// [`SocketRegistry::close`]). `false` when there is none. Never blocks.
     pub fn queue(&self, slug: &str, serial: &str, items: Vec<PushItem>, now_ms: u64) -> bool {
         let mut map = self.lock();
         match map.get_mut(&(slug.to_string(), serial.to_string())) {
@@ -305,6 +296,17 @@ mod tests {
     }
 
     #[test]
+    fn a_clock_that_stepped_back_does_not_hold_the_resend() {
+        let r = SocketRegistry::new();
+        let _rx = r.register("jordi", "SN1", "a", 0).0;
+        assert!(r.queue("jordi", "SN1", vec![item(1)], 0));
+        assert!(r.deliver("jordi", "SN1", "a", 50_000).is_some());
+        let again = r.deliver("jordi", "SN1", "a", 40_000).unwrap();
+        assert_eq!(delivered(&again), (texts(&[item(1)]), 40_000));
+        assert_eq!(r.deliver("jordi", "SN1", "a", 41_000), None);
+    }
+
+    #[test]
     fn received_before_the_window_sends_nothing_twice() {
         let r = SocketRegistry::new();
         let _rx = r.register("jordi", "SN1", "a", 0).0;
@@ -386,16 +388,16 @@ mod tests {
         assert_eq!(delivered(&again).0, texts(&[item(1)]));
     }
 
-    fn frame(s: &str) -> Outbound {
-        Outbound::Frame(s.to_string())
+    fn frame(s: &'static str) -> Outbound {
+        Outbound::Close(s)
     }
 
     #[test]
-    fn register_then_send_delivers() {
+    fn register_then_close_reaches_the_session() {
         let r = SocketRegistry::new();
         let mut rx = r.register("jordi", "SN1", "a", 0).0;
         assert!(r.is_connected("jordi", "SN1", 0));
-        assert!(r.send("jordi", "SN1", "f".into(), 0));
+        assert!(r.close("jordi", "SN1", "f", 0));
         assert_eq!(rx.try_recv().unwrap(), frame("f"));
     }
 
@@ -417,7 +419,7 @@ mod tests {
         let mut second = r.register("jordi", "SN1", "b", 0).0;
         assert_eq!(first.try_recv().unwrap(), Outbound::Close("replaced"));
         assert!(first.try_recv().is_err());
-        assert!(r.send("jordi", "SN1", "f".into(), 0));
+        assert!(r.close("jordi", "SN1", "f", 0));
         assert_eq!(second.try_recv().unwrap(), frame("f"));
         assert!(first.try_recv().is_err());
     }
@@ -427,7 +429,7 @@ mod tests {
         let r = SocketRegistry::new();
         let mut first = r.register("jordi", "SN1", "a", 0).0;
         for _ in 0..CHANNEL_CAPACITY {
-            assert!(r.send("jordi", "SN1", "f".into(), 0));
+            assert!(r.close("jordi", "SN1", "f", 0));
         }
         let _second = r.register("jordi", "SN1", "b", 0).0;
         for _ in 0..CHANNEL_CAPACITY {
@@ -452,29 +454,29 @@ mod tests {
     }
 
     #[test]
-    fn send_after_the_receiver_was_dropped_fails() {
+    fn close_after_the_receiver_was_dropped_fails() {
         let r = SocketRegistry::new();
         drop(r.register("jordi", "SN1", "a", 0).0);
-        assert!(!r.send("jordi", "SN1", "f".into(), 0));
+        assert!(!r.close("jordi", "SN1", "f", 0));
         assert!(!r.is_connected("jordi", "SN1", 0));
     }
 
     #[test]
-    fn send_to_a_full_channel_fails_without_blocking() {
+    fn close_to_a_full_channel_fails_without_blocking() {
         let r = SocketRegistry::new();
         let _rx = r.register("jordi", "SN1", "a", 0).0;
         for _ in 0..CHANNEL_CAPACITY {
-            assert!(r.send("jordi", "SN1", "f".into(), 0));
+            assert!(r.close("jordi", "SN1", "f", 0));
         }
-        assert!(!r.send("jordi", "SN1", "f".into(), 0));
+        assert!(!r.close("jordi", "SN1", "f", 0));
     }
 
     #[test]
     fn other_serial_or_slug_is_not_reached() {
         let r = SocketRegistry::new();
         let mut rx = r.register("jordi", "SN1", "a", 0).0;
-        assert!(!r.send("jordi", "SN2", "f".into(), 0));
-        assert!(!r.send("anna", "SN1", "f".into(), 0));
+        assert!(!r.close("jordi", "SN2", "f", 0));
+        assert!(!r.close("anna", "SN1", "f", 0));
         assert!(!r.is_connected("anna", "SN1", 0));
         assert!(rx.try_recv().is_err());
     }
@@ -485,7 +487,7 @@ mod tests {
         let mut rx = r.register("jordi", "SN1", "a", 1000).0;
         assert!(r.is_connected("jordi", "SN1", 1000 + LIVENESS_MS));
         assert!(!r.is_connected("jordi", "SN1", 1001 + LIVENESS_MS));
-        assert!(!r.send("jordi", "SN1", "f".into(), 1001 + LIVENESS_MS));
+        assert!(!r.close("jordi", "SN1", "f", 1001 + LIVENESS_MS));
         // Nothing was handed over: the push stays with the caller.
         assert!(rx.try_recv().is_err());
     }
@@ -498,7 +500,7 @@ mod tests {
         assert!(!r.is_connected("jordi", "SN1", late));
         last_inbound.store(late - 100, Ordering::Relaxed);
         assert!(r.is_connected("jordi", "SN1", late));
-        assert!(r.send("jordi", "SN1", "f".into(), late));
+        assert!(r.close("jordi", "SN1", "f", late));
         assert_eq!(rx.try_recv().unwrap(), frame("f"));
     }
 
@@ -509,7 +511,7 @@ mod tests {
         let late = LIVENESS_MS + 1;
         assert!(!r.is_connected("jordi", "SN1", late));
         let mut new = r.register("jordi", "SN1", "b", late).0;
-        assert!(r.send("jordi", "SN1", "f".into(), late));
+        assert!(r.close("jordi", "SN1", "f", late));
         assert_eq!(new.try_recv().unwrap(), frame("f"));
     }
 }

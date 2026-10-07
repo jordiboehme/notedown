@@ -232,13 +232,19 @@ struct StartsyncItem<'a> {
     timestamp: u64,
 }
 
+/// The `equipmentNo` of an item (4.5): `"<serial>-null"` for a change by the device `cause`
+/// (a device call has no `channel` header), `"null-null"` for a change no device made, as the
+/// web UI of Ratta gives.
+pub fn equipment_no(cause: Option<&str>) -> String {
+    format!("{}-null", cause.unwrap_or("null"))
+}
+
 /// The `STARTSYNC` item built at `now_ms`. `cause` is the serial of the device behind the
-/// change; `None` gives `null-null`, as the web UI of Ratta does for a change that no device
-/// made.
+/// change ([`equipment_no`]).
 pub fn startsync_item(cause: Option<&str>, now_ms: u64) -> PushItem {
     let item = StartsyncItem {
         message_type: "STARTSYNC",
-        equipment_no: cause.unwrap_or("null-null"),
+        equipment_no: &equipment_no(cause),
         timestamp: now_ms,
     };
     PushItem::new(&item, true)
@@ -253,11 +259,6 @@ pub fn file_syn_message(items: &[PushItem], now_ms: u64) -> String {
         r#"{{"code":"200","timestamp":{now_ms},"msgType":"FILE-SYN","data":[{}]}}"#,
         data.join(",")
     )
-}
-
-/// The `FILE-SYN` message with one `STARTSYNC` item, built and sent at `now_ms`.
-pub fn startsync_message(cause: Option<&str>, now_ms: u64) -> String {
-    file_syn_message(&[startsync_item(cause, now_ms)], now_ms)
 }
 
 /// The socket.io frame `42["ServerMessage", <message string>]`.
@@ -496,11 +497,12 @@ mod tests {
 
     #[test]
     fn startsync_message_has_the_fixed_field_order() {
+        let startsync_message = |cause, now| file_syn_message(&[startsync_item(cause, now)], now);
         assert_eq!(
             startsync_message(None, 1791270408879),
             r#"{"code":"200","timestamp":1791270408879,"msgType":"FILE-SYN","data":[{"messageType":"STARTSYNC","equipmentNo":"null-null","timestamp":1791270408879}]}"#
         );
-        assert!(startsync_message(Some("SN1"), 5).contains(r#""equipmentNo":"SN1""#));
+        assert!(startsync_message(Some("SN1"), 5).contains(r#""equipmentNo":"SN1-null""#));
     }
 
     #[test]
@@ -508,7 +510,7 @@ mod tests {
         let items = [startsync_item(None, 3), startsync_item(Some("SN1"), 4)];
         assert_eq!(
             file_syn_message(&items, 9),
-            r#"{"code":"200","timestamp":9,"msgType":"FILE-SYN","data":[{"messageType":"STARTSYNC","equipmentNo":"null-null","timestamp":3},{"messageType":"STARTSYNC","equipmentNo":"SN1","timestamp":4}]}"#
+            r#"{"code":"200","timestamp":9,"msgType":"FILE-SYN","data":[{"messageType":"STARTSYNC","equipmentNo":"null-null","timestamp":3},{"messageType":"STARTSYNC","equipmentNo":"SN1-null","timestamp":4}]}"#
         );
         assert!(items.iter().all(PushItem::is_startsync));
         let m: serde_json::Value = serde_json::from_str(&file_syn_message(&[], 1)).unwrap();
@@ -517,7 +519,7 @@ mod tests {
 
     #[test]
     fn the_frame_wraps_the_message_as_a_string() {
-        let m = startsync_message(None, 7);
+        let m = file_syn_message(&[startsync_item(None, 7)], 7);
         let frame = server_message_frame(&m);
         assert!(
             frame.starts_with(r#"42["ServerMessage","{\"code\":\"200\""#),

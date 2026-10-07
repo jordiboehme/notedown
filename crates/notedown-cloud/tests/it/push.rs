@@ -27,7 +27,6 @@ use notedown_cloud::{Clock, Config, PushMode, SyncMode};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::mpsc::error::TryRecvError;
 use tokio_tungstenite::tungstenite::Message;
 use tower::ServiceExt;
 
@@ -158,6 +157,12 @@ impl Fixture {
             .deliver("jordi", serial, &self.sids[serial], self.now())
     }
 
+    /// A `ratta_ping` of `serial` after the re-send window: the unacknowledged push again.
+    fn ping_again(&self, serial: &str) -> String {
+        self.advance_ms(RESEND_MS as i64);
+        self.ping(serial).expect("the push again")
+    }
+
     /// A `ClientMessage "Received"` of `serial`.
     fn received(&self, serial: &str) {
         self.heartbeat(serial);
@@ -206,19 +211,6 @@ impl Fixture {
             out.push(o);
         }
         out
-    }
-
-    /// The frames waiting for `serial`, in order.
-    fn frames(&mut self, serial: &str) -> Vec<String> {
-        let rx = self.rx.get_mut(serial).unwrap();
-        let mut out = Vec::new();
-        loop {
-            match rx.try_recv() {
-                Ok(Outbound::Frame(f)) => out.push(f),
-                Ok(other) => panic!("unexpected {other:?}"),
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => return out,
-            }
-        }
     }
 
     fn pending(&self, serial: &str) -> bool {
@@ -312,7 +304,7 @@ fn one_put_pushes_each_bound_device_once() {
     let t = f.now();
     assert_eq!(tick(&f.state, t), 2);
     // Queued, not sent: nothing goes out before the device's next heartbeat.
-    assert!(f.frames(A).is_empty() && f.frames(B).is_empty());
+    assert!(f.outbound(A).is_empty() && f.outbound(B).is_empty());
     assert!(!f.pending(A) && !f.pending(B));
     f.advance_ms(300);
     assert_eq!(f.ping(A), Some(startsync(None, t, t + 300)));
@@ -376,6 +368,39 @@ fn a_device_change_is_pushed_to_the_other_devices_only() {
     assert_eq!(tick(&f.state, t), 1);
     assert_eq!(f.ping(A), None);
     assert_eq!(f.ping(B), Some(startsync(Some(A), t, t)));
+    assert!(
+        f.ping_again(B)
+            .contains(&format!(r#"\"equipmentNo\":\"{A}-null\""#))
+    );
+}
+
+#[test]
+fn a_device_change_reaches_the_other_device_as_a_detail_item() {
+    let mut f = detail_fixture();
+    let mut events = [Event::new(
+        "jordi",
+        Origin::Device,
+        Some(A.to_string()),
+        &new_op_id(),
+        EventBody::FileCreated {
+            id: 7,
+            path: "/NOTE/Note/x.note".into(),
+            kind: FileKind::Note,
+            md5: "0".repeat(32),
+            size: 1,
+            pages_changed: None,
+        },
+    )];
+    f.state.journal.append(&mut events).unwrap();
+    f.follow();
+    f.advance_ms(2000);
+    assert_eq!(tick(&f.state, f.now()), 1);
+    assert_eq!(f.ping(A), None);
+    let (items, _) = message(&f.ping(B).unwrap());
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["messageType"], "DOWNLOADFILE");
+    assert_eq!(items[0]["equipmentNo"], format!("{A}-null"));
+    assert_eq!(items[0]["originalName"], "x.note");
 }
 
 #[test]
@@ -465,7 +490,7 @@ fn push_off_sends_nothing() {
     f.put("a.note");
     f.follow();
     assert_eq!(tick(&f.state, f.now() + 2000), 0);
-    assert!(f.frames(A).is_empty() && f.frames(B).is_empty());
+    assert!(f.outbound(A).is_empty() && f.outbound(B).is_empty());
     assert_eq!(f.ping(A), None);
     assert_eq!(f.ping(B), None);
 }
@@ -480,7 +505,7 @@ fn refused_sync_sends_nothing() {
     f.put("a.note");
     f.follow();
     assert_eq!(tick(&f.state, f.now() + 2000), 0);
-    assert!(f.frames(A).is_empty() && f.frames(B).is_empty());
+    assert!(f.outbound(A).is_empty() && f.outbound(B).is_empty());
     assert_eq!(f.ping(A), None);
     assert_eq!(f.ping(B), None);
 }
@@ -493,7 +518,7 @@ fn detail_mode_sends_one_item_per_change_after_a_ping() {
     f.advance_ms(2000);
     let t = f.now();
     assert_eq!(tick(&f.state, t), 2);
-    assert!(f.frames(A).is_empty());
+    assert!(f.outbound(A).is_empty());
     f.advance_ms(400);
     let (items, sent) = message(&f.ping(A).unwrap());
     assert_eq!(sent, t + 400);
@@ -529,7 +554,7 @@ fn two_changes_before_a_ping_merge_into_one_message() {
     f.follow();
     f.advance_ms(2000);
     assert_eq!(tick(&f.state, f.now()), 2);
-    assert!(f.frames(A).is_empty());
+    assert!(f.outbound(A).is_empty());
     let (items, _) = message(&f.ping(A).unwrap());
     let names: Vec<&str> = items
         .iter()
@@ -652,7 +677,7 @@ fn a_silent_session_keeps_the_push_until_a_frame_arrives() {
     f.follow();
     f.advance_ms(2000);
     assert_eq!(tick(&f.state, f.now()), 0);
-    assert!(f.frames(A).is_empty() && f.frames(B).is_empty());
+    assert!(f.outbound(A).is_empty() && f.outbound(B).is_empty());
     assert!(f.pending(A) && f.pending(B));
     // A heartbeat from A: A is live again and gets the push, B stays pending.
     f.heartbeat(A);
@@ -779,11 +804,13 @@ fn reconnect_skips_a_silent_session_and_keeps_the_push() {
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// The server on `127.0.0.1:0` with the real clock and `config`; device A bound to an imported
-/// account and connected past the handshake.
+/// The server on `127.0.0.1:0` with `config` and an injected clock that starts at the real time
+/// (the push timing moves only when the test moves it); device A bound to an imported account
+/// and connected past the handshake.
 struct Live {
     dir: tempfile::TempDir,
     state: Arc<AppState>,
+    clock: Arc<TestClock>,
     server: tokio::task::JoinHandle<notedown_cloud::Result<()>>,
     ws: Ws,
 }
@@ -798,7 +825,9 @@ impl Live {
     async fn start(config: Config) -> Live {
         let dir = tempfile::tempdir().unwrap();
         seed_account(dir.path(), true);
-        let state = AppState::open(config, dir.path()).unwrap();
+        let real = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+        let clock = Arc::new(TestClock(AtomicI64::new(real as i64)));
+        let state = AppState::open_with_clock(config, dir.path(), clock.clone()).unwrap();
         state
             .auth
             .devices()
@@ -826,6 +855,7 @@ impl Live {
         Live {
             dir,
             state,
+            clock,
             server,
             ws,
         }
@@ -868,10 +898,15 @@ impl Live {
         }
     }
 
-    /// `4212["ratta_ping"]` every 300 ms until the answer carries a push: the frames between the
-    /// ping and its ack.
+    fn advance_ms(&self, ms: i64) {
+        self.clock.0.fetch_add(ms, Ordering::SeqCst);
+    }
+
+    /// `4212["ratta_ping"]` every 300 ms, the clock 1 s further each time, until the answer
+    /// carries a push: the frames between the ping and its ack.
     async fn ping_until_push(&mut self) -> Vec<String> {
         for _ in 0..50 {
+            self.advance_ms(1000);
             let frames = self.exchange(r#"4212["ratta_ping"]"#, 12).await;
             assert_eq!(frames[0], r#"42["ratta_ping","Received"]"#);
             if frames.len() > 1 {
@@ -909,9 +944,11 @@ async fn the_server_sends_a_detail_push_after_the_ratta_ping_reply() {
     })
     .await;
     live.put();
-    // The follower reads the journal within 1 s and the push is due 2 s later; the device says
-    // nothing meanwhile, and nothing arrives.
-    tokio::time::sleep(Duration::from_millis(3500)).await;
+    // The follower reads the journal within 1 s, the push is due 2 s (clock) later and the
+    // tick runs every 500 ms; the device says nothing meanwhile, and nothing arrives.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    live.advance_ms(3000);
+    tokio::time::sleep(Duration::from_millis(700)).await;
     let silent = tokio::time::timeout(Duration::from_millis(300), live.ws.next()).await;
     assert!(silent.is_err(), "a frame without a heartbeat: {silent:?}");
     let frames = live.ping_until_push().await;
@@ -922,7 +959,7 @@ async fn the_server_sends_a_detail_push_after_the_ratta_ping_reply() {
     assert_eq!(items[0]["newName"], "pushed.note");
     // Without `Received`, the device's own heartbeat form (no ack id) 5 s later gets the reply
     // and the same items again.
-    tokio::time::sleep(Duration::from_millis(5200)).await;
+    live.advance_ms(RESEND_MS as i64);
     live.ws
         .send(Message::text(r#"42["ratta_ping"]"#))
         .await
@@ -936,7 +973,7 @@ async fn the_server_sends_a_detail_push_after_the_ratta_ping_reply() {
             .await
             .is_empty()
     );
-    tokio::time::sleep(Duration::from_millis(5200)).await;
+    live.advance_ms(RESEND_MS as i64);
     assert_eq!(
         live.exchange(r#"4213["ratta_ping"]"#, 13).await,
         vec![r#"42["ratta_ping","Received"]"#.to_string()]

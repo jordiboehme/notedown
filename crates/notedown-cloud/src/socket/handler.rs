@@ -197,18 +197,10 @@ pub async fn run(mut ws: WebSocket, session: Session, access: Access) {
                     msg
                 }
             },
-            out = recv_outbound(&mut rx) => match out {
-                Outbound::Frame(frame) => {
-                    if !session.send(&mut ws, frame).await {
-                        return;
-                    }
-                    continue;
-                }
-                Outbound::Close(reason) => {
-                    session.close(&mut ws, close_code::AWAY, reason).await;
-                    return;
-                }
-            },
+            Outbound::Close(reason) = recv_outbound(&mut rx) => {
+                session.close(&mut ws, close_code::AWAY, reason).await;
+                return;
+            }
         };
         match msg {
             Message::Text(text) => {

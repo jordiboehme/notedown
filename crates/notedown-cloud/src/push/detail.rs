@@ -11,15 +11,12 @@ use super::PushItem;
 use crate::journal::{Event, EventBody};
 use crate::store::{Store, WirePath};
 
-/// The `equipmentNo` of a change on the server side: no device call and no channel (4.5).
-const SERVER_CHANGE: &str = "null-null";
-
 /// One item. The field order is the order of the 4.5 example; `None` is left out.
 #[derive(Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct Item {
     message_type: &'static str,
-    equipment_no: &'static str,
+    equipment_no: String,
     file_type: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<u64>,
@@ -66,12 +63,12 @@ fn name_of(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
-/// The item of one event; `None` for an event that is no file or folder change. Every item
-/// carries `"null-null"`: the change happened on the server side for the device that gets it.
-/// Its `timestamp` is `built_ms`, the time the item is built (4.5).
+/// The item of one event; `None` for an event that is no file or folder change. `equipmentNo`
+/// is [`super::equipment_no`] of the device that caused the change. Its `timestamp` is
+/// `built_ms`, the time the item is built (4.5).
 fn item(event: &Event, store: &Store, built_ms: u64) -> crate::Result<Option<Item>> {
     let mut it = Item {
-        equipment_no: SERVER_CHANGE,
+        equipment_no: super::equipment_no(event.device.as_deref()),
         file_type: "FILE",
         timestamp: built_ms,
         ..Item::default()
@@ -345,7 +342,7 @@ mod tests {
     /// One golden line per event of [`every_event`].
     const GOLDEN: [&str; 10] = [
         // a new file
-        r#"{"messageType":"DOWNLOADFILE","equipmentNo":"null-null","fileType":"FILE","id":4711,"originalName":"a.pdf","newName":"a.pdf","md5":"m5","size":12,"directoryId":1002,"originalPath":"NOTE/Note/Work/","newPath":"NOTE/Note/Work/","timestamp":1000}"#,
+        r#"{"messageType":"DOWNLOADFILE","equipmentNo":"SN1-null","fileType":"FILE","id":4711,"originalName":"a.pdf","newName":"a.pdf","md5":"m5","size":12,"directoryId":1002,"originalPath":"NOTE/Note/Work/","newPath":"NOTE/Note/Work/","timestamp":1000}"#,
         // a changed file is downloaded again
         r#"{"messageType":"DOWNLOADFILE","equipmentNo":"null-null","fileType":"FILE","id":4711,"originalName":"b.note","newName":"b.note","md5":"m6","size":20,"directoryId":1001,"originalPath":"NOTE/Note/","newPath":"NOTE/Note/","timestamp":1000}"#,
         // a move into another folder
@@ -353,7 +350,7 @@ mod tests {
         // a rename in the same folder
         r#"{"messageType":"MODIFYFILE","equipmentNo":"null-null","fileType":"FILE","id":4711,"originalName":"b.note","newName":"c.note","directoryId":1001,"originalPath":"NOTE/Note/","newPath":"NOTE/Note/","timestamp":1000}"#,
         r#"{"messageType":"COPYFILE","equipmentNo":"null-null","fileType":"FILE","id":4711,"newId":4712,"newName":"d.note","goDirectoryId":1002,"newPath":"NOTE/Note/Work/","timestamp":1000}"#,
-        r#"{"messageType":"DELETEFILE","equipmentNo":"null-null","fileType":"FILE","id":4711,"originalName":"e.note","directoryId":1001,"originalPath":"NOTE/Note/","timestamp":1000}"#,
+        r#"{"messageType":"DELETEFILE","equipmentNo":"SN2-null","fileType":"FILE","id":4711,"originalName":"e.note","directoryId":1001,"originalPath":"NOTE/Note/","timestamp":1000}"#,
         r#"{"messageType":"ADDFOLDER","equipmentNo":"null-null","fileType":"FOLDE","id":77,"originalName":"New","size":0,"directoryId":1001,"originalPath":"NOTE/Note/","timestamp":1000}"#,
         r#"{"messageType":"MOVEFOLDER","equipmentNo":"null-null","fileType":"FOLDE","id":77,"originalName":"New","newName":"New","directoryId":1001,"goDirectoryId":1002,"originalPath":"NOTE/Note/","newPath":"NOTE/Note/Work/","timestamp":1000}"#,
         r#"{"messageType":"MODIFYFOLDER","equipmentNo":"null-null","fileType":"FOLDE","id":77,"originalName":"New","newName":"Newer","directoryId":1002,"originalPath":"NOTE/Note/Work/","newPath":"NOTE/Note/Work/","timestamp":1000}"#,

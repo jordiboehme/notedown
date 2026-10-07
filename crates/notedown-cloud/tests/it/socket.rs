@@ -777,23 +777,38 @@ async fn wait_connected(s: &Server, connected: bool) {
     panic!("is_connected never became {connected}");
 }
 
-#[tokio::test]
-async fn a_registered_session_receives_a_pushed_frame_and_logs_it() {
-    let s = Server::start().await;
-    let mut ws = s.session().await;
-    sync(&mut ws).await;
-    let frame = notedown_cloud::push::server_message_frame("{\"x\":1}");
+/// Queue one `STARTSYNC` item for the test device now; the frame its next heartbeat gets.
+fn queue_push(s: &Server) -> String {
+    use notedown_cloud::push::{file_syn_message, server_message_frame, startsync_item};
+    let now = s.state.now_ms();
+    let item = startsync_item(None, now);
     assert!(
         s.state
             .sockets
-            .send("jordi", SERIAL, frame.clone(), s.state.now_ms())
+            .queue("jordi", SERIAL, vec![item.clone()], now)
     );
-    assert_eq!(recv(&mut ws).await, frame);
+    server_message_frame(&file_syn_message(&[item], now))
+}
+
+#[tokio::test]
+async fn a_registered_session_sends_its_queued_push_after_the_heartbeat_and_logs_it() {
+    let s = Server::start().await;
+    let mut ws = s.session().await;
+    sync(&mut ws).await;
+    let frame = queue_push(&s);
+    send(&mut ws, r#"42["ratta_ping"]"#).await;
+    assert_eq!(recv(&mut ws).await, r#"42["ratta_ping","Received"]"#);
+    let pushed = recv(&mut ws).await;
+    // The same item; only the send time in the envelope may be a few ms later.
+    assert_eq!(
+        pushed.split("timestamp").nth(2),
+        frame.split("timestamp").nth(2)
+    );
     sync(&mut ws).await;
     assert!(
         s.frames()
             .iter()
-            .any(|(dir, payload, _)| dir == "out" && *payload == frame)
+            .any(|(dir, payload, _)| dir == "out" && *payload == pushed)
     );
     close(ws).await;
 }
@@ -831,13 +846,10 @@ async fn a_second_session_of_the_same_device_replaces_the_first() {
         other => panic!("expected the close with reason replaced, got {other:?}"),
     }
     expect_closed(&mut first).await;
-    let frame = notedown_cloud::push::server_message_frame("{}");
-    assert!(
-        s.state
-            .sockets
-            .send("jordi", SERIAL, frame.clone(), s.state.now_ms())
-    );
-    assert_eq!(recv(&mut second).await, frame);
+    queue_push(&s);
+    send(&mut second, r#"42["ratta_ping"]"#).await;
+    assert_eq!(recv(&mut second).await, r#"42["ratta_ping","Received"]"#);
+    assert!(recv(&mut second).await.starts_with(r#"42["ServerMessage""#));
     close(second).await;
 }
 
@@ -869,9 +881,10 @@ async fn a_rejected_session_is_never_registered() {
             .sockets
             .is_connected("jordi", SERIAL, s.state.now_ms())
     );
-    assert!(
-        !s.state
-            .sockets
-            .send("jordi", SERIAL, "x".into(), s.state.now_ms())
-    );
+    assert!(!s.state.sockets.queue(
+        "jordi",
+        SERIAL,
+        vec![notedown_cloud::push::startsync_item(None, 0)],
+        s.state.now_ms()
+    ));
 }

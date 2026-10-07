@@ -357,7 +357,8 @@ impl AppData<'_> {
     }
 
     /// The id for a new digest or group: the largest id of all digests and groups (deleted ones
-    /// too, ids are never reused) plus one, or [`FIRST_DIGEST_ID`].
+    /// too, ids are never reused) plus one, or [`FIRST_DIGEST_ID`]. Never above `i64::MAX` (the
+    /// device keeps ids as signed 64-bit integers): past it the id space is exhausted.
     pub fn next_digest_id(&self, guard: &WriteGuard) -> Result<u64> {
         self.check(guard)?;
         let items = record_ids(&self.digests_dir().join(ITEMS_DIR))?;
@@ -365,10 +366,13 @@ impl AppData<'_> {
         let max = items.last().into_iter().chain(groups.last()).max();
         match max {
             None => Ok(FIRST_DIGEST_ID),
-            Some(m) => m.checked_add(1).ok_or_else(|| Error::Invalid {
-                what: "digest id",
-                message: "the id space is exhausted".into(),
-            }),
+            Some(m) => m
+                .checked_add(1)
+                .filter(|&id| id <= i64::MAX as u64)
+                .ok_or_else(|| Error::Invalid {
+                    what: "digest id",
+                    message: "the id space is exhausted".into(),
+                }),
         }
     }
 
@@ -672,6 +676,28 @@ mod tests {
         assert_eq!(back.create_time, T0 as u64);
         assert_eq!(back.created_at_ms, Some(T0 as u64));
         assert_eq!(back.update_time, T0 as u64 + 1000);
+    }
+
+    #[test]
+    fn next_digest_id_never_goes_above_i64_max() {
+        let f = Fixture::new();
+        let app = AppData::new(&f.store);
+        let g = f.store.lock_recovered(&f.journal).unwrap();
+        let below = Digest {
+            id: i64::MAX as u64 - 1,
+            ..Digest::default()
+        };
+        app.put_digest(&g, &below, Origin::Cli, None, &f.journal)
+            .unwrap();
+        assert_eq!(app.next_digest_id(&g).unwrap(), i64::MAX as u64);
+        let top = DigestGroup {
+            id: i64::MAX as u64,
+            ..DigestGroup::default()
+        };
+        app.put_digest_group(&g, &top, Origin::Cli, None, &f.journal)
+            .unwrap();
+        let e = app.next_digest_id(&g).unwrap_err().to_string();
+        assert!(e.contains("the id space is exhausted"), "{e}");
     }
 
     #[test]

@@ -1305,6 +1305,54 @@ async fn a_mutation_without_a_session_takes_the_free_lock() {
 }
 
 #[tokio::test]
+async fn a_read_does_not_revive_a_lapsed_lock_of_a_write_without_a_session() {
+    let s = Server::new();
+    let t = s.session().await;
+    assert_ok(
+        &s.post(END, &t, json!({"equipmentNo": SERIAL, "flag": "Y"}))
+            .await,
+    );
+    assert_ok(&s.mkdir(&t, "/INBOX/F", false).await);
+    s.advance_ms(31_000);
+    // Auto Sync never ends such a lock: a later read must not bring it back.
+    assert_ok(
+        &s.post(LIST, &t, json!({"path": "/", "recursive": true}))
+            .await,
+    );
+    assert_eq!(s.state.sync_locks.holder("jordi", s.state.now_ms()), None);
+    let other = s.login_as(OTHER).await;
+    assert_ok(&s.post(START, &other, json!({"equipmentNo": OTHER})).await);
+    assert_ok(
+        &s.post(END, &other, json!({"equipmentNo": OTHER, "flag": "Y"}))
+            .await,
+    );
+    // The next write takes the lock again, with a new marker.
+    assert_ok(&s.mkdir(&t, "/INBOX/G", false).await);
+    assert_eq!(s.markers("implicit_lock").len(), 2);
+}
+
+#[tokio::test]
+async fn a_write_without_a_session_needs_the_import_marker() {
+    let s = Server::new();
+    let t = s.session().await;
+    assert_ok(
+        &s.post(END, &t, json!({"equipmentNo": SERIAL, "flag": "Y"}))
+            .await,
+    );
+    // Protect is off here: without the marker, synchronous/start refuses an account without
+    // files, so a write without a session must not fill it first.
+    let accounts = Accounts::new(s.data());
+    let mut a = accounts.get("jordi").unwrap().unwrap();
+    a.imported = None;
+    accounts.save(&a).unwrap();
+    let v = s.mkdir(&t, "/INBOX/F", false).await;
+    assert_err(&v, "E0079");
+    assert!(!s.files().join("INBOX/F").exists());
+    assert!(s.markers("implicit_lock").is_empty());
+    assert_eq!(s.state.sync_locks.holder("jordi", s.state.now_ms()), None);
+}
+
+#[tokio::test]
 async fn a_mutation_without_a_session_waits_while_another_device_syncs() {
     let s = Server::new();
     let t = s.session().await;

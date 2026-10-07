@@ -3,8 +3,9 @@
 //! device's token generation changed, answers HTTP 500 with the plain text `E1306`; a file that
 //! cannot be served answers HTTP 500 with `E1307`, as Ratta's server does.
 //!
-//! Uploads (`/api/oss/upload`, `/api/oss/upload/part`) also need the sync lock for the signed
-//! device, taken as for every write (another device's live lock: `E0079`, flag `no_sync_lock`). Their multipart field `file` streams into the
+//! Uploads (`/api/oss/upload`, `/api/oss/upload/part`) also need the sync lock for the
+//! signed device, taken as for every write (another device's live lock: `E0079`, flag
+//! `no_sync_lock`). Their multipart field `file` streams into the
 //! staging entry ([`crate::sync::staging`]) and is never held in memory as a whole.
 
 use std::collections::HashMap;
@@ -415,9 +416,6 @@ async fn upload_target(
     if !holds_sync_lock(state, &target.account, &serial) {
         return Err(Box::new(no_sync_lock(&serial).into_response()));
     }
-    state
-        .sync_locks
-        .touch(&target.account, &serial, state.now_ms());
     Ok(target)
 }
 

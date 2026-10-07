@@ -622,14 +622,28 @@ pub async fn space_usage(
 /// gate. The device that held the lock last keeps it ([`SyncLocks::retake`]). A device that
 /// writes without `synchronous/start` (Auto Sync sends a changed file this way,
 /// `docs/sync-protocol.md` 9.3) takes a free or lapsed lock; the protocol log gets a marker with
-/// the flag `implicit_lock`. Another device's live lock answers `E0079`.
+/// the flag `implicit_lock`. That needs the account's `imported` marker: without it
+/// `synchronous/start` refuses an account without files (`empty_account`), and a write
+/// without a session must not fill such an account past that check. Another device's live
+/// lock answers `E0079`.
 ///
 /// [`SyncLocks::retake`]: crate::sync::SyncLocks::retake
 pub fn holds_sync_lock(state: &AppState, slug: &str, serial: &str) -> bool {
-    match state
-        .sync_locks
-        .take_for_write(slug, serial, state.now_ms())
-    {
+    let now = state.now_ms();
+    if state.sync_locks.retake(slug, serial, now) {
+        return true;
+    }
+    let imported = match state.auth.accounts().get(slug) {
+        Ok(a) => a.is_some_and(|a| a.imported.is_some()),
+        Err(e) => {
+            eprintln!("notedown cloud: {e}");
+            false
+        }
+    };
+    if !imported {
+        return false;
+    }
+    match state.sync_locks.take_for_write(slug, serial, now) {
         WriteLock::Held => true,
         WriteLock::Taken => {
             let mut m = LogEntry::new(LogKind::Marker);
@@ -1339,7 +1353,7 @@ pub async fn create_folder_v2(
     bytes: Bytes,
 ) -> Reply {
     let req = gated_request!(state, headers, bytes);
-    // The lock first: a call without it is always E0079, whatever its body.
+    // The lock first: while another device syncs, a call is always E0079, whatever its body.
     if !holds_sync_lock(&state, &req.slug, &req.serial) {
         return no_sync_lock(&req.serial);
     }

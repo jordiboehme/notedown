@@ -23,12 +23,16 @@ pub enum StartOutcome {
 struct Held {
     owner: String,
     expires_at_ms: u64,
+    /// Taken by a write without `synchronous/start` ([`SyncLocks::take_for_write`]). Such a
+    /// lock is never ended by the device, so it is not revived once it lapsed.
+    implicit: bool,
 }
 
 /// The lock for a write of a device ([`SyncLocks::take_for_write`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteLock {
-    /// The device held the lock (live, or lapsed and taken again): a write of its session.
+    /// The device holds the lock: its session (live, or lapsed and taken again), or a live
+    /// lock that an earlier write without a session took.
     Held,
     /// Nobody held a live lock: the device holds it now without `synchronous/start`. Auto Sync
     /// sends a changed file this way (`docs/sync-protocol.md` 9.3).
@@ -69,6 +73,7 @@ impl SyncLocks {
             Held {
                 owner: serial.to_string(),
                 expires_at_ms: now_ms + SYNC_LOCK_TTL_MS,
+                implicit: false,
             },
         );
         outcome
@@ -98,7 +103,7 @@ impl SyncLocks {
     pub fn retake(&self, slug: &str, serial: &str, now_ms: u64) -> bool {
         let mut map = self.map();
         match map.get_mut(slug) {
-            Some(h) if h.owner == serial => {
+            Some(h) if h.owner == serial && (h.expires_at_ms > now_ms || !h.implicit) => {
                 h.expires_at_ms = h.expires_at_ms.max(now_ms + SYNC_LOCK_TTL_MS);
                 true
             }
@@ -109,20 +114,33 @@ impl SyncLocks {
     /// The lock for a write of `serial` at `now_ms`, after the protect gate passed. The device
     /// that held the lock last keeps it, as in [`SyncLocks::retake`]. A device that writes
     /// without a session takes a free or lapsed lock, as if it had sent `synchronous/start`;
-    /// another device's live lock is never touched.
+    /// another device's live lock is never touched. A lock taken this way lapses after
+    /// [`SYNC_LOCK_TTL_MS`] without writes: reads ([`SyncLocks::retake`]) do not revive it, and
+    /// the next write takes it again (`Taken`).
     pub fn take_for_write(&self, slug: &str, serial: &str, now_ms: u64) -> WriteLock {
         let mut map = self.map();
+        let live = |h: &Held| h.expires_at_ms > now_ms;
         let outcome = match map.get(slug) {
-            Some(h) if h.owner == serial => WriteLock::Held,
-            Some(h) if h.expires_at_ms > now_ms => return WriteLock::Busy,
+            Some(h) if h.owner == serial && (live(h) || !h.implicit) => WriteLock::Held,
+            Some(h) if h.owner != serial && live(h) => return WriteLock::Busy,
             _ => WriteLock::Taken,
         };
-        let held = map.entry(slug.to_string()).or_insert(Held {
-            owner: serial.to_string(),
-            expires_at_ms: 0,
-        });
-        held.owner = serial.to_string();
-        held.expires_at_ms = held.expires_at_ms.max(now_ms + SYNC_LOCK_TTL_MS);
+        let expires_at_ms = now_ms + SYNC_LOCK_TTL_MS;
+        match map.get_mut(slug) {
+            Some(h) if outcome == WriteLock::Held => {
+                h.expires_at_ms = h.expires_at_ms.max(expires_at_ms);
+            }
+            _ => {
+                map.insert(
+                    slug.to_string(),
+                    Held {
+                        owner: serial.to_string(),
+                        expires_at_ms,
+                        implicit: true,
+                    },
+                );
+            }
+        }
         outcome
     }
 
@@ -182,6 +200,32 @@ mod tests {
         assert_eq!(
             locks.holder("a", SYNC_LOCK_TTL_MS + 1).as_deref(),
             Some("D1")
+        );
+    }
+
+    #[test]
+    fn a_lapsed_implicit_lock_is_not_revived_by_a_read() {
+        let locks = SyncLocks::new();
+        assert_eq!(locks.take_for_write("a", "D1", 0), WriteLock::Taken);
+        assert!(locks.retake("a", "D1", 10_000));
+        let lapsed = 10_000 + SYNC_LOCK_TTL_MS + 1;
+        assert!(!locks.retake("a", "D1", lapsed));
+        assert_eq!(locks.holder("a", lapsed), None);
+        assert_eq!(locks.start("a", "D2", lapsed), StartOutcome::Taken);
+    }
+
+    #[test]
+    fn the_next_write_after_a_lapsed_implicit_lock_takes_it_again() {
+        let locks = SyncLocks::new();
+        assert_eq!(locks.take_for_write("a", "D1", 0), WriteLock::Taken);
+        assert_eq!(locks.take_for_write("a", "D1", 1000), WriteLock::Held);
+        let lapsed = 1000 + SYNC_LOCK_TTL_MS + 1;
+        assert_eq!(locks.take_for_write("a", "D1", lapsed), WriteLock::Taken);
+        // A session lock that lapsed is still the device's own (a long pause in its session).
+        assert_eq!(locks.start("b", "D1", 0), StartOutcome::Taken);
+        assert_eq!(
+            locks.take_for_write("b", "D1", SYNC_LOCK_TTL_MS + 1),
+            WriteLock::Held
         );
     }
 

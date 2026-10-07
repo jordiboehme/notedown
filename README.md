@@ -90,6 +90,12 @@ A file is skipped when its `.md` already exists and the front matter has the sam
 same model and the same notedown major version. The model is not even loaded when every file is
 skipped.
 
+A `.md` file from an older notedown has a front matter without `type`. When its source checksum, model
+and major version still match, notedown only replaces the front matter with the new one and keeps the
+text below it byte for byte. No OCR runs for this and the model isn't loaded. The run prints "updated
+the header of ..." for each such file. `generated` keeps the old version and time, `source_date` and
+`last_modified` come from the source file as it is now.
+
 notedown never overwrites a `.md` file it did not write itself. Such a file counts as a failure (exit
 code 1) and the error is printed.
 
@@ -104,16 +110,25 @@ One failing file does not stop the run. The exit code is 1 if any file failed an
 
 ## Output format
 
+Every `.md` file is a concept document of the
+[Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf) (OKF
+v0.2), so a folder of converted notes is an OKF bundle. Crystalline reads it as it is.
+
 ```markdown
 ---
-source: Test 2.note
+type: note
+title: Test 2
+description: Handwritten Supernote note, 1 page, read by OCR.
+resource: Test 2.note
+tags: [supernote]
+generated: { by: notedown/0.1.0, model: chandra-ocr-2 Q4_K_M, at: 2026-10-05T23:10:00Z }
+source_date: 2026-10-05
+sources:
+  - { id: note, resource: Test 2.note, last_modified: 2026-10-05T22:55:35Z }
+status: stable
 source_sha256: <hex>
-kind: supernote-note
 file_id: F20261005225535133622IHP5FqtIJoxD
 pages: 1
-model: chandra-ocr-2 Q4_K_M
-converted_at: "2026-10-05T23:10:00Z"
-generator: notedown 0.1.0
 keywords: []
 links:
   - { page: 1, target_file_id: F20240708174639550429bHksqaP2wKQ8, target_path: /storage/emulated/0/Note/Bike.note, target_md: Bike.md }
@@ -129,6 +144,32 @@ This note is without real-time recognition.
 
 Links: [Bike](Bike.md)
 ```
+
+The keys of the front matter:
+
+- `type` is always `note`, also for a PNG page.
+- `title` is the name of the source file without its extension.
+- `description` says what the file is: a note with its number of pages, or a single PNG page.
+- `resource` is the source file, relative to the folder of the `.md` file. It works with and without
+  `--out`.
+- `tags` is always `[supernote]`.
+- `generated` says who wrote the text and when: `by` is notedown with its version, `model` the OCR
+  model and `at` the time of the conversion in UTC.
+- `source_date` is the day the source file was last changed, in local time.
+- `sources` names the source file once more, with `last_modified`, the time it was last changed in
+  UTC.
+- `status` is `draft` when a page hit the token limit and its text may be cut off. Otherwise it's
+  `stable`.
+- `source_sha256` is the checksum of the source file. notedown uses it to skip files that didn't
+  change.
+- `file_id` is the `FILE_ID` of the note. A PNG page has none.
+- `pages` is the number of pages.
+- `keywords` lists the keywords of the note as `p<page>: <text>`.
+- `links` and `digests` are described below.
+
+OKF reserves the names `index.md` and `log.md`. A source named `index` or `log` (in any case) keeps its
+extension in the name of the `.md` file: `index.note` becomes `index.note.md` and `Log.png` becomes
+`Log.png.md`. Links to such a note use that name.
 
 Every page starts with an `<a id="page-N"></a>` anchor, so links to a page inside the same note work
 as `#page-N`. The image line and the `<name>.assets/` folder appear only with `--images`. A page that

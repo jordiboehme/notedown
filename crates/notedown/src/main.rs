@@ -75,8 +75,8 @@ enum CloudAction {
     /// Fill an account with a device backup and open its protect gate
     Import(ImportArgs),
     /// Fill an account's digests from the device's .snbak backup and open digest and to-do sync.
-    /// To-dos are never touched. A digest that never reached a cloud is left out: the device
-    /// adds it itself at its first sync
+    /// To-dos are never touched. A digest or digest group that never reached a cloud is left
+    /// out: the device adds it itself at its first sync
     ImportAppData(ImportAppDataArgs),
     /// Copy one file into an account (connected devices are told to sync)
     Put(PutArgs),

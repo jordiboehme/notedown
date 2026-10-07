@@ -134,7 +134,7 @@ Until this import is done, the server refuses every digest and to-do request of 
 - two digests have the same id;
 - the account already has digests (that needs `--replace`).
 
-A digest that never reached a cloud has no id yet. The import leaves it out and lists it. The device adds it itself at the first sync. The import also lists a digest whose group isn't in the file.
+A digest or a digest group that never reached a cloud has no id yet. The import leaves it out and lists it. The device adds it itself at the first sync. The import also lists a digest whose group isn't in the file.
 
 `import-app-data` doesn't touch to-dos. It doesn't count them, and `--replace` doesn't clear them.
 

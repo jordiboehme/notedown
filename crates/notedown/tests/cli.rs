@@ -71,10 +71,13 @@ fn converts_folder_with_note_and_png() {
         .unwrap();
     }
     let md = std::fs::read_to_string(out.join("Test 2.md")).unwrap();
-    assert!(md.starts_with("---\ntype: note\ntitle: Test 2\n"), "{md}");
-    assert!(md.contains("\nresource: ../in/Test 2.note\n"), "{md}");
-    assert!(md.contains("file_id: F20261005225535133622IHP5FqtIJoxD"));
-    assert!(md.contains(", model: fake-model, at: "), "{md}");
+    assert!(
+        md.starts_with("---\ntype: note\ntitle: \"Test 2\"\n"),
+        "{md}"
+    );
+    assert!(md.contains("\nresource: \"../in/Test 2.note\"\n"), "{md}");
+    assert!(md.contains("file_id: \"F20261005225535133622IHP5FqtIJoxD\""));
+    assert!(md.contains(", model: \"fake-model\", at: "), "{md}");
     assert!(md.contains("## Page 1\n<!-- page_id: P20261005225535142460xFi05hBOdWD6 -->"));
     assert!(md.contains("![Page 1](Test%202.assets/page-001.png)"));
     assert!(md.contains("Hello page"));
@@ -795,7 +798,7 @@ fn digests_are_listed_in_the_frontmatter_and_body_is_unchanged() {
     let with = notedown::document::render_document(&fm_with(digests), &outs);
     let without = notedown::document::render_document(&fm_with(vec![]), &outs);
     assert!(
-        with.contains("digests:\n  - { page: 1, digest_id: abc,"),
+        with.contains("digests:\n  - { page: 1, digest_id: \"abc\","),
         "{with}"
     );
     assert!(!without.contains("digests:"));
@@ -853,8 +856,8 @@ fn sample_fm() -> Frontmatter {
         generated_by: "notedown/0.1.0".into(),
         generated_model: "chandra-ocr-2 Q4_K_M".into(),
         generated_at: "2026-10-05T23:10:00Z".into(),
-        source_date: "2026-10-05".into(),
-        last_modified: "2026-10-05T22:55:35Z".into(),
+        source_date: Some("2026-10-05".into()),
+        last_modified: Some("2026-10-05T22:55:35Z".into()),
         status: "stable".into(),
         source_sha256: "ab".into(),
         file_id: Some("F20261005225535133622IHP5FqtIJoxD".into()),
@@ -862,6 +865,7 @@ fn sample_fm() -> Frontmatter {
         keywords: vec![],
         links: vec![],
         digests: vec![],
+        extra: vec![],
         format: HeaderFormat::Okf,
     }
 }
@@ -887,23 +891,23 @@ fn renders_the_open_knowledge_format_header_of_a_note() {
         fm.render(),
         "---
 type: note
-title: Test 2
-description: Handwritten Supernote note, 1 page, read by OCR.
-resource: Test 2.note
+title: \"Test 2\"
+description: \"Handwritten Supernote note, 1 page, read by OCR.\"
+resource: \"Test 2.note\"
 tags: [supernote]
-generated: { by: notedown/0.1.0, model: chandra-ocr-2 Q4_K_M, at: 2026-10-05T23:10:00Z }
+generated: { by: notedown/0.1.0, model: \"chandra-ocr-2 Q4_K_M\", at: 2026-10-05T23:10:00Z }
 source_date: 2026-10-05
 sources:
-  - { id: note, resource: Test 2.note, last_modified: 2026-10-05T22:55:35Z }
+  - { id: note, resource: \"Test 2.note\", last_modified: 2026-10-05T22:55:35Z }
 status: stable
-source_sha256: ab
-file_id: F20261005225535133622IHP5FqtIJoxD
+source_sha256: \"ab\"
+file_id: \"F20261005225535133622IHP5FqtIJoxD\"
 pages: 1
 keywords: []
 links:
-  - { page: 1, target_file_id: F20240708174639550429bHksqaP2wKQ8, target_path: /storage/emulated/0/Note/Bike.note, target_md: Bike.md }
+  - { page: 1, target_file_id: \"F20240708174639550429bHksqaP2wKQ8\", target_path: \"/storage/emulated/0/Note/Bike.note\", target_md: \"Bike.md\" }
 digests:
-  - { page: 1, digest_id: d1, text: plain, rect: \"256,796,271,88\" }
+  - { page: 1, digest_id: \"d1\", text: \"plain\", rect: \"256,796,271,88\" }
 ---
 "
     );
@@ -924,16 +928,16 @@ fn renders_the_open_knowledge_format_header_of_a_png_page() {
         fm.render(),
         "---
 type: note
-title: Test 1
-description: Handwritten Supernote page, read by OCR.
-resource: ../in/sub/Test 1.png
+title: \"Test 1\"
+description: \"Handwritten Supernote page, read by OCR.\"
+resource: \"../in/sub/Test 1.png\"
 tags: [supernote]
 generated: { by: notedown/0.1.0, model: \"fake: model, v2\", at: 2026-10-05T23:10:00Z }
 source_date: 2026-10-05
 sources:
-  - { id: note, resource: ../in/sub/Test 1.png, last_modified: 2026-10-05T22:55:35Z }
+  - { id: note, resource: \"../in/sub/Test 1.png\", last_modified: 2026-10-05T22:55:35Z }
 status: draft
-source_sha256: ab
+source_sha256: \"ab\"
 pages: 1
 keywords: []
 ---
@@ -1097,8 +1101,8 @@ fn old_header_is_updated_without_ocr_and_the_body_stays() {
     );
     assert_eq!(fm.generated_model, "fake-model");
     assert_eq!(fm.generated_at, "2026-10-01T08:00:00Z");
-    assert_eq!(fm.last_modified, "2026-10-05T22:55:35Z");
-    assert_eq!(fm.source_date, local_date(at));
+    assert_eq!(fm.last_modified.as_deref(), Some("2026-10-05T22:55:35Z"));
+    assert_eq!(fm.source_date, Some(local_date(at)));
     assert_eq!(fm.status, "draft", "the old body has a truncated page");
     assert_eq!(
         fm.file_id.as_deref(),
@@ -1137,7 +1141,7 @@ fn old_header_of_another_model_is_converted_again() {
     assert_eq!(outcome, pipeline::Outcome::Converted { pages: 1 });
     assert_eq!(engine.calls, 1, "an old notedown file may be overwritten");
     let md = std::fs::read_to_string(&md_path).unwrap();
-    assert!(md.contains("\nresource: Test 2.note\n"), "{md}");
+    assert!(md.contains("\nresource: \"Test 2.note\"\n"), "{md}");
     assert!(md.contains("\nstatus: stable\n"), "{md}");
     assert!(!md.contains("Old OCR text"), "{md}");
 }
@@ -1266,8 +1270,8 @@ fn a_truncated_page_makes_the_note_a_draft() {
     assert!(md.contains("<!-- notedown: truncated -->"), "{md}");
     let fm = Frontmatter::parse(&md).unwrap();
     assert_eq!(fm.status, "draft");
-    assert_eq!(fm.last_modified, "2026-10-05T22:55:35Z");
-    assert_eq!(fm.source_date, local_date(at));
+    assert_eq!(fm.last_modified.as_deref(), Some("2026-10-05T22:55:35Z"));
+    assert_eq!(fm.source_date, Some(local_date(at)));
     assert!(fm.generated_at.ends_with('Z'), "{}", fm.generated_at);
 }
 
@@ -1382,4 +1386,377 @@ fn out_folder_inside_the_source_folder_points_up() {
     .unwrap();
     let md = std::fs::read_to_string(out.join("Test 2.md")).unwrap();
     assert_eq!(Frontmatter::parse(&md).unwrap().resource, "../Test 2.note");
+}
+
+#[test]
+fn control_and_separator_characters_are_escaped() {
+    for (c, code) in [
+        ('\u{1}', "\\u0001"),
+        ('\u{7f}', "\\u007F"),
+        ('\u{80}', "\\u0080"),
+        ('\u{85}', "\\u0085"),
+        ('\u{9f}', "\\u009F"),
+        ('\u{2028}', "\\u2028"),
+        ('\u{2029}', "\\u2029"),
+        ('\u{fffe}', "\\uFFFE"),
+        ('\u{ffff}', "\\uFFFF"),
+    ] {
+        let v = format!("a{c}b");
+        let fm = Frontmatter {
+            title: v.clone(),
+            resource: format!("{v}.note"),
+            generated_model: v.clone(),
+            keywords: vec![v.clone()],
+            digests: vec![FrontmatterDigest {
+                page: 1,
+                digest_id: v.clone(),
+                text: v.clone(),
+                rect: [1, 2, 3, 4],
+            }],
+            ..sample_fm()
+        };
+        let text = fm.render();
+        assert!(!text.contains(c), "{code} raw in {text:?}");
+        assert!(text.contains(&format!("title: \"a{code}b\"\n")), "{text}");
+        assert!(text.contains(&format!("model: \"a{code}b\"")), "{text}");
+        assert_eq!(Frontmatter::parse(&text), Some(fm), "{code}");
+    }
+}
+
+#[test]
+fn values_that_look_like_other_types_are_quoted() {
+    for v in [
+        "0x1F",
+        "0o17",
+        ".inf",
+        "20231015_143012",
+        "2026-10-05",
+        "2026-10-05T23:10:00Z",
+        "yes",
+        "2024",
+        "~",
+    ] {
+        let fm = Frontmatter {
+            title: v.into(),
+            keywords: vec![v.into()],
+            file_id: Some(v.into()),
+            ..sample_fm()
+        };
+        let text = fm.render();
+        assert!(text.contains(&format!("title: \"{v}\"\n")), "{text}");
+        assert!(
+            text.contains(&format!("keywords:\n  - \"{v}\"\n")),
+            "{text}"
+        );
+        assert!(text.contains(&format!("file_id: \"{v}\"\n")), "{text}");
+        assert_eq!(Frontmatter::parse(&text), Some(fm));
+    }
+    // dates and times are plain only when they are real
+    let fm = Frontmatter {
+        generated_at: "2026-13-45T99:99:99Z".into(),
+        source_date: Some("2026-02-30".into()),
+        last_modified: Some("2026-10-05T22:55:35+02:00".into()),
+        ..sample_fm()
+    };
+    let text = fm.render();
+    assert!(text.contains("at: \"2026-13-45T99:99:99Z\" }"), "{text}");
+    assert!(text.contains("source_date: \"2026-02-30\"\n"), "{text}");
+    assert!(
+        text.contains("last_modified: 2026-10-05T22:55:35+02:00 }"),
+        "{text}"
+    );
+    assert_eq!(Frontmatter::parse(&text), Some(fm));
+}
+
+#[test]
+fn unknown_source_times_are_left_out() {
+    let fm = Frontmatter {
+        source_date: None,
+        last_modified: None,
+        ..sample_fm()
+    };
+    let text = fm.render();
+    assert!(!text.contains("source_date"), "{text}");
+    assert!(
+        text.contains("sources:\n  - { id: note, resource: \"Test 2.note\" }\n"),
+        "{text}"
+    );
+    assert_eq!(Frontmatter::parse(&text), Some(fm));
+}
+
+#[cfg(unix)]
+#[test]
+fn resource_follows_a_symlinked_out_folder() {
+    let (dir, src) = setup();
+    let real = dir.path().join("deep/real");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = dir.path().join("out-link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let note = src.join("Test 2.note");
+    let (found, _) = inputs::collect(std::slice::from_ref(&note), Some(&link));
+    let outputs = inputs::output_paths(&found, Some(&link));
+    let mut engine = FakeEngine { calls: 0 };
+    pipeline::convert_one(
+        &found[0],
+        &outputs[0],
+        &mut engine,
+        &opts(Some(link.clone())),
+        &FileIndex::default(),
+    )
+    .unwrap();
+    let md = std::fs::read_to_string(real.join("Test 2.md")).unwrap();
+    assert_eq!(
+        Frontmatter::parse(&md).unwrap().resource,
+        "../../in/Test 2.note"
+    );
+}
+
+fn convert_note(
+    note: &std::path::Path,
+    out: &std::path::Path,
+    engine: &mut FakeEngine,
+) -> pipeline::Outcome {
+    let (found, _) = inputs::collect(&[note.to_path_buf()], None);
+    let outputs = inputs::output_paths(&found, Some(out));
+    pipeline::convert_one(
+        &found[0],
+        &outputs[0],
+        engine,
+        &opts(Some(out.to_path_buf())),
+        &FileIndex::default(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn stale_source_fields_get_a_header_update() {
+    let (dir, src) = setup();
+    let out = dir.path().join("out");
+    let note = src.join("Test 2.note");
+    let mut engine = FakeEngine { calls: 0 };
+    assert_eq!(
+        convert_note(&note, &out, &mut engine),
+        pipeline::Outcome::Converted { pages: 1 }
+    );
+    let md_path = out.join("Test 2.md");
+    let body = |p: &std::path::Path| {
+        let t = std::fs::read_to_string(p).unwrap();
+        notedown::document::body_of(&t).unwrap().to_string()
+    };
+    let first_body = body(&md_path);
+    // only the time of the source changed
+    let at = pin_mtime(&note);
+    assert_eq!(
+        convert_note(&note, &out, &mut engine),
+        pipeline::Outcome::HeaderUpdated
+    );
+    let fm = Frontmatter::parse(&std::fs::read_to_string(&md_path).unwrap()).unwrap();
+    assert_eq!(fm.last_modified.as_deref(), Some("2026-10-05T22:55:35Z"));
+    assert_eq!(fm.source_date, Some(local_date(at)));
+    // the source folder moved
+    let moved = dir.path().join("moved");
+    std::fs::rename(&src, &moved).unwrap();
+    assert_eq!(
+        convert_note(&moved.join("Test 2.note"), &out, &mut engine),
+        pipeline::Outcome::HeaderUpdated
+    );
+    let fm = Frontmatter::parse(&std::fs::read_to_string(&md_path).unwrap()).unwrap();
+    assert_eq!(fm.resource, "../moved/Test 2.note");
+    assert_eq!(body(&md_path), first_body);
+    assert_eq!(
+        convert_note(&moved.join("Test 2.note"), &out, &mut engine),
+        pipeline::Outcome::Skipped
+    );
+    assert_eq!(engine.calls, 1, "OCR ran only once");
+}
+
+/// The header as Crystalline's `emit_engram` writes a notedown header back: other key
+/// order, block lists, single quotes, `+00:00`, plus a key a person added.
+fn crystalline_form(note: &std::path::Path, at: time::OffsetDateTime) -> String {
+    use sha2::Digest;
+    let sha = const_hex::encode(sha2::Sha256::digest(std::fs::read(note).unwrap()));
+    format!(
+        "---
+type: note
+title: Test 2
+description: Handwritten Supernote note, 1 page, read by OCR.
+tags:
+- supernote
+status: stable
+source_date: {}
+resource: ../in/Test 2.note
+generated: {{ by: notedown/{}, model: \"fake-model\", at: 2026-10-05T23:10:00+00:00 }}
+sources:
+- id: note
+  resource: ../in/Test 2.note
+  last_modified: 2026-10-05T22:55:35+00:00
+source_sha256: {sha}
+file_id: F20261005225535133622IHP5FqtIJoxD
+pages: 1
+keywords:
+- 'p1: it''s'
+links:
+- page: 1
+  target_file_id: F2
+  target_path: /storage/emulated/0/Note/Bike.note
+  target_md: Bike.md
+digests:
+- page: 1
+  digest_id: d1
+  text: plain
+  rect: 1,2,3,4
+verified:
+- by: human:jordi
+  at: 2026-10-06T09:00:00+02:00
+---
+
+<a id=\"page-1\"></a>
+## Page 1
+
+Text checked by a person.
+",
+        local_date(at),
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+#[test]
+fn a_header_written_back_by_crystalline_stays_notedowns() {
+    let (dir, src) = setup();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let note = src.join("Test 2.note");
+    let at = pin_mtime(&note);
+    let md_path = out.join("Test 2.md");
+    let text = crystalline_form(&note, at);
+    std::fs::write(&md_path, &text).unwrap();
+    let fm = Frontmatter::parse(&text).unwrap();
+    assert_eq!(fm.keywords, vec!["p1: it's".to_string()]);
+    assert_eq!(fm.links[0].target_md.as_deref(), Some("Bike.md"));
+    assert_eq!(fm.digests[0].rect, [1, 2, 3, 4]);
+    let mut engine = FakeEngine { calls: 0 };
+    assert_eq!(
+        convert_note(&note, &out, &mut engine),
+        pipeline::Outcome::Skipped
+    );
+    assert_eq!(std::fs::read_to_string(&md_path).unwrap(), text);
+    // the source changes: converted again, the added key stays
+    std::fs::copy(fixtures().join("notes/test1.note"), &note).unwrap();
+    assert!(matches!(
+        convert_note(&note, &out, &mut engine),
+        pipeline::Outcome::Converted { .. }
+    ));
+    assert_eq!(engine.calls, 1);
+    let md = std::fs::read_to_string(&md_path).unwrap();
+    assert!(
+        md.contains("\nverified:\n- by: human:jordi\n  at: 2026-10-06T09:00:00+02:00\n---\n"),
+        "{md}"
+    );
+    assert_eq!(
+        Frontmatter::parse(&md).unwrap().extra,
+        vec!["verified:\n- by: human:jordi\n  at: 2026-10-06T09:00:00+02:00\n".to_string()]
+    );
+    assert!(!md.contains("Text checked by a person"), "{md}");
+}
+
+#[test]
+fn a_header_only_update_keeps_added_keys() {
+    let (dir, src) = setup();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let note = src.join("Test 2.note");
+    let at = pin_mtime(&note);
+    let md_path = out.join("Test 2.md");
+    let text = crystalline_form(&note, at).replace("resource: ../in/", "resource: ../old/");
+    std::fs::write(&md_path, &text).unwrap();
+    let mut engine = FakeEngine { calls: 0 };
+    assert_eq!(
+        convert_note(&note, &out, &mut engine),
+        pipeline::Outcome::HeaderUpdated
+    );
+    let md = std::fs::read_to_string(&md_path).unwrap();
+    assert!(md.contains("\nresource: \"../in/Test 2.note\"\n"), "{md}");
+    assert!(md.contains("\nverified:\n- by: human:jordi\n"), "{md}");
+    assert!(md.ends_with("\nText checked by a person.\n"), "{md}");
+    assert_eq!(engine.calls, 0);
+}
+
+#[test]
+fn a_foreign_okf_file_is_refused() {
+    let (_dir, src) = setup();
+    let note = src.join("Test 2.note");
+    let md = "---\ntype: note\ntitle: Test 2\ngenerated: { by: other/1.0, at: 2026-10-05T23:10:00Z }\n---\n\nMine.\n";
+    std::fs::write(src.join("Test 2.md"), md).unwrap();
+    let (found, _) = inputs::collect(std::slice::from_ref(&note), None);
+    let outputs = inputs::output_paths(&found, None);
+    let mut engine = FakeEngine { calls: 0 };
+    let err = pipeline::convert_one(
+        &found[0],
+        &outputs[0],
+        &mut engine,
+        &opts(None),
+        &FileIndex::default(),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("not created by notedown"), "{err}");
+    assert_eq!(std::fs::read_to_string(&outputs[0]).unwrap(), md);
+    assert_eq!(engine.calls, 0);
+}
+
+#[test]
+fn an_old_file_with_crlf_line_endings_is_read() {
+    let (dir, src) = setup();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let note = src.join("Test 2.note");
+    let md_path = out.join("Test 2.md");
+    let crlf = old_header_md(&note, "fake-model", OLD_BODY).replace('\n', "\r\n");
+    std::fs::write(&md_path, &crlf).unwrap();
+    assert!(Frontmatter::parse(&crlf).is_some());
+    let mut engine = FakeEngine { calls: 0 };
+    assert_eq!(
+        convert_note(&note, &out, &mut engine),
+        pipeline::Outcome::HeaderUpdated
+    );
+    assert_eq!(engine.calls, 0);
+    let md = std::fs::read_to_string(&md_path).unwrap();
+    assert!(md.ends_with(&OLD_BODY.replace('\n', "\r\n")), "{md:?}");
+    assert_eq!(Frontmatter::parse(&md).unwrap().status, "draft");
+}
+
+#[test]
+fn an_old_index_md_is_named_but_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("index.note");
+    std::fs::copy(fixtures().join("notes/test2.note"), &note).unwrap();
+    let (found, _) = inputs::collect(std::slice::from_ref(&note), None);
+    let outputs = inputs::output_paths(&found, None);
+    assert_eq!(outputs[0], dir.path().join("index.note.md"));
+    let old = dir.path().join("index.md");
+    assert_eq!(pipeline::left_over_reserved(&found[0], &outputs[0]), None);
+    std::fs::write(
+        &old,
+        old_header_md(&note, "fake-model", OLD_BODY)
+            .replace("source: Test 2.note", "source: index.note"),
+    )
+    .unwrap();
+    assert_eq!(
+        pipeline::left_over_reserved(&found[0], &outputs[0]),
+        Some(old.clone())
+    );
+    // another note's file or a file of another tool is not named
+    std::fs::write(&old, old_header_md(&note, "fake-model", OLD_BODY)).unwrap();
+    assert_eq!(pipeline::left_over_reserved(&found[0], &outputs[0]), None);
+    std::fs::write(&old, "# my index\n").unwrap();
+    assert_eq!(pipeline::left_over_reserved(&found[0], &outputs[0]), None);
+    let mut engine = FakeEngine { calls: 0 };
+    pipeline::convert_one(
+        &found[0],
+        &outputs[0],
+        &mut engine,
+        &opts(None),
+        &FileIndex::default(),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(&old).unwrap(), "# my index\n");
 }

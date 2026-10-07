@@ -63,9 +63,9 @@ fn convert_updates_an_old_header_without_loading_the_model() {
     let md = std::fs::read_to_string(dir.path().join("Test 2.md")).unwrap();
     assert!(md.starts_with("---\ntype: note\n"), "{md}");
     assert!(md.ends_with(&format!("\n---\n{body}")), "{md}");
-    assert!(md.contains("\nresource: Test 2.note\n"), "{md}");
+    assert!(md.contains("\nresource: \"Test 2.note\"\n"), "{md}");
     assert!(
-        md.contains("\n  - { id: note, resource: Test 2.note, last_modified: "),
+        md.contains("\n  - { id: note, resource: \"Test 2.note\", last_modified: "),
         "{md}"
     );
 }

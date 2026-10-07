@@ -4,3 +4,4 @@ pub mod document;
 pub mod inputs;
 pub mod links;
 pub mod pipeline;
+mod yaml;

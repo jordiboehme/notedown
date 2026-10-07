@@ -9,7 +9,8 @@ use notedown_ocr::{OcrEngine, PageOcr};
 use sha2::{Digest, Sha256};
 
 use crate::document::{
-    Frontmatter, FrontmatterDigest, HeaderFormat, PageOut, TRUNCATED_MARK, body_of, render_document,
+    Frontmatter, FrontmatterDigest, Header, HeaderFormat, PageOut, TRUNCATED_MARK, body_of,
+    render_document, same_instant,
 };
 use crate::inputs::{Input, InputKind};
 use crate::links::{FileIndex, LinkContext, apply as apply_links, encode_url, relative_path};
@@ -274,42 +275,43 @@ fn major_key(generator: &str) -> Option<String> {
     }
 }
 
-/// Both header formats count: the parser turns the old `notedown 0.1.0` into `notedown/0.1.0`.
-fn written_by_notedown(output: &Path) -> bool {
-    std::fs::read_to_string(output)
-        .ok()
-        .and_then(|t| Frontmatter::parse(&t))
-        .is_some_and(|fm| fm.generated_by.starts_with("notedown/"))
-}
-
 /// What the existing Markdown file means for this run.
 enum Existing {
-    /// Missing, or the text is out of date: run OCR.
-    Convert,
-    /// Same source, model and notedown major version, in the current header format.
+    /// Missing, not readable as notedown's, or the text is out of date: run OCR. Holds
+    /// the keys another tool added to a notedown file, to keep them.
+    Convert(Vec<String>),
+    /// Same source, model and notedown major version, current header and source fields.
     Current,
-    /// Like `Current`, but with the old header: rewrite the header, keep the body.
-    OldHeader(Box<Frontmatter>, String),
+    /// The text is current but the header is old or names the source as it was: rewrite
+    /// the header, keep the body.
+    Header(Box<Frontmatter>, String),
 }
 
-fn existing(output: &Path, sha: &str, model: &str, generator: &str) -> Existing {
-    let Ok(text) = std::fs::read_to_string(output) else {
-        return Existing::Convert;
+fn existing(text: &str, sha: &str, model: &str, generator: &str, src: &SourceFields) -> Existing {
+    let Some(header) = Header::read(text).filter(Header::is_notedown) else {
+        return Existing::Convert(Vec::new());
     };
-    let Some(fm) = Frontmatter::parse(&text) else {
-        return Existing::Convert;
+    let Some(fm) = Frontmatter::from_header(&header) else {
+        return Existing::Convert(header.extra());
     };
     let same = fm.source_sha256 == sha
         && fm.generated_model == model
         && major_key(&fm.generated_by).is_some()
         && major_key(&fm.generated_by) == major_key(generator);
-    match (same, fm.format, body_of(&text)) {
-        (false, _, _) => Existing::Convert,
-        (true, HeaderFormat::Okf, _) => Existing::Current,
-        (true, HeaderFormat::Old, Some(body)) => {
-            Existing::OldHeader(Box::new(fm), body.to_string())
-        }
-        (true, HeaderFormat::Old, None) => Existing::Convert,
+    let Some(body) = body_of(text).filter(|_| same) else {
+        return Existing::Convert(fm.extra);
+    };
+    let fresh = fm.format == HeaderFormat::Okf
+        && fm.resource == src.resource
+        && fm.source_date == src.source_date
+        && match (&fm.last_modified, &src.last_modified) {
+            (Some(a), Some(b)) => same_instant(a, b),
+            (a, b) => a == b,
+        };
+    if fresh {
+        Existing::Current
+    } else {
+        Existing::Header(Box::new(fm), body.to_string())
     }
 }
 
@@ -349,14 +351,12 @@ fn local_offset() -> time::UtcOffset {
 }
 
 /// `source_date` (the local calendar date) and `last_modified` (RFC 3339 UTC) of the
-/// source file's modification time; empty when the time cannot be read.
-fn source_times(source: &Path) -> (String, String) {
-    let Ok(modified) = std::fs::metadata(source).and_then(|m| m.modified()) else {
-        return (String::new(), String::new());
-    };
+/// source file's modification time; `None` when the time cannot be read.
+fn source_times(source: &Path) -> Option<(String, String)> {
+    let modified = std::fs::metadata(source).and_then(|m| m.modified()).ok()?;
     let at = time::OffsetDateTime::from(modified);
     let date = at.to_offset(local_offset()).date();
-    (
+    Some((
         format!(
             "{:04}-{:02}-{:02}",
             date.year(),
@@ -364,7 +364,7 @@ fn source_times(source: &Path) -> (String, String) {
             date.day()
         ),
         rfc3339(at),
-    )
+    ))
 }
 
 /// The OKF `description` of a converted input.
@@ -395,12 +395,12 @@ fn resource_of(source: &Path, output: &Path) -> String {
 struct SourceFields {
     title: String,
     resource: String,
-    source_date: String,
-    last_modified: String,
+    source_date: Option<String>,
+    last_modified: Option<String>,
 }
 
 fn source_fields(input: &Input, output: &Path) -> SourceFields {
-    let (source_date, last_modified) = source_times(&input.source);
+    let (source_date, last_modified) = source_times(&input.source).unzip();
     SourceFields {
         title: input
             .source
@@ -413,11 +413,17 @@ fn source_fields(input: &Input, output: &Path) -> SourceFields {
     }
 }
 
-/// Puts the current header on a file with the old header. The body stays byte for byte,
-/// `generated` keeps who read the text and when; the source fields are read again.
-fn update_header(input: &Input, output: &Path, old: Frontmatter, body: &str) -> Result<()> {
-    let src = source_fields(input, output);
-    let truncated = body.lines().any(|l| l == TRUNCATED_MARK);
+/// Puts the current header on a file whose text is current. The body stays byte for
+/// byte, `generated` keeps who read the text and when, added keys stay; the source fields
+/// are read again.
+fn update_header(
+    input: &Input,
+    output: &Path,
+    src: SourceFields,
+    old: Frontmatter,
+    body: &str,
+) -> Result<()> {
+    let truncated = body.lines().any(|l| l.trim_end() == TRUNCATED_MARK);
     let fm = Frontmatter {
         title: src.title,
         description: description(input.kind, old.pages),
@@ -434,9 +440,39 @@ fn update_header(input: &Input, output: &Path, old: Frontmatter, body: &str) -> 
         keywords: old.keywords,
         links: old.links,
         digests: old.digests,
+        extra: old.extra,
         format: HeaderFormat::Okf,
     };
     write_atomic(output, format!("{}{body}", fm.render()).as_bytes())
+}
+
+/// For a source named `index` or `log`: the `<name>.md` an older notedown wrote for the
+/// same source next to the new output, which OKF reserves. notedown leaves it alone.
+pub fn left_over_reserved(input: &Input, output: &Path) -> Option<PathBuf> {
+    let stem = input.source.file_stem()?.to_string_lossy().into_owned();
+    if !(stem.eq_ignore_ascii_case("index") || stem.eq_ignore_ascii_case("log")) {
+        return None;
+    }
+    let old = output.with_file_name(format!("{stem}.md"));
+    if old == output {
+        return None;
+    }
+    let text = std::fs::read_to_string(&old).ok()?;
+    let header = Header::read(&text).filter(Header::is_notedown)?;
+    let fm = Frontmatter::from_header(&header)?;
+    let name = input.source.file_name()?.to_string_lossy();
+    (fm.resource.rsplit('/').next() == Some(name.as_ref())).then_some(old)
+}
+
+fn warn_left_over(input: &Input, output: &Path) {
+    if let Some(old) = left_over_reserved(input, output) {
+        eprintln!(
+            "warning: {} is from an older notedown and is no longer updated, the text of {} is now in {}. You can delete the old file.",
+            old.display(),
+            input.rel.display(),
+            output.display()
+        );
+    }
 }
 
 /// Converts one input. Skips when the output is current (see the skip rule in the design).
@@ -449,7 +485,12 @@ pub fn convert_one(
 ) -> Result<Outcome> {
     let bytes = std::fs::read(&input.source)
         .with_context(|| format!("cannot read {}", input.source.display()))?;
-    if !opts.force && output.exists() && !written_by_notedown(output) {
+    let current = std::fs::read_to_string(output).ok();
+    let ours = current
+        .as_deref()
+        .and_then(Header::read)
+        .is_some_and(|h| h.is_notedown());
+    if !opts.force && output.exists() && !ours {
         return Err(anyhow!(
             "refusing to overwrite {}: it was not created by notedown (use --force to replace it)",
             output.display()
@@ -457,16 +498,26 @@ pub fn convert_one(
     }
     let sha = const_hex::encode(Sha256::digest(&bytes));
     let generator = format!("notedown/{}", env!("CARGO_PKG_VERSION"));
-    if !opts.force {
-        match existing(output, &sha, engine.label(), &generator) {
-            Existing::Current => return Ok(Outcome::Skipped),
-            Existing::OldHeader(old, body) => {
-                update_header(input, output, *old, &body)?;
-                return Ok(Outcome::HeaderUpdated);
-            }
-            Existing::Convert => {}
+    let src = source_fields(input, output);
+    let state = match &current {
+        Some(text) => existing(text, &sha, engine.label(), &generator, &src),
+        None => Existing::Convert(Vec::new()),
+    };
+    let extra = match state {
+        Existing::Current if !opts.force => return Ok(Outcome::Skipped),
+        Existing::Header(old, body) if !opts.force => {
+            update_header(input, output, src, *old, &body)?;
+            warn_left_over(input, output);
+            return Ok(Outcome::HeaderUpdated);
         }
-    }
+        Existing::Convert(extra) => extra,
+        Existing::Header(old, _) => old.extra,
+        Existing::Current => current
+            .as_deref()
+            .and_then(Header::read)
+            .map(|h| h.extra())
+            .unwrap_or_default(),
+    };
 
     let stem = output
         .file_stem()
@@ -540,7 +591,6 @@ pub fn convert_one(
         }
     };
 
-    let src = source_fields(input, output);
     let fm = Frontmatter {
         title: src.title,
         description: description(input.kind, results.len()),
@@ -562,6 +612,7 @@ pub fn convert_one(
         keywords,
         links: fm_links,
         digests,
+        extra,
         format: HeaderFormat::Okf,
     };
 
@@ -607,6 +658,7 @@ pub fn convert_one(
     }
     let outs: Vec<PageOut> = results.iter().map(|r| r.out.clone()).collect();
     write_atomic(output, render_document(&fm, &outs).as_bytes())?;
+    warn_left_over(input, output);
     Ok(Outcome::Converted { pages: outs.len() })
 }
 

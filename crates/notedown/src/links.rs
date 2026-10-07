@@ -65,8 +65,7 @@ fn escape_label(s: &str) -> String {
 }
 
 /// The absolute form of a path as its anchor (root, drive) and its names, with `.` and
-/// `..` folded away by the text alone: no symbolic link is followed, so `/var` and
-/// `/private/var` on macOS stay what the caller wrote.
+/// `..` folded away by the text alone.
 fn lexical_parts(path: &Path) -> Option<(std::ffi::OsString, Vec<std::ffi::OsString>)> {
     let abs = std::path::absolute(path).ok()?;
     let mut anchor = std::ffi::OsString::new();
@@ -84,11 +83,35 @@ fn lexical_parts(path: &Path) -> Option<(std::ffi::OsString, Vec<std::ffi::OsStr
     Some((anchor, names))
 }
 
-/// The path from a folder to a file as `/`-separated parts (`..` to go up). `None` when
-/// the two are on different drives.
+/// Like [`lexical_parts`] for a folder, but with symbolic links resolved: the longest
+/// part of the path that exists is canonicalized and the rest (folders not created yet)
+/// is added to it. Falls back to the lexical form when nothing can be canonicalized.
+fn folder_parts(dir: &Path) -> Option<(std::ffi::OsString, Vec<std::ffi::OsString>)> {
+    let (anchor, names) = lexical_parts(dir)?;
+    for keep in (0..=names.len()).rev() {
+        let mut existing = PathBuf::from(&anchor);
+        existing.extend(&names[..keep]);
+        if let Ok(real) = std::fs::canonicalize(&existing)
+            && let Some((real_anchor, mut real_names)) = lexical_parts(&real)
+        {
+            real_names.extend(names[keep..].iter().cloned());
+            return Some((real_anchor, real_names));
+        }
+    }
+    Some((anchor, names))
+}
+
+/// The path from a folder to a file as `/`-separated parts (`..` to go up). Both folders
+/// are taken with symbolic links resolved, so the path works from where the files really
+/// are; the file itself keeps its name even when it is a link. `None` when the two are on
+/// different drives.
 pub(crate) fn relative_parts(from_dir: &Path, target: &Path) -> Option<Vec<String>> {
-    let (base_anchor, base) = lexical_parts(from_dir)?;
-    let (target_anchor, tgt) = lexical_parts(target)?;
+    let (base_anchor, base) = folder_parts(from_dir)?;
+    let (_, target_names) = lexical_parts(target)?;
+    let name = target_names.last()?.clone();
+    let target_dir = std::path::absolute(target).ok()?;
+    let (target_anchor, mut tgt) = folder_parts(target_dir.parent()?)?;
+    tgt.push(name);
     if base_anchor != target_anchor {
         return None;
     }

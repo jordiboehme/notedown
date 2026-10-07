@@ -2,6 +2,9 @@
 //!
 //! The frontmatter is an Open Knowledge Format (OKF v0.2) concept header with notedown's
 //! own keys after the OKF ones. `type` is always `note` and `tags` always `[supernote]`.
+//! Keys that another tool added are kept and written after notedown's keys.
+
+use crate::yaml::{Entry, Node, top_level};
 
 /// Which header a parsed file carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,10 +28,11 @@ pub struct Frontmatter {
     pub generated_model: String,
     /// `generated.at`: when the text was read, RFC 3339 UTC.
     pub generated_at: String,
-    /// Local calendar date of the source file's modification time (`YYYY-MM-DD`).
-    pub source_date: String,
+    /// Local calendar date of the source file's modification time (`YYYY-MM-DD`); left
+    /// out when the time cannot be read.
+    pub source_date: Option<String>,
     /// The source file's modification time, RFC 3339 UTC (`sources[0].last_modified`).
-    pub last_modified: String,
+    pub last_modified: Option<String>,
     /// `draft` when a page hit the token limit, else `stable`.
     pub status: String,
     pub source_sha256: String,
@@ -37,6 +41,9 @@ pub struct Frontmatter {
     pub keywords: Vec<String>,
     pub links: Vec<FrontmatterLink>,
     pub digests: Vec<FrontmatterDigest>,
+    /// Top-level keys notedown does not know, as they were written (each ending with a
+    /// newline). OKF asks to keep them.
+    pub extra: Vec<String>,
     /// Not written; set by [`Frontmatter::parse`].
     pub format: HeaderFormat,
 }
@@ -77,69 +84,9 @@ pub struct PageOut {
     pub empty: bool,
 }
 
-/// `YYYY-MM-DDTHH:MM:SS` with optional fraction and `Z` or `+HH:MM`: a YAML timestamp,
-/// written plain like the examples of the OKF spec.
-fn is_timestamp(v: &str) -> bool {
-    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    let Some((date, time)) = v.split_once('T') else {
-        return false;
-    };
-    let date_ok = date.len() == 10
-        && date.split('-').map(str::len).eq([4, 2, 2])
-        && date.split('-').all(digits);
-    let (clock, zone) = match time.strip_suffix('Z') {
-        Some(c) => (c, None),
-        None if time.len() > 6 => {
-            let (c, z) = time.split_at(time.len() - 6);
-            (c, Some(z))
-        }
-        None => return false,
-    };
-    let zone_ok = zone.is_none_or(|z| {
-        let (sign, rest) = z.split_at(1);
-        matches!(sign, "+" | "-")
-            && rest.split(':').map(str::len).eq([2, 2])
-            && rest.split(':').all(digits)
-    });
-    let (hms, fraction) = clock.split_once('.').unwrap_or((clock, "0"));
-    date_ok
-        && zone_ok
-        && digits(fraction)
-        && hms.split(':').map(str::len).eq([2, 2, 2])
-        && hms.split(':').all(digits)
-}
-
-fn needs_quotes(v: &str) -> bool {
-    if v.is_empty() || v != v.trim() {
-        return true;
-    }
-    if is_timestamp(v) {
-        return false;
-    }
-    if v.chars()
-        .any(|c| c.is_control() || matches!(c, ':' | '#' | '"' | '\\'))
-    {
-        return true;
-    }
-    let first = v.chars().next().unwrap_or(' ');
-    if "-?,[]{}&*!|>'%@`~".contains(first) {
-        return true;
-    }
-    let lower = v.to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "null" | "true" | "false" | "yes" | "no" | "on" | "off"
-    ) || v.parse::<f64>().is_ok()
-}
-
-fn scalar(v: &str) -> String {
-    if needs_quotes(v) {
-        quote(v)
-    } else {
-        v.to_string()
-    }
-}
-
+/// A double-quoted YAML string. Control characters, the Unicode line and paragraph
+/// separators and the non-characters U+FFFE and U+FFFF are written as `\uXXXX`, since YAML
+/// readers refuse them raw or read them as line breaks.
 fn quote(v: &str) -> String {
     let mut s = String::from("\"");
     for c in v.chars() {
@@ -149,7 +96,11 @@ fn quote(v: &str) -> String {
             '\n' => s.push_str("\\n"),
             '\r' => s.push_str("\\r"),
             '\t' => s.push_str("\\t"),
-            c if (c as u32) < 0x20 => s.push_str(&format!("\\u{:04X}", c as u32)),
+            c if c.is_control()
+                || matches!(c, '\u{2028}' | '\u{2029}' | '\u{FFFE}' | '\u{FFFF}') =>
+            {
+                s.push_str(&format!("\\u{:04X}", c as u32))
+            }
             c => s.push(c),
         }
     }
@@ -157,107 +108,180 @@ fn quote(v: &str) -> String {
     s
 }
 
-/// Like [`scalar`], but also quotes what would end a flow map entry.
-fn flow_scalar(v: &str) -> String {
-    if v.chars().any(|c| matches!(c, ',' | '{' | '}' | '[' | ']')) {
-        quote(v)
-    } else {
-        scalar(v)
-    }
+/// A fixed word of notedown (`note`, `stable`, `notedown/0.1.0`): plain when it is a
+/// simple token that no YAML reader takes for anything but a string, else quoted.
+fn token(v: &str) -> String {
+    let simple = v.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '+' | '-'))
+        && !matches!(
+            v.to_ascii_lowercase().as_str(),
+            "null" | "true" | "false" | "yes" | "no" | "on" | "off" | "y" | "n"
+        );
+    if simple { v.to_string() } else { quote(v) }
 }
 
-/// Parses `{ key: value, ... }` with plain or double-quoted values.
-fn parse_flow_map(s: &str) -> Option<Vec<(String, String)>> {
-    let inner = s.trim().strip_prefix('{')?.strip_suffix('}')?;
-    let mut out = Vec::new();
-    let mut rest = inner.trim_start();
-    while !rest.is_empty() {
-        let (key, after) = rest.split_once(':')?;
-        let after = after.trim_start();
-        let (raw, remaining) = if after.starts_with('"') {
-            let mut end = None;
-            let mut escaped = false;
-            for (i, c) in after.char_indices().skip(1) {
-                if escaped {
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == '"' {
-                    end = Some(i);
-                    break;
-                }
-            }
-            let end = end?;
-            (&after[..=end], &after[end + 1..])
-        } else {
-            match after.find(',') {
-                Some(i) => (&after[..i], &after[i..]),
-                None => (after, ""),
-            }
-        };
-        out.push((key.trim().to_string(), unscalar(raw)?));
-        let remaining = remaining.trim_start();
-        rest = match remaining.strip_prefix(',') {
-            Some(r) => r.trim_start(),
-            None if remaining.is_empty() => "",
-            None => return None,
-        };
-    }
-    Some(out)
+fn number(s: &str, len: usize) -> Option<u32> {
+    (s.len() == len && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse().ok())?
 }
 
-fn unscalar(v: &str) -> Option<String> {
-    let v = v.trim();
-    let Some(inner) = v.strip_prefix('"') else {
-        return Some(v.to_string());
+/// `YYYY-MM-DD` that is a real calendar date.
+fn is_date(v: &str) -> bool {
+    let mut parts = v.split('-');
+    let (Some(y), Some(m), Some(d), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
     };
-    let inner = inner.strip_suffix('"')?;
-    let mut out = String::new();
-    let mut chars = inner.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
+    let (Some(y), Some(m), Some(d)) = (number(y, 4), number(m, 2), number(d, 2)) else {
+        return false;
+    };
+    let Ok(month) = time::Month::try_from(m as u8) else {
+        return false;
+    };
+    time::Date::from_calendar_date(y as i32, month, d as u8).is_ok()
+}
+
+/// An RFC 3339 date and time that is real: `YYYY-MM-DDTHH:MM:SS`, an optional fraction
+/// and `Z` or `+HH:MM`.
+fn is_datetime(v: &str) -> bool {
+    let Some((date, rest)) = v.split_once('T') else {
+        return false;
+    };
+    let (clock, zone_ok) = if let Some(c) = rest.strip_suffix('Z') {
+        (c, true)
+    } else if rest.len() > 6 {
+        let (c, z) = rest.split_at(rest.len() - 6);
+        let ok = z.starts_with(['+', '-'])
+            && z[1..].split_once(':').is_some_and(|(h, m)| {
+                number(h, 2).is_some_and(|h| h < 24) && number(m, 2).is_some_and(|m| m < 60)
+            });
+        (c, ok)
+    } else {
+        return false;
+    };
+    let (hms, fraction) = clock.split_once('.').unwrap_or((clock, "0"));
+    let mut parts = hms.split(':');
+    let (Some(h), Some(m), Some(s), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let clock_ok = matches!(
+        (number(h, 2), number(m, 2), number(s, 2)),
+        (Some(h), Some(m), Some(s)) if h < 24 && m < 60 && s < 61
+    );
+    is_date(date)
+        && zone_ok
+        && clock_ok
+        && !fraction.is_empty()
+        && fraction.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A date or time value: plain when it is a real date or date and time, else quoted.
+fn when(v: &str) -> String {
+    if is_date(v) || is_datetime(v) {
+        v.to_string()
+    } else {
+        quote(v)
+    }
+}
+
+/// The keys notedown reads; every other top-level key is kept as it is.
+const KNOWN_KEYS: &[&str] = &[
+    "type",
+    "title",
+    "description",
+    "resource",
+    "tags",
+    "generated",
+    "source_date",
+    "sources",
+    "status",
+    "source",
+    "kind",
+    "model",
+    "converted_at",
+    "generator",
+    "source_sha256",
+    "file_id",
+    "pages",
+    "keywords",
+    "links",
+    "digests",
+];
+
+/// The front matter block of a Markdown file, split into top-level keys.
+#[derive(Debug, Clone)]
+pub struct Header {
+    entries: Vec<Entry>,
+}
+
+/// The lines between the opening and the closing `---` and the byte offset of the body.
+fn split_block(md: &str) -> Option<(Vec<&str>, usize)> {
+    let mut offset = 0;
+    let mut lines = Vec::new();
+    let mut first = true;
+    for raw in md.split_inclusive('\n') {
+        offset += raw.len();
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if first {
+            if line != "---" {
+                return None;
+            }
+            first = false;
             continue;
         }
-        match chars.next()? {
-            '"' => out.push('"'),
-            '\\' => out.push('\\'),
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            't' => out.push('\t'),
-            'u' => {
-                let hex: String = chars.by_ref().take(4).collect();
-                if hex.len() != 4 {
-                    return None;
-                }
-                out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
-            }
-            _ => return None,
+        if line == "---" {
+            return Some((lines, offset));
         }
+        lines.push(line);
     }
-    Some(out)
+    None
 }
 
-/// Reads the `  - { ... }` items that follow a list key; `None` when one is not a flow map.
-fn flow_items(lines: &mut std::str::Lines) -> Option<Vec<Vec<(String, String)>>> {
-    let mut items = Vec::new();
-    let mut rest = lines.clone();
-    while let Some(item) = rest.clone().next() {
-        let Some(v) = item.strip_prefix("  - ") else {
-            break;
-        };
-        items.push(parse_flow_map(v)?);
-        rest.next();
+impl Header {
+    /// `None` when the file has no front matter block or it cannot be read.
+    pub fn read(md: &str) -> Option<Header> {
+        let (lines, _) = split_block(md)?;
+        Some(Header {
+            entries: top_level(&lines)?,
+        })
     }
-    *lines = rest;
-    Some(items)
-}
 
-fn field(fields: &[(String, String)], key: &str) -> Option<String> {
-    fields
-        .iter()
-        .find(|(n, _)| n == key)
-        .map(|(_, v)| v.clone())
+    fn get(&self, key: &str) -> Option<&Node> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|e| e.key == key)
+            .map(|e| &e.value)
+    }
+
+    fn text(&self, key: &str) -> Option<String> {
+        self.get(key).and_then(Node::as_str).map(str::to_string)
+    }
+
+    /// Written by notedown: `generated.by` is `notedown/...` or the old `generator` is
+    /// `notedown ...`.
+    pub fn is_notedown(&self) -> bool {
+        self.get("generated")
+            .and_then(|g| g.get("by"))
+            .and_then(Node::as_str)
+            .is_some_and(|by| by.starts_with("notedown/"))
+            || self
+                .text("generator")
+                .is_some_and(|g| g.starts_with("notedown "))
+    }
+
+    /// The top-level keys notedown does not know, as written.
+    pub fn extra(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|e| !KNOWN_KEYS.contains(&e.key.as_str()))
+            .map(|e| e.raw.clone())
+            .collect()
+    }
 }
 
 /// The file name of a `/` path without its extension.
@@ -269,31 +293,89 @@ fn stem_of(path: &str) -> String {
     }
 }
 
+fn texts(node: Option<&Node>) -> Option<Vec<String>> {
+    match node {
+        None => Some(Vec::new()),
+        Some(n) => n
+            .as_list()?
+            .iter()
+            .map(|i| i.as_str().map(str::to_string))
+            .collect(),
+    }
+}
+
+fn items<T>(node: Option<&Node>, read: impl Fn(&Node) -> Option<T>) -> Option<Vec<T>> {
+    match node {
+        None => Some(Vec::new()),
+        Some(n) => n.as_list()?.iter().map(read).collect(),
+    }
+}
+
+fn field(node: &Node, key: &str) -> Option<String> {
+    node.get(key).and_then(Node::as_str).map(str::to_string)
+}
+
+fn rect_of(node: &Node) -> Option<[u32; 4]> {
+    let parts: Vec<String> = match node {
+        Node::Scalar(s) => s.split(',').map(|p| p.trim().to_string()).collect(),
+        Node::List(items) => items
+            .iter()
+            .map(|i| i.as_str().map(str::to_string))
+            .collect::<Option<_>>()?,
+        Node::Map(_) => return None,
+    };
+    let mut rect = [0u32; 4];
+    if parts.len() != 4 {
+        return None;
+    }
+    for (slot, p) in rect.iter_mut().zip(&parts) {
+        *slot = p.parse().ok()?;
+    }
+    Some(rect)
+}
+
+/// `+00:00` and `Z` name the same offset; other tools write either.
+pub fn same_instant(a: &str, b: &str) -> bool {
+    let norm = |s: &str| match s.strip_suffix("+00:00") {
+        Some(rest) => format!("{rest}Z"),
+        None => s.to_string(),
+    };
+    norm(a) == norm(b)
+}
+
 impl Frontmatter {
-    /// The frontmatter block including both `---` lines and a final newline.
+    /// The frontmatter block including both `---` lines and a final newline. Every value
+    /// from a file, the note or the model is double-quoted; dates and times are plain
+    /// when they are real ones; numbers are plain.
     pub fn render(&self) -> String {
         let mut s = String::from("---\n");
         s.push_str("type: note\n");
-        s.push_str(&format!("title: {}\n", scalar(&self.title)));
-        s.push_str(&format!("description: {}\n", scalar(&self.description)));
-        s.push_str(&format!("resource: {}\n", scalar(&self.resource)));
+        s.push_str(&format!("title: {}\n", quote(&self.title)));
+        s.push_str(&format!("description: {}\n", quote(&self.description)));
+        s.push_str(&format!("resource: {}\n", quote(&self.resource)));
         s.push_str("tags: [supernote]\n");
         s.push_str(&format!(
             "generated: {{ by: {}, model: {}, at: {} }}\n",
-            flow_scalar(&self.generated_by),
-            flow_scalar(&self.generated_model),
-            flow_scalar(&self.generated_at)
+            token(&self.generated_by),
+            quote(&self.generated_model),
+            when(&self.generated_at)
         ));
-        s.push_str(&format!("source_date: {}\n", scalar(&self.source_date)));
+        if let Some(date) = &self.source_date {
+            s.push_str(&format!("source_date: {}\n", when(date)));
+        }
+        let modified = self
+            .last_modified
+            .as_ref()
+            .map(|m| format!(", last_modified: {}", when(m)))
+            .unwrap_or_default();
         s.push_str(&format!(
-            "sources:\n  - {{ id: note, resource: {}, last_modified: {} }}\n",
-            flow_scalar(&self.resource),
-            flow_scalar(&self.last_modified)
+            "sources:\n  - {{ id: note, resource: {}{modified} }}\n",
+            quote(&self.resource)
         ));
-        s.push_str(&format!("status: {}\n", scalar(&self.status)));
-        s.push_str(&format!("source_sha256: {}\n", scalar(&self.source_sha256)));
+        s.push_str(&format!("status: {}\n", token(&self.status)));
+        s.push_str(&format!("source_sha256: {}\n", quote(&self.source_sha256)));
         if let Some(id) = &self.file_id {
-            s.push_str(&format!("file_id: {}\n", scalar(id)));
+            s.push_str(&format!("file_id: {}\n", quote(id)));
         }
         s.push_str(&format!("pages: {}\n", self.pages));
         if self.keywords.is_empty() {
@@ -301,7 +383,7 @@ impl Frontmatter {
         } else {
             s.push_str("keywords:\n");
             for k in &self.keywords {
-                s.push_str(&format!("  - {}\n", scalar(k)));
+                s.push_str(&format!("  - {}\n", quote(k)));
             }
         }
         if !self.links.is_empty() {
@@ -310,13 +392,13 @@ impl Frontmatter {
                 let md = l
                     .target_md
                     .as_ref()
-                    .map(|m| format!(", target_md: {}", flow_scalar(m)))
+                    .map(|m| format!(", target_md: {}", quote(m)))
                     .unwrap_or_default();
                 s.push_str(&format!(
                     "  - {{ page: {}, target_file_id: {}, target_path: {}{md} }}\n",
                     l.page,
-                    flow_scalar(&l.target_file_id),
-                    flow_scalar(&l.target_path)
+                    quote(&l.target_file_id),
+                    quote(&l.target_path)
                 ));
             }
         }
@@ -326,8 +408,8 @@ impl Frontmatter {
                 s.push_str(&format!(
                     "  - {{ page: {}, digest_id: {}, text: {}, rect: \"{},{},{},{}\" }}\n",
                     d.page,
-                    flow_scalar(&d.digest_id),
-                    flow_scalar(&d.text),
+                    quote(&d.digest_id),
+                    quote(&d.text),
                     d.rect[0],
                     d.rect[1],
                     d.rect[2],
@@ -335,175 +417,86 @@ impl Frontmatter {
                 ));
             }
         }
+        for raw in &self.extra {
+            s.push_str(raw);
+        }
         s.push_str("---\n");
         s
     }
 
-    /// Reads back what [`Frontmatter::render`] writes, and the header notedown wrote
-    /// before (see [`HeaderFormat::Old`]); `None` on anything unexpected.
+    /// Reads the header notedown writes, the same header as another tool wrote it back
+    /// (other quoting, block or flow style, other key order, added keys) and the header
+    /// notedown wrote before (see [`HeaderFormat::Old`]); `None` when notedown's keys are
+    /// missing or do not fit.
     pub fn parse(md: &str) -> Option<Frontmatter> {
-        let mut lines = md.lines();
-        if lines.next()? != "---" {
-            return None;
-        }
-        // the Open Knowledge Format keys
-        let mut doc_type = None;
-        let mut title = None;
-        let mut description = None;
-        let mut resource = None;
-        let mut tags = false;
-        let mut generated = None;
-        let mut source_date = None;
-        let mut sources = None;
-        let mut status = None;
-        // the keys of the old header
-        let mut source = None;
-        let mut kind = None;
-        let mut model = None;
-        let mut converted_at = None;
-        let mut generator = None;
-        // both
-        let mut sha = None;
-        let mut file_id = None;
-        let mut pages = None;
-        let mut keywords = None;
-        let mut links = Vec::new();
-        let mut digests = Vec::new();
-        let mut closed = false;
-        while let Some(line) = lines.next() {
-            if line == "---" {
-                closed = true;
-                break;
-            }
-            let (key, value) = line.split_once(':')?;
-            let value = value.trim();
-            match key {
-                "type" => doc_type = Some(unscalar(value)?),
-                "title" => title = Some(unscalar(value)?),
-                "description" => description = Some(unscalar(value)?),
-                "resource" => resource = Some(unscalar(value)?),
-                "tags" => tags = value.starts_with('[') && value.ends_with(']'),
-                "generated" => generated = Some(parse_flow_map(value)?),
-                "source_date" => source_date = Some(unscalar(value)?),
-                "sources" => {
-                    if !value.is_empty() {
-                        return None;
-                    }
-                    sources = flow_items(&mut lines)?.into_iter().next();
-                }
-                "status" => status = Some(unscalar(value)?),
-                "source" => source = Some(unscalar(value)?),
-                "kind" => kind = Some(unscalar(value)?),
-                "model" => model = Some(unscalar(value)?),
-                "converted_at" => converted_at = Some(unscalar(value)?),
-                "generator" => generator = Some(unscalar(value)?),
-                "source_sha256" => sha = Some(unscalar(value)?),
-                "file_id" => file_id = Some(unscalar(value)?),
-                "pages" => pages = Some(value.parse::<usize>().ok()?),
-                "keywords" => {
-                    let mut list = Vec::new();
-                    if value != "[]" {
-                        if !value.is_empty() {
-                            return None;
-                        }
-                        let mut rest = lines.clone();
-                        while let Some(item) = rest.clone().next() {
-                            let Some(v) = item.strip_prefix("  - ") else {
-                                break;
-                            };
-                            list.push(unscalar(v)?);
-                            rest.next();
-                        }
-                        lines = rest;
-                    }
-                    keywords = Some(list);
-                }
-                "links" => {
-                    if !value.is_empty() {
-                        return None;
-                    }
-                    for fields in flow_items(&mut lines)? {
-                        links.push(FrontmatterLink {
-                            page: field(&fields, "page")?.parse().ok()?,
-                            target_file_id: field(&fields, "target_file_id")?,
-                            target_path: field(&fields, "target_path")?,
-                            target_md: field(&fields, "target_md"),
-                        });
-                    }
-                }
-                "digests" => {
-                    if !value.is_empty() {
-                        return None;
-                    }
-                    for fields in flow_items(&mut lines)? {
-                        let mut rect = [0u32; 4];
-                        let raw = field(&fields, "rect")?;
-                        let mut parts = raw.split(',');
-                        for slot in &mut rect {
-                            *slot = parts.next()?.trim().parse().ok()?;
-                        }
-                        if parts.next().is_some() {
-                            return None;
-                        }
-                        digests.push(FrontmatterDigest {
-                            page: field(&fields, "page")?.parse().ok()?,
-                            digest_id: field(&fields, "digest_id")?,
-                            text: field(&fields, "text")?,
-                            rect,
-                        });
-                    }
-                }
-                _ => return None,
-            }
-        }
-        if !closed {
-            return None;
-        }
-        let old_keys = source.is_some()
-            || kind.is_some()
-            || model.is_some()
-            || converted_at.is_some()
-            || generator.is_some();
-        let new_keys = doc_type.is_some()
-            || title.is_some()
-            || description.is_some()
-            || resource.is_some()
-            || tags
-            || generated.is_some()
-            || source_date.is_some()
-            || sources.is_some()
-            || status.is_some();
-        let shared = (sha?, pages?, keywords?);
-        let fm = match (old_keys, new_keys) {
-            (false, true) => {
-                let generated = generated?;
-                let sources = sources.unwrap_or_default();
-                if doc_type.is_none_or(|t| t.is_empty()) {
+        Frontmatter::from_header(&Header::read(md)?)
+    }
+
+    pub fn from_header(h: &Header) -> Option<Frontmatter> {
+        let has = |k: &str| h.get(k).is_some();
+        let old_keys = ["source", "kind", "model", "converted_at", "generator"]
+            .iter()
+            .any(|k| has(k));
+        let format = match (has("generated"), old_keys) {
+            (true, false) => HeaderFormat::Okf,
+            (false, true) => HeaderFormat::Old,
+            _ => return None,
+        };
+        let source_sha256 = h.text("source_sha256")?;
+        let pages = h.text("pages")?.parse().ok()?;
+        let keywords = texts(h.get("keywords"))?;
+        let links = items(h.get("links"), |n| {
+            Some(FrontmatterLink {
+                page: field(n, "page")?.parse().ok()?,
+                target_file_id: field(n, "target_file_id")?,
+                target_path: field(n, "target_path")?,
+                target_md: field(n, "target_md"),
+            })
+        })?;
+        let digests = items(h.get("digests"), |n| {
+            Some(FrontmatterDigest {
+                page: field(n, "page")?.parse().ok()?,
+                digest_id: field(n, "digest_id")?,
+                text: field(n, "text")?,
+                rect: rect_of(n.get("rect")?)?,
+            })
+        })?;
+        let file_id = h.text("file_id").filter(|id| !id.is_empty());
+        let extra = h.extra();
+        let fm = match format {
+            HeaderFormat::Okf => {
+                if h.text("type").is_none_or(|t| t.is_empty()) {
                     return None;
                 }
+                let generated = h.get("generated")?;
+                let source = h
+                    .get("sources")
+                    .and_then(Node::as_list)
+                    .and_then(|l| l.first());
+                let non_empty = |v: Option<String>| v.filter(|s| !s.is_empty());
                 Frontmatter {
-                    title: title.unwrap_or_default(),
-                    description: description.unwrap_or_default(),
-                    resource: resource.unwrap_or_default(),
-                    generated_by: field(&generated, "by")?,
-                    generated_model: field(&generated, "model").unwrap_or_default(),
-                    generated_at: field(&generated, "at")?,
-                    source_date: source_date.unwrap_or_default(),
-                    last_modified: field(&sources, "last_modified").unwrap_or_default(),
-                    status: status.unwrap_or_else(|| "stable".into()),
-                    source_sha256: shared.0,
+                    title: h.text("title").unwrap_or_default(),
+                    description: h.text("description").unwrap_or_default(),
+                    resource: h.text("resource").unwrap_or_default(),
+                    generated_by: field(generated, "by")?,
+                    generated_model: field(generated, "model").unwrap_or_default(),
+                    generated_at: field(generated, "at")?,
+                    source_date: non_empty(h.text("source_date")),
+                    last_modified: non_empty(source.and_then(|s| field(s, "last_modified"))),
+                    status: h.text("status").unwrap_or_else(|| "stable".into()),
+                    source_sha256,
                     file_id,
-                    pages: shared.1,
-                    keywords: shared.2,
+                    pages,
+                    keywords,
                     links,
                     digests,
-                    format: HeaderFormat::Okf,
+                    extra,
+                    format,
                 }
             }
-            (true, false) => {
-                let source = source?;
-                kind?;
-                let generator = generator?;
+            HeaderFormat::Old => {
+                let source = h.text("source")?;
+                let generator = h.text("generator")?;
                 Frontmatter {
                     title: stem_of(&source),
                     description: String::new(),
@@ -512,21 +505,21 @@ impl Frontmatter {
                         Some(version) => format!("notedown/{version}"),
                         None => generator,
                     },
-                    generated_model: model?,
-                    generated_at: converted_at?,
-                    source_date: String::new(),
-                    last_modified: String::new(),
+                    generated_model: h.text("model")?,
+                    generated_at: h.text("converted_at")?,
+                    source_date: None,
+                    last_modified: None,
                     status: "stable".into(),
-                    source_sha256: shared.0,
+                    source_sha256,
                     file_id,
-                    pages: shared.1,
-                    keywords: shared.2,
+                    pages,
+                    keywords,
                     links,
                     digests,
-                    format: HeaderFormat::Old,
+                    extra,
+                    format,
                 }
             }
-            _ => return None,
         };
         Some(fm)
     }
@@ -534,9 +527,8 @@ impl Frontmatter {
 
 /// The Markdown body after the frontmatter block, byte for byte.
 pub fn body_of(md: &str) -> Option<&str> {
-    let rest = md.strip_prefix("---\n")?;
-    let end = rest.find("\n---\n")?;
-    Some(&rest[end + "\n---\n".len()..])
+    let (_, offset) = split_block(md)?;
+    Some(&md[offset..])
 }
 
 /// Keeps a value from the note safe inside an HTML comment: only letters, digits, `_`,

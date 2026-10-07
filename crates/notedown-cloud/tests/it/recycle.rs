@@ -387,11 +387,13 @@ fn a_folder_line_never_removes_a_file_that_is_still_listed() {
     f.add(&x, b"x");
     f.add(&y, b"y");
     f.add(&folder, b"");
+    std::fs::write(f.slot_path(&folder).join(".DS_Store"), b"dots").unwrap();
     let r = f.prune(NOW, Origin::Cli, false);
     assert_eq!(r.removed, vec![y.clone(), folder.clone()]);
     assert!(!f.slot_path(&y).exists());
     assert!(f.slot_path(&folder).is_dir());
     assert!(f.slot_path(&x).is_file());
+    assert!(f.slot_path(&folder).join(".DS_Store").is_file());
     let g = f.store.lock().unwrap();
     assert_eq!(f.store.recycle_index(&g).unwrap(), vec![x]);
 }
@@ -421,21 +423,149 @@ fn when_every_line_of_a_folder_delete_expires_its_whole_slot_goes() {
 }
 
 #[test]
-fn a_folder_line_leaves_a_symlink_and_its_target_alone() {
+fn a_folder_slot_with_a_symlink_inside_keeps_its_line_and_is_reported() {
     let f = Fixture::new();
     let ms = NOW - 91 * DAY;
     let folder = folder_entry(DEAD, "NOTE/Note/A", ms);
     f.add(&folder, b"");
+    std::fs::write(f.slot_path(&folder).join(".DS_Store"), b"dots").unwrap();
     let outside = f.store.account_dir().join("outside");
     std::fs::create_dir_all(&outside).unwrap();
     std::fs::write(outside.join("keep.txt"), b"keep").unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(&outside, f.slot_path(&folder).join("link")).unwrap();
-    let r = f.prune(NOW, Origin::Cli, false);
-    assert_eq!(r.removed, vec![folder.clone()]);
+    for dry_run in [true, false] {
+        let r = f.prune(NOW, Origin::Cli, dry_run);
+        assert!(r.removed.is_empty());
+        assert_eq!(r.kept, 1);
+        assert_eq!(r.failed.len(), 1, "{:?}", r.failed);
+        assert_eq!(r.failed[0].location, folder.location());
+    }
     assert!(outside.join("keep.txt").is_file());
     #[cfg(unix)]
     assert!(f.slot_path(&folder).join("link").is_symlink());
+    assert!(f.slot_path(&folder).join(".DS_Store").is_file());
+    assert_eq!(
+        f.index_text(),
+        format!("{}\n", serde_json::to_string(&folder).unwrap())
+    );
+    assert!(f.events().is_empty());
+}
+
+#[test]
+fn an_expired_folder_slot_goes_with_its_dot_files_and_unregistered_files() {
+    let f = Fixture::new();
+    let ms = NOW - 91 * DAY;
+    let folder = folder_entry(DEAD, "NOTE/Note/A", ms);
+    f.add(&folder, b"");
+    let slot = f.slot_path(&folder);
+    std::fs::create_dir_all(slot.join(".hidden/B")).unwrap();
+    std::fs::write(slot.join(".DS_Store"), b"dots").unwrap();
+    std::fs::write(slot.join(".hidden/B/x"), b"x").unwrap();
+    std::fs::write(slot.join("stray.pdf"), b"stray").unwrap();
+    let r = f.prune(NOW, Origin::Cli, true);
+    assert_eq!(r.removed, vec![folder.clone()]);
+    assert!(r.failed.is_empty(), "{:?}", r.failed);
+    assert!(slot.join(".DS_Store").is_file());
+    let r = f.prune(NOW, Origin::Cli, false);
+    assert_eq!(r.removed, vec![folder.clone()]);
+    assert!(r.failed.is_empty(), "{:?}", r.failed);
+    assert!(!f.recycle().join(ms.to_string()).exists());
+}
+
+/// A real folder delete through the store, with a dot-file inside: before the 90 days its
+/// slot stays whole, after them it goes whole.
+#[test]
+fn a_real_folder_delete_with_a_dot_file_goes_whole_when_it_expires() {
+    let f = Fixture::new();
+    f.live("NOTE/Note/A/x.note", b"x");
+    std::fs::write(f.store.fs_path(&wp("NOTE/Note/A/.DS_Store")), b"dots").unwrap();
+    let ms = NOW - 50 * DAY;
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    let c = f
+        .store
+        .plan_delete(&g, &wp("NOTE/Note/A"), ms, Origin::Device, None)
+        .unwrap();
+    f.store.commit(&g, c, &f.journal).unwrap();
+    drop(g);
+    let slot = f.recycle().join(format!("{ms}/NOTE/Note/A"));
+    assert!(slot.join(".DS_Store").is_file());
+    assert!(slot.join("x.note").is_file());
+    let lines = {
+        let g = f.store.lock().unwrap();
+        f.store.recycle_index(&g).unwrap()
+    };
+    assert_eq!(lines.len(), 2);
+    let events = f.events().len();
+
+    let r = f.prune(NOW, Origin::Cli, false);
+    assert!(r.removed.is_empty());
+    assert!(slot.join(".DS_Store").is_file());
+    assert_eq!(f.events().len(), events);
+
+    let later = ms + 91 * DAY;
+    let r = f.prune(later, Origin::Cli, true);
+    assert_eq!(r.removed, lines);
+    let r = f.prune(later, Origin::Cli, false);
+    assert_eq!(r.removed, lines);
+    assert!(r.failed.is_empty(), "{:?}", r.failed);
+    assert!(!f.recycle().join(ms.to_string()).exists());
+    assert_eq!(f.index_text(), "");
+}
+
+/// The last file of a folder that also holds a dot-file: the emptied folder goes to its own
+/// slot with the dot-file. When its line expires, that slot goes whole.
+#[test]
+fn a_pruned_folder_slot_goes_whole_when_its_line_expires() {
+    let f = Fixture::new();
+    f.live("NOTE/Note/P/a.note", b"a");
+    std::fs::write(f.store.fs_path(&wp("NOTE/Note/P/.DS_Store")), b"dots").unwrap();
+    let ms = NOW - 50 * DAY;
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    let c = f
+        .store
+        .plan_delete(&g, &wp("NOTE/Note/P/a.note"), ms, Origin::Device, None)
+        .unwrap();
+    f.store.commit(&g, c, &f.journal).unwrap();
+    drop(g);
+    let lines = {
+        let g = f.store.lock().unwrap();
+        f.store.recycle_index(&g).unwrap()
+    };
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    let pruned = &lines[1];
+    assert_eq!(pruned.md5, "");
+    assert_eq!(pruned.path, "NOTE/Note/P");
+    let slot = f.slot_path(pruned);
+    assert!(slot.join(".DS_Store").is_file());
+
+    assert!(f.prune(NOW, Origin::Cli, false).removed.is_empty());
+    assert!(slot.join(".DS_Store").is_file());
+
+    let r = f.prune(ms + 91 * DAY, Origin::Cli, false);
+    assert_eq!(r.removed, lines);
+    assert!(r.failed.is_empty(), "{:?}", r.failed);
+    assert!(!f.recycle().join(ms.to_string()).exists());
+    assert!(!f.recycle().join(pruned.deleted_at.to_string()).exists());
+    assert_eq!(f.index_text(), "");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_recycle_bin_gives_one_message_and_prunes_nothing() {
+    let f = Fixture::new();
+    let s = scene(&f);
+    let moved = f.store.account_dir().join("elsewhere");
+    std::fs::rename(f.recycle(), &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, f.recycle()).unwrap();
+    for dry_run in [true, false] {
+        let r = f.prune(NOW, Origin::Cli, dry_run);
+        assert!(r.removed.is_empty());
+        assert_eq!(r.failed.len(), 1, "{:?}", r.failed);
+        assert_eq!(r.failed[0].location, "");
+    }
+    assert!(moved.join(s.old1.location()).is_file());
+    assert!(f.events().is_empty());
 }
 
 #[test]
@@ -611,10 +741,10 @@ fn a_slot_that_cant_be_removed_doesnt_stop_the_rest() {
         .prune_recycle(&f.journal, &RETENTION, NOW, offset(), Origin::Cli, false);
     set_mode(&parent, 0o755);
     let r = r.unwrap();
-    assert_eq!(
-        r.removed,
-        vec![stuck.clone(), folder.clone(), other.clone()]
-    );
+    // The stuck slot is a failure only: not removed, not counted in the bytes.
+    assert_eq!(r.removed, vec![folder.clone(), other.clone()]);
+    assert_eq!(r.removed_bytes, 1);
+    assert_eq!(r.kept, 0);
     assert_eq!(r.failed.len(), 1, "{:?}", r.failed);
     assert_eq!(r.failed[0].location, stuck.location());
     assert!(f.slot_path(&stuck).is_file());
@@ -668,8 +798,8 @@ impl Clock for FixedClock {
 }
 
 /// A data folder with accounts `slugs`, each with one live file and five versions of it: the
-/// two old ones (more than 12 months back) go, the three recent ones stay. Returns the state, with
-/// the clock at `NOW`, and the old entry of each account.
+/// two old ones (more than 12 months back) go, the three recent ones stay. Returns the temp
+/// folder and the state, with the clock at `NOW`.
 fn server_with(slugs: &[&str], config: Config) -> (tempfile::TempDir, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     for slug in slugs {
@@ -729,7 +859,9 @@ fn journal_events(state: &AppState) -> Vec<Event> {
 #[test]
 fn the_server_prune_covers_every_account_and_journals_origin_retention() {
     let (_dir, state) = server_with(&["anna", "ben"], Config::default());
-    assert_eq!(state.prune_recycle_all().unwrap(), 4);
+    let r = state.prune_recycle_all().unwrap();
+    assert_eq!(r.removed, 4);
+    assert!(r.problems.is_empty(), "{:?}", r.problems);
     let events = journal_events(&state);
     assert_eq!(events.len(), 4);
     for e in &events {
@@ -739,7 +871,7 @@ fn the_server_prune_covers_every_account_and_journals_origin_retention() {
     for slug in ["anna", "ben"] {
         assert_eq!(events.iter().filter(|e| e.account == slug).count(), 2);
     }
-    assert_eq!(state.prune_recycle_all().unwrap(), 0);
+    assert_eq!(state.prune_recycle_all().unwrap().removed, 0);
 }
 
 #[test]
@@ -753,20 +885,40 @@ fn the_hourly_prune_does_nothing_when_recycle_prune_is_off() {
     assert!(journal_events(&state).is_empty());
 
     let (_dir, state) = server_with(&["anna"], Config::default());
-    assert_eq!(state.hourly_recycle_prune().unwrap().unwrap(), 2);
+    assert_eq!(state.hourly_recycle_prune().unwrap().unwrap().removed, 2);
 }
 
+#[cfg(unix)]
 #[test]
 fn an_account_whose_prune_fails_doesnt_stop_the_others() {
-    let (_dir, state) = server_with(&["anna", "ben"], Config::default());
-    // The index of anna is a folder: it can't be read.
+    let (dir, state) = server_with(&["anna", "ben"], Config::default());
+    // The index of anna can't be read.
     let store = Store::open(&state.data_dir, "anna").unwrap();
     let index = store.recycle_dir().join("index.jsonl");
-    std::fs::remove_file(&index).unwrap();
-    std::fs::create_dir(&index).unwrap();
-    assert_eq!(state.prune_recycle_all().unwrap(), 2);
+    let tree = |root: &Path| {
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    };
+    let before = tree(&store.recycle_dir());
+    set_mode(&index, 0o000);
+    let r = state.prune_recycle_all();
+    set_mode(&index, 0o644);
+    let r = r.unwrap();
+    assert_eq!(r.removed, 2);
+    assert_eq!(r.problems.len(), 1, "{:?}", r.problems);
+    assert!(
+        r.problems[0].starts_with("account anna: recycle bin prune failed: "),
+        "{}",
+        r.problems[0]
+    );
     let events = journal_events(&state);
+    assert_eq!(events.len(), 2);
     assert!(events.iter().all(|e| e.account == "ben"));
+    // anna's lines and slots are untouched.
+    assert_eq!(tree(&store.recycle_dir()), before);
+    assert_eq!(std::fs::read_to_string(&index).unwrap().lines().count(), 5);
+    drop(dir);
 }
 
 #[test]

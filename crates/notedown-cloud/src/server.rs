@@ -226,8 +226,9 @@ impl AppState {
 
     /// Prune the recycle bin of every account by the `recycle_keep_*` settings, journaled with
     /// origin `retention`. Blocking. The offset for local days is read at each run (UTC, with a
-    /// warning, when it can't be read). Returns how many old versions were removed.
-    pub fn prune_recycle_all(&self) -> Result<usize> {
+    /// warning, when it can't be read). Returns how many old versions were removed and the
+    /// problems to report.
+    pub fn prune_recycle_all(&self) -> Result<crate::store::PruneAllReport> {
         let offset = crate::localtime::local_utc_offset().unwrap_or_else(|| {
             eprintln!(
                 "notedown cloud: can't read the local UTC offset; recycle days are counted in UTC"
@@ -245,7 +246,7 @@ impl AppState {
 
     /// The prune of the hourly sweep: `None` when `recycle_prune` is off, else
     /// [`AppState::prune_recycle_all`]. Blocking.
-    pub fn hourly_recycle_prune(&self) -> Option<Result<usize>> {
+    pub fn hourly_recycle_prune(&self) -> Option<Result<crate::store::PruneAllReport>> {
         self.config.recycle_prune.then(|| self.prune_recycle_all())
     }
 
@@ -343,9 +344,17 @@ pub async fn serve_until(
             // binary can come first.
             let st = state.clone();
             match tokio::task::spawn_blocking(move || st.hourly_recycle_prune()).await {
-                Ok(None) | Ok(Some(Ok(0))) => {}
-                Ok(Some(Ok(n))) => {
-                    eprintln!("notedown cloud: removed {n} old versions from the recycle bin")
+                Ok(None) => {}
+                Ok(Some(Ok(report))) => {
+                    for p in &report.problems {
+                        eprintln!("notedown cloud: {p}");
+                    }
+                    if report.removed > 0 {
+                        eprintln!(
+                            "notedown cloud: removed {} old versions from the recycle bin",
+                            report.removed
+                        );
+                    }
                 }
                 Ok(Some(Err(e))) => eprintln!("notedown cloud: recycle bin prune failed: {e}"),
                 Err(e) => eprintln!("notedown cloud: recycle bin prune failed: {e}"),

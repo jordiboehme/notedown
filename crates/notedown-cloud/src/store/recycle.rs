@@ -56,7 +56,8 @@ pub enum IndexLine {
 /// What a prune did (or would do, for a dry run).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PruneReport {
-    /// The removed lines, in index order.
+    /// The removed lines whose slots are gone, in index order. A line whose slot couldn't be
+    /// removed is only in `failed`.
     pub removed: Vec<RecycleEntry>,
     /// The size of the removed files (a missing slot or a folder counts 0).
     pub removed_bytes: u64,
@@ -64,8 +65,9 @@ pub struct PruneReport {
     pub kept: usize,
     /// Lines that stay because they can't be read (or name a slot outside `recycle/`).
     pub unreadable_kept: usize,
-    /// Slots that couldn't be removed, and lines kept because a part of their slot path is a
-    /// symlink. The prune goes on after each.
+    /// Slots that couldn't be removed (their lines are gone all the same), lines kept because
+    /// of a symlink in or below their slot path, and a symlinked `recycle/` (one entry, nothing
+    /// pruned). The prune goes on after each.
     pub failed: Vec<PruneFailure>,
 }
 
@@ -300,16 +302,18 @@ impl Store {
     ///
     /// A real run recovers an unfinished commit first, plans on the index read after that,
     /// journals one `recycle.pruned` per removed line (one batch, one `opId`), writes the new
-    /// index atomically and then removes the slots: a file only when it is a file, a folder
-    /// only when it is empty. Empty folders up to `recycle/` go too. A slot that can't be
-    /// removed is reported in `failed` and the prune goes on with the rest. A dry run takes
-    /// the plain lock and doesn't recover (recovery writes), so with an unfinished commit on
-    /// disk its plan can differ a little from the real run's.
+    /// index atomically and then removes the slots: a file only when it is a file. A folder
+    /// slot goes whole (dot-files and files without a line too) when no kept line has its slot
+    /// inside it; otherwise only its empty folders go. Empty folders up to `recycle/` go too.
+    /// A slot that can't be removed is reported in `failed` and the prune goes on with the
+    /// rest. A dry run takes the plain lock and doesn't recover (recovery writes), so with an
+    /// unfinished commit on disk its plan can differ a little from the real run's.
     ///
     /// A line that doesn't parse, or whose slot would leave `recycle/`, is kept unchanged and
     /// counted in `unreadable_kept`. A line with a symlink anywhere in its slot path (from
-    /// `recycle/` down) is kept and reported in `failed`: no symlink is ever followed. Kept
-    /// lines are written back byte for byte.
+    /// `recycle/` down), or inside its folder slot, is kept and reported in `failed`: no
+    /// symlink is ever followed. A symlinked `recycle/` prunes nothing and gives one entry in
+    /// `failed`. Kept lines are written back byte for byte.
     pub fn prune_recycle(
         &self,
         journal: &Journal,
@@ -326,12 +330,25 @@ impl Store {
         } else {
             _recovered = self.lock_recovered(journal)?;
         }
+        let root = self.recycle_dir();
+        if std::fs::symlink_metadata(&root).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Ok(PruneReport {
+                failed: vec![PruneFailure {
+                    location: String::new(),
+                    message: "it is a symlink, nothing is pruned".into(),
+                }],
+                ..PruneReport::default()
+            });
+        }
         let lines = self.read_index_lines()?;
-        // The readable lines with a slot inside `recycle/`, and where each is in `lines`.
+        // The readable lines with a slot inside `recycle/`, their slots and where each is in
+        // `lines`.
         let mut entries = Vec::new();
+        let mut slots = Vec::new();
         let mut at = Vec::new();
         let mut unreadable = 0;
-        let mut linked = Vec::new();
+        let mut failed = Vec::new();
+        let mut linked_slots = Vec::new();
         for (i, (_, entry)) in lines.iter().enumerate() {
             let Some((e, slot)) = entry
                 .as_ref()
@@ -341,42 +358,70 @@ impl Store {
                 continue;
             };
             if self.has_symlink(&slot) {
-                linked.push(PruneFailure {
+                failed.push(PruneFailure {
                     location: e.location(),
                     message: "a part of its path is a symlink, the line is kept".into(),
                 });
+                linked_slots.push(slot);
                 continue;
             }
             entries.push(e.clone());
+            slots.push(slot);
             at.push(i);
         }
+        let linked = linked_slots.len();
         let mut live = HashSet::new();
         for e in &entries {
             if !live.contains(&e.id) && self.path_of(e.id)?.is_some() {
                 live.insert(e.id);
             }
         }
-        let remove = super::retention::plan(
+        let mut remove = super::retention::plan(
             &entries,
             &|id| live.contains(&id),
             retention,
             now_ms,
             offset,
         );
-        let removed: Vec<RecycleEntry> = remove.iter().map(|&i| entries[i].clone()).collect();
-        let removed_bytes = removed
+        // A folder slot with a symlink inside keeps its line.
+        let is_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+        remove.retain(|&i| {
+            if is_dir(&slots[i]) && holds_symlink(&slots[i]) {
+                failed.push(PruneFailure {
+                    location: entries[i].location(),
+                    message: "it holds a symlink, the line is kept".into(),
+                });
+                false
+            } else {
+                true
+            }
+        });
+        // A folder slot goes whole when no kept line has its slot inside it.
+        let going: HashSet<usize> = remove.iter().copied().collect();
+        let kept_slots: Vec<&PathBuf> = (0..entries.len())
+            .filter(|i| !going.contains(i))
+            .map(|i| &slots[i])
+            .chain(&linked_slots)
+            .collect();
+        let whole: Vec<bool> = remove
             .iter()
-            .filter_map(|e| self.recycle_path(e).ok())
-            .filter_map(|p| std::fs::symlink_metadata(p).ok())
-            .filter(|m| m.is_file())
-            .map(|m| m.len())
-            .sum();
+            .map(|&i| is_dir(&slots[i]) && !kept_slots.iter().any(|k| k.starts_with(&slots[i])))
+            .collect();
+        let sizes: Vec<u64> = remove
+            .iter()
+            .map(|&i| {
+                std::fs::symlink_metadata(&slots[i])
+                    .ok()
+                    .filter(|m| m.is_file())
+                    .map_or(0, |m| m.len())
+            })
+            .collect();
         let mut report = PruneReport {
-            kept: entries.len() - removed.len() + linked.len(),
+            kept: entries.len() - remove.len() + linked,
             unreadable_kept: unreadable,
-            removed,
-            removed_bytes,
-            failed: linked,
+            removed: remove.iter().map(|&i| entries[i].clone()).collect(),
+            removed_bytes: sizes.iter().sum(),
+            failed,
         };
         if dry_run || report.removed.is_empty() {
             return Ok(report);
@@ -409,36 +454,47 @@ impl Store {
                 text.push(b'\n');
             }
         }
-        super::write_atomic_short(&self.recycle_dir().join(RECYCLE_INDEX), &text)?;
+        super::write_atomic_short(&root.join(RECYCLE_INDEX), &text)?;
 
-        // 3. the slots: files first, then folder lines, then the emptied folders above them.
+        // 3. the slots: files first, then folder slots, then the emptied folders above them.
         // A failure is reported and the rest goes on: the index no longer names these slots.
-        let mut slots = Vec::new();
+        let mut stuck = HashSet::new();
         let mut folders = Vec::new();
-        for e in &report.removed {
-            let Ok(slot) = self.recycle_path(e) else {
-                continue;
-            };
-            match std::fs::symlink_metadata(&slot) {
+        for (k, &i) in remove.iter().enumerate() {
+            let slot = &slots[i];
+            match std::fs::symlink_metadata(slot) {
                 Ok(m) if m.is_file() => {
-                    if let Err(err) = std::fs::remove_file(&slot) {
+                    if let Err(err) = std::fs::remove_file(slot) {
                         report.failed.push(PruneFailure {
-                            location: e.location(),
+                            location: entries[i].location(),
                             message: format!("can't remove it: {err}"),
                         });
+                        stuck.insert(k);
                     }
                 }
-                Ok(m) if m.is_dir() => folders.push(slot.clone()),
+                Ok(m) if m.is_dir() => folders.push(k),
                 _ => {}
             }
-            slots.push(slot);
         }
-        for folder in &folders {
-            remove_empty_folders(folder);
+        for k in folders {
+            let i = remove[k];
+            if !whole[k] {
+                remove_empty_folders(&slots[i]);
+                continue;
+            }
+            match std::fs::remove_dir_all(&slots[i]) {
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                    report.failed.push(PruneFailure {
+                        location: entries[i].location(),
+                        message: format!("can't remove it: {err}"),
+                    });
+                    stuck.insert(k);
+                }
+                _ => {}
+            }
         }
-        let root = self.recycle_dir();
-        for slot in &slots {
-            let mut dir = slot.parent();
+        for &i in &remove {
+            let mut dir = slots[i].parent();
             while let Some(d) = dir {
                 if d == root || !d.starts_with(&root) || std::fs::remove_dir(d).is_err() {
                     break;
@@ -451,6 +507,15 @@ impl Store {
                 location: String::new(),
                 message: format!("can't sync the folder: {err}"),
             });
+        }
+        // A slot that is still there is a failure only.
+        if !stuck.is_empty() {
+            let mut k = 0;
+            report.removed.retain(|_| {
+                k += 1;
+                !stuck.contains(&(k - 1))
+            });
+            report.removed_bytes -= stuck.iter().map(|&k| sizes[k]).sum::<u64>();
         }
         Ok(report)
     }
@@ -493,6 +558,19 @@ impl Store {
             })
             .collect()
     }
+}
+
+/// Whether there is a symlink anywhere below `dir` (none is followed). A folder that can't be
+/// read counts as none: removing it fails then and is reported.
+fn holds_symlink(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| match entry.file_type() {
+        Ok(t) if t.is_symlink() => true,
+        Ok(t) if t.is_dir() => holds_symlink(&entry.path()),
+        _ => false,
+    })
 }
 
 /// Remove the empty folders in `dir` bottom-up, `dir` last. Files and symlinks stay, and a

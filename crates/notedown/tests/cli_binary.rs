@@ -963,19 +963,38 @@ fn cloud_recycle_prune_without_server_toml_creates_nothing_and_reports_failures(
     assert!(!d.join("server.toml").exists());
     assert!(!d.join("journal").exists());
 
-    // a.pdf can't be removed: b.pdf still goes, the run lists both and exits with 1
+    // A line with a symlink in its slot path: a dry run reports it and still exits with 0.
+    let outside = d.join("outside");
+    std::fs::create_dir_all(outside.join("INBOX")).unwrap();
+    std::fs::write(outside.join("INBOX/c.pdf"), b"keep").unwrap();
+    std::os::unix::fs::symlink(&outside, recycle.join("3000")).unwrap();
+    let linked = "{\"id\":900002,\"path\":\"INBOX/c.pdf\",\"md5\":\"m\",\"deletedAt\":3000,\"reason\":\"deleted\"}\n";
+    let mut index = std::fs::read_to_string(recycle.join("index.jsonl")).unwrap();
+    index.push_str(linked);
+    std::fs::write(recycle.join("index.jsonl"), index).unwrap();
+    let out = prune(&["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("recycle/3000/INBOX/c.pdf: a part of its path is a symlink"),
+        "{err}"
+    );
+
+    // a.pdf can't be removed: b.pdf still goes, a.pdf is listed as an error only and the run
+    // exits with 1
     let stuck = recycle.join("1000/INBOX");
     std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555)).unwrap();
     let out = prune(&[]);
     std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(out.status.code(), Some(1));
     let text = stdout(&out);
-    assert!(text.starts_with("removed INBOX/a.pdf  "), "{text}");
-    assert!(text.contains("\nremoved INBOX/b.pdf  "), "{text}");
+    assert!(text.starts_with("removed INBOX/b.pdf  "), "{text}");
+    assert!(!text.contains("a.pdf"), "{text}");
     assert!(
-        text.ends_with("removed 2 old versions (0.0 MB), kept 0\n"),
+        text.ends_with("removed 1 old version (0.0 MB), kept 1\n"),
         "{text}"
     );
+    assert!(outside.join("INBOX/c.pdf").is_file());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         err.contains("recycle/1000/INBOX/a.pdf: can't remove it: "),

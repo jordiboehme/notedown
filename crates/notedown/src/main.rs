@@ -894,10 +894,12 @@ fn recycle_prune_command(args: RecyclePruneArgs) -> Result<ExitCode> {
             plural(report.unreadable_kept, "index line")
         );
     }
+    // A dry run only reports: it fails on nothing it found.
+    let label = if args.dry_run { "warning" } else { "error" };
     for f in &report.failed {
-        eprintln!("error: recycle/{}: {}", f.location, f.message);
+        eprintln!("{label}: recycle/{}: {}", f.location, f.message);
     }
-    Ok(if report.failed.is_empty() {
+    Ok(if args.dry_run || report.failed.is_empty() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)

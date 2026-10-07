@@ -405,6 +405,7 @@ fn convert(args: ConvertArgs) -> Result<ExitCode> {
     };
 
     let (mut converted, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+    let mut headers = 0usize;
     let run_start = Instant::now();
     let mut hinted = false;
     for (input, output) in found.iter().zip(&outputs) {
@@ -427,6 +428,10 @@ fn convert(args: ConvertArgs) -> Result<ExitCode> {
                 skipped += 1;
                 eprintln!("skipped {name} (unchanged)");
             }
+            Ok(Outcome::HeaderUpdated) => {
+                headers += 1;
+                eprintln!("updated the header of {name} (text unchanged, no OCR)");
+            }
             Err(e) => {
                 failed += 1;
                 let reason = format!("{e:#}");
@@ -438,8 +443,13 @@ fn convert(args: ConvertArgs) -> Result<ExitCode> {
             }
         }
     }
+    let headers = if headers > 0 {
+        format!(", {} updated", plural(headers, "header"))
+    } else {
+        String::new()
+    };
     eprintln!(
-        "done: {} converted, {} skipped, {} failed ({}s)",
+        "done: {} converted{headers}, {} skipped, {} failed ({}s)",
         converted,
         skipped,
         failed,

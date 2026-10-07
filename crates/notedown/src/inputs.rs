@@ -155,13 +155,27 @@ pub fn collect(paths: &[PathBuf], out: Option<&Path>) -> (Vec<Input>, Vec<String
 }
 
 /// The Markdown path of every input: `<rel without extension>.md` under `out` or next to
-/// the source. When two inputs map to the same path, the PNG one becomes `<name>.png.md`.
+/// the source. The Open Knowledge Format reserves `index.md` and `log.md` (any case), so
+/// such a source keeps its extension: `index.note.md`, `Log.png.md`. When two inputs map
+/// to the same path, the PNG one becomes `<name>.png.md`.
 pub fn output_paths(inputs: &[Input], out: Option<&Path>) -> Vec<PathBuf> {
     let plain: Vec<PathBuf> = inputs
         .iter()
-        .map(|i| match out {
-            Some(out) => out.join(&i.rel).with_extension("md"),
-            None => i.source.with_extension("md"),
+        .map(|i| {
+            let p = match out {
+                Some(out) => out.join(&i.rel),
+                None => i.source.clone(),
+            };
+            let reserved = p
+                .file_stem()
+                .is_some_and(|s| s.eq_ignore_ascii_case("index") || s.eq_ignore_ascii_case("log"));
+            if reserved {
+                let mut name = p.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+                name.push(".md");
+                p.with_file_name(name)
+            } else {
+                p.with_extension("md")
+            }
         })
         .collect();
     let mut note_paths = HashSet::new();

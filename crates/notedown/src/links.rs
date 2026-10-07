@@ -64,6 +64,49 @@ fn escape_label(s: &str) -> String {
         .replace(']', "\\]")
 }
 
+/// The absolute form of a path as its anchor (root, drive) and its names, with `.` and
+/// `..` folded away by the text alone: no symbolic link is followed, so `/var` and
+/// `/private/var` on macOS stay what the caller wrote.
+fn lexical_parts(path: &Path) -> Option<(std::ffi::OsString, Vec<std::ffi::OsString>)> {
+    let abs = std::path::absolute(path).ok()?;
+    let mut anchor = std::ffi::OsString::new();
+    let mut names = Vec::new();
+    for c in abs.components() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => anchor.push(c.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                names.pop();
+            }
+            Component::Normal(n) => names.push(n.to_os_string()),
+        }
+    }
+    Some((anchor, names))
+}
+
+/// The path from a folder to a file as `/`-separated parts (`..` to go up). `None` when
+/// the two are on different drives.
+pub(crate) fn relative_parts(from_dir: &Path, target: &Path) -> Option<Vec<String>> {
+    let (base_anchor, base) = lexical_parts(from_dir)?;
+    let (target_anchor, tgt) = lexical_parts(target)?;
+    if base_anchor != target_anchor {
+        return None;
+    }
+    let common = base.iter().zip(&tgt).take_while(|(a, b)| a == b).count();
+    let mut parts: Vec<String> = vec!["..".to_string(); base.len() - common];
+    parts.extend(
+        tgt[common..]
+            .iter()
+            .map(|n| n.to_string_lossy().into_owned()),
+    );
+    Some(parts)
+}
+
+/// [`relative_parts`] joined with `/`, without percent-encoding.
+pub fn relative_path(from_dir: &Path, target: &Path) -> Option<String> {
+    relative_parts(from_dir, target).map(|p| p.join("/"))
+}
+
 /// Maps the `FILE_ID` of a note to the Markdown file generated for it.
 #[derive(Debug, Clone, Default)]
 pub struct FileIndex {
@@ -140,19 +183,15 @@ impl FileIndex {
 
     /// The relative URL from the linking document to the target (spaces as `%20`).
     pub fn resolve(&self, file_id: &str, from_md: &Path) -> Option<String> {
-        let target = std::path::absolute(self.map.get(file_id)?).ok()?;
         let from = std::path::absolute(from_md).ok()?;
-        let base: Vec<Component> = from.parent()?.components().collect();
-        let tgt: Vec<Component> = target.components().collect();
-        let common = base.iter().zip(&tgt).take_while(|(a, b)| a == b).count();
-        let mut parts: Vec<String> = Vec::new();
-        for _ in common..base.len() {
-            parts.push("..".into());
-        }
-        for c in &tgt[common..] {
-            parts.push(encode_url(&c.as_os_str().to_string_lossy()));
-        }
-        (!parts.is_empty()).then(|| parts.join("/"))
+        let parts = relative_parts(from.parent()?, self.map.get(file_id)?)?;
+        (!parts.is_empty()).then(|| {
+            parts
+                .iter()
+                .map(|p| encode_url(p))
+                .collect::<Vec<_>>()
+                .join("/")
+        })
     }
 
     /// The same relative path without percent-encoding.
@@ -377,4 +416,29 @@ pub fn apply(links: &[Link], pages: &mut [PageResult], ctx: &LinkContext) -> Vec
         }
     }
     front
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_paths() {
+        let rel = |from: &str, to: &str| relative_path(Path::new(from), Path::new(to));
+        assert_eq!(rel("/n", "/n/Test 2.note").as_deref(), Some("Test 2.note"));
+        assert_eq!(
+            rel("/t/out", "/t/in/Test 2.note").as_deref(),
+            Some("../in/Test 2.note")
+        );
+        assert_eq!(rel("/a/b", "/a/X.note").as_deref(), Some("../X.note"));
+        assert_eq!(
+            rel("/t/a/../out/sub", "/t/in/./sub/x.png").as_deref(),
+            Some("../../in/sub/x.png")
+        );
+        assert_eq!(
+            rel("/t/out", "/t/out/../in/x.note").as_deref(),
+            Some("../in/x.note")
+        );
+        assert_eq!(rel("/", "/x.note").as_deref(), Some("x.note"));
+    }
 }

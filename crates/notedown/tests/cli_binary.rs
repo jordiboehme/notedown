@@ -29,6 +29,42 @@ fn convert_reports_missing_model_with_hint() {
 }
 
 #[test]
+fn convert_updates_an_old_header_without_loading_the_model() {
+    use sha2::Digest;
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("Test 2.note");
+    std::fs::copy(NOTE, &note).unwrap();
+    let sha = const_hex::encode(sha2::Sha256::digest(std::fs::read(&note).unwrap()));
+    let body = "\n<a id=\"page-1\"></a>\n## Page 1\n\nOld text\n";
+    let old = format!(
+        "---\nsource: Test 2.note\nsource_sha256: {sha}\nkind: supernote-note\npages: 1\n\
+         model: chandra-ocr-2 Q4_K_M\nconverted_at: \"2026-10-01T08:00:00Z\"\n\
+         generator: notedown {}\nkeywords: []\n---\n{body}",
+        env!("CARGO_PKG_VERSION")
+    );
+    std::fs::write(dir.path().join("Test 2.md"), old).unwrap();
+    // an empty model folder: loading the model would fail the run
+    let models = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .env("NOTEDOWN_MODEL_DIR", models.path())
+        .arg("convert")
+        .arg(&note)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("updated the header of Test 2.note"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("1 header updated"), "{stderr}");
+    assert!(!stderr.contains("loading model"), "{stderr}");
+    let md = std::fs::read_to_string(dir.path().join("Test 2.md")).unwrap();
+    assert!(md.starts_with("---\ntype: note\n"), "{md}");
+    assert!(md.ends_with(&format!("\n---\n{body}")), "{md}");
+}
+
+#[test]
 fn model_path_prints_cache_dir() {
     let dir = tempfile::tempdir().unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))

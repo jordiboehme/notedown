@@ -8,9 +8,11 @@ use notedown_ocr::convert::{LayoutBlock, html_to_markdown};
 use notedown_ocr::{OcrEngine, PageOcr};
 use sha2::{Digest, Sha256};
 
-use crate::document::{Frontmatter, FrontmatterDigest, PageOut, render_document};
+use crate::document::{
+    Frontmatter, FrontmatterDigest, HeaderFormat, PageOut, TRUNCATED_MARK, body_of, render_document,
+};
 use crate::inputs::{Input, InputKind};
-use crate::links::{FileIndex, LinkContext, apply as apply_links, encode_url};
+use crate::links::{FileIndex, LinkContext, apply as apply_links, encode_url, relative_path};
 
 #[derive(Debug, Clone, Default)]
 pub struct Options {
@@ -24,8 +26,12 @@ pub struct Options {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    Converted { pages: usize },
+    Converted {
+        pages: usize,
+    },
     Skipped,
+    /// Only the header of an older notedown file was rewritten; no OCR ran.
+    HeaderUpdated,
 }
 
 /// Where the pages of one input come from. Positions are 0-based.
@@ -253,9 +259,12 @@ pub fn process_pages(
     Ok(results)
 }
 
-/// `0.x` counts as the major version for 0-versions.
+/// `0.x` counts as the major version for 0-versions. Takes `notedown/<version>` and the
+/// old `notedown <version>`.
 fn major_key(generator: &str) -> Option<String> {
-    let version = generator.strip_prefix("notedown ")?;
+    let version = generator
+        .strip_prefix("notedown/")
+        .or_else(|| generator.strip_prefix("notedown "))?;
     let mut parts = version.split('.');
     let major = parts.next()?;
     if major == "0" {
@@ -265,24 +274,43 @@ fn major_key(generator: &str) -> Option<String> {
     }
 }
 
+/// Both header formats count: the parser turns the old `notedown 0.1.0` into `notedown/0.1.0`.
 fn written_by_notedown(output: &Path) -> bool {
     std::fs::read_to_string(output)
         .ok()
         .and_then(|t| Frontmatter::parse(&t))
-        .is_some_and(|fm| fm.generator.starts_with("notedown "))
+        .is_some_and(|fm| fm.generated_by.starts_with("notedown/"))
 }
 
-fn can_skip(output: &Path, sha: &str, model: &str, generator: &str) -> bool {
+/// What the existing Markdown file means for this run.
+enum Existing {
+    /// Missing, or the text is out of date: run OCR.
+    Convert,
+    /// Same source, model and notedown major version, in the current header format.
+    Current,
+    /// Like `Current`, but with the old header: rewrite the header, keep the body.
+    OldHeader(Box<Frontmatter>, String),
+}
+
+fn existing(output: &Path, sha: &str, model: &str, generator: &str) -> Existing {
     let Ok(text) = std::fs::read_to_string(output) else {
-        return false;
+        return Existing::Convert;
     };
     let Some(fm) = Frontmatter::parse(&text) else {
-        return false;
+        return Existing::Convert;
     };
-    fm.source_sha256 == sha
-        && fm.model == model
-        && major_key(&fm.generator).is_some()
-        && major_key(&fm.generator) == major_key(generator)
+    let same = fm.source_sha256 == sha
+        && fm.generated_model == model
+        && major_key(&fm.generated_by).is_some()
+        && major_key(&fm.generated_by) == major_key(generator);
+    match (same, fm.format, body_of(&text)) {
+        (false, _, _) => Existing::Convert,
+        (true, HeaderFormat::Okf, _) => Existing::Current,
+        (true, HeaderFormat::Old, Some(body)) => {
+            Existing::OldHeader(Box::new(fm), body.to_string())
+        }
+        (true, HeaderFormat::Old, None) => Existing::Convert,
+    }
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -302,11 +330,113 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn now_rfc3339() -> String {
-    let now = time::OffsetDateTime::now_utc();
-    let now = now.replace_nanosecond(0).unwrap_or(now);
-    now.format(&time::format_description::well_known::Rfc3339)
+fn rfc3339(at: time::OffsetDateTime) -> String {
+    let at = at.replace_nanosecond(0).unwrap_or(at);
+    at.format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default()
+}
+
+fn now_rfc3339() -> String {
+    rfc3339(time::OffsetDateTime::now_utc())
+}
+
+/// This computer's offset from UTC, read once per run; UTC when it cannot be read.
+fn local_offset() -> time::UtcOffset {
+    static OFFSET: std::sync::OnceLock<time::UtcOffset> = std::sync::OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        notedown_cloud::localtime::local_utc_offset().unwrap_or(time::UtcOffset::UTC)
+    })
+}
+
+/// `source_date` (the local calendar date) and `last_modified` (RFC 3339 UTC) of the
+/// source file's modification time; empty when the time cannot be read.
+fn source_times(source: &Path) -> (String, String) {
+    let Ok(modified) = std::fs::metadata(source).and_then(|m| m.modified()) else {
+        return (String::new(), String::new());
+    };
+    let at = time::OffsetDateTime::from(modified);
+    let date = at.to_offset(local_offset()).date();
+    (
+        format!(
+            "{:04}-{:02}-{:02}",
+            date.year(),
+            u8::from(date.month()),
+            date.day()
+        ),
+        rfc3339(at),
+    )
+}
+
+/// The OKF `description` of a converted input.
+fn description(kind: InputKind, pages: usize) -> String {
+    match kind {
+        InputKind::Note if pages == 1 => "Handwritten Supernote note, 1 page, read by OCR.".into(),
+        InputKind::Note => format!("Handwritten Supernote note, {pages} pages, read by OCR."),
+        InputKind::Png => "Handwritten Supernote page, read by OCR.".into(),
+    }
+}
+
+/// The source file relative to the folder of the Markdown file, with `/` separators;
+/// the absolute path when there is no relative one (another drive).
+fn resource_of(source: &Path, output: &Path) -> String {
+    let dir = match output.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    relative_path(dir, source).unwrap_or_else(|| {
+        std::path::absolute(source)
+            .unwrap_or_else(|_| source.to_path_buf())
+            .to_string_lossy()
+            .replace('\\', "/")
+    })
+}
+
+/// The header fields every run takes from the input file as it is now.
+struct SourceFields {
+    title: String,
+    resource: String,
+    source_date: String,
+    last_modified: String,
+}
+
+fn source_fields(input: &Input, output: &Path) -> SourceFields {
+    let (source_date, last_modified) = source_times(&input.source);
+    SourceFields {
+        title: input
+            .source
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        resource: resource_of(&input.source, output),
+        source_date,
+        last_modified,
+    }
+}
+
+/// Puts the current header on a file with the old header. The body stays byte for byte,
+/// `generated` keeps who read the text and when; the source fields are read again.
+fn update_header(input: &Input, output: &Path, old: Frontmatter, body: &str) -> Result<()> {
+    let src = source_fields(input, output);
+    let truncated = body.lines().any(|l| l == TRUNCATED_MARK);
+    let fm = Frontmatter {
+        title: src.title,
+        description: description(input.kind, old.pages),
+        resource: src.resource,
+        generated_by: old.generated_by,
+        generated_model: old.generated_model,
+        generated_at: old.generated_at,
+        source_date: src.source_date,
+        last_modified: src.last_modified,
+        status: if truncated { "draft" } else { "stable" }.into(),
+        source_sha256: old.source_sha256,
+        file_id: old.file_id.filter(|_| input.kind == InputKind::Note),
+        pages: old.pages,
+        keywords: old.keywords,
+        links: old.links,
+        digests: old.digests,
+        format: HeaderFormat::Okf,
+    };
+    write_atomic(output, format!("{}{body}", fm.render()).as_bytes())
 }
 
 /// Converts one input. Skips when the output is current (see the skip rule in the design).
@@ -326,9 +456,16 @@ pub fn convert_one(
         ));
     }
     let sha = const_hex::encode(Sha256::digest(&bytes));
-    let generator = format!("notedown {}", env!("CARGO_PKG_VERSION"));
-    if !opts.force && can_skip(output, &sha, engine.label(), &generator) {
-        return Ok(Outcome::Skipped);
+    let generator = format!("notedown/{}", env!("CARGO_PKG_VERSION"));
+    if !opts.force {
+        match existing(output, &sha, engine.label(), &generator) {
+            Existing::Current => return Ok(Outcome::Skipped),
+            Existing::OldHeader(old, body) => {
+                update_header(input, output, *old, &body)?;
+                return Ok(Outcome::HeaderUpdated);
+            }
+            Existing::Convert => {}
+        }
     }
 
     let stem = output
@@ -338,86 +475,94 @@ pub fn convert_one(
     let assets_name = format!("{stem}.assets");
     let dir = output.parent().unwrap_or_else(|| Path::new("."));
 
-    let (kind, file_id, keywords, notebook, results, fm_links, text_boxes, digests) =
-        match input.kind {
-            InputKind::Note => {
-                let policy = if opts.allow_unknown_version {
-                    VersionPolicy::AllowUnknown
-                } else {
-                    VersionPolicy::Strict
-                };
-                let nb = Notebook::from_bytes(bytes, policy)
-                    .with_context(|| format!("cannot read {}", input.source.display()))?;
-                let src = NoteSource {
-                    notebook: &nb,
-                    keep_template: opts.keep_template,
-                };
-                let mut results = process_pages(&src, engine, opts.images, &assets_name)?;
-                let page_ids: Vec<Option<String>> = nb.pages.iter().map(|p| p.id.clone()).collect();
-                let fm_links = apply_links(
-                    &nb.links,
-                    &mut results,
-                    &LinkContext {
-                        index,
-                        from_md: output,
-                        page_ids: &page_ids,
-                        width: nb.width,
-                        height: nb.height,
-                    },
-                );
-                let (text_boxes, digests) = collect_text_boxes(&src, &mut |w| {
-                    eprintln!("warning: {}: {w}", input.rel.display())
-                });
-                let keywords = nb
-                    .keywords
-                    .iter()
-                    .filter_map(|k| {
-                        let text = k.text.as_deref()?.trim();
-                        (!text.is_empty()).then(|| format!("p{}: {text}", k.page + 1))
-                    })
-                    .collect::<Vec<_>>();
-                (
-                    "supernote-note",
-                    nb.file_id.clone(),
-                    keywords,
-                    Some(nb),
-                    results,
-                    fm_links,
-                    text_boxes,
-                    digests,
-                )
-            }
-            InputKind::Png => {
-                let src = PngSource {
-                    png: load_png_page(&bytes)
-                        .with_context(|| format!("cannot read {}", input.source.display()))?,
-                };
-                let results = process_pages(&src, engine, opts.images, &assets_name)?;
-                (
-                    "png",
-                    None,
-                    Vec::new(),
-                    None,
-                    results,
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                )
-            }
-        };
+    let (file_id, keywords, notebook, results, fm_links, text_boxes, digests) = match input.kind {
+        InputKind::Note => {
+            let policy = if opts.allow_unknown_version {
+                VersionPolicy::AllowUnknown
+            } else {
+                VersionPolicy::Strict
+            };
+            let nb = Notebook::from_bytes(bytes, policy)
+                .with_context(|| format!("cannot read {}", input.source.display()))?;
+            let src = NoteSource {
+                notebook: &nb,
+                keep_template: opts.keep_template,
+            };
+            let mut results = process_pages(&src, engine, opts.images, &assets_name)?;
+            let page_ids: Vec<Option<String>> = nb.pages.iter().map(|p| p.id.clone()).collect();
+            let fm_links = apply_links(
+                &nb.links,
+                &mut results,
+                &LinkContext {
+                    index,
+                    from_md: output,
+                    page_ids: &page_ids,
+                    width: nb.width,
+                    height: nb.height,
+                },
+            );
+            let (text_boxes, digests) = collect_text_boxes(&src, &mut |w| {
+                eprintln!("warning: {}: {w}", input.rel.display())
+            });
+            let keywords = nb
+                .keywords
+                .iter()
+                .filter_map(|k| {
+                    let text = k.text.as_deref()?.trim();
+                    (!text.is_empty()).then(|| format!("p{}: {text}", k.page + 1))
+                })
+                .collect::<Vec<_>>();
+            (
+                nb.file_id.clone(),
+                keywords,
+                Some(nb),
+                results,
+                fm_links,
+                text_boxes,
+                digests,
+            )
+        }
+        InputKind::Png => {
+            let src = PngSource {
+                png: load_png_page(&bytes)
+                    .with_context(|| format!("cannot read {}", input.source.display()))?,
+            };
+            let results = process_pages(&src, engine, opts.images, &assets_name)?;
+            (
+                None,
+                Vec::new(),
+                None,
+                results,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        }
+    };
 
+    let src = source_fields(input, output);
     let fm = Frontmatter {
-        source: input.rel.to_string_lossy().replace('\\', "/"),
+        title: src.title,
+        description: description(input.kind, results.len()),
+        resource: src.resource,
+        generated_by: generator,
+        generated_model: engine.label().to_string(),
+        generated_at: now_rfc3339(),
+        source_date: src.source_date,
+        last_modified: src.last_modified,
+        status: if results.iter().any(|r| r.out.truncated) {
+            "draft"
+        } else {
+            "stable"
+        }
+        .into(),
         source_sha256: sha,
-        kind: kind.to_string(),
         file_id,
         pages: results.len(),
-        model: engine.label().to_string(),
-        converted_at: now_rfc3339(),
-        generator,
         keywords,
         links: fm_links,
         digests,
+        format: HeaderFormat::Okf,
     };
 
     if opts.images {
@@ -433,7 +578,7 @@ pub fn convert_one(
     }
     if opts.debug {
         let debug = serde_json::json!({
-            "source": fm.source,
+            "source": input.rel.to_string_lossy().replace('\\', "/"),
             "notebook": notebook.as_ref().map(|nb| serde_json::json!({
                 "signature": nb.signature,
                 "file_id": nb.file_id,
@@ -615,5 +760,8 @@ mod tests {
         assert_eq!(major_key("notedown 0.1.7"), major_key("notedown 0.1.0"));
         assert_ne!(major_key("notedown 0.2.0"), major_key("notedown 0.1.0"));
         assert_eq!(major_key("notedown 1.4.2"), Some("1".into()));
+        assert_eq!(major_key("notedown/0.1.3"), major_key("notedown 0.1.0"));
+        assert_eq!(major_key("notedown/2.0.0"), Some("2".into()));
+        assert_eq!(major_key("other/0.1.0"), None);
     }
 }

@@ -25,6 +25,8 @@ Every statement carries one or more tags:
 | [proposal] | Design proposal for notedown, not observed protocol |
 | [capture:nomad-3.29.42] | Observed by notedown's capture server (`notedown serve --capture`) with a Nomad on firmware Chauvet 3.29.42, 2026-10-06; see 9.1 |
 
+Since 2026-10-08, [ratta-server] statements about behaviour (what the server does, in which order, with which answer) come from an analysis of `supernote-service` 26.06.04; section 4 is based on it. Older [ratta-server] statements came from strings, names and configuration only.
+
 "Device-confirmed" means a community project reports it from traffic of a real device. Facts confirmed by two independent sources are marked with both tags.
 
 ### 0.2 Secrets
@@ -44,7 +46,7 @@ Ratta's server contains hard-coded keys (JWT signing string, URL signing key, so
 
 | Component | Role | Source |
 |---|---|---|
-| `supernote-service` container | nginx (container port 8080, optional 443), Spring Boot backend on 19071, socket.io (netty-socketio) on 18072 (file and digest channel) and 18073 (task channel), Node.js web UI on 9888 | [ratta-server] [doc] |
+| `supernote-service` container | nginx (container port 8080, optional 443), Spring Boot backend on 19071, socket.io (netty-socketio) on 18072 (file, to-do and digest), a second socket.io server on 18073 without listeners, Node.js web UI on 9888 | [ratta-server] [doc] |
 | MariaDB `supernotedb` | metadata: users, files, digests, tasks, devices, logs | [ratta-server] |
 | Redis | tokens, random login codes, sync lock, socket message queues, counters | [ratta-server] [community:ultrabridge] |
 | `notelib` container (TCP 6000) | renders `.note` to PDF/PNG for the web UI and conversion requests; length-prefixed JSON over raw TCP with business codes `T01` (note to PDF), `T02` (note to PNG), `T03` (page count) | [ratta-server] [community:allenporter] |
@@ -58,7 +60,7 @@ Ratta's server contains hard-coded keys (JWT signing string, URL signing key, so
 | 19072 (host) to 8080 (container nginx) | everything the device and browser use: `/` web UI (to 9888), `/api/` backend (to 19071), `/socket.io/` auto sync (to 18072) | [doc] [ratta-server nginx.conf] |
 | 19071 | backend directly (also published by the compose file) | [ratta-server] |
 | 18072 | socket.io for auto sync; Ratta's doc calls it optional ("needed only for automatic sync") | [doc] [ratta-server] |
-| 18073 | second socket.io server for the task channel; nginx does not route to it, the device never opens it | [ratta-server] [community:ultrabridge] |
+| 18073 | second socket.io server; it starts but has no listeners, nginx does not route to it, the device never opens it | [ratta-server] [community:ultrabridge] |
 | 443 / 19443 | HTTPS; Ratta ships nginx with an optional `listen 443 ssl` and recommends a reverse proxy with a public certificate | [doc] [ratta-server] |
 
 nginx forwards `X-Forwarded-Host`, `X-Forwarded-Port` and `X-Forwarded-Proto` to the backend, and the backend builds absolute upload and download URLs (`<scheme>://<host>:<port>/api/oss/...`) from them [ratta-server]. A reimplementation must therefore build URLs that the device can reach, from the request's Host header or from configuration [community:opennotecloud uses a configured base URL] [inferred].
@@ -275,7 +277,7 @@ POST /api/file/2/files/synchronous/start
 
 - `synType` true = normal compare; false = the device should upload all its files without comparing (used when the server is empty) [ratta-server field description] [community:allenporter returns false for an empty account].
 - Locking: one sync per account. Another device starting a sync while the lock is held gets `E0078` ("A device is currently synchronizing") [ratta-server] [community:allenporter]. Ratta's lock lives `lock_cloud_time` = 30 s and every sync endpoint extends it; uploads and downloads extend it by an amount based on file size [ratta-server: config and log strings]. allenporter uses a 5 min lock [community:allenporter].
-- Ratta also pushes `STARTSYNC` (or `WAITING`) to the user's other connected devices over socket.io (section 4) [ratta-server].
+- Ratta sends no push on `synchronous/start` (`WAITING` is never sent). It pushes `STARTSYNC` on `synchronous/end` (4.5) [ratta-server].
 
 #### synchronous/end
 
@@ -453,14 +455,18 @@ The device never computes a signature; it uses the URLs as given [community:ultr
 
 ## 4. Auto sync (socket.io)
 
+Statements tagged [ratta-server] in this section describe behaviour of Ratta's server as read in its analyzed code (0.1). Class names are given as evidence.
+
 ### 4.1 Transport
 
-- Engine.IO protocol 3 (socket.io 2.x wire), WebSocket transport, path `/socket.io/`, default namespace `/` [ratta-server: netty-socketio] [community:ultrabridge] [community:allenporter] [community:opennotecloud].
-- On Ratta's setup it reaches port 18072 through the same external port as the REST API (nginx `location /socket.io/`) [ratta-server] [doc].
-- Ratta settings: `socket.pinginterval=5000`, `socket.pingtimeout=25000` (ms) [ratta-server]. opennotecloud announces the values swapped (25000/5000) and still works [community:opennotecloud]; use Ratta's values [inferred].
+- Engine.IO protocol 3 (socket.io 2.x wire), WebSocket transport, path `/socket.io/`, default namespace `/` only, no rooms [ratta-server: netty-socketio 2.0.3] [community:ultrabridge] [community:allenporter] [community:opennotecloud]. Ratta selects recipients by Redis keys, not by rooms [ratta-server].
+- One socket server on port 18072 carries all listeners: file, to-do and digest (`SocketIoConfiguration`, `SocketIOEventHandler`) [ratta-server]. On Ratta's setup it is reached through the same external port as the REST API (nginx `location /socket.io/`) [ratta-server] [doc].
+- A second server on 18073 (`socketIOServerStask`) is started but has no listeners. It is not a task channel [ratta-server]. The device opens only one socket [community:ultrabridge].
+- Ratta settings: ping interval 5000 ms, ping timeout 25000 ms [ratta-server]. opennotecloud announces the values swapped (25000/5000) and still works [community:opennotecloud]; use Ratta's values [inferred].
+- Ack mode is the library default `AUTO_SUCCESS_ONLY`: after a listener ran without error, the server sends an empty ack `43<id>[]`, but only if the client packet carried an ack id [ratta-server: `Configuration`, `Namespace`, `AckRequest`].
 - permessage-deflate is not needed [community:ultrabridge, device-confirmed].
 
-### 4.2 Handshake and auth
+### 4.2 Handshake and session
 
 ```
 GET /socket.io/?token=<JWT>&type=<equipmentNo>&random=<ms>&sign=<sig>&EIO=3&transport=websocket
@@ -471,75 +477,131 @@ GET /socket.io/?token=<JWT>&type=<equipmentNo>&random=<ms>&sign=<sig>&EIO=3&tran
 | `token` | the login JWT (in the query string, not a header) | [ratta-server] [community:ultrabridge] [community:allenporter] |
 | `type` | device serial in device traces; `ANDROID<uuid>` in another trace (probably another client app) | [community:ultrabridge] [community:allenporter] |
 | `random` | client time in ms, used as nonce | same |
-| `sign` | keyed hash over token, type and random; checked by Ratta, failure closes the connection | [ratta-server] [community:allenporter] [community:ultrabridge] |
+| `sign` | keyed hash over the string `<token>_<type>_<random>` | [ratta-server: `SignVerifierSocketIO`] |
 | `EIO`, `transport` | `3`, `websocket` | same |
 
-- `sign` can be accepted and ignored: the token check is enough and devices connect fine [community:ultrabridge] [community:opennotecloud]. The key for `sign` is a Ratta secret and is not given here (0.2).
-- Ratta rejects a bad token or sign by emitting `ServerMessage` with `{"code":"403","msg":"..."}` and disconnecting [ratta-server strings] [community:allenporter] [community:opennotecloud].
-- Server speaks first: Engine.IO open packet `0{"sid":"<id>","upgrades":[],"pingInterval":5000,"pingTimeout":25000}`, then immediately the Socket.IO connect packet `40`. The device does not send its own `40` for the default namespace; without the server's `40` it never considers itself connected and reconnects with growing back-off (30/60/120/240 s) [community:ultrabridge, from the device's socket library and hardware] [community:opennotecloud sends the same].
-- If the client sends `40` anyway, answer `40` [community:ultrabridge].
-- After login the device retries the socket about every 5 s until it connects [community:ultrabridge]. Connections last minutes and get re-established [community:ultrabridge].
+- The server speaks first: Engine.IO open packet, then the Socket.IO connect packet `40` [ratta-server: `AuthorizeHandler`]. The open packet lists `"upgrades":["websocket"]` on Ratta [ratta-server]. A device-confirmed open packet is `0{"sid":"<id>","upgrades":[],"pingInterval":5000,"pingTimeout":25000}` [community:ultrabridge] [community:opennotecloud]. The device does not send its own `40` for the default namespace; without the server's `40` it never considers itself connected and reconnects with growing back-off (30/60/120/240 s) [community:ultrabridge]. If the client sends `40` anyway, answer `40` [community:ultrabridge].
+- Sign check: on failure the server emits `ServerMessage` with a JSON string (`code` `"403"` and a Chinese `msg`), then disconnects [ratta-server]. The key for `sign` is a Ratta secret and is not given here (0.2). `sign` can be accepted and ignored [community:ultrabridge] [community:opennotecloud].
+- On connect the token is only decoded: `userId` is read from the JWT claim `userId` without a signature check. If it is missing: the same 403 and disconnect [ratta-server: `JwtTokenUtil`]. The full token check runs later on every `ratta_ping`, `status`, to-do and digest event (4.3).
+- On success Ratta writes three Redis keys with a 10 min TTL, one per channel: `<userId>_fileSocket_<type>_<random>`, `<userId>_todoSocket_<type>_<random>` and `<userId>_digestSocket_<type>_<random>`. Each value names the session (`<session>_<userId>_<type>_file`, `_todo`, `_digest`) and is also the key of that session's message queue (a Redis sorted set) [ratta-server].
+- Nothing is sent on connect, and the queue is not flushed on connect [ratta-server].
+- Online rule: a session is online while its key `<userId>_fileSocket_<type>_<random>` exists. Only `ratta_ping` and `ClientMessage "status"` refresh it (10 min). Engine.IO pings do not [ratta-server].
+- Disconnect: all six keys (three channel keys, three queues) are deleted. Queued and unacknowledged messages are lost. If `<userId>_lockCloud` holds this session's token, type and random, the sync lock is released [ratta-server].
+- After login the device retries the socket about every 5 s until it connects. Connections last minutes and get re-established [community:ultrabridge].
 
-### 4.3 Heartbeats and acknowledgements
+### 4.3 Events and answers
 
-The sources disagree on what the device sends [community:ultrabridge docs contradict each other; community:allenporter; community:opennotecloud]. A server must answer all of these [inferred]:
+Token check (used below): the JWT is verified, its `key` claim is looked up in Redis, and the stored value must equal the token. On failure the server disconnects and deletes the session keys [ratta-server].
 
-| Client sends | Server answers | Source |
+| Client sends | Server does | Source |
 |---|---|---|
-| Engine.IO ping `2` | pong `3` | [community:ultrabridge] [community:opennotecloud] |
-| `42["ratta_ping", ...]` | `42["ratta_ping","Received"]` | [ratta-server event names] [community:allenporter] [community:opennotecloud] [community:ultrabridge code] |
-| `42["ClientMessage","status"]` | `42["ServerMessage","true"]` | [ratta-server strings `status`, `true`] [community:allenporter] [community:opennotecloud] |
-| `42["ClientMessage","Received"]` | nothing; marks pending file messages delivered | [ratta-server] [community:allenporter] |
+| Engine.IO ping `2` | pong `3` (library) | [ratta-server] [community:ultrabridge] [community:opennotecloud] |
+| `42["ratta_ping", ...]` (any or no argument) | token check; `42["ratta_ping","Received"]`; refresh the channel keys and queue TTLs; flush the file queue (`ServerMessage`), then the to-do queue, then the digest queue; ack `43<id>[]` if an ack id was given | [ratta-server: `SocketIOEventHandler`, `SocketIOTaskEventHandler`, `SetocketIODigestEventHandler`] |
+| `42["ClientMessage","status"]` | token check; `42["ServerMessage","true"]`; refresh the file keys; flush the file queue only | [ratta-server] |
+| `42["ClientMessage","Received"]` | removes the sent entries from the file queue; ack `43<id>[]` if an ack id was given (`430[]` for `420[...]`) | [ratta-server] |
+| `42["ClientMessage","<other string>"]` | ack `43<id>["Received"]` if an ack id was given | [ratta-server] |
+| `to-do` `"Received"` / `digest` `"Received"` | token check; removes the sent entries from that queue; ack `43<id>[]` if an ack id was given | [ratta-server] |
 
-Firmware 3.29.42 sends, every 5 s, both an Engine.IO `2` and `42["ratta_ping"]` (no argument), right after each other; it sends no `ClientMessage "status"` and no `40` [capture:nomad-3.29.42].
+Firmware 3.29.42 sends, every 5 s, both an Engine.IO `2` and `42["ratta_ping"]` (no argument), right after each other; it sends no `ClientMessage "status"` and no `40` [capture:nomad-3.29.42]. It acknowledges a `ServerMessage` push with `420["ClientMessage","Received"]`, an event with ack id 0 (9.3); Ratta answers that with `430[]` [ratta-server].
 
-### 4.4 Channels and event names
+### 4.4 From change to push
 
-| Channel | Event (server to device) | `msgType` | Triggers | Source |
-|---|---|---|---|---|
-| file | `ServerMessage` | `FILE-SYN` | file/folder added, changed, moved, copied, deleted by another client; sync started elsewhere | [ratta-server] [community:ultrabridge] [community:allenporter] |
-| task | `to-do` | `TASK-SYN` | tasks or task sort changed | [ratta-server] [community:ultrabridge] |
-| digest | `digest` | `DIGEST-SYN` | digest added, updated, deleted elsewhere | [ratta-server] [community:ultrabridge] |
+| Channel | Event (server to device) | `msgType` | Source |
+|---|---|---|---|
+| file | `ServerMessage` | `FILE-SYN` | [ratta-server] [community:ultrabridge] [community:allenporter] |
+| to-do | `to-do` | `TASK-SYN` | [ratta-server] [community:ultrabridge] |
+| digest | `digest` | `DIGEST-SYN` | [ratta-server] [community:ultrabridge] |
 
+- All three events go over the one socket on 18072 [ratta-server]. Task pushes on the `to-do` event over the main socket work [community:ultrabridge, device-confirmed].
 - The event name decides the handler on the device, not `msgType`: the device's task service listens on `to-do` and starts a task sync on any message [community:ultrabridge].
-- The payload is sent as one **string** argument holding JSON (`42["ServerMessage","{\"code\":\"200\",...}"]`); the device parses `args[0]` [community:ultrabridge] [ratta-server] [inferred for to-do].
-- Ratta queues messages per connection in Redis and sends them when the next heartbeat arrives; it drops a push if the previous push to that client was less than 5 s ago [ratta-server log strings]. A server can also push immediately [community:ultrabridge task push works].
-- notedown: with `sync = "accept"` the server pushes to the bound and connected devices of the account after a file or folder change by `put`, an import or another device. By default (`push = "reconnect"`) the push closes the device's WebSocket (close code 1001, reason `sync`, without a socket.io disconnect packet, which a client treats as final); the device connects again and runs a full sync (9.3). The message forms send one `ServerMessage` with one `STARTSYNC` item, or one item per change. `equipmentNo` is the serial of the device that caused the change, or `"null-null"` for the CLI. The server pushes only while no sync lock is held, at most once per 5 s per device, and never to the device that caused the change. A session that sent no frame for more than 15 s (three heartbeats) counts as not connected: its push waits for the next session, so a push never goes into the half-open socket of a sleeping device. The `push` key of `server.toml` switches the form: `reconnect` (default), `startsync`, `detail` (one item per changed file or folder with the fields of 4.5) or `off`. Firmware 3.29.42 acknowledges both message forms but syncs on neither (9.3) [capture:nomad-3.29.42].
-- Ratta runs the task channel on a second socket server (18073) that nginx does not expose; the device opens only one socket. Task pushes on the `to-do` event over the main socket work [community:ultrabridge, device-confirmed].
+- The payload is one **string** argument holding JSON (`42["ServerMessage","{\"code\":\"200\",...}"]`); the device parses `args[0]` [ratta-server] [community:ultrabridge].
+
+Producer [ratta-server: `SocketIoMessageInfo`, `AsyncConfig`]:
+
+- A REST handler calls an asynchronous method (pool of 20 to 50 threads). It sleeps 1 s, then puts the message into the queues of the recipients. Nothing is sent at the time of the change.
+- No Redis pub/sub. The queues are Redis sorted sets, used from one JVM.
+
+Recipients [ratta-server: `SocketIOEventHandler`; to-do and digest the same]:
+
+- The REST header `channel` is parsed as `<token>_<type>_<random>`. It gives the sender's channel and its `type`. A missing or empty header gives none.
+- All `<userId>_fileSocket_*` keys of the user are listed. Without a sender channel, every session of the user gets the message, including the session of the device that caused it. With a sender channel, every session whose queue key contains the sender's `type` is skipped (substring match).
+- Device file-sync calls carry an empty `channel` header (9.1), so the device that caused a file change is not excluded. Digest and to-do calls carry a `channel` header, so their sender is excluded.
+- One queue entry per recipient, with status "not sent". Queue TTL: 10 min for file, 30 min for to-do and digest.
+
+Delivery, only inside the `ratta_ping` and `status` handlers [ratta-server: `pushMessageToChannel`]:
+
+1. If an entry with status "sent" was sent less than 5 s ago, nothing is sent now. The message is deferred, not dropped.
+2. Otherwise all entries are merged into one item list and stored back as one entry with status "sent" and the time of now.
+3. If Redis holds no valid token for the user, nothing is sent.
+4. The server emits `ServerMessage` with one string argument (the envelope JSON of 4.5).
+5. `ClientMessage "Received"` removes the sent entries. Without it, the merged items are sent again at the next heartbeat that comes at least 5 s later, merged with any new items.
+
+- Latency: about 1 s plus up to one `ratta_ping` interval.
+- To-do and digest have no 5 s gate: they are sent again on every `ratta_ping` until `"Received"`.
+- No gating by firmware, version, device type or serial pattern in the socket code.
+
+notedown [notedown's current behaviour]: with `sync = "accept"` the server pushes to the bound and connected devices of the account after a file or folder change by `put`, an import or another device. By default (`push = "reconnect"`) the push closes the device's WebSocket (close code 1001, reason `sync`, without a socket.io disconnect packet, which a client treats as final); the device connects again and runs a full sync (9.3). The message forms send one `ServerMessage` with one `STARTSYNC` item, or one item per change. `equipmentNo` is the serial of the device that caused the change, or `"null-null"` for the CLI. The server pushes immediately (not inside the heartbeat handler), only while no sync lock is held, at most once per 5 s per device, and never to the device that caused the change. A session that sent no frame for more than 15 s (three heartbeats) counts as not connected: its push waits for the next session, so a push never goes into the half-open socket of a sleeping device. The `push` key of `server.toml` switches the form: `reconnect` (default), `startsync`, `detail` (one item per changed file or folder) or `off`. These message forms differ from Ratta's: they send `STARTSYNC` for a server-side change and an envelope with `"msg":""` and null fields, and notedown does not ack `420["ClientMessage","Received"]`. Firmware 3.29.42 acknowledges both message forms but syncs on neither (9.3) [capture:nomad-3.29.42].
 
 ### 4.5 Payloads
 
-File channel (`SocketMessageData`, items `SocketIoMessageTemplate`) [ratta-server] [community:ultrabridge example]:
+All payloads are serialized with plain Gson: fields that are null are left out, and there is no `msg` key [ratta-server]. The top-level `timestamp` is the send time; an item `timestamp` is the time the item was built [ratta-server].
+
+File channel (`SocketMessageData`, items `SocketIoMessageTemplate`) [ratta-server]. Example, a web upload:
 
 ```json
-{"code": "200", "msg": "", "timestamp": 1791270408879, "msgType": "FILE-SYN",
- "data": [{"messageType": "MOVEFILE", "equipmentNo": "SN078C10000001", "fileType": "FILE",
-           "id": 4711, "newId": null, "originalName": "Bike.note", "newName": "Bike 2026.note",
-           "md5": "0cc175b9c0f1b6a831c399e269772661", "size": 1135077,
-           "directoryId": 102, "goDirectoryId": 5120,
-           "originalPath": "NOTE/Note/", "newPath": "NOTE/Note/Archive/", "timestamp": 1791270408000}]}
+{"code": "200", "timestamp": 1791270409912, "msgType": "FILE-SYN",
+ "data": [{"messageType": "DOWNLOADFILE", "equipmentNo": "null-null", "fileType": "FILE",
+           "id": 4711, "originalName": "Bike.note", "newName": "Bike.note",
+           "md5": "0cc175b9c0f1b6a831c399e269772661", "size": 1135077, "directoryId": 102,
+           "originalPath": "NOTE/Note/", "newPath": "NOTE/Note/", "timestamp": 1791270408879}]}
 ```
 
-| `messageType` | Meaning | Source |
-|---|---|---|
-| `DOWNLOADFILE` | new file on the server (constant named ADDFILE) | [ratta-server] |
-| `ADDFOLDER` | new folder | [ratta-server] |
-| `MODIFYFILE` / `MODIFYFOLDER` | renamed or content changed | [ratta-server] [community:ultrabridge web rename] |
-| `MOVEFILE` / `MOVEFOLDER` | moved | [ratta-server] |
-| `COPYFILE` / `COPYFOLDER` | copied (`newId`, `goDirectoryId` set) | [ratta-server] [community:ultrabridge] |
-| `DELETEFILE` / `DELETEFOLDER` | deleted | [ratta-server] |
-| `STARTSYNC` / `WAITING` | another device started a sync / must wait | [ratta-server] [community:ultrabridge] |
+- Envelope: `code` `"200"` (string), `timestamp` (number), `msgType` `"FILE-SYN"`, `data[]`.
+- Item fields: `messageType`, `equipmentNo`, `fileType` (`FILE` or `FOLDE`, sic), `id`, `newId`, `originalName`, `newName`, `md5`, `size`, `directoryId`, `goDirectoryId`, `originalPath`, `newPath`, `timestamp`. `id`, `newId`, `size`, `directoryId`, `goDirectoryId` and `timestamp` are numbers. Each message type fills only some of them.
+- `equipmentNo` is always `"<x>-<y>"`: the `equipmentNo` argument of the call, a hyphen, and the `type` from the `channel` header. A web action gives `"null-null"`; a device call with an empty `channel` header gives `"<serial>-null"` [ratta-server] [community:ultrabridge saw "null-null" for web actions].
 
-`fileType` is `FILE` or `FOLDE` (sic) [ratta-server]. For web UI actions `equipmentNo` was `"null-null"` [community:ultrabridge]. Sending `STARTSYNC` makes a connected device run a sync; this is how a server can make the device pick up server-side changes [community:ultrabridge] [community:opennotecloud] [inferred]. Firmware 3.29.42 acknowledged a `STARTSYNC` push with `420["ClientMessage","Received"]` but did not start a sync (9.3) [capture:nomad-3.29.42].
+| `messageType` | Trigger | Fields | Source |
+|---|---|---|---|
+| `DOWNLOADFILE` | upload finish from the web or the device, terminal upload, restore from the recycle bin, a converted image finished | `fileType` `FILE`, `id`, `md5`, `originalName` = `newName`, `originalPath` = `newPath`, `directoryId`, `size`; no `goDirectoryId`, no `newId` | [ratta-server: `FileLocalWebServiceImpl`, `FileServiceImpl`, `FileUploadServiceImpl`] |
+| `ADDFOLDER` | folder created on the web or the device, also the missing parents of a device upload | `fileType` `FOLDE`, `size` 0 | [ratta-server] |
+| `MODIFYFILE` / `MODIFYFOLDER` | rename | | [ratta-server] [community:ultrabridge web rename] |
+| `MOVEFILE` / `MOVEFOLDER` | move; a file move carries `goDirectoryId`. A device move mixes `ADDFOLDER`, `MODIFY*` and `MOVE*` items | | [ratta-server] |
+| `COPYFILE` / `COPYFOLDER` | copy | with `newId` and `goDirectoryId` | [ratta-server] [community:ultrabridge] |
+| `DELETEFILE` / `DELETEFOLDER` | delete | no `newName` | [ratta-server] |
+| `STARTSYNC` | only on a device's `synchronous/end` and at the end of a history sync | only `messageType`, `equipmentNo`, `timestamp` | [ratta-server: `FileLocalServiceImpl`, `FinishSynchronousServiceImpl`] |
+| `WAITING` | never sent (the code path returns at once) | | [ratta-server] |
 
-Task channel (`SocketTaskMessageData`, items `ScheduleMessageTemplate`): `{"code":"200","msg":"","timestamp":...,"msgType":"TASK-SYN","data":[{"messageType":"QUERY"|"SORT","equipmentNo":"...","taskListId":"...","taskId":"...","timestamp":...}]}` [ratta-server]. `taskListId` must be numeric-looking (the device parses it as a long) [community:ultrabridge].
+- On a restore, the item timestamps are now plus a running index [ratta-server].
+- `STARTSYNC` means "a device just finished a sync: the lock is free, the cloud may have changed". It is never sent for a web change; web and device file operations send per-item notices [ratta-server]. Because device file-sync calls carry an empty `channel` header, every device, including the one that just synced, gets `STARTSYNC` with `"<own serial>-null"`, and the uploader gets its own `DOWNLOADFILE` and `ADDFOLDER` items [ratta-server]. The firmware therefore cannot obey `STARTSYNC` without a condition: it filters on its own serial, or it treats `STARTSYNC` as "lock free, retry", for example after `E0078` [inferred].
+- Community projects send `STARTSYNC` to make a device sync [community:ultrabridge] [community:opennotecloud]. Ratta never sends `STARTSYNC` with `"null-null"` [ratta-server]. Firmware 3.29.42 did not sync on such a push (9.3) [capture:nomad-3.29.42].
 
-Digest channel (`SocketDigestMessageData`, items `DigestMessageTemplate`): `code`, `msg`, `timestamp`, `msgType:"DIGEST-SYN"`, `data[]` with `messageType` (`ADD_DIGEST`, `UPDATE_DIGEST`, `DELETE_DIGEST`), `dataType`, `equipmentNo`, `summaryGroupId`, `summaryId`, `timestamp` and all digest record fields of section 5 [ratta-server]. A delete with only `messageType`, `dataType`, `equipmentNo`, `timestamp` and `id` was honored by a Nomad; the device keys on `id` and did not care about `equipmentNo` or the `dataType` value [community:ultrabridge, device-confirmed]. Ratta uses `dataType` `"3"` in its delete path [ratta-server string]; its meaning is [unknown]. The device sends no acknowledgement for a digest push [community:ultrabridge].
+To-do channel (`SocketTaskMessageData`, items `ScheduleMessageTemplate`) [ratta-server]:
+
+- Envelope: `code` `"200"`, `msgType` `"TASK-SYN"`, `timestamp`, `data[]`.
+- Item: `messageType` always `"QUERY"`, `equipmentNo` the bare `type` of the channel (no suffix), `taskListId` (string), `taskId` (string, absent when null), `timestamp`.
+- Every write of a task, a group or the sort order triggers it (`ScheduleServiceImpl`).
+- `taskListId` must be numeric-looking (the device parses it as a long) [community:ultrabridge].
+
+Digest channel (`SocketDigestMessageData`, items `DigestMessageTemplate`) [ratta-server]:
+
+- Envelope: `code` `"200"`, `msgType` `"DIGEST-SYN"`, `timestamp`, `data[]`.
+- Item: `messageType` `ADD_DIGEST`, `UPDATE_DIGEST` or `DELETE_DIGEST`; `dataType` `"1"` group, `"2"` digest, `"3"` tag (`SummaryServiceImpl`); `equipmentNo` the bare `type`; `id`; `timestamp`. Add and update also carry the digest record fields of section 5; delete carries only these fields.
+- A delete with only `messageType`, `dataType`, `equipmentNo`, `timestamp` and `id` was honored by a Nomad; the device keys on `id` and did not care about `equipmentNo` or the `dataType` value [community:ultrabridge, device-confirmed]. ultrabridge saw no acknowledgement for a digest push [community:ultrabridge]; Ratta's server handles a `digest` `"Received"` (4.3) [ratta-server].
 
 ### 4.6 Direction summary
 
 - Device to server: only heartbeats and acknowledgements on the socket. All changes go over REST [ratta-server] [community:ultrabridge] [community:allenporter].
-- Server to device: hints only. If a hint is lost nothing breaks, the device's next REST sync reconciles [community:allenporter]. Exception: a server-side digest delete is only learned through a `DELETE_DIGEST` push, so it must be queued durably per device until sent (5.7) [community:ultrabridge].
+- Server to device: hints only. If a hint is lost nothing breaks, the device's next REST sync reconciles [community:allenporter]. Ratta itself loses queued hints on disconnect (4.2) [ratta-server]. Exception: a server-side digest delete is only learned through a `DELETE_DIGEST` push, so it must be queued durably per device until sent (5.7) [community:ultrabridge].
+
+### 4.7 Recommended push [proposal]
+
+- Keep `push = "reconnect"` as the default until a push in Ratta's exact form is proven on 3.29.42. Test one change at a time.
+- Ack every client event that has an ack id: `43<id>[]` for `ClientMessage "Received"`, to-do `"Received"`, digest `"Received"` and `ratta_ping`; `43<id>["Received"]` for any other `ClientMessage` string.
+- On `ratta_ping` reply `42["ratta_ping","Received"]`, then send the session's pending `ServerMessage`, `to-do` and `digest` pushes. On `status` reply `42["ServerMessage","true"]`, then the pending file pushes.
+- A session is online while `ratta_ping` or `status` arrive. Keep a queue per session and merge pending file items into one push. Send an unacknowledged push again, merged with new items, at the next heartbeat at least 5 s after the last send. Drop the queue when the session ends.
+- File push: wait about 1 s, queue, deliver after the next `ratta_ping` reply. Frame `42["ServerMessage","<JSON string>"]`. Envelope `code` `"200"`, `timestamp`, `msgType` `"FILE-SYN"`, `data[]`, no `msg`. A new or changed file: `messageType` `"DOWNLOADFILE"`, `equipmentNo` `"null-null"`, `fileType` `"FILE"`, `id`, `md5`, `originalName` = `newName`, `originalPath` = `newPath` (device-form folder path, for example `"NOTE/Note/"`), `directoryId`, `size`, `timestamp`. No `goDirectoryId`, no `newId`, no nulls. The matching item types of 4.5 for folders, renames, moves, copies and deletes.
+- No `STARTSYNC` for server-side changes. If ever: only after another device's `synchronous/end`, with `equipmentNo` `"<that serial>-null"` and the three fields of 4.5.
+- If the exact push plus the ack fix still triggers nothing on 3.29.42, reconnect stays the only trigger.
 
 ## 5. Digests ("summary")
 
@@ -965,7 +1027,7 @@ Append-only JSONL, one event per line, written after the change is durable (data
 ```
 
 - Event types: `file.created`, `file.modified`, `file.moved` (`path`, `oldPath`), `file.copied` (`id`, `sourceId`), `file.deleted`, `file.restored`, `folder.created`, `folder.moved`, `folder.deleted`, `digest.created`, `digest.updated`, `digest.deleted`, `digest.mark.stored`, `digest.group.created|updated|deleted`, `digest.tag.*`, `task.created|updated|deleted`, `device.bound`, `device.unlinked`.
-- `origin` is one of `device`, `cli`, `scan`, `repair` or `snapshot`. Events of `journal snapshot` carry `origin: snapshot`: they describe the current state, not a change, and a consumer that reacts to changes (such as the push of 4.5) ignores them.
+- `origin` is one of `device`, `cli`, `scan`, `repair` or `snapshot`. Events of `journal snapshot` carry `origin: snapshot`: they describe the current state, not a change, and a consumer that reacts to changes (such as the push of 4.4) ignores them.
 - `kind` for files: `note`, `document` (pdf, epub, doc...), `mark` (document sidecar), `image`, `other`, derived from the extension.
 - `seq` is a server-wide counter, strictly increasing, never reused; it is recovered at start from the last line of the newest journal file.
 - Rotation: a new file `journal-<firstSeq>.jsonl` when the current one passes a size (for example 64 MiB) or at a month change; old files are kept until all registered consumers passed them (then they may be compressed or removed by the admin).
@@ -1081,10 +1143,15 @@ Still open: 4 to 7, 10 and 11. They need a sync with deletes and moves on the de
 Device tests on 2026-10-07 with "Auto Sync" on, against notedown with socket pushes:
 
 - A `ServerMessage` push with one `STARTSYNC` item (`equipmentNo` `"null-null"`) was acknowledged within 0.2 s with `420["ClientMessage","Received"]` (an event with ack id 0). No `synchronous/start` followed in the next four minutes. Twice the same result.
-- A `ServerMessage` push with one `DOWNLOADFILE` item carrying the fields of 4.5 (`id`, `originalName`, `md5`, `size`, `directoryId`, `originalPath`) was acknowledged the same way within 0.4 s. No sync followed either. Neither push form makes firmware 3.29.42 sync.
+- A `ServerMessage` push with one `DOWNLOADFILE` item (`id`, `originalName`, `md5`, `size`, `directoryId`, `originalPath`) was acknowledged the same way within 0.4 s. No sync followed either. Neither push form makes firmware 3.29.42 sync.
 - A server restart (all sockets closed by the server) makes the device reconnect within seconds and run a full sync. This is how a file added on the server side reached the device in every test.
 - A WebSocket close by the server (code 1001, reason `sync`, no socket.io disconnect packet, notedown's `push = "reconnect"`) makes the device connect again and run a full sync that downloads the new file. In the first test the new connection came 26 s after the close (12:51:49 close, 12:52:15 open packet, 12:52:16 `synchronous/end` `Y`). The client's reconnect delay is not known yet; more tests will show whether 26 s is typical.
 - Every new socket connection (after a server restart or a wifi reconnect) is followed within 0.2 s by a full sync run (`synchronous/start`, `list_folder`, transfers, `synchronous/end` `Y`). This is how the device picked up files added on the server side.
+- The `DOWNLOADFILE` test push was not in Ratta's form (4.5): the envelope carried `"msg":""`, the item carried null fields and lacked `fileType`, `newName` and `newPath`. notedown left the device's `420["ClientMessage","Received"]` without the `430[]` ack that Ratta sends. The protocol log shows no REST call after the push, only pings. Next device test, cheapest first [proposal]:
+  1. Ack the device's `420["ClientMessage","Received"]` with `430[]`.
+  2. Do not send `STARTSYNC` for a server-side change; Ratta never sends `STARTSYNC` with `"null-null"`.
+  3. Send a complete `DOWNLOADFILE` item as in 4.7 (with `fileType`, `newName`, `newPath`, no `msg`, no nulls).
+  4. Send the push right after the `ratta_ping` reply, as Ratta does.
 - An edit of a note makes the device send it on its own within a few minutes, without `synchronous/start`: `POST /api/file/3/files/query_v3` with the file's `id`, then `3/files/upload/apply` for the same path (and then, presumably, the byte upload and `upload/finish`). A server that requires the sync lock for writes refuses this upload; notedown now takes the free sync lock for such a write (log marker `implicit_lock`) and answers `E0079` only while another device holds the lock.
 
 

@@ -154,7 +154,8 @@ impl Digest {
 }
 
 /// One digest group ("category"): its fields of the 5.1 record in that order, then the fields
-/// the device sent that are not named here.
+/// the device sent that are not named here. Records written before the group had `createTime`
+/// and `updateTime` fields kept them among the extra fields; they read into the fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DigestGroup {
@@ -177,6 +178,13 @@ pub struct DigestGroup {
     /// `"Y"` once soft-deleted.
     #[serde(deserialize_with = "super::null_as_no")]
     pub is_deleted: String,
+    /// Server time of the first write, ms (0: not known); kept by
+    /// [`AppData::put_digest_group`].
+    #[serde(deserialize_with = "super::null_default")]
+    pub create_time: u64,
+    /// Server time of the last write, ms; set by [`AppData::put_digest_group`].
+    #[serde(deserialize_with = "super::null_default")]
+    pub update_time: u64,
     /// Fields of the device that are not named above, sent back unchanged.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -197,6 +205,8 @@ impl Default for DigestGroup {
             creation_time: None,
             last_modified_time: None,
             is_deleted: NO.into(),
+            create_time: 0,
+            update_time: 0,
             extra: Map::new(),
         }
     }
@@ -389,7 +399,9 @@ impl AppData<'_> {
     }
 
     /// Store `group` under its id (a full replace), then journal `digest_group.created`,
-    /// `.updated` or `.deleted` as [`AppData::put_digest`] does. Id 0 is refused.
+    /// `.updated` or `.deleted` as [`AppData::put_digest`] does. `createTime` is kept from the
+    /// stored record, else taken from `group` (an import), else now; `updateTime` is now. Id 0
+    /// is refused.
     pub fn put_digest_group(
         &self,
         guard: &WriteGuard,
@@ -400,10 +412,17 @@ impl AppData<'_> {
     ) -> Result<()> {
         refuse_id_0(group.id, "digest group id")?;
         let old = self.digest_group(guard, group.id)?;
-        write_record(&self.group_path(group.id), group)?;
+        let now = journal.now_ms();
+        let mut record = group.clone();
+        record.create_time = [old.as_ref().map_or(0, |o| o.create_time), group.create_time]
+            .into_iter()
+            .find(|&t| t > 0)
+            .unwrap_or(now);
+        record.update_time = now;
+        write_record(&self.group_path(record.id), &record)?;
         let was_live = old.as_ref().is_some_and(DigestGroup::is_live);
-        let bodies = change(was_live, group.is_live())
-            .map(|c| group_event(c, group.info()))
+        let bodies = change(was_live, record.is_live())
+            .map(|c| group_event(c, record.info()))
             .into_iter()
             .collect();
         self.journal(bodies, origin, device, journal)
@@ -735,6 +754,8 @@ mod tests {
             creation_time: Some(2),
             last_modified_time: Some(3),
             is_deleted: "N".into(),
+            create_time: 4,
+            update_time: 5,
             extra,
         };
         let text = serde_json::to_string(&group).unwrap();
@@ -744,10 +765,67 @@ mod tests {
                 r#"{"id":1,"uniqueIdentifier":"u","name":"n","description":"d","metadata":"{}","#,
                 r#""commentStr":"c","commentHandwriteName":"h","handwriteInnerName":"i","#,
                 r#""md5Hash":"m","creationTime":2,"lastModifiedTime":3,"isDeleted":"N","#,
-                r#""userId":1000001}"#
+                r#""createTime":4,"updateTime":5,"userId":1000001}"#
             )
         );
         assert_eq!(serde_json::from_str::<DigestGroup>(&text).unwrap(), group);
+    }
+
+    #[test]
+    fn an_older_group_record_with_its_times_after_the_extra_fields_reads() {
+        // Records written before the group had time fields kept them among the extra fields.
+        let text =
+            r#"{"id":1,"name":"n","isDeleted":"N","userId":3,"createTime":7,"updateTime":8}"#;
+        let g: DigestGroup = serde_json::from_str(text).unwrap();
+        assert_eq!((g.create_time, g.update_time), (7, 8));
+        assert!(!g.extra.contains_key("createTime"));
+        assert_eq!(g.extra.get("userId"), Some(&Value::from(3)));
+    }
+
+    #[test]
+    fn a_group_write_keeps_the_create_time_and_stamps_the_update_time() {
+        let f = Fixture::new();
+        let app = AppData::new(&f.store);
+        let g = f.store.lock_recovered(&f.journal).unwrap();
+        // A new group without a createTime gets now.
+        let fresh = DigestGroup {
+            id: 3,
+            ..DigestGroup::default()
+        };
+        app.put_digest_group(&g, &fresh, Origin::Cli, None, &f.journal)
+            .unwrap();
+        let back = app.digest_group(&g, 3).unwrap().unwrap();
+        assert_eq!((back.create_time, back.update_time), (T0 as u64, T0 as u64));
+        // A new group with a createTime (an import) keeps it.
+        let imported = DigestGroup {
+            id: 4,
+            create_time: 1_700_000_000_000,
+            update_time: 1_700_000_000_500,
+            ..DigestGroup::default()
+        };
+        app.put_digest_group(&g, &imported, Origin::Cli, None, &f.journal)
+            .unwrap();
+        let back = app.digest_group(&g, 4).unwrap().unwrap();
+        assert_eq!(back.create_time, 1_700_000_000_000);
+        assert_eq!(back.update_time, T0 as u64);
+        // A later write keeps the stored createTime, whatever the new record says.
+        f.set_now(T0 + 1000);
+        let edit = DigestGroup {
+            id: 4,
+            name: Some("x".into()),
+            create_time: 0,
+            ..DigestGroup::default()
+        };
+        app.put_digest_group(&g, &edit, Origin::Device, None, &f.journal)
+            .unwrap();
+        app.delete_digest_group(&g, 3, Origin::Device, None, &f.journal)
+            .unwrap();
+        let back = app.digest_group(&g, 4).unwrap().unwrap();
+        assert_eq!(back.create_time, 1_700_000_000_000);
+        assert_eq!(back.update_time, T0 as u64 + 1000);
+        let deleted = app.digest_group(&g, 3).unwrap().unwrap();
+        assert_eq!(deleted.create_time, T0 as u64);
+        assert_eq!(deleted.update_time, T0 as u64 + 1000);
     }
 
     #[test]

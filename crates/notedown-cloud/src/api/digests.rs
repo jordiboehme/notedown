@@ -20,7 +20,8 @@
 //! `page` is 1-based (`page <= 0` reads as 1), `size <= 0` means all; `currentPage` and
 //! `pageSize` are answered as sent. Fields the device sends that the records do not name are
 //! stored and sent back unchanged; `equipmentNo` is not stored. A missing or malformed required
-//! field answers `422`. A group stores its server times `createTime`/`updateTime` in `extra`.
+//! field answers `422`, and so does an id above `i64::MAX`. The server-set fields of a request
+//! (`userId`, `createTime`, `updateTime`) are never stored, whatever their type.
 
 use std::sync::Arc;
 
@@ -69,10 +70,14 @@ pub const FLAG_DIGEST_ADOPTED: &str = "digest_adopted";
 /// Log flag: `update/summary/group` for an id without a live group created (or revived) it.
 pub const FLAG_DIGEST_GROUP_ADOPTED: &str = "digest_group_adopted";
 
+/// The largest server id (D3: ids are JSON integers up to 2^63).
+const MAX_ID: u64 = i64::MAX as u64;
 /// Request fields that are not record data: never stored.
 const NOT_STORED: &[&str] = &["equipmentNo"];
-/// Fields of the group answer that the server sets; not stored from a request. The server times
-/// are stored in the group's `extra` by the routes.
+/// Fields of the digest answer that the server sets; not stored from a request (a wrong type
+/// there must not fail the write).
+const DIGEST_SERVER_FIELDS: &[&str] = &["userId", "createTime", "updateTime"];
+/// Fields of the group answer that the server sets; not stored from a request.
 const GROUP_SERVER_FIELDS: &[&str] = &["userId", "isSummaryGroup", "createTime", "updateTime"];
 
 /// A checked app data request: the token's account and device and the parsed body.
@@ -243,10 +248,11 @@ fn record_from<T: DeserializeOwned>(req: &AppRequest, drop: &[&str]) -> Result<T
     })
 }
 
-/// The required `id`: a positive integer, as a number or a decimal string.
+/// The required `id`: a positive integer up to `i64::MAX` (the device keeps ids as signed
+/// 64-bit integers), as a number or a decimal string.
 fn required_id(req: &AppRequest) -> Result<u64, Reply> {
     match id_arg(&req.body, "id") {
-        IdArg::Id(id) if id > 0 => Ok(id),
+        IdArg::Id(id) if id > 0 && id <= MAX_ID => Ok(id),
         _ => Err(req.bad_params("id")),
     }
 }
@@ -262,7 +268,8 @@ fn int_arg(body: &Value, key: &str) -> Option<i64> {
     }
 }
 
-/// The `ids` argument: absent or `null` is empty; else an array of ids (numbers or strings).
+/// The `ids` argument: absent or `null` is empty; else an array of ids (numbers or strings,
+/// each at most `i64::MAX`).
 fn ids_arg(body: &Value) -> Option<Vec<u64>> {
     match body.get("ids") {
         None | Some(Value::Null) => Some(Vec::new()),
@@ -273,6 +280,7 @@ fn ids_arg(body: &Value) -> Option<Vec<u64>> {
                 Value::String(s) => s.trim().parse().ok(),
                 _ => None,
             })
+            .map(|id| id.filter(|&id| id <= MAX_ID))
             .collect(),
         Some(_) => None,
     }
@@ -377,23 +385,9 @@ fn hash_view(d: &Digest, user_id: u64) -> Value {
     })
 }
 
-/// A server time of a group, ms: kept in the record's `extra` under its wire name
-/// (`DigestGroup` has no field for it).
-fn group_time(g: &DigestGroup, key: &str) -> Option<u64> {
-    g.extra.get(key).and_then(Value::as_u64)
-}
-
-/// Set the server times of a group a device writes: `createTime` from the stored record (now
-/// for a new one), `updateTime` now.
-fn stamp_group(group: &mut DigestGroup, old: Option<&DigestGroup>, now: u64) {
-    let created = old.and_then(|o| group_time(o, "createTime")).unwrap_or(now);
-    group.extra.insert("createTime".into(), json!(created));
-    group.extra.insert("updateTime".into(), json!(now));
-}
-
 /// A group as the device gets it: its record plus `userId`, `isSummaryGroup: "Y"` and the
-/// server times `createTime`/`updateTime`. An imported group has none; it answers its device
-/// times (`creationTime`, `lastModifiedTime`), or 0.
+/// server times `createTime`/`updateTime` (set by [`AppData::put_digest_group`]). A record
+/// without them (0) answers its device times (`creationTime`, `lastModifiedTime`), or 0.
 fn group_view(g: &DigestGroup, user_id: u64) -> Value {
     let mut v = serde_json::to_value(g).unwrap_or_else(|_| json!({}));
     if let Value::Object(m) = &mut v {
@@ -401,8 +395,12 @@ fn group_view(g: &DigestGroup, user_id: u64) -> Value {
         let device_updated = g
             .last_modified_time
             .map_or(device_created, |t| t.max(0) as u64);
-        let created = group_time(g, "createTime").unwrap_or(device_created);
-        let updated = group_time(g, "updateTime").unwrap_or(device_updated);
+        let created = Some(g.create_time)
+            .filter(|&t| t > 0)
+            .unwrap_or(device_created);
+        let updated = Some(g.update_time)
+            .filter(|&t| t > 0)
+            .unwrap_or(device_updated);
         m.insert("userId".into(), json!(user_id));
         m.insert("isSummaryGroup".into(), json!(YES));
         m.insert("createTime".into(), json!(created));
@@ -441,7 +439,7 @@ pub async fn add_summary(
     bytes: Bytes,
 ) -> Reply {
     let req = app_request!(state, headers, bytes);
-    let mut digest: Digest = match record_from(&req, &[]) {
+    let mut digest: Digest = match record_from(&req, DIGEST_SERVER_FIELDS) {
         Ok(d) => d,
         Err(r) => return r,
     };
@@ -478,7 +476,7 @@ pub async fn update_summary(
         Ok(id) => id,
         Err(r) => return r,
     };
-    let mut digest: Digest = match record_from(&req, &[]) {
+    let mut digest: Digest = match record_from(&req, DIGEST_SERVER_FIELDS) {
         Ok(d) => d,
         Err(r) => return r,
     };
@@ -635,7 +633,6 @@ pub async fn add_group(
         }
         group.id = c.app.next_digest_id(c.guard)?;
         group.is_deleted = NO.into();
-        stamp_group(&mut group, None, c.state.journal.now_ms());
         c.put_group(&group)?;
         Ok(c.ok(json!({"id": group.id})))
     })
@@ -662,7 +659,6 @@ pub async fn update_group(
     with_app_data(&state, &req, move |c| {
         let old = c.app.digest_group(c.guard, id)?;
         let adopted = !old.as_ref().is_some_and(DigestGroup::is_live);
-        stamp_group(&mut group, old.as_ref(), c.state.journal.now_ms());
         if let Some(old) = old {
             group.creation_time = old.creation_time.or(group.creation_time);
         }

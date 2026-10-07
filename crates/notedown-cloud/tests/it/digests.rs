@@ -66,6 +66,7 @@ struct Server {
 
 struct Raw {
     status: StatusCode,
+    headers: axum::http::HeaderMap,
     body: Vec<u8>,
 }
 
@@ -201,11 +202,16 @@ impl Server {
             .await
             .unwrap();
         let status = resp.status();
+        let headers = resp.headers().clone();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap()
             .to_vec();
-        Raw { status, body }
+        Raw {
+            status,
+            headers,
+            body,
+        }
     }
 
     /// A request with a raw body and content type (multipart uploads, signed GETs).
@@ -224,11 +230,16 @@ impl Server {
             .await
             .unwrap();
         let status = resp.status();
+        let headers = resp.headers().clone();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap()
             .to_vec();
-        Raw { status, body }
+        Raw {
+            status,
+            headers,
+            body,
+        }
     }
 
     /// `POST <signed upload URL>` with `bytes` as the multipart field `file`.
@@ -384,6 +395,8 @@ fn group(id: u64, unique: &str, name: &str, creation: i64) -> DigestGroup {
         md5_hash: Some(format!("{id:032x}")),
         creation_time: Some(creation),
         last_modified_time: Some(creation),
+        // As the import sets it: the device's creationTime when the backup has no createTime.
+        create_time: creation as u64,
         ..DigestGroup::default()
     }
 }
@@ -487,9 +500,9 @@ async fn the_sync_flow_of_5_4() {
     assert_eq!(g["userId"], s.user_id());
     assert_eq!(g["isDeleted"], "N");
     assert_eq!(g["userId"], uid);
-    // an imported group has no server times: its device times
+    // an imported group: createTime from the backup, updateTime the time of the import
     assert_eq!(g["createTime"], T0 - 60_000);
-    assert_eq!(g["updateTime"], T0 - 60_000);
+    assert_eq!(g["updateTime"], T0);
 
     let hash = s.post(HASH, &t, json!({"page": 1, "size": 100})).await;
     assert_ok(&hash);
@@ -1734,4 +1747,70 @@ async fn a_root_folder_named_like_the_mark_target_still_takes_uploads() {
     let r = s.send_mark(url, b"x").await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert_ok(&r.json());
+}
+
+// ------------------------------------------------------------------ server-set fields and ids
+
+#[tokio::test]
+async fn server_set_fields_of_a_wrong_type_are_ignored() {
+    let s = Server::new();
+    let t = s.login(SERIAL).await;
+    let mut body = add_body("aaaa", "x");
+    body["userId"] = json!("not a number");
+    body["createTime"] = json!(-5);
+    body["updateTime"] = json!("yesterday");
+    let v = s.post(ADD, &t, body).await;
+    assert_ok(&v);
+    let id = v["id"].as_u64().unwrap();
+    s.advance_ms(1_000);
+    let v = s
+        .put(
+            UPDATE,
+            &t,
+            json!({"id": id, "content": "y", "userId": -1, "createTime": "x",
+                   "updateTime": -7}),
+        )
+        .await;
+    assert_ok(&v);
+    let d = &s.post(BY_ID, &t, json!({"ids": [id]})).await["summaryDOList"][0];
+    assert_eq!(d["content"], "y");
+    assert_eq!(d["userId"], s.user_id());
+    assert_eq!(d["createTime"], T0 as u64);
+    assert_eq!(d["updateTime"], T0 as u64 + 1_000);
+}
+
+#[tokio::test]
+async fn ids_above_i64_max_are_refused() {
+    let s = Server::new();
+    let t = s.login(SERIAL).await;
+    let too_big = i64::MAX as u64 + 1;
+    let bad: Vec<(&str, &str, Value)> = vec![
+        ("PUT", UPDATE, json!({"id": too_big, "content": "x"})),
+        (
+            "PUT",
+            UPDATE,
+            json!({"id": too_big.to_string(), "content": "x"}),
+        ),
+        ("PUT", UPDATE, json!({"id": u64::MAX, "content": "x"})),
+        ("DELETE", DELETE, json!({"id": too_big})),
+        ("PUT", GROUP_UPDATE, json!({"id": too_big, "md5Hash": "m"})),
+        ("DELETE", GROUP_DELETE, json!({"id": too_big})),
+        ("PUT", TAG_UPDATE, json!({"id": too_big, "name": "x"})),
+        ("DELETE", TAG_DELETE, json!({"id": too_big})),
+        ("POST", MARK_DOWNLOAD, json!({"id": too_big})),
+        ("POST", QUERY, json!({"ids": [too_big]})),
+        ("POST", HASH, json!({"ids": [too_big.to_string()]})),
+        ("POST", BY_ID, json!({"ids": [1, too_big]})),
+    ];
+    for (method, path, body) in bad {
+        let v = s.call(method, path, &t, body.clone()).await;
+        assert_err(&v, "422");
+    }
+    assert!(s.stored().0.is_empty());
+    // i64::MAX itself is a valid id
+    let v = s
+        .put(UPDATE, &t, json!({"id": i64::MAX, "content": "x"}))
+        .await;
+    assert_ok(&v);
+    assert_eq!(s.stored().0[0].id, i64::MAX as u64);
 }

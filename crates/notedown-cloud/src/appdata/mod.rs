@@ -63,6 +63,8 @@ pub const FIRST_DIGEST_ID: u64 = 1;
 pub const FIRST_TAG_ID: u64 = 1;
 /// The longest accepted `.mark` name, in bytes.
 pub const MAX_MARK_NAME: usize = 64;
+/// The largest accepted `.mark` (upload and import), in bytes.
+pub const MAX_MARK_BYTES: u64 = 32 * 1024 * 1024;
 /// The longest accepted `taskId` or `taskListId`, in bytes.
 pub const MAX_TASK_KEY: usize = 128;
 

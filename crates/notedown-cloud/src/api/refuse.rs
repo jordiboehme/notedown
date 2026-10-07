@@ -36,7 +36,7 @@ const DOCUMENTED: &[(&str, &str)] = &[
     ("POST", "/api/file/terminal/upload/finish"),
     ("POST", "/api/file/upload/apply"),
     ("POST", "/api/file/upload/finish"),
-    // 5.3
+    // 5.3, 5.5
     ("POST", "/api/file/add/summary"),
     ("PUT", "/api/file/update/summary"),
     ("DELETE", "/api/file/delete/summary"),
@@ -53,6 +53,8 @@ const DOCUMENTED: &[(&str, &str)] = &[
     ("GET", "/api/file/query/summary/tag"),
     ("POST", "/api/file/upload/apply/summary"),
     ("POST", "/api/file/download/summary"),
+    ("POST", "/api/oss/upload/summary"),
+    ("GET", "/api/oss/download/summary"),
     // 6.1
     ("POST", "/api/file/schedule/group/all"),
     ("POST", "/api/file/schedule/group"),

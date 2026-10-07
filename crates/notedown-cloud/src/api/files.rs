@@ -25,7 +25,7 @@ use crate::journal::Origin;
 use crate::server::AppState;
 use crate::store::{Entry, Kind, PendingOp, PutOptions, Store, StoreGuard, WirePath};
 use crate::sync::staging;
-use crate::sync::urls::{base_url, download_url, upload_url};
+use crate::sync::urls::{base_url, download_url, oss_url};
 use crate::sync::{Purpose, SignedTarget, StartOutcome, WriteLock};
 
 /// Another device holds the sync lock.
@@ -876,8 +876,8 @@ pub async fn upload_apply(
         "innerName": file_name,
         "xamzDate": signed.timestamp.to_string(),
         "authorization": "",
-        "fullUploadUrl": upload_url(&base, "upload", &signed_target, &signed),
-        "partUploadUrl": upload_url(&base, "upload/part", &signed_target, &signed),
+        "fullUploadUrl": oss_url(&base, "upload", &signed_target, &signed),
+        "partUploadUrl": oss_url(&base, "upload/part", &signed_target, &signed),
     }))
 }
 

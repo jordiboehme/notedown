@@ -816,6 +816,8 @@ const REFUSED: &[(&str, &str)] = &[
     ("GET", "/api/file/query/summary/tag"),
     ("POST", "/api/file/upload/apply/summary"),
     ("POST", "/api/file/download/summary"),
+    ("POST", "/api/oss/upload/summary"),
+    ("GET", "/api/oss/download/summary"),
     ("POST", "/api/file/schedule/group/all"),
     ("POST", "/api/file/schedule/group"),
     ("PUT", "/api/file/schedule/group"),

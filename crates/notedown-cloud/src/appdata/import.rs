@@ -24,7 +24,7 @@ use serde_json::{Map, Value};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::{AppData, Digest, DigestGroup, valid_mark_name};
+use super::{AppData, Digest, DigestGroup, MAX_MARK_BYTES, valid_mark_name};
 use crate::auth::{Accounts, AppDataImported};
 use crate::journal::{Journal, Origin};
 use crate::store::Store;
@@ -33,8 +33,6 @@ use crate::{Error, Result, io_err};
 const KNOWLEDGE: &str = "backup/DIGEST/knowledge.json";
 const KNOWLEDGE_BASES: &str = "backup/DIGEST/knowledge_bases.json";
 const HANDWRITE_DIR: &str = "backup/DIGEST/handwrite/";
-/// Largest `.mark` accepted (the upload cap of the server).
-const MAX_MARK_BYTES: u64 = 32 * 1024 * 1024;
 /// Largest `knowledge.json` accepted.
 const MAX_JSON_BYTES: u64 = 256 * 1024 * 1024;
 

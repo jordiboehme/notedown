@@ -7,6 +7,12 @@
 //! signed device, taken as for every write (another device's live lock: `E0079`, flag
 //! `no_sync_lock`). Their multipart field `file` streams into the
 //! staging entry ([`crate::sync::staging`]) and is never held in memory as a whole.
+//!
+//! The handwritten comments of digests (`docs/sync-protocol.md` 5.5) move on their own routes,
+//! `/api/oss/upload/summary` and `/api/oss/download/summary`, with targets whose `path` is
+//! [`MARK_TARGET`] (no file route takes such a target, and these routes take no other). They
+//! pass the app data gates of the signed account ([`super::digests`]: `E0079`, flags
+//! `protect_refused`, `app_data_refused`) and never take, revive or extend the sync lock.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -18,10 +24,12 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
+use super::digests::{AppRequest, app_data_open, app_data_refused, on_app_data};
 use super::envelope::{LogDevice, LogFlags, Reply, Streamed};
 use super::files::{
     E_UPLOAD, FLAG_UPLOAD_TOO_LARGE, MSG_UPLOAD, holds_sync_lock, keep_lock, no_sync_lock,
 };
+use crate::appdata::{AppData, Digest, MAX_MARK_BYTES, valid_mark_name};
 use crate::server::AppState;
 use crate::store::WirePath;
 use crate::sync::staging::{
@@ -51,6 +59,10 @@ pub const OTHER_FIELDS_MAX: usize = 256 * 1024;
 
 /// Bytes read per step while a download streams.
 const CHUNK: usize = 256 * 1024;
+
+/// The `path` of a signed target that names a handwritten comment of a digest (`inner`: the
+/// `.mark` name for uploads, `id`: the digest for downloads) instead of a file.
+pub const MARK_TARGET: &str = "digest-mark";
 
 /// HTTP 500 with a plain-text error code (the OSS endpoints answer no envelope).
 pub fn plain_error(code: &str, flag: &str, device: Option<&str>) -> Response {
@@ -142,18 +154,24 @@ fn generation_current(state: &AppState, target: &SignedTarget) -> crate::Result<
         == Some(target.generation))
 }
 
-struct Flow {
-    file: Option<std::fs::File>,
-    seek_to: Option<u64>,
-    remaining: u64,
+/// The sync lock a download extends while it streams: the account and the device.
+struct Touch {
     state: Arc<AppState>,
     slug: String,
     serial: String,
 }
 
+struct Flow {
+    file: Option<std::fs::File>,
+    seek_to: Option<u64>,
+    remaining: u64,
+    touch: Option<Touch>,
+}
+
 /// The file's bytes as a body: read in blocking steps of [`CHUNK`], never the whole file in
-/// memory. Each step extends the device's sync lock. A file that shrinks while it streams ends
-/// the body with an error (the client sees a cut transfer, never wrong bytes as complete).
+/// memory. Each step extends the device's sync lock (when `touch` is set). A file that shrinks
+/// while it streams ends the body with an error (the client sees a cut transfer, never wrong
+/// bytes as complete).
 fn stream_body(flow: Flow) -> Body {
     let stream = futures_util::stream::unfold(flow, |mut flow| async move {
         if flow.remaining == 0 {
@@ -184,9 +202,11 @@ fn stream_body(flow: Flow) -> Body {
             Ok(Ok((file, buf))) if !buf.is_empty() => {
                 flow.remaining -= buf.len() as u64;
                 flow.file = Some(file);
-                flow.state
-                    .sync_locks
-                    .touch(&flow.slug, &flow.serial, flow.state.now_ms());
+                if let Some(t) = &flow.touch {
+                    t.state
+                        .sync_locks
+                        .touch(&t.slug, &t.serial, t.state.now_ms());
+                }
                 Some((Ok(Bytes::from(buf)), flow))
             }
             Ok(Ok(_)) => Some((
@@ -203,6 +223,113 @@ fn stream_body(flow: Flow) -> Body {
     Body::from_stream(stream)
 }
 
+/// The checked target of a signed URL: the signature of `method` and `purpose` (the signed
+/// size is the target's for uploads, 0 for downloads) and the kind of target, a handwritten
+/// comment ([`MARK_TARGET`]) when `mark`, else a file. Anything else answers `E1306`.
+fn verified(
+    state: &AppState,
+    q: &HashMap<String, String>,
+    method: &str,
+    purpose: Purpose,
+    mark: bool,
+) -> Result<SignedTarget, Box<Response>> {
+    let get = |k: &str| q.get(k).map(String::as_str).unwrap_or("");
+    let path_b64 = get("path");
+    let bad = || Box::new(plain_error(E_SIGNATURE, FLAG_BAD_SIGNATURE, None));
+    let target = SignedTarget::decode(path_b64).ok_or_else(bad)?;
+    let size = match purpose {
+        Purpose::Upload => target.size,
+        Purpose::Download => 0,
+    };
+    match state.url_signer.verify(
+        method,
+        path_b64,
+        get("timestamp"),
+        get("nonce"),
+        get("signature"),
+        purpose,
+        size,
+        state.now_ms(),
+    ) {
+        Ok(()) => {}
+        Err(UrlError::Bad) => return Err(bad()),
+        Err(UrlError::Expired) => {
+            return Err(Box::new(plain_error(
+                E_SIGNATURE,
+                FLAG_EXPIRED_SIGNATURE,
+                None,
+            )));
+        }
+    }
+    if (target.path == MARK_TARGET) != mark {
+        return Err(Box::new(plain_error(
+            E_SIGNATURE,
+            FLAG_BAD_SIGNATURE,
+            Some(&target.device),
+        )));
+    }
+    Ok(target)
+}
+
+/// The response that sends `file` (`size` bytes, downloaded as `name`): one `Range` supported
+/// (206, `Content-Range`), 416 for a start past the end.
+fn send_file(
+    headers: &HeaderMap,
+    file: std::fs::File,
+    size: u64,
+    name: &str,
+    serial: String,
+    touch: Option<Touch>,
+) -> Response {
+    let range = parse_range(
+        headers.get(header::RANGE).and_then(|v| v.to_str().ok()),
+        size,
+    );
+    let (status, start, len) = match range {
+        ByteRange::Full => (StatusCode::OK, 0, size),
+        ByteRange::Partial { start, end } => (StatusCode::PARTIAL_CONTENT, start, end - start + 1),
+        ByteRange::Unsatisfiable => {
+            let mut r = (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [
+                    (header::CONTENT_RANGE, format!("bytes */{size}")),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                ],
+            )
+                .into_response();
+            r.extensions_mut().insert(LogDevice(serial));
+            return r;
+        }
+    };
+    let body = stream_body(Flow {
+        file: Some(file),
+        seek_to: (start > 0).then_some(start),
+        remaining: len,
+        touch,
+    });
+    let mut r = Response::new(body);
+    *r.status_mut() = status;
+    let h = r.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Ok(v) = HeaderValue::from_str(&content_disposition(name)) {
+        h.insert(header::CONTENT_DISPOSITION, v);
+    }
+    if status == StatusCode::PARTIAL_CONTENT {
+        let end = start + len - 1;
+        if let Ok(v) = HeaderValue::from_str(&format!("bytes {start}-{end}/{size}")) {
+            h.insert(header::CONTENT_RANGE, v);
+        }
+    }
+    r.extensions_mut().insert(Streamed);
+    r.extensions_mut().insert(LogDevice(serial));
+    r
+}
+
 /// `GET /api/oss/download?path&signature&timestamp&nonce&pathId`: the file's bytes, with one
 /// `Range` supported (206, `Content-Range`). The signed id must still name the signed path and
 /// the signed token generation must be current. `pathId` is not signed and not used.
@@ -212,24 +339,9 @@ pub async fn download(
     query: Result<Query<HashMap<String, String>>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     let q = query.map(|Query(q)| q).unwrap_or_default();
-    let get = |k: &str| q.get(k).map(String::as_str).unwrap_or("");
-    let path_b64 = get("path");
-    let checked = state.url_signer.verify(
-        "GET",
-        path_b64,
-        get("timestamp"),
-        get("nonce"),
-        get("signature"),
-        Purpose::Download,
-        0,
-        state.now_ms(),
-    );
-    let target = match checked.map(|()| SignedTarget::decode(path_b64)) {
-        Ok(Some(t)) => t,
-        Ok(None) | Err(UrlError::Bad) => return plain_error(E_SIGNATURE, FLAG_BAD_SIGNATURE, None),
-        Err(UrlError::Expired) => {
-            return plain_error(E_SIGNATURE, FLAG_EXPIRED_SIGNATURE, None);
-        }
+    let target = match verified(&state, &q, "GET", Purpose::Download, false) {
+        Ok(t) => t,
+        Err(r) => return *r,
     };
     let serial = target.device.clone();
     let Some(id) = target.id else {
@@ -275,55 +387,12 @@ pub async fn download(
     state
         .sync_locks
         .touch(&target.account, &serial, state.now_ms());
-    let range = parse_range(
-        headers.get(header::RANGE).and_then(|v| v.to_str().ok()),
-        size,
-    );
-    let (status, start, len) = match range {
-        ByteRange::Full => (StatusCode::OK, 0, size),
-        ByteRange::Partial { start, end } => (StatusCode::PARTIAL_CONTENT, start, end - start + 1),
-        ByteRange::Unsatisfiable => {
-            let mut r = (
-                StatusCode::RANGE_NOT_SATISFIABLE,
-                [
-                    (header::CONTENT_RANGE, format!("bytes */{size}")),
-                    (header::ACCEPT_RANGES, "bytes".to_string()),
-                ],
-            )
-                .into_response();
-            r.extensions_mut().insert(LogDevice(serial));
-            return r;
-        }
-    };
-    let body = stream_body(Flow {
-        file: Some(file),
-        seek_to: (start > 0).then_some(start),
-        remaining: len,
+    let touch = Touch {
         state: state.clone(),
         slug: target.account,
         serial: serial.clone(),
-    });
-    let mut r = Response::new(body);
-    *r.status_mut() = status;
-    let h = r.headers_mut();
-    h.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
-    h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
-    h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    if let Ok(v) = HeaderValue::from_str(&content_disposition(&name)) {
-        h.insert(header::CONTENT_DISPOSITION, v);
-    }
-    if status == StatusCode::PARTIAL_CONTENT {
-        let end = start + len - 1;
-        if let Ok(v) = HeaderValue::from_str(&format!("bytes {start}-{end}/{size}")) {
-            h.insert(header::CONTENT_RANGE, v);
-        }
-    }
-    r.extensions_mut().insert(Streamed);
-    r.extensions_mut().insert(LogDevice(serial));
-    r
+    };
+    send_file(&headers, file, size, &name, serial, Some(touch))
 }
 
 // ------------------------------------------------------------------ uploads
@@ -337,33 +406,7 @@ async fn upload_target(
     state: &Arc<AppState>,
     q: &HashMap<String, String>,
 ) -> Result<SignedTarget, Box<Response>> {
-    let get = |k: &str| q.get(k).map(String::as_str).unwrap_or("");
-    let path_b64 = get("path");
-    let Some(target) = SignedTarget::decode(path_b64) else {
-        return Err(Box::new(plain_error(E_SIGNATURE, FLAG_BAD_SIGNATURE, None)));
-    };
-    match state.url_signer.verify(
-        "POST",
-        path_b64,
-        get("timestamp"),
-        get("nonce"),
-        get("signature"),
-        Purpose::Upload,
-        target.size,
-        state.now_ms(),
-    ) {
-        Ok(()) => {}
-        Err(UrlError::Bad) => {
-            return Err(Box::new(plain_error(E_SIGNATURE, FLAG_BAD_SIGNATURE, None)));
-        }
-        Err(UrlError::Expired) => {
-            return Err(Box::new(plain_error(
-                E_SIGNATURE,
-                FLAG_EXPIRED_SIGNATURE,
-                None,
-            )));
-        }
-    }
+    let target = verified(state, q, "POST", Purpose::Upload, false)?;
     let serial = target.device.clone();
     if !target
         .inner
@@ -427,11 +470,11 @@ enum Recv {
 }
 
 /// Stream the multipart field `file` into a temp file in `dir`, at most `cap` bytes. Other
-/// fields are read and dropped (256 KiB at most, all together). Each step extends the sync lock. On any error
-/// the temp file is removed.
+/// fields are read and dropped (256 KiB at most, all together). Each step extends the sync lock
+/// of `lock` (none for the app data). On any error the temp file is removed.
 async fn receive_file(
     state: &AppState,
-    target: &SignedTarget,
+    lock: Option<&SignedTarget>,
     multipart: &mut Multipart,
     dir: &std::path::Path,
     cap: u64,
@@ -472,9 +515,11 @@ async fn receive_file(
                         if let Err(e) = f.push(&chunk).await {
                             return fail(Some(f), Recv::Failed(e));
                         }
-                        state
-                            .sync_locks
-                            .touch(&target.account, &target.device, state.now_ms());
+                        if let Some(t) = lock {
+                            state
+                                .sync_locks
+                                .touch(&t.account, &t.device, state.now_ms());
+                        }
                     }
                     Ok(None) => break,
                     Err(_) => return fail(Some(f), Recv::Broken),
@@ -555,7 +600,15 @@ pub async fn upload(
         Ok(e) => e,
         Err(e) => return recv_refused(Recv::Failed(e), &serial),
     };
-    let file = match receive_file(&state, &target, &mut multipart, &entry, state.file_max()).await {
+    let file = match receive_file(
+        &state,
+        Some(&target),
+        &mut multipart,
+        &entry,
+        state.file_max(),
+    )
+    .await
+    {
         Ok(f) => f,
         Err(why) => return recv_refused(why, &serial),
     };
@@ -636,7 +689,15 @@ pub async fn upload_part(
         Ok(e) => e,
         Err(e) => return recv_refused(Recv::Failed(e), &serial),
     };
-    let file = match receive_file(&state, &target, &mut multipart, &entry, state.part_max()).await {
+    let file = match receive_file(
+        &state,
+        Some(&target),
+        &mut multipart,
+        &entry,
+        state.part_max(),
+    )
+    .await
+    {
         Ok(f) => f,
         Err(why) => return recv_refused(why, &serial),
     };
@@ -685,4 +746,174 @@ pub async fn upload_part(
     }))
     .device(&serial)
     .into_response()
+}
+
+// ------------------------------------------------------------------ handwritten comments
+
+/// What the gates of a mark URL found.
+enum MarkGate {
+    /// Open; the account's user id.
+    Open(u64),
+    /// The device's token generation changed since signing.
+    Stale,
+    /// A closed gate's answer.
+    Refused(Reply),
+}
+
+/// The gates for the account a mark URL was signed for: the token generation (`E1306`, flag
+/// `stale_token`), the protect gate and the app data gate (`E0079`). The request that passes
+/// carries no body.
+async fn mark_request(
+    state: &Arc<AppState>,
+    target: &SignedTarget,
+) -> Result<AppRequest, Box<Response>> {
+    let serial = target.device.clone();
+    let (st, t) = (state.clone(), target.clone());
+    let checked = tokio::task::spawn_blocking(move || -> crate::Result<MarkGate> {
+        if !generation_current(&st, &t)? {
+            return Ok(MarkGate::Stale);
+        }
+        let Some(account) = st.auth.accounts().get(&t.account)? else {
+            return Err(crate::Error::NoAccount(t.account.clone()));
+        };
+        if let Some(refused) = super::files::protect_gate(&st, &account, &t.device) {
+            return Ok(MarkGate::Refused(refused));
+        }
+        if !app_data_open(&st, &account) {
+            return Ok(MarkGate::Refused(app_data_refused(&t.device)));
+        }
+        Ok(MarkGate::Open(account.user_id))
+    })
+    .await;
+    match checked {
+        Ok(Ok(MarkGate::Open(user_id))) => Ok(AppRequest {
+            slug: target.account.clone(),
+            serial,
+            user_id,
+            generation: target.generation,
+            body: serde_json::Value::Null,
+        }),
+        Ok(Ok(MarkGate::Stale)) => Err(Box::new(plain_error(
+            E_SIGNATURE,
+            FLAG_STALE_TOKEN,
+            Some(&serial),
+        ))),
+        Ok(Ok(MarkGate::Refused(reply))) => Err(Box::new(reply.into_response())),
+        Ok(Err(e)) => {
+            eprintln!("notedown cloud: {e}");
+            Err(Box::new(Reply::internal().device(&serial).into_response()))
+        }
+        Err(e) => {
+            eprintln!("notedown cloud: {e}");
+            Err(Box::new(Reply::internal().device(&serial).into_response()))
+        }
+    }
+}
+
+/// `POST /api/oss/upload/summary?path&signature&timestamp&nonce` (multipart field `file`): the
+/// handwritten comment signed in `upload/apply/summary`, at most 32 MiB (`E0324`). The bytes
+/// stream into a temp file in `digests/marks/` without the store lock; then, under the store
+/// lock and with the gates read again, a rename makes it `<name>.mark` (an existing comment of
+/// that name is replaced: a changed comment keeps its name). Answers `{innerName, md5}`.
+pub async fn upload_summary(
+    State(state): State<Arc<AppState>>,
+    query: QueryArg,
+    multipart: Result<Multipart, MultipartRejection>,
+) -> Response {
+    let q = query.map(|Query(q)| q).unwrap_or_default();
+    let target = match verified(&state, &q, "POST", Purpose::Upload, true) {
+        Ok(t) => t,
+        Err(r) => return *r,
+    };
+    let serial = target.device.clone();
+    let Some(name) = target.inner.clone().filter(|n| valid_mark_name(n)) else {
+        return plain_error(E_SIGNATURE, FLAG_BAD_SIGNATURE, Some(&serial));
+    };
+    let req = match mark_request(&state, &target).await {
+        Ok(r) => r,
+        Err(r) => return *r,
+    };
+    let Ok(mut multipart) = multipart else {
+        return upload_refused(FLAG_UPLOAD_BROKEN, &serial);
+    };
+    let (st, slug) = (state.clone(), req.slug.clone());
+    let dir = tokio::task::spawn_blocking(move || -> crate::Result<std::path::PathBuf> {
+        let store = st.store(&slug)?;
+        let dir = AppData::new(&store).marks_dir();
+        std::fs::create_dir_all(&dir).map_err(crate::io_err(&dir))?;
+        Ok(dir)
+    })
+    .await;
+    let dir = match dir {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => return recv_refused(Recv::Failed(e), &serial),
+        Err(e) => {
+            eprintln!("notedown cloud: upload failed: {e}");
+            return Reply::internal().device(&serial).into_response();
+        }
+    };
+    let file = match receive_file(&state, None, &mut multipart, &dir, MAX_MARK_BYTES).await {
+        Ok(f) => f,
+        Err(why) => return recv_refused(why, &serial),
+    };
+    let (tmp, _, md5) = match file.close().await {
+        Ok(c) => c,
+        Err(e) => return recv_refused(Recv::Failed(e), &serial),
+    };
+    let t = tmp.clone();
+    let reply = on_app_data(&state, &req, move |c| {
+        c.app.put_mark_file(c.guard, &name, &t)?;
+        Ok(Ok(Reply::ok(serde_json::json!({
+            "innerName": name,
+            "md5": md5,
+        }))
+        .device(c.serial)))
+    })
+    .await
+    .unwrap_or_else(|refused| refused);
+    // Renamed on success; else the temp file goes.
+    let _ = std::fs::remove_file(&tmp);
+    reply.into_response()
+}
+
+/// `GET /api/oss/download/summary?path&signature&timestamp&nonce`: the handwritten comment of
+/// the signed digest (the `.mark` its `commentHandwriteName` names), with one `Range`
+/// supported. A digest that is gone, names no valid comment or whose file is missing answers
+/// HTTP 500 `E1307`.
+pub async fn download_summary(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    query: QueryArg,
+) -> Response {
+    let q = query.map(|Query(q)| q).unwrap_or_default();
+    let target = match verified(&state, &q, "GET", Purpose::Download, true) {
+        Ok(t) => t,
+        Err(r) => return *r,
+    };
+    let serial = target.device.clone();
+    let Some(id) = target.id else {
+        return plain_error(E_SIGNATURE, FLAG_BAD_SIGNATURE, Some(&serial));
+    };
+    let req = match mark_request(&state, &target).await {
+        Ok(r) => r,
+        Err(r) => return *r,
+    };
+    let opened = on_app_data(&state, &req, move |c| {
+        let Some(digest) = c.app.digest(c.guard, id)?.filter(Digest::is_live) else {
+            return Ok(Ok(None));
+        };
+        let Some(name) = digest.comment_handwrite_name.filter(|n| valid_mark_name(n)) else {
+            return Ok(Ok(None));
+        };
+        Ok(Ok(c
+            .app
+            .open_mark(c.guard, &name)?
+            .map(|(file, size)| (file, size, name))))
+    })
+    .await;
+    match opened {
+        Ok(Some((file, size, name))) => send_file(&headers, file, size, &name, serial, None),
+        Ok(None) => plain_error(E_DOWNLOAD, FLAG_DOWNLOAD_FAILED, Some(&serial)),
+        Err(refused) => refused.into_response(),
+    }
 }

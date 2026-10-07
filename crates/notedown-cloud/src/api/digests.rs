@@ -1,6 +1,7 @@
 //! The digest routes of accept mode (`docs/sync-protocol.md` 5.3, 5.4, 5.7): items, groups and
-//! tags of the device's Digest app. The two transfer routes of the handwritten comments
-//! (`upload/apply/summary`, `download/summary`) are not served here.
+//! tags of the device's Digest app, and the two routes that sign the transfers of the
+//! handwritten comments (`upload/apply/summary`, `download/summary`, 5.5). The bytes move on
+//! `/api/oss/upload/summary` and `/api/oss/download/summary` ([`super::oss`]).
 //!
 //! The gate of every call: the device token (`E0712`), the body's `equipmentNo` when present
 //! (`E0312`), the protect gate of the files (`E0079`, flag `protect_refused`) and then, with
@@ -31,13 +32,17 @@ use serde_json::{Map, Value, json};
 
 use super::envelope::{Reply, field, parse_body};
 use super::files::{
-    E_DEVICE_MISMATCH, IdArg, MSG_DEVICE_MISMATCH, blocking, gate_locked, id_arg, protect_gate,
+    E_DEVICE_MISMATCH, E_NO_FILE, E_UPLOAD, FLAG_BAD_NAME, IdArg, MSG_DEVICE_MISMATCH, MSG_NO_FILE,
+    MSG_UPLOAD, blocking, gate_locked, id_arg, protect_gate,
 };
-use crate::appdata::{AppData, Digest, DigestGroup, DigestTag, NO, YES};
+use super::oss::MARK_TARGET;
+use crate::appdata::{AppData, Digest, DigestGroup, DigestTag, NO, YES, valid_mark_name};
 use crate::auth::Account;
 use crate::journal::Origin;
 use crate::server::AppState;
 use crate::store::WriteGuard;
+use crate::sync::urls::{base_url, oss_url};
+use crate::sync::{Purpose, SignedTarget};
 
 /// A tag with this name exists.
 pub const E_TAG_EXISTS: &str = "E0335";
@@ -77,6 +82,8 @@ pub struct AppRequest {
     pub serial: String,
     /// The account's user id (`userId` of the answers).
     pub user_id: u64,
+    /// The token's generation (signed into transfer URLs).
+    pub generation: u64,
     pub body: Value,
 }
 
@@ -108,6 +115,7 @@ pub fn app_request(
 ) -> Result<AppRequest, Reply> {
     let (a, _) = super::server::authenticate(state, headers)?;
     let serial = a.claims.equipment_no;
+    let generation = a.claims.generation;
     let body = parse_body(bytes).map_err(|r| r.device(&serial))?;
     if let Some(sent) = field(&body, "equipmentNo")
         && sent != serial
@@ -124,6 +132,7 @@ pub fn app_request(
         slug: a.account.slug.clone(),
         serial,
         user_id: a.account.user_id,
+        generation,
         body,
     })
 }
@@ -183,6 +192,18 @@ pub async fn with_app_data<F>(state: &Arc<AppState>, req: &AppRequest, f: F) -> 
 where
     F: FnOnce(Ctx<'_>) -> crate::Result<Reply> + Send + 'static,
 {
+    on_app_data(state, req, move |c| f(c).map(Ok))
+        .await
+        .unwrap_or_else(|reply| reply)
+}
+
+/// [`with_app_data`] for work that hands back a value (an opened file): `Err` is the answer of
+/// a closed gate, of a store error, or the refusal `f` returns.
+pub async fn on_app_data<T, F>(state: &Arc<AppState>, req: &AppRequest, f: F) -> Result<T, Reply>
+where
+    T: Send + 'static,
+    F: FnOnce(Ctx<'_>) -> crate::Result<Result<T, Reply>> + Send + 'static,
+{
     let (st, slug, serial, user_id) = (
         state.clone(),
         req.slug.clone(),
@@ -199,7 +220,7 @@ where
             .get(store.slug())?
             .is_some_and(|a| app_data_open(&st, &a));
         if !open {
-            return Ok(app_data_refused(&serial));
+            return Ok(Err(app_data_refused(&serial)));
         }
         f(Ctx {
             state: &st,
@@ -210,7 +231,7 @@ where
         })
     })
     .await;
-    done.unwrap_or_else(|reply| reply)
+    done.and_then(|r| r)
 }
 
 // ------------------------------------------------------------------ request parsing
@@ -861,6 +882,99 @@ pub async fn query_tag(
             })
             .collect();
         Ok(c.ok(json!({"summaryTagDOList": list})))
+    })
+    .await
+}
+
+// ------------------------------------------------------------------ handwritten comments
+
+/// The base URL of the signed transfer URLs: `external_base_url`, else the request's host.
+fn transfer_base(state: &AppState, headers: &HeaderMap) -> String {
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok());
+    base_url(state.config.external_base_url.as_deref(), host)
+}
+
+/// `POST /api/file/upload/apply/summary` `{fileName, equipmentNo}` (5.4 step 3, 5.5):
+/// `fullUploadUrl` (signed, `POST /api/oss/upload/summary`, valid 30 min), `partUploadUrl: ""`
+/// and `innerName` = `fileName`. A name that is no plain `<name>.mark` of at most 64 bytes
+/// answers `E0324` (flag `bad_name`). Nothing is written here.
+pub async fn upload_apply_summary(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Reply {
+    let req = app_request!(state, headers, bytes);
+    let Some(name) = field(&req.body, "fileName").filter(|n| valid_mark_name(n)) else {
+        return Reply::error(E_UPLOAD, MSG_UPLOAD)
+            .flag(FLAG_BAD_NAME)
+            .device(&req.serial);
+    };
+    let target = SignedTarget {
+        account: req.slug.clone(),
+        device: req.serial.clone(),
+        generation: req.generation,
+        path: MARK_TARGET.into(),
+        id: None,
+        inner: Some(name.clone()),
+        size: 0,
+    }
+    .encode();
+    let signed = state
+        .url_signer
+        .sign("POST", &target, Purpose::Upload, 0, state.now_ms());
+    let base = transfer_base(&state, &headers);
+    Reply::ok(json!({
+        "fullUploadUrl": oss_url(&base, "upload/summary", &target, &signed),
+        "partUploadUrl": "",
+        "innerName": name,
+    }))
+    .device(&req.serial)
+}
+
+/// `POST /api/file/download/summary` `{id}` (5.4 step 5): `url` (signed,
+/// `GET /api/oss/download/summary`, valid 24 h) for the handwritten comment of the digest.
+/// `E0340` without a live digest; `E0321` when it names no comment, a name that is no valid
+/// `.mark` name, or one whose file is missing.
+pub async fn download_summary(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Reply {
+    let req = app_request!(state, headers, bytes);
+    let id = match required_id(&req) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    let base = transfer_base(&state, &headers);
+    let (slug, generation) = (req.slug.clone(), req.generation);
+    with_app_data(&state, &req, move |c| {
+        let Some(digest) = c.app.digest(c.guard, id)?.filter(Digest::is_live) else {
+            return Ok(c.error(E_DIGEST_MISSING, MSG_DIGEST_MISSING));
+        };
+        let present = match digest.comment_handwrite_name.as_deref() {
+            Some(name) if valid_mark_name(name) => c.app.open_mark(c.guard, name)?.is_some(),
+            _ => false,
+        };
+        if !present {
+            return Ok(c.error(E_NO_FILE, MSG_NO_FILE));
+        }
+        let target = SignedTarget {
+            account: slug,
+            device: c.serial.to_string(),
+            generation,
+            path: MARK_TARGET.into(),
+            id: Some(id),
+            inner: None,
+            size: 0,
+        }
+        .encode();
+        let signed =
+            c.state
+                .url_signer
+                .sign("GET", &target, Purpose::Download, 0, c.state.now_ms());
+        Ok(c.ok(json!({"url": oss_url(&base, "download/summary", &target, &signed)})))
     })
     .await
 }

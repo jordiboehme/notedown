@@ -1,7 +1,8 @@
 //! Digest records: items, groups, tags and the handwritten comments (`docs/sync-protocol.md`
 //! 5.1, 5.5).
 
-use std::path::PathBuf;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -476,6 +477,39 @@ impl AppData<'_> {
     pub fn put_mark(&self, guard: &WriteGuard, name: &str, bytes: &[u8]) -> Result<()> {
         let path = self.mark_path(guard, name)?;
         crate::fsutil::write_atomic(&path, bytes, false)
+    }
+
+    /// The folder of the handwritten comments (`digests/marks`). An upload streams into a temp
+    /// file here without the store lock and [`AppData::put_mark_file`] renames it then.
+    pub fn marks_dir(&self) -> PathBuf {
+        self.digests_dir().join(MARKS_DIR)
+    }
+
+    /// Make the closed temp file `tmp` (in [`AppData::marks_dir`]) the handwritten comment
+    /// `name`: a rename in the same folder, so the comment is replaced atomically. Not
+    /// journaled, as [`AppData::put_mark`].
+    pub fn put_mark_file(&self, guard: &WriteGuard, name: &str, tmp: &Path) -> Result<()> {
+        let path = self.mark_path(guard, name)?;
+        if tmp.parent() != path.parent() {
+            return Err(Error::Invalid {
+                what: "mark upload",
+                message: format!("{} is not in {}", tmp.display(), self.marks_dir().display()),
+            });
+        }
+        crate::fsutil::rename_durable(tmp, &path)
+    }
+
+    /// The handwritten comment `name` opened for reading, with its size; `None` when it is
+    /// missing.
+    pub fn open_mark(&self, guard: &WriteGuard, name: &str) -> Result<Option<(File, u64)>> {
+        let path = self.mark_path(guard, name)?;
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io_err(&path)(e)),
+        };
+        let meta = file.metadata().map_err(io_err(&path))?;
+        Ok(meta.is_file().then_some((file, meta.len())))
     }
 }
 

@@ -39,6 +39,12 @@ const TAG_UPDATE: &str = "/api/file/update/summary/tag";
 const TAG_DELETE: &str = "/api/file/delete/summary/tag";
 const TAG_QUERY: &str = "/api/file/query/summary/tag";
 const START: &str = "/api/file/2/files/synchronous/start";
+const MARK_APPLY: &str = "/api/file/upload/apply/summary";
+const MARK_DOWNLOAD: &str = "/api/file/download/summary";
+const MARK_UPLOAD: &str = "/api/oss/upload/summary";
+const MARK_GET: &str = "/api/oss/download/summary";
+/// A handwritten comment's name as the device makes it (5.5): 32 hex characters, case kept.
+const MARK: &str = "0123456789abcdefABCDEF0123456789.mark";
 
 /// Above 2^53: an `f64` would round it.
 const BIG_ID: u64 = 895_334_188_016_730_113;
@@ -132,6 +138,13 @@ impl Server {
         accounts.save(&a).unwrap();
     }
 
+    fn clear_app_data_imported(&self) {
+        let accounts = Accounts::new(self.data());
+        let mut a = accounts.get("jordi").unwrap().unwrap();
+        a.app_data_imported = None;
+        accounts.save(&a).unwrap();
+    }
+
     fn user_id(&self) -> u64 {
         Accounts::new(self.data())
             .get("jordi")
@@ -193,6 +206,45 @@ impl Server {
             .unwrap()
             .to_vec();
         Raw { status, body }
+    }
+
+    /// A request with a raw body and content type (multipart uploads, signed GETs).
+    async fn bytes(&self, method: &str, uri: &str, content_type: &str, body: Vec<u8>) -> Raw {
+        let addr: SocketAddr = "192.168.1.50:40000".parse().unwrap();
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", content_type)
+            .header("host", "192.168.1.10:19072")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = router(self.state.clone())
+            .layer(MockConnectInfo(addr))
+            .oneshot(req)
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        Raw { status, body }
+    }
+
+    /// `POST <signed upload URL>` with `bytes` as the multipart field `file`.
+    async fn send_mark(&self, url: &str, bytes: &[u8]) -> Raw {
+        let (ct, body) = multipart(bytes);
+        self.bytes("POST", &path_and_query(url), &ct, body).await
+    }
+
+    /// `GET <signed download URL>`.
+    async fn fetch(&self, url: &str) -> Raw {
+        self.bytes("GET", &path_and_query(url), "", Vec::new())
+            .await
+    }
+
+    fn holder(&self) -> Option<String> {
+        self.state.sync_locks.holder("jordi", self.state.now_ms())
     }
 
     async fn call(&self, method: &str, path: &str, token: &str, body: Value) -> Value {
@@ -358,6 +410,38 @@ fn add_body(unique: &str, content: &str) -> Value {
         "author": "Jordi",
         "equipmentNo": SERIAL,
     })
+}
+
+/// A multipart body with a text field and then the field `file`.
+fn multipart(bytes: &[u8]) -> (String, Vec<u8>) {
+    let b = "notedownTestBoundary7MA4YWxk";
+    let mut body = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nhello\r\n\
+         --{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{MARK}\"\r\n\
+         Content-Type: application/octet-stream\r\n\r\n"
+    )
+    .into_bytes();
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{b}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={b}"), body)
+}
+
+/// `http://host:port/a/b?c` -> `/a/b?c`.
+fn path_and_query(url: &str) -> String {
+    let rest = url.split_once("://").unwrap().1;
+    rest[rest.find('/').unwrap()..].to_string()
+}
+
+fn md5_of(bytes: &[u8]) -> String {
+    use md5::Digest as _;
+    const_hex::encode(md5::Md5::digest(bytes))
+}
+
+/// The URL with one character of its `signature` changed.
+fn tampered(url: &str) -> String {
+    let at = url.find("signature=").unwrap() + "signature=".len();
+    let flipped = if &url[at..=at] == "0" { "1" } else { "0" };
+    format!("{}{flipped}{}", &url[..at], &url[at + 1..])
 }
 
 fn ids_of(list: &Value) -> Vec<u64> {
@@ -1236,22 +1320,291 @@ async fn refuse_mode_and_the_transfer_routes_stay_refused() {
     let v = s.raw("GET", TAG_QUERY, Some(&t), None).await.json();
     assert_err(&v, "E0079");
 
+    let v = s
+        .post(
+            MARK_APPLY,
+            &t,
+            json!({"fileName": MARK, "equipmentNo": SERIAL}),
+        )
+        .await;
+    assert_err(&v, "E0079");
+    let v = s.post(MARK_DOWNLOAD, &t, json!({"id": 1})).await;
+    assert_err(&v, "E0079");
+    for (method, path) in [("POST", MARK_UPLOAD), ("GET", MARK_GET)] {
+        let v = s.raw(method, path, Some(&t), None).await.json();
+        assert_err(&v, "E0079");
+    }
+
+    // another method on a digest path is refused like any file path
     let s = Server::new();
     let t = s.login(SERIAL).await;
-    for path in [
-        "/api/file/upload/apply/summary",
-        "/api/file/download/summary",
+    let v = s.raw("GET", ADD, Some(&t), None).await.json();
+    assert_err(&v, "E0079");
+}
+
+// ------------------------------------------------------------------ 5.4 steps 3 and 5, 5.5, D9
+
+/// `upload/apply/summary` for `name`; asserts success and returns the answer.
+async fn apply_mark(s: &Server, t: &str, name: &str) -> Value {
+    let v = s
+        .post(
+            MARK_APPLY,
+            t,
+            json!({"fileName": name, "equipmentNo": SERIAL}),
+        )
+        .await;
+    assert_ok(&v);
+    v
+}
+
+/// The update of 5.4 step 3: the digest `id` names the comment `name` with `md5`.
+fn update_with_mark(id: u64, name: &str, md5: &str) -> Value {
+    let mut body = add_body("aaaa", "x");
+    body["id"] = json!(id);
+    body["commentHandwriteName"] = json!(name);
+    body["handwriteInnerName"] = json!(name);
+    body["handwriteMD5"] = json!(md5);
+    body
+}
+
+#[tokio::test]
+async fn a_handwritten_comment_round_trip() {
+    let s = Server::new();
+    let t = s.login(SERIAL).await;
+    // A lapsed sync lock of this device stays lapsed through every transfer (D1).
+    assert_ok(&s.post(START, &t, json!({"equipmentNo": SERIAL})).await);
+    s.advance_ms(30_001);
+    assert_eq!(s.holder(), None);
+
+    let id = s.post(ADD, &t, add_body("aaaa", "x")).await["id"]
+        .as_u64()
+        .unwrap();
+    let a = apply_mark(&s, &t, MARK).await;
+    let url = a["fullUploadUrl"].as_str().unwrap();
+    assert!(
+        url.starts_with("http://192.168.1.10:19072/api/oss/upload/summary?path="),
+        "{url}"
+    );
+    assert_eq!(a["partUploadUrl"], "");
+    assert_eq!(a["innerName"], MARK);
+
+    let bytes: Vec<u8> = (0..29_000u32).map(|i| (i * 7 % 251) as u8).collect();
+    let r = s.send_mark(url, &bytes).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let v = r.json();
+    assert_ok(&v);
+    assert_eq!(v["md5"], md5_of(&bytes));
+    assert_eq!(v["innerName"], MARK);
+    let stored = s.data().join("accounts/jordi/digests/marks").join(MARK);
+    assert_eq!(std::fs::read(&stored).unwrap(), bytes);
+    assert_eq!(s.holder(), None);
+
+    // Nothing links the bytes before the update (5.4 step 3).
+    assert_err(&s.post(MARK_DOWNLOAD, &t, json!({"id": id})).await, "E0321");
+    let md5 = md5_of(&bytes);
+    assert_ok(&s.put(UPDATE, &t, update_with_mark(id, MARK, &md5)).await);
+    let (digests, _) = s.stored();
+    assert_eq!(digests[0].comment_handwrite_name.as_deref(), Some(MARK));
+    assert_eq!(digests[0].handwrite_md5.as_deref(), Some(md5.as_str()));
+
+    let d = s.post(MARK_DOWNLOAD, &t, json!({"id": id})).await;
+    assert_ok(&d);
+    let get = d["url"].as_str().unwrap();
+    assert!(
+        get.starts_with("http://192.168.1.10:19072/api/oss/download/summary?path="),
+        "{get}"
+    );
+    let r = s.fetch(get).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.body, bytes);
+
+    // A changed comment keeps its name: the upload replaces the bytes.
+    let a = apply_mark(&s, &t, MARK).await;
+    let r = s
+        .send_mark(a["fullUploadUrl"].as_str().unwrap(), b"changed")
+        .await;
+    assert_ok(&r.json());
+    assert_eq!(s.fetch(get).await.body, b"changed");
+    // No temp file is left beside the comment.
+    let names: Vec<_> = std::fs::read_dir(stored.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from(MARK)]);
+    assert_eq!(s.holder(), None);
+}
+
+#[tokio::test]
+async fn a_bad_mark_name_is_refused() {
+    let s = Server::new();
+    let t = s.login(SERIAL).await;
+    let long = format!("{}.mark", "a".repeat(60));
+    for name in [
+        "",
+        ".mark",
+        ".hidden.mark",
+        "x.txt",
+        "../x.mark",
+        "a/b.mark",
+        "a\\b.mark",
+        "a\0b.mark",
+        long.as_str(),
     ] {
         let v = s
             .post(
-                path,
+                MARK_APPLY,
                 &t,
-                json!({"fileName": "a.mark", "id": 1, "equipmentNo": SERIAL}),
+                json!({"fileName": name, "equipmentNo": SERIAL}),
             )
             .await;
-        assert_err(&v, "E0079");
+        assert_err(&v, "E0324");
     }
-    // another method on a digest path is refused like any file path
-    let v = s.raw("GET", ADD, Some(&t), None).await.json();
+    let v = s.post(MARK_APPLY, &t, json!({"equipmentNo": SERIAL})).await;
+    assert_err(&v, "E0324");
+    // 64 bytes is the limit.
+    apply_mark(&s, &t, &format!("{}.mark", "a".repeat(59))).await;
+    assert!(!s.data().join("accounts/jordi/digests/marks").exists());
+}
+
+#[tokio::test]
+async fn download_without_handwriting_or_digest() {
+    let s = Server::new();
+    let mut gone = digest(7, "gone", "", T0);
+    gone.comment_handwrite_name = Some(MARK.into());
+    let mut bad = digest(8, "bad", "", T0);
+    bad.comment_handwrite_name = Some("../../account.json".into());
+    let mut deleted = digest(9, "deleted", "", T0);
+    deleted.is_deleted = "Y".into();
+    s.seed(&[digest(5, "plain", "", T0), gone, bad, deleted], &[]);
+    let t = s.login(SERIAL).await;
+    for id in [5, 7, 8] {
+        let v = s.post(MARK_DOWNLOAD, &t, json!({"id": id})).await;
+        assert_err(&v, "E0321");
+    }
+    for id in [9, 404] {
+        let v = s.post(MARK_DOWNLOAD, &t, json!({"id": id})).await;
+        assert_err(&v, "E0340");
+    }
+}
+
+#[tokio::test]
+async fn a_tampered_or_foreign_signature_is_e1306() {
+    let s = Server::new();
+    let t = s.login(SERIAL).await;
+    let a = apply_mark(&s, &t, MARK).await;
+    let up = a["fullUploadUrl"].as_str().unwrap().to_string();
+    for url in [
+        tampered(&up),
+        "http://h/api/oss/upload/summary?path=abc".to_string(),
+        "http://h/api/oss/upload/summary".to_string(),
+        // the file upload's URL shape is no mark URL
+        up.replace("/upload/summary?", "/upload?"),
+    ] {
+        let r = s.send_mark(&url, b"x").await;
+        assert_eq!(r.status, StatusCode::INTERNAL_SERVER_ERROR, "{url}");
+        assert_eq!(r.text(), "E1306", "{url}");
+    }
+    assert!(
+        !s.data()
+            .join("accounts/jordi/digests/marks")
+            .join(MARK)
+            .exists()
+    );
+
+    let r = s.send_mark(&up, b"x").await;
+    assert_ok(&r.json());
+    let id = s.post(ADD, &t, add_body("aaaa", "x")).await["id"]
+        .as_u64()
+        .unwrap();
+    assert_ok(
+        &s.put(UPDATE, &t, update_with_mark(id, MARK, &md5_of(b"x")))
+            .await,
+    );
+    let get = s.post(MARK_DOWNLOAD, &t, json!({"id": id})).await["url"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for url in [
+        tampered(&get),
+        "http://h/api/oss/download/summary?path=abc".to_string(),
+        // the file download's URL shape is no mark URL
+        get.replace("/download/summary?", "/download?"),
+    ] {
+        let r = s.fetch(&url).await;
+        assert_eq!(r.status, StatusCode::INTERNAL_SERVER_ERROR, "{url}");
+        assert_eq!(r.text(), "E1306", "{url}");
+    }
+    // An upload URL is no download URL.
+    let r = s
+        .fetch(&up.replace("/upload/summary?", "/download/summary?"))
+        .await;
+    assert_eq!(r.text(), "E1306");
+    // A new login raises the token generation: older URLs stop working.
+    s.login(SERIAL).await;
+    assert_eq!(s.fetch(&get).await.text(), "E1306");
+    assert_eq!(s.send_mark(&up, b"y").await.text(), "E1306");
+}
+
+#[tokio::test]
+async fn the_gate_covers_the_transfers() {
+    let s = Server::new();
+    let t = s.login(SERIAL).await;
+    let id = s.post(ADD, &t, add_body("aaaa", "x")).await["id"]
+        .as_u64()
+        .unwrap();
+    let up = apply_mark(&s, &t, MARK).await["fullUploadUrl"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ok(&s.send_mark(&up, b"x").await.json());
+    assert_ok(
+        &s.put(UPDATE, &t, update_with_mark(id, MARK, &md5_of(b"x")))
+            .await,
+    );
+    let get = s.post(MARK_DOWNLOAD, &t, json!({"id": id})).await["url"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    s.clear_app_data_imported();
+    let v = s
+        .post(
+            MARK_APPLY,
+            &t,
+            json!({"fileName": MARK, "equipmentNo": SERIAL}),
+        )
+        .await;
     assert_err(&v, "E0079");
+    assert!(
+        s.last_flags(MARK_APPLY)
+            .contains(&"app_data_refused".to_string())
+    );
+    assert_err(&s.post(MARK_DOWNLOAD, &t, json!({"id": id})).await, "E0079");
+    // The signed account decides for the byte transfers.
+    let v = s.send_mark(&up, b"other").await.json();
+    assert_err(&v, "E0079");
+    assert!(
+        s.last_flags(MARK_UPLOAD)
+            .contains(&"app_data_refused".to_string())
+    );
+    let v = s.fetch(&get).await.json();
+    assert_err(&v, "E0079");
+    assert!(
+        s.last_flags(MARK_GET)
+            .contains(&"app_data_refused".to_string())
+    );
+    let stored = s.data().join("accounts/jordi/digests/marks").join(MARK);
+    assert_eq!(std::fs::read(stored).unwrap(), b"x");
+
+    // With protect off the transfers are open without the marker.
+    let s = Server::with_config(Config {
+        protect: false,
+        ..Config::default()
+    });
+    let t = s.login(SERIAL).await;
+    let up = apply_mark(&s, &t, MARK).await["fullUploadUrl"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ok(&s.send_mark(&up, b"x").await.json());
 }

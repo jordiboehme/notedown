@@ -316,10 +316,11 @@ pub fn base_url(external_base_url: Option<&str>, host: Option<&str>) -> String {
     }
 }
 
-/// `<base>/api/oss/upload?path=..&signature=..&timestamp=..&nonce=..` (`endpoint` is
-/// `upload` or `upload/part`; the device appends `&uploadId=..&partNumber=..&totalChunks=..` to
-/// the part URL). Every value is URL-safe as it is.
-pub fn upload_url(base: &str, endpoint: &str, path_b64: &str, signed: &Signed) -> String {
+/// `<base>/api/oss/<endpoint>?path=..&signature=..&timestamp=..&nonce=..` (`endpoint` is
+/// `upload`, `upload/part`, `upload/summary` or `download/summary`; the device appends
+/// `&uploadId=..&partNumber=..&totalChunks=..` to the part URL). Every value is URL-safe as it
+/// is.
+pub fn oss_url(base: &str, endpoint: &str, path_b64: &str, signed: &Signed) -> String {
     format!(
         "{base}/api/oss/{endpoint}?path={path_b64}&signature={}&timestamp={}&nonce={}",
         signed.signature, signed.timestamp, signed.nonce

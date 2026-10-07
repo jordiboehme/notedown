@@ -94,17 +94,25 @@ const ACCEPT_IMPLEMENTED: &[(&str, &str)] = &[
     ("PUT", "/api/file/update/summary/tag"),
     ("DELETE", "/api/file/delete/summary/tag"),
     ("GET", "/api/file/query/summary/tag"),
+    ("POST", "/api/file/upload/apply/summary"),
+    ("POST", "/api/file/download/summary"),
+    ("POST", UPLOAD_SUMMARY_PATH),
+    ("GET", DOWNLOAD_SUMMARY_PATH),
 ];
 
 /// The byte uploads: their bodies stream to staging and are never read by the request log.
 pub const UPLOAD_PATH: &str = "/api/oss/upload";
 pub const UPLOAD_PART_PATH: &str = "/api/oss/upload/part";
+/// The byte upload of a digest's handwritten comment (`.mark`).
+pub const UPLOAD_SUMMARY_PATH: &str = "/api/oss/upload/summary";
+/// The byte download of a digest's handwritten comment.
+pub const DOWNLOAD_SUMMARY_PATH: &str = "/api/oss/download/summary";
 
 /// Whether accept mode streams this request's body to disk (the log does not read it).
 fn is_streamed_upload(state: &AppState, method: &axum::http::Method, path: &str) -> bool {
     state.sync_mode() == SyncMode::Accept
         && method == axum::http::Method::POST
-        && (path == UPLOAD_PATH || path == UPLOAD_PART_PATH)
+        && (path == UPLOAD_PATH || path == UPLOAD_PART_PATH || path == UPLOAD_SUMMARY_PATH)
 }
 
 fn is_implemented(method: &axum::http::Method, path: &str) -> bool {
@@ -175,8 +183,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 /// The file sync and digest routes of accept mode. Another method on one of these paths is
-/// refused like any file path (`E0079`), not answered by the catch-all. The digest transfers
-/// (`upload/apply/summary`, `download/summary`) are not among them yet.
+/// refused like any file path (`E0079`), not answered by the catch-all.
 fn accept_routes() -> Router<Arc<AppState>> {
     fn p<H, T>(handler: H) -> axum::routing::MethodRouter<Arc<AppState>>
     where
@@ -249,11 +256,20 @@ fn accept_routes() -> Router<Arc<AppState>> {
             get(digests::query_tag).fallback(refuse::refuse),
         )
         .route(
+            "/api/file/upload/apply/summary",
+            p(digests::upload_apply_summary),
+        )
+        .route("/api/file/download/summary", p(digests::download_summary))
+        .route(
             "/api/oss/download",
             get(oss::download).fallback(refuse::refuse),
         )
+        .route(
+            DOWNLOAD_SUMMARY_PATH,
+            get(oss::download_summary).fallback(refuse::refuse),
+        )
         // The byte uploads lift axum's body limit (2 MB); the handlers stream the field to disk
-        // and enforce their own limits (9 MiB per part, 1 GiB per file).
+        // and enforce their own limits (9 MiB per part, 1 GiB per file, 32 MiB per `.mark`).
         .route(
             UPLOAD_PATH,
             post(oss::upload)
@@ -263,6 +279,12 @@ fn accept_routes() -> Router<Arc<AppState>> {
         .route(
             UPLOAD_PART_PATH,
             post(oss::upload_part)
+                .fallback(refuse::refuse)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            UPLOAD_SUMMARY_PATH,
+            post(oss::upload_summary)
                 .fallback(refuse::refuse)
                 .layer(DefaultBodyLimit::disable()),
         )

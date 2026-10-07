@@ -96,6 +96,15 @@ text below it byte for byte. No OCR runs for this and the model isn't loaded. Th
 the header of ..." for each such file. `generated` keeps the old version and time, `source_date` and
 `last_modified` come from the source file as it is now.
 
+The same header-only update runs when the text is current but the source file moved or only its time
+changed, so `resource`, `source_date` and `last_modified` are right again. A header-only update keeps
+the links in the old text as they are. Use `--force` to convert the file again and rewrite them.
+
+Other tools may change the front matter of a converted file, for example Crystalline when it writes the
+note back or adds a `verified` key. notedown still knows the file as its own as long as `generated.by`
+starts with `notedown/`. Keys that notedown doesn't know are kept and written after its own keys when
+notedown writes the file again.
+
 notedown never overwrites a `.md` file it did not write itself. Such a file counts as a failure (exit
 code 1) and the error is printed.
 
@@ -117,21 +126,21 @@ v0.2), so a folder of converted notes is an OKF bundle. Crystalline reads it as 
 ```markdown
 ---
 type: note
-title: Test 2
-description: Handwritten Supernote note, 1 page, read by OCR.
-resource: Test 2.note
+title: "Test 2"
+description: "Handwritten Supernote note, 1 page, read by OCR."
+resource: "Test 2.note"
 tags: [supernote]
-generated: { by: notedown/0.1.0, model: chandra-ocr-2 Q4_K_M, at: 2026-10-05T23:10:00Z }
+generated: { by: notedown/0.1.0, model: "chandra-ocr-2 Q4_K_M", at: 2026-10-05T23:10:00Z }
 source_date: 2026-10-05
 sources:
-  - { id: note, resource: Test 2.note, last_modified: 2026-10-05T22:55:35Z }
+  - { id: note, resource: "Test 2.note", last_modified: 2026-10-05T22:55:35Z }
 status: stable
-source_sha256: <hex>
-file_id: F20261005225535133622IHP5FqtIJoxD
+source_sha256: "<hex>"
+file_id: "F20261005225535133622IHP5FqtIJoxD"
 pages: 1
 keywords: []
 links:
-  - { page: 1, target_file_id: F20240708174639550429bHksqaP2wKQ8, target_path: /storage/emulated/0/Note/Bike.note, target_md: Bike.md }
+  - { page: 1, target_file_id: "F20240708174639550429bHksqaP2wKQ8", target_path: "/storage/emulated/0/Note/Bike.note", target_md: "Bike.md" }
 ---
 
 <a id="page-1"></a>
@@ -151,13 +160,13 @@ The keys of the front matter:
 - `title` is the name of the source file without its extension.
 - `description` says what the file is: a note with its number of pages, or a single PNG page.
 - `resource` is the source file, relative to the folder of the `.md` file. It works with and without
-  `--out`.
+  `--out`, and also when `--out` is a symbolic link.
 - `tags` is always `[supernote]`.
 - `generated` says who wrote the text and when: `by` is notedown with its version, `model` the OCR
   model and `at` the time of the conversion in UTC.
 - `source_date` is the day the source file was last changed, in local time.
 - `sources` names the source file once more, with `last_modified`, the time it was last changed in
-  UTC.
+  UTC. When that time can't be read, `source_date` and `last_modified` are left out.
 - `status` is `draft` when a page hit the token limit and its text may be cut off. Otherwise it's
   `stable`.
 - `source_sha256` is the checksum of the source file. notedown uses it to skip files that didn't
@@ -169,7 +178,12 @@ The keys of the front matter:
 
 OKF reserves the names `index.md` and `log.md`. A source named `index` or `log` (in any case) keeps its
 extension in the name of the `.md` file: `index.note` becomes `index.note.md` and `Log.png` becomes
-`Log.png.md`. Links to such a note use that name.
+`Log.png.md`. Links to such a note use that name. An `index.md` or `log.md` that an older notedown
+wrote for the same note stays where it is and is no longer updated. The run prints a warning that names
+it, so you can delete it.
+
+Text values are written in double quotes, so no YAML reader takes a name like `2024` or `yes` for a
+number or a yes/no value. Dates, times and numbers are written without quotes.
 
 Every page starts with an `<a id="page-N"></a>` anchor, so links to a page inside the same note work
 as `#page-N`. The image line and the `<name>.assets/` folder appear only with `--images`. A page that

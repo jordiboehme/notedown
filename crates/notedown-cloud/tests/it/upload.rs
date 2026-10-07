@@ -896,6 +896,43 @@ async fn an_upload_over_a_case_variant_replaces_it_and_keeps_id_and_spelling() {
 }
 
 #[tokio::test]
+async fn a_note_over_a_case_variant_indexes_its_pages_under_the_stored_path() {
+    let s = Server::new();
+    let t = s.session().await;
+    let first = s.upload(&t, "NOTE/Note", "Bike.note", &test1()).await;
+    assert_ok(&first);
+    let id = first["id"].as_str().unwrap().to_string();
+    let before = s.state.journal.last_seq().unwrap();
+    let second = std::fs::read(root().join("tests/fixtures/notes/test2.note")).unwrap();
+    let f = s.upload(&t, "note/note", "bike.NOTE", &second).await;
+    assert_ok(&f);
+    assert_eq!(f["id"], id.as_str());
+    assert_eq!(f["path_display"], "NOTE/Note/Bike.note");
+    assert_eq!(names_in(&s.files().join("NOTE/Note")), ["Bike.note"]);
+    let new: Vec<Value> = s
+        .events()
+        .into_iter()
+        .filter(|e| e["seq"].as_u64().unwrap() > before)
+        .collect();
+    let ty = types(&new);
+    assert_eq!(ty[0], "file.modified", "{ty:?}");
+    assert_eq!(new[0]["path"], "NOTE/Note/Bike.note");
+    assert!(ty.len() > 1, "page events: {ty:?}");
+    for e in &new[1..] {
+        assert!(e["type"].as_str().unwrap().starts_with("page."), "{e}");
+        assert_ne!(e["type"], "page.index_failed", "{e}");
+        assert_eq!(e["id"].to_string(), id, "{e}");
+    }
+    // The page index has one record, under the stored path.
+    let records: Vec<Value> = std::fs::read_dir(s.account().join("pages"))
+        .unwrap()
+        .map(|e| serde_json::from_slice(&std::fs::read(e.unwrap().path()).unwrap()).unwrap())
+        .collect();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["path"], "NOTE/Note/Bike.note");
+}
+
+#[tokio::test]
 async fn a_case_variant_upload_into_a_case_variant_folder_is_one_file() {
     let s = Server::new();
     let t = s.session().await;

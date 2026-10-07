@@ -95,6 +95,7 @@ pub const FLAG_NAME_TOO_LONG: &str = "name_too_long";
 
 /// The longest name the store takes, in UTF-8 bytes: most file systems allow 255 bytes.
 pub const MAX_NAME_BYTES: usize = 255;
+/// The message of `E0324` for a name longer than [`MAX_NAME_BYTES`].
 pub const MSG_NAME_TOO_LONG: &str = "The name is too long";
 
 /// A wire path with the stored spelling of each existing segment ([`stored`]).
@@ -1639,7 +1640,14 @@ fn target_of(
     let own = (in_place && source.path.parent().as_ref() == Some(&parent))
         .then_some(source.name.as_str());
     match pick_name(store, guard, &parent, name, source.tag, autorename, own)? {
-        Some(name) if name.len() > MAX_NAME_BYTES => Ok(Target::Refused(Outcome::too_long()?)),
+        // A name that is new on disk; the source's own name in any case is not (the file
+        // system took it), so a case-only rename of a long name keeps working.
+        Some(name)
+            if name.len() > MAX_NAME_BYTES
+                && crate::store::fold(&name) != crate::store::fold(&source.name) =>
+        {
+            Ok(Target::Refused(Outcome::too_long()?))
+        }
         Some(name) => Ok(Target::Path(parent.join(&name)?)),
         None => taken(),
     }

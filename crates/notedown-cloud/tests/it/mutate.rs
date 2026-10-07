@@ -1999,3 +1999,32 @@ async fn names_over_255_bytes_are_refused_by_create_move_and_copy() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_long_name_that_is_stored_already_can_be_renamed_in_case_and_moved() {
+    let s = Server::new();
+    let t = s.session().await;
+    // 256 bytes; APFS takes it (255 characters), other file systems may not
+    let wide = "\u{e9}".repeat(128);
+    let upper = "\u{c9}".repeat(128);
+    if std::fs::write(s.files().join(format!("INBOX/{wide}")), b"w").is_err() {
+        return;
+    }
+    let id = s.id_of(&t, &format!("INBOX/{wide}")).await;
+    // a case-only rename keeps working (C7)
+    let v = s.mv(&t, &id, &format!("/INBOX/{upper}"), false).await;
+    assert_ok(&v);
+    assert_eq!(v["entriesVO"]["id"], id.as_str());
+    assert_eq!(names_at(&s, "INBOX"), std::slice::from_ref(&upper));
+    // a move into another folder keeps the stored name
+    let v = s.mv(&t, &id, &format!("/NOTE/Note/{upper}"), false).await;
+    assert_ok(&v);
+    assert_eq!(v["entriesVO"]["path_display"], format!("NOTE/Note/{upper}"));
+    // another new name over 255 bytes stays refused
+    let other = format!("{upper}x");
+    assert_err(
+        &s.mv(&t, &id, &format!("/NOTE/Note/{other}"), false).await,
+        "E0324",
+    );
+    assert!(s.last_flags(MOVE).contains("name_too_long"));
+}

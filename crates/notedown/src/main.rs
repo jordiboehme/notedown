@@ -74,7 +74,8 @@ enum CloudAction {
     },
     /// Fill an account with a device backup and open its protect gate
     Import(ImportArgs),
-    /// Fill an account's digests from the device's .snbak backup, before its first digest sync
+    /// Fill an account's digests from the device's .snbak backup and open digest and to-do sync
+    /// (the backup holds no to-dos)
     ImportAppData(ImportAppDataArgs),
     /// Copy one file into an account (connected devices are told to sync)
     Put(PutArgs),
@@ -110,7 +111,7 @@ struct ImportArgs {
 
 #[derive(clap::Args)]
 struct ImportAppDataArgs {
-    /// The device backup (.snbak, made by the device's backup function)
+    /// The device backup (.snbak, made by the device's own backup function)
     #[arg(value_name = "SNBAK", required_unless_present = "empty")]
     snbak: Option<PathBuf>,
     /// The data folder
@@ -119,7 +120,7 @@ struct ImportAppDataArgs {
     /// The account slug
     #[arg(long)]
     account: String,
-    /// Import nothing and only open the gate for the digests (the device has none)
+    /// Import nothing and only open digest and to-do sync (the device has no digests)
     #[arg(long, conflicts_with = "snbak")]
     empty: bool,
     /// Clear the digests and to-dos the account holds now first
@@ -180,7 +181,7 @@ enum JournalAction {
         #[arg(long)]
         follow: bool,
     },
-    /// Journal the current files and folders of an account as created events
+    /// Journal the current files, folders, digests and to-dos of an account as created events
     Snapshot {
         /// The data folder
         #[arg(long, value_name = "DIR")]
@@ -935,7 +936,7 @@ fn journal_command(data: &Path, action: JournalAction) -> Result<ExitCode> {
                     "journaled {} for account {account} (seq {a} to {b})",
                     plural(seqs.len(), "event")
                 ),
-                _ => println!("account {account} has no files or folders"),
+                _ => println!("account {account} has no files, folders, digests or to-dos"),
             }
         }
     }

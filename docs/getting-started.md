@@ -54,7 +54,7 @@ The README has all options and the output format.
 
 The device can sync with a "Private Cloud" instead of Ratta's cloud. notedown can be that cloud. Your files then live as real files in a folder on your computer, and every change is written to a journal.
 
-Status: experimental. Notes, documents and the other device folders sync. Digests and to-dos don't sync yet (see "What to expect").
+Status: experimental. Notes, documents and the other device folders sync. Digests and to-dos sync too (see "What to expect").
 
 Before you start:
 
@@ -86,9 +86,12 @@ notedown cloud backup-device http://192.168.1.20:8089 ~/supernote-backup
 
 Use a new, empty folder. notedown copies every file and writes `backup.json` with the result. This backup is your safety net and the start of the cloud in step 4.
 
+Then make the device's own backup too. Use the backup function of the device. It writes one file with a name like `Supernote_<date>_<time>.snbak`. Copy that file to the computer. It holds your digests (with their handwritten comments), and step 4 puts them into the cloud.
+
 Good to know:
 
-- The built-in backup of the device (a `.snbak` file) holds only digests and plugins, not your notes. This backup is the one that counts.
+- The `.snbak` file holds digests and plugins, not your notes. For the notes, the folder above is the backup that counts.
+- The `.snbak` file doesn't hold your to-dos. The cloud starts with no to-dos. What the device does with its own to-dos at the first sync isn't tested yet. If you have to-dos, write them down before you go on.
 - The SD card is skipped. Add `--include-sd` to copy it too (it lands below `REMOVABLE0/`). The cloud never syncs the SD card.
 - If a file failed, run the same command again with `--resume`. Use `--resume` only to finish this same backup, never on an older folder.
 
@@ -114,6 +117,24 @@ notedown protects you here. Until the import is done, the server refuses every f
 - the account already has files (that needs `--replace`).
 
 An import that failed or was stopped leaves files in the account. Run the next one with `--replace`. The error message says so too.
+
+Then import the digests from the `.snbak` file. Again, look first:
+
+```sh
+notedown cloud import-app-data Supernote_<date>_<time>.snbak --data ~/notedown-data --account me --dry-run
+notedown cloud import-app-data Supernote_<date>_<time>.snbak --data ~/notedown-data --account me
+```
+
+Why this matters: the device treats a digest that's missing in the cloud the same way as a file. The import makes the cloud hold the digests the device holds, with the ids the device knows. The dry run lists every digest with its id, its source file and the start of its text.
+
+Until this import is done, the server refuses every digest and to-do request of the device, and the device shows "App Data Sync Failed". Your files still sync. The import needs the file import first. It refuses a `.snbak` file that looks wrong:
+
+- it has no digest list (`backup/DIGEST/knowledge.json`);
+- a digest names a handwritten comment that isn't in the file;
+- two digests have the same id;
+- the account already has digests or to-dos (that needs `--replace`).
+
+A digest that never reached a cloud has no id yet. It gets a new one, and the import prints it. A device without any digests needs no `.snbak` file: run `notedown cloud import-app-data --empty --data ~/notedown-data --account me` instead.
 
 ### 5. Start the server
 
@@ -147,7 +168,7 @@ Then check that nothing was deleted before you do anything else:
 notedown cloud journal tail --data ~/notedown-data
 ```
 
-The import wrote one `file.created` line per file. After this sync there must be no `file.deleted` line. Go on only then. The full protocol log is in `~/notedown-data/logs/` (one file per day, passwords and tokens masked) if someone helps you look into a problem.
+The import wrote one `file.created` line per file and one `digest.created` line per digest. After this sync there must be no `file.deleted` and no `digest.deleted` line. Go on only then. The full protocol log is in `~/notedown-data/logs/` (one file per day, passwords and tokens masked) if someone helps you look into a problem.
 
 ### 10. Try one change
 
@@ -175,7 +196,9 @@ If the device doesn't sync after a `put`, start a manual sync. The `push` settin
 
 ## What to expect
 
-- Digests and to-dos don't sync yet. The server answers them with "busy", so the device shows "App Data Sync Failed". Your files still sync.
+- Digests and to-dos sync with every sync of the device. Each change shows up in the journal (`digest.created`, `digest.updated`, `digest.deleted`, `task.created` and so on). The digests are in `accounts/me/digests/` and the to-dos in `accounts/me/tasks/`, as JSON files. A handwritten comment of a digest is a `.mark` file in `accounts/me/digests/marks/`.
+- If you import an old `.snbak` file, a digest can show up twice on the device. Always import a fresh one.
+- A digest you delete on one device can come back when a second device still has it and changes it.
 - A file you add with `put` arrives a few seconds later when "Auto Sync" is on. Without it, the file arrives at the next manual sync. notedown doesn't push while a sync runs or while protect mode is closed. A change you make while `notedown serve` is stopped isn't pushed later. The device gets it at its next sync.
 - The `push` setting in `server.toml` has four values. `reconnect` (the default) closes the device's connection: the device connects again within seconds and syncs. `startsync` and `detail` send a message instead (the Nomad receives it but doesn't sync on it). `off` does nothing. `notedown serve` prints the active value. Restart the server after you change it.
 - Don't change files in the data folder directly. The server doesn't notice such a change yet. A removed file looks like a delete to the device, and it removes its own copy too. Use `put`, or change files on the device.
@@ -185,11 +208,13 @@ If the device doesn't sync after a `put`, start a manual sync. The `push` settin
 
 Log out of the Private Cloud on the device, choose "Retain locally" and log in to Ratta's cloud again. Your files stay on the device. The data folder stays as it is.
 
-To come back later, never reuse the old backup: the device changed in the meantime, and a file that's missing in the cloud gets deleted on the device. Stop writing, make a new backup into a new folder (step 3), import that one with `--replace` (step 4) and go on with step 5.
+To come back later, never reuse the old backup: the device changed in the meantime, and a file that's missing in the cloud gets deleted on the device. Stop writing, make a new backup into a new folder and a new `.snbak` file (step 3), import both with `--replace` (step 4) and go on with step 5.
 
 ## Troubleshooting
 
 **The device says the sync is busy or failed.** Look at the server output and at the newest file in `~/notedown-data/logs/`. Before the import is done, every file request is refused on purpose.
+
+**"App Data Sync Failed".** The digests aren't imported yet. Run `import-app-data` (step 4) or `import-app-data --empty` if the device has no digests. The files sync anyway.
 
 **"No folders selected to sync".** See step 8.
 

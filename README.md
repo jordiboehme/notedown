@@ -15,12 +15,14 @@ notedown convert ~/Supernote/Note --out ~/notes-md
 ```
 
 notedown can also be the Private Cloud of your Supernote. Back up the device, fill the cloud with the
-backup, start the server and log in on the device:
+backup and the digests from the device's own `.snbak` backup, start the server and log in on the
+device:
 
 ```sh
 notedown cloud account --data ~/notedown-data add me --email you@example.org
 notedown cloud backup-device http://<device ip>:8089 ~/supernote-backup
 notedown cloud import ~/supernote-backup --data ~/notedown-data --account me
+notedown cloud import-app-data Supernote_<date>_<time>.snbak --data ~/notedown-data --account me
 notedown serve --data ~/notedown-data
 ```
 
@@ -159,7 +161,10 @@ files as real files in a data folder and writes every change to a journal.
 - `notedown cloud journal tail` prints the changes as JSON lines.
 - `notedown serve --refuse-sync` refuses every sync and exchanges no files. It's for recording the
   protocol only.
-- Digests and to-dos don't sync yet.
+- Digests (with groups and handwritten comments) and to-dos sync too. They're stored as JSON files
+  and every change goes to the journal. `notedown cloud import-app-data` fills the digests from the
+  device's `.snbak` backup first (the backup holds no to-dos). Until then the device shows "App Data
+  Sync Failed" and only the files sync.
 
 Read the [getting started guide](docs/getting-started.md) before you switch a device. It covers the
 backup, the import, the first sync, daily use, the way back and troubleshooting. The protocol is

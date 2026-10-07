@@ -641,6 +641,11 @@ Observed on a Nomad [community:ultrabridge 0b and Phase D]:
 
 The device polls `query/summary/hash` every sync, so the round trip works without socket pushes [community:ultrabridge].
 
+- notedown: paging. `page` is 1-based and `page <= 0` reads as 1; `size <= 0` means all rows, so the device's `{"page":0,"size":0}` group query (9.1) gets every live group. Rows are ordered by `creationTime` descending, ties by `id` descending. `totalPages` is at least 1; `currentPage` and `pageSize` are answered as sent (0 stays 0) [proposal].
+- notedown: ids. Before the first digest sync `notedown cloud import-app-data` fills the account from the device's own `.snbak` backup and keeps the cloud id the device holds (`serviceId` in `knowledge.json`) as the record `id`, so `query/summary/hash` answers the ids and `md5Hash` values the device already has. A new digest or group gets the largest id of all digests and groups of the account plus one; tags count in their own space. Ids stay JSON integers and never pass through a float. Until the import, every digest and to-do call answers `E0079` (flag `app_data_refused`) when protect is on [proposal].
+- notedown: identity. An `add/summary` whose `metadata.unique_identifier` matches a live digest updates that digest and answers its `id`. An `update/summary` (or `update/summary/group`) for an id the server does not know creates the record under that id (flags `digest_adopted`, `digest_group_adopted`, 5.7) without checking `metadata.unique_identifier`. After an import of an old backup this can leave two records for one digest, and the device may download a duplicate. An `update/summary` for a soft-deleted digest brings it back: a second device that has not seen the delete can revive a digest with an ordinary edit [proposal].
+- notedown: handwritten comments. `upload/apply/summary` answers a signed `fullUploadUrl` for `POST /api/oss/upload/summary`, `partUploadUrl: ""` and `innerName` = `fileName`; `download/summary` answers a signed `url` for `GET /api/oss/download/summary`, or `E0321` when the digest names no comment. The target in these signed URLs is distinct from every file path (it contains a backslash, which no wire path can), so a mark URL never reaches a file and a file URL never reaches a mark. A failed mark upload (account or store error) answers HTTP 500 with the plain text `E1305`, a failed mark download `E1307`, as the file transfers do (7.1) [proposal].
+
 ### 5.5 The handwritten comment file (`.mark`)
 
 - Name: `<32 hex>.mark`. In the one published sample the name differs from `handwriteMD5`, so the name is not the MD5 of the file content [community:ultrabridge sample]. opennotecloud returns the device's `fileName` as `innerName` [community:opennotecloud]. Whether Ratta renames is [unknown]; returning the device's name keeps `commentHandwriteName == handwriteInnerName` as observed [inferred].
@@ -686,6 +691,9 @@ Task fields: `taskId` (32 hex, made by the device), `taskListId`, `recurrenceId`
 - Incremental sync: with a `nextSyncToken` younger than 5 days the server returns changes, older -> `E0330` and the device does a full pull [ratta-server: `next.sync.tiamout=5`, enum E0330] [community:ultrabridge].
 - Tasks with `lastModified` 0 or without sort fields are hidden on the device [community:ultrabridge]. Empty page tokens must be omitted, an empty string made the device loop [community:ultrabridge].
 - The Nomad called `task/all` 7 times, `group/all` 3 times and `PUT task/list` twice in one session [community:ultrabridge 0b].
+- notedown: ids and records. `taskId` and `taskListId` are kept as the device sends them (a JSON number is stored as its decimal string); the `.snbak` backup holds no to-dos, so an account starts without any. A task delete leaves a tombstone (`isDeleted: "Y"`) for 5 days, so incremental pulls see it; a group delete makes tombstones of its tasks and removes its sort. Deleting a task, group or sort that is not there answers success: an error would fail every to-do sync of the device [proposal].
+- notedown: sync tokens. `nextSyncToken` is the server time in ms. A pull with a token answers every task the server wrote at or after that ms (`>=`, so a write in the same ms comes again instead of never), tombstones included. A token older than 5 days, in the future or not a number answers `E0330`; an absent, `null`, `""` or `0` token gives a full pull of the live tasks [proposal].
+- notedown: paging. Tasks are ordered by `taskId`, groups by `taskListId`, and paged by offset; `maxResults` defaults to 20. A page with more rows after it carries `nextPageToken` (or `pageToken` for groups); the last page omits it. Every page of one pull answers the first page's time as `nextSyncToken`. A change between the page calls can be skipped or repeated on that pass; the next incremental pull repairs it. `pageToken`, `nextPageTokens`, `maxResults` and `nextIndexNumber` are read leniently (a string, a number or a one-element array); any other shape means the first page or the default of 20, never `422`, since an error would fail every to-do poll [proposal].
 
 ### 6.2 Equipment
 
@@ -905,6 +913,7 @@ Notes:
 - Document digests have no stable file id in the protocol; the key is the `sourcePath` (plus `source_size`); a rename of the PDF makes a new key, so `source.json` records the old path and the server can re-key on `move_v3` of the document.
 - The digest's server `id` (a long the device uses in `update/summary`, `delete/summary`, `download/summary` and `query/summary/hash`) is stored inside each digest JSON; an in-memory index id -> file is built at start.
 - `.mark` blobs are stored under the digest's `unique_identifier` so the pair JSON + `.mark` sits together per source; the device-facing name (`commentHandwriteName`/`handwriteInnerName`) stays in the JSON and is returned unchanged.
+- notedown: built differently from this proposal. Digests are flat, one file per server id (`digests/items/<id>.json`, `digests/groups/<id>.json`, `digests/tags.json`), and the `.mark` files sit in `digests/marks/` under the device's name; the source link stays in the records and the journal (design spec, "Known limits"). The `outbox/` is not used yet: the server never deletes a digest on its own.
 
 #### 8.3.3 Feature table
 
@@ -1013,6 +1022,7 @@ Two mappers reference tables that the shipped schema does not create (`f_composi
 | 11 | When the device drops a token (logout, server says `E0712`, `E0085`) and how it re-logs in | Stub returns `E0712` once and logs the following requests |
 | 12 | HTTP vs HTTPS: Ratta's doc shows plain `http://IP:19072`; does 3.29.42 require HTTPS for private cloud? | Try plain HTTP first with the stub |
 | 13 | Firmware 3.29.42 differences from the firmware used by the community traces (not stated there) | All of the above captures on Jordi's device |
+| 14 | The real body of the device's first `schedule/task/all` request (which `maxResults`, whether `nextSyncToken` and `nextPageTokens` are absent, `null` or empty, and their JSON types); notedown parses them leniently until it is known | The protocol log of the first to-do sync against notedown |
 
 Plan [proposal]: build the logging stub first (it is also the skeleton of the server), capture items 1, 2, 3, 8, 11, 12 in one session, then run the Ratta test stack for items 4 to 7 and save the captures as test fixtures with personal data removed.
 

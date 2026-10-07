@@ -304,7 +304,8 @@ impl Store {
     /// journals one `recycle.pruned` per removed line (one batch, one `opId`), writes the new
     /// index atomically and then removes the slots: a file only when it is a file. A folder
     /// slot goes whole (dot-files and files without a line too) when no kept line has its slot
-    /// inside it; otherwise only its empty folders go. Empty folders up to `recycle/` go too.
+    /// inside it and no line that can't be read names its `deletedAt`; otherwise only its
+    /// empty folders go. Empty folders up to `recycle/` go too.
     /// A slot that can't be removed is reported in `failed` and the prune goes on with the
     /// rest. A dry run takes the plain lock and doesn't recover (recovery writes), so with an
     /// unfinished commit on disk its plan can differ a little from the real run's.
@@ -349,12 +350,14 @@ impl Store {
         let mut unreadable = 0;
         let mut failed = Vec::new();
         let mut linked_slots = Vec::new();
-        for (i, (_, entry)) in lines.iter().enumerate() {
+        let mut raw = Vec::new();
+        for (i, (bytes, entry)) in lines.iter().enumerate() {
             let Some((e, slot)) = entry
                 .as_ref()
                 .and_then(|e| Some((e, self.recycle_path(e).ok()?)))
             else {
                 unreadable += 1;
+                raw.push(bytes.as_slice());
                 continue;
             };
             if self.has_symlink(&slot) {
@@ -396,7 +399,8 @@ impl Store {
                 true
             }
         });
-        // A folder slot goes whole when no kept line has its slot inside it.
+        // A folder slot goes whole when no kept line has its slot inside it and no line that
+        // can't be read names its `deletedAt` (it might hold bytes in there).
         let going: HashSet<usize> = remove.iter().copied().collect();
         let kept_slots: Vec<&PathBuf> = (0..entries.len())
             .filter(|i| !going.contains(i))
@@ -405,7 +409,14 @@ impl Store {
             .collect();
         let whole: Vec<bool> = remove
             .iter()
-            .map(|&i| is_dir(&slots[i]) && !kept_slots.iter().any(|k| k.starts_with(&slots[i])))
+            .map(|&i| {
+                let ms = entries[i].deleted_at.to_string();
+                is_dir(&slots[i])
+                    && !kept_slots.iter().any(|k| k.starts_with(&slots[i]))
+                    && !raw
+                        .iter()
+                        .any(|l| l.windows(ms.len()).any(|w| w == ms.as_bytes()))
+            })
             .collect();
         let sizes: Vec<u64> = remove
             .iter()

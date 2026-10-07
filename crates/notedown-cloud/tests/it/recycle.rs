@@ -422,6 +422,7 @@ fn when_every_line_of_a_folder_delete_expires_its_whole_slot_goes() {
     assert!(f.slot_path(&keep).is_file());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_folder_slot_with_a_symlink_inside_keeps_its_line_and_is_reported() {
     let f = Fixture::new();
@@ -432,7 +433,6 @@ fn a_folder_slot_with_a_symlink_inside_keeps_its_line_and_is_reported() {
     let outside = f.store.account_dir().join("outside");
     std::fs::create_dir_all(&outside).unwrap();
     std::fs::write(outside.join("keep.txt"), b"keep").unwrap();
-    #[cfg(unix)]
     std::os::unix::fs::symlink(&outside, f.slot_path(&folder).join("link")).unwrap();
     for dry_run in [true, false] {
         let r = f.prune(NOW, Origin::Cli, dry_run);
@@ -442,7 +442,6 @@ fn a_folder_slot_with_a_symlink_inside_keeps_its_line_and_is_reported() {
         assert_eq!(r.failed[0].location, folder.location());
     }
     assert!(outside.join("keep.txt").is_file());
-    #[cfg(unix)]
     assert!(f.slot_path(&folder).join("link").is_symlink());
     assert!(f.slot_path(&folder).join(".DS_Store").is_file());
     assert_eq!(
@@ -471,6 +470,23 @@ fn an_expired_folder_slot_goes_with_its_dot_files_and_unregistered_files() {
     assert_eq!(r.removed, vec![folder.clone()]);
     assert!(r.failed.is_empty(), "{:?}", r.failed);
     assert!(!f.recycle().join(ms.to_string()).exists());
+}
+
+#[test]
+fn a_folder_slot_that_a_corrupt_line_may_name_is_not_removed_whole() {
+    let f = Fixture::new();
+    let ms = NOW - 91 * DAY;
+    let folder = folder_entry(DEAD, "NOTE/Note/A", ms);
+    f.add(&folder, b"");
+    let inside = f.slot_path(&folder).join("x.note");
+    std::fs::write(&inside, b"x").unwrap();
+    let raw = format!("{{\"deletedAt\":{ms},\"path\":\"NOTE/Note/A/x.note\"");
+    f.raw_line(&raw);
+    let r = f.prune(NOW, Origin::Cli, false);
+    assert_eq!(r.removed, vec![folder]);
+    assert_eq!(r.unreadable_kept, 1);
+    assert!(inside.is_file());
+    assert_eq!(f.index_text(), format!("{raw}\n"));
 }
 
 /// A real folder delete through the store, with a dot-file inside: before the 90 days its

@@ -1,6 +1,6 @@
 # Supernote `.note` file format
 
-This document describes the binary format of Supernote `.note` notebook files as far as it could be established from four sample files. It is written so that a parser can be implemented from this text and the samples alone. The open-source Python package supernotelib (0.7.3) was used as a reference for facts about the format; nothing in this document is derived from its code structure.
+This document describes the binary format of Supernote `.note` notebook files as far as it could be established from four sample files. It is written so that a parser can be implemented from this text and the samples alone. The open-source Python package supernotelib (0.7.3) was used as a reference for facts about the format; nothing in this document is derived from its code structure. A second source is Ratta's own server-side note renderer (mark [ratta-notelib]); its facts were taken from symbol names, strings and single disassembled functions, no code was copied.
 
 ## 0. Conventions
 
@@ -13,6 +13,7 @@ Every statement carries one of these marks:
 | [verified] | Checked on the sample files with an independent decoder written from this text. |
 | [reference] | Taken from the reference implementation only; not observed in the samples. |
 | [others] | Reported by other community parsers (see Appendix B); not observed in the samples. |
+| [ratta-notelib] | Seen in Ratta's server-side note renderer notelib 6.9.3 (June 2025, the `noteServer` binary of the private cloud). It renders note and mark pages to PNG/PDF only: it never draws vectors, recognition, titles, keywords or text boxes, and it does not know `SN_FILE_VER_20260016`. A key it does not read is not proof that the key is meaningless. Evidence is cited by function or table name. |
 | [inferred] | Reasoning from the samples that is consistent but not proven. |
 | [unknown] | Present in the samples, meaning not established. A parser should expose it as raw data. |
 
@@ -36,10 +37,10 @@ All integers are little-endian [verified]. `u8`, `u16`, `u32`, `i16`, `i32`, `u6
 
 | Offset | Size | Content |
 |---|---|---|
-| 0 | 4 | File type, ASCII. `note` in all samples [verified]. `mark` for PDF annotation files [others]. |
+| 0 | 4 | File type, ASCII. `note` in all samples [verified]. `mark` for PDF annotation files [others; ratta-notelib]. Ratta's loader refuses anything else on this path (`fetchFileVertion`, `CheckIfA6X`); a file starting with `SN_FILE` goes to the original A5 path [ratta-notelib]. |
 | 4 | 20 | Signature, ASCII `SN_FILE_VER_` followed by 8 decimal digits [verified]. |
 | 24 | ... | First block (in all samples a header block) [verified]. |
-| end-8 | 4 | ASCII `tail` [verified]. |
+| end-8 | 4 | ASCII `tail` [verified]. Ratta does not check it (`fetchModuleIndexSite` reads only the address) [ratta-notelib]. |
 | end-4 | 4 | `u32` address of the current footer block [verified]. |
 
 ### Known signatures
@@ -53,6 +54,8 @@ All integers are little-endian [verified]. `u8`, `u16`, `u32`, `i16`, `i32`, `u6
 
 The digits are a date-like version number (`YYYY` + 4-digit sequence) [inferred]. A version of `20230015` or higher selects the "X2" color code table for RATTA_RLE bitmaps (section 5.3) [reference; consistent with all samples].
 
+Version gate in Ratta's renderer [ratta-notelib]: the first 24 bytes (`note` + signature, `fetchFileHeader`) are compared as a string with `noteSN_FILE_VER_20230015` (`markSN_FILE_VER_20230015` for marks). Greater or equal selects the "15" decoder and table (`fetchNoteRLEData_15`), smaller the old decoder (`fetchNoteRLEDataFromFile`), see 5.2 and 5.3. There is no list of known versions: `20260016` and any later signature take the "15" path. A second threshold exists: a signature below `SN_FILE_VER_20210009` sets a background flag in the layer loop; its effect was not traced [ratta-notelib].
+
 ### Differences between 20230015 and 20260016 in practice
 
 No difference in container structure, block encoding, metadata syntax, RLE or stroke layout was found [verified]. Differences seen:
@@ -64,7 +67,7 @@ No difference in container structure, block encoding, metadata syntax, RLE or st
 
 ### Unknown signatures
 
-A reader should accept any `SN_FILE_VER_` + 8 digits and parse it with these rules, flagging the version as unrecognized rather than failing [inferred]. The block structure has been stable across all versions the reference knows [reference].
+A reader should accept any `SN_FILE_VER_` + 8 digits and parse it with these rules, flagging the version as unrecognized rather than failing [inferred]. The block structure has been stable across all versions the reference knows [reference]. Ratta's renderer does the same: it parses any signature and only compares it with the two thresholds above [ratta-notelib].
 
 ## 2. Block chain and append-only saves
 
@@ -77,7 +80,7 @@ Everything after the 24-byte prefix is a sequence of blocks, each:
 | 4 | `u32` length N |
 | N | payload |
 
-A block is referenced by the address of its length field [verified]. There are two payload kinds: metadata blocks (UTF-8 text of `<KEY:VALUE>` pairs, section 3) and binary blocks (bitmaps, stroke data, ZIP archives) [verified].
+A block is referenced by the address of its length field [verified]. Ratta treats a length that reaches past the end of the file as an error ("content size is bigger than file size") [ratta-notelib]. There are two payload kinds: metadata blocks (UTF-8 text of `<KEY:VALUE>` pairs, section 3) and binary blocks (bitmaps, stroke data, ZIP archives) [verified].
 
 ### Save markers
 
@@ -95,7 +98,7 @@ A sequential walk is not needed for parsing; it is useful for validation and for
 ### Finding the current state
 
 1. Read the `u32` at file length minus 4: the current footer address [verified].
-2. The 4 bytes before it should be `tail` [verified].
+2. The 4 bytes before it should be `tail` [verified]. Ratta's renderer does not check this [ratta-notelib], so a missing `tail` should be a warning, not an error [inferred].
 3. Parse the footer block. All other current blocks are reached by addresses from the footer, recursively [verified].
 
 ### Stale blocks
@@ -125,6 +128,8 @@ The payload is UTF-8 text, a concatenation of items `<KEY:VALUE>` with no separa
 - A value may contain `:` (none observed except inside the `#`-escaped JSON) [inferred: take everything up to `>`].
 - A key may repeat inside one block (footer `TITLE_`, `KEYWORD_`, `LINKO_` keys when two items share a position, original A5 `PAGE`) [reference]. No repeated keys in the samples [verified]. A parser should keep all values in order.
 - Item order is meaningful for repeated keys only [inferred]; footer `PAGEn` keys appear in page order in the samples [verified], but a parser should sort by the number in the key.
+
+Ratta's parser is stricter [ratta-notelib]: it treats the payload as a C string (a NUL byte ends it), splits it on `>`, then splits each item on `:`. An item that does not give exactly two parts logs "module format error." and is skipped; parsing goes on. So an item without `:` and an item whose value contains `:` are both dropped. The key is the first part without the leading `<`. Items are kept in file order with repeats, and a lookup takes the first match. The rule above (value up to `>`) is more lenient; a parser that follows it should at least flag items that Ratta would drop [inferred]. No such item occurs in the samples [verified: no value contains `:`].
 
 ### Value types
 
@@ -170,20 +175,22 @@ footer
 
 | Key | Value | Meaning | Mark |
 |---|---|---|---|
-| `PAGE1`, `PAGE2`, ... | address | page blocks, 1-based page number in the key | [verified] |
+| `PAGE1`, `PAGE2`, ... | address | page blocks, 1-based page number in the key, no zero padding | [verified]; Ratta counts pages as the number of footer keys starting with `PAGE` and looks up page n as `PAGE` + decimal n (`getTotalPageNum`) [ratta-notelib]; `.mark` files may have gaps (6.4) |
 | `FILE_FEATURE` | address | header block | [verified] |
 | `DIRTY` | integer | 0 in bike (compacted), 1 in t1/t2, 6 in content; rises with unsaved edits | [verified values], meaning [others: count of modifications since last compaction] |
 | `COVER_0` | `0` | no cover | [verified] |
-| `COVER_1`, `COVER_2` | address | cover image; `COVER_2` preferred over `COVER_1` | [reference] |
+| `COVER_1`, `COVER_2` | address | cover image, a PNG (6.3); `COVER_2` preferred over `COVER_1` | [reference]; PNG [ratta-notelib] |
+| `COVER_3` | address | cover image, a JPEG (6.3) | [ratta-notelib] |
 | `STYLE_<stylename>` | address | template bitmap per style name, e.g. `STYLE_style_8mm_ruled_line:330`, `STYLE_style_white:905` | [verified] |
 | `STYLE_user_<name><md5>` | address | custom template (PNG), md5 appended to the name | [reference] |
 | `TITLE_<page4><top4><left4>` | address | title block | [reference]; shape [others] |
 | `KEYWORD_<page4><top4>` | address | keyword block | [reference]; shape [others] |
-| `LINKO_<page4><top4><left4><height4><width4>` | address | link block | [verified] |
+| `LINKO_<page4><top4><left4><height4><width4>` | address | outgoing link block | [verified]; Ratta reads the page as the 4 characters after the prefix [ratta-notelib] |
+| `LINKI_...` | address | incoming link block, same block keys as 7.3 [inferred] | prefix [ratta-notelib]; not in the samples [verified]; shape of the rest [inferred: like `LINKO_`] |
 
 The position digits in `LINKO_` keys equal the link's `LINKRECT` (section 7.3) [verified on all 6 links]: `LINKO_00010246081200840537` = page 0001, top 0246, left 0812, height 0084, width 0537 for `LINKRECT:812,246,537,84`. The page number for titles, keywords and links must be taken from the key [verified for links; reference for titles; others report `KEYWORDPAGE` can be wrong].
 
-t1 and t2 carry no `COVER_` key at all [verified]; bike and content carry `COVER_0:0` [verified].
+t1 and t2 carry no `COVER_` key at all [verified]; bike and content carry `COVER_0:0` [verified]. Ratta expects at most one cover key ("vecSite more than 1") [ratta-notelib]. Title and keyword footer keys are only sorted by Ratta's renderer, never drawn [ratta-notelib].
 
 ### 4.2 Header keys
 
@@ -191,21 +198,23 @@ t1 and t2 carry no `COVER_` key at all [verified]; bike and content carry `COVER
 |---|---|---|---|
 | `MODULE_LABEL` | `none` (t1), `SNFILE_FEATURE` (bike, content) | unknown | [unknown] |
 | `FILE_TYPE` | `NOTE` | file kind | [verified] |
-| `APPLY_EQUIPMENT` | `N6`, `A6X` | device model code, selects page size (4.6) | [verified] |
+| `APPLY_EQUIPMENT` | `N6`, `A6X` | device model code, selects page size (4.6) | [verified]; Ratta knows `A6X`, `A5X`, `N5`, `N6` and treats anything else as `N6` [ratta-notelib] |
 | `FINALOPERATION_PAGE` | `1`, `3`, `2` | last page edited (1-based) | [inferred: equals a valid page] |
 | `FINALOPERATION_LAYER` | `1` | last layer edited | [inferred] |
 | `DEVICE_DPI` | `0` | 0 on these devices | [verified value], meaning [others] |
 | `SOFT_DPI` | `0` | as above | [verified value] |
 | `FILE_PARSE_TYPE` | `0` | unknown | [unknown] |
 | `RATTA_ETMD` | `0` | unknown | [unknown] |
-| `APP_VERSION` | `0` | unknown | [unknown] |
+| `APP_VERSION` | `0` | unknown | [unknown]; Ratta's key list spells it `APP_VERTION` and has no `APP_VERSION`, so it never reads the samples' value [ratta-notelib; samples spell `APP_VERSION`, verified]. Accept both spellings [inferred] |
+| `ORIGINAL_STYLE` | absent | unknown | key [ratta-notelib]; not in the samples [verified] |
+| `COVER` | absent | unknown, maybe the cover kind | key [ratta-notelib]; not in the samples [verified]; meaning [unknown] |
 | `FILE_ID` | see 3.1 | file identity, target of links | [verified] |
 | `FILE_RECOGN_TYPE` | `0`, `1` | `1` = real-time recognition note | [verified with t1 history], meaning [reference] |
 | `FILE_RECOGN_LANGUAGE` | `none`, `en_US` | recognition language | [verified] |
 | `PDFSTYLE` | `none` | PDF used as template | [unknown] |
 | `PDFSTYLEMD5` | `0` | hash of that PDF | [unknown] |
 | `STYLEUSAGETYPE` | `0` | unknown | [unknown] |
-| `HIGHLIGHTINFO` | `0` | address of highlight data, base64 JSON | value [verified]; meaning [others] |
+| `HIGHLIGHTINFO` | `0` | address of highlight data: a block of `u32` length + base64 text | value [verified]; block shape [ratta-notelib, `loadHighlightInfo`, content not parsed]; JSON inside [others] |
 | `HORIZONTAL_CHECK` | `0` | unknown | [unknown] |
 | `IS_OLD_APPLY_EQUIPMENT` | `1` (t1, t2), `0` (bike, content) | unknown | [unknown] |
 | `ANTIALIASING_CONVERT` | `2` | anti-aliased bitmaps (section 5.3) | value [verified], meaning [inferred] |
@@ -217,7 +226,8 @@ t1 and t2 carry no `COVER_` key at all [verified]; bike and content carry `COVER
 | `PAGESTYLE` | `style_8mm_ruled_line` | template name; `style_white` = blank; `user_...` = custom PNG | [verified] for the first two, [reference] for `user_` |
 | `PAGESTYLEMD5` | `0` | hash of custom template, `0` = none | [verified value] |
 | `LAYERINFO` | JSON, see 4.4 | layer names, visibility, flags | [verified] |
-| `LAYERSEQ` | `MAINLAYER,BGLAYER` | layer stacking order, first = top | [verified] |
+| `LAYERSEQ` | `MAINLAYER,BGLAYER` | layer stacking order, first = top; in Ratta's renderer also the list of layers drawn (6.1) | [verified]; [ratta-notelib] |
+| `LAYERSWITCH` | absent | unknown | key [ratta-notelib]; not in the samples [verified] |
 | `MAINLAYER`, `LAYER1`, `LAYER2`, `LAYER3`, `BGLAYER` | address or `0` | layer blocks | [verified] |
 | `TOTALPATH` | address or `0` | stroke data, section 9 | [verified] |
 | `THUMBNAILTYPE` | `0` | unknown; no thumbnail blocks exist in the samples | [unknown] |
@@ -228,9 +238,9 @@ t1 and t2 carry no `COVER_` key at all [verified]; bike and content carry `COVER
 | `RECOGNTYPE` | `0` | unknown | [unknown] |
 | `RECOGNFILESTATUS` | `0`, `1` | 1 after the RECOGNFILE was written (t1 history) | [verified sequence], meaning [inferred] |
 | `RECOGNLANGUAGE` | `none` | per-page language | [unknown] |
-| `EXTERNALLINKINFO` | `0` | address, unknown content | [unknown] |
+| `EXTERNALLINKINFO` | `0` | address of a block: `u32` length + text, records separated by `\|`, fields by `,`, each field base64 (several are numbers). Ratta turns each record into an external link in its PDF export (`fetchExternalLinkInfoForExport`) | [verified value 0]; layout [ratta-notelib]; field order [unknown] |
 | `IDTABLE` | `0` | address, unknown content | [unknown] |
-| `ORIENTATION` | `1000` | `1000` portrait; `1090` and `1270` landscape | `1000` [verified], others [reference] |
+| `ORIENTATION` | `1000` | `1000` and `1180` portrait; `1090` and `1270` landscape; `2000`, `2090`, `2180`, `2270` a larger family (4.6) | `1000` [verified], `1090`/`1270` [reference; ratta-notelib], `1180` and the `2000` family [ratta-notelib] |
 | `PAGETEXTBOX` | `0`, `1` | `1` on a page that has a text box, `0` otherwise (a count is possible, only 0 and 1 seen) | [verified: bike-digest page 3] |
 | `DISABLE` | `none`, `256,796,271,88\|` | list of rects `left,top,width,height`, each followed by `\|`; `none` when empty. Each rect is a region whose pixels are device-drawn and have no ink strokes (text boxes; digests per others) | [verified: the rect equals the text box rect in the stroke data (7.4) and contains all pixels the text box added to MAINLAYER] |
 | `FIVESTAR` | absent | present only on starred pages; value holds the star stroke coordinates and a trailing flag, exact layout not documented | [others] |
@@ -238,6 +248,8 @@ t1 and t2 carry no `COVER_` key at all [verified]; bike and content carry `COVER
 Keys of a page block written by newer firmware: `PAGETEXTBOX`, `DISABLE` [verified present in t1, t2, content page 1, all bike-digest pages; absent in bike and content page 2].
 
 All address-valued page keys with value `0` mean "absent" [verified].
+
+Ratta's renderer reads only `PAGESTYLE`, `LAYERSWITCH`, the five layer slots, `TOTALPATH`, `FIVESTAR`, `LAYERINFO`, `LAYERSEQ`, `PAGEID`, `EXTERNALLINKINFO` and `ORIENTATION` from a page block (`setInfoOfPageFeature`) [ratta-notelib].
 
 ### 4.4 LAYERINFO
 
@@ -251,7 +263,7 @@ The value is JSON with every `:` replaced by `#` [verified]. Replace `#` by `:` 
 | 0 | `Main Layer` | false | true | true | false |
 | -1 | `Background Layer` | true | false | true | false |
 
-Further fields per entry: `isAllowAdd`, `isAllowUp`, `isAllowDown` (booleans) [verified]. Mapping: `layerId` 0 = MAINLAYER, 1..3 = LAYER1..3, `isBackgroundLayer:true` = BGLAYER [reference; consistent]. A layer is drawn when `isVisible` is true [reference]. Layers 1-3 are marked deleted and have address `0` in the page block [verified]. Names are user-editable [others]. If MAINLAYER is missing from LAYERINFO it is visible [reference]. When `LAYERINFO` is `none`, visibility comes from `LAYERTYPE` (layers of type `MARK` visible) [reference; for `.mark` files].
+Further fields per entry: `isAllowAdd`, `isAllowUp`, `isAllowDown` (booleans) [verified]. Mapping: `layerId` 0 = MAINLAYER, 1..3 = LAYER1..3, `isBackgroundLayer:true` = BGLAYER [reference; consistent]. A layer is drawn when `isVisible` is true [reference]. Ratta's renderer reads `LAYERINFO` but does not use its visibility when it draws; it draws what `LAYERSEQ` lists (6.1) [ratta-notelib]. Which rule the device screen follows is not known [unknown]; in the samples both give the same result [verified: all layers visible]. Layers 1-3 are marked deleted and have address `0` in the page block [verified]. Names are user-editable [others]. If MAINLAYER is missing from LAYERINFO it is visible [reference]. When `LAYERINFO` is `none`, visibility comes from `LAYERTYPE` (layers of type `MARK` visible) [reference; for `.mark` files].
 
 ### 4.5 Layer keys
 
@@ -265,7 +277,7 @@ Further fields per entry: `isAllowAdd`, `isAllowUp`, `isAllowDown` (booleans) [v
 | `LAYERVECTORGRAPH` | `0` | address of vector graph data | [unknown] |
 | `LAYERRECOGN` | `0` | address of per-layer recognition | [unknown] |
 
-Some firmware writes the background layer with `LAYERNAME:MAINLAYER`; a second MAINLAYER-named layer is then the background layer [reference]. A parser should identify layers by the page key that points to them (`BGLAYER:<addr>`), not by `LAYERNAME` [inferred].
+Some firmware writes the background layer with `LAYERNAME:MAINLAYER`; a second MAINLAYER-named layer is then the background layer [reference]. A parser should identify layers by the page key that points to them (`BGLAYER:<addr>`), not by `LAYERNAME` [inferred]. Ratta does exactly this: it takes the slot names from `LAYERSEQ` (`MAINLAYER`, `LAYER1`-`LAYER3`, `BGLAYER`) and follows the page key of the same name; a listed slot with address `0` is skipped as transparent ("iLayerSite is 0,no this layer."), and an unknown slot name makes the whole page fail ("Unknown Layer Name...") [ratta-notelib]. A reader should skip an unknown name and report it [inferred].
 
 ### 4.6 Page size by device
 
@@ -273,10 +285,22 @@ Some firmware writes the background layer with `LAYERNAME:MAINLAYER`; a second M
 |---|---|---|---|
 | `N6` | Supernote Nomad (A6 X2) | 1404 x 1872 | [verified] |
 | `A6X` | Supernote A6X | 1404 x 1872 | [verified] |
-| `N5` | Supernote Manta (A5 X2) | 1920 x 2560 | [reference] |
-| any other | A5X, A5 and others | 1404 x 1872 | [reference] |
+| `N5` | Supernote Manta (A5 X2) | 1920 x 2560 | [reference; ratta-notelib] |
+| any other | A5X, A5 and others | 1404 x 1872 | [reference; ratta-notelib: `A5X` and unknown codes use the 1404 family] |
 
-Every bitmap in the samples decodes to exactly 1404 x 1872 = 2,628,288 pixels [verified]. The RLE stream itself does not state the size; the decoder needs it from the device code [verified]. For landscape pages (`ORIENTATION` 1090 or 1270) the bitmap is stored with width and height swapped, i.e. 1872 wide and 1404 high [reference]. The 300 dpi of the 1404 x 1872 devices follows from the stroke data (section 9.4) [verified: 0.0845 mm per pixel].
+Every bitmap in the samples decodes to exactly 1404 x 1872 = 2,628,288 pixels [verified]. The RLE stream itself does not state the size; the decoder needs it from the device code [verified]. For landscape pages (`ORIENTATION` 1090 or 1270) the bitmap is stored with width and height swapped, i.e. 1872 wide and 1404 high [reference; ratta-notelib].
+
+Bitmap size by `ORIENTATION` in Ratta's renderer (width x height, `get_cimagesize`, `getCimageSizeByRotationType`) [ratta-notelib]:
+
+| `ORIENTATION` | `N5` | all other devices |
+|---|---|---|
+| `1000`, `1180` | 1920 x 2560 | 1404 x 1872 |
+| `1090`, `1270` | 2560 x 1920 | 1872 x 1404 |
+| `2000`, `2180` | 3414 x 2560 | 2496 x 1872 |
+| `2090`, `2270` | 2560 x 3414 | 1872 x 2496 |
+| any other | logged as an error, then treated as `1000` | |
+
+The last two digits read like a rotation in degrees (0, 90, 180, 270) [inferred]. The `2000` family has one side 4/3 as long (2496 = 1872 x 4/3); what it is for, maybe linked to the header key `HORIZONTAL_CHECK`, is not known [unknown]; none of the samples has it [verified]. The 300 dpi of the 1404 x 1872 devices follows from the stroke data (section 9.4) [verified: 0.0845 mm per pixel].
 
 ## 5. Bitmaps
 
@@ -286,7 +310,7 @@ Every bitmap in the samples decodes to exactly 1404 x 1872 = 2,628,288 pixels [v
 |---|---|---|---|
 | `RATTA_RLE` | `LAYERPROTOCOL`, `LINKPROTOCAL`, `TITLEPROTOCOL` | run-length, 5.2 | [verified] |
 | `SN_ASA_COMPRESS` | original A5 `PROTOCOL` | zlib stream of `u16` pixels, 1404 columns x 1888 rows stored rotated; rotate 90 degrees clockwise and drop the last 16 rows; codes `0x0000` black, `0x2104` dark gray, `0xE1E2` gray, `0xFFFF` background | [reference] |
-| PNG | BGLAYER when `PAGESTYLE` starts with `user_` | a complete PNG file as block payload | [reference] |
+| PNG | BGLAYER when `PAGESTYLE` starts with `user_` | a complete PNG file as block payload | [reference]; Ratta loads the payload as any image file Qt can read (`QImage::loadFromData`) and draws the note layers over it [ratta-notelib] |
 
 Only RATTA_RLE occurs in the samples (14 layer bitmaps, 4 template bitmaps, 6 link bitmaps) [verified]. A binary block that starts with `89 50 4E 47` is a PNG [reference]; RLE blocks have no magic.
 
@@ -294,22 +318,21 @@ Only RATTA_RLE occurs in the samples (14 layer bitmaps, 4 template bitmaps, 6 li
 
 The payload is a sequence of 2-byte pairs `(code, len)` [verified]. Pixels are produced in row-major order, top row first, left to right [verified by pixel-exact match]. A layer with page size W x H produces exactly W*H pixels [verified on all 18 layer and template bitmaps].
 
-Meaning of a pair, by the value of `len`:
+Each pair is one run on its own [ratta-notelib: `uncompresseDataByRLE_15` and the old `uncompresseDataByRLE` decode every pair without looking at its neighbours; verified: on every current sample bitmap this gives exactly W*H pixels, identical to the reading below]. The run length is `(len & 0x7F) + 1`, multiplied by 128 when bit 7 of `len` is set:
 
-| `len` | Meaning |
+| `len` | Run length |
 |---|---|
-| `0x00`-`0x7F` | a run of `len + 1` pixels (1 to 128) of `code` [verified] |
-| `0xFF` | a run of 16384 (`0x4000`) pixels of `code` [verified] |
-| `0x80`-`0xFE` | a "high part" `h = len & 0x7F` (0 to 126). See below. [verified] |
+| `0x00`-`0x7F` | `len + 1` pixels (1 to 128) of `code` [verified] |
+| `0x80`-`0xFE` | `((len & 0x7F) + 1) * 128` pixels (128 to 16256) of `code` [verified] |
+| `0xFF` | 16384 (`0x4000`) pixels of `code`, the same formula [verified] |
 
-High part. A pair with a high part does not stand alone; its meaning depends on the next pair:
+Ratta's encoder (`unitForRLE`) writes a run of n pixels as `floor(n / 16384)` pairs `(c, 0xFF)`, then, for the rest r, `(c, 0x80 + (r >> 7) - 1)` if r >= 128, then `(c, (r & 0x7F) - 1)` if `r & 0x7F` is not 0 [ratta-notelib]. So a long run is a "high" pair followed by a "low" pair of the same code, and the two add up to `(h + 1) * 128 + l + 1` with `h = len & 0x7F` of the first and `l` the `len` of the second [verified, 8,468 such combinations in the current layers of the samples]. A high pair followed by a different code is a run of exactly `(h + 1) * 128` [verified, 63 occurrences].
 
-- If the next pair has the same `code` and a `len` of `0x00`-`0x7F` (call it `l`), the two pairs together encode one run of `(h + 1) * 128 + l + 1` pixels (129 to 16384) [verified, 8,468 such combinations in the current layers of the samples].
-- If the next pair has a different `code`, the high-part pair alone is a run of `(h + 1) * 128` pixels, and the next pair is read normally [verified, 63 occurrences].
-- A high-part pair followed by a same-code pair whose `len` is `0x80` or more never occurs in the samples [verified]. Treat it as malformed [inferred]; the reference is lenient there [reference].
-- A high-part pair as the last pair of the stream never occurs in the samples; every sample stream ends with a complete run [verified]. Treat it as malformed or as a run that is cut to the remaining pixel count [inferred]; the reference accepts it and shortens the run to fit [reference].
+Earlier versions of this document read a high pair together with the next pair and called two other cases malformed: a high pair followed by a same-code high pair, and a high pair at the end of the stream. With independent pairs both are valid: two runs that add up, and a run of `(h + 1) * 128` [ratta-notelib]. Neither occurs in the samples [verified].
 
-Special blank length. The reference uses 1024 instead of 16384 for `0xFF` in one case: a BGLAYER of a `style_white` page whose bitmap block is exactly 5134 (`0x140E`) bytes long [reference]. The samples' `style_white` bitmap is 324 bytes and decodes correctly with 16384 [verified]. Treat the 1024 rule as a compatibility quirk of older files.
+Ratta's decoder does not check the pixel total, has no bound on the output and ignores an odd trailing byte [ratta-notelib]. A reader should still stop at W*H pixels and report extra or missing pixels (section 10) [inferred].
+
+Special blank length. The reference uses 1024 instead of 16384 for `0xFF` in one case: a BGLAYER of a `style_white` page whose bitmap block is exactly 5134 (`0x140E`) bytes long [reference]. Ratta's renderer has no such rule (no `0x140E` constant) [ratta-notelib], so it is a supernotelib quirk, not a format rule. The samples' `style_white` bitmap is 324 bytes and decodes correctly with 16384 [verified].
 
 Streams of odd length do not occur [verified]. A run may cross row boundaries [verified].
 
@@ -331,42 +354,60 @@ t1 MAINLAYER bitmap at 5037, bytes 11616-11619: `62 86 df 00` = 896 transparent 
 
 ### 5.3 Color codes
 
-Two code tables exist. The "X2" table applies when the signature version is 20230015 or higher [reference; all samples are X2]. Values below are the gray levels produced by the reference renderer, which the golden images use [verified pixel-exactly for every code that occurs].
+Two mappings from code to gray are known, and they differ on a few codes. supernotelib uses two tables, "X2" for signature versions 20230015 and higher and "X" for older files [reference]. Ratta's renderer uses one table for versions 20230015 and higher, and an old decoder that paints only a few codes below that version (5.2, section 1) [ratta-notelib]. The golden images and the test vectors in section 11 follow supernotelib's X2 table [verified pixel-exactly for every code that occurs]. Which mapping the device screen shows is not known [unknown]; a reader should offer both.
 
-| Code | Name | Gray (X2 table) | Gray (X table, older) | Seen in samples |
-|---|---|---|---|---|
-| `0x61` | black | 0 | 0 | yes |
-| `0x62` | transparent (background) | transparent | transparent | yes |
-| `0x63` | dark gray (X), compat dark gray (X2) | 0x30 | 0x9D | yes, see note |
-| `0x64` | gray (X), compat gray (X2) | 0x50 | 0xC9 | yes, see note |
-| `0x65` | white | 0xFE | 0xFE | no |
-| `0x66` | marker black | 0 | 0 | yes (2 pixels in t1) |
-| `0x67` | marker dark gray (X only) | (literal) | 0x9D | no |
-| `0x68` | marker gray (X only) | (literal) | 0xC9 | no |
-| `0x9D` | dark gray (X2) | 0x9D | n/a | no |
-| `0x9E` | marker dark gray (X2) | 0x9D | n/a | no |
-| `0xC9` | gray (X2) | 0xC9 | n/a | no |
-| `0xCA` | marker gray (X2) | 0xC9 | n/a | no |
-| any other | anti-aliasing level (X2) | the code value itself | n/a | yes |
+| Code | Name (supernotelib) | supernotelib X2 | supernotelib X (older) | Ratta, from 20230015 | Ratta, below 20230015 | Raw count in the current sample layers |
+|---|---|---|---|---|---|---|
+| `0x61` | black | 0 | 0 | 0 | 0 | many |
+| `0x62` | transparent (background) | transparent | transparent | transparent | transparent | many |
+| `0x63` | dark gray (X), compat dark gray (X2) | 0x30 | 0x9D | 0x30 | 0x30 | 24 (content p1) |
+| `0x64` | gray (X), compat gray (X2) | 0x50 | 0xC9 | 0x50 | 0x50 | 12 (content p1) |
+| `0x65` | white | 0xFE | 0xFE | 0xFE | 0xFE | 28 (bike-digest p3) |
+| `0x66` | marker black | 0 | 0 | 1 | 1 | 2 (t1) |
+| `0x67` | marker dark gray (X only) | 0x67 (literal) | 0x9D | 0x31 | 0x31 | 4 (bike-digest p3) |
+| `0x68` | marker gray (X only) | 0x68 (literal) | 0xC9 | 0x51 | 0x51 | 2 (bike-digest p3) |
+| `0x9D` | dark gray (X2) | 0x9D | n/a | 0x9D | not painted | 6 (bike-digest p3) |
+| `0x9E` | marker dark gray (X2) | 0x9D | n/a | 0x9E | not painted | 5 (bike-digest p3) |
+| `0xC9` | gray (X2) | 0xC9 | n/a | 0xC9 | not painted | 1 (bike-digest p3) |
+| `0xCA` | marker gray (X2) | 0xC9 | n/a | 0xCA | not painted | 10 (bike-digest p3) |
+| `0x00` | (level) | 0x00 | n/a | 0x61 | not painted | 0 |
+| `0x01` | (level) | 0x01 | n/a | 0x66 | not painted | 3 (bike-digest p3) |
+| `0x30` | (level) | 0x30 | n/a | 0x63 | not painted | 5 (bike-digest p3) |
+| `0x31` | (level) | 0x31 | n/a | 0x67 | not painted | 5 (bike-digest p3) |
+| `0x50` | (level) | 0x50 | n/a | 0x64 | not painted | 2 (bike-digest p3) |
+| `0x51` | (level) | 0x51 | n/a | 0x68 | not painted | 0 |
+| `0xFE` | (level) | 0xFE | n/a | 0x65 | not painted | 1 (bike-digest p3) |
+| `0xFF` | (level) | 0xFF | n/a | 0x62 (opaque) | not painted | 4 (bike-digest p3) |
+| any other | anti-aliasing level | the code value itself | n/a | the code value itself | not painted | many |
+
+Counts are from the current MAINLAYER and BGLAYER bitmaps of all five sample files [verified]; codes not listed with a sample have count 0 everywhere.
 
 Anti-aliasing [verified]: all X2 sample layers contain edge pixels with codes outside the named set. Pen strokes use mostly the 15 levels `0x0F, 0x1F, ..., 0xEF` (step 16); t1 also has scattered other values (`0x03`, `0x05`, `0x11`, ... `0xD1`). These are gray levels: the golden renderings show them with gray = code [verified].
 
-Note on `0x63`/`0x64` [inferred, strong]: in content page 1 these two codes occur only inside the link icons that the device draws into MAINLAYER (24 and 12 pixels), surrounded by levels `0x10, 0x20, ..., 0xE0`, `0x60`, `0x70`. There they are plain anti-aliasing levels between 0x60 and 0x70, not "compat" colors. The reference maps them to 0x30 and 0x50 and the goldens follow it. To reproduce the goldens use 0x30/0x50; for a faithful image use the code value [inferred].
+Ratta's table is an involution [ratta-notelib: the 256-byte table `RLE_INDEX`, used by the decoder and by the encoder `unitForRLE`]. It is the identity except for eight swapped pairs: `0x61`/`0x00`, `0x62`/`0xFF`, `0x63`/`0x30`, `0x64`/`0x50`, `0x65`/`0xFE`, `0x66`/`0x01`, `0x67`/`0x31`, `0x68`/`0x51`. The encoder writes gray g as code `RLE_INDEX[g]`, the decoder turns code c into gray `RLE_INDEX[c]`. So the named codes are also the stored form of the grays they displace: gray 0x30 is stored as code `0x63`, and gray 0x62 as code `0xFF`, so no gray level is lost to the transparent code. The codes `0x9D`, `0x9E`, `0xC9`, `0xCA` keep their value; Ratta does not merge `0x9E` into `0x9D` or `0xCA` into `0xC9` as supernotelib does.
 
-The same holds for device-rendered text [verified on bike-digest page 3]: the glyph edges of the text box contain codes `0x65` (28 pixels), `0x9D` (6), `0x9E` (5), `0xC9` (1) and `0xCA` (10) among plain levels. The named mappings (`0x65` -> 0xFE, `0x9E` -> 0x9D, `0xCA` -> 0xC9) change these pixels by at most 1 gray step, so the difference is invisible, but it decides whether hashes match: the reference applies the full table, and so do the test vectors in section 11.
+The samples support the involution [verified]. In content page 1 the codes `0x63` and `0x64` occur only inside the device-drawn link icons, among levels `0x10, 0x20, ..., 0xE0`; raw codes `0x30` and `0x50` do not occur on that page, so `0x63`/`0x64` fill exactly the two missing steps 0x30 and 0x50. The glyph edges of the device-drawn text box on bike-digest page 3 contain raw codes `0x01`, `0x30`, `0x31`, `0x50`, `0xFE`, `0xFF`, `0x65`, `0x67`, `0x68` among plain levels, which is what an 8-bit gray image looks like after the involution. An earlier version of this document read `0x63`/`0x64` as plain levels 0x63/0x64; that inference was wrong. Both supernotelib and Ratta map them to 0x30 and 0x50.
 
-The code `0x62` as a literal gray level would be indistinguishable from transparent; levels in the samples never fall on `0x61`-`0x66` except the two link icon cases above [verified].
+Below 20230015 [ratta-notelib]: Ratta's old decoder paints only `0x61` (0x00) and `0x63`-`0x68` (0x30, 0x50, 0xFE, 0x01, 0x31, 0x51) and skips every other code, anti-aliasing levels included; the layer streams are merged before decoding (`combineRLEData`). supernotelib's X table maps `0x63`/`0x67` to 0x9D and `0x64`/`0x68` to 0xC9 instead. No sample is older than 20230015 [verified], and the device screen is not known for these files [unknown], so both mappings are listed.
+
+Output palettes in Ratta's renderer [ratta-notelib, `fetchNoteRLEData_15`]: with a built-in template the composite becomes an 8-bit gray image directly (gray = `RLE_INDEX[code]`, unpainted pixels 255), so black is 0. With a `user_` template the composite goes through `NOTE_COLOR_CONVERT_INDEX`, an ARGB table that is opaque gray i for index i except index 0 (gray 1) and 0xFF (fully transparent), and is drawn over the template image; there black is 1, as in the device export (6.2). The `.mark` palette is different (6.4).
+
+Pixels where Ratta's renderer differs from notedown's golden images and test vectors today (current layers, per the table above) [verified by code counts]:
+
+- t1 page 1: 2 pixels (`0x66`: 0 versus 1). This is the only golden image affected.
+- bike and content goldens: 0 pixels (`0x63`/`0x64` map the same in both).
+- bike-digest page 3 (test vector 11.3a, no golden image): 41 pixels, by code `0x01` 3, `0x30` 5, `0x31` 5, `0x50` 2, `0xFE` 1, `0xFF` 4, `0x67` 4, `0x68` 2, `0x9E` 5, `0xCA` 10. Some steps are large: `0x30` becomes 0x63 instead of 0x30, `0x67` becomes 0x31 instead of 0x67, `0xFF` becomes 0x62 instead of 0xFF.
 
 ### 5.4 Template layer (BGLAYER)
 
-The BGLAYER bitmap is the page template [verified]. Its block is shared: every page with the same `PAGESTYLE` points to the same bitmap block, and the footer lists it as `STYLE_<name>` [verified: bike pages 1-3 all use 439]. The ruled template `style_8mm_ruled_line` is 462 bytes and byte-identical in all four files [verified]. Templates in the samples contain only black (`0x61`) and transparent pixels [verified]. Footers may list templates no page uses (bike and content list `STYLE_style_white`) [verified].
+The BGLAYER bitmap is the page template [verified]. Its block is shared: every page with the same `PAGESTYLE` points to the same bitmap block, and the footer lists it as `STYLE_<name>` [verified: bike pages 1-3 all use 439]. The ruled template `style_8mm_ruled_line` is 462 bytes and byte-identical in all four files [verified]. Templates in the samples contain only black (`0x61`) and transparent pixels [verified]. Footers may list templates no page uses (bike and content list `STYLE_style_white`) [verified]. Built-in templates are RLE layers inside the file; Ratta's renderer draws them from the file and does not use its own template pictures for these files (those serve only the original A5 path) [ratta-notelib]. When `PAGESTYLE` starts with `user_`, the BGLAYER block is a complete image file instead (5.1) [reference; ratta-notelib].
 
 ## 6. Rendering a page
 
 ### 6.1 Compositing (matches the golden renderings)
 
 1. Decode each layer with an address other than 0 to W*H codes [verified].
-2. Determine visible layers from `LAYERINFO` (4.4) [reference; all layers visible in the samples].
+2. Determine visible layers from `LAYERINFO` (4.4) [reference; all layers visible in the samples]. Ratta's renderer skips this step and draws every layer listed in `LAYERSEQ` [ratta-notelib].
 3. Start with a canvas of gray 255 (white) [verified].
 4. Go through `LAYERSEQ` from last to first (bottom to top). For each visible layer, every pixel whose code is not `0x62` replaces the canvas pixel with the code's gray value from 5.3. Transparent pixels leave the canvas unchanged [verified].
 5. The result is an 8-bit gray image. The goldens are RGBA PNGs with R = G = B = gray and A = 255 [verified].
@@ -376,6 +417,8 @@ Without template ("nobg" goldens): skip BGLAYER, and output A = 0 with R = G = B
 With these rules all 14 golden PNGs (7 pages, with and without template) are reproduced with 0 differing pixels [verified]. The order matters where ink overlaps template lines: in t1, 169 MAINLAYER pixels lie on template lines and the MAINLAYER value wins [verified].
 
 Replacement compositing means anti-aliased edge pixels show their own level even over a black template line. A reader that wants alpha blending must do it itself (6.2).
+
+Ratta's renderer composites the same way [ratta-notelib, `A6X_saveNotePagePic`, `combineBitmapData`]: the first `LAYERSEQ` entry is on top, each next layer is put below it, and a pixel of the upper layer wins unless it is transparent; anti-aliasing pixels replace what is below. Special `LAYERSEQ` values: empty means `LAYER3,LAYER2,LAYER1,MAINLAYER,BGLAYER`, `none` means `BGLAYER` only, `nolayer` gives a blank page. Listed layers with address 0 are skipped (4.5). Its colors follow its own table and palettes (5.3), so its output differs from the goldens on the pixels listed there. No mode that leaves out the template was found [ratta-notelib].
 
 ### 6.2 How the device's own PNG export differs
 
@@ -392,8 +435,19 @@ So the device composites `result = level * below / 255` for anti-aliasing codes 
 - Link bitmaps are RATTA_RLE (`LINKPROTOCAL`) images of exactly `LINKRECT` width x height pixels, row-major [verified: the run totals of all six link bitmaps in content equal width x height of their rects, e.g. 537 x 84 = 45108]. The four links created in 2024 store an all-transparent bitmap (8, 8, 6 and 8 bytes) [verified]. The two newer ones (3918 and 5660 bytes) hold ink: for the first, every non-transparent pixel equals the MAINLAYER pixel at the same page position, and the page has extra pixels in the rect (link icon, other strokes) [verified]; the second differs from the current page in 1625 pixels, probably because the page was edited after the link was made [inferred]. So the link bitmap is a snapshot of the linked handwriting at creation time [inferred].
 - Title bitmaps (`TITLEBITMAP`) are RLE images of the title region [reference]; their size is `TITLERECT` width x height by analogy with links [inferred].
 - The `KEYWORDSITE` block holds the keyword text as UTF-8 [others], not a bitmap.
-- Cover image (`COVER_1`/`COVER_2`): binary block. All surveyed parsers expose it only as raw bytes; its encoding is not documented anywhere [unknown].
+- Cover image: a block of `u32` length + the image file. `COVER_1` and `COVER_2` hold a PNG, `COVER_3` a JPEG; `COVER_0` means no cover; other numbers are unknown ("unkown cover type.") [ratta-notelib, `fetchFileCover`, which the renderer never calls; no sample has a cover, verified]. All surveyed community parsers expose it only as raw bytes [others]. (Answered open question: the encoding was unknown before.)
 - No thumbnails are stored in the samples (`THUMBNAILTYPE:0`) [verified].
+
+### 6.4 `.mark` files [ratta-notelib; no `.mark` sample, verified]
+
+A `.mark` file holds handwriting drawn over a PDF. It uses the same container, footer, page, layer and RLE rules as a `.note`, with file type `mark` (section 1).
+
+- Only the MAINLAYER of a mark page is rendered (`A6X_saveMarkPagePic`).
+- Page size comes from the mark page's `ORIENTATION` and the header's `APPLY_EQUIPMENT` (unknown codes as `N6`), as in 4.6.
+- From `markSN_FILE_VER_20230015` on: the "15" decoder and table (5.2, 5.3), then the palette `MARK_COLOR_CONVERT_INDEX` into an ARGB image: gray 0 and 1 become opaque gray 1; gray 2 to 0xFD become black with alpha `255 - gray`; 0xFE stays opaque 0xFE; 0xFF is transparent. So a gray level acts as ink coverage over the PDF. Older marks use the old decoder and are then rotated.
+- Page mapping (`A6X_producePDFbyMarkAndPdf`): for each PDF page n the renderer draws mark page n, and skips mark pages without ink (`markPageIsEmpty`). That the footer then has `PAGE<n>` keys with n the PDF page number and no key for pages without ink is [inferred]; a reader must expect gaps in the page numbers.
+- Rotation: the mark image is rotated by minus the PDF page rotation; for a PDF page wider than high by -90 minus the rotation; for a mark `ORIENTATION` of 1090 or 1270 another 90 degrees are added. The image is placed over the whole PDF page; how the PDF library scales it is not known [unknown].
+- Link to the PDF: by file name only, not by any id in the mark (`pdfWithMarkToPdf` in Ratta's Java server). For `x.pdf` the mark is `x.pdf.mark` in the same folder, else `x_PDF.mark`.
 
 ## 7. Titles, keywords, links
 
@@ -430,6 +484,8 @@ None of the samples has titles or keywords [verified]. content has six links [ve
 | `ANTI`, `BOLD`, `ITALIC` | `1`, `1`, `0` | text style flags, only in links created by newer firmware | [unknown] |
 
 Link targets [verified]: content's third link has `LINKFILE` decoding to `/storage/emulated/0/Note/Bike.note` and `LINKFILEID:F20240708174639550429bHksqaP2wKQ8`, which is exactly bike's header `FILE_ID`. Resolve a link by `LINKFILEID` first (stable across renames and moves) and use the decoded path as a fallback [inferred]. A link is internal when `LINKFILEID` equals the file's own `FILE_ID` [reference]. All six `LINKFILE` values are device paths under `/storage/emulated/0/Note/` ending in `.note` [verified].
+
+Ratta's renderer [ratta-notelib, `A6XSnLinkFeatureModule`] reads `LINKTYPE`, `LINKINOUT`, `LINKBITMAP`, `LINKSTYLE` (default `1000000`), `LINKTIMESTAMP`, `LINKRECT`, `LINKRECTORI`, `LINKPROTOCAL` (default `RATTA_RLE`), `LINKFILE`, `LINKFILEID`, `PAGEID` and `OBJPAGE`; missing string keys default to `none`. It does not know the text link keys `FONTSIZE`, `FONTPATH`, `FULLTEXT`, `SHOWTEXT`, `ANTI`, `BOLD`, `ITALIC`. In its PDF export, `LINKO_` links become internal PDF links over `LINKRECT` (split on `,` into four integers, `LINKFILE` base64-decoded), and `EXTERNALLINKINFO` records (4.3) become external links; a link without a file id is skipped ("fileid not set, do not process link"). Which `LINKTYPE` values end up as internal or external links was not traced [unknown].
 
 The device draws a link icon at the right end of the link rect into MAINLAYER [verified: content page 1, the icons lie at the right ends of the six rects]. A link also leaves records in the page's stroke data (9.6).
 
@@ -668,28 +724,30 @@ Creating a link can write a lasso path record (tool 4, class -5, operation 604) 
 
 Out-of-bounds risks and invariants [inferred unless marked]:
 
-1. File shorter than 32 bytes, missing `tail` before the last 4 bytes, or footer address outside `[24, len-8)`: reject or fall back to a sequential walk (2.) to find the last valid footer.
+1. File shorter than 32 bytes or footer address outside `[24, len-8)`: reject or fall back to a sequential walk (2.) to find the last valid footer. A missing `tail` before the last 4 bytes alone is a warning: Ratta's renderer does not check it [ratta-notelib].
 2. Every address: check `addr + 4 <= len` and `addr + 4 + N <= len` before reading a block. Address 0 means absent; do not read offset 0.
 3. Metadata: decode as UTF-8 with replacement on error; never trust a value to be numeric. Parse integers with overflow checks; addresses must fit `u32`.
 4. Cycles cannot occur in a well-formed file (addresses point to blocks, never back to the footer), but a corrupt file can point a page key at the footer itself; detect re-visits.
-5. RLE: stop when W*H pixels are produced and report extra input; report short output instead of panicking. A run must not write past W*H. A `len` of `0xFF` after a high part, an odd stream length, or a high part at the end are format violations in the samples' terms; decide per policy (strict: error; lenient: reference behavior).
-6. Page size: determine from `APPLY_EQUIPMENT` and orientation before decoding; an unknown device code should fall back to 1404 x 1872 and be reported.
+5. RLE: stop when W*H pixels are produced and report extra input; report short output instead of panicking. A run must not write past W*H. Decode every pair on its own (5.2): a high pair after a high pair and a high pair at the end are valid runs for Ratta [ratta-notelib]. An odd trailing byte is ignored by Ratta [ratta-notelib]; report it. Ratta checks neither the pixel total nor the output bounds, so these checks are the reader's own.
+6. Page size: determine from `APPLY_EQUIPMENT` and `ORIENTATION` before decoding (4.6); an unknown device code should fall back to the 1404 family (as Ratta does, treating it as `N6`) and be reported; an unknown orientation should fall back to `1000` and be reported [ratta-notelib for both fallbacks].
 7. TOTALPATH: check `R` against the block length (each record needs at least 4 bytes); check each record length against the remaining bytes; inside a record check every count against the remaining record bytes (`n * size`) before allocating. Point counts in parts B to E must be equal [verified invariant]; ring count in N must equal the ring count in M [verified invariant].
 8. Digitizer range fields of 0 must not be used for scaling; others report one non-stroke record with a range of 120 [others]. Skip points of records whose range is implausible.
 9. RECOGNFILE: treat as an untrusted ZIP (size limits, path traversal in entry names).
 10. RECOGNTEXT: base64 then JSON; both can fail.
-11. Unknown signature: parse with these rules, mark as unrecognized. Unknown `LAYERPROTOCOL`: expose the raw block.
+11. Unknown signature: parse with these rules, mark as unrecognized; versions are ordered by string compare, not by an allow-list (section 1) [ratta-notelib]. Unknown `LAYERPROTOCOL`: expose the raw block.
 12. Unknown keys anywhere: keep them as raw strings.
+13. Metadata items that do not split into exactly key and value on `:`, and text after a NUL byte, are dropped by Ratta (3) [ratta-notelib]; keep them, but flag them.
+14. A `LAYERSEQ` entry that is not one of the five slot names: Ratta fails the page [ratta-notelib]; skip the entry and report it [inferred].
 
 Plausible invariants worth checking [verified on samples]: `tail` before each footer address; the footer address points to a block that ends exactly 8 bytes before end of file; footer `FILE_FEATURE` points to a block whose first key is `MODULE_LABEL` or `FILE_TYPE`; `LAYERSEQ` lists only layers with a non-zero address; each layer bitmap decodes to exactly W*H; record page number (9.3 A offset 28) equals the page.
 
 ## 11. Test vectors
 
-All values computed by an independent decoder written from this document, and cross-checked against supernotelib 0.7.3 (layer decoding with the X2 table, raw TOTALPATH and RECOGNFILE blocks): all hashes and counts agree [verified].
+All values computed by an independent decoder written from this document, and cross-checked against supernotelib 0.7.3 (layer decoding with the X2 table, raw TOTALPATH and RECOGNFILE blocks): all hashes and counts agree [verified]. The "gray" hashes follow supernotelib's X2 table, not Ratta's table; with Ratta's table the t1 MAINLAYER and composite hashes and the bike-digest page 3 hash would change (2 and 41 pixels, 5.3), all other gray hashes stay the same [verified by code counts].
 
 Definitions:
 - "codes" = the decoded RLE output, one byte per pixel, the raw code values, row-major.
-- "gray" = codes mapped with the full X2 table of 5.3 (`0x61` -> 0, `0x63` -> 0x30, `0x64` -> 0x50, `0x65` -> 0xFE, `0x66` -> 0, `0x9E` -> 0x9D, `0xCA` -> 0xC9, other codes unchanged), transparent -> 255.
+- "gray" = codes mapped with supernotelib's full X2 table of 5.3 (`0x61` -> 0, `0x63` -> 0x30, `0x64` -> 0x50, `0x65` -> 0xFE, `0x66` -> 0, `0x9E` -> 0x9D, `0xCA` -> 0xC9, other codes unchanged), transparent -> 255.
 - "opaque" = pixels whose code is not `0x62`.
 
 ### 11.1 t1 (`test1.note`, 186649 bytes)
@@ -759,13 +817,26 @@ Links: 6 blocks at 452, 843, 1252, 1638, 500079, 1180240, all `LINKTYPE:1`, `LIN
 
 ### 11.5 Golden images
 
-Rendering per 6.1 reproduces all of `tests/fixtures/golden/test{1,2}-p1-{bg,nobg}.png` and `tests/fixtures/local/golden/{bike-p1..p3,content-p1..p2}-{bg,nobg}.png` with 0 differing pixels [verified].
+Rendering per 6.1 reproduces all of `tests/fixtures/golden/test{1,2}-p1-{bg,nobg}.png` and `tests/fixtures/local/golden/{bike-p1..p3,content-p1..p2}-{bg,nobg}.png` with 0 differing pixels [verified]. The goldens follow supernotelib's X2 table. Rendered with Ratta's table (5.3) they would differ only in t1 page 1, on the 2 pixels of code `0x66` (gray 1 instead of 0), in both the `bg` and `nobg` variant [verified by code counts].
 
 ## 12. Unknowns and open items
 
-Raw-only fields (expose as raw data): text box style list, item 15 (`63`) and the bbox values of the text box record, the `1000`/`4` values in `TEXTBOX_TRAILS`, color/thickness/range fields of the group record, `digest_source`; header `MODULE_LABEL`, `FILE_PARSE_TYPE`, `RATTA_ETMD`, `APP_VERSION`, `PDFSTYLE`, `PDFSTYLEMD5`, `STYLEUSAGETYPE`, `HORIZONTAL_CHECK`, `IS_OLD_APPLY_EQUIPMENT`; page `THUMBNAILTYPE`, `RECOGNTYPE`, `RECOGNLANGUAGE`, `EXTERNALLINKINFO`, `IDTABLE` (both address-shaped, 0 in samples); layer `LAYERPATH`, `LAYERVECTORGRAPH`, `LAYERRECOGN` (address-shaped, 0 in samples); link `LINKSTYLE`, `FONTSIZE`, `FONTPATH`, `FULLTEXT`, `SHOWTEXT`, `ANTI`, `BOLD`, `ITALIC`; stroke head offsets 12, 16, 20, 24, 32, 36, 124, 188; tilt semantics; render flag; trailer values; `page.bdom`, `style.css`, the `ink.bink` element table.
+Open questions answered by Ratta's renderer [ratta-notelib]: cover encoding (answered: PNG or JPEG, 6.3); the 1024/5134 `style_white` rule (answered: a supernotelib quirk, 5.2); `0x63`/`0x64` (answered: gray 0x30/0x50 by the involution, the earlier anti-aliasing reading was wrong, 5.3); RLE edge cases of a high pair (answered: valid, pairs are independent, 5.2); `tail` check (answered: not checked); page size for landscape (answered and extended, 4.6). Partly answered: `HIGHLIGHTINFO` (block shape known, content not), `EXTERNALLINKINFO` (record layout and use as external PDF links known, field order not), `.mark` rendering (6.4, still no sample).
 
-Not present in the samples: titles, keywords, stars, covers, thumbnails, custom (PNG) or PDF templates, landscape pages, layers 1-3, `SN_ASA_COMPRESS`, X-table files (versions below 20230015), `.mark` files, RECOGNTEXT, N5 (1920 x 2560) files, other pens than needle point, other colors than black, lasso move/delete, partial erase, typed text boxes (not created from handwriting), document digests, the digest record and its handwritten `.mark` annotation (stored outside the `.note`, 7.4). Each of these needs a sample before its rules can be verified.
+Still unknown after Ratta's renderer:
+
+- The device screen's color mapping for files below 20230015 and for the swapped codes in X2 files (5.3); this needs a rendering from the device.
+- Whether the device honors `LAYERINFO` visibility (4.4); Ratta's renderer does not.
+- Meaning of the `2000` orientation family (4.6), maybe linked to `HORIZONTAL_CHECK`.
+- `LAYERSWITCH`, `ORIGINAL_STYLE`, header `COVER` value, `EXTERNALLINKINFO` field order, `HIGHLIGHTINFO` content.
+- Effect of the background flag for signatures below `SN_FILE_VER_20210009` (section 1).
+- Which `LINKTYPE` values become internal or external PDF links (7.3); shape of `LINKI_` footer keys.
+- How the PDF library scales the `.mark` image on the PDF page (6.4).
+- Everything Ratta's renderer does not use: TOTALPATH, RECOGNTEXT and RECOGNFILE, titles, keywords, text boxes (`PAGETEXTBOX`, `DISABLE`), digests, `FIVESTAR`, anything only in 20260016.
+
+Raw-only fields (expose as raw data): text box style list, item 15 (`63`) and the bbox values of the text box record, the `1000`/`4` values in `TEXTBOX_TRAILS`, color/thickness/range fields of the group record, `digest_source`; header `MODULE_LABEL`, `FILE_PARSE_TYPE`, `RATTA_ETMD`, `APP_VERSION` (`APP_VERTION`), `ORIGINAL_STYLE`, `COVER`, `PDFSTYLE`, `PDFSTYLEMD5`, `STYLEUSAGETYPE`, `HORIZONTAL_CHECK`, `IS_OLD_APPLY_EQUIPMENT`; page `LAYERSWITCH`, `THUMBNAILTYPE`, `RECOGNTYPE`, `RECOGNLANGUAGE`, `EXTERNALLINKINFO` (record fields), `IDTABLE` (the last two address-shaped, 0 in samples); layer `LAYERPATH`, `LAYERVECTORGRAPH`, `LAYERRECOGN` (address-shaped, 0 in samples); link `LINKSTYLE`, `FONTSIZE`, `FONTPATH`, `FULLTEXT`, `SHOWTEXT`, `ANTI`, `BOLD`, `ITALIC`; stroke head offsets 12, 16, 20, 24, 32, 36, 124, 188; tilt semantics; render flag; trailer values; `page.bdom`, `style.css`, the `ink.bink` element table.
+
+Not present in the samples: titles, keywords, stars, covers, thumbnails, custom (PNG) or PDF templates, landscape pages, layers 1-3, `SN_ASA_COMPRESS`, X-table files (versions below 20230015), `.mark` files, `LINKI_` links, `COVER_3`, the `1180` and `2000` orientations, RECOGNTEXT, N5 (1920 x 2560) files, other pens than needle point, other colors than black, lasso move/delete, partial erase, typed text boxes (not created from handwriting), document digests, the digest record and its handwritten `.mark` annotation (stored outside the `.note`, 7.4). Each of these needs a sample before its rules can be verified.
 
 ## Appendix A. Data model for a complete parser
 
@@ -787,7 +858,7 @@ Entities and fields a parser should expose (no API prescribed). Section referenc
 | Link | footer key with decoded page and position, all link keys, decoded target path or URL, target file id, target page id, kind, direction, rect, timestamp, bitmap, link-box stroke record and linked stroke ids | 4.1, 7.3, 9.6 |
 | Title | footer key with page and position, rect, original rect, level, sequence number, style (decoded background and text gray), protocol, bitmap | 7.1 |
 | Keyword | footer key with page and position, page, rect, original rect, sequence number, text (from `KEYWORDSITE` and inline), length | 7.2 |
-| Cover | footer key (`COVER_0/1/2`), address, raw bytes | 4.1, 6.3 |
+| Cover | footer key (`COVER_0` to `COVER_3`), address, image kind (PNG or JPEG), raw bytes | 4.1, 6.3 |
 | Recognition | RECOGNTEXT decoded JSON (elements, labels, word boxes), RECOGNFILE archive entries, `ink.bink` strokes with timestamps and mm coordinates, raw `page.bdom`/`style.css` | 8 |
 
 ## Appendix B. Coverage compared with other parsers
@@ -800,11 +871,11 @@ Projects surveyed (feature inventory only): supernotelib (reference, Python), su
 |---|---|---|---|---|---|---|---|---|---|
 | envelope, signature, footer/header/page/layer metadata | yes | yes | yes | yes | via lib | yes | partial | 1-4 verified | required |
 | append-only history, stale block handling | current only | current only | current only | current only | via lib | current only | - | 2 verified, history exposed | required (current state); history beyond baseline |
-| RATTA_RLE, X and X2 tables, anti-aliasing levels | yes | yes | yes | yes | via lib | yes | - | 5.2, 5.3 verified | required |
+| RATTA_RLE, X and X2 tables, anti-aliasing levels | yes | yes | yes | yes | via lib | yes | - | 5.2, 5.3 verified; Ratta's tables 5.3 | required |
 | SN_ASA_COMPRESS (original A5) | yes | - | yes | yes | via lib | yes | - | 5.1 reference | required, not in samples |
 | PNG custom templates | yes | yes | yes | yes | via lib | yes | - | 5.1 reference | required, not in samples |
-| layer visibility from LAYERINFO, LAYERSEQ order | yes | yes | yes | yes | via lib | yes | - | 4.4, 6.1 verified | required |
-| landscape orientation | yes | yes | - | yes | via lib | yes | - | 4.6 reference | required, not in samples |
+| layer visibility from LAYERINFO, LAYERSEQ order | yes | yes | yes | yes | via lib | yes | - | 4.4, 6.1 verified; Ratta uses LAYERSEQ only | required |
+| landscape orientation | yes | yes | - | yes | via lib | yes | - | 4.6 reference, ratta-notelib (with `1180` and the `2000` family) | required, not in samples |
 | page rendering (PNG) | yes | yes | yes | yes | via lib | yes | - | 6 verified pixel-exact | required |
 | SVG by tracing bitmaps | yes | yes | yes | yes | via lib | yes | - | (renderer concern) | required (output feature) |
 | keywords (text, page, rect, bitmap) | yes | yes | - | yes | yes | yes | yes | 7.2 reference | required, not in samples |
@@ -814,7 +885,7 @@ Projects surveyed (feature inventory only): supernotelib (reference, Python), su
 | link `OBJPAGE` target page | - | yes | - | yes | - | - | - | 7.3 value verified | required |
 | link bitmap | stored | yes | - | yes | - | yes | - | 6.3 verified (size = rect) | required |
 | stars (`FIVESTAR`, star stroke kind) | - | yes | - | yes | - | - | - | 4.3, 9.3 others | required as presence flag plus raw value; value layout undocumented everywhere |
-| cover image | yes | yes | - | yes | - | yes | - | 4.1, 6.3 reference | required as raw bytes (no parser decodes it); not in samples |
+| cover image | yes | yes | - | yes | - | yes | - | 4.1, 6.3 ratta-notelib (PNG/JPEG) | required as raw bytes plus image kind; not in samples |
 | real-time recognition text (RECOGNTEXT) | yes | yes (with word positions) | - | yes | via lib | yes | yes | 8.2 reference/others | required, not in samples; word-box units unverified |
 | RECOGNFILE archive, `ink.bink` strokes and timestamps | - | yes | - | - | - | - | - | 8.3 verified | required |
 | TOTALPATH container and records | stored raw | yes | yes | - | - | - | - | 9.1-9.3 verified | required |
@@ -833,8 +904,8 @@ Projects surveyed (feature inventory only): supernotelib (reference, Python), su
 | heading rects, ruler lines, partial-erase fragments | - | yes | - | - | - | - | - | 9.5 others | required, not in samples |
 | vector freshness versus bitmap | - | heuristic | - | - | - | - | - | 9.7 verified pattern | beyond baseline |
 | device export compositing (multiply, black = 1) | - | - | - | - | - | - | - | 6.2 verified | beyond baseline |
-| `0x63`/`0x64` as anti-aliasing levels in X2 files | - | - | - | - | - | - | - | 5.3 inferred | beyond baseline |
+| Ratta's color table (involution, swapped codes `0x00`/`0x01`/`0x30`/`0x31`/`0x50`/`0x51`/`0xFE`/`0xFF`) | - | - | - | - | - | - | - | 5.3 ratta-notelib, supported by sample codes | beyond baseline (replaces the wrong `0x63`/`0x64` anti-aliasing inference) |
 | per-save history of headers and pages | - | - | - | - | - | - | - | 2 verified | beyond baseline |
-| `.mark` files | yes | partial | doc only | - | - | - | yes (PDF side) | 1 others | required, not in samples |
+| `.mark` files | yes | partial | doc only | - | - | - | yes (PDF side) | 6.4 ratta-notelib | required, not in samples |
 | `HIGHLIGHTINFO` | - | - | doc only | - | - | - | - | 4.2 value verified | raw only |
 | writing RECOGNTEXT into files | - | - | - | - | - | - | yes | out of scope (read-only) | not required for a reader |

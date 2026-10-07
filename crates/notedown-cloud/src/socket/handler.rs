@@ -45,6 +45,9 @@ pub enum Access {
     Granted,
     /// Bad, stale or missing token: the reason goes to the device in the `403` message.
     Denied(&'static str),
+    /// The token could not be checked (a read error): the session closes without the
+    /// socket.io disconnect packet, which a client treats as final.
+    Unavailable,
 }
 
 /// Who is on the other end, for the frame log.
@@ -141,6 +144,12 @@ pub async fn run(mut ws: WebSocket, session: Session, access: Access) {
                 .close(&mut ws, close_code::POLICY, "forbidden")
                 .await;
         }
+        return;
+    }
+    if let Access::Unavailable = access {
+        session
+            .close(&mut ws, close_code::ERROR, "unavailable")
+            .await;
         return;
     }
     // The registration guard lives until the session ends, whatever the exit path.

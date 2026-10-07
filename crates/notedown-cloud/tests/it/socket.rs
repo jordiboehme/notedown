@@ -549,6 +549,32 @@ async fn stale_token_is_rejected() {
 }
 
 #[tokio::test]
+async fn a_token_that_cannot_be_checked_closes_without_the_disconnect_packet() {
+    // A read error is not the device's fault: no 403 and no `41` (a socket.io client does not
+    // connect again after a server disconnect), only the WebSocket close.
+    let s = Server::start().await;
+    let token = s.token();
+    let device = s
+        .data()
+        .join(format!("accounts/jordi/devices/{SERIAL}.json"));
+    std::fs::remove_file(&device).unwrap();
+    std::fs::create_dir(&device).unwrap();
+    let mut ws = s.connect(Some(&token)).await;
+    assert!(recv(&mut ws).await.starts_with("0{"));
+    assert_eq!(recv(&mut ws).await, "40");
+    loop {
+        match next(&mut ws).await {
+            Some(Message::Close(Some(f))) => {
+                assert_eq!(u16::from(f.code), 1011);
+                break;
+            }
+            Some(Message::Ping(_) | Message::Pong(_)) => continue,
+            other => panic!("expected the close, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn rejected_session_ignores_frames_sent_after_the_403() {
     let s = Server::start().await;
     let mut ws = s.connect(Some("not-a-token")).await;

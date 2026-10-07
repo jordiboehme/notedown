@@ -59,7 +59,16 @@ pub async fn upgrade(
                 Some(a.claims.equipment_no),
                 Some(a.account.slug),
             ),
-            Err(_) => (Access::Denied("Token verification failed"), None, None),
+            // A bad or stale token is refused. Any other error (the account or device file could
+            // not be read) is not the device's fault: the session closes without the socket.io
+            // disconnect, so the device connects again.
+            Err(crate::auth::AuthError::NotLoggedIn) => {
+                (Access::Denied("Token verification failed"), None, None)
+            }
+            Err(e) => {
+                eprintln!("notedown cloud: socket: {e}");
+                (Access::Unavailable, None, None)
+            }
         }
     };
     // Without a valid token the device stays unnamed: the serial it claims is visible in the

@@ -546,8 +546,10 @@ fn config_push_key_defaults_to_reconnect_and_parses() {
         Config::load_or_create(dir.path()).unwrap().push,
         PushMode::Startsync
     );
-    std::fs::write(&path, old).unwrap();
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "push = \"startsync\"\n"
+    );
 
     std::fs::write(&path, "push = \"off\"\n").unwrap();
     assert_eq!(

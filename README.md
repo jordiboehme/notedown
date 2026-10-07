@@ -155,7 +155,11 @@ notedown can run a small server that the Supernote Nomad accepts as its Private 
 files as real files in a data folder and writes every change to a journal.
 
 - Protect mode is on by default. The server refuses every file request until `notedown cloud import`
-  has filled the account, and it keeps a recycle bin for every delete and overwrite. The server prunes the recycle bin once an hour: it keeps the 3 newest versions of a file, one per day for 7 days and one per month for 12 months. A deleted file is kept for 90 days. See `server.toml` and `notedown cloud recycle prune --dry-run`.
+  has filled the account, and it keeps a recycle bin for every delete and overwrite.
+- The server prunes the recycle bin about once an hour while it runs. For each file it keeps the 3
+  newest old versions, the version the file had at the end of each of the last 7 days and at the end
+  of each of the last 12 months. A deleted file's versions are removed 90 days after the delete. See
+  `server.toml` and `notedown cloud recycle prune --dry-run`.
 - `notedown cloud put` adds a file from the computer. notedown then tells the connected devices to sync.
   With "Auto Sync" on, the file usually arrives a few seconds later. If it doesn't, start a manual sync.
 - `notedown cloud journal tail` prints the changes as JSON lines.

@@ -374,8 +374,8 @@ use notedown_cloud::appdata::{AppImportOptions, AppImportReport, import_app_data
 use serde_json::{Value, json};
 use std::io::Write;
 
-const MARK_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.mark";
-const MARK_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.mark";
+pub(crate) const MARK_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.mark";
+pub(crate) const MARK_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.mark";
 
 /// A fixture whose account holds the device files (a real, tiny `notedown cloud import`).
 fn import_fixture() -> Fixture {
@@ -402,7 +402,7 @@ fn import_fixture() -> Fixture {
 }
 
 /// Write a `.snbak` (a ZIP with deflate) with the given (name, bytes) entries.
-fn snbak(path: &Path, entries: &[(&str, Vec<u8>)]) {
+pub(crate) fn snbak(path: &Path, entries: &[(&str, Vec<u8>)]) {
     let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
@@ -413,13 +413,13 @@ fn snbak(path: &Path, entries: &[(&str, Vec<u8>)]) {
     zip.finish().unwrap();
 }
 
-fn json_bytes(v: Value) -> Vec<u8> {
+pub(crate) fn json_bytes(v: Value) -> Vec<u8> {
     serde_json::to_vec(&v).unwrap()
 }
 
 /// Two digests (a note with a `.mark` and a group, a document with `source_size` and a
 /// `.mark`), one without cloud id, one group.
-fn backup_entries() -> Vec<(&'static str, Vec<u8>)> {
+pub(crate) fn backup_entries() -> Vec<(&'static str, Vec<u8>)> {
     let note_meta = r#"{"author":"Jordi","unique_identifier":"n1","source_size":3344196}"#;
     let doc_meta = r#"{"unique_identifier":"d1"}"#;
     vec![
@@ -500,8 +500,10 @@ fn app_import_maps_digests_groups_and_marks() {
     let file = f.data().join("device.snbak");
     snbak(&file, &backup_entries());
     let r = run(&f, Some(&file), &no_options()).unwrap();
-    assert_eq!((r.digests, r.groups, r.marks), (3, 1, 2));
-    assert_eq!(r.new_ids.len(), 1);
+    assert_eq!((r.digests, r.groups, r.marks), (2, 1, 2));
+    // The digest without a cloud id is left to the device: it adds it itself.
+    assert_eq!(r.left_to_device, vec!["Note/y.note  never synced"]);
+    assert!(r.without_group.is_empty(), "{:?}", r.without_group);
     assert_eq!(
         r.skipped,
         vec!["backup/DIGEST/handwrite/cccccccccccccccccccccccccccccccc.mark"]
@@ -535,15 +537,13 @@ fn app_import_maps_digests_groups_and_marks() {
             .unwrap()
             .contains("unique_identifier")
     );
-    // The digest without a cloud id gets an id above everything in the account.
+    // The digest without a cloud id is not stored.
     let all = app.digests(&g).unwrap();
-    let fresh = all
-        .iter()
-        .find(|d| d.content.as_deref() == Some("never synced"))
-        .unwrap();
-    assert_eq!(fresh.id, 895_334_188_016_730_301);
-    assert_ne!(fresh.id, 0);
-    assert_eq!(r.new_ids, vec![format!("Note/y.note: {}", fresh.id)]);
+    assert_eq!(all.len(), 2);
+    assert!(
+        all.iter()
+            .all(|d| d.content.as_deref() != Some("never synced"))
+    );
 
     let groups = app.digest_groups(&g).unwrap();
     assert_eq!(groups.len(), 1);
@@ -552,6 +552,9 @@ fn app_import_maps_digests_groups_and_marks() {
     assert_eq!(groups[0].name.as_deref(), Some("Ideas"));
     assert_eq!(groups[0].md5_hash.as_deref(), Some("gm"));
     assert_eq!(groups[0].last_modified_time, Some(1_700_000_000_500));
+    // The backup has no createTime: the device's creationTime stands in; updateTime is now.
+    assert_eq!(groups[0].create_time, 1_700_000_000_000);
+    assert_eq!(groups[0].update_time, T0 as u64);
 
     assert_eq!(app.mark(&g, MARK_A).unwrap().unwrap(), b"mark A");
     assert_eq!(app.mark(&g, MARK_B).unwrap().unwrap(), b"mark B");
@@ -563,18 +566,18 @@ fn app_import_maps_digests_groups_and_marks() {
 
     let a = Accounts::new(f.data()).get("jordi").unwrap().unwrap();
     let m = a.app_data_imported.unwrap();
-    assert_eq!((m.digests, m.groups, m.marks), (3, 1, 2));
+    assert_eq!((m.digests, m.groups, m.marks), (2, 1, 2));
     assert_eq!(m.source, file.display().to_string());
 
     // One batch per record, origin cli, no device.
     let events = app_events(&f);
     let types: Vec<_> = kinds(&events).into_iter().collect();
-    assert_eq!(types.len(), 4);
+    assert_eq!(types.len(), 3);
     assert_eq!(types[0].0, "digest_group.created");
     assert!(types[1..].iter().all(|t| t.0 == "digest.created"));
     assert!(types.iter().all(|t| t.1 == Origin::Cli && t.2.is_none()));
     let ops: std::collections::BTreeSet<_> = events.iter().map(|e| e.op_id.clone()).collect();
-    assert_eq!(ops.len(), 4);
+    assert_eq!(ops.len(), 3);
 }
 
 #[test]
@@ -591,7 +594,9 @@ fn app_import_dry_run_writes_nothing_and_prints_the_mapping() {
         },
     )
     .unwrap();
-    assert_eq!((r.digests, r.groups, r.marks), (3, 1, 2));
+    assert_eq!((r.digests, r.groups, r.marks), (2, 1, 2));
+    assert_eq!(r.mapping.len(), 2);
+    assert_eq!(r.left_to_device, vec!["Note/y.note  never synced"]);
     assert_eq!(
         r.mapping[0],
         "895334188016730112  Note/x.note  A line from the note that is longer than"
@@ -662,39 +667,31 @@ fn app_import_refuses_missing_marks_missing_knowledge_and_duplicate_ids() {
 }
 
 #[test]
-fn app_import_refuses_an_account_with_records_unless_replace() {
+fn app_import_refuses_an_account_with_digests_unless_replace_and_leaves_to_dos_alone() {
     let f = import_fixture();
     let file = f.data().join("device.snbak");
     snbak(&file, &backup_entries());
+    put_to_dos(&f);
     {
         let app = AppData::new(&f.store);
         let g = f.store.lock_recovered(&f.journal).unwrap();
         app.put_digest(&g, &digest(5, "old"), Origin::Device, None, &f.journal)
             .unwrap();
-        app.put_task(
-            &g,
-            &task("t1", "l1", "buy"),
-            Origin::Device,
-            None,
-            &f.journal,
-        )
-        .unwrap();
-        app.put_task_group(
-            &g,
-            &TaskGroup {
-                task_list_id: "l1".into(),
-                title: Some("Inbox".into()),
-                ..TaskGroup::default()
-            },
-            Origin::Device,
-            None,
-            &f.journal,
-        )
-        .unwrap();
     }
     let e = run(&f, Some(&file), &no_options()).unwrap_err().to_string();
-    assert!(e.contains("--replace"), "{e}");
+    assert!(
+        e.contains("1 digests and 0 digest groups") && e.contains("--replace"),
+        "{e}"
+    );
+    assert!(!e.contains("to-do"), "{e}");
     assert!(run(&f, None, &no_options()).is_err());
+    let e = notedown_cloud::appdata::dry_run_app_data(f.data(), "jordi", Some(&file), false)
+        .unwrap_err()
+        .to_string();
+    assert!(!e.contains("to-do"), "{e}");
+    let dry =
+        notedown_cloud::appdata::dry_run_app_data(f.data(), "jordi", Some(&file), true).unwrap();
+    assert_eq!(dry.replaced, 1);
 
     let before = app_events(&f).len();
     let r = run(
@@ -706,17 +703,14 @@ fn app_import_refuses_an_account_with_records_unless_replace() {
         },
     )
     .unwrap();
-    assert_eq!(r.replaced, 3);
+    assert_eq!(r.replaced, 1);
     let events = app_events(&f);
     let new: Vec<_> = kinds(&events[before..]).into_iter().map(|k| k.0).collect();
     assert_eq!(
         new,
         vec![
             "digest.deleted",
-            "task.deleted",
-            "task_group.deleted",
             "digest_group.created",
-            "digest.created",
             "digest.created",
             "digest.created",
         ]
@@ -729,12 +723,92 @@ fn app_import_refuses_an_account_with_records_unless_replace() {
         .into_iter()
         .filter(|d| d.is_live())
         .collect();
-    assert_eq!(live.len(), 3);
+    assert_eq!(live.len(), 2);
     assert!(!app.digest(&g, 5).unwrap().unwrap().is_live());
-    assert!(app.tasks(&g).unwrap().iter().all(|t| !t.is_live()));
-    assert!(app.task_groups(&g).unwrap().is_empty());
-    // The old record's id stays used: the new ids are above it.
-    assert!(live.iter().all(|d| d.id != 5));
+    drop(g);
+    assert_to_dos_untouched(&f);
+}
+
+/// A to-do, its list and the list's sort, as the device writes them.
+fn put_to_dos(f: &Fixture) {
+    use notedown_cloud::appdata::TaskSort;
+    let app = AppData::new(&f.store);
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    app.put_task(
+        &g,
+        &task("t1", "l1", "buy"),
+        Origin::Device,
+        None,
+        &f.journal,
+    )
+    .unwrap();
+    app.put_task_group(
+        &g,
+        &TaskGroup {
+            task_list_id: "l1".into(),
+            title: Some("Inbox".into()),
+            ..TaskGroup::default()
+        },
+        Origin::Device,
+        None,
+        &f.journal,
+    )
+    .unwrap();
+    app.put_task_sort(
+        &g,
+        &TaskSort {
+            task_list_id: "l1".into(),
+            ..TaskSort::default()
+        },
+    )
+    .unwrap();
+}
+
+/// The records of [`put_to_dos`] are live and unchanged, and no import wrote a to-do event.
+fn assert_to_dos_untouched(f: &Fixture) {
+    let app = AppData::new(&f.store);
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    let tasks = app.tasks(&g).unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert!(tasks[0].is_live());
+    assert_eq!(tasks[0].title.as_deref(), Some("buy"));
+    let groups = app.task_groups(&g).unwrap();
+    assert_eq!(groups.len(), 1);
+    assert!(groups[0].is_live());
+    assert_eq!(app.task_sorts(&g).unwrap().len(), 1);
+    drop(g);
+    let cli_task_events = app_events(f)
+        .into_iter()
+        .filter(|e| e.origin == Origin::Cli && e.body.type_name().starts_with("task"))
+        .count();
+    assert_eq!(cli_task_events, 0);
+}
+
+#[test]
+fn app_import_does_not_count_or_touch_to_dos() {
+    let f = import_fixture();
+    let file = f.data().join("device.snbak");
+    snbak(&file, &backup_entries());
+    put_to_dos(&f);
+    // To-dos alone are no reason to refuse, in the dry run and in the real run.
+    let dry =
+        notedown_cloud::appdata::dry_run_app_data(f.data(), "jordi", Some(&file), false).unwrap();
+    assert_eq!(dry.replaced, 0);
+    let r = run(&f, Some(&file), &no_options()).unwrap();
+    assert_eq!((r.digests, r.replaced), (2, 0));
+    assert_to_dos_untouched(&f);
+    // --replace clears the digests, never the to-dos.
+    let r = run(
+        &f,
+        Some(&file),
+        &AppImportOptions {
+            dry_run: false,
+            replace: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(r.replaced, 3);
+    assert_to_dos_untouched(&f);
 }
 
 #[test]
@@ -761,7 +835,12 @@ fn app_import_without_groups_file_and_with_an_unreadable_record_in_the_account()
     entries.retain(|(n, _)| !n.ends_with("knowledge_bases.json"));
     snbak(&file, &entries);
     let r = run(&f, Some(&file), &no_options()).unwrap();
-    assert_eq!((r.digests, r.groups), (3, 0));
+    assert_eq!((r.digests, r.groups), (2, 0));
+    // The note's group g1 is not in the backup.
+    assert_eq!(
+        r.without_group,
+        vec!["895334188016730112  Note/x.note  group g1"]
+    );
     // A broken record in the account stops a strict read: the import refuses it.
     let items = f.store.account_dir().join("digests/items");
     std::fs::write(items.join("99.json"), b"{broken").unwrap();
@@ -786,7 +865,7 @@ fn app_import_dry_run_takes_no_lock_leaves_a_pending_commit_and_creates_no_journ
     std::fs::remove_dir_all(f.data().join("journal")).unwrap();
     let r =
         notedown_cloud::appdata::dry_run_app_data(f.data(), "jordi", Some(&file), false).unwrap();
-    assert_eq!((r.digests, r.groups, r.marks), (3, 1, 2));
+    assert_eq!((r.digests, r.groups, r.marks), (2, 1, 2));
     assert_eq!(std::fs::read(&pending).unwrap(), b"an unfinished commit");
     assert!(!f.data().join("journal").exists());
     assert!(!f.store.account_dir().join("digests").exists());
@@ -828,29 +907,12 @@ fn app_import_dry_run_sees_the_records_of_the_account() {
     let r =
         notedown_cloud::appdata::dry_run_app_data(f.data(), "jordi", Some(&file), true).unwrap();
     assert_eq!(r.replaced, 1);
-    // New ids sit above the account's own largest id, as in the real import.
-    assert_eq!(
-        r.new_ids,
-        vec!["Note/y.note: 900000000000000001".to_string()]
-    );
+    assert_eq!(r.left_to_device, vec!["Note/y.note  never synced"]);
 }
 
 #[test]
-fn app_import_replace_removes_task_sorts_and_a_group_without_service_id_gets_a_new_id() {
-    use notedown_cloud::appdata::TaskSort;
+fn app_import_leaves_a_group_without_service_id_to_the_device() {
     let f = import_fixture();
-    {
-        let app = AppData::new(&f.store);
-        let g = f.store.lock_recovered(&f.journal).unwrap();
-        app.put_task_sort(
-            &g,
-            &TaskSort {
-                task_list_id: "l1".into(),
-                ..TaskSort::default()
-            },
-        )
-        .unwrap();
-    }
     let file = f.data().join("device.snbak");
     let mut entries = backup_entries();
     for (n, b) in &mut entries {
@@ -861,28 +923,62 @@ fn app_import_replace_removes_task_sorts_and_a_group_without_service_id_gets_a_n
         }
     }
     snbak(&file, &entries);
-    assert!(run(&f, Some(&file), &no_options()).is_err());
-    let r = run(
-        &f,
-        Some(&file),
-        &AppImportOptions {
-            dry_run: false,
-            replace: true,
-        },
-    )
-    .unwrap();
-    assert_eq!(r.replaced, 1);
-    // The digest without a cloud id and the group take the next two ids, in that order.
+    let dry =
+        notedown_cloud::appdata::dry_run_app_data(f.data(), "jordi", Some(&file), false).unwrap();
+    let r = run(&f, Some(&file), &no_options()).unwrap();
+    assert_eq!(dry, r);
+    assert_eq!((r.digests, r.groups), (2, 0));
     assert_eq!(
-        r.new_ids,
-        vec![
-            "Note/y.note: 895334188016730201".to_string(),
-            "group Ideas: 895334188016730202".to_string()
-        ]
+        r.left_to_device,
+        vec!["Note/y.note  never synced", "group Ideas"]
+    );
+    // The note names the group that was left out.
+    assert_eq!(
+        r.without_group,
+        vec!["895334188016730112  Note/x.note  group g1"]
     );
     let app = AppData::new(&f.store);
     let g = f.store.lock_recovered(&f.journal).unwrap();
-    assert!(app.task_sorts(&g).unwrap().is_empty());
-    let groups = app.digest_groups(&g).unwrap();
-    assert_eq!(groups[0].id, 895_334_188_016_730_202);
+    assert!(app.digest_groups(&g).unwrap().is_empty());
+}
+
+#[test]
+fn app_import_reports_digests_whose_group_is_not_imported_and_keeps_group_times() {
+    let f = import_fixture();
+    let file = f.data().join("device.snbak");
+    let mut entries = backup_entries();
+    for (n, b) in &mut entries {
+        if n.ends_with("knowledge.json") {
+            *b = json_bytes(json!([
+                {"serviceId": 11, "content": "in g1", "sourcePath": "Note/a.note",
+                 "knowledgeBaseUniqueAttribute": "g1"},
+                {"serviceId": 12, "content": "in g9", "sourcePath": "Note/b.note",
+                 "knowledgeBaseUniqueAttribute": "g9"},
+                {"serviceId": 13, "content": "no group", "sourcePath": "Note/c.note",
+                 "knowledgeBaseUniqueAttribute": ""},
+                {"serviceId": 14, "content": "no key", "sourcePath": "Note/d.note"}
+            ]));
+        }
+        if n.ends_with("knowledge_bases.json") {
+            *b = json_bytes(json!([
+                {"serviceId": 20, "uniqueIdentifier": "g1", "name": "Ideas", "md5Hash": "gm",
+                 "creationTime": 1_700_000_000_000i64, "createTime": 1_700_000_000_100i64,
+                 "updateTime": "not a number", "userId": "x"}
+            ]));
+        }
+    }
+    snbak(&file, &entries);
+    let dry =
+        notedown_cloud::appdata::dry_run_app_data(f.data(), "jordi", Some(&file), false).unwrap();
+    assert_eq!(dry.without_group, vec!["12  Note/b.note  group g9"]);
+    let r = run(&f, Some(&file), &no_options()).unwrap();
+    assert_eq!(r.without_group, dry.without_group);
+    assert_eq!(r.digests, 4);
+    let app = AppData::new(&f.store);
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    let grp = app.digest_group(&g, 20).unwrap().unwrap();
+    // The backup's createTime wins over creationTime; updateTime is the import time.
+    assert_eq!(grp.create_time, 1_700_000_000_100);
+    assert_eq!(grp.update_time, T0 as u64);
+    assert!(!grp.extra.contains_key("userId"), "{:?}", grp.extra);
 }

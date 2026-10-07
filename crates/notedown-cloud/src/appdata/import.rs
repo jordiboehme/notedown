@@ -1,17 +1,23 @@
 //! `notedown cloud import-app-data`: fill an account's digests from the device's `.snbak`
-//! backup, so the server holds them before the device's first digest sync (a digest the server
-//! lacks would otherwise be deleted on the device, `docs/sync-protocol.md` 5.7).
+//! backup, so the server holds them with the ids the device knows before the device's first
+//! digest sync. Without them the device sees an empty cloud and has to send every digest back
+//! (`docs/sync-protocol.md` 5.7).
 //!
 //! - The backup is a ZIP with a `backup/` root. `backup/DIGEST/knowledge.json` (required) holds
 //!   the digests, `knowledge_bases.json` (optional) the groups and `handwrite/<name>.mark` the
 //!   handwritten comments. Everything else (`Plugin/`, `digest.db`) is ignored.
-//! - A digest keeps the cloud id the device knows (`serviceId`). One that has none (never
-//!   synced) gets the next free id and is reported in [`AppImportReport::new_ids`].
+//! - A digest or group keeps the cloud id the device knows (`serviceId`). One that has none
+//!   (it never reached a cloud) is not imported and is reported in
+//!   [`AppImportReport::left_to_device`]: the device adds it itself at its first digest sync.
+//!   A server id the device never saw would come back to the device as a second copy.
+//! - A digest whose group (`knowledgeBaseUniqueAttribute`) is no imported group's
+//!   `uniqueIdentifier` is imported and reported in [`AppImportReport::without_group`].
+//! - To-dos are never touched: the backup holds none, and a cleared to-do would be deleted on
+//!   the device too.
 //! - The account must hold the device files first (the `imported` marker, protect on or off),
-//!   and no digests or to-dos, unless `replace` clears them (soft delete for digests and
-//!   groups, removal for to-dos, all journaled).
-//! - Refused before anything is written: a `.mark` that a digest names but the zip lacks, two
-//!   digests (or groups) with the same id, a zip without `knowledge.json`.
+//!   and no digests or digest groups, unless `replace` soft-deletes them first (journaled).
+//! - Refused before anything is written: a `.mark` that an imported digest names but the zip
+//!   lacks, two digests (or groups) with the same id, a zip without `knowledge.json`.
 //! - Writes happen under the store lock, one journal batch per record (origin `cli`). The
 //!   `app_data_imported` marker goes in last, so a failed import leaves the gate closed.
 
@@ -41,7 +47,7 @@ const MAX_JSON_BYTES: u64 = 256 * 1024 * 1024;
 pub struct AppImportOptions {
     /// Read and check everything, write nothing.
     pub dry_run: bool,
-    /// Clear the account's digests and to-dos first, instead of refusing.
+    /// Soft-delete the account's digests and digest groups first, instead of refusing.
     pub replace: bool,
 }
 
@@ -52,13 +58,17 @@ pub struct AppImportReport {
     pub groups: u64,
     /// Handwritten comments (`.mark` files) copied.
     pub marks: u64,
-    /// Records the device did not know by a cloud id, with the id they got.
-    pub new_ids: Vec<String>,
-    /// Entries of the backup that were not imported (`.mark` files no digest names).
+    /// Digests and groups without a cloud id, not imported (the device adds them itself): one
+    /// line each, `<source path>  <first 40 characters>` or `group <name>`.
+    pub left_to_device: Vec<String>,
+    /// Imported digests whose group is no imported group: one line each,
+    /// `<id>  <source path>  group <unique identifier>`.
+    pub without_group: Vec<String>,
+    /// Entries of the backup that were not imported (`.mark` files no imported digest names).
     pub skipped: Vec<String>,
     /// One line per digest: id, source path, first 40 characters of the content.
     pub mapping: Vec<String>,
-    /// Records of the account removed by `replace`.
+    /// Digests and digest groups of the account soft-deleted by `replace`.
     pub replaced: u64,
 }
 
@@ -90,12 +100,17 @@ struct Knowledge {
 }
 
 /// The backup, read and checked.
+#[derive(Default)]
 struct Backup {
+    /// The digests with a cloud id.
     digests: Vec<Digest>,
+    /// The groups with a cloud id.
     groups: Vec<DigestGroup>,
-    /// Name -> bytes, for the marks the digests name.
+    /// Name -> bytes, for the marks the imported digests name.
     marks: BTreeMap<String, Vec<u8>>,
     skipped: Vec<String>,
+    left_to_device: Vec<String>,
+    without_group: Vec<String>,
 }
 
 fn read_entry(
@@ -118,8 +133,8 @@ fn read_entry(
     Ok(Some(out))
 }
 
-/// A cloud id: a positive JSON integer, or a decimal string of one. `None` for 0, null and
-/// anything else.
+/// A cloud id: a positive JSON integer up to `i64::MAX`, or a decimal string of one. `None` for
+/// 0, null and anything else.
 fn service_id(v: &Value) -> Option<u64> {
     let id = match v {
         Value::Number(n) => n.as_u64()?,
@@ -127,6 +142,21 @@ fn service_id(v: &Value) -> Option<u64> {
         _ => return None,
     };
     (id > 0 && id <= i64::MAX as u64).then_some(id)
+}
+
+/// First 40 characters of the content, on one line.
+fn excerpt(content: Option<&str>) -> String {
+    content
+        .unwrap_or("")
+        .chars()
+        .take(40)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// A server time of a backup group: a positive JSON integer, else 0.
+fn backup_time(v: Option<&Value>) -> u64 {
+    v.and_then(Value::as_u64).unwrap_or(0)
 }
 
 /// The metadata as the JSON text the record keeps (the device stores a string; an object is
@@ -162,14 +192,20 @@ fn read_backup(path: &Path) -> Result<Backup> {
 
     let mut digests = Vec::new();
     let mut groups = Vec::new();
+    let mut left_to_device = Vec::new();
     let mut seen: BTreeSet<u64> = BTreeSet::new();
     let mut dup: BTreeSet<u64> = BTreeSet::new();
 
     for k in entries {
-        let id = service_id(&k.service_id);
-        if let Some(id) = id
-            && !seen.insert(id)
-        {
+        let Some(id) = service_id(&k.service_id) else {
+            left_to_device.push(format!(
+                "{}  {}",
+                k.source_path.as_deref().unwrap_or(""),
+                excerpt(k.content.as_deref())
+            ));
+            continue;
+        };
+        if !seen.insert(id) {
             dup.insert(id);
         }
         let metadata = metadata_text(&k.metadata);
@@ -181,7 +217,7 @@ fn read_backup(path: &Path) -> Result<Backup> {
                 _ => None,
             });
         digests.push(Digest {
-            id: id.unwrap_or(0),
+            id,
             unique_identifier: Some(String::new()),
             parent_unique_identifier: Some(k.knowledge_base_unique_attribute.unwrap_or_default()),
             content: k.content,
@@ -202,16 +238,27 @@ fn read_backup(path: &Path) -> Result<Backup> {
 
     for (i, base) in bases.iter_mut().enumerate() {
         let id = base.remove("serviceId").as_ref().and_then(service_id);
-        // The device's local row id means nothing to the server.
+        // The device's local row id means nothing to the server. The server fields are set
+        // here or by the store, whatever type the backup gives them.
         base.remove("id");
+        let create_time = backup_time(base.get("createTime"));
+        for key in ["userId", "isSummaryGroup", "createTime", "updateTime"] {
+            base.remove(key);
+        }
         let mut g: DigestGroup = serde_json::from_value(Value::Object(std::mem::take(base)))
             .map_err(|e| failed(format!("{KNOWLEDGE_BASES}, entry {}: {e}", i + 1)))?;
-        if let Some(id) = id {
-            if !seen.insert(id) {
-                dup.insert(id);
-            }
-            g.id = id;
+        let Some(id) = id else {
+            left_to_device.push(format!("group {}", g.name.as_deref().unwrap_or("")));
+            continue;
+        };
+        if !seen.insert(id) {
+            dup.insert(id);
         }
+        g.id = id;
+        // The server's createTime when the backup has one, else the device's creationTime.
+        g.create_time = Some(create_time)
+            .filter(|&t| t > 0)
+            .unwrap_or_else(|| g.creation_time.unwrap_or(0).max(0) as u64);
         groups.push(g);
     }
     if !dup.is_empty() {
@@ -274,110 +321,103 @@ fn read_backup(path: &Path) -> Result<Backup> {
     }
     skipped.sort();
 
+    // Digests whose group is not imported (a group of the device that never reached a cloud,
+    // or one the backup lacks).
+    let identifiers: BTreeSet<&str> = groups
+        .iter()
+        .filter_map(|g| g.unique_identifier.as_deref())
+        .collect();
+    let without_group = digests
+        .iter()
+        .filter_map(|d| {
+            let parent = d.parent_unique_identifier.as_deref().unwrap_or("");
+            (!parent.is_empty() && !identifiers.contains(parent)).then(|| {
+                format!(
+                    "{}  {}  group {parent}",
+                    d.id,
+                    d.source_path.as_deref().unwrap_or("")
+                )
+            })
+        })
+        .collect();
+
     Ok(Backup {
         digests,
         groups,
         marks,
         skipped,
+        left_to_device,
+        without_group,
     })
 }
 
-/// First 40 characters of the content, on one line.
-fn excerpt(content: Option<&str>) -> String {
-    content
-        .unwrap_or("")
-        .chars()
-        .take(40)
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
-}
-
-/// The refusal for an account that holds records; `counts` are digests, digest groups, to-dos,
-/// to-do groups and to-do sorts.
-fn present_refusal(slug: &str, c: [usize; 5]) -> Error {
+/// The refusal for an account that holds digests or digest groups.
+fn present_refusal(slug: &str, digests: usize, groups: usize) -> Error {
     failed(format!(
-        "account {slug} already holds {} digests, {} digest groups, {} to-dos, {} to-do groups \
-         and {} to-do sorts; use --replace to clear them first",
-        c[0], c[1], c[2], c[3], c[4]
+        "account {slug} already holds {digests} digests and {groups} digest groups; use \
+         --replace to clear them first"
     ))
 }
 
-/// Give the records without a cloud id new ids above `next` and above the backup's ids, set
-/// the owner, and describe the digests. Returns the `new_ids` and `mapping` lines.
-fn assign_ids(backup: &mut Backup, mut next: u64, user_id: u64) -> (Vec<String>, Vec<String>) {
-    for id in backup
+/// Set the owner of the digests and describe them: one `mapping` line each.
+fn own_and_map(backup: &mut Backup, user_id: u64) -> Vec<String> {
+    backup
         .digests
-        .iter()
-        .map(|d| d.id)
-        .chain(backup.groups.iter().map(|g| g.id))
-    {
-        next = next.max(id.saturating_add(1));
-    }
-    let mut new_ids = Vec::new();
-    let mut mapping = Vec::new();
-    for d in &mut backup.digests {
-        if d.id == 0 {
-            d.id = next;
-            next += 1;
-            new_ids.push(format!(
-                "{}: {}",
+        .iter_mut()
+        .map(|d| {
+            d.user_id = user_id;
+            format!(
+                "{}  {}  {}",
+                d.id,
                 d.source_path.as_deref().unwrap_or(""),
-                d.id
-            ));
-        }
-        d.user_id = user_id;
-        mapping.push(format!(
-            "{}  {}  {}",
-            d.id,
-            d.source_path.as_deref().unwrap_or(""),
-            excerpt(d.content.as_deref())
-        ));
-    }
-    for g in &mut backup.groups {
-        if g.id == 0 {
-            g.id = next;
-            next += 1;
-            new_ids.push(format!(
-                "group {}: {}",
-                g.name.as_deref().unwrap_or(""),
-                g.id
-            ));
-        }
-    }
-    (new_ids, mapping)
+                excerpt(d.content.as_deref())
+            )
+        })
+        .collect()
 }
 
-/// Live records and the largest file-name id in `dir` (`<id>.json` files), read without the
-/// store lock. A file that cannot be read or parsed is an error, as in the strict lists. A
-/// missing folder is empty.
-fn scan_records(dir: &Path) -> Result<(usize, u64)> {
+/// The report of an import of `backup` that clears `replaced` records first.
+fn report(backup: &mut Backup, user_id: u64, replaced: usize) -> AppImportReport {
+    let mapping = own_and_map(backup, user_id);
+    AppImportReport {
+        digests: backup.digests.len() as u64,
+        groups: backup.groups.len() as u64,
+        marks: backup.marks.len() as u64,
+        left_to_device: backup.left_to_device.clone(),
+        without_group: backup.without_group.clone(),
+        skipped: backup.skipped.clone(),
+        mapping,
+        replaced: replaced as u64,
+    }
+}
+
+/// The live records in `dir` (`<id>.json` files), read without the store lock. A file that
+/// cannot be read or parsed is an error, as in the strict lists. A missing folder is empty.
+fn scan_records(dir: &Path) -> Result<usize> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(io_err(dir)(e)),
     };
-    let (mut live, mut max_id) = (0, 0);
+    let mut live = 0;
     for e in entries {
         let path = e.map_err(io_err(dir))?.path();
-        let Some(stem) = path
+        let record_file = path
             .file_name()
             .and_then(|n| n.to_str())
             .and_then(|n| n.strip_suffix(".json"))
-            .filter(|n| !n.starts_with('.'))
-        else {
+            .is_some_and(|n| !n.starts_with('.'));
+        if !record_file {
             continue;
-        };
+        }
         let bytes = std::fs::read(&path).map_err(io_err(&path))?;
         let record: Map<String, Value> = serde_json::from_slice(&bytes)
             .map_err(|e| failed(format!("{}: {e}", path.display())))?;
         if record.get("isDeleted").and_then(Value::as_str) != Some("Y") {
             live += 1;
         }
-        if let Ok(id) = stem.parse::<u64>() {
-            max_id = max_id.max(id);
-        }
     }
-    Ok((live, max_id))
+    Ok(live)
 }
 
 /// The read-only check of [`import_app_data`] for `--dry-run`: the same refusals and counts,
@@ -399,46 +439,15 @@ pub fn dry_run_app_data(
     }
     let mut backup = match snbak {
         Some(path) => read_backup(path)?,
-        None => Backup {
-            digests: Vec::new(),
-            groups: Vec::new(),
-            marks: BTreeMap::new(),
-            skipped: Vec::new(),
-        },
+        None => Backup::default(),
     };
-    let dir = data.join("accounts").join(slug);
-    let (digests, max_item) = scan_records(&dir.join(super::DIGESTS_DIR).join("items"))?;
-    let (groups, max_group) = scan_records(&dir.join(super::DIGESTS_DIR).join("groups"))?;
-    let (tasks, _) = scan_records(&dir.join(super::TASKS_DIR).join("items"))?;
-    let (task_groups, _) = scan_records(&dir.join(super::TASKS_DIR).join("groups"))?;
-    let sorts = std::fs::read_dir(dir.join(super::TASKS_DIR).join("sort"))
-        .map(|d| {
-            d.filter_map(|e| e.ok())
-                .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
-                .count()
-        })
-        .unwrap_or(0);
-    let present = digests + groups + tasks + task_groups + sorts;
-    if present > 0 && !replace {
-        return Err(present_refusal(
-            slug,
-            [digests, groups, tasks, task_groups, sorts],
-        ));
+    let dir = data.join("accounts").join(slug).join(super::DIGESTS_DIR);
+    let digests = scan_records(&dir.join("items"))?;
+    let groups = scan_records(&dir.join("groups"))?;
+    if digests + groups > 0 && !replace {
+        return Err(present_refusal(slug, digests, groups));
     }
-    let next = max_item
-        .max(max_group)
-        .saturating_add(1)
-        .max(super::FIRST_DIGEST_ID);
-    let (new_ids, mapping) = assign_ids(&mut backup, next, account.user_id);
-    Ok(AppImportReport {
-        digests: backup.digests.len() as u64,
-        groups: backup.groups.len() as u64,
-        marks: backup.marks.len() as u64,
-        new_ids,
-        skipped: backup.skipped,
-        mapping,
-        replaced: present as u64,
-    })
+    Ok(report(&mut backup, account.user_id, digests + groups))
 }
 
 /// Fill the account `slug` from the `.snbak` at `snbak`, or, with `None`, import nothing and
@@ -464,12 +473,7 @@ pub fn import_app_data(
     }
     let mut backup = match snbak {
         Some(path) => read_backup(path)?,
-        None => Backup {
-            digests: Vec::new(),
-            groups: Vec::new(),
-            marks: BTreeMap::new(),
-            skipped: Vec::new(),
-        },
+        None => Backup::default(),
     };
 
     let store = Store::open(data, slug)?;
@@ -485,43 +489,14 @@ pub fn import_app_data(
         .into_iter()
         .filter(DigestGroup::is_live)
         .collect();
-    let live_tasks: Vec<_> = app
-        .tasks_strict(&guard)?
-        .into_iter()
-        .filter(|t| t.is_live())
-        .collect();
-    let task_groups: Vec<_> = app
-        .task_groups_strict(&guard)?
-        .into_iter()
-        .filter(|g| g.is_live())
-        .collect();
-    let sorts = app.task_sorts_strict(&guard)?;
-    let present =
-        live_digests.len() + live_groups.len() + live_tasks.len() + task_groups.len() + sorts.len();
-    if present > 0 && !options.replace {
-        return Err(present_refusal(
-            slug,
-            [
-                live_digests.len(),
-                live_groups.len(),
-                live_tasks.len(),
-                task_groups.len(),
-                sorts.len(),
-            ],
-        ));
+    if (!live_digests.is_empty() || !live_groups.is_empty()) && !options.replace {
+        return Err(present_refusal(slug, live_digests.len(), live_groups.len()));
     }
-
-    let next = app.next_digest_id(&guard)?;
-    let (new_ids, mapping) = assign_ids(&mut backup, next, account.user_id);
-    let report = AppImportReport {
-        digests: backup.digests.len() as u64,
-        groups: backup.groups.len() as u64,
-        marks: backup.marks.len() as u64,
-        new_ids,
-        skipped: backup.skipped,
-        mapping,
-        replaced: present as u64,
-    };
+    let report = report(
+        &mut backup,
+        account.user_id,
+        live_digests.len() + live_groups.len(),
+    );
 
     // Close the gate before the first write: a failed import must not leave it open.
     set_marker(&accounts, slug, None)?;
@@ -531,15 +506,6 @@ pub fn import_app_data(
         }
         for g in &live_groups {
             app.delete_digest_group(&guard, g.id, Origin::Cli, None, journal)?;
-        }
-        for t in &live_tasks {
-            app.delete_task(&guard, &t.task_id, Origin::Cli, None, journal)?;
-        }
-        for g in &task_groups {
-            app.delete_task_group(&guard, &g.task_list_id, Origin::Cli, None, journal)?;
-        }
-        for s in &sorts {
-            app.delete_task_sort(&guard, &s.task_list_id)?;
         }
     }
     for (name, bytes) in &backup.marks {

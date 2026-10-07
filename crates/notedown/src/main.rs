@@ -74,8 +74,9 @@ enum CloudAction {
     },
     /// Fill an account with a device backup and open its protect gate
     Import(ImportArgs),
-    /// Fill an account's digests from the device's .snbak backup and open digest and to-do sync
-    /// (the backup holds no to-dos)
+    /// Fill an account's digests from the device's .snbak backup and open digest and to-do sync.
+    /// To-dos are never touched. A digest that never reached a cloud is left out: the device
+    /// adds it itself at its first sync
     ImportAppData(ImportAppDataArgs),
     /// Copy one file into an account (connected devices are told to sync)
     Put(PutArgs),
@@ -123,7 +124,7 @@ struct ImportAppDataArgs {
     /// Import nothing and only open digest and to-do sync (the device has no digests)
     #[arg(long, conflicts_with = "snbak")]
     empty: bool,
-    /// Clear the digests and to-dos the account holds now first
+    /// Clear the digests the account holds now first (to-dos stay as they are)
     #[arg(long)]
     replace: bool,
     /// Print the mapping and the counts, write nothing
@@ -724,11 +725,14 @@ fn import_app_data_command(args: ImportAppDataArgs) -> Result<ExitCode> {
             println!("{line}");
         }
     }
-    for id in &report.new_ids {
-        println!("no cloud id on the device, new id: {id}");
+    for line in &report.left_to_device {
+        println!("no cloud id yet, left to the device: {line}");
+    }
+    for line in &report.without_group {
+        println!("its group is not imported: {line}");
     }
     for name in &report.skipped {
-        println!("skipped {name} (no digest names it)");
+        println!("skipped {name} (no imported digest names it)");
     }
     if report.replaced > 0 {
         println!(
@@ -738,8 +742,16 @@ fn import_app_data_command(args: ImportAppDataArgs) -> Result<ExitCode> {
             } else {
                 "cleared"
             },
-            plural(report.replaced as usize, "record"),
+            plural(report.replaced as usize, "digest record"),
             args.account
+        );
+    }
+    if !report.left_to_device.is_empty() {
+        let n = report.left_to_device.len();
+        println!(
+            "{} left to the device (the device adds {} itself at its first sync)",
+            plural(n, "record"),
+            if n == 1 { "it" } else { "them" }
         );
     }
     println!(

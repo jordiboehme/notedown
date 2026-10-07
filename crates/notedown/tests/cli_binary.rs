@@ -602,7 +602,9 @@ fn cloud_import_app_data_dry_run_import_and_refusals() {
         .unwrap();
     zip.write_all(
         br#"[{"serviceId": 42, "content": "an excerpt", "sourcePath": "Note/x.note",
-              "sourceType": 2, "commentHandwriteName": "", "metadata": "{}"}]"#,
+              "sourceType": 2, "commentHandwriteName": "", "metadata": "{}",
+              "knowledgeBaseUniqueAttribute": "g9"},
+             {"serviceId": 0, "content": "never synced", "sourcePath": "Note/y.note"}]"#,
     )
     .unwrap();
     zip.finish().unwrap();
@@ -661,6 +663,9 @@ fn cloud_import_app_data_dry_run_import_and_refusals() {
         stdout(&out),
         "dry run, nothing is written\n\
          42  Note/x.note  an excerpt\n\
+         no cloud id yet, left to the device: Note/y.note  never synced\n\
+         its group is not imported: 42  Note/x.note  group g9\n\
+         1 record left to the device (the device adds it itself at its first sync)\n\
          would import 1 digest, 0 groups, 0 handwritten comments into account jordi\n"
     );
     assert!(!d.join("accounts/jordi/digests").exists());
@@ -673,7 +678,10 @@ fn cloud_import_app_data_dry_run_import_and_refusals() {
     );
     assert_eq!(
         stdout(&out),
-        "imported 1 digest, 0 groups, 0 handwritten comments into account jordi\n"
+        "no cloud id yet, left to the device: Note/y.note  never synced\n\
+         its group is not imported: 42  Note/x.note  group g9\n\
+         1 record left to the device (the device adds it itself at its first sync)\n\
+         imported 1 digest, 0 groups, 0 handwritten comments into account jordi\n"
     );
     assert!(d.join("accounts/jordi/digests/items/42.json").is_file());
     let again = run(args(&[]));

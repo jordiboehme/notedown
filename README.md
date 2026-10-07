@@ -103,7 +103,8 @@ the links in the old text as they are. Use `--force` to convert the file again a
 Other tools may change the front matter of a converted file, for example Crystalline when it writes the
 note back or adds a `verified` key. notedown still knows the file as its own as long as `generated.by`
 starts with `notedown/`. Keys that notedown doesn't know are kept and written after its own keys when
-notedown writes the file again.
+notedown writes the file again, together with comment lines. notedown's own keys (like `tags` or
+`title`) get notedown's values again. A file with CRLF line endings keeps them.
 
 notedown never overwrites a `.md` file it did not write itself. Such a file counts as a failure (exit
 code 1) and the error is printed.

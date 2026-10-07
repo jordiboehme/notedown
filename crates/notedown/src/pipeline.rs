@@ -277,9 +277,8 @@ fn major_key(generator: &str) -> Option<String> {
 
 /// What the existing Markdown file means for this run.
 enum Existing {
-    /// Missing, not readable as notedown's, or the text is out of date: run OCR. Holds
-    /// the keys another tool added to a notedown file, to keep them.
-    Convert(Vec<String>),
+    /// Missing, not readable as notedown's, or the text is out of date: run OCR.
+    Convert,
     /// Same source, model and notedown major version, current header and source fields.
     Current,
     /// The text is current but the header is old or names the source as it was: rewrite
@@ -287,19 +286,23 @@ enum Existing {
     Header(Box<Frontmatter>, String),
 }
 
-fn existing(text: &str, sha: &str, model: &str, generator: &str, src: &SourceFields) -> Existing {
-    let Some(header) = Header::read(text).filter(Header::is_notedown) else {
-        return Existing::Convert(Vec::new());
-    };
-    let Some(fm) = Frontmatter::from_header(&header) else {
-        return Existing::Convert(header.extra());
+fn existing(
+    text: &str,
+    header: &Header,
+    sha: &str,
+    model: &str,
+    generator: &str,
+    src: &SourceFields,
+) -> Existing {
+    let Some(fm) = Frontmatter::from_header(header) else {
+        return Existing::Convert;
     };
     let same = fm.source_sha256 == sha
         && fm.generated_model == model
         && major_key(&fm.generated_by).is_some()
         && major_key(&fm.generated_by) == major_key(generator);
     let Some(body) = body_of(text).filter(|_| same) else {
-        return Existing::Convert(fm.extra);
+        return Existing::Convert;
     };
     let fresh = fm.format == HeaderFormat::Okf
         && fm.resource == src.resource
@@ -442,6 +445,7 @@ fn update_header(
         digests: old.digests,
         extra: old.extra,
         format: HeaderFormat::Okf,
+        crlf: old.crlf,
     };
     write_atomic(output, format!("{}{body}", fm.render()).as_bytes())
 }
@@ -486,11 +490,11 @@ pub fn convert_one(
     let bytes = std::fs::read(&input.source)
         .with_context(|| format!("cannot read {}", input.source.display()))?;
     let current = std::fs::read_to_string(output).ok();
-    let ours = current
+    let header = current
         .as_deref()
         .and_then(Header::read)
-        .is_some_and(|h| h.is_notedown());
-    if !opts.force && output.exists() && !ours {
+        .filter(Header::is_notedown);
+    if !opts.force && output.exists() && header.is_none() {
         return Err(anyhow!(
             "refusing to overwrite {}: it was not created by notedown (use --force to replace it)",
             output.display()
@@ -499,25 +503,21 @@ pub fn convert_one(
     let sha = const_hex::encode(Sha256::digest(&bytes));
     let generator = format!("notedown/{}", env!("CARGO_PKG_VERSION"));
     let src = source_fields(input, output);
-    let state = match &current {
-        Some(text) => existing(text, &sha, engine.label(), &generator, &src),
-        None => Existing::Convert(Vec::new()),
-    };
-    let extra = match state {
-        Existing::Current if !opts.force => return Ok(Outcome::Skipped),
-        Existing::Header(old, body) if !opts.force => {
-            update_header(input, output, src, *old, &body)?;
-            warn_left_over(input, output);
-            return Ok(Outcome::HeaderUpdated);
+    if !opts.force
+        && let (Some(text), Some(header)) = (&current, &header)
+    {
+        match existing(text, header, &sha, engine.label(), &generator, &src) {
+            Existing::Current => return Ok(Outcome::Skipped),
+            Existing::Header(old, body) => {
+                update_header(input, output, src, *old, &body)?;
+                warn_left_over(input, output);
+                return Ok(Outcome::HeaderUpdated);
+            }
+            Existing::Convert => {}
         }
-        Existing::Convert(extra) => extra,
-        Existing::Header(old, _) => old.extra,
-        Existing::Current => current
-            .as_deref()
-            .and_then(Header::read)
-            .map(|h| h.extra())
-            .unwrap_or_default(),
-    };
+    }
+    // a notedown file keeps the keys and comments other tools added and its line endings
+    let (extra, crlf) = header.map_or((Vec::new(), false), |h| (h.extra(), h.crlf()));
 
     let stem = output
         .file_stem()
@@ -614,6 +614,7 @@ pub fn convert_one(
         digests,
         extra,
         format: HeaderFormat::Okf,
+        crlf,
     };
 
     if opts.images {

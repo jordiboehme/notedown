@@ -4,7 +4,7 @@
 //! own keys after the OKF ones. `type` is always `note` and `tags` always `[supernote]`.
 //! Keys that another tool added are kept and written after notedown's keys.
 
-use crate::yaml::{Entry, Node, top_level};
+use crate::yaml::{Block, Node, top_level};
 
 /// Which header a parsed file carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +46,8 @@ pub struct Frontmatter {
     pub extra: Vec<String>,
     /// Not written; set by [`Frontmatter::parse`].
     pub format: HeaderFormat,
+    /// Write the header (and a new body) with CRLF line endings, like the file it replaces.
+    pub crlf: bool,
 }
 
 /// The comment a page that hit the token limit carries.
@@ -214,27 +216,29 @@ const KNOWN_KEYS: &[&str] = &[
 /// The front matter block of a Markdown file, split into top-level keys.
 #[derive(Debug, Clone)]
 pub struct Header {
-    entries: Vec<Entry>,
+    block: Block,
+    crlf: bool,
 }
 
-/// The lines between the opening and the closing `---` and the byte offset of the body.
-fn split_block(md: &str) -> Option<(Vec<&str>, usize)> {
+/// The lines between the opening and the closing `---`, the byte offset of the body and
+/// whether the opening line ends with CRLF.
+fn split_block(md: &str) -> Option<(Vec<&str>, usize, bool)> {
     let mut offset = 0;
     let mut lines = Vec::new();
-    let mut first = true;
+    let mut crlf = None;
     for raw in md.split_inclusive('\n') {
         offset += raw.len();
         let line = raw.strip_suffix('\n').unwrap_or(raw);
         let line = line.strip_suffix('\r').unwrap_or(line);
-        if first {
+        if crlf.is_none() {
             if line != "---" {
                 return None;
             }
-            first = false;
+            crlf = Some(raw.ends_with("\r\n"));
             continue;
         }
         if line == "---" {
-            return Some((lines, offset));
+            return Some((lines, offset, crlf.unwrap_or(false)));
         }
         lines.push(line);
     }
@@ -244,14 +248,21 @@ fn split_block(md: &str) -> Option<(Vec<&str>, usize)> {
 impl Header {
     /// `None` when the file has no front matter block or it cannot be read.
     pub fn read(md: &str) -> Option<Header> {
-        let (lines, _) = split_block(md)?;
+        let (lines, _, crlf) = split_block(md)?;
         Some(Header {
-            entries: top_level(&lines)?,
+            block: top_level(&lines)?,
+            crlf,
         })
     }
 
+    /// The header uses CRLF line endings.
+    pub fn crlf(&self) -> bool {
+        self.crlf
+    }
+
     fn get(&self, key: &str) -> Option<&Node> {
-        self.entries
+        self.block
+            .entries
             .iter()
             .rev()
             .find(|e| e.key == key)
@@ -260,6 +271,14 @@ impl Header {
 
     fn text(&self, key: &str) -> Option<String> {
         self.get(key).and_then(Node::as_str).map(str::to_string)
+    }
+
+    /// `Some(None)` when the key is missing, `None` when it holds no text.
+    fn optional(&self, key: &str) -> Option<Option<String>> {
+        match self.get(key) {
+            None => Some(None),
+            Some(n) => n.as_str().map(|s| Some(s.to_string())),
+        }
     }
 
     /// Written by notedown: `generated.by` is `notedown/...` or the old `generator` is
@@ -274,13 +293,22 @@ impl Header {
                 .is_some_and(|g| g.starts_with("notedown "))
     }
 
-    /// The top-level keys notedown does not know, as written.
+    /// The top-level keys notedown does not know, as written, each with the comment lines
+    /// before it. Comment lines before one of notedown's keys and after the last key come
+    /// in their order too, since their place among notedown's keys cannot be kept.
     pub fn extra(&self) -> Vec<String> {
-        self.entries
-            .iter()
-            .filter(|e| !KNOWN_KEYS.contains(&e.key.as_str()))
-            .map(|e| e.raw.clone())
-            .collect()
+        let mut out = Vec::new();
+        for e in &self.block.entries {
+            if !KNOWN_KEYS.contains(&e.key.as_str()) {
+                out.push(format!("{}{}", e.lead, e.raw));
+            } else if !e.lead.is_empty() {
+                out.push(e.lead.clone());
+            }
+        }
+        if !self.block.trailing.is_empty() {
+            out.push(self.block.trailing.clone());
+        }
+        out
     }
 }
 
@@ -315,6 +343,14 @@ fn field(node: &Node, key: &str) -> Option<String> {
     node.get(key).and_then(Node::as_str).map(str::to_string)
 }
 
+/// `Some(None)` when the key is missing, `None` when it holds no text.
+fn optional_field(node: &Node, key: &str) -> Option<Option<String>> {
+    match node.get(key) {
+        None => Some(None),
+        Some(n) => n.as_str().map(|s| Some(s.to_string())),
+    }
+}
+
 fn rect_of(node: &Node) -> Option<[u32; 4]> {
     let parts: Vec<String> = match node {
         Node::Scalar(s) => s.split(',').map(|p| p.trim().to_string()).collect(),
@@ -322,7 +358,7 @@ fn rect_of(node: &Node) -> Option<[u32; 4]> {
             .iter()
             .map(|i| i.as_str().map(str::to_string))
             .collect::<Option<_>>()?,
-        Node::Map(_) => return None,
+        Node::Map(_) | Node::Unknown => return None,
     };
     let mut rect = [0u32; 4];
     if parts.len() != 4 {
@@ -348,6 +384,16 @@ impl Frontmatter {
     /// from a file, the note or the model is double-quoted; dates and times are plain
     /// when they are real ones; numbers are plain.
     pub fn render(&self) -> String {
+        let s = self.render_lf();
+        if self.crlf {
+            s.replace('\n', "\r\n")
+        } else {
+            s
+        }
+    }
+
+    /// [`Frontmatter::render`] with `\n` line endings.
+    fn render_lf(&self) -> String {
         let mut s = String::from("---\n");
         s.push_str("type: note\n");
         s.push_str(&format!("title: {}\n", quote(&self.title)));
@@ -450,7 +496,7 @@ impl Frontmatter {
                 page: field(n, "page")?.parse().ok()?,
                 target_file_id: field(n, "target_file_id")?,
                 target_path: field(n, "target_path")?,
-                target_md: field(n, "target_md"),
+                target_md: optional_field(n, "target_md")?,
             })
         })?;
         let digests = items(h.get("digests"), |n| {
@@ -461,7 +507,7 @@ impl Frontmatter {
                 rect: rect_of(n.get("rect")?)?,
             })
         })?;
-        let file_id = h.text("file_id").filter(|id| !id.is_empty());
+        let file_id = h.optional("file_id")?.filter(|id| !id.is_empty());
         let extra = h.extra();
         let fm = match format {
             HeaderFormat::Okf => {
@@ -469,21 +515,24 @@ impl Frontmatter {
                     return None;
                 }
                 let generated = h.get("generated")?;
-                let source = h
-                    .get("sources")
-                    .and_then(Node::as_list)
-                    .and_then(|l| l.first());
+                let last_modified = match h.get("sources") {
+                    None => None,
+                    Some(sources) => match sources.as_list()?.first() {
+                        None => None,
+                        Some(first) => optional_field(first, "last_modified")?,
+                    },
+                };
                 let non_empty = |v: Option<String>| v.filter(|s| !s.is_empty());
                 Frontmatter {
-                    title: h.text("title").unwrap_or_default(),
-                    description: h.text("description").unwrap_or_default(),
-                    resource: h.text("resource").unwrap_or_default(),
+                    title: h.optional("title")?.unwrap_or_default(),
+                    description: h.optional("description")?.unwrap_or_default(),
+                    resource: h.optional("resource")?.unwrap_or_default(),
                     generated_by: field(generated, "by")?,
-                    generated_model: field(generated, "model").unwrap_or_default(),
+                    generated_model: optional_field(generated, "model")?.unwrap_or_default(),
                     generated_at: field(generated, "at")?,
-                    source_date: non_empty(h.text("source_date")),
-                    last_modified: non_empty(source.and_then(|s| field(s, "last_modified"))),
-                    status: h.text("status").unwrap_or_else(|| "stable".into()),
+                    source_date: non_empty(h.optional("source_date")?),
+                    last_modified: non_empty(last_modified),
+                    status: h.optional("status")?.unwrap_or_else(|| "stable".into()),
                     source_sha256,
                     file_id,
                     pages,
@@ -492,6 +541,7 @@ impl Frontmatter {
                     digests,
                     extra,
                     format,
+                    crlf: h.crlf,
                 }
             }
             HeaderFormat::Old => {
@@ -518,6 +568,7 @@ impl Frontmatter {
                     digests,
                     extra,
                     format,
+                    crlf: h.crlf,
                 }
             }
         };
@@ -527,7 +578,7 @@ impl Frontmatter {
 
 /// The Markdown body after the frontmatter block, byte for byte.
 pub fn body_of(md: &str) -> Option<&str> {
-    let (_, offset) = split_block(md)?;
+    let (_, offset, _) = split_block(md)?;
     Some(&md[offset..])
 }
 
@@ -546,9 +597,9 @@ pub fn comment_safe(s: &str) -> String {
     out
 }
 
-/// The whole Markdown file.
+/// The whole Markdown file, with CRLF line endings when the header asks for them.
 pub fn render_document(fm: &Frontmatter, pages: &[PageOut]) -> String {
-    let mut doc = fm.render();
+    let mut doc = fm.render_lf();
     for p in pages {
         doc.push_str(&format!(
             "\n<a id=\"page-{}\"></a>\n## Page {}\n",
@@ -567,6 +618,9 @@ pub fn render_document(fm: &Frontmatter, pages: &[PageOut]) -> String {
         if !p.markdown.trim().is_empty() {
             doc.push_str(&format!("\n{}\n", p.markdown.trim_end()));
         }
+    }
+    if fm.crlf {
+        doc = doc.replace('\n', "\r\n");
     }
     doc
 }

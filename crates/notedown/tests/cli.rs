@@ -867,6 +867,7 @@ fn sample_fm() -> Frontmatter {
         digests: vec![],
         extra: vec![],
         format: HeaderFormat::Okf,
+        crlf: false,
     }
 }
 
@@ -1759,4 +1760,138 @@ fn an_old_index_md_is_named_but_left_alone() {
     )
     .unwrap();
     assert_eq!(std::fs::read_to_string(&old).unwrap(), "# my index\n");
+}
+
+/// [`crystalline_form`] with the multi-line values that Crystalline writes as block
+/// scalars (`|`, `|-`, `|2-`, `|+`).
+fn crystalline_multi_line(note: &std::path::Path, at: time::OffsetDateTime) -> String {
+    crystalline_form(note, at)
+        .replace(
+            "keywords:\n- 'p1: it''s'\n",
+            "keywords:\n- |-\n  a\n  b\n- |\n  line1\n  line2\n- |-\n  two\n\n  paras\n\
+             - |2-\n    indented\n    more\n- |-\n  x\n  ---\n  y\n- |+\n  keep\n\n\n",
+        )
+        .replace(
+            "  text: plain\n",
+            "  text: |-\n    first line\n    second line\n",
+        )
+}
+
+#[test]
+fn block_scalars_from_crystalline_read_back_exactly() {
+    let (dir, src) = setup();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let note = src.join("Test 2.note");
+    let at = pin_mtime(&note);
+    let md_path = out.join("Test 2.md");
+    let text = crystalline_multi_line(&note, at);
+    std::fs::write(&md_path, &text).unwrap();
+    let expected_keywords: Vec<String> = [
+        "a\nb",
+        "line1\nline2\n",
+        "two\n\nparas",
+        "  indented\n  more",
+        "x\n---\ny",
+        "keep\n\n\n",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let fm = Frontmatter::parse(&text).unwrap();
+    assert_eq!(fm.keywords, expected_keywords);
+    assert_eq!(fm.digests[0].text, "first line\nsecond line");
+    let mut engine = FakeEngine { calls: 0 };
+    assert_eq!(
+        convert_note(&note, &out, &mut engine),
+        pipeline::Outcome::Skipped
+    );
+    // a header-only update writes the same values back in notedown's form
+    let moved = dir.path().join("moved");
+    std::fs::rename(&src, &moved).unwrap();
+    assert_eq!(
+        convert_note(&moved.join("Test 2.note"), &out, &mut engine),
+        pipeline::Outcome::HeaderUpdated
+    );
+    let md = std::fs::read_to_string(&md_path).unwrap();
+    assert!(md.contains("  - \"  indented\\n  more\"\n"), "{md}");
+    let fm = Frontmatter::parse(&md).unwrap();
+    assert_eq!(fm.keywords, expected_keywords);
+    assert_eq!(fm.digests[0].text, "first line\nsecond line");
+    assert_eq!(engine.calls, 0);
+}
+
+#[test]
+fn a_value_the_reader_does_not_understand_means_a_new_conversion() {
+    let (dir, src) = setup();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let note = src.join("Test 2.note");
+    let at = pin_mtime(&note);
+    let md_path = out.join("Test 2.md");
+    // a tag on a keyword: the header is notedown's, but the keyword cannot be read
+    let text = crystalline_form(&note, at).replace("- 'p1: it''s'", "- !!str p1");
+    std::fs::write(&md_path, &text).unwrap();
+    assert_eq!(Frontmatter::parse(&text), None);
+    let mut engine = FakeEngine { calls: 0 };
+    assert!(matches!(
+        convert_note(&note, &out, &mut engine),
+        pipeline::Outcome::Converted { .. }
+    ));
+    assert_eq!(engine.calls, 1);
+    let md = std::fs::read_to_string(&md_path).unwrap();
+    assert!(md.contains("\nkeywords: []\n"), "{md}");
+    assert!(md.contains("\nverified:\n- by: human:jordi\n"), "{md}");
+}
+
+#[test]
+fn flow_map_shapes_that_only_look_like_notedown_are_foreign() {
+    for header in [
+        "generated: { x: a # , by: notedown/1.0.0\n  }\n",
+        "generated: { by:notedown/1 }\n",
+        "generated: { by: !!str notedown/1 }\n",
+    ] {
+        let md = format!("---\ntype: note\n{header}---\nbody\n");
+        let h = notedown::document::Header::read(&md).expect("readable");
+        assert!(!h.is_notedown(), "{header:?}");
+    }
+}
+
+#[test]
+fn a_crlf_header_keeps_its_line_endings_comments_and_added_keys() {
+    let (dir, src) = setup();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let note = src.join("Test 2.note");
+    let at = pin_mtime(&note);
+    let md_path = out.join("Test 2.md");
+    let text = crystalline_form(&note, at)
+        .replace("resource: ../in/", "resource: ../old/")
+        .replace("verified:\n", "# checked by hand\nverified:\n")
+        .replace("type: note\n", "type: note\n# about notedown keys\n")
+        .replace('\n', "\r\n");
+    std::fs::write(&md_path, &text).unwrap();
+    let mut engine = FakeEngine { calls: 0 };
+    assert_eq!(
+        convert_note(&note, &out, &mut engine),
+        pipeline::Outcome::HeaderUpdated
+    );
+    let md = std::fs::read_to_string(&md_path).unwrap();
+    let (head, body) = md.split_at(md.find("\r\n---\r\n").unwrap() + 7);
+    assert!(
+        !head.replace("\r\n", "").contains('\n'),
+        "only CRLF: {head:?}"
+    );
+    assert!(
+        head.ends_with(
+            "# about notedown keys\r\n# checked by hand\r\nverified:\r\n- by: human:jordi\r\n  at: 2026-10-06T09:00:00+02:00\r\n---\r\n"
+        ),
+        "{head:?}"
+    );
+    assert!(
+        head.contains("\r\nresource: \"../in/Test 2.note\"\r\n"),
+        "{head:?}"
+    );
+    assert_eq!(body, text.split_once("\r\n---\r\n").unwrap().1);
+    assert_eq!(engine.calls, 0);
 }

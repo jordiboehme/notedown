@@ -14,6 +14,7 @@ mod journal;
 mod mutate;
 mod pages;
 mod push;
+mod recycle;
 mod serve;
 mod socket;
 mod store;

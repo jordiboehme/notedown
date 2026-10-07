@@ -82,6 +82,31 @@ enum CloudAction {
     Put(PutArgs),
     /// Copy every file of the device over Browse & Access (port 8089) into a folder
     BackupDevice(BackupDeviceArgs),
+    /// Manage the recycle bin of an account
+    Recycle {
+        #[command(subcommand)]
+        action: RecycleAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecycleAction {
+    /// Remove old versions and deleted files by the recycle_keep_* settings of server.toml.
+    /// Works also when recycle_prune is off (that only stops the hourly prune of the server)
+    Prune(RecyclePruneArgs),
+}
+
+#[derive(clap::Args)]
+struct RecyclePruneArgs {
+    /// The data folder
+    #[arg(long, value_name = "DIR")]
+    data: PathBuf,
+    /// The account slug
+    #[arg(long)]
+    account: String,
+    /// Print what would be removed, change nothing
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(clap::Args)]
@@ -596,6 +621,14 @@ fn cloud_command(action: CloudAction) -> Result<ExitCode> {
             put_command(args)
         }
         CloudAction::BackupDevice(args) => backup_device_command(args),
+        CloudAction::Recycle {
+            action: RecycleAction::Prune(args),
+        } => {
+            if !args.dry_run {
+                recover_accounts(&args.data)?;
+            }
+            recycle_prune_command(args)
+        }
     }
 }
 
@@ -789,38 +822,79 @@ fn put_command(args: PutArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `+HH:MM`, `-HH:MM`, `+HHMM` or `Z`.
-fn parse_utc_offset(text: &str) -> Option<time::UtcOffset> {
-    let t = text.trim();
-    if t == "Z" || t == "z" {
-        return Some(time::UtcOffset::UTC);
+/// `ms` since the epoch as local `YYYY-MM-DD HH:MM`.
+fn local_time(ms: u64, offset: time::UtcOffset) -> String {
+    match time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000) {
+        Ok(t) => {
+            let t = t.to_offset(offset);
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}",
+                t.year(),
+                u8::from(t.month()),
+                t.day(),
+                t.hour(),
+                t.minute()
+            )
+        }
+        Err(_) => format!("{ms} ms"),
     }
-    let (sign, rest) = match t.as_bytes().first()? {
-        b'+' => (1i8, &t[1..]),
-        b'-' => (-1i8, &t[1..]),
-        _ => return None,
-    };
-    let digits: String = rest.chars().filter(|c| *c != ':').collect();
-    if digits.len() != 4 || !digits.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let h: i8 = digits[..2].parse().ok()?;
-    let m: i8 = digits[2..].parse().ok()?;
-    time::UtcOffset::from_hms(sign * h, sign * m, 0).ok()
 }
 
-/// This computer's current offset from UTC, from `date +%z` (the time crate cannot read it
-/// safely once threads run).
-fn local_utc_offset() -> Option<time::UtcOffset> {
-    let out = std::process::Command::new("date")
-        .arg("+%z")
-        .output()
-        .ok()?;
-    parse_utc_offset(std::str::from_utf8(&out.stdout).ok()?)
+fn recycle_prune_command(args: RecyclePruneArgs) -> Result<ExitCode> {
+    use notedown_cloud::journal::{Journal, Origin};
+    use notedown_cloud::store::{RecycleReason, Store};
+    let store = Store::open(&args.data, &args.account)?;
+    let config = notedown_cloud::Config::load_or_create(&args.data)?;
+    let journal = Journal::open(&args.data)?;
+    let offset = notedown_cloud::localtime::local_utc_offset().unwrap_or_else(|| {
+        eprintln!("warning: cannot read the local UTC offset; days are counted in UTC");
+        time::UtcOffset::UTC
+    });
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let report = store.prune_recycle(
+        &journal,
+        &config.retention(),
+        now_ms,
+        offset,
+        Origin::Cli,
+        args.dry_run,
+    )?;
+    let verb = if args.dry_run {
+        "would remove"
+    } else {
+        "removed"
+    };
+    for e in &report.removed {
+        let reason = match e.reason {
+            RecycleReason::Overwritten => "overwritten",
+            RecycleReason::Deleted => "deleted",
+        };
+        println!(
+            "{verb} {}  {}  {reason}",
+            e.path,
+            local_time(e.deleted_at, offset)
+        );
+    }
+    println!(
+        "{verb} {} ({}), kept {}",
+        plural(report.removed.len(), "old version"),
+        mb(report.removed_bytes),
+        report.kept
+    );
+    if report.unreadable_kept > 0 {
+        println!(
+            "kept {} that can't be read",
+            plural(report.unreadable_kept, "index line")
+        );
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn backup_device_command(args: BackupDeviceArgs) -> Result<ExitCode> {
     use notedown_cloud::device_backup::{BackupOptions, backup};
+    use notedown_cloud::localtime::{local_utc_offset, parse_utc_offset};
     let utc_offset = match &args.utc_offset {
         Some(t) => parse_utc_offset(t)
             .ok_or_else(|| anyhow!("--utc-offset {t:?}: use a form like +02:00 or -05:00"))?,
@@ -1163,21 +1237,6 @@ mod tests {
             device_urls(&listen, &ips),
             ["http://192.168.1.20:19072", "http://10.0.0.5:19072"]
         );
-    }
-
-    #[test]
-    fn utc_offsets_parse_in_the_usual_forms() {
-        let two = time::UtcOffset::from_hms(2, 0, 0).unwrap();
-        assert_eq!(parse_utc_offset("+02:00"), Some(two));
-        assert_eq!(parse_utc_offset("+0200\n"), Some(two));
-        assert_eq!(
-            parse_utc_offset("-05:30"),
-            Some(time::UtcOffset::from_hms(-5, -30, 0).unwrap())
-        );
-        assert_eq!(parse_utc_offset("Z"), Some(time::UtcOffset::UTC));
-        for bad in ["", "02:00", "+2", "+02:0x", "CEST"] {
-            assert_eq!(parse_utc_offset(bad), None, "{bad}");
-        }
     }
 
     #[test]

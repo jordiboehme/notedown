@@ -32,7 +32,7 @@ pub use commit::{
 pub use ids::FIRST_ID;
 pub use list::Entry;
 pub use path::WirePath;
-pub use recycle::{RECYCLE_INDEX, RecycleEntry, RecycleReason};
+pub use recycle::{IndexLine, PruneReport, RECYCLE_INDEX, RecycleEntry, RecycleReason};
 
 use hashes::HashCache;
 use ids::{Op, Registry};

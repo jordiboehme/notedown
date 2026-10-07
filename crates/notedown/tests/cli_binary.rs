@@ -722,3 +722,158 @@ fn cloud_import_app_data_dry_run_import_and_refusals() {
         stdout(&out)
     );
 }
+
+/// Every file below `dir` with its bytes (the store lock file left out).
+fn tree(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    ) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+            if p.is_dir() {
+                out.insert(format!("{rel}/"), Vec::new());
+                walk(root, &p, out);
+            } else if !rel.ends_with(".store.lock") {
+                out.insert(rel, std::fs::read(&p).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+#[test]
+fn cloud_recycle_prune_dry_run_then_real_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let out = cloud(
+        d,
+        &[
+            "add",
+            "jordi",
+            "--email",
+            "jordi@example.org",
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(out.status.success());
+    // Only the newest old version stays: the result doesn't depend on the clock.
+    std::fs::write(
+        d.join("server.toml"),
+        "recycle_keep_latest = 1\nrecycle_keep_daily = 0\nrecycle_keep_monthly = 0\n",
+    )
+    .unwrap();
+    let backup = d.join("backup");
+    for f in [
+        "Note",
+        "Document",
+        "MyStyle",
+        "EXPORT",
+        "SCREENSHOT",
+        "INBOX",
+    ] {
+        std::fs::create_dir_all(backup.join(f)).unwrap();
+    }
+    std::fs::write(backup.join("Note/a.note"), b"note").unwrap();
+    let data = d.to_str().unwrap();
+    let b = backup.to_str().unwrap();
+    let out = notedown(&[
+        "cloud",
+        "import",
+        b,
+        "--data",
+        data,
+        "--account",
+        "jordi",
+        "--no-report",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let src = d.join("c.pdf");
+    let s = src.to_str().unwrap();
+    for bytes in [&b"one"[..], b"two", b"three"] {
+        std::fs::write(&src, bytes).unwrap();
+        let out = notedown(&[
+            "cloud",
+            "put",
+            s,
+            "--data",
+            data,
+            "--account",
+            "jordi",
+            "--to",
+            "INBOX",
+        ]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let prune = |extra: &[&str]| {
+        let mut args = vec![
+            "cloud",
+            "recycle",
+            "prune",
+            "--data",
+            data,
+            "--account",
+            "jordi",
+        ];
+        args.extend_from_slice(extra);
+        notedown(&args)
+    };
+
+    let before = tree(d);
+    let out = prune(&["--dry-run"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    let rows: Vec<&str> = text.lines().collect();
+    assert_eq!(rows.len(), 2, "{text}");
+    assert!(rows[0].starts_with("would remove INBOX/c.pdf  "), "{text}");
+    assert!(rows[0].ends_with("  overwritten"), "{text}");
+    assert_eq!(rows[1], "would remove 1 old version (0.0 MB), kept 1");
+    assert_eq!(tree(d), before);
+
+    let out = prune(&[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    assert!(text.starts_with("removed INBOX/c.pdf  "), "{text}");
+    assert!(
+        text.ends_with("\nremoved 1 old version (0.0 MB), kept 1\n"),
+        "{text}"
+    );
+    assert!(!text.contains('\u{2014}'));
+    let ev = lines(&journal(d, &["tail"]));
+    let last = ev.last().unwrap();
+    assert_eq!(last["type"], "recycle.pruned");
+    assert_eq!(last["path"], "INBOX/c.pdf");
+    assert_eq!(last["origin"], "cli");
+
+    let out = notedown(&[
+        "cloud",
+        "recycle",
+        "prune",
+        "--data",
+        data,
+        "--account",
+        "nobody",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+}

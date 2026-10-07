@@ -6,13 +6,15 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::store::RecycleReason;
+
 /// Who caused a change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Origin {
     /// A request of a device.
     Device,
-    /// A CLI command (`put`, `import`).
+    /// A CLI command (`put`, `import`, `recycle prune`).
     Cli,
     /// The scan of out-of-band changes.
     Scan,
@@ -20,6 +22,8 @@ pub enum Origin {
     Repair,
     /// An event of `notedown cloud journal snapshot`: the state at that time, not a change.
     Snapshot,
+    /// The hourly prune of the recycle bin by the server.
+    Retention,
 }
 
 /// The kind of a file, by its extension (case-insensitive).
@@ -188,6 +192,16 @@ pub enum EventBody {
     TaskGroupUpdated(TaskGroupInfo),
     #[serde(rename = "task_group.deleted")]
     TaskGroupDeleted(TaskGroupInfo),
+    /// A line of the recycle bin index was removed by the retention, with its slot
+    /// `recycle/<deletedAt>/<path>`. The fields are those of the line.
+    #[serde(rename = "recycle.pruned", rename_all = "camelCase")]
+    RecyclePruned {
+        id: u64,
+        path: String,
+        md5: String,
+        deleted_at: u64,
+        reason: RecycleReason,
+    },
 }
 
 /// The fields of `digest.*` events. `uniqueIdentifier` is the digest's identity,
@@ -272,6 +286,7 @@ impl EventBody {
             EventBody::TaskGroupCreated(_) => "task_group.created",
             EventBody::TaskGroupUpdated(_) => "task_group.updated",
             EventBody::TaskGroupDeleted(_) => "task_group.deleted",
+            EventBody::RecyclePruned { .. } => "recycle.pruned",
         }
     }
 }

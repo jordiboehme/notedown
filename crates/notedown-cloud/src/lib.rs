@@ -16,6 +16,7 @@ pub mod device_backup;
 pub mod diag;
 pub mod import;
 pub mod journal;
+pub mod localtime;
 pub mod pages;
 pub mod push;
 pub mod put;

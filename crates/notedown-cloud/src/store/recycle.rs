@@ -23,14 +23,21 @@
 //!
 //! A commit that is discarded (not applied) removes its copy with
 //! [`Store::discard_recycled`]; no line was written for it.
+//!
+//! [`Store::prune_recycle`] applies the retention ([`super::retention`]): it journals a
+//! `recycle.pruned` event per removed line, rewrites the index atomically and then removes the
+//! slots. A line it can't read stays as it is.
 
+use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::commit::RECYCLE_DIR;
+use super::retention::Retention;
 use super::{Store, StoreGuard, WirePath};
+use crate::journal::{Event, EventBody, Journal, Origin, new_op_id};
 use crate::{Error, Result, io_err};
 
 /// `recycle/index.jsonl`.
@@ -38,6 +45,26 @@ pub const RECYCLE_INDEX: &str = "index.jsonl";
 
 /// How far back from the end of the index the last line is searched (a line holds one path).
 const TAIL_BYTES: u64 = 64 * 1024;
+
+/// One line of the index as read: parsed, or kept verbatim when it doesn't parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexLine {
+    Entry(RecycleEntry),
+    Raw(String),
+}
+
+/// What a prune did (or would do, for a dry run).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PruneReport {
+    /// The removed lines, in index order.
+    pub removed: Vec<RecycleEntry>,
+    /// The size of the removed files (a missing slot or a folder counts 0).
+    pub removed_bytes: u64,
+    /// Readable lines that stay.
+    pub kept: usize,
+    /// Lines that stay because they can't be read (or name a slot outside `recycle/`).
+    pub unreadable_kept: usize,
+}
 
 /// Why something is in the recycle bin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +251,172 @@ impl Store {
         }
     }
 
+    /// Every line of `recycle/index.jsonl` in order; a torn last line is left out.
+    pub fn recycle_lines(&self, guard: &StoreGuard) -> Result<Vec<IndexLine>> {
+        self.check_guard(guard)?;
+        Ok(self
+            .read_index_lines()?
+            .into_iter()
+            .map(|(text, entry)| match entry {
+                Some(e) => IndexLine::Entry(e),
+                None => IndexLine::Raw(text),
+            })
+            .collect())
+    }
+
+    /// The complete lines of the index (blank lines left out), each with its text and its
+    /// parsed entry (`None` when it doesn't parse). A missing index is empty.
+    fn read_index_lines(&self) -> Result<Vec<(String, Option<RecycleEntry>)>> {
+        let path = self.recycle_dir().join(RECYCLE_INDEX);
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(io_err(&path)(e)),
+        };
+        let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        Ok(bytes[..complete]
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.trim_ascii().is_empty())
+            .map(|l| {
+                let text = String::from_utf8_lossy(l).into_owned();
+                (text, serde_json::from_slice(l).ok())
+            })
+            .collect())
+    }
+
+    /// Apply the retention to this account (R2 to R8). With `dry_run` nothing changes and
+    /// nothing is journaled. Takes the store lock with recovery itself.
+    ///
+    /// A real run recovers an unfinished commit first, plans on the index read after that,
+    /// journals one `recycle.pruned` per removed line (one batch, one `opId`), writes the new
+    /// index atomically and then removes the slots: a file only when it is a file (a symlink
+    /// is never followed), a folder only when it is empty. Empty folders up to `recycle/` go
+    /// too. A dry run takes the plain lock and doesn't recover (recovery writes), so with an
+    /// unfinished commit on disk its plan can differ a little from the real run's.
+    ///
+    /// A line that doesn't parse, or whose slot would leave `recycle/`, is kept unchanged and
+    /// counted in `unreadable_kept`. Kept lines are written back as they were read.
+    pub fn prune_recycle(
+        &self,
+        journal: &Journal,
+        retention: &Retention,
+        now_ms: u64,
+        offset: time::UtcOffset,
+        origin: Origin,
+        dry_run: bool,
+    ) -> Result<PruneReport> {
+        // Held to the end. Only a real run recovers.
+        let (_plain, _recovered);
+        if dry_run {
+            _plain = self.lock()?;
+        } else {
+            _recovered = self.lock_recovered(journal)?;
+        }
+        let lines = self.read_index_lines()?;
+        // The readable lines with a slot inside `recycle/`, and where each is in `lines`.
+        let mut entries = Vec::new();
+        let mut at = Vec::new();
+        for (i, (_, entry)) in lines.iter().enumerate() {
+            if let Some(e) = entry
+                && self.recycle_path(e).is_ok()
+            {
+                entries.push(e.clone());
+                at.push(i);
+            }
+        }
+        let mut live = HashSet::new();
+        for e in &entries {
+            if !live.contains(&e.id) && self.path_of(e.id)?.is_some() {
+                live.insert(e.id);
+            }
+        }
+        let remove = super::retention::plan(
+            &entries,
+            &|id| live.contains(&id),
+            retention,
+            now_ms,
+            offset,
+        );
+        let removed: Vec<RecycleEntry> = remove.iter().map(|&i| entries[i].clone()).collect();
+        let removed_bytes = removed
+            .iter()
+            .filter_map(|e| self.recycle_path(e).ok())
+            .filter_map(|p| std::fs::symlink_metadata(p).ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum();
+        let report = PruneReport {
+            kept: entries.len() - removed.len(),
+            unreadable_kept: lines.len() - entries.len(),
+            removed,
+            removed_bytes,
+        };
+        if dry_run || report.removed.is_empty() {
+            return Ok(report);
+        }
+
+        // 1. the journal
+        let op_id = new_op_id();
+        let mut events: Vec<Event> = report
+            .removed
+            .iter()
+            .map(|e| {
+                let body = EventBody::RecyclePruned {
+                    id: e.id,
+                    path: e.path.clone(),
+                    md5: e.md5.clone(),
+                    deleted_at: e.deleted_at,
+                    reason: e.reason,
+                };
+                Event::new(&self.slug, origin, None, &op_id, body)
+            })
+            .collect();
+        journal.append(&mut events)?;
+
+        // 2. the new index, kept lines as they were
+        let gone: HashSet<usize> = remove.iter().map(|&i| at[i]).collect();
+        let mut text = String::new();
+        for (i, (line, _)) in lines.iter().enumerate() {
+            if !gone.contains(&i) {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+        super::write_atomic_short(&self.recycle_dir().join(RECYCLE_INDEX), text.as_bytes())?;
+
+        // 3. the slots: files first, then folder lines, then the emptied folders above them
+        let slots: Vec<PathBuf> = report
+            .removed
+            .iter()
+            .filter_map(|e| self.recycle_path(e).ok())
+            .collect();
+        let mut folders = Vec::new();
+        for slot in &slots {
+            match std::fs::symlink_metadata(slot) {
+                Ok(m) if m.is_file() => {
+                    std::fs::remove_file(slot).map_err(io_err(slot))?;
+                }
+                Ok(m) if m.is_dir() => folders.push(slot.clone()),
+                _ => {}
+            }
+        }
+        for folder in &folders {
+            remove_empty_folders(folder);
+        }
+        let root = self.recycle_dir();
+        for slot in &slots {
+            let mut dir = slot.parent();
+            while let Some(d) = dir {
+                if d == root || !d.starts_with(&root) || std::fs::remove_dir(d).is_err() {
+                    break;
+                }
+                dir = d.parent();
+            }
+        }
+        crate::fsutil::fsync_dir(&root)?;
+        Ok(report)
+    }
+
     /// Every complete line of `recycle/index.jsonl`, oldest first. A missing index is empty.
     pub fn recycle_index(&self, guard: &StoreGuard) -> Result<Vec<RecycleEntry>> {
         self.check_guard(guard)?;
@@ -245,6 +438,19 @@ impl Store {
             })
             .collect()
     }
+}
+
+/// Remove the empty folders in `dir` bottom-up, `dir` last. Files and symlinks stay, and a
+/// symlink is never followed.
+fn remove_empty_folders(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                remove_empty_folders(&entry.path());
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
 }
 
 /// The length of the complete part of the index (up to and including the last newline) and its

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::store::retention::Retention;
 use crate::{Error, Result, io_err};
 
 pub const CONFIG_FILE: &str = "server.toml";
@@ -60,9 +61,10 @@ pub struct Config {
     /// `"accept"` (default) exchanges files with the device. `"refuse"` answers every sync
     /// with a busy error (capture only). `notedown serve --refuse-sync` sets it for one run.
     pub sync: SyncMode,
-    /// `"startsync"` (default) tells a connected device to sync after a change it did not make
-    /// itself (a `notedown cloud put`, another device's upload). `"detail"` sends the changed
-    /// items instead, `"off"` sends nothing.
+    /// `"reconnect"` (default) closes a connected device's socket after a change it did not make
+    /// itself (a `notedown cloud put`, another device's upload), so it connects again and syncs.
+    /// `"startsync"` sends one `STARTSYNC` message, `"detail"` sends the changed items instead,
+    /// `"off"` sends nothing.
     pub push: PushMode,
     /// Write full, masked dumps of every request and frame to `capture/`. For one capture
     /// session only: the dumps have no size cap and no rotation. The `--capture` flag of
@@ -72,6 +74,17 @@ pub struct Config {
     pub log_retention_days: u32,
     /// Cap for the total size of `logs/` in bytes.
     pub log_max_bytes: u64,
+    /// The server prunes the recycle bin by the `recycle_keep_*` rules (hourly).
+    pub recycle_prune: bool,
+    /// Newest recycled versions kept per file, whatever their age. At least 1.
+    pub recycle_keep_latest: u32,
+    /// Local days (back from today) that keep their newest recycled version per file.
+    pub recycle_keep_daily: u32,
+    /// Local months (back from this month) that keep their newest recycled version per file.
+    pub recycle_keep_monthly: u32,
+    /// A deleted file whose newest recycled line is older than this many days is removed
+    /// completely. At least 1.
+    pub recycle_keep_deleted_days: u32,
 }
 
 impl Default for Config {
@@ -86,6 +99,11 @@ impl Default for Config {
             capture: false,
             log_retention_days: 30,
             log_max_bytes: 1024 * 1024 * 1024,
+            recycle_prune: true,
+            recycle_keep_latest: 3,
+            recycle_keep_daily: 7,
+            recycle_keep_monthly: 12,
+            recycle_keep_deleted_days: 90,
         }
     }
 }
@@ -99,10 +117,14 @@ impl Config {
     pub fn load_or_create(data_dir: &Path) -> Result<Config> {
         let path = Self::path(data_dir);
         match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).map_err(|e| Error::Config {
-                path,
-                message: e.to_string(),
-            }),
+            Ok(text) => {
+                let config: Config = toml::from_str(&text).map_err(|e| Error::Config {
+                    path: path.clone(),
+                    message: e.to_string(),
+                })?;
+                config.validate(&path)?;
+                Ok(config)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let config = Config::default();
                 config.save(data_dir)?;
@@ -110,6 +132,32 @@ impl Config {
             }
             Err(e) => Err(io_err(&path)(e)),
         }
+    }
+
+    /// The recycle bin retention settings.
+    pub fn retention(&self) -> Retention {
+        Retention {
+            keep_latest: self.recycle_keep_latest,
+            keep_daily: self.recycle_keep_daily,
+            keep_monthly: self.recycle_keep_monthly,
+            keep_deleted_days: self.recycle_keep_deleted_days,
+        }
+    }
+
+    /// Refuse values the server can't work with. `path` is the file named in the message.
+    pub fn validate(&self, path: &Path) -> Result<()> {
+        for (key, value) in [
+            ("recycle_keep_latest", self.recycle_keep_latest),
+            ("recycle_keep_deleted_days", self.recycle_keep_deleted_days),
+        ] {
+            if value < 1 {
+                return Err(Error::Config {
+                    path: path.to_path_buf(),
+                    message: format!("{key} must be at least 1"),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Atomic write: unique temp file, fsync, rename, fsync of the folder.
@@ -126,5 +174,65 @@ impl Config {
             1,
         );
         crate::fsutil::write_atomic(&path, text.as_bytes(), false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn recycle_defaults() {
+        let c = Config::default();
+        assert!(c.recycle_prune);
+        assert_eq!(
+            c.retention(),
+            Retention {
+                keep_latest: 3,
+                keep_daily: 7,
+                keep_monthly: 12,
+                keep_deleted_days: 90
+            }
+        );
+    }
+
+    #[test]
+    fn old_file_gets_the_defaults() {
+        let d = dir();
+        std::fs::write(Config::path(d.path()), "protect = true\n").unwrap();
+        let c = Config::load_or_create(d.path()).unwrap();
+        assert_eq!(c.retention(), Config::default().retention());
+        assert!(c.recycle_prune);
+    }
+
+    #[test]
+    fn zero_values_are_refused_with_the_key() {
+        for key in ["recycle_keep_latest", "recycle_keep_deleted_days"] {
+            let d = dir();
+            std::fs::write(Config::path(d.path()), format!("{key} = 0\n")).unwrap();
+            let err = Config::load_or_create(d.path()).unwrap_err().to_string();
+            assert!(err.contains(key), "{err}");
+            assert!(err.contains("must be at least 1"), "{err}");
+        }
+    }
+
+    #[test]
+    fn written_default_names_the_keys() {
+        let d = dir();
+        Config::load_or_create(d.path()).unwrap();
+        let text = std::fs::read_to_string(Config::path(d.path())).unwrap();
+        for key in [
+            "recycle_prune = true",
+            "recycle_keep_latest = 3",
+            "recycle_keep_daily = 7",
+            "recycle_keep_monthly = 12",
+            "recycle_keep_deleted_days = 90",
+        ] {
+            assert!(text.contains(key), "{key} missing in:\n{text}");
+        }
     }
 }

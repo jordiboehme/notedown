@@ -511,6 +511,11 @@ fn config_defaults_created_and_round_trip() {
         capture: true,
         log_retention_days: 7,
         log_max_bytes: 123,
+        recycle_prune: false,
+        recycle_keep_latest: 2,
+        recycle_keep_daily: 5,
+        recycle_keep_monthly: 6,
+        recycle_keep_deleted_days: 30,
     };
     custom.save(dir.path()).unwrap();
     assert_eq!(Config::load_or_create(dir.path()).unwrap(), custom);

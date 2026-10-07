@@ -18,8 +18,9 @@
 //! pulls all. `nextSyncToken` of the answer is the server time of the pull's first page, carried
 //! in the page token, so a change made between page calls comes with the next pull. Tasks are
 //! ordered by `taskId`, groups by `taskListId`; `maxResults` (default 20) pages them by an
-//! opaque token, which only a page with more rows after it carries. Paging arguments of an
-//! unexpected shape never answer `422`: they read as the default or the first page.
+//! opaque token, which only a page with more rows after it carries. Paging arguments (also
+//! `nextIndexNumber` of the sort query) of an unexpected shape never answer `422`: they read as
+//! the default or the first page.
 //!
 //! Deletes: a task delete leaves a tombstone (D5). A group delete turns every task of the group
 //! into a tombstone (one journal batch), then removes its sort and the group; `group/clear` does
@@ -165,13 +166,11 @@ fn task_page_token(body: &Value) -> (u64, Option<u64>) {
     }
 }
 
-/// `nextIndexNumber`: absent is 0, negative or no number is bad.
-fn offset_arg(req: &AppRequest, name: &str) -> Result<u64, Reply> {
-    match int_arg(&req.body, name) {
-        Ok(None) => Ok(0),
-        Ok(Some(n)) if n >= 0 => Ok(n as u64),
-        _ => Err(req.bad_params(name)),
-    }
+/// `nextIndexNumber` of the sort query: a decimal index; anything else is the first sort.
+fn sort_index(body: &Value) -> u64 {
+    paging_text(body, "nextIndexNumber")
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(0)
 }
 
 /// The `nextSyncToken` of a pull.
@@ -654,10 +653,7 @@ pub async fn query_sort(
     bytes: Bytes,
 ) -> Reply {
     let req = app_request!(state, headers, bytes);
-    let index = match offset_arg(&req, "nextIndexNumber") {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
+    let index = sort_index(&req.body);
     with_app_data(&state, &req, move |c| {
         let mut sorts = c.app.task_sorts(c.guard)?;
         sorts.sort_by(|a, b| a.task_list_id.cmp(&b.task_list_id));

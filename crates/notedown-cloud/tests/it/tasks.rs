@@ -963,11 +963,6 @@ async fn bad_parameters_answer_422_and_store_nothing() {
             Some(json!({"taskListId": L1, "updateScheduleTaskList": "no"})),
         ),
         ("POST", SORT.into(), Some(json!({"title": "no id"}))),
-        (
-            "POST",
-            SORT_QUERY.into(),
-            Some(json!({"nextIndexNumber": "x"})),
-        ),
         ("GET", format!("{TASK}/a.b"), None),
         ("DELETE", format!("{TASK}/a.b"), None),
         ("GET", format!("{GROUP}/a.b"), None),
@@ -1328,4 +1323,46 @@ async fn a_tombstone_lives_exactly_as_long_as_the_token_before_its_delete() {
     let v = s.post(TASK_ALL, &t, json!({"nextSyncToken": token})).await;
     assert_err(&v, "E0330");
     assert!(!file.exists());
+}
+
+#[tokio::test]
+async fn a_sort_index_of_any_shape_never_answers_422() {
+    let s = Server::new();
+    let t = s.login(SERIAL).await;
+    for (id, title) in [(L1, "Home"), (L2, "Work")] {
+        assert_ok(
+            &s.post(
+                SORT,
+                &t,
+                json!({"taskListId": id, "title": title, "lastModify": T0, "content": "[]"}),
+            )
+            .await,
+        );
+    }
+    // a string, a number or a one-element array of either
+    for index in [json!("1"), json!(1), json!(["1"]), json!([1])] {
+        let v = s
+            .post(SORT_QUERY, &t, json!({"nextIndexNumber": index}))
+            .await;
+        assert_ok(&v);
+        assert_eq!(v["taskListId"], L2, "{index}");
+        assert!(v["nextIndexNumber"].is_null(), "{index}");
+    }
+    // anything else starts at the first sort
+    for index in [
+        json!("x"),
+        json!(-1),
+        json!(1.5),
+        json!(true),
+        json!({"a": 1}),
+        json!([]),
+        json!(["1", "2"]),
+    ] {
+        let v = s
+            .post(SORT_QUERY, &t, json!({"nextIndexNumber": index}))
+            .await;
+        assert_ok(&v);
+        assert_eq!(v["taskListId"], L1, "{index}");
+        assert_eq!(v["nextIndexNumber"], 1, "{index}");
+    }
 }

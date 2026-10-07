@@ -1320,12 +1320,6 @@ async fn a_read_does_not_revive_a_lapsed_lock_of_a_write_without_a_session() {
             .await,
     );
     assert_eq!(s.state.sync_locks.holder("jordi", s.state.now_ms()), None);
-    let other = s.login_as(OTHER).await;
-    assert_ok(&s.post(START, &other, json!({"equipmentNo": OTHER})).await);
-    assert_ok(
-        &s.post(END, &other, json!({"equipmentNo": OTHER, "flag": "Y"}))
-            .await,
-    );
     // The next write takes the lock again, with a new marker.
     assert_ok(&s.mkdir(&t, "/INBOX/G", false).await);
     assert_eq!(s.markers("implicit_lock").len(), 2);

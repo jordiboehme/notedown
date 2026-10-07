@@ -78,9 +78,9 @@ pub struct Config {
     pub recycle_prune: bool,
     /// Newest recycled versions kept per file, whatever their age. At least 1.
     pub recycle_keep_latest: u32,
-    /// Local days (back from today) that keep their newest recycled version per file.
+    /// Local days (back from today) whose end keeps the version a file had then.
     pub recycle_keep_daily: u32,
-    /// Local months (back from this month) that keep their newest recycled version per file.
+    /// Local months (back from this month) whose end keeps the version a file had then.
     pub recycle_keep_monthly: u32,
     /// A deleted file whose newest recycled line is older than this many days is removed
     /// completely. At least 1.

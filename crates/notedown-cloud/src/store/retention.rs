@@ -1,16 +1,21 @@
 //! The retention policy of the recycle bin: which index lines to remove.
 //!
 //! Pure: no file access. The caller passes the parsed index, a lookup for ids the store still
-//! knows, the settings and the clock. Days and months are local calendar buckets counted back
-//! from now (also when a bucket has no line).
+//! knows, the settings and the clock.
 //!
-//! - A live file keeps its `keep_latest` newest lines, the newest line of each of the last
-//!   `keep_daily` local days and the newest line of each of the last `keep_monthly` local
-//!   months. Every other line goes.
+//! A line holds the version that was current from the time of the line before it (same id) to
+//! its own time (`deletedAt`, when the next version replaced it). The oldest line of an id has
+//! an open start. Days and months are local calendar days and months counted back from now
+//! (also when they have no line). The end of a day or month is the local midnight after it.
+//!
+//! - A live file keeps its `keep_latest` newest lines, the line current at the end of each of
+//!   the last `keep_daily` local days and the line current at the end of each of the last
+//!   `keep_monthly` local months. An end that is still in the future (today, this month) needs
+//!   no line: the live file is that version. Every other line is removed.
 //! - A deleted file (id unknown to the store) follows the same rules until its newest line is
-//!   older than `keep_deleted_days`. Then every line of it goes.
+//!   older than `keep_deleted_days`. Then every line of it is removed.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use time::{Date, OffsetDateTime, UtcOffset};
 
@@ -23,9 +28,9 @@ const DAY_MS: u64 = 86_400_000;
 pub struct Retention {
     /// Newest lines kept per file, whatever their age.
     pub keep_latest: u32,
-    /// Local days (back from today) that keep their newest line.
+    /// Local days (back from today) whose end keeps the line current then.
     pub keep_daily: u32,
-    /// Local months (back from this month) that keep their newest line.
+    /// Local months (back from this month) whose end keeps the line current then.
     pub keep_monthly: u32,
     /// A deleted file whose newest line is older than this many days is removed completely.
     pub keep_deleted_days: u32,
@@ -46,15 +51,34 @@ pub fn plan(
             .map(|t| t.to_offset(offset).date())
     };
     let today = local(now_ms);
+    let day_of = |d: Date| i64::from(d.to_julian_day());
     let month_of = |d: Date| i64::from(d.year()) * 12 + i64::from(u8::from(d.month())) - 1;
     // First day / month still inside the window; `None` when the window is empty or `now` is
     // not representable.
     let first_day = today
         .filter(|_| retention.keep_daily > 0)
-        .map(|d| i64::from(d.to_julian_day()) - (i64::from(retention.keep_daily) - 1));
+        .map(|d| day_of(d) - (i64::from(retention.keep_daily) - 1));
     let first_month = today
         .filter(|_| retention.keep_monthly > 0)
         .map(|d| month_of(d) - (i64::from(retention.keep_monthly) - 1));
+    // Whether the version current from `start` (exclusive, `None`: open) to `end` (inclusive)
+    // was current at the end of an in-window day or month that has already ended. The latest
+    // such end is the midnight that starts the day (month) of `min(end, now)`; when it is
+    // before the window or not after `start`, every earlier end is too.
+    let holds_an_end = |start: Option<u64>, end: u64| -> bool {
+        // A timestamp `time` can't represent is never removed by the window rules.
+        let (Some(end), Some(today)) = (local(end), today) else {
+            return true;
+        };
+        let last = end.min(today);
+        let start = start.and_then(local);
+        let day = day_of(last) - 1;
+        let daily = first_day.is_some_and(|f| day >= f) && start.is_none_or(|s| day >= day_of(s));
+        let month = month_of(last) - 1;
+        let monthly =
+            first_month.is_some_and(|f| month >= f) && start.is_none_or(|s| month >= month_of(s));
+        daily || monthly
+    };
 
     let mut groups: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
     for (i, e) in entries.iter().enumerate() {
@@ -63,38 +87,19 @@ pub fn plan(
 
     let mut remove = Vec::new();
     for (id, mut idx) in groups {
-        // Newest first; equal times: the later line is newer.
-        idx.sort_by_key(|&i| std::cmp::Reverse((entries[i].deleted_at, i)));
+        // Oldest first; equal times: the later line is newer.
+        idx.sort_by_key(|&i| (entries[i].deleted_at, i));
         if !live(id) {
-            let newest = entries[idx[0]].deleted_at;
+            let newest = entries[idx[idx.len() - 1]].deleted_at;
             if now_ms.saturating_sub(newest) > u64::from(retention.keep_deleted_days) * DAY_MS {
                 remove.extend(idx);
                 continue;
             }
         }
-        let mut kept_latest = 0u32;
-        let mut days = HashSet::new();
-        let mut months = HashSet::new();
-        for i in idx {
-            let latest = kept_latest < retention.keep_latest;
-            if latest {
-                kept_latest += 1;
-            }
-            // A timestamp `time` can't represent is never removed by the window rules.
-            let Some(date) = local(entries[i].deleted_at) else {
-                continue;
-            };
-            // Every rule picks the newest line of its bucket on its own, so a line kept as one
-            // of the newest also fills its buckets.
-            let mut keep = latest;
-            let day = i64::from(date.to_julian_day());
-            if first_day.is_some_and(|f| day >= f) {
-                keep |= days.insert(day);
-            }
-            if first_month.is_some_and(|f| month_of(date) >= f) {
-                keep |= months.insert(month_of(date));
-            }
-            if !keep {
+        let latest = idx.len().saturating_sub(retention.keep_latest as usize);
+        for (k, &i) in idx[..latest].iter().enumerate() {
+            let start = k.checked_sub(1).map(|p| entries[idx[p]].deleted_at);
+            if !holds_an_end(start, entries[i].deleted_at) {
                 remove.push(i);
             }
         }
@@ -148,32 +153,82 @@ mod tests {
         }
     }
 
+    /// Why each line stays or goes. Now is Wed 2026-10-07 20:00 local (+02:00), settings 3 / 7
+    /// / 12 / 90. In-window ends already past: the end of Oct 1 to Oct 6 and the end of Nov 2025
+    /// to Sep 2026. A line holds the version current from the line before it (same id) to its
+    /// own time.
     #[test]
     fn table() {
-        let now = at(2026, 10, 7, 12, 0);
-        let live_lines = [
-            at(2025, 9, 15, 10, 0),  // 0 a remove
-            at(2025, 11, 20, 9, 0),  // 1 b keep
-            at(2025, 11, 2, 9, 0),   // 2 c remove
-            at(2026, 8, 31, 23, 30), // 3 d keep
-            at(2026, 9, 30, 23, 59), // 4 e keep
-            at(2026, 10, 1, 0, 10),  // 5 f keep
-            at(2026, 10, 5, 8, 0),   // 6 g remove
-            at(2026, 10, 5, 18, 0),  // 7 h keep
-            at(2026, 10, 7, 9, 0),   // 8 i keep
-            at(2026, 10, 7, 10, 0),  // 9 j keep
-            at(2026, 10, 7, 11, 0),  // 10 k keep
+        let now = at(2026, 10, 7, 20, 0);
+        let ow = RecycleReason::Overwritten;
+        let del = RecycleReason::Deleted;
+        #[rustfmt::skip]
+        let lines = [
+            // id 5, live
+            (5, at(2025, 9, 15, 10, 0), ow, false),  // 0 current until Sep 2025: no in-window end
+            (5, at(2025, 11, 2, 9, 0), ow, false),   // 1 holds only the end of Oct 2025 (outside)
+            (5, at(2025, 11, 20, 9, 0), ow, false),  // 2 no end inside
+            (5, at(2026, 1, 10, 9, 0), ow, true),    // 3 current at the end of Nov and Dec 2025
+            (5, at(2026, 8, 31, 23, 30), ow, true),  // 4 current at the end of Jan to Jul
+            (5, at(2026, 9, 1, 0, 10), ow, true),    // 5 end of Aug, local midnight (UTC: line 6)
+            (5, at(2026, 9, 30, 23, 59), ow, false), // 6 replaced a minute before Sep ended
+            (5, at(2026, 10, 1, 0, 0), ow, true),    // 7 replaced at midnight: the end of Sep
+            (5, at(2026, 10, 3, 8, 0), ow, true),    // 8 end of Oct 1 and Oct 2
+            (5, at(2026, 10, 5, 8, 0), ow, true),    // 9 end of Oct 3 and of Oct 4 (no upload)
+            (5, at(2026, 10, 5, 18, 0), ow, false),  // 10 no end inside
+            (5, at(2026, 10, 6, 9, 0), ow, true),    // 11 end of Oct 5
+            (5, at(2026, 10, 6, 18, 0), ow, false),  // 12 no end inside
+            (5, at(2026, 10, 7, 9, 0), ow, true),    // 13 end of Oct 6
+            (5, at(2026, 10, 7, 10, 0), ow, true),   // 14 one of the 3 newest
+            (5, at(2026, 10, 7, 11, 0), ow, true),   // 15 one of the 3 newest
+            (5, at(2026, 10, 7, 12, 0), ow, true),   // 16 one of the 3 newest
+            // id 6, live, unchanged for 14 months, then 4 uploads today
+            (6, at(2025, 8, 1, 10, 0), ow, false),   // 17 current until Aug 2025: no in-window end
+            (6, at(2026, 10, 7, 9, 0), ow, true),    // 18 current at every in-window end
+            (6, at(2026, 10, 7, 10, 0), ow, true),   // 19 one of the 3 newest
+            (6, at(2026, 10, 7, 11, 0), ow, true),   // 20 one of the 3 newest
+            (6, at(2026, 10, 7, 12, 0), ow, true),   // 21 one of the 3 newest
+            // id 9, deleted 98 days ago: all of it goes
+            (9, at(2026, 6, 1, 10, 0), ow, false),   // 22
+            (9, at(2026, 7, 1, 10, 0), del, false),  // 23
+            // id 10, deleted 36 days ago: the rules of a live file still apply
+            (10, at(2026, 8, 1, 10, 0), ow, true),   // 24 current at the end of Nov 2025 to Jul
+            (10, at(2026, 8, 15, 10, 0), ow, true),  // 25 one of the 3 newest
+            (10, at(2026, 9, 1, 10, 0), del, true),  // 26 the end of Aug
+            // deleted exactly 90 days ago (stays) and 1 ms longer (goes)
+            (11, now - 90 * DAY_MS, del, true),      // 27
+            (12, now - 90 * DAY_MS - 1, del, false), // 28
         ];
-        let mut entries: Vec<_> = live_lines.iter().map(|&t| over(5, t)).collect();
-        entries.push(over(9, at(2026, 6, 1, 10, 0))); // 11
-        entries.push(entry(9, at(2026, 7, 1, 10, 0), RecycleReason::Deleted)); // 12
-        entries.push(over(10, at(2026, 8, 1, 10, 0))); // 13
-        entries.push(over(10, at(2026, 8, 15, 10, 0))); // 14
-        entries.push(entry(10, at(2026, 9, 1, 10, 0), RecycleReason::Deleted)); // 15
-        entries.push(entry(11, now - 90 * DAY_MS, RecycleReason::Deleted)); // 16
-        entries.push(entry(12, now - 90 * DAY_MS - 1, RecycleReason::Deleted)); // 17
+        let entries: Vec<_> = lines
+            .iter()
+            .map(|&(id, t, why, _)| entry(id, t, why))
+            .collect();
+        let want: Vec<usize> = (0..lines.len()).filter(|&i| !lines[i].3).collect();
+        let live = |id: u64| id == 5 || id == 6;
+        let got = plan(&entries, &live, &r(3, 7, 12, 90), now, offset());
+        assert_eq!(got, want);
+    }
+
+    /// An upload creates a line with the version before it. Mon to Wed with Auto Sync: the
+    /// version at the end of Mon (line 2) and of Tue (line 5) stays.
+    #[test]
+    fn the_version_at_the_end_of_each_day_is_kept() {
+        let now = at(2026, 10, 7, 20, 0);
+        let times = [
+            at(2026, 10, 5, 12, 0), // 0 v0, current at the end of Sun and before: keep
+            at(2026, 10, 5, 18, 0), // 1 v1, Mon 12 to 18: remove
+            at(2026, 10, 6, 8, 0),  // 2 v2, the end of Mon: keep
+            at(2026, 10, 6, 12, 0), // 3 remove
+            at(2026, 10, 6, 18, 0), // 4 remove
+            at(2026, 10, 7, 8, 0),  // 5 v5, the end of Tue: keep
+            at(2026, 10, 7, 10, 0), // 6 remove
+            at(2026, 10, 7, 12, 0), // 7 one of the 3 newest
+            at(2026, 10, 7, 14, 0), // 8 one of the 3 newest
+            at(2026, 10, 7, 16, 0), // 9 one of the 3 newest
+        ];
+        let entries: Vec<_> = times.iter().map(|&t| over(5, t)).collect();
         let got = plan(&entries, &live5, &r(3, 7, 12, 90), now, offset());
-        assert_eq!(got, vec![0, 2, 6, 11, 12, 17]);
+        assert_eq!(got, vec![1, 3, 4, 6]);
     }
 
     #[test]
@@ -214,14 +269,15 @@ mod tests {
     }
 
     #[test]
-    fn a_newest_line_also_fills_its_day_and_month() {
+    fn the_oldest_line_holds_the_version_before_it() {
         let now = at(2026, 10, 7, 12, 0);
+        // Line 0 holds the version current before 08:00 today, so at the end of yesterday.
         let entries: Vec<_> = [8, 9, 10, 11]
             .iter()
             .map(|&h| over(5, at(2026, 10, 7, h, 0)))
             .collect();
         let got = plan(&entries, &live5, &r(3, 7, 12, 90), now, offset());
-        assert_eq!(got, vec![0]);
+        assert!(got.is_empty());
     }
 
     #[test]

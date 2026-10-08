@@ -216,6 +216,14 @@ struct TreeCheck {
     folders: Vec<(String, std::fs::Metadata)>,
 }
 
+/// The walk of a scan that applied ([`Store::scan_walked`]): the tree check before it and what
+/// it found. A listing of the same scope under the same guard reuses it
+/// ([`Store::list_walked`]) instead of walking the tree again; the scan changes no file.
+pub(crate) struct Walk {
+    found: Vec<Found>,
+    before: TreeCheck,
+}
+
 struct State {
     ids: Registry,
     /// Stamps of `ids.json` and `ids.jsonl` when `ids` was loaded; `None` forces a reload.
@@ -851,23 +859,47 @@ impl Store {
     /// [`Store::lock`] checked it (`files/` or a native folder gone) is `Error::StoreDamaged`,
     /// never an empty or partial list.
     pub fn list(&self, guard: &StoreGuard, path: &WirePath, recursive: bool) -> Result<Vec<Entry>> {
+        self.list_walked(guard, path, recursive, None)
+    }
+
+    /// [`Store::list`] that takes the walk of the scan of the same scope right before it under
+    /// the same guard ([`Store::scan_walked`]), so the tree is walked once. `None` walks it.
+    pub(crate) fn list_walked(
+        &self,
+        guard: &StoreGuard,
+        path: &WirePath,
+        recursive: bool,
+        walk: Option<Walk>,
+    ) -> Result<Vec<Entry>> {
         self.check_guard(guard)?;
         // `files/` or a native folder may vanish or be swapped by another process after the
         // lock checked the tree: an empty or partial listing would make the device delete its
         // files. So the tree is checked before the walk and again after the last read of
-        // `files/` (the hashing in `entries`), and the folders must be the same ones.
-        let before = self.check_tree(false)?;
-        let mut all = Vec::new();
-        if let Some(found) = list::resolve(&self.files, path)?
-            && found.kind == Kind::Folder
-        {
-            list::walk(
-                &found,
-                recursive,
-                &mut all,
-                &self.vanished_damage(before.imported),
-            )?;
-        }
+        // `files/` (the hashing in `entries`), and the folders must be the same ones. A reused
+        // walk brings the check from before it.
+        let (before, mut all) = match walk {
+            Some(walk) => {
+                // The scan's walk holds the scope itself too (a file or folder below the root).
+                let mut all = walk.found;
+                all.retain(|f| f.path != *path);
+                (walk.before, all)
+            }
+            None => {
+                let before = self.check_tree(false)?;
+                let mut all = Vec::new();
+                if let Some(found) = list::resolve(&self.files, path)?
+                    && found.kind == Kind::Folder
+                {
+                    list::walk(
+                        &found,
+                        recursive,
+                        &mut all,
+                        &self.vanished_damage(before.imported),
+                    )?;
+                }
+                (before, all)
+            }
+        };
         all.sort_by(|a, b| a.path.cmp(&b.path));
         let full = path.is_root() && recursive;
         let entries = self.entries(all)?;

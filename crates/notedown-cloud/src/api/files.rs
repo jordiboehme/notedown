@@ -24,7 +24,7 @@ use crate::diag::{LogEntry, LogKind};
 use crate::journal::Origin;
 use crate::server::AppState;
 use crate::store::{
-    Entry, Kind, PendingOp, PutOptions, ScanOptions, Store, StoreGuard, Stored, WirePath,
+    Entry, Kind, PendingOp, PutOptions, ScanOptions, Store, StoreGuard, Stored, Walk, WirePath,
     WriteGuard,
 };
 use crate::sync::staging;
@@ -311,14 +311,15 @@ pub fn gate_locked(state: &AppState, store: &Store) -> crate::Result<()> {
 /// The scan of a device listing (`docs/sync-protocol.md` 8.3): `scope` and what lies below it
 /// (only the direct children when not `recursive`), right before the listing under the same
 /// guard, so a change made by hand is journaled before the device sees it. A hold is
-/// `Error::ScanHold`.
+/// `Error::ScanHold`. Returns the scan's walk, which the listing reuses
+/// ([`Store::list_walked`]).
 fn scan_scope(
     state: &AppState,
     store: &Store,
     guard: &WriteGuard,
     scope: &WirePath,
     recursive: bool,
-) -> crate::Result<()> {
+) -> crate::Result<Option<Walk>> {
     let opts = ScanOptions {
         scope: scope.clone(),
         recursive,
@@ -326,7 +327,9 @@ fn scan_scope(
         accept: false,
         min_files: state.config.scan_min_files,
     };
-    state.run_scan(store, guard, &opts).map(drop)
+    state
+        .run_scan_walked(store, guard, &opts)
+        .map(|(_, walk)| walk)
 }
 
 /// [`scan_scope`] for every existing folder on the way to `target` (stored spelling,
@@ -352,7 +355,7 @@ fn scan_around(
     path: &WirePath,
 ) -> crate::Result<()> {
     let parent = path.parent().unwrap_or_else(WirePath::root);
-    scan_scope(state, store, guard, &parent, false)
+    scan_scope(state, store, guard, &parent, false).map(drop)
 }
 
 /// The answer for a damaged store (`Error::StoreDamaged`): `E0079` with flag `store_damaged`,
@@ -550,14 +553,16 @@ fn list_folder_of(
             _ => return Ok(Listing::Missing),
         },
     };
-    scan_scope(state, &store, &guard, &path, recursive)?;
+    let walk = scan_scope(state, &store, &guard, &path, recursive)?;
     if !path.is_root() {
         match store.entry(&guard, &path)? {
             Some(e) if e.tag == Kind::Folder => {}
             _ => return Ok(Listing::Missing),
         }
     }
-    store.list(&guard, &path, recursive).map(Listing::Entries)
+    store
+        .list_walked(&guard, &path, recursive, walk)
+        .map(Listing::Entries)
 }
 
 /// `POST /api/file/2/files/list_folder` `{path, recursive}`: `entries`. `""` or `/` is the
@@ -1568,7 +1573,9 @@ fn source_of(
 ) -> crate::Result<Option<Entry>> {
     match store.kind_and_path_of(id)? {
         None => return Ok(None),
-        Some((Kind::Folder, path)) => scan_scope(state, store, guard, &path, true)?,
+        Some((Kind::Folder, path)) => {
+            scan_scope(state, store, guard, &path, true)?;
+        }
         Some((Kind::File, path)) => scan_around(state, store, guard, &path)?,
     }
     let Some(path) = store.path_of(id)? else {

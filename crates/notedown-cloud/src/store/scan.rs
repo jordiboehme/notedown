@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use super::commit::{SideBatch, SideWrite, WriteGuard};
 use super::hashes::{HashCache, md5_stable};
 use super::ids::{Op, Registry};
-use super::{Kind, Store, WirePath, is_native_folder, list};
+use super::{Kind, Store, Walk, WirePath, is_native_folder, list};
 use crate::journal::{Event, EventBody, FileKind, Journal, Origin, new_op_id};
 use crate::{Error, Result, io_err};
 
@@ -265,6 +265,18 @@ impl Store {
         self.scan_until(guard, journal, opts, now_ms, false)
     }
 
+    /// [`Store::scan`], plus its walk of the scope when the scan applied (not held, not a dry
+    /// run), for a listing of the same scope under the same guard ([`Store::list_walked`]).
+    pub(crate) fn scan_walked(
+        &self,
+        guard: &WriteGuard,
+        journal: &Journal,
+        opts: &ScanOptions,
+        now_ms: u64,
+    ) -> Result<(ScanReport, Option<Walk>)> {
+        self.scan_inner(guard, journal, opts, now_ms, false)
+    }
+
     /// [`Store::scan`] that stops after the journal append, before the registry append, as a
     /// crash there would. Test hook.
     #[doc(hidden)]
@@ -276,8 +288,21 @@ impl Store {
         now_ms: u64,
         stop_after_journal: bool,
     ) -> Result<ScanReport> {
+        self.scan_inner(guard, journal, opts, now_ms, stop_after_journal)
+            .map(|(report, _)| report)
+    }
+
+    /// The scan of [`Store::scan_until`], with the walk when the scan applied.
+    fn scan_inner(
+        &self,
+        guard: &WriteGuard,
+        journal: &Journal,
+        opts: &ScanOptions,
+        now_ms: u64,
+        stop_after_journal: bool,
+    ) -> Result<(ScanReport, Option<Walk>)> {
         self.check_write(guard)?;
-        let (disk, parents, cache) = self.scan_disk(opts)?;
+        let (disk, parents, cache, walk) = self.scan_disk(opts)?;
         // The plan reads the rows of gone paths from the store's cache.
         // Under the state mutex: a whole-tree plan (about 8 ms at 20000 files) blocks `id_of`
         // and `path_of` readers for that time.
@@ -320,12 +345,12 @@ impl Store {
             };
             if held.is_some() {
                 report.held = held;
-                return Ok(report);
+                return Ok((report, None));
             }
         }
         report.released = has_marker;
         if opts.dry_run {
-            return Ok(report);
+            return Ok((report, None));
         }
         let (mut events, side_writes) = self.scan_events(&plan);
         // The new ids are reserved first: after a crash between the journal append and the
@@ -343,7 +368,7 @@ impl Store {
         // Events next: the registry is never ahead of the journal.
         report.seqs = journal.append(&mut events)?;
         if stop_after_journal {
-            return Ok(report);
+            return Ok((report, None));
         }
         self.finish_scan(&plan, cache, opts)?;
         if report.released {
@@ -356,7 +381,7 @@ impl Store {
             }
         }
         self.sync_sides(batch);
-        Ok(report)
+        Ok((report, Some(walk)))
     }
 
     /// Walk the scope and hash its files through a copy of the cache: the whole cache for a
@@ -364,8 +389,12 @@ impl Store {
     /// (files with a fresh MD5 and the cached one), the folders above it and the copy. The store's
     /// cache is not touched: a scan that holds or stops early leaves it as it was. The tree is
     /// checked before and after, like [`Store::list`] does. The files to hash are read on a few
-    /// threads ([`hash_files`]); the results go into the copy in walk order.
-    fn scan_disk(&self, opts: &ScanOptions) -> Result<(Vec<OnDisk>, Vec<WirePath>, HashCache)> {
+    /// threads ([`hash_files`]); the results go into the copy in walk order. The walk itself
+    /// comes back too, without the files that vanished while they were hashed.
+    fn scan_disk(
+        &self,
+        opts: &ScanOptions,
+    ) -> Result<(Vec<OnDisk>, Vec<WirePath>, HashCache, Walk)> {
         let before = self.check_tree(false)?;
         let mut found = Vec::new();
         let mut parents = Vec::new();
@@ -414,6 +443,7 @@ impl Store {
         let mut hashed = hash_files(&found, &to_hash, hook.as_deref()).into_iter();
         let mut next_hashed = to_hash.iter().copied().peekable();
         let mut disk = Vec::with_capacity(found.len());
+        let mut kept = Vec::with_capacity(found.len());
         for (i, f) in found.into_iter().enumerate() {
             let (md5, prev, unstable) = match f.kind {
                 Kind::Folder => (String::new(), None, false),
@@ -449,16 +479,21 @@ impl Store {
                 } else {
                     0
                 },
-                path: f.path,
+                path: f.path.clone(),
                 kind: f.kind,
                 md5,
                 prev,
                 unstable,
             });
+            kept.push(f);
         }
         let after = self.check_tree(false)?;
         self.check_same_tree(&before, &after)?;
-        Ok((disk, parents, cache))
+        let walk = Walk {
+            found: kept,
+            before,
+        };
+        Ok((disk, parents, cache, walk))
     }
 
     /// The scope on disk, and in `parents` the folders above it. `None` when the scope or one
@@ -1185,5 +1220,143 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// An imported account with its native folders, its store and journal.
+    fn imported_account() -> (tempfile::TempDir, Store, Journal) {
+        let dir = tempfile::tempdir().unwrap();
+        let accounts = crate::auth::Accounts::new(dir.path());
+        accounts
+            .create("jordi", "jordi@example.org", "secret")
+            .unwrap();
+        let store = Store::open(dir.path(), "jordi").unwrap();
+        {
+            let g = store.lock().unwrap();
+            store.ensure_native_folders(&g).unwrap();
+        }
+        let mut a = accounts.get("jordi").unwrap().unwrap();
+        a.imported = Some(crate::auth::Imported {
+            at: "2026-10-06T10:00:00Z".into(),
+            source: "/backup/Supernote".into(),
+            files: 0,
+            bytes: 0,
+        });
+        accounts.save(&a).unwrap();
+        let journal = Journal::open(dir.path()).unwrap();
+        (dir, store, journal)
+    }
+
+    /// Place a file by hand (parents too).
+    fn write_by_hand(store: &Store, rel: &str, bytes: &[u8]) {
+        let p = store.fs_path(&WirePath::parse_named(rel).unwrap());
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, bytes).unwrap();
+    }
+
+    fn scope_of(s: &str) -> WirePath {
+        if s.is_empty() {
+            WirePath::root()
+        } else {
+            WirePath::parse_named(s).unwrap()
+        }
+    }
+
+    #[test]
+    fn a_listing_after_a_scan_is_the_listing_of_its_own_walk() {
+        let (_dir, store, journal) = imported_account();
+        write_by_hand(&store, "NOTE/Note/Work/a.note", b"a");
+        write_by_hand(&store, "NOTE/Note/top.note", b"top");
+        {
+            let g = store.lock().unwrap();
+            store.list(&g, &WirePath::root(), true).unwrap();
+        }
+        // Changes by hand: a new file in a new folder, and a case-only rename of a folder.
+        write_by_hand(&store, "NOTE/Note/Work/Sub/b.note", b"b");
+        std::fs::rename(
+            store.fs_path(&scope_of("NOTE/Note/Work")),
+            store.fs_path(&scope_of("NOTE/Note/work")),
+        )
+        .unwrap();
+        for recursive in [false, true] {
+            for scope in [
+                "",
+                "NOTE/Note",
+                "NOTE/Note/work",
+                "NOTE/Note/work/Sub",
+                "NOTE/Note/top.note",
+                "NOTE/Note/missing",
+            ] {
+                let scope = scope_of(scope);
+                let g = store.lock_recovered(&journal).unwrap();
+                let opts = ScanOptions {
+                    scope: scope.clone(),
+                    recursive,
+                    ..ScanOptions::all(0)
+                };
+                let (report, walk) = store.scan_walked(&g, &journal, &opts, 1).unwrap();
+                assert!(report.held.is_none());
+                assert!(walk.is_some(), "scope {scope:?} recursive {recursive}");
+                let reused = store.list_walked(&g, &scope, recursive, walk).unwrap();
+                let own = store.list(&g, &scope, recursive).unwrap();
+                assert_eq!(reused, own, "scope {scope:?} recursive {recursive}");
+            }
+        }
+        // The walk saw the new file: the reused listing of the root has it.
+        let g = store.lock_recovered(&journal).unwrap();
+        let (_, walk) = store
+            .scan_walked(&g, &journal, &ScanOptions::all(0), 1)
+            .unwrap();
+        let all = store
+            .list_walked(&g, &WirePath::root(), true, walk)
+            .unwrap();
+        assert!(
+            all.iter()
+                .any(|e| e.path_display == "NOTE/Note/work/Sub/b.note")
+        );
+    }
+
+    #[test]
+    fn a_reused_walk_of_a_tree_swapped_after_the_scan_is_damage() {
+        let (_dir, store, journal) = imported_account();
+        write_by_hand(&store, "NOTE/a.note", b"a");
+        let g = store.lock_recovered(&journal).unwrap();
+        let (_, walk) = store
+            .scan_walked(&g, &journal, &ScanOptions::all(0), 1)
+            .unwrap();
+        // NOTE is put aside and an empty folder takes its place.
+        let note = store.fs_path(&scope_of("NOTE"));
+        std::fs::rename(&note, note.with_file_name(".NOTE-aside")).unwrap();
+        std::fs::create_dir(&note).unwrap();
+        let err = store
+            .list_walked(&g, &WirePath::root(), true, walk)
+            .unwrap_err();
+        assert!(matches!(err, Error::StoreDamaged { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_scan_that_holds_or_is_a_dry_run_gives_no_walk() {
+        let (_dir, store, journal) = imported_account();
+        write_by_hand(&store, "NOTE/a.note", b"a");
+        let g = store.lock_recovered(&journal).unwrap();
+        let dry = ScanOptions {
+            dry_run: true,
+            ..ScanOptions::all(0)
+        };
+        assert!(
+            store
+                .scan_walked(&g, &journal, &dry, 1)
+                .unwrap()
+                .1
+                .is_none()
+        );
+        store
+            .scan_walked(&g, &journal, &ScanOptions::all(0), 1)
+            .unwrap();
+        std::fs::remove_file(store.fs_path(&scope_of("NOTE/a.note"))).unwrap();
+        let (report, walk) = store
+            .scan_walked(&g, &journal, &ScanOptions::all(5), 1)
+            .unwrap();
+        assert!(report.held.is_some());
+        assert!(walk.is_none());
     }
 }

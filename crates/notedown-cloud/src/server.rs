@@ -13,7 +13,7 @@ use crate::auth::Auth;
 use crate::diag::{Capture, Clock, LogEntry, LogKind, ProtocolLog, SystemClock};
 use crate::journal::{Journal, JournalOptions};
 use crate::push::{PushPlanner, PushTiming};
-use crate::store::{ScanHold, ScanOptions, ScanReport, Store, WriteGuard};
+use crate::store::{ScanHold, ScanOptions, ScanReport, Store, Walk, WriteGuard};
 use crate::sync::staging::{self, StagingLocks};
 use crate::sync::{SyncLocks, UrlSigner};
 use crate::{Config, Error, Result};
@@ -257,8 +257,20 @@ impl AppState {
         guard: &WriteGuard,
         opts: &ScanOptions,
     ) -> Result<ScanReport> {
+        self.run_scan_walked(store, guard, opts)
+            .map(|(report, _)| report)
+    }
+
+    /// [`AppState::run_scan`], plus the scan's walk for a listing of the same scope under the
+    /// same guard ([`Store::list_walked`]). Blocking.
+    pub(crate) fn run_scan_walked(
+        &self,
+        store: &Store,
+        guard: &WriteGuard,
+        opts: &ScanOptions,
+    ) -> Result<(ScanReport, Option<Walk>)> {
         let before = store.scan_hold();
-        let report = store.scan(guard, &self.journal, opts, self.now_ms())?;
+        let (report, walk) = store.scan_walked(guard, &self.journal, opts, self.now_ms())?;
         if report.held.is_some() {
             if !matches!(before, Ok(Some(_)))
                 && let Ok(Some(hold)) = store.scan_hold()
@@ -283,7 +295,7 @@ impl AppState {
                 ),
             }
         }
-        Ok(report)
+        Ok((report, walk))
     }
 
     /// Print the warning of [`scan_hold_warning`] for every account that is held already (from

@@ -310,8 +310,65 @@ fn a_tail_whose_file_was_cut_starts_over_without_repeats() {
     // returned already; seq 4 is new.
     let first = text.iter().position(|b| *b == b'\n').unwrap() + 1;
     std::fs::write(&file, &text[..first]).unwrap();
-    assert_eq!(j.append(&mut [ev(5), ev(6), ev(7)]).unwrap(), vec![2, 3, 4]);
+    // Longer lines than before, so the old offset falls inside a line.
+    let mut again = [ev_long(5, 40), ev_long(6, 40), ev_long(7, 40)];
+    assert_eq!(j.append(&mut again).unwrap(), vec![2, 3, 4]);
     assert_eq!(batch(&mut tail), vec![4]);
+}
+
+/// An event whose path is `len` characters long, for lines of another length.
+fn ev_long(n: u64, len: usize) -> Event {
+    Event::new(
+        "jordi",
+        Origin::Cli,
+        None,
+        &format!("op-{n}"),
+        EventBody::FolderCreated {
+            id: 1000 + n,
+            path: format!("F{n}-{}", "x".repeat(len)),
+        },
+    )
+}
+
+/// A journal file with seqs 1 to 12 and short lines, made in another folder.
+fn short_lines_file() -> (tempfile::TempDir, std::path::PathBuf) {
+    let other = tempfile::tempdir().unwrap();
+    let oj = Journal::open(other.path()).unwrap();
+    for n in 1..=12 {
+        oj.append(&mut [ev(n)]).unwrap();
+    }
+    let file = oj.files().unwrap()[0].1.clone();
+    (other, file)
+}
+
+/// The file the tail reads is replaced by another one with other line lengths (a copy over
+/// it, a restore): the tail starts over, and the batch is exactly the seqs it did not return.
+#[test]
+fn a_tail_whose_file_was_replaced_starts_over() {
+    for in_place in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(dir.path()).unwrap();
+        j.append(&mut [ev_long(1, 300), ev_long(2, 300)]).unwrap();
+        let mut tail = j.tail(1);
+        assert_eq!(batch(&mut tail), vec![1, 2]);
+        let file = j.files().unwrap()[0].1.clone();
+        let offset = std::fs::metadata(&file).unwrap().len();
+        let (_other, replacement) = short_lines_file();
+        assert!(std::fs::metadata(&replacement).unwrap().len() >= offset);
+        if in_place {
+            // Same file, other bytes.
+            std::fs::write(&file, std::fs::read(&replacement).unwrap()).unwrap();
+        } else {
+            std::fs::rename(&replacement, &file).unwrap();
+        }
+        let items = tail.next_batch().unwrap();
+        let seqs: Vec<u64> = items
+            .into_iter()
+            .map(|e| e.unwrap_or_else(|e| panic!("in place {in_place}: {e}")).seq)
+            .collect();
+        assert_eq!(seqs, (3..=12).collect::<Vec<_>>(), "in place {in_place}");
+        assert!(batch(&mut tail).is_empty());
+    }
 }
 
 #[test]

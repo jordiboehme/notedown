@@ -310,6 +310,8 @@ impl Journal {
             dir: self.dir.clone(),
             next: from,
             at: None,
+            behind: false,
+            warned: None,
         }
     }
 
@@ -504,8 +506,12 @@ impl Iterator for ReadFrom {
 ///   order. A torn or unfinished last line stays unread until it is complete.
 /// - Only events with `seq` at or above the next one wanted are returned: each `seq` at most
 ///   once, also when lines are read twice after a fallback.
-/// - A line that cannot be parsed is an `Err` item, returned once.
-/// - When the file vanished or became shorter than the offset, the tail starts over as
+/// - A line that cannot be parsed is an `Err` item. It is not returned again by the next
+///   batch, but it can come again after a fallback, which reads the file from its start.
+/// - The tail falls back when the file vanished, became shorter than the offset or was
+///   replaced: on unix another file (device and inode) at the path; anywhere, a byte before
+///   the offset that is not a newline, or a first event after the offset whose `seq` is not
+///   the next one (within one file the seqs follow each other). The fallback starts over as
 ///   [`Journal::read_from`] does from the next `seq` wanted. Lines rewritten under a `seq`
 ///   that was returned already are not returned again.
 #[derive(Debug)]
@@ -513,10 +519,48 @@ pub struct JournalTail {
     dir: PathBuf,
     /// The lowest `seq` still to return.
     next: u64,
-    /// The file being read: its first `seq`, its path and the offset after the last complete
-    /// line read.
-    at: Option<(u64, PathBuf, u64)>,
+    /// The file being read and where.
+    at: Option<At>,
+    /// The last batch stopped early (a file system error, too many fallbacks): the rest is
+    /// read by the next one.
+    behind: bool,
+    /// The last problem printed, so the same one is not printed on every batch.
+    warned: Option<String>,
 }
+
+#[derive(Debug, Clone)]
+struct At {
+    first: u64,
+    path: PathBuf,
+    /// The offset after the last complete line read.
+    offset: u64,
+    /// Device and inode of the file at the last read (unix).
+    id: Option<(u64, u64)>,
+}
+
+/// What the read of one file came to.
+enum FileRead {
+    /// Read to its end: the offset after the last complete line and the file's id.
+    Done(u64, Option<(u64, u64)>),
+    /// Not the file the tail read before: fall back.
+    Replaced,
+    /// A file system error after the lines up to the offset.
+    Failed(u64, Option<(u64, u64)>, Error),
+}
+
+#[cfg(unix)]
+fn file_id(m: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(_: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+/// How often one batch may fall back before it gives up until the next batch.
+const MAX_RESTARTS: usize = 8;
 
 impl JournalTail {
     /// The lowest `seq` the next batch can return.
@@ -524,109 +568,174 @@ impl JournalTail {
         self.next
     }
 
+    /// Whether the last batch stopped before the end of the journal (a file system error, a
+    /// file that kept changing): the next batch reads on, also when nothing new was appended.
+    pub fn is_behind(&self) -> bool {
+        self.behind
+    }
+
     /// The events appended since the last batch (see [`JournalTail`]). A file system error
-    /// ends the batch: the events read before it are returned, and the error only when there
-    /// are none; the next call reads on from the last complete line.
+    /// ends the batch: the events read before it are returned (with one line on stderr), the
+    /// error only when there are none; the next call reads on from the last complete line.
     pub fn next_batch(&mut self) -> Result<Vec<Result<Event>>> {
         let mut out = Vec::new();
-        match self.read_all(&mut out) {
-            Ok(()) => Ok(out),
-            Err(_) if !out.is_empty() => Ok(out),
+        let r = self.read_all(&mut out);
+        self.behind = !matches!(r, Ok(true));
+        match r {
+            Ok(true) => {
+                self.warned = None;
+                Ok(out)
+            }
+            Ok(false) => {
+                self.warn("a journal file keeps changing, reading on later".to_string());
+                Ok(out)
+            }
+            Err(e) if !out.is_empty() => {
+                self.warn(format!("{e}, reading on later"));
+                Ok(out)
+            }
             Err(e) => Err(e),
         }
     }
 
-    fn read_all(&mut self, out: &mut Vec<Result<Event>>) -> Result<()> {
-        // Starting over after a vanished or shorter file; bounded, so a file that keeps
-        // vanishing can't hold the caller.
+    fn warn(&mut self, message: String) {
+        if self.warned.as_ref() != Some(&message) {
+            eprintln!("notedown cloud: journal: {message}");
+            self.warned = Some(message);
+        }
+    }
+
+    /// Read to the end of the journal; false when it gave up after too many fallbacks.
+    fn read_all(&mut self, out: &mut Vec<Result<Event>>) -> Result<bool> {
         let mut restarts = 0;
         loop {
             let files = list_files(&self.dir)?;
-            let (first, path, offset) = match self.at.take() {
+            let at = match self.at.take() {
                 Some(at) => at,
                 None => match files.get(start_index(&files, self.next)) {
-                    Some((first, path)) => (*first, path.clone(), 0),
-                    None => return Ok(()),
+                    Some((first, path)) => At {
+                        first: *first,
+                        path: path.clone(),
+                        offset: 0,
+                        id: None,
+                    },
+                    None => return Ok(true),
                 },
             };
             // Listed before the read: once a newer file exists, the writer never appends to
             // this one again, so the read below sees all of it.
-            let newer = files.iter().find(|(f, _)| *f > first).cloned();
-            let len = match std::fs::metadata(&path) {
+            let newer = files.iter().find(|(f, _)| *f > at.first).cloned();
+            let len = match std::fs::metadata(&at.path) {
                 Ok(m) => Some(m.len()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(e) => {
-                    self.at = Some((first, path.clone(), offset));
-                    return Err(io_err(&path)(e));
+                    let err = io_err(&at.path)(e);
+                    self.at = Some(at);
+                    return Err(err);
                 }
             };
-            if len.is_none_or(|len| len < offset) {
-                // Removed, or cut: start over as `read_from` does from the next `seq`.
-                restarts += 1;
-                if restarts > 8 {
-                    return Ok(());
-                }
-                continue;
-            }
-            let end = match self.read_file(&path, offset, out) {
-                Ok(end) => end,
-                Err((end, e)) => {
-                    self.at = Some((first, path, end));
+            let read = match len {
+                Some(len) if len >= at.offset => self.read_file(&at, out),
+                // Removed, or cut.
+                _ => FileRead::Replaced,
+            };
+            match read {
+                FileRead::Done(offset, id) => match newer {
+                    Some((first, path)) => {
+                        self.at = Some(At {
+                            first,
+                            path,
+                            offset: 0,
+                            id: None,
+                        })
+                    }
+                    None => {
+                        self.at = Some(At { offset, id, ..at });
+                        return Ok(true);
+                    }
+                },
+                FileRead::Failed(offset, id, e) => {
+                    self.at = Some(At { offset, id, ..at });
                     return Err(e);
                 }
-            };
-            match newer {
-                Some((first, path)) => self.at = Some((first, path, 0)),
-                None => {
-                    self.at = Some((first, path, end));
-                    return Ok(());
+                FileRead::Replaced => {
+                    // Start over as `read_from` does from the next `seq`.
+                    restarts += 1;
+                    if restarts > MAX_RESTARTS {
+                        return Ok(false);
+                    }
                 }
             }
         }
     }
 
-    /// Read the complete lines of `path` from `offset` into `out`; the offset after the last
-    /// complete line. On an error, that offset and the error.
-    fn read_file(
-        &mut self,
-        path: &Path,
-        offset: u64,
-        out: &mut Vec<Result<Event>>,
-    ) -> std::result::Result<u64, (u64, Error)> {
+    /// Read the complete lines of `at.path` from `at.offset` into `out`. At a nonzero offset
+    /// it first checks that the file is the one read before; nothing is added to `out` when
+    /// it is not.
+    fn read_file(&mut self, at: &At, out: &mut Vec<Result<Event>>) -> FileRead {
+        let path = &at.path;
         let mut f = match std::fs::File::open(path) {
             Ok(f) => f,
-            Err(e) => return Err((offset, io_err(path)(e))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FileRead::Replaced,
+            Err(e) => return FileRead::Failed(at.offset, at.id, io_err(path)(e)),
         };
-        if let Err(e) = f.seek(SeekFrom::Start(offset)) {
-            return Err((offset, io_err(path)(e)));
+        let id = match f.metadata() {
+            Ok(m) => file_id(&m),
+            Err(e) => return FileRead::Failed(at.offset, at.id, io_err(path)(e)),
+        };
+        let mut checked = at.offset == 0;
+        if !checked {
+            if at.id.is_some() && id != at.id {
+                return FileRead::Replaced;
+            }
+            let mut before = [0u8; 1];
+            let seek = f
+                .seek(SeekFrom::Start(at.offset - 1))
+                .and_then(|_| f.read_exact(&mut before));
+            match seek {
+                Ok(()) if before[0] == b'\n' => {}
+                Ok(()) => return FileRead::Replaced,
+                Err(e) => return FileRead::Failed(at.offset, at.id, io_err(path)(e)),
+            }
         }
         let mut reader = BufReader::new(f);
-        let mut end = offset;
+        let mut end = at.offset;
+        let mut got = Vec::new();
         let mut line = Vec::new();
-        loop {
+        let result = loop {
             line.clear();
             match reader.read_until(b'\n', &mut line) {
-                Err(e) => return Err((end, io_err(path)(e))),
-                Ok(0) => return Ok(end),
+                Err(e) => break FileRead::Failed(end, id, io_err(path)(e)),
+                Ok(0) => break FileRead::Done(end, id),
                 Ok(_) => {}
             }
             if line.last() != Some(&b'\n') {
                 // A torn or unfinished last line: read again once it is complete.
-                return Ok(end);
+                break FileRead::Done(end, id);
             }
             end += line.len() as u64;
             line.pop();
             match serde_json::from_slice::<Event>(&line) {
-                Ok(event) if event.seq >= self.next => {
-                    self.next = event.seq + 1;
-                    out.push(Ok(event));
+                Ok(event) => {
+                    if !checked {
+                        // The line after the last one read must be the next seq.
+                        if event.seq != self.next {
+                            return FileRead::Replaced;
+                        }
+                        checked = true;
+                    }
+                    if event.seq >= self.next {
+                        self.next = event.seq + 1;
+                        got.push(Ok(event));
+                    }
                 }
-                Ok(_) => {}
-                Err(e) => out.push(Err(corrupt(
+                Err(e) => got.push(Err(corrupt(
                     path,
                     format!("journal line cannot be read: {e}"),
                 ))),
             }
-        }
+        };
+        out.extend(got);
+        result
     }
 }

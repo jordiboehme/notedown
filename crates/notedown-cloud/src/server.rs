@@ -373,9 +373,9 @@ impl AppState {
     }
 
     /// Scan `scope` of account `slug` for changes made by hand ([`AppState::run_scan`],
-    /// recursive, under the store lock). An account with a scan hold is scanned whole. Skipped when the account or its `files/` folder
-    /// does not exist or its protect gate is closed; busy while a device holds its sync lock.
-    /// Errors are logged. Blocking.
+    /// recursive, under the store lock). An account with a scan hold is scanned whole. Skipped
+    /// when the account or its `files/` folder does not exist or its protect gate is closed;
+    /// busy while a device holds its sync lock. Errors are logged. Blocking.
     pub fn scan_account(&self, slug: &str, scope: &Scope) -> ScanOutcome {
         match self.auth.accounts().get(slug) {
             Ok(Some(account)) => self.scan_account_of(&account, scope),

@@ -1504,6 +1504,20 @@ fn render_fixture() -> tempfile::TempDir {
     let note = data.path().join("accounts/acc/files/NOTE/Note/a.note");
     std::fs::create_dir_all(note.parent().unwrap()).unwrap();
     std::fs::copy(NOTE.replace("test2", "test1"), &note).unwrap();
+    // The render pass reads only notes the store knows: a scan registers the hand-placed one.
+    let scan = notedown(&[
+        "cloud",
+        "scan",
+        "--data",
+        data.path().to_str().unwrap(),
+        "--account",
+        "acc",
+    ]);
+    assert!(
+        scan.status.success(),
+        "{}",
+        String::from_utf8_lossy(&scan.stderr)
+    );
     data
 }
 

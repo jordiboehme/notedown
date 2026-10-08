@@ -1,20 +1,24 @@
 //! PDFs of an account's notes in a folder outside the data tree, kept up to date by comparing
 //! the store with a manifest (docs/superpowers/specs/2026-10-08-notedown-render-and-push-order-design.md 4).
 //!
+//! The pass reads the store without changing it: no ids, no MD5 cache rows, no journal
+//! events. It renders only notes the id registry knows, so a note placed by hand waits for the
+//! scan, which journals it first.
+//!
 //! The pass touches only files that are its own: PDFs the manifest names, and at a target path
 //! also a PDF that notedown made (see [`Pass::is_ours`]). Every other file in the render folder
 //! is never moved, replaced or deleted.
 
 pub mod manifest;
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use md5::{Digest, Md5};
 use notedown_note::{Notebook, RENDERER_ID, RenderOptions, RenderStyle, VersionPolicy};
 
 use crate::journal::FileKind;
-use crate::store::{Kind, Store, WirePath};
+use crate::store::{Store, WirePath};
 use crate::{Error, Result, io_err};
 use manifest::{Manifest, Row};
 
@@ -60,8 +64,8 @@ pub fn pdf_path_of(wire_path: &str) -> String {
 }
 
 /// One pass for the account of `store`: write, move or delete the PDFs below `<root>/<slug>/`
-/// so they match the store's notes. `root` must exist. The store lock is held only for the
-/// listing, never while a note is read or rendered.
+/// so they match the store's notes. `root` must exist. The store lock is held only while the
+/// registry and the MD5 cache are read, never while a note is read or rendered.
 pub fn render_account(store: &Store, root: &Path, opts: &PassOptions) -> Result<PassReport> {
     let dir = account_dir(store, root)?;
     let Some(_lock) = take_lock(&dir, store.slug(), opts.wait_for_lock)? else {
@@ -71,16 +75,12 @@ pub fn render_account(store: &Store, root: &Path, opts: &PassOptions) -> Result<
         });
     };
     let notes = list_notes(store)?;
-    let (m, lost) = match manifest::read(&dir) {
-        Some(m) => (m, false),
-        None => (Manifest::default(), true),
-    };
+    let m = manifest::load(&dir);
     let mut pass = Pass {
-        store,
+        slug: store.slug().to_string(),
         stale: opts.all || m.renderer != RENDERER_ID,
         dir,
         m,
-        lost,
         report: PassReport::default(),
         emptied: BTreeSet::new(),
         changes: 0,
@@ -137,34 +137,80 @@ fn take_lock(dir: &Path, slug: &str, wait: bool) -> Result<Option<std::fs::File>
     Ok(Some(file))
 }
 
-/// A note of the store as the listing gave it.
+/// A note the id registry knows.
 struct Note {
     id: u64,
-    wire: WirePath,
     path: String,
-    md5: String,
+    /// The file on disk; `None` when it is missing (the scan journals the delete or move).
+    on_disk: Option<OnDisk>,
 }
 
-/// The store's notes, sorted by path. The store lock is held for the listing only.
+struct OnDisk {
+    fs_path: PathBuf,
+    /// From the MD5 cache when its row is current for the file; `None`: hash the bytes.
+    md5: Option<String>,
+}
+
+/// The registered notes, sorted by path, read under a short store guard. Changes nothing in
+/// the store: a file on disk the registry doesn't know is not listed (the scan adds it).
 fn list_notes(store: &Store) -> Result<Vec<Note>> {
-    let entries = {
-        let g = store.lock()?;
-        store.list(&g, &WirePath::root(), true)?
-    };
-    let mut notes: Vec<Note> = entries
-        .into_iter()
-        .filter(|e| e.tag == Kind::File && FileKind::of(&e.name) == FileKind::Note)
-        .filter_map(|e| {
-            Some(Note {
-                id: e.id,
-                path: e.path.display(),
-                md5: e.content_hash?,
-                wire: e.path,
-            })
-        })
-        .collect();
+    let g = store.lock()?;
+    let mut names = FolderNames::default();
+    let mut notes = Vec::new();
+    for (id, wire) in store.registered_files(&g)? {
+        let Some(name) = wire.name() else { continue };
+        if wire.is_hidden() || FileKind::of(name) != FileKind::Note {
+            continue;
+        }
+        let fs_path = store.fs_path(&wire);
+        let meta = names
+            .exists(store.files_dir(), &wire)
+            .then(|| std::fs::symlink_metadata(&fs_path).ok())
+            .flatten()
+            .filter(|m| m.is_file());
+        let on_disk = match meta {
+            Some(meta) => Some(OnDisk {
+                md5: store.current_md5(&g, &wire, &meta)?,
+                fs_path,
+            }),
+            None => None,
+        };
+        notes.push(Note {
+            id,
+            path: wire.display(),
+            on_disk,
+        });
+    }
+    drop(g);
     notes.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(notes)
+}
+
+/// The names in each folder, read once per folder, to check paths by their exact names (a
+/// case-insensitive disk opens `a.note` for `A.note` too).
+#[derive(Default)]
+struct FolderNames(HashMap<PathBuf, HashSet<String>>);
+
+impl FolderNames {
+    /// Whether every segment of `wire` is there below `files` with exactly this name.
+    fn exists(&mut self, files: &Path, wire: &WirePath) -> bool {
+        let mut dir = files.to_path_buf();
+        for segment in wire.segments() {
+            let names = self.0.entry(dir.clone()).or_insert_with(|| {
+                std::fs::read_dir(&dir)
+                    .map(|rd| {
+                        rd.filter_map(|e| e.ok()?.file_name().into_string().ok())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            });
+            if !names.contains(segment) {
+                return false;
+            }
+            dir.push(segment);
+        }
+        true
+    }
 }
 
 fn md5_hex(bytes: &[u8]) -> String {
@@ -202,22 +248,19 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Whether the file at `path` is a PDF, and with `by_notedown` one that `render_pdf` made.
-fn is_pdf(path: &Path, by_notedown: bool) -> bool {
+/// Whether the file at `path` is a PDF that `render_pdf` made.
+fn is_notedown_pdf(path: &Path) -> bool {
     let Ok(bytes) = std::fs::read(path) else {
         return false;
     };
-    bytes.starts_with(b"%PDF-")
-        && (!by_notedown || bytes.windows(PRODUCER.len()).any(|w| w == PRODUCER))
+    bytes.starts_with(b"%PDF-") && bytes.windows(PRODUCER.len()).any(|w| w == PRODUCER)
 }
 
-struct Pass<'a> {
-    store: &'a Store,
+struct Pass {
+    slug: String,
     /// `<root>/<slug>`.
     dir: PathBuf,
     m: Manifest,
-    /// The manifest was missing or unreadable.
-    lost: bool,
     /// Every row counts as out of date for rendering (`--all` or another renderer id). The rows
     /// still say which PDFs are ours.
     stale: bool,
@@ -227,7 +270,7 @@ struct Pass<'a> {
     changes: usize,
 }
 
-impl Pass<'_> {
+impl Pass {
     fn run(&mut self, notes: &[Note]) -> Result<()> {
         // Gone notes first, so a PDF that a later note moves or writes to the same path is
         // never deleted as the PDF of a gone note.
@@ -282,38 +325,67 @@ impl Pass<'_> {
     }
 
     fn note(&mut self, n: &Note) -> Result<()> {
+        // A registered note that is missing on disk waits for the scan: its PDF stays.
+        let Some(disk) = &n.on_disk else {
+            return Ok(());
+        };
+        // Without a current cache row the bytes are read and hashed here (and rendered from
+        // these bytes if needed); nothing is cached.
+        let (md5, bytes) = match &disk.md5 {
+            Some(md5) => (md5.clone(), None),
+            None => {
+                let Ok(bytes) = std::fs::read(&disk.fs_path) else {
+                    return Ok(());
+                };
+                (md5_hex(&bytes), Some(bytes))
+            }
+        };
         let key = n.id.to_string();
         let row = self.m.notes.get(&key).cloned();
         if let Some(row) = &row
             && !self.stale
-            && row.md5 == n.md5
+            && row.md5 == md5
         {
             if row.path == n.path {
                 return Ok(());
             }
             if !row.pdf {
                 // A note that failed and moved: still no PDF, and no retry until it changes.
-                self.set_row(&key, n, false);
+                self.set_row(&key, n, &md5, false);
                 return self.changed();
             }
-            if self.move_pdf(&key, row, n)? {
+            if self.move_pdf(&key, row, n, &md5)? {
                 return self.changed();
             }
         }
-        self.render_one(&key, row.as_ref(), n)
+        let bytes = match bytes {
+            Some(bytes) => bytes,
+            None => {
+                // The cache row was current at the listing; a note that changed since (its
+                // bytes don't match) or can't be read is left for the next pass.
+                let Ok(bytes) = std::fs::read(&disk.fs_path) else {
+                    return Ok(());
+                };
+                if md5_hex(&bytes) != md5 {
+                    return Ok(());
+                }
+                bytes
+            }
+        };
+        self.render_one(&key, row.as_ref(), n, &md5, bytes)
     }
 
-    fn set_row(&mut self, key: &str, n: &Note, pdf: bool) {
+    fn set_row(&mut self, key: &str, n: &Note, md5: &str, pdf: bool) {
         let row = Row {
             path: n.path.clone(),
-            md5: n.md5.clone(),
+            md5: md5.to_string(),
             pdf,
         };
         self.m.notes.insert(key.to_string(), row);
     }
 
     /// Move the PDF of a moved note. False when the old PDF is gone (render it instead).
-    fn move_pdf(&mut self, key: &str, row: &Row, n: &Note) -> Result<bool> {
+    fn move_pdf(&mut self, key: &str, row: &Row, n: &Note, md5: &str) -> Result<bool> {
         let (old, new) = (pdf_path_of(&row.path), pdf_path_of(&n.path));
         let (from, to) = (self.dir.join(&old), self.dir.join(&new));
         if !from.is_file() {
@@ -329,21 +401,21 @@ impl Pass<'_> {
         }
         crate::fsutil::rename_durable(&from, &to)?;
         self.note_emptied(&from);
-        self.set_row(key, n, true);
+        self.set_row(key, n, md5, true);
         self.report.moved.push((old, new));
         Ok(true)
     }
 
-    /// Read, check and render one note. A note that changes right now (its bytes don't match
-    /// the listing) or that can't be read is left for the next pass.
-    fn render_one(&mut self, key: &str, row: Option<&Row>, n: &Note) -> Result<()> {
-        let Ok(bytes) = std::fs::read(self.store.fs_path(&n.wire)) else {
-            return Ok(());
-        };
-        if md5_hex(&bytes) != n.md5 {
-            return Ok(());
-        }
-        let slug = self.store.slug().to_string();
+    /// Render one note from `bytes` (whose MD5 is `md5`) and write its PDF.
+    fn render_one(
+        &mut self,
+        key: &str,
+        row: Option<&Row>,
+        n: &Note,
+        md5: &str,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        let slug = self.slug.clone();
         let new = pdf_path_of(&n.path);
         let old = row.filter(|r| r.pdf).map(|r| pdf_path_of(&r.path));
         let pdf = match render_pdf(bytes) {
@@ -353,7 +425,7 @@ impl Pass<'_> {
                 if let Some(old) = &old {
                     self.remove_pdf(old)?;
                 }
-                self.set_row(key, n, false);
+                self.set_row(key, n, md5, false);
                 self.report.failed.push((n.path.clone(), e));
                 return self.changed();
             }
@@ -376,17 +448,16 @@ impl Pass<'_> {
         {
             self.remove_pdf(&old)?;
         }
-        self.set_row(key, n, true);
+        self.set_row(key, n, md5, true);
         self.report.written.push(new);
         self.changed()
     }
 
     /// Whether the pass may write to `rel`: nothing is there, or the file there is ours. Ours
     /// is a PDF a row names; the old PDF of this note (`own`) under another spelling of the
-    /// name; a PDF that notedown made (written right before a crash, before its row was
-    /// saved). When the manifest was lost, every PDF counts as ours: the PDFs of earlier passes
-    /// are then unknown, and their names match notes of the store. A target that is not a PDF
-    /// stays foreign.
+    /// name; a PDF that notedown made (its producer entry), which covers a PDF written right
+    /// before a crash and the PDFs of earlier passes after the manifest was lost. Any other
+    /// file, a PDF from another program too, stays foreign, also on the first pass.
     fn is_ours(&self, rel: &str, own: Option<&str>) -> bool {
         let target = self.dir.join(rel);
         let Ok(meta) = std::fs::symlink_metadata(&target) else {
@@ -406,7 +477,7 @@ impl Pass<'_> {
         if own.is_some_and(|own| same_file(&self.dir.join(own), &target)) {
             return true;
         }
-        is_pdf(&target, !self.lost)
+        is_notedown_pdf(&target)
     }
 
     /// Drop the rows of other notes whose PDF is at `rel`: the pass is about to replace that

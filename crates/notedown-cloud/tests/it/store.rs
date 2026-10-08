@@ -1245,3 +1245,63 @@ fn a_server_start_loads_the_registry_once_up_to_the_first_listing() {
         );
     }
 }
+
+#[test]
+fn registered_files_and_current_md5_change_nothing() {
+    let (dir, store) = setup();
+    let known = put(dir.path(), "INBOX/known.txt", b"one");
+    {
+        let g = store.lock().unwrap();
+        store.list(&g, &WirePath::root(), true).unwrap();
+    }
+    let id = store.id_of(&wp("/INBOX/known.txt")).unwrap().unwrap();
+    // A file added by hand and an edit by hand, no scan or listing after them.
+    let new = put(dir.path(), "INBOX/new.txt", b"two");
+    let cache = account_dir(dir.path()).join("hashes.json");
+    let ids = account_dir(dir.path()).join("ids.json");
+    let before = (
+        std::fs::read(&cache).unwrap(),
+        std::fs::read(&ids).ok(),
+        std::fs::read(account_dir(dir.path()).join("ids.jsonl")).ok(),
+    );
+
+    let g = store.lock().unwrap();
+    let files = store.registered_files(&g).unwrap();
+    assert!(files.contains(&(id, wp("/INBOX/known.txt"))), "{files:?}");
+    assert!(!files.iter().any(|(_, p)| *p == wp("/INBOX/new.txt")));
+    assert!(files.iter().all(|(_, p)| p.display() != "INBOX"));
+
+    let meta = std::fs::metadata(&known).unwrap();
+    assert_eq!(
+        store
+            .current_md5(&g, &wp("/INBOX/known.txt"), &meta)
+            .unwrap(),
+        Some(md5_hex(b"one"))
+    );
+    // No row: none, and none is made.
+    let meta_new = std::fs::metadata(&new).unwrap();
+    assert_eq!(
+        store
+            .current_md5(&g, &wp("/INBOX/new.txt"), &meta_new)
+            .unwrap(),
+        None
+    );
+    // A row that no longer matches the file: none.
+    std::fs::write(&known, b"changed").unwrap();
+    let meta = std::fs::metadata(&known).unwrap();
+    assert_eq!(
+        store
+            .current_md5(&g, &wp("/INBOX/known.txt"), &meta)
+            .unwrap(),
+        None
+    );
+    drop(g);
+
+    assert_eq!(store.id_of(&wp("/INBOX/new.txt")).unwrap(), None);
+    let after = (
+        std::fs::read(&cache).unwrap(),
+        std::fs::read(&ids).ok(),
+        std::fs::read(account_dir(dir.path()).join("ids.jsonl")).ok(),
+    );
+    assert_eq!(before, after);
+}

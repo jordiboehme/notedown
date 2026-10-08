@@ -659,6 +659,21 @@ impl Store {
         Ok(self.kind_and_path_of(id)?.map(|(_, p)| p))
     }
 
+    /// Every file the id registry knows: id and path, by id. Touches no disk and changes
+    /// nothing: unlike [`Store::list`] it assigns no ids and neither reads nor writes the MD5
+    /// cache, so a scan after it still sees every change made by hand. A file may be missing on
+    /// disk, and a file on disk may be missing here, until the next scan.
+    pub fn registered_files(&self, guard: &StoreGuard) -> Result<Vec<(u64, WirePath)>> {
+        self.check_guard(guard)?;
+        let state = self.state();
+        Ok(state
+            .ids
+            .rows()
+            .filter(|(_, kind, _)| *kind == Kind::File)
+            .map(|(id, _, path)| (id, path.clone()))
+            .collect())
+    }
+
     /// The kind and path of `id`, if the id is known.
     pub fn kind_and_path_of(&self, id: u64) -> Result<Option<(Kind, WirePath)>> {
         let mut state = self.state();
@@ -787,6 +802,20 @@ impl Store {
             self.flush_hashes(&mut state)?;
         }
         Ok(())
+    }
+
+    /// The cached MD5 of the file at `path` when its cache row is current for the file as it is
+    /// in `meta` (same size, mtime and ctime); `None` otherwise. Touches no disk and changes
+    /// nothing: no hashing, no cache row is added or written. For readers that must leave the
+    /// store as it is (the render pass).
+    pub fn current_md5(
+        &self,
+        guard: &StoreGuard,
+        path: &WirePath,
+        meta: &std::fs::Metadata,
+    ) -> Result<Option<String>> {
+        self.check_guard(guard)?;
+        Ok(self.state().hashes.current(path, meta).map(str::to_string))
     }
 
     /// The cached MD5 of the file at `path`, without touching the disk (it may be stale). Test

@@ -141,6 +141,15 @@ impl HashCache {
         self.rows.get(&path.display()).map(|r| r.md5.as_str())
     }
 
+    /// The cached MD5 of `path` when its row is current for the file as it is in `meta` (same
+    /// size, mtime and ctime). Reads nothing and changes nothing.
+    pub fn current(&self, path: &WirePath, meta: &std::fs::Metadata) -> Option<&str> {
+        self.rows
+            .get(&path.display())
+            .filter(|r| row_matches(r, meta))
+            .map(|r| r.md5.as_str())
+    }
+
     /// The last cached size and MD5 of `path`, without touching the disk (they may be stale).
     pub fn cached_with_size(&self, path: &WirePath) -> Option<(u64, &str)> {
         self.rows

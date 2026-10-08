@@ -31,17 +31,13 @@ pub fn path(dir: &Path) -> PathBuf {
     dir.join(MANIFEST_FILE)
 }
 
-/// The manifest of `dir`; `None` when it is missing or can't be read.
-pub fn read(dir: &Path) -> Option<Manifest> {
-    std::fs::read(path(dir))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-}
-
 /// The manifest of `dir`; empty when it is missing or can't be read (every note then counts
 /// as new, which is safe: a PDF the pass doesn't know it never deletes).
 pub fn load(dir: &Path) -> Manifest {
-    read(dir).unwrap_or_default()
+    std::fs::read(path(dir))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
 }
 
 pub fn save(dir: &Path, m: &Manifest) -> crate::Result<()> {

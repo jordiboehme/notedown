@@ -375,8 +375,8 @@ fn a_foreign_file_in_the_render_root_is_left_alone() {
 fn a_foreign_file_at_the_target_is_kept() {
     let fx = Fx::new();
     std::fs::create_dir_all(fx.out().join("NOTE/Note")).unwrap();
-    // Not a PDF: a file that is one would count as a PDF of an earlier pass without manifest.
-    std::fs::write(fx.out().join("NOTE/Note/a.pdf"), b"mine").unwrap();
+    // A PDF, but not one notedown made: kept also on the first pass (no manifest yet).
+    std::fs::write(fx.out().join("NOTE/Note/a.pdf"), b"%PDF-1.7 mine").unwrap();
     fx.write("NOTE/Note/a.note", &fixture_note("test1"));
     fx.scan();
     let r = fx.pass();
@@ -384,7 +384,7 @@ fn a_foreign_file_at_the_target_is_kept() {
     assert!(r.written.is_empty());
     assert_eq!(
         std::fs::read(fx.out().join("NOTE/Note/a.pdf")).unwrap(),
-        b"mine"
+        b"%PDF-1.7 mine"
     );
     assert!(fx.manifest().notes.values().all(|row| !row.pdf));
 }
@@ -398,6 +398,7 @@ fn a_lost_manifest_renders_all_and_leaves_the_same_files() {
     fx.pass();
     let files = fx.files();
     std::fs::remove_file(fx.out().join(MANIFEST_FILE)).unwrap();
+    // The PDFs notedown wrote are known by their producer and replaced in place.
     let r = fx.pass();
     let mut written = r.written.clone();
     written.sort();
@@ -556,17 +557,18 @@ fn a_foreign_pdf_at_the_target_is_kept_once_a_manifest_exists() {
     );
 }
 
-/// Open issue: the pass lists through `Store::list`, which gives new files ids and caches new
-/// MD5s without events, so the next scan misses hand changes made before the pass (a new
-/// note is not journaled, an edit is not journaled, a rename is journaled as a delete only).
+/// The pass reads the store without changing it: no ids, no MD5 cache rows, no journal. A
+/// scan after it still journals every change made by hand before it.
 #[test]
-#[ignore = "needs a ruling: the pass's listing must not hide hand changes from the scan"]
 fn a_pass_before_a_scan_keeps_hand_changes_for_the_scan() {
     let fx = Fx::new();
     fx.write("NOTE/Note/k.note", &fixture_note("test1"));
     fx.write("NOTE/Note/r.note", &fixture_note("test1"));
     fx.scan();
-    fx.write("NOTE/Note/n.note", &fixture_note("test1"));
+    // Other bytes than r.note, so the scan can pair the rename by its MD5.
+    let mut other = fixture_note("test1");
+    other.extend_from_slice(b"x");
+    fx.write("NOTE/Note/n.note", &other);
     fx.write("NOTE/Note/k.note", &fixture_note("test2"));
     fx.rename("NOTE/Note/r.note", "NOTE/Note/r2.note");
     fx.pass();
@@ -583,4 +585,48 @@ fn a_pass_before_a_scan_keeps_hand_changes_for_the_scan() {
         vec![(p("NOTE/Note/r.note"), p("NOTE/Note/r2.note"))]
     );
     assert!(rep.deleted.is_empty(), "{:?}", rep.deleted);
+}
+
+#[test]
+fn a_note_placed_by_hand_waits_for_the_scan() {
+    let fx = Fx::new();
+    fx.write("NOTE/Note/a.note", &fixture_note("test1"));
+    let r = fx.pass();
+    assert!(r.written.is_empty(), "{r:?}");
+    assert_eq!(fx.id("NOTE/Note/a.note"), None);
+    fx.scan();
+    assert_eq!(fx.pass().written, s(&["NOTE/Note/a.pdf"]));
+}
+
+#[test]
+fn a_note_deleted_by_hand_keeps_its_pdf_until_the_scan() {
+    let fx = Fx::new();
+    fx.write("NOTE/Note/a.note", &fixture_note("test1"));
+    fx.scan();
+    fx.pass();
+    std::fs::remove_file(fx.fs("NOTE/Note/a.note")).unwrap();
+    let r = fx.pass();
+    assert_eq!(r, PassReport::default());
+    assert!(fx.out().join("NOTE/Note/a.pdf").is_file());
+    fx.scan();
+    assert_eq!(fx.pass().deleted, s(&["NOTE/Note/a.pdf"]));
+    assert!(!fx.out().join("NOTE/Note/a.pdf").exists());
+}
+
+#[test]
+fn a_note_edited_by_hand_before_the_scan_is_rendered_from_its_bytes() {
+    let fx = Fx::new();
+    fx.write("NOTE/Note/a.note", &fixture_note("test1"));
+    fx.scan();
+    fx.pass();
+    fx.write("NOTE/Note/a.note", &fixture_note("test2"));
+    let r = fx.pass();
+    assert_eq!(r.written, s(&["NOTE/Note/a.pdf"]));
+    let id = fx.id("NOTE/Note/a.note").unwrap();
+    assert_eq!(
+        fx.manifest().notes[&id.to_string()].md5,
+        md5_hex(&fixture_note("test2"))
+    );
+    // Nothing new until it changes again.
+    assert_eq!(fx.pass(), PassReport::default());
 }

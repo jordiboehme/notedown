@@ -65,7 +65,7 @@ pub(crate) struct Registry {
     by_path: HashMap<WirePath, u64>,
     /// `by_path` in path order, so a subtree is one range (see [`Registry::scope_rows`]). Built
     /// at the first scope query, then kept up to date; a load or a whole-tree scan never pays
-    /// for it.
+    /// for it. Once built it holds every path key a second time in memory.
     ordered: OnceLock<BTreeMap<WirePath, u64>>,
     /// The number of file rows.
     files: usize,
@@ -208,6 +208,9 @@ impl Registry {
             if add {
                 self.files += 1;
             } else {
+                // A drifted count would give a wrong hold decision: loud in tests, never a
+                // panic in a release build.
+                debug_assert!(self.files > 0, "file count below zero");
                 self.files = self.files.saturating_sub(1);
             }
         }

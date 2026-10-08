@@ -273,6 +273,8 @@ impl Store {
         let (disk, parents, cache) = self.scan_disk(opts)?;
         // The cache rows of gone paths come from the store's cache: the walk hashed only paths
         // on disk, so the copy holds no rows for them.
+        // Under the state mutex: a whole-tree plan (about 8 ms at 20000 files) blocks `id_of`
+        // and `path_of` readers for that time.
         let plan = {
             let state = self.state();
             plan(&state.ids, &state.hashes, opts, disk, parents)
@@ -723,6 +725,12 @@ fn gone_rows(
     }
     // Every file row is in the scope or outside it, and the gone ones outside are counted above
     // (each id once: a parent above the scope is never below it).
+    debug_assert!(
+        reg.files() >= files_in_scope + gone_outside,
+        "file count {} below the counted rows {}",
+        reg.files(),
+        files_in_scope + gone_outside
+    );
     let left_outside = reg
         .files()
         .saturating_sub(files_in_scope)

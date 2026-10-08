@@ -313,19 +313,25 @@ impl Store {
     /// file system keeps names byte-exact and warns on stderr if not
     /// ([`Store::names_preserved`]).
     pub fn open(data_dir: &Path, slug: &str) -> Result<Store> {
-        Self::open_with(data_dir, slug, false, false)
+        Self::open_with(data_dir, slug, false, false, true)
     }
 
     /// [`Store::open`] for `notedown cloud import`: the import may create a missing `files/` and
     /// rebuild the tree of an account whose store is damaged.
     pub fn open_for_import(data_dir: &Path, slug: &str) -> Result<Store> {
-        Self::open_with(data_dir, slug, true, false)
+        Self::open_with(data_dir, slug, true, false, true)
     }
 
     /// [`Store::open`] that prints "waiting for the store lock of account <slug>" when the lock
     /// is busy (a running import), for the recovery of every command.
     pub fn open_announced(data_dir: &Path, slug: &str) -> Result<Store> {
-        Self::open_with(data_dir, slug, false, true)
+        Self::open_with(data_dir, slug, false, true, true)
+    }
+
+    /// [`Store::open`] that leaves `ids.jsonl` as it is (no compaction), for a dry run that must
+    /// write nothing.
+    pub fn open_no_compact(data_dir: &Path, slug: &str) -> Result<Store> {
+        Self::open_with(data_dir, slug, false, false, false)
     }
 
     fn open_with(
@@ -333,6 +339,7 @@ impl Store {
         slug: &str,
         import_mode: bool,
         announce_wait: bool,
+        compact: bool,
     ) -> Result<Store> {
         validate_slug(slug)?;
         let account_dir = Accounts::new(data_dir).account_dir(slug);
@@ -362,7 +369,7 @@ impl Store {
         let guard = store.lock()?;
         {
             let mut state = store.state();
-            if !Registry::log_is_empty(&store.account_dir) {
+            if compact && !Registry::log_is_empty(&store.account_dir) {
                 state.ids.compact(&store.account_dir)?;
                 state.ids_stamp = Some(store.ids_stamps());
             }

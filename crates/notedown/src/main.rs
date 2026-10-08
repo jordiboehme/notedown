@@ -968,7 +968,12 @@ fn scan_account(
     journal: &notedown_cloud::journal::Journal,
 ) -> Result<bool> {
     use notedown_cloud::store::{ScanOptions, Store};
-    let store = Store::open(data, slug)?;
+    // A dry run leaves the registry log of earlier writes as it is.
+    let store = if args.dry_run {
+        Store::open_no_compact(data, slug)?
+    } else {
+        Store::open(data, slug)?
+    };
     let guard = if args.dry_run {
         // A dry run writes nothing, so it can't finish an unfinished change either.
         store.lock_unless_pending()?.ok_or_else(|| {

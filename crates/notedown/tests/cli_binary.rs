@@ -1242,6 +1242,32 @@ fn cloud_scan_dry_run_writes_nothing_then_a_scan_counts_the_changes() {
     assert!(!stdout(&out).contains('\u{2014}'));
 }
 
+/// A dry run after real scans writes nothing either: the registry log of those scans stays as
+/// it is.
+#[test]
+fn cloud_scan_dry_run_after_a_scan_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let files = scan_account(d, "jordi");
+    std::fs::write(files.join("INBOX/a.pdf"), "one").unwrap();
+    assert!(scan(d, &["--account", "jordi"]).status.success());
+    std::fs::write(files.join("INBOX/b.pdf"), "two").unwrap();
+    assert!(d.join("accounts/jordi/ids.jsonl").is_file());
+    let before = tree(d);
+    let out = scan(d, &["--account", "jordi", "--dry-run"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout(&out).contains("would add INBOX/b.pdf"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(tree(d), before);
+}
+
 /// A dry run writes nothing, so it can't finish an unfinished change: it refuses.
 #[test]
 fn cloud_scan_dry_run_refuses_an_unfinished_change() {

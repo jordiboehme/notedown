@@ -265,7 +265,7 @@ impl AppState {
             {
                 eprintln!(
                     "notedown cloud: warning: {}",
-                    scan_hold_warning(store.slug(), &hold)
+                    scan_hold_warning(&self.data_dir, store.slug(), &hold)
                 );
             }
             return Err(Error::ScanHold(store.slug().to_string()));
@@ -319,7 +319,7 @@ impl AppState {
             match serde_json::from_slice::<ScanHold>(&bytes) {
                 Ok(hold) => eprintln!(
                     "notedown cloud: warning: {}",
-                    scan_hold_warning(slug, &hold)
+                    scan_hold_warning(&self.data_dir, slug, &hold)
                 ),
                 Err(e) => eprintln!(
                     "notedown cloud: warning: account {slug}: can't read {}: {e}. Device sync \
@@ -356,10 +356,12 @@ impl AppState {
             }
             let scanned = self.store(slug).and_then(|store| {
                 let guard = store.lock_recovered(&self.journal)?;
-                // A device may have started its sync while this pass waited for the store lock.
+                // A device may have started its sync, or an import may have closed the protect
+                // gate, while this pass waited for the store lock.
                 if self.sync_locks.holder(slug, self.now_ms()).is_some() {
                     return Ok(());
                 }
+                crate::api::files::protect_locked(self, slug)?;
                 self.run_scan(
                     &store,
                     &guard,
@@ -368,7 +370,7 @@ impl AppState {
                 .map(drop)
             });
             match scanned {
-                Ok(()) | Err(Error::ScanHold(_)) => {}
+                Ok(()) | Err(Error::ScanHold(_)) | Err(Error::GateClosed(_)) => {}
                 Err(e) => eprintln!("notedown cloud: account {slug}: scan failed: {e}"),
             }
         }
@@ -380,14 +382,41 @@ impl AppState {
     }
 }
 
-/// The warning `serve` prints once when a scan of account `slug` holds.
-pub fn scan_hold_warning(slug: &str, hold: &ScanHold) -> String {
+/// The warning `serve` prints once when a scan of account `slug` (data folder `data`) holds.
+pub fn scan_hold_warning(data: &Path, slug: &str, hold: &ScanHold) -> String {
+    let gone = if hold.gone == 1 {
+        "1 file is".to_string()
+    } else {
+        format!("{} files are", hold.gone)
+    };
     format!(
-        "account {slug}: {} files are gone from the data folder and only {} would be left. \
-         Device sync is on hold. If that's on purpose, run: \
-         notedown cloud scan --account {slug} --accept",
-        hold.gone, hold.left
+        "account {slug}: {gone} gone from the data folder and only {} would be left. \
+         Device sync is on hold. If that's on purpose, run: {}",
+        hold.left,
+        accept_command(data, slug)
     )
+}
+
+/// The command that accepts the hold of account `slug`: `notedown cloud scan --data <dir>
+/// --account <slug> --accept`, with the data folder as an absolute path (quoted for a shell
+/// when it needs it), so it can be copied as it is.
+pub fn accept_command(data: &Path, slug: &str) -> String {
+    let data = std::path::absolute(data).unwrap_or_else(|_| data.to_path_buf());
+    format!(
+        "notedown cloud scan --data {} --account {slug} --accept",
+        shell_word(&data.display().to_string())
+    )
+}
+
+/// `text` as one shell word: as it is when it holds only safe characters, else in single
+/// quotes.
+fn shell_word(text: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "/._-+,:=@%~".contains(c);
+    if !text.is_empty() && text.chars().all(safe) {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
 }
 
 fn report_temp_sweep(r: Result<usize>) {

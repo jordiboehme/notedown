@@ -1115,6 +1115,49 @@ fn a_put_that_replaces_a_file_is_not_journaled_again_by_the_scan() {
     assert_eq!(fx.events().len(), before);
 }
 
+/// `put` scans the folders on its way first, as a device upload does: a folder and a file made
+/// by hand there are journaled by the scan before the put's own event.
+#[test]
+fn a_put_journals_the_hand_changes_on_its_way_first() {
+    let fx = Fx::imported();
+    fx.write("INBOX/A/hand.txt", b"hand");
+    let src = fx.dir.path().join("src.txt");
+    std::fs::write(&src, b"src").unwrap();
+    notedown_cloud::put::put(fx.dir.path(), "jordi", &fx.journal, &src, "INBOX/A", None).unwrap();
+    let got: Vec<(&str, Origin)> = fx
+        .events()
+        .iter()
+        .map(|e| (kind_names(std::slice::from_ref(&e.body))[0], e.origin))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("folder.created", Origin::Scan),
+            ("file.created", Origin::Scan),
+            ("file.created", Origin::Cli),
+        ]
+    );
+    // Nothing is left for the next scan.
+    assert_eq!(fx.scan(), ScanReport::default());
+}
+
+/// While a scan holds the account, `put` refuses and writes nothing.
+#[test]
+fn a_put_refuses_while_the_account_is_held() {
+    let fx = Fx::imported();
+    let path = format!("{DOC}/a.txt");
+    fx.write(&path, b"a");
+    fx.seed();
+    fx.rm(&path);
+    assert!(fx.scan().held.is_some());
+    let src = fx.dir.path().join("src.txt");
+    std::fs::write(&src, b"src").unwrap();
+    let r = notedown_cloud::put::put(fx.dir.path(), "jordi", &fx.journal, &src, "INBOX", None);
+    assert!(matches!(r, Err(Error::ScanHold(_))), "{r:?}");
+    assert!(!fx.fs("INBOX/src.txt").exists());
+    assert!(fx.events().is_empty(), "{:?}", fx.events());
+}
+
 #[test]
 fn hidden_and_temp_files_are_never_seen() {
     let fx = Fx::imported();
@@ -1683,11 +1726,28 @@ mod served {
             min: 1,
             examples: Vec::new(),
         };
+        let data = std::path::Path::new("/srv/notedown");
         assert_eq!(
-            scan_hold_warning("jordi", &hold),
+            scan_hold_warning(data, "jordi", &hold),
             "account jordi: 412 files are gone from the data folder and only 0 would be left. \
              Device sync is on hold. If that's on purpose, run: \
-             notedown cloud scan --account jordi --accept"
+             notedown cloud scan --data /srv/notedown --account jordi --accept"
+        );
+        let one = ScanHold { gone: 1, ..hold };
+        assert!(
+            scan_hold_warning(data, "jordi", &one)
+                .starts_with("account jordi: 1 file is gone from the data folder"),
+            "{}",
+            scan_hold_warning(data, "jordi", &one)
+        );
+        // A folder name with a space is quoted, so the command can be copied as it is.
+        assert!(
+            scan_hold_warning(
+                std::path::Path::new("/Volumes/My Disk/notedown"),
+                "jordi",
+                &one
+            )
+            .ends_with("--data '/Volumes/My Disk/notedown' --account jordi --accept")
         );
     }
 

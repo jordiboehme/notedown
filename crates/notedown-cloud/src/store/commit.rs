@@ -421,6 +421,17 @@ impl Store {
         Ok(WriteGuard { guard })
     }
 
+    /// Take the store lock without recovering anything: `None` (the lock is let go again) when
+    /// an unfinished commit is on disk, which only [`Store::lock_recovered`] repairs. For
+    /// callers that must write nothing, such as a dry run.
+    pub fn lock_unless_pending(&self) -> Result<Option<WriteGuard>> {
+        let guard = self.lock()?;
+        if self.pending_path().exists() {
+            return Ok(None);
+        }
+        Ok(Some(WriteGuard { guard }))
+    }
+
     /// Refuse to plan or commit while an intent is on disk (a commit under this guard failed
     /// after writing it): the registry may not reflect it. `lock_recovered` again to repair.
     fn check_no_pending(&self) -> Result<()> {

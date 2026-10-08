@@ -542,6 +542,15 @@ pub fn import(
     // Only the import may create a missing `files/` or rebuild a damaged tree.
     let store = Store::open_for_import(data, slug)?;
     let guard = store.lock_recovered(journal)?;
+    // The changes made by hand are journaled first, so the listing below gives nothing an id
+    // without its event. It never holds: the import replaces the tree anyway, and it ends a
+    // hold that is there.
+    store.scan(
+        &guard,
+        journal,
+        &crate::store::ScanOptions::all(0),
+        journal.now_ms(),
+    )?;
     let present = listed_files(&store, &guard)?;
     if present > 0 && !options.replace {
         return Err(failed(format!(

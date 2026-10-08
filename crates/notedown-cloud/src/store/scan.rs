@@ -566,6 +566,26 @@ impl Store {
         self.flush_hashes(&mut state)
     }
 
+    /// The scopes a write to `target` scans first, each without recursion: the root, then each
+    /// folder above `target` that is a real folder on disk, from the top down. A write then
+    /// plans against a registry that knows every change made by hand on its way.
+    pub fn way_scopes(&self, target: &WirePath) -> Result<Vec<WirePath>> {
+        let mut cur = WirePath::root();
+        let mut scopes = vec![cur.clone()];
+        let Some(parent) = target.parent() else {
+            return Ok(scopes);
+        };
+        for segment in parent.segments() {
+            cur = cur.join(segment)?;
+            let is_dir = std::fs::symlink_metadata(self.fs_path(&cur)).is_ok_and(|m| m.is_dir());
+            if !is_dir {
+                break;
+            }
+            scopes.push(cur.clone());
+        }
+        Ok(scopes)
+    }
+
     /// Run `hook` with the wire path of each file a scan of this store is about to hash, as a
     /// person changing or removing it at that moment would. Test hook.
     #[doc(hidden)]

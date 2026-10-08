@@ -329,27 +329,17 @@ fn scan_scope(
     state.run_scan(store, guard, &opts).map(drop)
 }
 
-/// [`scan_scope`] for every existing folder on the way to `target` (stored spelling): the root,
-/// then each folder above `target` that is a real folder on disk, direct children only. A write
-/// to `target` then plans against a registry that knows every hand change on its way.
+/// [`scan_scope`] for every existing folder on the way to `target` (stored spelling,
+/// [`Store::way_scopes`]): the root, then each folder above `target` that is a real folder on
+/// disk, direct children only.
 fn scan_way(
     state: &AppState,
     store: &Store,
     guard: &WriteGuard,
     target: &WirePath,
 ) -> crate::Result<()> {
-    let mut cur = WirePath::root();
-    scan_scope(state, store, guard, &cur, false)?;
-    let Some(parent) = target.parent() else {
-        return Ok(());
-    };
-    for segment in parent.segments() {
-        cur = cur.join(segment)?;
-        let is_dir = std::fs::symlink_metadata(store.fs_path(&cur)).is_ok_and(|m| m.is_dir());
-        if !is_dir {
-            break;
-        }
-        scan_scope(state, store, guard, &cur, false)?;
+    for scope in store.way_scopes(target)? {
+        scan_scope(state, store, guard, &scope, false)?;
     }
     Ok(())
 }
@@ -404,10 +394,12 @@ macro_rules! gated_request {
 
 /// `POST /api/file/2/files/synchronous/start`. Order: device check, the protect gate (accept
 /// mode with `protect = true` refuses with `E0079` until the account has an `imported` marker),
-/// a scan of the whole tree (`E0079` with `scan_hold` when it holds; it also ends a hold when
-/// the files are back), the store check (`E0079` with `store_damaged` for a damaged tree, and
-/// with `empty_account` for an account without marker and without files), then the lock
-/// (`E0078` while another device holds it). Answers `synType: true`.
+/// `E0078` while another device holds the lock (checked before the store lock and again under
+/// it, so nothing is scanned under another device's sync), a scan of the whole tree (`E0079`
+/// with `scan_hold` when it holds; it also ends a hold when the files are back), the store
+/// check (`E0079` with `store_damaged` for a damaged tree, and with `empty_account` for an
+/// account without marker and without files), then the lock is taken (`E0078` if another
+/// device got it meanwhile). Answers `synType: true`.
 pub async fn sync_start(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -435,11 +427,19 @@ pub async fn sync_start(
     {
         return req.error(E_SYNC_LOCKED, MSG_SYNC_LOCKED);
     }
-    let (st, slug) = (state.clone(), req.slug.clone());
+    let (st, slug, serial) = (state.clone(), req.slug.clone(), req.serial.clone());
     let checked = blocking(&req.serial, move || {
         let store = st.store(&slug)?;
         let guard = store.lock_recovered(&st.journal)?;
         protect_locked(&st, store.slug())?;
+        // Again under the store lock: another device may have started while this one waited.
+        if st
+            .sync_locks
+            .holder(&slug, st.now_ms())
+            .is_some_and(|h| h != serial)
+        {
+            return Ok(None);
+        }
         st.run_scan(&store, &guard, &ScanOptions::all(st.config.scan_min_files))?;
         let last_seq = match st.journal.last_seq() {
             Ok(seq) => Some(seq),
@@ -454,15 +454,19 @@ pub async fn sync_start(
             .get(store.slug())?
             .is_some_and(|a| a.imported.is_some());
         if imported {
-            return Ok((false, last_seq));
+            return Ok(Some((false, last_seq)));
         }
         let entries = store.list(&guard, &WirePath::root(), true)?;
-        Ok((!entries.iter().any(|e| e.tag == Kind::File), last_seq))
+        Ok(Some((
+            !entries.iter().any(|e| e.tag == Kind::File),
+            last_seq,
+        )))
     })
     .await;
     let last_seq = match checked {
-        Ok((false, last_seq)) => last_seq,
-        Ok((true, _)) => {
+        Ok(None) => return req.error(E_SYNC_LOCKED, MSG_SYNC_LOCKED),
+        Ok(Some((false, last_seq))) => last_seq,
+        Ok(Some((true, _))) => {
             return Reply::sync_busy()
                 .flag(FLAG_EMPTY_ACCOUNT)
                 .device(&req.serial);

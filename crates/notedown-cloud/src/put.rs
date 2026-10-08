@@ -8,11 +8,14 @@
 //! - A replace keeps the id (`file.modified`) and copies the old bytes into the recycle bin
 //!   first. Identical bytes change nothing.
 //! - Events carry `origin: "cli"`. `put` never touches the `imported` marker.
+//! - First the folders on the way to the target are scanned for changes made by hand, as for a
+//!   device upload (`docs/sync-protocol.md` 8.3). While a scan holds the account
+//!   (`scan-hold.json`), `put` refuses with `Error::ScanHold`.
 
 use std::path::Path;
 
 use crate::journal::{Journal, Origin};
-use crate::store::{PendingOp, PutOptions, Store, WirePath, create_temp};
+use crate::store::{PendingOp, PutOptions, ScanOptions, Store, WirePath, WriteGuard, create_temp};
 use crate::{Error, Result, io_err};
 
 /// What [`put`] did.
@@ -91,6 +94,7 @@ pub fn put(
             format!("{} is not a file", source.display()),
         ));
     }
+    let min_files = crate::Config::load_or_default(data)?.scan_min_files;
     let store = Store::open(data, slug)?;
 
     // Stage the copy inside the account before taking the lock.
@@ -99,7 +103,7 @@ pub fn put(
         .join(crate::sync::staging::STAGING_DIR)
         .join(format!("cli-{}", crate::journal::new_op_id()));
     std::fs::create_dir_all(&staging).map_err(io_err(&staging))?;
-    let result = stage_and_commit(&store, journal, source, &path, &staging);
+    let result = stage_and_commit(&store, journal, source, &path, &staging, min_files);
     let _ = std::fs::remove_dir_all(&staging);
     result
 }
@@ -110,6 +114,7 @@ fn stage_and_commit(
     source: &Path,
     path: &WirePath,
     staging: &Path,
+    min_files: u64,
 ) -> Result<PutResult> {
     let (tmp, mut out) = create_temp(staging).map_err(io_err(staging))?;
     let copied = (|| -> std::io::Result<()> {
@@ -121,6 +126,7 @@ fn stage_and_commit(
     copied.map_err(io_err(source))?;
 
     let guard = store.lock_recovered(journal)?;
+    scan_way(store, &guard, journal, path, min_files)?;
     let mut commit = store.plan_put_with(
         &guard,
         path,
@@ -155,4 +161,37 @@ fn stage_and_commit(
         outcome,
         seqs,
     })
+}
+
+/// The scans of a device upload to `path` ([`Store::way_scopes`]), so the put never gives a
+/// file or folder made by hand an id without its event. `Error::ScanHold` while the account is
+/// held (also when the marker can't be read) or when one of these scans holds.
+fn scan_way(
+    store: &Store,
+    guard: &WriteGuard,
+    journal: &Journal,
+    path: &WirePath,
+    min_files: u64,
+) -> Result<()> {
+    let held = || Error::ScanHold(store.slug().to_string());
+    if !matches!(store.scan_hold(), Ok(None)) {
+        return Err(held());
+    }
+    for scope in store.way_scopes(path)? {
+        let opts = ScanOptions {
+            scope,
+            recursive: false,
+            dry_run: false,
+            accept: false,
+            min_files,
+        };
+        if store
+            .scan(guard, journal, &opts, journal.now_ms())?
+            .held
+            .is_some()
+        {
+            return Err(held());
+        }
+    }
+    Ok(())
 }

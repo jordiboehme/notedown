@@ -38,7 +38,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::commit::{SideWrite, WriteGuard};
+use super::commit::{SideBatch, SideWrite, WriteGuard};
 use super::hashes::HashCache;
 use super::ids::{Op, Registry};
 use super::{Kind, Store, WirePath, is_native_folder, list};
@@ -343,11 +343,13 @@ impl Store {
         if report.released {
             self.remove_hold()?;
         }
+        let mut batch = SideBatch::default();
         for w in &side_writes {
-            if let Err(e) = self.write_side(w) {
+            if let Err(e) = self.write_side(w, &mut batch) {
                 eprintln!("warning: account {}: {e}", self.slug);
             }
         }
+        self.sync_sides(batch);
         Ok(report)
     }
 

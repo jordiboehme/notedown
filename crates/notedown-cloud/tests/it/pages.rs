@@ -1152,3 +1152,109 @@ fn a_snapshot_that_cannot_read_app_data_writes_no_page_records() {
     assert_eq!(f.journal.last_seq().unwrap(), before);
     assert!(f.record(FID).is_none(), "no page record without its events");
 }
+
+const FID2: &str = "F20261006120000000001abcdefABCDEF";
+
+/// The record files in `pages/`: name to (inode, mtime, bytes).
+fn record_files(f: &Fixture) -> BTreeMap<String, (u64, std::time::SystemTime, Vec<u8>)> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = f.store.account_dir().join(PAGES_DIR);
+    std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            let m = std::fs::symlink_metadata(e.path()).unwrap();
+            let name = e.file_name().to_string_lossy().into_owned();
+            let bytes = std::fs::read(e.path()).unwrap();
+            (name, (m.ino(), m.modified().unwrap(), bytes))
+        })
+        .collect()
+}
+
+fn snapshot(f: &Fixture) {
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    f.store.snapshot(&g, &f.journal).unwrap();
+}
+
+#[test]
+fn a_second_snapshot_rewrites_no_record() {
+    let f = Fixture::new();
+    f.put_raw("NOTE/Note/a.note", &abc(Some(FID), ["s", "s", "s"]));
+    f.put_raw("NOTE/Note/b.note", &abc(Some(FID2), ["s", "t", "s"]));
+    f.put_raw("NOTE/Note/c.note", &abc(None, ["t", "t", "s"]));
+    snapshot(&f);
+    let first = record_files(&f);
+    assert_eq!(first.len(), 3);
+    assert!(first.contains_key(&format!("{FID}.json")));
+    assert!(first.contains_key(&format!("{FID2}.json")));
+    assert!(first.contains_key(&format!("{}.json", path_key_file("NOTE/Note/c.note"))));
+    snapshot(&f);
+    // same inode and mtime: nothing was written, not even with the same bytes
+    assert_eq!(record_files(&f), first);
+    // and the records are the ones a fresh build writes
+    std::fs::remove_dir_all(f.store.account_dir().join(PAGES_DIR)).unwrap();
+    snapshot(&f);
+    let fresh: BTreeMap<String, Vec<u8>> = record_files(&f)
+        .into_iter()
+        .map(|(k, (_, _, b))| (k, b))
+        .collect();
+    let kept: BTreeMap<String, Vec<u8>> = first.into_iter().map(|(k, (_, _, b))| (k, b)).collect();
+    assert_eq!(fresh, kept);
+}
+
+#[test]
+fn a_snapshot_rewrites_only_the_record_of_a_changed_note() {
+    let f = Fixture::new();
+    f.put_raw("NOTE/Note/a.note", &abc(Some(FID), ["s", "s", "s"]));
+    f.put_raw("NOTE/Note/b.note", &abc(Some(FID2), ["s", "t", "s"]));
+    snapshot(&f);
+    let first = record_files(&f);
+    let v2 = abc(Some(FID), ["t", "s", "s"]);
+    f.put_raw("NOTE/Note/a.note", &v2);
+    snapshot(&f);
+    let second = record_files(&f);
+    let b = format!("{FID2}.json");
+    assert_eq!(second[&b], first[&b]);
+    let a = format!("{FID}.json");
+    assert_ne!(
+        second[&a].0, first[&a].0,
+        "a new file under the record name"
+    );
+    let rec = f.record(FID).unwrap();
+    assert_eq!(
+        (rec.size, rec.md5.as_str()),
+        (v2.len() as u64, md5_hex(&v2).as_str())
+    );
+}
+
+#[test]
+fn a_snapshot_keys_the_second_note_with_a_used_file_id_by_its_path() {
+    let f = Fixture::new();
+    f.put_raw("NOTE/Note/a.note", &abc(Some(FID), ["s", "s", "s"]));
+    f.put_raw("NOTE/Note/b.note", &abc(Some(FID), ["s", "t", "s"]));
+    snapshot(&f);
+    assert_eq!(f.record(FID).unwrap().path, "NOTE/Note/a.note");
+    let b = f.record(&path_key_file("NOTE/Note/b.note")).unwrap();
+    assert_eq!(b.path, "NOTE/Note/b.note");
+    assert_eq!(record_files(&f).len(), 2);
+}
+
+#[test]
+fn a_snapshot_after_a_scan_rewrites_no_record() {
+    use notedown_cloud::store::ScanOptions;
+    let f = Fixture::new();
+    for (name, id) in [("a", Some(FID)), ("b", Some(FID2)), ("c", None)] {
+        let p = f.store.fs_path(&wp(&format!("NOTE/Note/{name}.note")));
+        std::fs::write(p, abc(id, ["s", "t", "s"])).unwrap();
+    }
+    {
+        let g = f.store.lock_recovered(&f.journal).unwrap();
+        f.store
+            .scan(&g, &f.journal, &ScanOptions::all(1), 1_791_270_000_000)
+            .unwrap();
+    }
+    let scanned = record_files(&f);
+    assert_eq!(scanned.len(), 3);
+    snapshot(&f);
+    assert_eq!(record_files(&f), scanned);
+}

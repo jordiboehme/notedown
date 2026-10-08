@@ -47,7 +47,8 @@
 //! under the store lock ([`crate::store::SideWrite`]). They are not part of the intent in
 //! `pending.json`: a missing or stale record is harmless (see above). [`Store::snapshot`] writes
 //! the record of every note it journals, before its append. Moves carry the record along with
-//! [`plan_page_move`].
+//! [`plan_page_move`]. A record that already has the new bytes is not written again, and the
+//! `pages/` folder is synced once per commit, scan or snapshot.
 
 pub mod fingerprint;
 

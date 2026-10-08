@@ -116,6 +116,14 @@ pub fn create_temp(dir: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
 /// Write `bytes` to `path` atomically with a short temp name ([`temp_path_in`]): write, fsync,
 /// rename, fsync of the folder. The folder must exist.
 pub fn write_atomic_short(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_short_unsynced(path, bytes)?;
+    crate::fsutil::fsync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+/// [`write_atomic_short`] without the fsync of the folder: the file is synced before the
+/// rename, so the path holds the old or the new bytes, never a torn file. The rename is durable
+/// only after the caller syncs the folder.
+pub(crate) fn write_atomic_short_unsynced(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let (tmp, mut f) = create_temp(dir).map_err(io_err(dir))?;
@@ -128,8 +136,7 @@ pub fn write_atomic_short(path: &Path, bytes: &[u8]) -> Result<()> {
     write().map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         io_err(path)(e)
-    })?;
-    crate::fsutil::fsync_dir(dir)
+    })
 }
 
 /// The comparison key for name collisions, Unicode canonical caseless matching: NFD, full case

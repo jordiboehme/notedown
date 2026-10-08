@@ -23,6 +23,7 @@
 //!
 //! Lock order: the store lock first, then `journal/.lock`.
 
+use std::collections::BTreeSet;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -201,12 +202,19 @@ pub struct Commit {
 
 /// A file directly inside `<account>/pages/` that a commit writes (atomically) or removes after
 /// its data change and before its journal append; any other path is refused. A failure is reported on stderr and does not fail the
-/// commit.
+/// commit. A file that already has the new bytes is not written again.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SideWrite {
     pub path: PathBuf,
     /// The new content; `None` removes the file.
     pub bytes: Option<Vec<u8>>,
+}
+
+/// The folders a run of side writes changed. Each is synced once at the end of the run
+/// ([`Store::sync_sides`]) instead of once per file.
+#[derive(Debug, Default)]
+pub(super) struct SideBatch {
+    dirs: BTreeSet<PathBuf>,
 }
 
 impl std::fmt::Debug for SideWrite {
@@ -1183,11 +1191,13 @@ impl Store {
         let written = written.filter(|_| !commit.drop_md5);
         self.finish_registry(guard, &commit.op, written)?;
         self.finish_recycle(&commit.op)?;
+        let mut batch = SideBatch::default();
         for w in &commit.side_writes {
-            if let Err(e) = self.write_side(w) {
+            if let Err(e) = self.write_side(w, &mut batch) {
                 eprintln!("warning: account {}: {e}", self.slug);
             }
         }
+        self.sync_sides(batch);
         // 3. events
         let mut events = commit.journal_events(&self.slug, commit.origin, &commit.events);
         let seqs = journal.append(&mut events)?;
@@ -1201,8 +1211,11 @@ impl Store {
 
     /// Write a side file atomically (its folder is created if needed), or remove it. Only a
     /// file directly inside `<account>/pages/` is accepted: the path must be the account folder
-    /// followed by exactly `pages` and one plain name (no `..`, `.`, root or prefix part).
-    pub(super) fn write_side(&self, w: &SideWrite) -> Result<()> {
+    /// followed by exactly `pages` and one plain name (no `..`, `.`, root or prefix part). A
+    /// regular file that already has the new bytes is left alone, and a missing file needs no
+    /// removal. A change is visible right away, but its folder is only noted in `batch` (also
+    /// for a file left alone): the caller syncs it with [`Store::sync_sides`] before it returns.
+    pub(super) fn write_side(&self, w: &SideWrite, batch: &mut SideBatch) -> Result<()> {
         use std::path::Component;
         let confined = w.path.strip_prefix(&self.account_dir).is_ok_and(|rel| {
             let parts: Vec<Component<'_>> = rel.components().collect();
@@ -1224,13 +1237,37 @@ impl Store {
         let parent = w.path.parent().unwrap_or(&self.account_dir).to_path_buf();
         let Some(bytes) = &w.bytes else {
             return match std::fs::remove_file(&w.path) {
-                Ok(()) => crate::fsutil::fsync_dir(&parent),
+                Ok(()) => {
+                    batch.dirs.insert(parent);
+                    Ok(())
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(io_err(&w.path)(e)),
             };
         };
         self.create_dirs_durable(&parent)?;
-        super::write_atomic_short(&w.path, bytes)
+        // Only a regular file of the same size is read: never a symlink, a FIFO or a folder.
+        let same = std::fs::symlink_metadata(&w.path)
+            .is_ok_and(|m| m.is_file() && m.len() == bytes.len() as u64)
+            && std::fs::read(&w.path).is_ok_and(|old| old == *bytes);
+        if same {
+            // An earlier run may have died before its folder sync: sync it once here too.
+            batch.dirs.insert(parent);
+            return Ok(());
+        }
+        super::write_atomic_short_unsynced(&w.path, bytes)?;
+        batch.dirs.insert(parent);
+        Ok(())
+    }
+
+    /// Sync each folder of `batch` once (see [`Store::write_side`]). A failure is reported on
+    /// stderr, like a failed side write.
+    pub(super) fn sync_sides(&self, batch: SideBatch) {
+        for dir in batch.dirs {
+            if let Err(e) = crate::fsutil::fsync_dir(&dir) {
+                eprintln!("warning: account {}: {e}", self.slug);
+            }
+        }
     }
 
     /// Perform the data change durably. `stop_before_rename` (test hook) ends a `put` after its
@@ -1812,6 +1849,8 @@ impl Store {
         let app_data = crate::appdata::AppData::new(self).snapshot_bodies(guard)?;
         let op_id = new_op_id();
         let mut events: Vec<Event> = Vec::new();
+        // Each record is in place before the next note picks its key (it reads the records).
+        let mut batch = SideBatch::default();
         for e in entries {
             let mut bodies = Vec::new();
             match e.tag {
@@ -1828,7 +1867,7 @@ impl Store {
                         (None, Vec::new(), None)
                     };
                     if let Some(w) = record
-                        && let Err(err) = self.write_side(&w)
+                        && let Err(err) = self.write_side(&w, &mut batch)
                     {
                         eprintln!("warning: account {}: {err}", self.slug);
                     }
@@ -1854,6 +1893,7 @@ impl Store {
                 .into_iter()
                 .map(|body| Event::new(&self.slug, Origin::Snapshot, None, &op_id, body)),
         );
+        self.sync_sides(batch);
         journal.append(&mut events)
     }
 

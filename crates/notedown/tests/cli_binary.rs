@@ -1074,3 +1074,210 @@ fn cloud_recycle_prune_without_server_toml_creates_nothing_and_reports_failures(
     assert!(!recycle.join("2000").exists());
     assert!(!d.join("server.toml").exists());
 }
+
+/// An account `name` with the six native folders and nothing else.
+fn scan_account(d: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let out = cloud(
+        d,
+        &[
+            "add",
+            name,
+            "--email",
+            &format!("{name}@example.org"),
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(out.status.success());
+    let files = d.join("accounts").join(name).join("files");
+    for f in [
+        "Note",
+        "Document",
+        "MyStyle",
+        "EXPORT",
+        "SCREENSHOT",
+        "INBOX",
+    ] {
+        std::fs::create_dir_all(files.join(f)).unwrap();
+    }
+    files
+}
+
+fn scan(data: &std::path::Path, extra: &[&str]) -> std::process::Output {
+    let mut args = vec!["cloud", "scan", "--data", data.to_str().unwrap()];
+    args.extend_from_slice(extra);
+    notedown(&args)
+}
+
+#[test]
+fn cloud_scan_dry_run_writes_nothing_then_a_scan_counts_the_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let files = scan_account(d, "jordi");
+    for (n, body) in [("a", "one"), ("b", "two"), ("c", "three"), ("d", "four")] {
+        std::fs::write(files.join(format!("INBOX/{n}.pdf")), body).unwrap();
+    }
+    let before = tree(d);
+    let out = scan(d, &["--account", "jordi", "--dry-run"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    assert!(text.contains("would add INBOX/a.pdf\n"), "{text}");
+    assert!(
+        text.contains("account jordi: would journal 10 new\n"),
+        "{text}"
+    );
+    assert_eq!(tree(d), before);
+    assert!(!d.join("server.toml").exists());
+    assert!(!d.join("journal").exists());
+
+    let out = scan(d, &["--account", "jordi"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout(&out), "account jordi: journaled 10 new\n");
+    assert!(!d.join("server.toml").exists());
+    let ev = lines(&journal(d, &["tail"]));
+    assert!(
+        ev.iter()
+            .any(|e| e["type"] == "file.created" && e["origin"] == "scan")
+    );
+
+    // Nothing changed since.
+    let out = scan(d, &["--account", "jordi"]);
+    assert_eq!(stdout(&out), "account jordi: no changes\n");
+
+    let inbox = files.join("INBOX");
+    for (n, body) in [("e", "five"), ("f", "six"), ("g", "seven")] {
+        std::fs::write(inbox.join(format!("{n}.pdf")), body).unwrap();
+    }
+    std::fs::write(inbox.join("a.pdf"), "one, edited").unwrap();
+    std::fs::rename(inbox.join("b.pdf"), inbox.join("B2.pdf")).unwrap();
+    std::fs::remove_file(inbox.join("c.pdf")).unwrap();
+    std::fs::remove_file(inbox.join("d.pdf")).unwrap();
+    let out = scan(d, &["--dry-run"]);
+    let text = stdout(&out);
+    assert!(text.contains("would update INBOX/a.pdf\n"), "{text}");
+    assert!(
+        text.contains("would move INBOX/b.pdf to INBOX/B2.pdf\n"),
+        "{text}"
+    );
+    assert!(text.contains("would delete INBOX/c.pdf\n"), "{text}");
+    let out = scan(d, &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout(&out),
+        "account jordi: journaled 3 new, 1 changed, 1 moved, 2 deleted\n"
+    );
+    assert!(!stdout(&out).contains('\u{2014}'));
+}
+
+#[test]
+fn cloud_scan_holds_on_an_empty_folder_until_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let files = scan_account(d, "jordi");
+    std::fs::write(files.join("INBOX/a.pdf"), "one").unwrap();
+    std::fs::write(files.join("INBOX/b.pdf"), "two").unwrap();
+    assert!(scan(d, &["--account", "jordi"]).status.success());
+    std::fs::remove_file(files.join("INBOX/a.pdf")).unwrap();
+    std::fs::remove_file(files.join("INBOX/b.pdf")).unwrap();
+
+    let out = scan(d, &["--account", "jordi"]);
+    assert_eq!(out.status.code(), Some(1));
+    let text = stdout(&out);
+    assert!(text.contains("would delete 2 files"), "{text}");
+    assert!(text.contains("only 0 would be left"), "{text}");
+    assert!(
+        text.contains("run: notedown cloud scan --account jordi --accept"),
+        "{text}"
+    );
+    assert!(!text.contains('\u{2014}'));
+    assert!(d.join("accounts/jordi/scan-hold.json").is_file());
+
+    // A dry run on a hold also exits with 1 and keeps the marker.
+    let out = scan(d, &["--account", "jordi", "--dry-run"]);
+    assert_eq!(out.status.code(), Some(1));
+
+    let out = scan(d, &["--account", "jordi", "--accept"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    assert!(text.contains("journaled 2 deleted"), "{text}");
+    assert!(text.contains("the hold is gone"), "{text}");
+    assert!(!d.join("accounts/jordi/scan-hold.json").exists());
+}
+
+#[test]
+fn cloud_scan_min_files_comes_from_server_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let files = scan_account(d, "jordi");
+    for n in ["a", "b", "c"] {
+        std::fs::write(files.join(format!("INBOX/{n}.pdf")), n).unwrap();
+    }
+    assert!(scan(d, &[]).status.success());
+    std::fs::remove_file(files.join("INBOX/a.pdf")).unwrap();
+    std::fs::remove_file(files.join("INBOX/b.pdf")).unwrap();
+    std::fs::write(d.join("server.toml"), "scan_min_files = 2\n").unwrap();
+    let out = scan(d, &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stdout(&out).contains("only 1 would be left"),
+        "{}",
+        stdout(&out)
+    );
+    std::fs::write(d.join("server.toml"), "scan_min_files = 0\n").unwrap();
+    let out = scan(d, &[]);
+    assert!(out.status.success());
+    assert!(
+        stdout(&out).contains("journaled 2 deleted"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(
+        stdout(&out).contains("the hold is gone"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn cloud_scan_unknown_account_fails_and_every_account_runs_in_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let out = scan(d, &["--account", "nobody"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("nobody"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let files = scan_account(d, "anna");
+    std::fs::write(files.join("INBOX/a.pdf"), "one").unwrap();
+    let broken = scan_account(d, "broken");
+    std::fs::remove_dir_all(&broken).unwrap();
+    std::fs::write(&broken, "not a folder").unwrap();
+    let files_b = scan_account(d, "zoe");
+    std::fs::write(files_b.join("INBOX/z.pdf"), "zed").unwrap();
+    let out = scan(d, &[]);
+    assert_eq!(out.status.code(), Some(1));
+    let text = stdout(&out);
+    assert!(text.contains("account anna: journaled 7 new\n"), "{text}");
+    assert!(text.contains("account zoe: journaled 7 new\n"), "{text}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("account broken:"), "{err}");
+}

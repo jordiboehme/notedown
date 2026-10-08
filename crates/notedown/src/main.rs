@@ -87,6 +87,27 @@ enum CloudAction {
         #[command(subcommand)]
         action: RecycleAction,
     },
+    /// Look for files added, changed, renamed or deleted by hand in the data folder and journal
+    /// them, so the device follows. The server does this by itself; run it to see the result
+    /// at once, or with --accept after a hold
+    Scan(ScanArgs),
+}
+
+#[derive(clap::Args)]
+struct ScanArgs {
+    /// The data folder
+    #[arg(long, value_name = "DIR")]
+    data: PathBuf,
+    /// The account slug (default: every account, one after the other)
+    #[arg(long)]
+    account: Option<String>,
+    /// Print what the scan would journal, change nothing
+    #[arg(long)]
+    dry_run: bool,
+    /// Apply the changes also when they would leave fewer than scan_min_files files, and lift
+    /// the hold
+    #[arg(long)]
+    accept: bool,
 }
 
 #[derive(Subcommand)]
@@ -639,6 +660,12 @@ fn cloud_command(action: CloudAction) -> Result<ExitCode> {
             }
             recycle_prune_command(args)
         }
+        CloudAction::Scan(args) => {
+            if !args.dry_run {
+                recover_accounts(&args.data)?;
+            }
+            scan_command(args)
+        }
     }
 }
 
@@ -913,6 +940,129 @@ fn recycle_prune_command(args: RecyclePruneArgs) -> Result<ExitCode> {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    })
+}
+
+/// The counts of a scan as "3 new, 1 changed, 1 moved, 2 deleted"; parts that are 0 are left out.
+fn scan_counts(r: &notedown_cloud::store::ScanReport) -> String {
+    let parts: Vec<String> = [
+        (r.created.len(), "new"),
+        (r.modified.len(), "changed"),
+        (r.moved.len(), "moved"),
+        (r.deleted.len(), "deleted"),
+    ]
+    .iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, w)| format!("{n} {w}"))
+    .collect();
+    parts.join(", ")
+}
+
+/// Scan one account and print the result. Returns true when the scan held.
+fn scan_account(
+    data: &Path,
+    slug: &str,
+    args: &ScanArgs,
+    min_files: u64,
+    journal: &notedown_cloud::journal::Journal,
+) -> Result<bool> {
+    use notedown_cloud::store::{ScanOptions, Store};
+    let store = Store::open(data, slug)?;
+    let guard = store.lock_recovered(journal)?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let mut opts = ScanOptions::all(min_files);
+    opts.dry_run = args.dry_run;
+    opts.accept = args.accept;
+    let report = store.scan(&guard, journal, &opts, now_ms)?;
+    if args.dry_run || report.held.is_some() {
+        for p in &report.created {
+            println!("would add {p}");
+        }
+        for p in &report.modified {
+            println!("would update {p}");
+        }
+        for (from, to) in &report.moved {
+            println!("would move {from} to {to}");
+        }
+        for p in &report.deleted {
+            println!("would delete {p}");
+        }
+    }
+    if let Some(hold) = &report.held {
+        println!(
+            "account {slug}: would delete {}, and only {} would be left (the minimum is {}).",
+            plural(report.deleted.len(), "file"),
+            hold.left,
+            hold.min
+        );
+        println!(
+            "Device sync is on hold. If that's on purpose, run: notedown cloud scan --account {slug} --accept"
+        );
+        return Ok(true);
+    }
+    let counts = scan_counts(&report);
+    let verb = if args.dry_run {
+        "would journal"
+    } else {
+        "journaled"
+    };
+    if counts.is_empty() {
+        println!("account {slug}: no changes");
+    } else {
+        println!("account {slug}: {verb} {counts}");
+    }
+    if report.released {
+        let text = if args.dry_run {
+            "would lift the hold"
+        } else {
+            "the hold is gone"
+        };
+        println!("account {slug}: {text}");
+    }
+    Ok(false)
+}
+
+fn scan_command(args: ScanArgs) -> Result<ExitCode> {
+    use notedown_cloud::journal::Journal;
+    if !args.data.is_dir() {
+        return Err(anyhow!(
+            "data folder {} does not exist",
+            args.data.display()
+        ));
+    }
+    // Never write server.toml here, and a dry run creates nothing at all.
+    let config = notedown_cloud::Config::load_or_default(&args.data)?;
+    let journal = if args.dry_run {
+        Journal::open_no_create(&args.data)
+    } else {
+        Journal::open(&args.data)?
+    };
+    let slugs = match &args.account {
+        Some(slug) => vec![slug.clone()],
+        None => notedown_cloud::auth::Accounts::new(&args.data)
+            .list()?
+            .into_iter()
+            .map(|a| a.slug)
+            .collect(),
+    };
+    let mut failed = false;
+    for slug in &slugs {
+        // With --account the error ends the command; otherwise the other accounts still run.
+        match scan_account(&args.data, slug, &args, config.scan_min_files, &journal) {
+            Ok(held) => failed |= held,
+            Err(e) if args.account.is_some() => return Err(e),
+            Err(e) => {
+                eprintln!("error: account {slug}: {e}");
+                failed = true;
+            }
+        }
+    }
+    Ok(if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
     })
 }
 

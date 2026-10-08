@@ -182,7 +182,7 @@ Now you can turn "Auto Sync" on. Done.
 
 ## Daily use
 
-**Add a file from the computer.** Don't copy it into the data folder by hand. Use `put`:
+**Add a file from the computer.** The simplest way is `put`:
 
 ```sh
 notedown cloud put report.pdf --data ~/notedown-data --account me --to DOCUMENT/Document/Inbox
@@ -191,6 +191,12 @@ notedown cloud put report.pdf --data ~/notedown-data --account me --to DOCUMENT/
 notedown makes the connected devices of the account sync (it closes their connection, and a device syncs when it connects again). With "Auto Sync" on, the device syncs a few seconds after the `put`. Without it, the device downloads the file at its next manual sync.
 
 If the device doesn't sync after a `put`, start a manual sync. The `push` setting in `server.toml` changes how notedown tells the device (see "What to expect").
+
+**Change files by hand.** You can add, change, rename and delete files in `accounts/me/files/` with Finder or any tool. notedown looks for such changes every `scan_interval` seconds (300 by default), when a device starts a sync and before it answers a device's folder listing. It writes each change to the journal and the device follows. A file you rename or move keeps its place in the device's list. To see it at once, run `notedown cloud scan --data ~/notedown-data --account me`. Add `--dry-run` to only see what it would do. Without `--account` it scans every account. Set `scan_interval = 0` in `server.toml` to turn the timer off. The scan at sync start and before listings stays. Restart the server after you change it.
+
+A delete by hand is a real delete. The old file isn't in the recycle bin, because notedown never sees its bytes. Move files out of the folder instead of deleting them if you want a copy.
+
+One safety stop: if a scan would delete files and leave fewer than `scan_min_files` files in the account, notedown doesn't apply it. The default is 1, so an empty folder or an unmounted disk stops it. Device sync then waits, because the device would delete everything it has. Put the files back and the stop lifts by itself at the next scan. If you really want those files gone, run `notedown cloud scan --data ~/notedown-data --account me --accept`. Deleting your last file on purpose needs `--accept` too. Set `scan_min_files = 0` to turn the stop off. `notedown serve` prints a warning when it stops.
 
 **Watch the changes.** `notedown cloud journal tail --data ~/notedown-data --follow` prints every change as a JSON line while it happens. Each line has a `seq` number. Start at a later one with `--from <seq>`.
 
@@ -209,7 +215,7 @@ After `notedown cloud import --replace` every file gets a new id. The old versio
 - A digest you delete on one device can come back when a second device still has it and changes it.
 - A file you add with `put` arrives a few seconds later when "Auto Sync" is on. Without it, the file arrives at the next manual sync. notedown doesn't push while a sync runs or while protect mode is closed. A change you make while `notedown serve` is stopped isn't pushed later. The device gets it at its next sync.
 - The `push` setting in `server.toml` has four values. `reconnect` (the default) closes the device's connection: the device connects again within seconds and syncs. `startsync` and `detail` send a message instead, after the device's next heartbeat. `detail` now follows the format and timing of Ratta's push, so it is the one to try if you want a file to download at once without a reconnect. With `startsync` the Nomad receives the message but doesn't sync on it. `off` does nothing. `notedown serve` prints the active value. Restart the server after you change it.
-- Don't change files in the data folder directly. The server doesn't notice such a change yet. A removed file looks like a delete to the device, and it removes its own copy too. Use `put`, or change files on the device.
+- You can add, change, rename and delete files in the data folder by hand (see "Change files by hand"). A delete there is a real delete: the device removes its own copy too, and the file doesn't go to the recycle bin.
 - Don't move `files/` in the data folder and don't replace it with a symlink. If `files/` or a device folder is missing or is a symlink, the server refuses every file request, and the device keeps all of its files. The error message says how to repair it.
 
 ## The way back

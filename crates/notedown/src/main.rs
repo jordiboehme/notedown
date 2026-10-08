@@ -993,13 +993,19 @@ fn scan_account(
     if let Some(hold) = &report.held {
         println!(
             "account {slug}: would delete {}, and only {} would be left (the minimum is {}).",
-            plural(report.deleted.len(), "file"),
+            plural(hold.gone, "file"),
             hold.left,
             hold.min
         );
-        println!(
-            "Device sync is on hold. If that's on purpose, run: notedown cloud scan --account {slug} --accept"
-        );
+        if args.dry_run {
+            println!(
+                "Device sync would be put on hold. If that's on purpose, run: notedown cloud scan --account {slug} --accept"
+            );
+        } else {
+            println!(
+                "Device sync is on hold. If that's on purpose, run: notedown cloud scan --account {slug} --accept"
+            );
+        }
         return Ok(true);
     }
     let counts = scan_counts(&report);

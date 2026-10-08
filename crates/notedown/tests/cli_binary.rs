@@ -1281,3 +1281,35 @@ fn cloud_scan_unknown_account_fails_and_every_account_runs_in_turn() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("account broken:"), "{err}");
 }
+
+#[test]
+fn cloud_scan_hold_counts_files_not_folders_and_a_dry_run_only_would_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let files = scan_account(d, "jordi");
+    std::fs::create_dir_all(files.join("INBOX/sub")).unwrap();
+    std::fs::write(files.join("INBOX/sub/a.pdf"), "one").unwrap();
+    std::fs::write(files.join("INBOX/sub/b.pdf"), "two").unwrap();
+    assert!(scan(d, &[]).status.success());
+    std::fs::remove_dir_all(files.join("INBOX/sub")).unwrap();
+
+    let out = scan(d, &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(1));
+    let text = stdout(&out);
+    assert!(
+        text.contains("would delete 2 files, and only 0 would be left"),
+        "{text}"
+    );
+    assert!(text.contains("Device sync would be put on hold."), "{text}");
+    assert!(!text.contains("Device sync is on hold."), "{text}");
+    assert!(!d.join("accounts/jordi/scan-hold.json").exists());
+
+    let out = scan(d, &[]);
+    assert_eq!(out.status.code(), Some(1));
+    let text = stdout(&out);
+    assert!(
+        text.contains("would delete 2 files, and only 0 would be left"),
+        "{text}"
+    );
+    assert!(text.contains("Device sync is on hold."), "{text}");
+}

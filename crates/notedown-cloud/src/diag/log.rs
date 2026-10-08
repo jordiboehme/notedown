@@ -184,10 +184,11 @@ struct Sanitized {
 /// ([`mask_raw_json_from`]).
 ///
 /// A body whose masked keys and leaves fit [`MAX_BODY_BYTES`] is masked whole, as is a raw text
-/// of at most that size (or whose masked form fits it). A larger one is cut first and only the kept part is masked: the body as a value
-/// ([`mask_json_within`]), the raw text at the end of a value, closed again so that it is still
-/// JSON ([`json_cut_point`]) and so gets every check of [`mask_raw_json_from`]. What is cut off
-/// never reaches the log. The cut note then names the size before masking.
+/// of at most that size (or whose masked form fits it). A larger one is cut first and only the
+/// kept part is masked: the body as a value ([`mask_json_within`]), the raw text at the end of a
+/// value, closed again so that it is still JSON ([`json_cut_point`]) and so gets every check of
+/// [`mask_raw_json_from`]. What is cut off never reaches the log. The cut note then names the
+/// size before masking.
 fn sanitize_body(body: Option<Value>, raw: Option<String>, origin: Origin) -> Sanitized {
     let raw = raw.map(|r| {
         let masked = mask_raw_kept(&r, origin);

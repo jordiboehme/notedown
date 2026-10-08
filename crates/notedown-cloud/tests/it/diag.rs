@@ -1169,8 +1169,10 @@ fn a_large_body_with_repeated_keys_leaks_neither_value() {
             &raw[..80],
             v.get("flags")
         );
-        if kept_dup {
-            assert!(v.get("request_body_raw").is_none());
+        // The escaped key: the structural check on the kept part drops the raw text.
+        let escaped = raw.contains("pass\\u0077ord");
+        if kept_dup || escaped {
+            assert!(v.get("request_body_raw").is_none(), "{}", &raw[..80]);
         }
     }
 }

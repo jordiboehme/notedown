@@ -108,7 +108,7 @@ fn layer_vectors_test1_and_test2() {
     );
     assert_eq!(
         gray_hash(&main.codes),
-        "56aeaf16e108c6f6ada26498a5eb0256792a9d403ed3e0f490a74ab3fa8bbb57"
+        "141fc8ccf4681ee1e921a2eb106bd1ef8411d95d7fdcf25f2db302b13e41e332"
     );
     let bg = t1.decode_layer(0, "BGLAYER").expect("t1 bg");
     assert_eq!(bg.opaque, 21168);
@@ -459,4 +459,26 @@ fn huge_page_size_is_an_error() {
         panic!("expected a decode error");
     };
     assert!(m.contains("implausible"), "{m}");
+}
+
+#[test]
+fn gray_x2_is_the_device_involution() {
+    let pairs = [
+        (0x61, 0x00),
+        (0x63, 0x30),
+        (0x64, 0x50),
+        (0x65, 0xFE),
+        (0x66, 0x01),
+        (0x67, 0x31),
+        (0x68, 0x51),
+    ];
+    for (a, b) in pairs {
+        assert_eq!(gray_x2(a), Some(b), "code {a:#04x}");
+        assert_eq!(gray_x2(b), Some(a), "code {b:#04x}");
+    }
+    assert_eq!(gray_x2(0x62), None);
+    assert_eq!(gray_x2(0xFF), Some(0x62));
+    for code in [0x9D, 0x9E, 0xC9, 0xCA, 0x0F, 0x1F, 0xEF, 0x02, 0x60, 0x69] {
+        assert_eq!(gray_x2(code), Some(code), "code {code:#04x}");
+    }
 }

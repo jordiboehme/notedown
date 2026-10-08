@@ -248,16 +248,27 @@ fn context(error: NoteError, what: &str) -> NoteError {
     }
 }
 
-/// Gray level of a code in the X2 table (docs/note-format.md 5.3); `None` = transparent.
+/// Gray level of a code for files of version 20230015 and higher; `None` = transparent.
+/// The device's table (docs/note-format.md 5.3): the identity except eight swapped pairs, so
+/// each named code is also the stored form of the gray level it displaces.
 pub fn gray_x2(code: u8) -> Option<u8> {
     match code {
         0x62 => None,
-        0x61 | 0x66 => Some(0),
+        0x61 => Some(0x00),
+        0x00 => Some(0x61),
+        0xFF => Some(0x62),
         0x63 => Some(0x30),
+        0x30 => Some(0x63),
         0x64 => Some(0x50),
+        0x50 => Some(0x64),
         0x65 => Some(0xFE),
-        0x9D | 0x9E => Some(0x9D),
-        0xC9 | 0xCA => Some(0xC9),
+        0xFE => Some(0x65),
+        0x66 => Some(0x01),
+        0x01 => Some(0x66),
+        0x67 => Some(0x31),
+        0x31 => Some(0x67),
+        0x68 => Some(0x51),
+        0x51 => Some(0x68),
         other => Some(other),
     }
 }

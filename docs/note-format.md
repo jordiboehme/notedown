@@ -354,7 +354,7 @@ t1 MAINLAYER bitmap at 5037, bytes 11616-11619: `62 86 df 00` = 896 transparent 
 
 ### 5.3 Color codes
 
-Two mappings from code to gray are known, and they differ on a few codes. supernotelib uses two tables, "X2" for signature versions 20230015 and higher and "X" for older files [reference]. Ratta's renderer uses one table for versions 20230015 and higher, and an old decoder that paints only a few codes below that version (5.2, section 1) [ratta-notelib]. The golden images and the test vectors in section 11 follow supernotelib's X2 table [verified pixel-exactly for every code that occurs]. Which mapping the device screen shows is not known [unknown]; a reader should offer both.
+Two mappings from code to gray are known, and they differ on a few codes. supernotelib uses two tables, "X2" for signature versions 20230015 and higher and "X" for older files [reference]. Ratta's renderer uses one table for versions 20230015 and higher, and an old decoder that paints only a few codes below that version (5.2, section 1) [ratta-notelib]. The golden images and the test vectors in section 11 follow Ratta's table since 2026-10-08 (before: supernotelib's X2 table) [verified pixel-exactly for every code that occurs]. Which mapping the device screen shows is not known [unknown]; a reader should offer both.
 
 | Code | Name (supernotelib) | supernotelib X2 | supernotelib X (older) | Ratta, from 20230015 | Ratta, below 20230015 | Raw count in the current sample layers |
 |---|---|---|---|---|---|---|
@@ -392,11 +392,13 @@ Below 20230015 [ratta-notelib]: Ratta's old decoder paints only `0x61` (0x00) an
 
 Output palettes in Ratta's renderer [ratta-notelib, `fetchNoteRLEData_15`]: with a built-in template the composite becomes an 8-bit gray image directly (gray = `RLE_INDEX[code]`, unpainted pixels 255), so black is 0. With a `user_` template the composite goes through `NOTE_COLOR_CONVERT_INDEX`, an ARGB table that is opaque gray i for index i except index 0 (gray 1) and 0xFF (fully transparent), and is drawn over the template image; there black is 1, as in the device export (6.2). The `.mark` palette is different (6.4).
 
-Pixels where Ratta's renderer differs from notedown's golden images and test vectors today (current layers, per the table above) [verified by code counts]:
+Pixels where Ratta's renderer differed from notedown's golden images and test vectors before 2026-10-08 (current layers, per the table above) [verified by code counts]:
 
 - t1 page 1: 2 pixels (`0x66`: 0 versus 1). This is the only golden image affected.
 - bike and content goldens: 0 pixels (`0x63`/`0x64` map the same in both).
 - bike-digest page 3 (test vector 11.3a, no golden image): 41 pixels, by code `0x01` 3, `0x30` 5, `0x31` 5, `0x50` 2, `0xFE` 1, `0xFF` 4, `0x67` 4, `0x68` 2, `0x9E` 5, `0xCA` 10. Some steps are large: `0x30` becomes 0x63 instead of 0x30, `0x67` becomes 0x31 instead of 0x67, `0xFF` becomes 0x62 instead of 0xFF.
+
+notedown: from 2026-10-08 notedown uses Ratta's table for 20230015 and higher, because it is the inverse of the device's encoder and the samples fit it. The goldens were updated (t1: 2 pixels per image). Files below 20230015 keep supernotelib's X table: no sample is older, and Ratta's old decoder drops anti-aliasing.
 
 ### 5.4 Template layer (BGLAYER)
 
@@ -759,11 +761,11 @@ Definitions:
 | page 1 block | 185284 |
 | MAINLAYER block / bitmap | 48971 / 5037, 43930 bytes, opaque 34435 |
 | MAINLAYER sha256(codes) | `5d901d57bcbdd9660225cc667a397da49b071942451c401f6139d8d9e0b12510` |
-| MAINLAYER sha256(gray) | `56aeaf16e108c6f6ada26498a5eb0256792a9d403ed3e0f490a74ab3fa8bbb57` |
+| MAINLAYER sha256(gray) | `141fc8ccf4681ee1e921a2eb106bd1ef8411d95d7fdcf25f2db302b13e41e332` |
 | BGLAYER block / bitmap | 1255 / 330, 462 bytes, opaque 21168 |
 | BGLAYER sha256(codes) | `04238c0017e9a91e915a3d8ce2f5b78779e34d45d7e6fbe8a740be76b27761d4` |
 | BGLAYER sha256(gray) | `2b7209c3f1c749fa26a43d54acdf52b11934d23554f249c6e9bbfe3125ba3658` |
-| page composite with template, gray, canvas 255, sha256 | `2846069b5cc07c9f66ec37b56b6fe6e4e8143cb5b07a50893cfa36ba01bf5da8` |
+| page composite with template, gray, canvas 255, sha256 | `cfc192bc95c7bd0a28de7d485828873763a7ef139b763d8382298e16ce2669f2` |
 | page composite without template | same as MAINLAYER gray |
 | TOTALPATH | 50458, 104841 bytes, 72 records, all (tool 10, class 5000, status 0) |
 | TOTALPATH sha256 | `2488505f0e3814f40e679cbf4b50349e2b30158b6fd48bc0bd6cf78d400de162` |
@@ -802,7 +804,7 @@ BGLAYER bitmap 439 on all pages, identical bytes to t1's 330. `FILE_ID` `F202407
 | footer / header | 1134930 / 24 (header block byte-identical to bike) |
 | pages 1, 2 | page blocks 544370, 958898; bitmaps and TOTALPATH blocks byte-identical to bike |
 | page 3 block | 1133641, `PAGETEXTBOX:1`, `DISABLE:256,796,271,88\|` |
-| page 3 MAINLAYER bitmap | 960176, 28802 bytes, opaque 22775, sha256(gray) `7229c7bfcd2818f1070c1c33530dc8e3d0e1958afcf8a5fd72dd1fdd4defba12` (matches supernotelib) |
+| page 3 MAINLAYER bitmap | 960176, 28802 bytes, opaque 22775, sha256(gray) `38afffcd62394783bfc8711d70a0d4b761dd0823e7743c4bb67be74ab2623fe9` (Ratta's table; supernotelib's X2 table gives `7229c7bfcd2818f1070c1c33530dc8e3d0e1958afcf8a5fd72dd1fdd4defba12`, 41 pixels differ) |
 | page 3 TOTALPATH | 989245, 144392 bytes, 64 records: 52 old ink (ids 1 to 52), 7 ink with status -5, 1 lasso, 1 text box, 1 group record, 1 erased ink tap and 1 eraser; sha256 `d9dbdcb4ffc594f2e1bd31ea004c75b713dac7596bbe55f248a84e495bc30ef4` |
 | text box record | record 60, 15609 bytes, rect 256,796,271,88, 7 embedded strokes |
 

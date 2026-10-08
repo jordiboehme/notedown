@@ -275,6 +275,7 @@ fn serve_refuse_sync_flag_counts_for_one_run_and_keeps_server_toml() {
         ),
         "{out}"
     );
+    assert!(out.contains("\nrender: off\n"), "{out}");
     assert!(
         out.contains("\nscan of the data folder: every 300 s, at sync start and before listings\n"),
         "{out}"

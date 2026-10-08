@@ -746,3 +746,63 @@ fn a_live_note_with_a_bad_row_path_touches_nothing_outside() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_follower_renders_after_a_put_and_a_quiet_time() {
+    use notedown_cloud::Config;
+    use notedown_cloud::render::follow::{Timing, run};
+    use notedown_cloud::server::AppState;
+    use std::time::{Duration, Instant};
+
+    async fn until(what: &str, mut ok: impl FnMut() -> bool) {
+        let end = Instant::now() + Duration::from_secs(5);
+        while !ok() {
+            assert!(Instant::now() < end, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    let data = tempfile::tempdir().unwrap();
+    let render = tempfile::tempdir().unwrap();
+    Accounts::new(data.path())
+        .create("acc", "acc@example.org", "secret")
+        .unwrap();
+    let config = Config {
+        render_dir: Some(render.path().to_string_lossy().to_string()),
+        ..Config::default()
+    };
+    let root = config.render_root(data.path()).unwrap();
+    let state = AppState::open(config, data.path()).unwrap();
+    let task = tokio::spawn(run(
+        state.clone(),
+        root.clone(),
+        Timing {
+            quiet: Duration::from_millis(200),
+            poll: Duration::from_millis(50),
+        },
+    ));
+    // The start pass.
+    until("the start pass", || root.join("acc").exists()).await;
+    assert!(!root.join("acc/NOTE/Note/n.pdf").exists());
+
+    let src = data.path().join("n.note");
+    std::fs::write(&src, fixture_note("test1")).unwrap();
+    let st = state.clone();
+    let put = tokio::task::spawn_blocking(move || {
+        notedown_cloud::put::put(&st.data_dir, "acc", &st.journal, &src, "/NOTE/Note", None)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let last = *put.seqs.last().unwrap();
+    until("the PDF", || root.join("acc/NOTE/Note/n.pdf").exists()).await;
+    until("the cursor", || {
+        state
+            .journal
+            .cursor("render")
+            .unwrap()
+            .is_some_and(|c| c.seq >= last)
+    })
+    .await;
+    task.abort();
+}

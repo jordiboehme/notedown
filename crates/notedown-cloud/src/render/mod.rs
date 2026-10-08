@@ -9,6 +9,7 @@
 //! also a PDF that notedown made (see [`Pass::is_ours`]). Every other file in the render folder
 //! is never moved, replaced or deleted.
 
+pub mod follow;
 pub mod manifest;
 
 use std::collections::{BTreeSet, HashMap, HashSet};

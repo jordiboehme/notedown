@@ -531,6 +531,14 @@ pub async fn serve_until(
             }
         }))
     });
+    // The PDFs of the notes in render_dir (when set); stopped when this returns.
+    let _renderer = state.config.render_root(&state.data_dir).map(|root| {
+        AbortOnDrop(tokio::spawn(crate::render::follow::run(
+            state.clone(),
+            root,
+            crate::render::follow::Timing::DEFAULT,
+        )))
+    });
     // The hourly staging and temp file sweep (the first one ran at start) and the recycle bin
     // prune (its first run is the first tick); stopped when this returns.
     let _sweeper = AbortOnDrop(tokio::spawn(async move {

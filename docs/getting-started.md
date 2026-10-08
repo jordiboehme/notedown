@@ -208,6 +208,10 @@ After `notedown cloud import --replace` every file gets a new id. The old versio
 
 **Back up.** The data folder holds everything: accounts, files, journal, recycle bin and logs. Back it up like any other folder (Time Machine is fine). Stop the server first if you want a backup that's exactly in sync.
 
+## PDFs of your notes
+
+Set `render_dir` in `server.toml` to a folder, for example `render_dir = "~/Documents/Supernote PDFs"`. The folder must exist. The server keeps a PDF of every note there, in one subfolder per account, with the same folders as on the device. A changed note is rendered again a few seconds after the sync. A moved or deleted note moves or deletes its PDF. Other files in that folder are never touched. To render everything again, run `notedown cloud render --data <data folder> --all`. For one note without the server, run `notedown render <file.note> --pdf`.
+
 ## What to expect
 
 - Digests and to-dos sync with every sync of the device. Each change shows up in the journal (`digest.created`, `digest.updated`, `digest.deleted`, `task.created` and so on). The digests are in `accounts/me/digests/` and the to-dos in `accounts/me/tasks/`, as JSON files. A handwritten comment of a digest is a `.mark` file in `accounts/me/digests/marks/`.

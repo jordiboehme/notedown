@@ -516,6 +516,8 @@ fn config_defaults_created_and_round_trip() {
         recycle_keep_daily: 5,
         recycle_keep_monthly: 6,
         recycle_keep_deleted_days: 30,
+        scan_interval: 0,
+        scan_min_files: 25,
     };
     custom.save(dir.path()).unwrap();
     assert_eq!(Config::load_or_create(dir.path()).unwrap(), custom);

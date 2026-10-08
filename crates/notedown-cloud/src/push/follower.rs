@@ -140,8 +140,26 @@ pub fn tick(state: &AppState, now_ms: u64) -> usize {
     sent
 }
 
-/// The protect gate (D8): with `protect = true` an account gets pushes only after its import.
+/// The push gate (D8): with `protect = true` an account gets pushes only after its import, and
+/// no account gets pushes while a scan holds (`scan-hold.json` exists or can't be read): the
+/// device would only meet `E0079`.
 fn gate_open(state: &AppState, slug: &str) -> bool {
+    let hold = state
+        .auth
+        .accounts()
+        .account_dir(slug)
+        .join(crate::store::SCAN_HOLD_FILE);
+    match std::fs::symlink_metadata(&hold) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return false,
+        Err(e) => {
+            eprintln!(
+                "notedown cloud: push: account {slug}: {}: {e}",
+                hold.display()
+            );
+            return false;
+        }
+    }
     if !state.config.protect {
         return true;
     }

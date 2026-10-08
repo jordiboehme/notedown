@@ -23,7 +23,10 @@ use crate::auth::{Account, DEFAULT_QUOTA_BYTES};
 use crate::diag::{LogEntry, LogKind};
 use crate::journal::Origin;
 use crate::server::AppState;
-use crate::store::{Entry, Kind, PendingOp, PutOptions, Store, StoreGuard, Stored, WirePath};
+use crate::store::{
+    Entry, Kind, PendingOp, PutOptions, ScanOptions, Store, StoreGuard, Stored, WirePath,
+    WriteGuard,
+};
 use crate::sync::staging;
 use crate::sync::urls::{base_url, download_url, oss_url};
 use crate::sync::{Purpose, SignedTarget, StartOutcome, WriteLock};
@@ -62,6 +65,10 @@ pub const FLAG_INNER_NAME_FILE: &str = "inner_name_file_name";
 pub const FLAG_INNER_NAME_ID: &str = "inner_name_id";
 /// Log flag: `synchronous/start` refused by the protect gate (no import yet).
 pub const FLAG_PROTECT_REFUSED: &str = "protect_refused";
+/// Log flag: a scan of the account holds (`scan-hold.json`): too many files are gone from the
+/// data folder. Every file route answers `E0079` until the files are back or the scan is
+/// accepted.
+pub const FLAG_SCAN_HOLD: &str = "scan_hold";
 /// Log flag: `synchronous/end` with `flag` `Y`.
 pub const FLAG_SYNC_END_OK: &str = "sync_end_ok";
 /// Log flag: `synchronous/end` with `flag` `N` (the device saw a failure).
@@ -228,6 +235,7 @@ where
     match tokio::task::spawn_blocking(f).await {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(Error::GateClosed(_))) => Err(protect_refused(serial)),
+        Ok(Err(Error::ScanHold(_))) => Err(scan_held(serial)),
         Ok(Err(e @ Error::StoreDamaged { .. })) => Err(store_damaged(serial, &e)),
         Ok(Err(e)) => {
             eprintln!("notedown cloud: {e}");
@@ -269,9 +277,10 @@ pub fn protect_gate(state: &AppState, account: &Account, serial: &str) -> Option
 
 /// The protect gate again, read fresh under the store lock: a request that passed
 /// [`protect_gate`] and then waited for the lock behind an import that cleared the marker (and
-/// failed) must not see the half-imported tree. Call it right after `lock_recovered` in every
-/// gated route; [`blocking`] turns the error into the `E0079` answer.
-pub fn gate_locked(state: &AppState, slug: &str) -> crate::Result<()> {
+/// failed) must not see the half-imported tree. Digest and to-do routes call it right after
+/// `lock_recovered`; file routes call [`gate_locked`]. [`blocking`] turns the error into the
+/// `E0079` answer.
+pub fn protect_locked(state: &AppState, slug: &str) -> crate::Result<()> {
     if !state.config.protect {
         return Ok(());
     }
@@ -279,6 +288,56 @@ pub fn gate_locked(state: &AppState, slug: &str) -> crate::Result<()> {
         Some(a) if a.imported.is_some() => Ok(()),
         _ => Err(Error::GateClosed(slug.to_string())),
     }
+}
+
+/// The gates of a file route under the store lock: [`protect_locked`], then the scan hold. While
+/// `scan-hold.json` exists (or can't be read) the route answers `E0079` with `scan_hold`. Call
+/// it right after `lock_recovered` in every file route.
+pub fn gate_locked(state: &AppState, store: &Store) -> crate::Result<()> {
+    protect_locked(state, store.slug())?;
+    match store.scan_hold() {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => Err(Error::ScanHold(store.slug().to_string())),
+        Err(e) => {
+            eprintln!(
+                "notedown cloud: account {}: can't read the scan hold, device sync waits: {e}",
+                store.slug()
+            );
+            Err(Error::ScanHold(store.slug().to_string()))
+        }
+    }
+}
+
+/// The scan of a device listing (`docs/sync-protocol.md` 8.3): `scope` and what lies below it
+/// (only the direct children when not `recursive`), right before the listing under the same
+/// guard, so a change made by hand is journaled before the device sees it. A hold is
+/// `Error::ScanHold`.
+fn scan_scope(
+    state: &AppState,
+    store: &Store,
+    guard: &WriteGuard,
+    scope: &WirePath,
+    recursive: bool,
+) -> crate::Result<()> {
+    let opts = ScanOptions {
+        scope: scope.clone(),
+        recursive,
+        dry_run: false,
+        accept: false,
+        min_files: state.config.scan_min_files,
+    };
+    state.run_scan(store, guard, &opts).map(drop)
+}
+
+/// [`scan_scope`] for the entry at `path`: its parent folder, direct children only.
+fn scan_around(
+    state: &AppState,
+    store: &Store,
+    guard: &WriteGuard,
+    path: &WirePath,
+) -> crate::Result<()> {
+    let parent = path.parent().unwrap_or_else(WirePath::root);
+    scan_scope(state, store, guard, &parent, false)
 }
 
 /// The answer for a damaged store (`Error::StoreDamaged`): `E0079` with flag `store_damaged`,
@@ -295,6 +354,11 @@ pub fn store_damaged(serial: &str, e: &Error) -> Reply {
 /// The answer of a closed protect gate: `E0079` with flag `protect_refused`.
 pub fn protect_refused(serial: &str) -> Reply {
     Reply::sync_busy().flag(FLAG_PROTECT_REFUSED).device(serial)
+}
+
+/// The answer while a scan holds: `E0079` with flag `scan_hold`.
+pub fn scan_held(serial: &str) -> Reply {
+    Reply::sync_busy().flag(FLAG_SCAN_HOLD).device(serial)
 }
 
 /// [`device_request!`] followed by the protect gate, then a lapsed sync lock of this device is
@@ -315,9 +379,10 @@ macro_rules! gated_request {
 
 /// `POST /api/file/2/files/synchronous/start`. Order: device check, the protect gate (accept
 /// mode with `protect = true` refuses with `E0079` until the account has an `imported` marker),
-/// the store check (`E0079` with `store_damaged` for a damaged tree, and with `empty_account`
-/// for an account without marker and without files), then the lock (`E0078` while another
-/// device holds it). Answers `synType: true`.
+/// a scan of the whole tree (`E0079` with `scan_hold` when it holds; it also ends a hold when
+/// the files are back), the store check (`E0079` with `store_damaged` for a damaged tree, and
+/// with `empty_account` for an account without marker and without files), then the lock
+/// (`E0078` while another device holds it). Answers `synType: true`.
 pub async fn sync_start(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -330,14 +395,18 @@ pub async fn sync_start(
     // The store is checked before the lock is taken: a damaged tree (`store_damaged`) or, with
     // protect off, an account that was never imported and holds no file (`empty_account`) gets
     // no sync, so the device never compares against an empty tree.
-    // The journal position is read here too (store lock, then journal lock): the sync lists
-    // the tree after it, so pushes for the changes up to it are covered (D7). It is only a hint,
-    // so a failure to read it is logged and never fails the sync.
+    // The changes made by hand are journaled first, by a scan of the whole tree under the same
+    // store lock. The hold is checked by that scan only, not by `gate_locked`: a scan that sees
+    // the files back ends it.
+    // The journal position is read after the scan (store lock, then journal lock): the sync
+    // lists the tree after it, so pushes for the changes up to it are covered (D7). It is only
+    // a hint, so a failure to read it is logged and never fails the sync.
     let (st, slug) = (state.clone(), req.slug.clone());
     let checked = blocking(&req.serial, move || {
         let store = st.store(&slug)?;
         let guard = store.lock_recovered(&st.journal)?;
-        gate_locked(&st, store.slug())?;
+        protect_locked(&st, store.slug())?;
+        st.run_scan(&store, &guard, &ScanOptions::all(st.config.scan_min_files))?;
         let last_seq = match st.journal.last_seq() {
             Ok(seq) => Some(seq),
             Err(e) => {
@@ -432,7 +501,7 @@ fn list_folder_of(
 ) -> crate::Result<Listing> {
     let store = state.store(slug)?;
     let guard = store.lock_recovered(&state.journal)?;
-    gate_locked(state, store.slug())?;
+    gate_locked(state, &store)?;
     let path = match folder {
         Folder::Path(p) => match stored(&store, &guard, &p)? {
             Some(r) => r.path,
@@ -443,6 +512,7 @@ fn list_folder_of(
             _ => return Ok(Listing::Missing),
         },
     };
+    scan_scope(state, &store, &guard, &path, recursive)?;
     if !path.is_root() {
         match store.entry(&guard, &path)? {
             Some(e) if e.tag == Kind::Folder => {}
@@ -533,11 +603,17 @@ pub async fn list_folder_v3(
     }
 }
 
-/// The entry with `id`, if the id is known and something listable is at its path.
+/// The entry with `id`, if the id is known and something listable is at its path. Its parent
+/// folder is scanned first ([`scan_around`]).
 fn entry_by_id(state: &AppState, slug: &str, id: u64) -> crate::Result<Option<Entry>> {
     let store = state.store(slug)?;
     let guard = store.lock_recovered(&state.journal)?;
-    gate_locked(state, store.slug())?;
+    gate_locked(state, &store)?;
+    let Some(path) = store.path_of(id)? else {
+        return Ok(None);
+    };
+    scan_around(state, &store, &guard, &path)?;
+    // The scan may have dropped the id (the file is gone) or moved it.
     let Some(path) = store.path_of(id)? else {
         return Ok(None);
     };
@@ -585,9 +661,12 @@ pub async fn query_by_path_v3(
     let r = blocking(&req.serial, move || {
         let store = st.store(&slug)?;
         let guard = store.lock_recovered(&st.journal)?;
-        gate_locked(&st, store.slug())?;
+        gate_locked(&st, &store)?;
         match stored(&store, &guard, &path)? {
-            Some(r) => store.entry(&guard, &r.path).map(Some),
+            Some(r) => {
+                scan_around(&st, &store, &guard, &r.path)?;
+                store.entry(&guard, &r.path).map(Some)
+            }
             None => Ok(None),
         }
     })
@@ -914,7 +993,7 @@ pub async fn upload_apply(
     let checked = blocking(&req.serial, move || {
         let store = st.store(&slug)?;
         let guard = store.lock_recovered(&st.journal)?;
-        gate_locked(&st, store.slug())?;
+        gate_locked(&st, &store)?;
         // The staging entry and the URLs keep the device's spelling: finish looks the target
         // up again.
         let Some(t) = stored(&store, &guard, &t)? else {
@@ -1073,7 +1152,7 @@ fn finish_claimed(
         return cannot(FLAG_SIZE_MISMATCH);
     }
     let guard = store.lock_recovered(&state.journal)?;
-    gate_locked(state, store.slug())?;
+    gate_locked(state, store)?;
     // A case variant of an existing file is that file: it is replaced and keeps its id and
     // spelling (3.0).
     let Some(target) = stored(store, &guard, target)? else {
@@ -1494,7 +1573,7 @@ pub async fn create_folder_v2(
         };
         let store = st.store(slug)?;
         let guard = store.lock_recovered(&st.journal)?;
-        gate_locked(st, store.slug())?;
+        gate_locked(st, &store)?;
         let Some(parent) = stored(&store, &guard, &parent)? else {
             return Outcome::ambiguous();
         };
@@ -1548,7 +1627,7 @@ pub async fn delete_folder_v3(
         };
         let store = st.store(slug)?;
         let guard = store.lock_recovered(&st.journal)?;
-        gate_locked(st, store.slug())?;
+        gate_locked(st, &store)?;
         let Some(e) = source_of(&store, &guard, id)? else {
             return Outcome::refused(E_DELETE_MISSING, MSG_DELETE_MISSING);
         };
@@ -1676,7 +1755,7 @@ pub async fn move_v3(
         };
         let store = st.store(slug)?;
         let guard = store.lock_recovered(&st.journal)?;
-        gate_locked(st, store.slug())?;
+        gate_locked(st, &store)?;
         let Some(src) = source_of(&store, &guard, id)? else {
             return Outcome::refused(E_MOVE_MISSING, MSG_MOVE_MISSING);
         };
@@ -1731,7 +1810,7 @@ pub async fn copy_v3(
         };
         let store = st.store(slug)?;
         let guard = store.lock_recovered(&st.journal)?;
-        gate_locked(st, store.slug())?;
+        gate_locked(st, &store)?;
         let Some(src) = source_of(&store, &guard, id)? else {
             return Outcome::refused(E_COPY_MISSING, MSG_COPY_MISSING);
         };

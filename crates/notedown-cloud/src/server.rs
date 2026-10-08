@@ -13,7 +13,7 @@ use crate::auth::Auth;
 use crate::diag::{Capture, Clock, LogEntry, LogKind, ProtocolLog, SystemClock};
 use crate::journal::{Journal, JournalOptions};
 use crate::push::{PushPlanner, PushTiming};
-use crate::store::{Store, WirePath};
+use crate::store::{ScanHold, ScanOptions, ScanReport, Store, WirePath, WriteGuard};
 use crate::sync::staging::{self, StagingLocks};
 use crate::sync::{SyncLocks, UrlSigner};
 use crate::{Config, Error, Result};
@@ -250,10 +250,96 @@ impl AppState {
         self.config.recycle_prune.then(|| self.prune_recycle_all())
     }
 
+    /// [`Store::scan`] under `guard` with the server's journal and clock. A plan that holds
+    /// is `Error::ScanHold`, so nothing is listed or written from the emptied tree. When this
+    /// scan wrote the hold marker (none was there, or one that can't be read), the warning of
+    /// [`scan_hold_warning`] goes to stderr once. Blocking.
+    pub fn run_scan(
+        &self,
+        store: &Store,
+        guard: &WriteGuard,
+        opts: &ScanOptions,
+    ) -> Result<ScanReport> {
+        let before = store.scan_hold();
+        let report = store.scan(guard, &self.journal, opts, self.now_ms())?;
+        if report.held.is_some() {
+            if !matches!(before, Ok(Some(_)))
+                && let Ok(Some(hold)) = store.scan_hold()
+            {
+                eprintln!(
+                    "notedown cloud: warning: {}",
+                    scan_hold_warning(store.slug(), &hold)
+                );
+            }
+            return Err(Error::ScanHold(store.slug().to_string()));
+        }
+        if report.released {
+            eprintln!(
+                "notedown cloud: account {}: the files are back, device sync goes on",
+                store.slug()
+            );
+        }
+        Ok(report)
+    }
+
+    /// One timer pass: a whole-tree scan of every account ([`AppState::run_scan`]). An account
+    /// is skipped while a device holds its sync lock, while its protect gate is closed and when
+    /// it has no `files/` folder. Errors are logged and never stop the pass. Blocking.
+    pub fn scan_all(&self) {
+        let accounts = match self.auth.accounts().list() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("notedown cloud: scan: {e}");
+                return;
+            }
+        };
+        for account in accounts {
+            let slug = &account.slug;
+            let files = self
+                .auth
+                .accounts()
+                .account_dir(slug)
+                .join(crate::store::FILES_DIR);
+            if !files.is_dir()
+                || (self.config.protect && account.imported.is_none())
+                || self.sync_locks.holder(slug, self.now_ms()).is_some()
+            {
+                continue;
+            }
+            let scanned = self.store(slug).and_then(|store| {
+                let guard = store.lock_recovered(&self.journal)?;
+                // A device may have started its sync while this pass waited for the store lock.
+                if self.sync_locks.holder(slug, self.now_ms()).is_some() {
+                    return Ok(());
+                }
+                self.run_scan(
+                    &store,
+                    &guard,
+                    &ScanOptions::all(self.config.scan_min_files),
+                )
+                .map(drop)
+            });
+            match scanned {
+                Ok(()) | Err(Error::ScanHold(_)) => {}
+                Err(e) => eprintln!("notedown cloud: account {slug}: scan failed: {e}"),
+            }
+        }
+    }
+
     /// Milliseconds since the epoch, from the clock.
     pub fn now_ms(&self) -> u64 {
         now_ms_of(self.clock.as_ref())
     }
+}
+
+/// The warning `serve` prints once when a scan of account `slug` holds.
+pub fn scan_hold_warning(slug: &str, hold: &ScanHold) -> String {
+    format!(
+        "account {slug}: {} files are gone from the data folder and only {} would be left. \
+         Device sync is on hold. If that's on purpose, run: \
+         notedown cloud scan --account {slug} --accept",
+        hold.gone, hold.left
+    )
 }
 
 fn report_temp_sweep(r: Result<usize>) {
@@ -296,8 +382,8 @@ pub async fn serve_listeners(listeners: Vec<TcpListener>, state: Arc<AppState>) 
     serve_until(listeners, state, std::future::pending()).await
 }
 
-/// Aborts a background task when dropped (the hourly sweep, the push loop, the lock keeper of a
-/// request).
+/// Aborts a background task when dropped (the hourly sweep, the scan timer, the push loop, the
+/// lock keeper of a request).
 pub(crate) struct AbortOnDrop(pub(crate) tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -321,6 +407,23 @@ pub async fn serve_until(
     // position is taken before the listeners serve.
     let follower = crate::push::Follower::start(state.clone()).await;
     let _pusher = AbortOnDrop(tokio::spawn(follower.run()));
+    // The scan of the data folder for changes made by hand: the first pass right now (after
+    // the startup sweeps of `AppState::open`), then every `scan_interval` seconds; stopped when
+    // this returns. Started after the follower, so the changes it finds are pushed.
+    let _scanner = state.config.scan_period().map(|period| {
+        let state = state.clone();
+        AbortOnDrop(tokio::spawn(async move {
+            let mut every = tokio::time::interval(period);
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                every.tick().await;
+                let st = state.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || st.scan_all()).await {
+                    eprintln!("notedown cloud: scan failed: {e}");
+                }
+            }
+        }))
+    });
     // The hourly staging and temp file sweep (the first one ran at start) and the recycle bin
     // prune (its first run is the first tick); stopped when this returns.
     let _sweeper = AbortOnDrop(tokio::spawn(async move {

@@ -88,6 +88,14 @@ pub struct Config {
     /// A deleted file whose newest recycled line is older than this many days is removed
     /// completely. At least 1.
     pub recycle_keep_deleted_days: u32,
+    /// Seconds between two scans of the data folder for changes made by hand (each account,
+    /// skipped while a device syncs). The first scan runs at start. 0 turns the timer off; a
+    /// device sync and a device listing still scan first.
+    pub scan_interval: u64,
+    /// A scan that would remove files holds instead when fewer than this many files would be
+    /// left in the account (an empty data folder, an unmounted volume): device sync waits until
+    /// the files are back or `notedown cloud scan --accept` runs. 0 never holds.
+    pub scan_min_files: u64,
 }
 
 impl Default for Config {
@@ -107,6 +115,8 @@ impl Default for Config {
             recycle_keep_daily: 7,
             recycle_keep_monthly: 12,
             recycle_keep_deleted_days: 90,
+            scan_interval: 300,
+            scan_min_files: 1,
         }
     }
 }
@@ -154,6 +164,11 @@ impl Config {
             keep_monthly: self.recycle_keep_monthly,
             keep_deleted_days: self.recycle_keep_deleted_days,
         }
+    }
+
+    /// The time between two timer scans; `None` when `scan_interval` is 0 (no timer).
+    pub fn scan_period(&self) -> Option<std::time::Duration> {
+        (self.scan_interval > 0).then(|| std::time::Duration::from_secs(self.scan_interval))
     }
 
     /// Refuse values the server can't work with. `path` is the file named in the message.
@@ -262,6 +277,8 @@ mod tests {
             "recycle_keep_daily = 7",
             "recycle_keep_monthly = 12",
             "recycle_keep_deleted_days = 90",
+            "scan_interval = 300",
+            "scan_min_files = 1",
         ] {
             assert!(text.contains(key), "{key} missing in:\n{text}");
         }

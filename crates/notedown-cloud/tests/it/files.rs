@@ -1442,12 +1442,13 @@ async fn protect_off_refuses_an_empty_account_that_was_never_imported() {
     // One file is enough: the device compares against a tree that holds something.
     s.put("INBOX/a.pdf", b"a");
     assert_ok(&s.post(START, &t, json!({"equipmentNo": SERIAL})).await);
-    // With the marker an empty account syncs (an import of an empty device).
-    std::fs::remove_file(s.files().join("INBOX/a.pdf")).unwrap();
-    assert_ok(
-        &s.post(END, &t, json!({"equipmentNo": SERIAL, "flag": "Y"}))
-            .await,
-    );
+    // With the marker an empty account syncs (an import of an empty device). A fresh one: the
+    // scan at sync start would hold if this account's file were removed by hand.
+    let s = Server::with_config(Config {
+        protect: false,
+        ..Config::default()
+    });
+    let t = s.login(SERIAL).await;
     s.mark_imported();
     assert_ok(&s.post(START, &t, json!({"equipmentNo": SERIAL})).await);
 }

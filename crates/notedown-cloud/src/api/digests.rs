@@ -34,7 +34,7 @@ use serde_json::{Map, Value, json};
 use super::envelope::{Reply, field, parse_body};
 use super::files::{
     E_DEVICE_MISMATCH, E_NO_FILE, E_UPLOAD, FLAG_BAD_NAME, IdArg, MSG_DEVICE_MISMATCH, MSG_NO_FILE,
-    MSG_UPLOAD, blocking, gate_locked, id_arg, protect_gate,
+    MSG_UPLOAD, blocking, id_arg, protect_gate, protect_locked,
 };
 use super::oss::MARK_TARGET;
 use crate::appdata::{AppData, Digest, DigestGroup, DigestTag, NO, YES, valid_mark_name};
@@ -210,7 +210,7 @@ where
     let done = blocking(&req.serial, move || {
         let store = st.store(&slug)?;
         let guard = store.lock_recovered(&st.journal)?;
-        gate_locked(&st, store.slug())?;
+        protect_locked(&st, store.slug())?;
         let open = st
             .auth
             .accounts()

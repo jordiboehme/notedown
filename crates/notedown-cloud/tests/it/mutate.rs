@@ -488,13 +488,15 @@ async fn create_folder_refuses_a_taken_name_or_renames_it() {
     let c = s.mkdir(&t, "/INBOX/box", true).await;
     assert_eq!(c["metadata"]["path_display"], "INBOX/box(1)");
     assert!(s.listed(&t, "NOTE/Note/Work(2)").await);
+    // The listing journals the file placed by hand (a scan) after the four folders.
     assert_eq!(
         types(&s.events_after(n)),
         [
             "folder.created",
             "folder.created",
             "folder.created",
-            "folder.created"
+            "folder.created",
+            "file.created"
         ]
     );
 }

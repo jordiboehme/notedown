@@ -63,6 +63,10 @@ pub enum Error {
     /// `store_damaged`.
     #[error("the store of account {slug} is damaged: {reason}")]
     StoreDamaged { slug: String, reason: String },
+    /// A scan of the account holds (`accounts/<slug>/scan-hold.json`): too many files are gone
+    /// from the data folder. Device file routes answer `E0079` with `scan_hold`.
+    #[error("device sync of account {0} is on hold: files are gone from the data folder")]
+    ScanHold(String),
     #[error("cannot listen on {addr}: {source}")]
     Bind {
         addr: std::net::SocketAddr,

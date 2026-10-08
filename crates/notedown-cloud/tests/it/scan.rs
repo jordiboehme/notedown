@@ -1004,3 +1004,556 @@ fn a_broken_tree_is_never_scanned() {
     assert!(matches!(r, Err(Error::StoreDamaged { .. })), "{r:?}");
     assert!(fx.events().is_empty());
 }
+
+// ---------------------------------------------------------------- the scan in the server
+
+/// The scan as the server runs it: at `synchronous/start`, before a device listing and on the
+/// timer. Requests go through the router in memory (`tower::oneshot`).
+mod served {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use axum::body::Body;
+    use axum::extract::connect_info::MockConnectInfo;
+    use axum::http::Request;
+    use notedown_cloud::auth::{Accounts, Imported, expected_login_hash, md5_hex};
+    use notedown_cloud::journal::{Event, EventBody, Origin};
+    use notedown_cloud::push::{RECONNECT_REASON, follow_once, start_seq, tick};
+    use notedown_cloud::server::{AppState, router, scan_hold_warning, serve_listeners};
+    use notedown_cloud::socket::Outbound;
+    use notedown_cloud::store::{SCAN_HOLD_FILE, ScanHold, Store};
+    use notedown_cloud::{Clock, Config, PushMode};
+    use serde_json::{Value, json};
+    use time::OffsetDateTime;
+    use tower::ServiceExt;
+
+    use super::{DOC, EMAIL, kind_names};
+
+    const SERIAL: &str = "SN078C10000000";
+    const T0: i64 = 1_791_270_000_000;
+    const START: &str = "/api/file/2/files/synchronous/start";
+    const END: &str = "/api/file/2/files/synchronous/end";
+    const LIST: &str = "/api/file/2/files/list_folder";
+    const LIST_V3: &str = "/api/file/3/files/list_folder_v3";
+    const QUERY: &str = "/api/file/3/files/query_v3";
+    const BY_PATH: &str = "/api/file/3/files/query/by/path_v3";
+    const DOWNLOAD: &str = "/api/file/3/files/download_v3";
+    const CREATE: &str = "/api/file/2/files/create_folder_v2";
+    const APPLY: &str = "/api/file/3/files/upload/apply";
+    const DELETE: &str = "/api/file/3/files/delete_folder_v3";
+    const MOVE: &str = "/api/file/3/files/move_v3";
+    const COPY: &str = "/api/file/3/files/copy_v3";
+    const DIGEST_GROUPS: &str = "/api/file/query/summary/group";
+    const TODO_GROUPS: &str = "/api/file/schedule/group/all";
+
+    struct TestClock(AtomicI64);
+
+    impl Clock for TestClock {
+        fn now(&self) -> OffsetDateTime {
+            OffsetDateTime::from_unix_timestamp_nanos(
+                self.0.load(Ordering::SeqCst) as i128 * 1_000_000,
+            )
+            .unwrap()
+        }
+    }
+
+    /// The account as after an import (native folders, `imported` marker).
+    fn seed_imported(data: &std::path::Path) {
+        Accounts::new(data)
+            .create("jordi", EMAIL, "secret")
+            .unwrap();
+        let store = Store::open(data, "jordi").unwrap();
+        {
+            let g = store.lock().unwrap();
+            store.ensure_native_folders(&g).unwrap();
+        }
+        let accounts = Accounts::new(data);
+        let mut a = accounts.get("jordi").unwrap().unwrap();
+        a.imported = Some(Imported {
+            at: "2026-10-06T10:00:00Z".into(),
+            source: "/backup/Supernote".into(),
+            files: 0,
+            bytes: 0,
+        });
+        accounts.save(&a).unwrap();
+    }
+
+    struct Server {
+        dir: tempfile::TempDir,
+        state: Arc<AppState>,
+        clock: Arc<TestClock>,
+        token: String,
+    }
+
+    impl Server {
+        /// Protect off (no app data gate for the digest and to-do checks).
+        fn new() -> Server {
+            Self::with(Config {
+                protect: false,
+                ..Config::default()
+            })
+        }
+
+        fn with(config: Config) -> Server {
+            let dir = tempfile::tempdir().unwrap();
+            seed_imported(dir.path());
+            let clock = Arc::new(TestClock(AtomicI64::new(T0)));
+            let state = AppState::open_with_clock(config, dir.path(), clock.clone()).unwrap();
+            let now = state.now_ms();
+            let (code, _) = state.auth.challenge(EMAIL, now).unwrap();
+            let hash = expected_login_hash(&md5_hex("secret"), &code);
+            let token = state.auth.login(EMAIL, &hash, SERIAL, now).unwrap().token;
+            state
+                .auth
+                .devices()
+                .update("jordi", SERIAL, |d| d.bound = true)
+                .unwrap();
+            Server {
+                dir,
+                state,
+                clock,
+                token,
+            }
+        }
+
+        fn fs(&self, rel: &str) -> std::path::PathBuf {
+            self.dir.path().join("accounts/jordi/files").join(rel)
+        }
+
+        fn write(&self, rel: &str, bytes: &[u8]) {
+            let p = self.fs(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        }
+
+        fn rm(&self, rel: &str) {
+            std::fs::remove_file(self.fs(rel)).unwrap();
+        }
+
+        fn now(&self) -> u64 {
+            self.clock.0.load(Ordering::SeqCst) as u64
+        }
+
+        fn advance_ms(&self, ms: i64) {
+            self.clock.0.fetch_add(ms, Ordering::SeqCst);
+        }
+
+        async fn post(&self, path: &str, body: Value) -> Value {
+            let addr: SocketAddr = "192.168.1.50:40000".parse().unwrap();
+            let req = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("x-access-token", &self.token)
+                .header("content-type", "application/json")
+                .header("host", "192.168.1.10:19072")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let resp = router(self.state.clone())
+                .layer(MockConnectInfo(addr))
+                .oneshot(req)
+                .await
+                .unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        async fn start(&self) -> Value {
+            self.post(START, json!({"equipmentNo": SERIAL})).await
+        }
+
+        async fn end(&self) -> Value {
+            self.post(END, json!({"equipmentNo": SERIAL, "flag": "Y"}))
+                .await
+        }
+
+        async fn list(&self, path: &str, recursive: bool) -> Value {
+            self.post(LIST, json!({"path": path, "recursive": recursive}))
+                .await
+        }
+
+        fn events(&self) -> Vec<Event> {
+            self.state
+                .journal
+                .read_from(1)
+                .unwrap()
+                .map(|e| e.unwrap())
+                .collect()
+        }
+
+        fn kinds(&self) -> Vec<&'static str> {
+            let bodies: Vec<EventBody> = self.events().into_iter().map(|e| e.body).collect();
+            kind_names(&bodies)
+        }
+
+        fn holder(&self) -> Option<String> {
+            self.state.sync_locks.holder("jordi", self.now())
+        }
+
+        fn marker(&self) -> std::path::PathBuf {
+            self.dir.path().join("accounts/jordi").join(SCAN_HOLD_FILE)
+        }
+
+        /// The flags of the last logged request to `path`.
+        fn last_flags(&self, path: &str) -> Vec<String> {
+            let mut files: Vec<_> = std::fs::read_dir(self.dir.path().join("logs"))
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            files.sort();
+            let entry = files
+                .iter()
+                .flat_map(|f| {
+                    std::fs::read_to_string(f)
+                        .unwrap()
+                        .lines()
+                        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+                        .collect::<Vec<_>>()
+                })
+                .rfind(|e| e["kind"] == "request" && e["path"] == path)
+                .unwrap_or_else(|| panic!("no request to {path}"));
+            entry["flags"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|f| f.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        /// Two files listed by the device: both have ids and `file.created` events.
+        async fn two_files(&self) -> (String, String) {
+            let (a, b) = (format!("{DOC}/a.txt"), format!("{DOC}/b.txt"));
+            self.write(&a, b"a");
+            self.write(&b, b"b");
+            let v = self.list("/", true).await;
+            assert_eq!(v["success"], true, "{v}");
+            (a, b)
+        }
+    }
+
+    fn assert_ok(v: &Value) {
+        assert_eq!(v["success"], true, "{v}");
+    }
+
+    fn assert_scan_hold(s: &Server, path: &str, v: &Value) {
+        assert_eq!(v["success"], false, "{path}: {v}");
+        assert_eq!(v["errorCode"], "E0079", "{path}: {v}");
+        assert!(v.get("entries").is_none(), "{path}: {v}");
+        assert!(
+            s.last_flags(path).contains(&"scan_hold".to_string()),
+            "{path}: {:?}",
+            s.last_flags(path)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hand_added_file_is_journaled_before_the_device_lists_it() {
+        let s = Server::new();
+        let path = format!("{DOC}/a.pdf");
+        s.write(&path, b"hello");
+        let v = s.list(&format!("/{DOC}"), false).await;
+        assert_ok(&v);
+        let events = s.events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let e = &events[0];
+        assert_eq!(e.origin, Origin::Scan);
+        let EventBody::FileCreated { id, path: p, .. } = &e.body else {
+            panic!("{e:?}");
+        };
+        assert_eq!(p, &path);
+        let entries = v["entries"].as_array().unwrap();
+        let listed = entries
+            .iter()
+            .find(|x| x["path_display"] == path.as_str())
+            .unwrap_or_else(|| panic!("{v}"));
+        assert_eq!(listed["id"], id.to_string());
+        // The next listing finds nothing new.
+        assert_ok(&s.list("/", true).await);
+        assert_eq!(s.events().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_v3_listing_and_the_queries_journal_first_too() {
+        let s = Server::new();
+        s.write(&format!("{DOC}/a.txt"), b"a");
+        assert_ok(&s.post(LIST_V3, json!({"id": "0", "recursive": true})).await);
+        assert_eq!(s.kinds(), vec!["file.created"]);
+        s.write(&format!("{DOC}/b.txt"), b"b");
+        let v = s
+            .post(BY_PATH, json!({"path": format!("/{DOC}/b.txt")}))
+            .await;
+        assert_ok(&v);
+        assert_eq!(s.kinds(), vec!["file.created", "file.created"]);
+        let EventBody::FileCreated { id, .. } = &s.events()[1].body else {
+            panic!();
+        };
+        assert_eq!(v["entriesVO"]["id"], id.to_string());
+        // A file removed by hand is journaled before query_v3 answers null.
+        let id = *id;
+        s.rm(&format!("{DOC}/b.txt"));
+        let v = s.post(QUERY, json!({"id": id.to_string()})).await;
+        assert_ok(&v);
+        assert!(v["entriesVO"].is_null(), "{v}");
+        assert_eq!(
+            s.kinds(),
+            vec!["file.created", "file.created", "file.deleted"]
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_start_journals_hand_deletes_and_grants_the_lock() {
+        let s = Server::new();
+        let (a, _) = s.two_files().await;
+        s.rm(&a);
+        assert_ok(&s.start().await);
+        assert_eq!(s.holder().as_deref(), Some(SERIAL));
+        let last = s.events().pop().unwrap();
+        assert_eq!(last.origin, Origin::Scan);
+        assert!(
+            matches!(&last.body, EventBody::FileDeleted { path, .. } if *path == a),
+            "{last:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_start_answers_scan_hold_after_a_mass_delete() {
+        let s = Server::new();
+        let (a, b) = s.two_files().await;
+        let id = s.events()[0].body.clone();
+        let EventBody::FileCreated { id, .. } = id else {
+            panic!();
+        };
+        let before = s.events().len();
+        s.rm(&a);
+        s.rm(&b);
+        let v = s.start().await;
+        assert_scan_hold(&s, START, &v);
+        assert_eq!(s.holder(), None);
+        assert!(s.marker().is_file());
+        assert_eq!(s.events().len(), before, "nothing journaled");
+        let calls = [
+            (LIST, json!({"path": "/", "recursive": true})),
+            (LIST, json!({"path": format!("/{DOC}"), "recursive": false})),
+            (LIST_V3, json!({"id": "0", "recursive": true})),
+            (QUERY, json!({"id": id.to_string()})),
+            (BY_PATH, json!({"path": format!("/{a}")})),
+            (DOWNLOAD, json!({"id": id.to_string()})),
+            (CREATE, json!({"path": "/INBOX/New", "autorename": false})),
+            (
+                APPLY,
+                json!({"path": "/INBOX/x.pdf", "fileName": "x.pdf", "size": 1}),
+            ),
+            (DELETE, json!({"id": id.to_string()})),
+            (
+                MOVE,
+                json!({"id": id.to_string(), "to_path": "/INBOX/a.txt", "autorename": false}),
+            ),
+            (
+                COPY,
+                json!({"id": id.to_string(), "to_path": "/INBOX/a.txt", "autorename": false}),
+            ),
+        ];
+        for (path, body) in calls {
+            let v = s.post(path, body).await;
+            assert_scan_hold(&s, path, &v);
+        }
+        assert_eq!(s.events().len(), before, "nothing journaled");
+        // Digests and to-dos stay open.
+        for (path, body) in [
+            (DIGEST_GROUPS, json!({"page": 0, "size": 0})),
+            (TODO_GROUPS, json!({"maxResults": "20"})),
+        ] {
+            let v = s.post(path, body).await;
+            assert_ok(&v);
+            assert!(!s.last_flags(path).contains(&"scan_hold".to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_hold_ends_when_the_files_come_back() {
+        let s = Server::new();
+        let (a, b) = s.two_files().await;
+        let before = s.events().len();
+        s.rm(&a);
+        s.rm(&b);
+        assert_scan_hold(&s, START, &s.start().await);
+        s.write(&a, b"a");
+        s.write(&b, b"b");
+        assert_ok(&s.start().await);
+        assert!(!s.marker().exists());
+        assert_eq!(s.holder().as_deref(), Some(SERIAL));
+        assert_eq!(s.events().len(), before, "the files came back unchanged");
+        assert_ok(&s.list("/", true).await);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_hold_marker_closes_the_file_routes() {
+        let s = Server::new();
+        std::fs::write(s.marker(), b"{not json").unwrap();
+        let v = s.list("/", true).await;
+        assert_scan_hold(&s, LIST, &v);
+    }
+
+    #[tokio::test]
+    async fn the_timer_scan_skips_while_a_device_syncs() {
+        let s = Server::new();
+        assert_ok(&s.start().await);
+        s.write(&format!("{DOC}/a.txt"), b"a");
+        s.state.scan_all();
+        assert!(s.events().is_empty(), "{:?}", s.events());
+        assert_ok(&s.end().await);
+        s.state.scan_all();
+        assert_eq!(s.kinds(), vec!["file.created"]);
+        assert_eq!(s.events()[0].origin, Origin::Scan);
+    }
+
+    #[test]
+    fn the_timer_scan_holds_after_a_mass_delete() {
+        let s = Server::new();
+        let (a, b) = (format!("{DOC}/a.txt"), format!("{DOC}/b.txt"));
+        s.write(&a, b"a");
+        s.write(&b, b"b");
+        s.state.scan_all();
+        assert_eq!(s.kinds(), vec!["file.created", "file.created"]);
+        s.rm(&a);
+        s.rm(&b);
+        s.state.scan_all();
+        assert!(s.marker().is_file());
+        assert_eq!(s.events().len(), 2);
+    }
+
+    /// A data folder with a socket session of the bound device and the follower cursor.
+    struct Pushed {
+        s: Server,
+        cursor: u64,
+        rx: tokio::sync::mpsc::Receiver<Outbound>,
+        inbound: notedown_cloud::socket::LastInbound,
+    }
+
+    impl Pushed {
+        fn new() -> Pushed {
+            let s = Server::with(Config {
+                protect: false,
+                push: PushMode::Reconnect,
+                ..Config::default()
+            });
+            let cursor = start_seq(&s.state).unwrap();
+            let (rx, inbound) = s.state.sockets.register("jordi", SERIAL, "sid", s.now());
+            Pushed {
+                s,
+                cursor,
+                rx,
+                inbound,
+            }
+        }
+
+        /// Follow the journal and tick 2 s later; the pushes handed over.
+        fn follow_and_tick(&mut self) -> usize {
+            follow_once(&self.s.state, &mut self.cursor).unwrap();
+            self.s.advance_ms(2000);
+            let now = self.s.now();
+            self.inbound.store(now, Ordering::SeqCst);
+            tick(&self.s.state, now)
+        }
+
+        fn closed(&mut self) -> bool {
+            let mut out = Vec::new();
+            while let Ok(o) = self.rx.try_recv() {
+                out.push(o);
+            }
+            match out.as_slice() {
+                [] => false,
+                [Outbound::Close(reason)] => {
+                    assert_eq!(*reason, RECONNECT_REASON);
+                    true
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_scan_event_is_pushed() {
+        let mut p = Pushed::new();
+        p.s.write(&format!("{DOC}/a.txt"), b"a");
+        p.s.state.scan_all();
+        assert_eq!(p.follow_and_tick(), 1);
+        assert!(p.closed());
+    }
+
+    #[test]
+    fn no_push_while_a_hold_exists() {
+        let mut p = Pushed::new();
+        let (a, b) = (format!("{DOC}/a.txt"), format!("{DOC}/b.txt"));
+        p.s.write(&a, b"a");
+        p.s.write(&b, b"b");
+        p.s.state.scan_all();
+        p.s.rm(&a);
+        p.s.rm(&b);
+        p.s.state.scan_all();
+        assert!(p.s.marker().is_file());
+        // The created events wait for the push gate.
+        assert_eq!(p.follow_and_tick(), 0);
+        assert!(!p.closed());
+        // The files come back: the hold ends and the waiting push goes out.
+        p.s.write(&a, b"a");
+        p.s.write(&b, b"b");
+        p.s.state.scan_all();
+        assert!(!p.s.marker().exists());
+        assert_eq!(p.follow_and_tick(), 1);
+        assert!(p.closed());
+    }
+
+    #[test]
+    fn scan_interval_zero_turns_the_timer_off() {
+        let d = tempfile::tempdir().unwrap();
+        let c = Config::default();
+        assert_eq!(c.scan_interval, 300);
+        assert_eq!(c.scan_min_files, 1);
+        assert_eq!(c.scan_period(), Some(std::time::Duration::from_secs(300)));
+        std::fs::write(Config::path(d.path()), "scan_interval = 0\n").unwrap();
+        let c = Config::load_or_create(d.path()).unwrap();
+        assert_eq!(c.scan_interval, 0);
+        assert_eq!(c.scan_period(), None);
+    }
+
+    #[test]
+    fn the_hold_warning_names_the_account_and_the_way_out() {
+        let hold = ScanHold {
+            at: 0,
+            gone: 412,
+            left: 0,
+            min: 1,
+            examples: Vec::new(),
+        };
+        assert_eq!(
+            scan_hold_warning("jordi", &hold),
+            "account jordi: 412 files are gone from the data folder and only 0 would be left. \
+             Device sync is on hold. If that's on purpose, run: \
+             notedown cloud scan --account jordi --accept"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_server_scans_at_start() {
+        let s = Server::new();
+        s.write(&format!("{DOC}/a.txt"), b"a");
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = tokio::spawn(serve_listeners(vec![l], s.state.clone()));
+        let mut found = false;
+        for _ in 0..100 {
+            if !s.events().is_empty() {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        server.abort();
+        assert!(found, "no scan at start");
+        assert_eq!(s.kinds(), vec!["file.created"]);
+    }
+}

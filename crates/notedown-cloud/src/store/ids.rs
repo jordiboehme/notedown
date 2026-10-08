@@ -9,8 +9,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::ops::Bound;
-use std::path::Path;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +22,17 @@ use crate::{Error, Result, io_err};
 pub const FIRST_ID: u64 = 1000;
 pub(crate) const IDS_FILE: &str = "ids.json";
 pub(crate) const LOG_FILE: &str = "ids.jsonl";
+
+/// How often [`Registry::load`] read the registry of each account folder in this process.
+static LOADS: LazyLock<Mutex<HashMap<PathBuf, usize>>> = LazyLock::new(Mutex::default);
+
+/// How often the registry of `account_dir` was loaded in this process (tests: a start must
+/// load it once). Keyed by the folder, so tests on other accounts do not disturb it.
+#[doc(hidden)]
+pub fn registry_loads(account_dir: &Path) -> usize {
+    let loads = LOADS.lock().unwrap_or_else(|e| e.into_inner());
+    loads.get(account_dir).copied().unwrap_or(0)
+}
 
 /// One registry row, as stored in `ids.json` (field order is the file order).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,6 +343,11 @@ impl Registry {
     /// ignored; with `repair` (only under the store lock) it is also cut from the file. A corrupt
     /// complete line is an error: guessing could reuse or lose ids.
     pub fn load(dir: &Path, repair: bool) -> Result<Registry> {
+        *LOADS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(dir.to_path_buf())
+            .or_default() += 1;
         let mut reg = Registry::default();
         let ids_path = dir.join(IDS_FILE);
         match std::fs::read(&ids_path) {

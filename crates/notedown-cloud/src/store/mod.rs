@@ -33,7 +33,8 @@ pub use commit::{
     PruneAllReport, PutOptions, RECYCLE_DIR, Recovery, STALE_TEMP_AGE, SideWrite, WriteGuard,
     prune_all_recycle, recover_all, sweep_all_temps,
 };
-pub use ids::FIRST_ID;
+pub(crate) use commit::{recover_all_keeping, sweep_all_temps_with};
+pub use ids::{FIRST_ID, registry_loads};
 pub use list::Entry;
 pub use path::WirePath;
 pub use recycle::{

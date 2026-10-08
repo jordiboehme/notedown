@@ -1953,6 +1953,17 @@ impl Store {
 /// server start and with the hourly staging sweep. An account whose store cannot be opened (a
 /// damaged one, say) is reported on stderr and skipped. Returns how many files were removed.
 pub fn sweep_all_temps(data_dir: &Path) -> Result<usize> {
+    sweep_all_temps_with(data_dir, &[])
+}
+
+/// [`sweep_all_temps`] that takes an account's store from `open` if it is there instead of
+/// opening it again (the server start passes the stores its recovery opened). Only an opened
+/// store compacts `ids.jsonl`, so the hourly sweep keeps opening its own.
+pub(crate) fn sweep_all_temps_with(data_dir: &Path, open: &[Store]) -> Result<usize> {
+    fn sweep(store: &Store) -> Result<usize> {
+        let _guard = store.lock()?;
+        store.sweep_temps()
+    }
     let accounts = crate::auth::Accounts::new(data_dir);
     let mut removed = 0;
     for account in accounts.list()? {
@@ -1963,10 +1974,10 @@ pub fn sweep_all_temps(data_dir: &Path) -> Result<usize> {
         {
             continue;
         }
-        let swept = Store::open(data_dir, &account.slug).and_then(|store| {
-            let _guard = store.lock()?;
-            store.sweep_temps()
-        });
+        let swept = match open.iter().find(|s| s.slug == account.slug) {
+            Some(store) => sweep(store),
+            None => Store::open(data_dir, &account.slug).and_then(|store| sweep(&store)),
+        };
         match swept {
             Ok(n) => removed += n,
             Err(e) => eprintln!(
@@ -2038,21 +2049,37 @@ pub fn prune_all_recycle(
 /// something or failed. A failure of one account (an
 /// unreadable `pending.json`, say) does not stop the others; the caller reports it.
 pub fn recover_all(data_dir: &Path, journal: &Journal) -> Result<Vec<(String, Result<Recovery>)>> {
+    Ok(recover_all_keeping(data_dir, journal)?.0)
+}
+
+/// What [`recover_all_keeping`] found: the accounts [`recover_all`] reports, and every store
+/// it opened.
+pub(crate) type RecoveredStores = (Vec<(String, Result<Recovery>)>, Vec<Store>);
+
+/// [`recover_all`] that also hands back the stores it opened (also those whose recovery
+/// failed: [`Store::lock_recovered`] tries again), so the server start keeps them instead of
+/// loading each registry again. They no longer announce a busy store lock.
+pub(crate) fn recover_all_keeping(data_dir: &Path, journal: &Journal) -> Result<RecoveredStores> {
     let accounts = crate::auth::Accounts::new(data_dir);
     let mut out = Vec::new();
+    let mut stores = Vec::new();
     for account in accounts.list()? {
         let store_dir = accounts.account_dir(&account.slug);
         if !store_dir.join(PENDING_FILE).exists() && !store_dir.join(super::FILES_DIR).is_dir() {
             continue;
         }
         // A running import holds the store lock for its whole run: say why this waits.
-        let r = Store::open_announced(data_dir, &account.slug).and_then(|store| {
-            let guard = store.lock()?;
-            store.recover(&guard, journal)
+        let r = Store::open_announced(data_dir, &account.slug).and_then(|mut store| {
+            let r = store
+                .lock()
+                .and_then(|guard| store.recover(&guard, journal));
+            store.announce_wait = false;
+            stores.push(store);
+            r
         });
         if !matches!(r, Ok(Recovery::Clean)) {
             out.push((account.slug, r));
         }
     }
-    Ok(out)
+    Ok((out, stores))
 }

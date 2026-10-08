@@ -1180,3 +1180,68 @@ fn without_the_marker_or_during_an_import_a_vanished_files_folder_lists_empty() 
     std::fs::remove_dir_all(files_dir(dir.path())).unwrap();
     assert!(import.list(&g, &WirePath::root(), true).unwrap().is_empty());
 }
+
+// ---------------------------------------------------------------- registry loads at start
+
+/// An account with three files that have ids. With `compacted`, a second open folded
+/// `ids.jsonl` into `ids.json`; without, the log still holds the assignments.
+fn account_with_ids(compacted: bool) -> tempfile::TempDir {
+    let (dir, store) = setup();
+    for name in ["a.note", "b.note", "c.note"] {
+        put(dir.path(), &format!("NOTE/Note/{name}"), b"x");
+    }
+    {
+        let g = store.lock().unwrap();
+        store.list(&g, &WirePath::root(), true).unwrap();
+    }
+    drop(store);
+    let log = account_dir(dir.path()).join("ids.jsonl");
+    assert!(std::fs::metadata(&log).unwrap().len() > 0);
+    if compacted {
+        drop(Store::open(dir.path(), SLUG).unwrap());
+        assert!(!log.exists());
+    }
+    dir
+}
+
+/// Open the store, lock it and list the whole tree; the registry loads this took.
+fn loads_from_open_to_first_listing(dir: &Path) -> usize {
+    let acc = account_dir(dir);
+    let before = notedown_cloud::store::registry_loads(&acc);
+    let store = Store::open(dir, SLUG).unwrap();
+    let g = store.lock().unwrap();
+    assert_eq!(store.list(&g, &WirePath::root(), true).unwrap().len(), 5);
+    notedown_cloud::store::registry_loads(&acc) - before
+}
+
+#[test]
+fn a_store_loads_its_registry_once_from_open_to_the_first_listing() {
+    let dir = account_with_ids(false);
+    assert_eq!(loads_from_open_to_first_listing(dir.path()), 1);
+}
+
+#[test]
+fn a_store_with_an_empty_log_loads_its_registry_once() {
+    let dir = account_with_ids(true);
+    assert_eq!(loads_from_open_to_first_listing(dir.path()), 1);
+}
+
+#[test]
+fn a_server_start_loads_the_registry_once_up_to_the_first_listing() {
+    use notedown_cloud::Config;
+    use notedown_cloud::server::AppState;
+    for compacted in [false, true] {
+        let dir = account_with_ids(compacted);
+        let acc = account_dir(dir.path());
+        let before = notedown_cloud::store::registry_loads(&acc);
+        let state = AppState::open(Config::default(), dir.path()).unwrap();
+        let store = state.store(SLUG).unwrap();
+        let g = store.lock().unwrap();
+        assert_eq!(store.list(&g, &WirePath::root(), true).unwrap().len(), 5);
+        assert_eq!(
+            notedown_cloud::store::registry_loads(&acc) - before,
+            1,
+            "compacted: {compacted}"
+        );
+    }
+}

@@ -92,7 +92,9 @@ impl AppState {
                 ..JournalOptions::default()
             },
         )?;
-        for (slug, r) in crate::store::recover_all(data_dir, &journal)? {
+        // The stores recovery opened are kept: the start loads each registry once.
+        let (recovered, opened) = crate::store::recover_all_keeping(data_dir, &journal)?;
+        for (slug, r) in recovered {
             match r {
                 Ok(r) => eprintln!("notedown cloud: account {slug}: {r}"),
                 Err(e) => {
@@ -110,14 +112,21 @@ impl AppState {
             Ok(n) => eprintln!("notedown cloud: removed {n} stale upload staging entries"),
             Err(e) => eprintln!("notedown cloud: staging sweep failed: {e}"),
         }
-        report_temp_sweep(crate::store::sweep_all_temps(data_dir));
+        report_temp_sweep(crate::store::sweep_all_temps_with(data_dir, &opened));
+        let stores = opened
+            .into_iter()
+            .map(|store| {
+                log_names_not_preserved(&log, &store);
+                (store.slug().to_string(), Arc::new(store))
+            })
+            .collect();
         Ok(Arc::new(AppState {
             auth: Auth::open(data_dir)?,
             url_signer: UrlSigner::load_or_create(data_dir)?,
             sync_locks: SyncLocks::new(),
             sockets: crate::socket::SocketRegistry::new(),
             push: Mutex::new(PushPlanner::new(PushTiming::default())),
-            stores: Mutex::new(HashMap::new()),
+            stores: Mutex::new(stores),
             usage: Mutex::new(HashMap::new()),
             staging_locks: StagingLocks::default(),
             part_max: AtomicU64::new(staging::PART_MAX),
@@ -147,13 +156,7 @@ impl AppState {
         // Opened without the map lock: `Store::open` waits for the account's store lock (a CLI
         // import may hold it), and other accounts must not wait behind that.
         let store = Arc::new(Store::open(&self.data_dir, slug)?);
-        if !store.names_preserved() {
-            // `Store::open` warned on stderr; the protocol log gets a marker too.
-            let mut m = LogEntry::new(LogKind::Marker);
-            m.flags = vec![FLAG_NAMES_NOT_PRESERVED.to_string()];
-            m.message = Some(store.names_warning());
-            self.log.record(m);
-        }
+        log_names_not_preserved(&self.log, &store);
         Ok(stores().entry(slug.to_string()).or_insert(store).clone())
     }
 
@@ -428,6 +431,17 @@ fn shell_word(text: &str) -> String {
         text.to_string()
     } else {
         format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+/// `Store::open` warned on stderr when the file system changes names; the protocol log gets a
+/// marker too.
+fn log_names_not_preserved(log: &ProtocolLog, store: &Store) {
+    if !store.names_preserved() {
+        let mut m = LogEntry::new(LogKind::Marker);
+        m.flags = vec![FLAG_NAMES_NOT_PRESERVED.to_string()];
+        m.message = Some(store.names_warning());
+        log.record(m);
     }
 }
 

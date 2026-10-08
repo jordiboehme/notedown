@@ -541,6 +541,25 @@ fn a_render_folder_on_the_data_folder_is_refused() {
     assert!(!data.join(MANIFEST_FILE).exists());
     assert!(!data.join(LOCK_FILE).exists());
 
+    // The same with another spelling of the name: on a case-insensitive disk, `<root>/acc` is
+    // the data folder `Acc`.
+    let parent = tempfile::tempdir().unwrap();
+    let data = parent.path().join("Acc");
+    std::fs::create_dir(&data).unwrap();
+    if parent.path().join("acc").exists() {
+        Accounts::new(&data)
+            .create("acc", "acc@example.org", "secret")
+            .unwrap();
+        let store = Store::open(&data, "acc").unwrap();
+        {
+            let g = store.lock().unwrap();
+            store.ensure_native_folders(&g).unwrap();
+        }
+        let err = render_err(&store, parent.path());
+        assert!(err.contains("inside the data folder"), "{err}");
+        assert!(!data.join(MANIFEST_FILE).exists());
+    }
+
     // The parent of a data folder with another name is fine.
     let other = tempfile::tempdir().unwrap();
     let data = other.path().join("notedown-data");

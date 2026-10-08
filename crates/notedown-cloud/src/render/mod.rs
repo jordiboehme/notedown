@@ -500,6 +500,12 @@ impl Pass {
                 return self.changed();
             }
         }
+        // A foreign file at the target is kept, so the note is not read or rendered at all.
+        let old = row.as_ref().filter(|r| r.pdf).map(Row::pdf_path);
+        if !self.is_ours(target, old.as_deref()) {
+            self.report.kept_foreign.push(target.to_string());
+            return Ok(());
+        }
         let bytes = match bytes {
             Some(bytes) => bytes,
             None => {
@@ -618,6 +624,7 @@ impl Pass {
                 return self.changed();
             }
         };
+        // Checked again: a file may have been put there while the note was rendered.
         if !self.is_ours(&new, old.as_deref()) {
             self.report.kept_foreign.push(new);
             return Ok(());

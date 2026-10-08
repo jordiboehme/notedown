@@ -370,6 +370,27 @@ fn an_unreadable_note_gets_no_pdf_and_is_not_retried() {
     assert_eq!(fx.pass().written, s(&["NOTE/Note/a.pdf"]));
 }
 
+/// A note whose PDF place holds a foreign file is not rendered at all: a note that would fail
+/// to render is kept foreign and never counts as failed, on every pass.
+#[test]
+fn a_note_whose_target_is_foreign_is_not_rendered() {
+    let fx = Fx::new();
+    std::fs::create_dir_all(fx.out().join("NOTE/Note")).unwrap();
+    std::fs::write(fx.out().join("NOTE/Note/a.pdf"), b"%PDF-1.7 mine").unwrap();
+    let bytes = fixture_note("test1");
+    fx.write("NOTE/Note/a.note", &bytes[..100]);
+    fx.scan();
+    for _ in 0..2 {
+        let r = fx.pass();
+        assert_eq!(r.kept_foreign, s(&["NOTE/Note/a.pdf"]), "{r:?}");
+        assert!(r.failed.is_empty() && r.written.is_empty(), "{r:?}");
+    }
+    assert_eq!(
+        std::fs::read(fx.out().join("NOTE/Note/a.pdf")).unwrap(),
+        b"%PDF-1.7 mine"
+    );
+}
+
 #[test]
 fn a_foreign_file_in_the_render_root_is_left_alone() {
     let fx = Fx::new();

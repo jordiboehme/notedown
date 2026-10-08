@@ -772,12 +772,7 @@ impl Store {
         let replaced = state.hashes.cached(path).is_some();
         state.hashes.insert(
             path,
-            hashes::HashRow {
-                size: written.size,
-                mtime_ns: written.mtime_ns,
-                ctime_ns: Some(written.ctime_ns),
-                md5: md5.to_string(),
-            },
+            hashes::HashRow::new(written.size, written.mtime_ns, written.ctime_ns, md5),
         );
         if replaced {
             self.flush_hashes(&mut state)?;
@@ -785,7 +780,9 @@ impl Store {
         Ok(())
     }
 
-    /// The cached MD5 of the file at `path`, without touching the disk (it may be stale).
+    /// The cached MD5 of the file at `path`, without touching the disk (it may be stale). Test
+    /// hook only: the integration tests read the cache with it.
+    #[doc(hidden)]
     pub fn cached_md5(&self, guard: &StoreGuard, path: &WirePath) -> Result<Option<String>> {
         self.check_guard(guard)?;
         Ok(self.state().hashes.cached(path).map(str::to_string))

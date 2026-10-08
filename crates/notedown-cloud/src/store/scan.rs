@@ -278,8 +278,7 @@ impl Store {
     ) -> Result<ScanReport> {
         self.check_write(guard)?;
         let (disk, parents, cache) = self.scan_disk(opts)?;
-        // The cache rows of gone paths come from the store's cache: the walk hashed only paths
-        // on disk, so the copy holds no rows for them.
+        // The plan reads the rows of gone paths from the store's cache.
         // Under the state mutex: a whole-tree plan (about 8 ms at 20000 files) blocks `id_of`
         // and `path_of` readers for that time.
         let plan = {

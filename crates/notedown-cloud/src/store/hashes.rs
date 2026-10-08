@@ -25,6 +25,18 @@ pub(crate) struct HashRow {
     pub md5: String,
 }
 
+impl HashRow {
+    /// The row of a file with this size, mtime and ctime whose content has `md5`.
+    pub(crate) fn new(size: u64, mtime_ns: u64, ctime_ns: u64, md5: &str) -> HashRow {
+        HashRow {
+            size,
+            mtime_ns,
+            ctime_ns: Some(ctime_ns),
+            md5: md5.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HashCache {
     rows: BTreeMap<String, HashRow>,
@@ -187,12 +199,7 @@ impl HashCache {
     pub fn hashed(&mut self, key: &WirePath, meta: &std::fs::Metadata, md5: &str) {
         self.rows.insert(
             key.display(),
-            HashRow {
-                size: meta.len(),
-                mtime_ns: mtime_ns(meta),
-                ctime_ns: Some(ctime_ns(meta)),
-                md5: md5.to_string(),
-            },
+            HashRow::new(meta.len(), mtime_ns(meta), ctime_ns(meta), md5),
         );
         self.dirty = true;
     }
@@ -412,15 +419,7 @@ mod tests {
     fn removed_all_drops_folders_by_whole_segments() {
         let mut cache = HashCache::default();
         for k in ["a/b/x", "a/bc/y", "a/b", "c/d", "e"] {
-            cache.rows.insert(
-                k.into(),
-                HashRow {
-                    size: 1,
-                    mtime_ns: 1,
-                    ctime_ns: Some(1),
-                    md5: "m".into(),
-                },
-            );
+            cache.rows.insert(k.into(), HashRow::new(1, 1, 1, "m"));
         }
         cache.removed_all(&[wp("a/b"), wp("c")]);
         let left: Vec<&str> = cache.rows.keys().map(String::as_str).collect();

@@ -9,24 +9,29 @@
 //! - **changed**: a file whose fresh MD5 differs from the cached one (a file without a cached
 //!   MD5 is hashed and cached without an event);
 //! - **gone**: a registry row whose path no longer holds an entry of its kind;
-//! - **moved**: a gone file and a new file with the same MD5, when that MD5 is unique among the
-//!   gone files and among the new files. The file keeps its id. Folders are never paired.
+//! - **moved**: a gone file and a new file with the same size and MD5 (for the gone file: its
+//!   row in `hashes.json`), when that pair of values is unique among the gone files and among
+//!   the new files. The file keeps its id. Folders are never paired; a folder renamed on disk
+//!   is deleted and created, and its files move one by one.
 //!
 //! The scope is a folder (or a file) and what lies below it: every descendant, or only the
 //! direct children when the scan is not recursive. A gone folder in the scope takes its whole
 //! subtree along. Parents of the scope that have no id yet are created too.
 //!
 //! The scan never renames, moves or deletes anything in `files/`. Under the store lock it plans
-//! on copies of the registry and the cache, appends the events to the journal (one batch, one
-//! `opId`, `origin: "scan"`), then the registry ops in one log append and the cache, then the
-//! page records. A crash after the journal append journals the same changes again at the next
-//! scan; the registry is never ahead of the journal.
+//! on copies of the registry and the cache, reserves the new ids in the registry log (the next
+//! id only, no rows), appends the events to the journal (one batch, one `opId`,
+//! `origin: "scan"`), then the registry ops in one log append and the cache, then the page
+//! records. A crash after the journal append journals the same changes again at the next scan
+//! (with new ids; the reserved ones stay unused); the registry is never ahead of the journal,
+//! and no id the journal used is handed out again.
 //!
 //! A plan that removes files holds instead of applying when fewer than `min_files` files would
 //! be left in the whole account (an empty data folder, an unmounted volume). It writes
 //! [`SCAN_HOLD_FILE`] and keeps it while the condition stays. A later whole-tree scan that no
-//! longer matches, or one with `accept`, removes it and applies its plan. A scoped scan never
-//! removes it: it can't see whether the files outside its scope came back.
+//! longer matches, or one with `accept`, removes it and applies its plan. While it exists, a
+//! scoped scan applies nothing and reports the hold: it can't see whether the files outside its
+//! scope came back.
 
 use std::collections::{HashMap, HashSet};
 
@@ -85,7 +90,8 @@ pub struct ScanReport {
     pub moved: Vec<(WirePath, WirePath)>,
     /// Gone files, then gone folders (children first).
     pub deleted: Vec<WirePath>,
-    /// The hold, when the plan was not applied because too few files would be left.
+    /// The hold, when the plan was not applied: too few files would be left, or a hold exists
+    /// and the scan is scoped.
     pub held: Option<ScanHold>,
     /// An earlier hold was removed (for a dry run: would be removed). Only a whole-tree scan or
     /// one with `accept` removes it.
@@ -241,6 +247,20 @@ impl Store {
         opts: &ScanOptions,
         now_ms: u64,
     ) -> Result<ScanReport> {
+        self.scan_until(guard, journal, opts, now_ms, false)
+    }
+
+    /// [`Store::scan`] that stops after the journal append, before the registry append, as a
+    /// crash there would. Test hook.
+    #[doc(hidden)]
+    pub fn scan_until(
+        &self,
+        guard: &WriteGuard,
+        journal: &Journal,
+        opts: &ScanOptions,
+        now_ms: u64,
+        stop_after_journal: bool,
+    ) -> Result<ScanReport> {
         self.check_write(guard)?;
         let (reg, mut cache) = {
             let state = self.state();
@@ -252,32 +272,62 @@ impl Store {
         // An unreadable marker counts as one: it is replaced or removed.
         let marker = self.scan_hold();
         let has_marker = !matches!(marker, Ok(None));
-        if !opts.accept
-            && let Some(fresh) = plan.hold(opts.min_files, now_ms)
-        {
-            // An existing marker stays as it is while the condition holds.
-            let hold = match marker {
-                Ok(Some(old)) => old,
-                _ => {
-                    if !opts.dry_run {
-                        self.write_hold(&fresh)?;
-                    }
-                    fresh
-                }
-            };
-            report.held = Some(hold);
-            return Ok(report);
-        }
-        // Only a whole-tree scan knows that the files came back; a scoped one applies its own
-        // plan and leaves the marker.
         let whole = opts.scope.is_root() && opts.recursive;
-        report.released = has_marker && (whole || opts.accept);
+        if !opts.accept {
+            let held = if let Some(fresh) = plan.hold(opts.min_files, now_ms) {
+                // An existing marker stays as it is while the condition holds.
+                Some(match marker {
+                    Ok(Some(old)) => old,
+                    _ => {
+                        if !opts.dry_run {
+                            self.write_hold(&fresh)?;
+                        }
+                        fresh
+                    }
+                })
+            } else if has_marker && !whole {
+                // Only a whole-tree scan knows whether the files came back. A scoped one counts
+                // the files outside its scope as left, so it applies nothing while held.
+                Some(match marker {
+                    Ok(Some(old)) => old,
+                    _ => ScanHold {
+                        at: now_ms,
+                        gone: 0,
+                        left: plan.left,
+                        min: opts.min_files,
+                        examples: Vec::new(),
+                    },
+                })
+            } else {
+                None
+            };
+            if held.is_some() {
+                report.held = held;
+                return Ok(report);
+            }
+        }
+        report.released = has_marker;
         if opts.dry_run {
             return Ok(report);
         }
-        // Events first: the registry is never ahead of the journal.
         let (mut events, side_writes) = self.scan_events(&plan);
+        // The new ids are reserved first: after a crash between the journal append and the
+        // registry append, no other write gets an id the journal already used.
+        if let Some(last) = plan
+            .new_folders
+            .iter()
+            .chain(&plan.new_files)
+            .map(|n| n.id)
+            .max()
+        {
+            let mut state = self.state();
+            self.append(&mut state, &[Op::Reserve { next: last + 1 }])?;
+        }
+        // Events next: the registry is never ahead of the journal.
         report.seqs = journal.append(&mut events)?;
+        if stop_after_journal {
+            return Ok(report);
+        }
         self.finish_scan(&plan, cache, opts)?;
         if report.released {
             self.remove_hold()?;
@@ -372,6 +422,15 @@ impl Store {
     fn scan_events(&self, plan: &Plan) -> (Vec<Event>, Vec<SideWrite>) {
         let mut bodies = Vec::new();
         let mut writes = Vec::new();
+        // The page records, read once, when a changed or moved note needs them.
+        let is_note = |p: &WirePath| FileKind::of(p.name().unwrap_or_default()) == FileKind::Note;
+        let by_path = if plan.modified.iter().any(|(_, d)| is_note(&d.path))
+            || plan.moved.iter().any(|(_, from, _)| is_note(from))
+        {
+            crate::pages::records_by_path(self)
+        } else {
+            Default::default()
+        };
         for n in &plan.new_folders {
             bodies.push(EventBody::FolderCreated {
                 id: n.id,
@@ -379,7 +438,8 @@ impl Store {
             });
         }
         for n in &plan.new_files {
-            let (kind, pages_changed, pages) = self.scan_pages(n.id, &n.entry, None, &mut writes);
+            let (kind, pages_changed, pages) =
+                self.scan_pages(n.id, &n.entry, None, &by_path, &mut writes);
             bodies.push(EventBody::FileCreated {
                 id: n.id,
                 path: n.entry.path.display(),
@@ -392,7 +452,8 @@ impl Store {
         }
         for (id, d) in &plan.modified {
             let prev = d.prev.clone().unwrap_or_default();
-            let (kind, pages_changed, pages) = self.scan_pages(*id, d, Some(&prev), &mut writes);
+            let (kind, pages_changed, pages) =
+                self.scan_pages(*id, d, Some(&prev), &by_path, &mut writes);
             bodies.push(EventBody::FileModified {
                 id: *id,
                 path: d.path.display(),
@@ -406,7 +467,7 @@ impl Store {
         }
         let mut moved_notes = Vec::new();
         for (id, from, d) in &plan.moved {
-            if FileKind::of(from.name().unwrap_or_default()) == FileKind::Note {
+            if is_note(from) {
                 moved_notes.push((from.clone(), d.path.clone()));
             }
             bodies.push(EventBody::FileMoved {
@@ -415,7 +476,7 @@ impl Store {
                 old_path: from.display(),
             });
         }
-        writes.extend(crate::pages::move_records(self, &moved_notes));
+        writes.extend(crate::pages::move_records(self, &by_path, &moved_notes));
         for g in &plan.gone_files {
             bodies.push(EventBody::FileDeleted {
                 id: g.id,
@@ -444,13 +505,15 @@ impl Store {
         id: u64,
         d: &OnDisk,
         prev: Option<&str>,
+        by_path: &crate::pages::RecordsByPath,
         writes: &mut Vec<SideWrite>,
     ) -> (FileKind, Option<u64>, Vec<EventBody>) {
         let kind = FileKind::of(d.path.name().unwrap_or_default());
         if kind != FileKind::Note {
             return (kind, None, Vec::new());
         }
-        let (changed, events, w) = crate::pages::scan_note(self, &d.path, id, &d.md5, d.size, prev);
+        let (changed, events, w) =
+            crate::pages::scan_note(self, &d.path, id, &d.md5, d.size, prev, by_path);
         writes.extend(w);
         (kind, changed, events)
     }
@@ -602,8 +665,8 @@ fn plan(
         }
     }
 
-    // Moves: a gone file and a new file with the same MD5, each the only one with it on its
-    // side. The new path must be free of other rows (a gone folder there is removed later).
+    // Moves: a gone file and a new file with the same size and MD5, each the only one with
+    // them on its side. The new path must be free of other rows (a gone folder there is removed later).
     let mut gone_files = Vec::new();
     for g in gone {
         match g.kind {
@@ -614,17 +677,22 @@ fn plan(
             Kind::Folder => p.gone_folders.push(g),
         }
     }
-    let mut by_md5: HashMap<&str, (Vec<usize>, Vec<usize>)> = HashMap::new();
-    let gone_md5: Vec<Option<&str>> = gone_files.iter().map(|g| cache.cached(&g.path)).collect();
-    for (i, md5) in gone_md5.iter().enumerate() {
-        if let Some(md5) = md5 {
-            by_md5.entry(md5).or_default().0.push(i);
+    // (size, MD5) -> the gone files and the new files with them.
+    type Sides = (Vec<usize>, Vec<usize>);
+    let mut by_content: HashMap<(u64, &str), Sides> = HashMap::new();
+    for (i, g) in gone_files.iter().enumerate() {
+        if let Some(key) = cache.cached_with_size(&g.path) {
+            by_content.entry(key).or_default().0.push(i);
         }
     }
     for (i, d) in new_files.iter().enumerate() {
-        by_md5.entry(d.md5.as_str()).or_default().1.push(i);
+        by_content
+            .entry((d.size, d.md5.as_str()))
+            .or_default()
+            .1
+            .push(i);
     }
-    let mut pairs: Vec<(usize, usize)> = by_md5
+    let mut pairs: Vec<(usize, usize)> = by_content
         .values()
         .filter_map(|(g, n)| match (g.as_slice(), n.as_slice()) {
             ([g], [n]) if reg.id_of(&new_files[*n].path).is_none() => Some((*g, *n)),

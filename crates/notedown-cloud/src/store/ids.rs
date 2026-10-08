@@ -1,8 +1,9 @@
 //! The id registry: `ids.json` (compacted state) plus `ids.jsonl` (append log).
 //!
 //! Ids are `u64`, start at [`FIRST_ID`] and are never reused. A move keeps the id (a folder move
-//! moves every descendant), a copy gets a new id. The log lines are `assign`, `move` and
-//! `remove`; replaying a line twice gives the same state, so a crash during compaction (after
+//! moves every descendant), a copy gets a new id. The log lines are `assign`, `move`, `remove`
+//! and `reserve` (raises the next id without a row, so ids a journal append used before their
+//! rows were written are never handed out again); replaying a line twice gives the same state, so a crash during compaction (after
 //! `ids.json` is written, before the log is removed) is harmless.
 
 use std::collections::{BTreeMap, HashMap};
@@ -38,9 +39,22 @@ struct IdsFile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub(crate) enum Op {
-    Assign { id: u64, kind: Kind, path: String },
-    Move { id: u64, path: String },
-    Remove { id: u64 },
+    Assign {
+        id: u64,
+        kind: Kind,
+        path: String,
+    },
+    Move {
+        id: u64,
+        path: String,
+    },
+    Remove {
+        id: u64,
+    },
+    /// The next id is at least `next`; no row changes.
+    Reserve {
+        next: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -177,6 +191,7 @@ impl Registry {
                     self.insert(m, k, p);
                 }
             }
+            Op::Reserve { next } => self.next = self.next.max(*next),
             Op::Remove { id } => {
                 let Some((kind, path)) = self.by_id.get(id).cloned() else {
                     return;

@@ -734,18 +734,24 @@ pub fn plan_page_move(store: &Store, _guard: &WriteGuard, commit: &mut Commit) {
             }
         }
     }
-    commit.side_writes.extend(move_records(store, &notes));
+    if notes.is_empty() {
+        return;
+    }
+    // One pass over the records, instead of parsing every moved note for its FILE_ID.
+    let by_path = records_by_path(store);
+    commit
+        .side_writes
+        .extend(move_records(store, &by_path, &notes));
 }
 
 /// The record changes for notes that moved from the first path to the second (see
 /// [`plan_page_move`]): the record's `path` follows, and a record keyed by the old path is
 /// re-keyed by the new path. Empty when no note has a record.
-pub(crate) fn move_records(store: &Store, notes: &[(WirePath, WirePath)]) -> Vec<SideWrite> {
-    if notes.is_empty() {
-        return Vec::new();
-    }
-    // One pass over the records, instead of parsing every moved note for its FILE_ID.
-    let by_path = records_by_path(store);
+pub(crate) fn move_records(
+    store: &Store,
+    by_path: &RecordsByPath,
+    notes: &[(WirePath, WirePath)],
+) -> Vec<SideWrite> {
     let mut writes = Vec::new();
     for (old, new) in notes {
         for (key, mut r) in by_path.get(&old.display()).cloned().unwrap_or_default() {
@@ -765,7 +771,8 @@ pub(crate) fn move_records(store: &Store, notes: &[(WirePath, WirePath)]) -> Vec
 /// The page index of a note the scan found new or changed on disk (store id `id`, `md5`,
 /// `size`): `pagesChanged` for its file event, the page events, and the record changes. The
 /// old note is no longer on disk, so the state before is the record for this path with
-/// `prev_md5` (the MD5 the store knew), under any key; without one, the new file is the
+/// `prev_md5` (the MD5 the store knew), under any key, found in `by_path` (read once per scan
+/// with [`records_by_path`]); without one, the new file is the
 /// baseline and the diff is empty. `None` for `prev_md5` is a new note: every page is added.
 /// Never fails: a note that does not parse gives `page.index_failed`.
 pub(crate) fn scan_note(
@@ -775,6 +782,7 @@ pub(crate) fn scan_note(
     md5: &str,
     size: u64,
     prev_md5: Option<&str>,
+    by_path: &RecordsByPath,
 ) -> (Option<u64>, Vec<EventBody>, Vec<SideWrite>) {
     let w = Write {
         target: path,
@@ -783,12 +791,12 @@ pub(crate) fn scan_note(
         current_md5: prev_md5.map(str::to_string),
         limit: MAX_NOTE_BYTES,
         known: prev_md5.and_then(|prev| {
-            let records = records_by_path(store).remove(&path.display())?;
-            let (key, r) = records.into_iter().find(|(_, r)| r.md5 == prev)?;
+            let records = by_path.get(&path.display())?;
+            let (key, r) = records.iter().find(|(_, r)| r.md5 == prev)?;
             Some(Before {
-                key: Some(key),
-                note_id: r.note_id,
-                pages: r.pages,
+                key: Some(key.clone()),
+                note_id: r.note_id.clone(),
+                pages: r.pages.clone(),
             })
         }),
     };
@@ -807,8 +815,11 @@ pub(crate) fn scan_note(
     (diff.pages_changed(), diff.events(id), writes)
 }
 
+/// The valid records of `pages/` by their `path`, each with its key.
+pub(crate) type RecordsByPath = HashMap<String, Vec<(String, PageRecord)>>;
+
 /// Every valid record in `pages/` by its `path`, with its key.
-fn records_by_path(store: &Store) -> HashMap<String, Vec<(String, PageRecord)>> {
+pub(crate) fn records_by_path(store: &Store) -> RecordsByPath {
     let mut out: HashMap<String, Vec<(String, PageRecord)>> = HashMap::new();
     let Ok(entries) = std::fs::read_dir(store.account_dir().join(PAGES_DIR)) else {
         return out;

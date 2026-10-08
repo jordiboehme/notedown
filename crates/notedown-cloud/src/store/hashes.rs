@@ -109,6 +109,13 @@ impl HashCache {
         self.rows.get(&path.display()).map(|r| r.md5.as_str())
     }
 
+    /// The last cached size and MD5 of `path`, without touching the disk (they may be stale).
+    pub fn cached_with_size(&self, path: &WirePath) -> Option<(u64, &str)> {
+        self.rows
+            .get(&path.display())
+            .map(|r| (r.size, r.md5.as_str()))
+    }
+
     /// The MD5 of the regular file `fs_path` (wire path `key`), from the cache when size, mtime
     /// and ctime match `meta`, else hashed and cached. A file that changes while it is hashed is
     /// not cached.

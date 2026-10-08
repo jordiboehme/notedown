@@ -9,7 +9,7 @@ use notedown_cloud::Error;
 use notedown_cloud::auth::{Accounts, Imported};
 use notedown_cloud::journal::{Event, EventBody, FileKind, Journal, Origin};
 use notedown_cloud::pages::fingerprint_note;
-use notedown_cloud::store::{SCAN_HOLD_FILE, ScanOptions, ScanReport, Store, WirePath};
+use notedown_cloud::store::{Kind, SCAN_HOLD_FILE, ScanOptions, ScanReport, Store, WirePath};
 
 const EMAIL: &str = "jordi@example.org";
 /// 2026-10-06 08:20 UTC.
@@ -385,6 +385,56 @@ fn a_case_only_rename_by_hand_keeps_its_id() {
     );
     assert_eq!(fx.id(&to), Some(id));
     assert_eq!(fx.id(&from), None);
+}
+
+#[test]
+fn a_folder_renamed_by_case_only_keeps_the_ids_of_its_files() {
+    let fx = Fx::imported();
+    fx.write("Work/a.txt", b"a");
+    fx.write("Work/Sub/b.txt", b"bb");
+    fx.seed();
+    let a = fx.id("Work/a.txt").unwrap();
+    let b = fx.id("Work/Sub/b.txt").unwrap();
+    let work = fx.id("Work").unwrap();
+    let sub = fx.id("Work/Sub").unwrap();
+    std::fs::rename(fx.fs("Work"), fx.fs("work")).unwrap();
+    fx.scan();
+    let bodies = fx.bodies();
+    assert_eq!(
+        kind_names(&bodies),
+        vec![
+            "folder.created",
+            "folder.created",
+            "file.moved",
+            "file.moved",
+            "folder.deleted",
+            "folder.deleted"
+        ]
+    );
+    assert_eq!(
+        bodies[4],
+        EventBody::FolderDeleted {
+            id: sub,
+            path: "Work/Sub".into()
+        }
+    );
+    assert_eq!(
+        bodies[5],
+        EventBody::FolderDeleted {
+            id: work,
+            path: "Work".into()
+        }
+    );
+    // The folder removes in the registry never drop the moved rows.
+    assert_eq!(fx.id("work/a.txt"), Some(a));
+    assert_eq!(fx.id("work/Sub/b.txt"), Some(b));
+    for p in ["Work", "Work/Sub", "Work/a.txt", "Work/Sub/b.txt"] {
+        assert_eq!(fx.id(p), None, "{p}");
+    }
+    let fresh = Store::open(fx.dir.path(), "jordi").unwrap();
+    assert_eq!(fresh.id_of(&wp("work/a.txt")).unwrap(), Some(a));
+    assert_eq!(fresh.id_of(&wp("work/Sub/b.txt")).unwrap(), Some(b));
+    assert_eq!(fx.scan(), ScanReport::default());
 }
 
 #[test]
@@ -764,16 +814,31 @@ fn a_scoped_scan_never_releases_the_hold() {
     }
     assert!(fx.scan().held.is_some());
     let bytes = fx.account_file(SCAN_HOLD_FILE);
+    let hold = fx.store.scan_hold().unwrap();
+    let state = fx.state_files();
     fx.write("INBOX/new.txt", b"new");
     let report = fx.scan_with(&ScanOptions {
         scope: wp("INBOX"),
         recursive: true,
         ..ScanOptions::all(1)
     });
+    // While the hold exists a scoped scan applies nothing: it only reports its plan.
     assert!(!report.released);
-    assert_eq!(report.held, None);
+    assert_eq!(report.held, hold);
     assert_eq!(paths(&report.created), vec!["INBOX/new.txt"]);
+    assert!(report.seqs.is_empty());
+    assert!(fx.events().is_empty());
+    assert_eq!(fx.state_files(), state);
+    assert_eq!(fx.id("INBOX/new.txt"), None);
     assert_eq!(fx.account_file(SCAN_HOLD_FILE), bytes);
+    // The whole-tree scan with accept applies everything and removes the hold.
+    let report = fx.scan_with(&ScanOptions {
+        accept: true,
+        ..ScanOptions::all(1)
+    });
+    assert!(report.released);
+    assert!(fx.id("INBOX/new.txt").is_some());
+    assert_eq!(fx.hold_marker(), None);
 }
 
 #[test]
@@ -822,7 +887,17 @@ fn the_registry_is_never_ahead_of_the_journal() {
     std::fs::create_dir(&lock).unwrap();
     let r = fx.store.scan(&g, &fx.journal, &ScanOptions::all(1), NOW);
     assert!(r.is_err(), "{r:?}");
-    assert_eq!(fx.state_files(), state);
+    // Only the reserve of the new id reached the registry log: no row changed.
+    let mut now = fx.state_files();
+    let log = String::from_utf8(now[1].take().unwrap()).unwrap();
+    let old = String::from_utf8(state[1].clone().unwrap()).unwrap();
+    let added = log.strip_prefix(old.as_str()).expect("appended only");
+    assert!(
+        added.lines().all(|l| l.starts_with(r#"{"op":"reserve""#)),
+        "{added}"
+    );
+    assert_eq!(now[0], state[0]);
+    assert_eq!(now[2], state[2]);
     assert_eq!(fx.id(&format!("{DOC}/new.txt")), None);
     drop(g);
     std::fs::remove_dir(&lock).unwrap();
@@ -831,6 +906,76 @@ fn the_registry_is_never_ahead_of_the_journal() {
     assert_eq!(
         kind_names(&fx.bodies()),
         vec!["file.created", "file.modified"]
+    );
+}
+
+/// A crash after the journal append and before the registry append: the ids the journal used
+/// are reserved, so nothing else gets them after a restart.
+#[test]
+fn ids_journaled_before_a_crash_are_never_handed_out_again() {
+    let fx = Fx::imported();
+    fx.write("Work/a.txt", b"a");
+    fx.write("Work/b.txt", b"bb");
+    {
+        let g = fx.store.lock_recovered(&fx.journal).unwrap();
+        fx.store
+            .scan_until(&g, &fx.journal, &ScanOptions::all(1), NOW, true)
+            .unwrap();
+    }
+    let journaled = fx
+        .bodies()
+        .iter()
+        .filter_map(|b| match b {
+            EventBody::FileCreated { id, .. } | EventBody::FolderCreated { id, .. } => Some(*id),
+            _ => None,
+        })
+        .max()
+        .expect("journaled");
+    // A restart, then a write that mints an id.
+    let store = Store::open(fx.dir.path(), "jordi").unwrap();
+    assert_eq!(store.id_of(&wp("Work/a.txt")).unwrap(), None);
+    let g = store.lock_recovered(&fx.journal).unwrap();
+    let id = store.assign(&g, &wp("INBOX/x.txt"), Kind::File).unwrap();
+    assert!(id > journaled, "{id} <= {journaled}");
+}
+
+/// A scan that mints no ids reserves none.
+#[test]
+fn a_scan_without_new_entries_writes_no_registry_line() {
+    let fx = Fx::imported();
+    let path = format!("{DOC}/a.txt");
+    fx.write(&path, b"one");
+    fx.seed();
+    let log = fx.account_file("ids.jsonl");
+    fx.write(&path, b"three");
+    fx.scan();
+    assert_eq!(fx.account_file("ids.jsonl"), log);
+}
+
+/// A gone file and a new file with the same MD5 but another size than the cached row are not
+/// paired (S4 asks for both).
+#[test]
+fn a_move_needs_the_cached_size_too() {
+    let fx = Fx::imported();
+    let from = format!("{DOC}/a.txt");
+    fx.write(&from, b"content");
+    fx.write(&format!("{DOC}/keep.txt"), b"keep");
+    fx.seed();
+    // Plant another size in the cached row of the file.
+    let hashes = fx.store.account_dir().join("hashes.json");
+    let mut rows: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&hashes).unwrap()).unwrap();
+    rows[&from]["size"] = 99.into();
+    std::fs::write(&hashes, serde_json::to_vec(&rows).unwrap()).unwrap();
+    let store = Store::open(fx.dir.path(), "jordi").unwrap();
+    std::fs::rename(fx.fs(&from), fx.fs(&format!("{DOC}/b.txt"))).unwrap();
+    let g = store.lock_recovered(&fx.journal).unwrap();
+    store
+        .scan(&g, &fx.journal, &ScanOptions::all(1), NOW)
+        .unwrap();
+    assert_eq!(
+        kind_names(&fx.bodies()),
+        vec!["file.created", "file.deleted"]
     );
 }
 

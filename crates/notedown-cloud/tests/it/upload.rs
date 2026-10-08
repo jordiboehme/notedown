@@ -2385,8 +2385,10 @@ async fn a_finish_whose_intent_names_the_bytes_leaves_them_to_recovery() {
 async fn an_upload_into_a_folder_removed_out_of_band_answers_the_listed_id() {
     let s = Server::new();
     let t = s.session().await;
-    // the folder gets ids through a listing, then vanishes by hand with its content
+    // the folder gets ids through a listing, then vanishes by hand with its content (another
+    // file stays, so the scan doesn't hold)
     s.put("NOTE/Note/Work/old.pdf", b"old");
+    s.put("INBOX/keep.pdf", b"keep");
     let tree = s
         .post(LIST, &t, json!({"path": "/", "recursive": true}))
         .await;
@@ -2399,7 +2401,19 @@ async fn an_upload_into_a_folder_removed_out_of_band_answers_the_listed_id() {
     assert_ok(&v);
     let answered = v["id"].as_str().unwrap().to_string();
     let ev: Vec<Value> = s.events().into_iter().skip(n).collect();
-    assert_eq!(types(&ev), ["folder.created", "file.created"]);
+    // the scan before the upload journals the removal first
+    assert_eq!(
+        types(&ev),
+        [
+            "file.deleted",
+            "folder.deleted",
+            "folder.created",
+            "file.created"
+        ]
+    );
+    assert_eq!(ev[0]["origin"], "scan");
+    assert_eq!(ev[1]["origin"], "scan");
+    let ev = &ev[2..];
     assert_eq!(ev[1]["id"].as_u64().unwrap().to_string(), answered);
     let tree = s
         .post(LIST, &t, json!({"path": "/", "recursive": true}))

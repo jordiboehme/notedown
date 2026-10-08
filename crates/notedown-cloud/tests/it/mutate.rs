@@ -475,7 +475,8 @@ async fn create_folder_refuses_a_taken_name_or_renames_it() {
     // dot names are never stored, also not with autorename
     assert_err(&s.mkdir(&t, "/NOTE/Note/.hidden", false).await, "E0322");
     assert_err(&s.mkdir(&t, "/NOTE/Note/.hidden", true).await, "E0322");
-    assert_eq!(s.events().len(), n, "nothing journaled");
+    // nothing journaled but the scan of the file placed by hand
+    assert_eq!(types(&s.events_after(n)), ["file.created"]);
     // autorename: name(1), name(2)
     let a = s.mkdir(&t, "/NOTE/Note/Work", true).await;
     assert_ok(&a);
@@ -488,15 +489,15 @@ async fn create_folder_refuses_a_taken_name_or_renames_it() {
     let c = s.mkdir(&t, "/INBOX/box", true).await;
     assert_eq!(c["metadata"]["path_display"], "INBOX/box(1)");
     assert!(s.listed(&t, "NOTE/Note/Work(2)").await);
-    // The listing journals the file placed by hand (a scan) after the four folders.
+    // The scan before the first create journals the file placed by hand.
     assert_eq!(
         types(&s.events_after(n)),
         [
+            "file.created",
             "folder.created",
             "folder.created",
             "folder.created",
-            "folder.created",
-            "file.created"
+            "folder.created"
         ]
     );
 }
@@ -840,6 +841,8 @@ async fn unknown_ids_get_their_error_codes_and_never_panic() {
     let s = Server::new();
     let t = s.session().await;
     s.put("INBOX/a.pdf", b"a");
+    // another file stays, so removing a.pdf by hand doesn't hold the sync
+    s.put("INBOX/keep.pdf", b"k");
     let a = s.id_of(&t, "INBOX/a.pdf").await;
     let n = s.events().len();
     for id in [
@@ -862,12 +865,14 @@ async fn unknown_ids_get_their_error_codes_and_never_panic() {
         assert_err(&s.post_raw(MOVE, &t, body(to.clone())).await, "E0320");
         assert_err(&s.post_raw(COPY, &t, body(to)).await, "E0308");
     }
-    // a registry row whose file is gone on disk is unknown too, and the row is dropped
+    assert_eq!(s.events().len(), n);
+    // a registry row whose file is gone on disk is unknown too: the scan before the delete
+    // journals it as deleted
     std::fs::remove_file(s.files().join("INBOX/a.pdf")).unwrap();
     assert_err(&s.delete(&t, &a).await, "E0318");
     assert_err(&s.mv(&t, &a, "/INBOX/z.pdf", false).await, "E0320");
     assert_err(&s.cp(&t, &a, "/INBOX/z.pdf", false).await, "E0308");
-    assert_eq!(s.events().len(), n);
+    assert_eq!(types(&s.events_after(n)), ["file.deleted"]);
 }
 
 #[tokio::test]
@@ -984,7 +989,10 @@ async fn a_move_onto_a_taken_name_is_refused_or_renamed() {
         &s.mv(&t, &a, "/NOTE/Note/unseen.note", false).await,
         "E0322",
     );
-    assert_eq!(s.events().len(), n);
+    // only the scan before the move journals the file placed by hand (and its page index)
+    let ev = s.events_after(n);
+    assert_eq!(types(&ev)[0], "file.created");
+    assert!(ev.iter().all(|e| e["origin"] == "scan"), "{ev:?}");
     assert_eq!(
         std::fs::read(s.files().join("NOTE/Note/unseen.note")).unwrap(),
         b"u"

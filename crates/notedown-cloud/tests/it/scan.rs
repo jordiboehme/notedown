@@ -1044,6 +1044,7 @@ mod served {
     const DELETE: &str = "/api/file/3/files/delete_folder_v3";
     const MOVE: &str = "/api/file/3/files/move_v3";
     const COPY: &str = "/api/file/3/files/copy_v3";
+    const CAPACITY: &str = "/api/file/capacity/query";
     const DIGEST_GROUPS: &str = "/api/file/query/summary/group";
     const TODO_GROUPS: &str = "/api/file/schedule/group/all";
 
@@ -1140,11 +1141,27 @@ mod served {
         }
 
         async fn post(&self, path: &str, body: Value) -> Value {
+            self.post_as(&self.token, path, body).await
+        }
+
+        /// A login token for another device `serial`.
+        fn token_of(&self, serial: &str) -> String {
+            let now = self.state.now_ms();
+            let (code, _) = self.state.auth.challenge(EMAIL, now).unwrap();
+            let hash = expected_login_hash(&md5_hex("secret"), &code);
+            self.state
+                .auth
+                .login(EMAIL, &hash, serial, now)
+                .unwrap()
+                .token
+        }
+
+        async fn post_as(&self, token: &str, path: &str, body: Value) -> Value {
             let addr: SocketAddr = "192.168.1.50:40000".parse().unwrap();
             let req = Request::builder()
                 .method("POST")
                 .uri(path)
-                .header("x-access-token", &self.token)
+                .header("x-access-token", token)
                 .header("content-type", "application/json")
                 .header("host", "192.168.1.10:19072")
                 .body(Body::from(body.to_string()))
@@ -1555,5 +1572,172 @@ mod served {
         server.abort();
         assert!(found, "no scan at start");
         assert_eq!(s.kinds(), vec!["file.created"]);
+    }
+
+    // ------------------------------------------------ every device route scans first
+
+    fn origins(s: &Server) -> Vec<(&'static str, Origin)> {
+        s.events()
+            .into_iter()
+            .map(|e| {
+                let k = kind_names(std::slice::from_ref(&e.body))[0];
+                (k, e.origin)
+            })
+            .collect()
+    }
+
+    fn id_in(v: &Value, key: &str) -> String {
+        v[key]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{v}"))
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_folder_made_by_hand_is_journaled_before_a_folder_inside_it() {
+        let s = Server::new();
+        std::fs::create_dir_all(s.fs("INBOX/A")).unwrap();
+        let v = s
+            .post(CREATE, json!({"path": "/INBOX/A/B", "autorename": false}))
+            .await;
+        assert_ok(&v);
+        assert_eq!(
+            origins(&s),
+            vec![
+                ("folder.created", Origin::Scan),
+                ("folder.created", Origin::Device)
+            ]
+        );
+        let paths: Vec<String> = s
+            .events()
+            .iter()
+            .map(|e| match &e.body {
+                EventBody::FolderCreated { path, .. } => path.clone(),
+                b => panic!("{b:?}"),
+            })
+            .collect();
+        assert_eq!(paths, vec!["INBOX/A", "INBOX/A/B"]);
+    }
+
+    #[tokio::test]
+    async fn an_upload_into_a_folder_made_by_hand_journals_the_folder_first() {
+        let s = Server::new();
+        std::fs::create_dir_all(s.fs("INBOX/A")).unwrap();
+        let v = s
+            .post(
+                APPLY,
+                json!({"path": "/INBOX/A/x.pdf", "fileName": "x.pdf", "size": 1}),
+            )
+            .await;
+        assert_ok(&v);
+        assert_eq!(origins(&s), vec![("folder.created", Origin::Scan)]);
+    }
+
+    #[tokio::test]
+    async fn a_device_delete_of_a_folder_journals_its_hand_added_file_first() {
+        let s = Server::new();
+        let v = s
+            .post(CREATE, json!({"path": "/INBOX/F", "autorename": false}))
+            .await;
+        assert_ok(&v);
+        let id = id_in(&v, "metadata");
+        s.write("INBOX/F/x.txt", b"x");
+        assert_ok(&s.post(DELETE, json!({"id": id})).await);
+        assert_eq!(
+            origins(&s),
+            vec![
+                ("folder.created", Origin::Device),
+                ("file.created", Origin::Scan),
+                ("file.deleted", Origin::Device),
+                ("folder.deleted", Origin::Device),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_copy_of_a_folder_journals_its_hand_added_file_first() {
+        let s = Server::new();
+        let v = s
+            .post(CREATE, json!({"path": "/INBOX/F", "autorename": false}))
+            .await;
+        let id = id_in(&v, "metadata");
+        s.write("INBOX/F/sub/x.txt", b"x");
+        let v = s
+            .post(
+                COPY,
+                json!({"id": id, "to_path": "/INBOX/G", "autorename": false}),
+            )
+            .await;
+        assert_ok(&v);
+        let o = origins(&s);
+        assert_eq!(
+            o[..3],
+            [
+                ("folder.created", Origin::Device),
+                ("folder.created", Origin::Scan),
+                ("file.created", Origin::Scan),
+            ],
+            "{o:?}"
+        );
+        assert!(
+            o[3..].iter().all(|(_, origin)| *origin == Origin::Device),
+            "{o:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_move_of_a_file_gone_by_hand_journals_the_delete() {
+        let s = Server::new();
+        let (a, _) = s.two_files().await;
+        let EventBody::FileCreated { id, .. } = s.events()[0].body.clone() else {
+            panic!();
+        };
+        s.rm(&a);
+        let v = s
+            .post(
+                MOVE,
+                json!({"id": id.to_string(), "to_path": "/INBOX/a.txt", "autorename": false}),
+            )
+            .await;
+        assert_eq!(v["errorCode"], "E0320", "{v}");
+        let last = s.events().pop().unwrap();
+        assert_eq!(last.origin, Origin::Scan);
+        assert!(
+            matches!(&last.body, EventBody::FileDeleted { id: i, .. } if *i == id),
+            "{last:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_never_gives_a_hand_added_file_an_id() {
+        let s = Server::new();
+        let path = format!("{DOC}/a.pdf");
+        s.write(&path, b"hello");
+        let v = s.post(CAPACITY, json!({})).await;
+        assert_ok(&v);
+        assert_eq!(v["usedCapacity"], 5, "{v}");
+        let store = Store::open(s.dir.path(), "jordi").unwrap();
+        assert_eq!(
+            store
+                .id_of(&notedown_cloud::store::WirePath::parse(&path).unwrap())
+                .unwrap(),
+            None
+        );
+        assert_ok(&s.list("/", true).await);
+        assert_eq!(origins(&s), vec![("file.created", Origin::Scan)]);
+    }
+
+    #[tokio::test]
+    async fn sync_start_does_not_scan_while_another_device_syncs() {
+        let s = Server::new();
+        let other = s.token_of("SN078C10000001");
+        let v = s
+            .post_as(&other, START, json!({"equipmentNo": "SN078C10000001"}))
+            .await;
+        assert_ok(&v);
+        s.write(&format!("{DOC}/a.txt"), b"a");
+        let v = s.start().await;
+        assert_eq!(v["errorCode"], "E0078", "{v}");
+        assert!(s.events().is_empty(), "{:?}", s.events());
     }
 }

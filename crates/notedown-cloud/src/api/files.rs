@@ -329,6 +329,31 @@ fn scan_scope(
     state.run_scan(store, guard, &opts).map(drop)
 }
 
+/// [`scan_scope`] for every existing folder on the way to `target` (stored spelling): the root,
+/// then each folder above `target` that is a real folder on disk, direct children only. A write
+/// to `target` then plans against a registry that knows every hand change on its way.
+fn scan_way(
+    state: &AppState,
+    store: &Store,
+    guard: &WriteGuard,
+    target: &WirePath,
+) -> crate::Result<()> {
+    let mut cur = WirePath::root();
+    scan_scope(state, store, guard, &cur, false)?;
+    let Some(parent) = target.parent() else {
+        return Ok(());
+    };
+    for segment in parent.segments() {
+        cur = cur.join(segment)?;
+        let is_dir = std::fs::symlink_metadata(store.fs_path(&cur)).is_ok_and(|m| m.is_dir());
+        if !is_dir {
+            break;
+        }
+        scan_scope(state, store, guard, &cur, false)?;
+    }
+    Ok(())
+}
+
 /// [`scan_scope`] for the entry at `path`: its parent folder, direct children only.
 fn scan_around(
     state: &AppState,
@@ -401,6 +426,15 @@ pub async fn sync_start(
     // The journal position is read after the scan (store lock, then journal lock): the sync
     // lists the tree after it, so pushes for the changes up to it are covered (D7). It is only
     // a hint, so a failure to read it is logged and never fails the sync.
+    // Another device's live lock answers E0078 before anything is scanned: its sync must not
+    // see the journal and the registry change under it.
+    if state
+        .sync_locks
+        .holder(&req.slug, state.now_ms())
+        .is_some_and(|h| h != req.serial)
+    {
+        return req.error(E_SYNC_LOCKED, MSG_SYNC_LOCKED);
+    }
     let (st, slug) = (state.clone(), req.slug.clone());
     let checked = blocking(&req.serial, move || {
         let store = st.store(&slug)?;
@@ -1002,6 +1036,7 @@ pub async fn upload_apply(
         if t.new_name_too_long() {
             return Ok(Some(Refusal::TooLong));
         }
+        scan_way(&st, &store, &guard, &t.path)?;
         let refused = check_target(&store, &guard, &t.path)?;
         if refused.is_none() {
             let entry = staging::entry_dir(store.account_dir(), &inner_c)?;
@@ -1164,6 +1199,7 @@ fn finish_claimed(
         return Ok(Finished::Refused(Refusal::TooLong));
     }
     let target = &target.path;
+    scan_way(state, store, &guard, target)?;
     if let Some(refusal) = check_target(store, &guard, target)? {
         staging::remove_entry(entry);
         return Ok(Finished::Refused(refusal));
@@ -1511,19 +1547,25 @@ fn entry_after(store: &Store, guard: &StoreGuard, path: &WirePath) -> crate::Res
     })
 }
 
-/// The entry of `id` when it is known and on disk. A registry row whose file or folder is gone
-/// is dropped (it was removed out of band) and counts as unknown.
-fn source_of(store: &Store, guard: &StoreGuard, id: u64) -> crate::Result<Option<Entry>> {
+/// The entry of `id` when it is known and on disk. The source is scanned first: a folder with
+/// everything below it, a file through its parent folder (direct children only). So a hand
+/// change inside it is journaled before the write, and a source that is gone from disk is
+/// journaled as deleted by the scan and counts as unknown.
+fn source_of(
+    state: &AppState,
+    store: &Store,
+    guard: &WriteGuard,
+    id: u64,
+) -> crate::Result<Option<Entry>> {
+    match store.kind_and_path_of(id)? {
+        None => return Ok(None),
+        Some((Kind::Folder, path)) => scan_scope(state, store, guard, &path, true)?,
+        Some((Kind::File, path)) => scan_around(state, store, guard, &path)?,
+    }
     let Some(path) = store.path_of(id)? else {
         return Ok(None);
     };
-    if let Some(e) = store.entry(guard, &path)?.filter(|e| e.id == id) {
-        return Ok(Some(e));
-    }
-    if store.path_of(id)?.is_some() && std::fs::symlink_metadata(store.fs_path(&path)).is_err() {
-        store.removed(guard, id)?;
-    }
-    Ok(None)
+    Ok(store.entry(guard, &path)?.filter(|e| e.id == id))
 }
 
 /// `{tag, id, name, path_display}` of an entry.
@@ -1581,6 +1623,7 @@ pub async fn create_folder_v2(
             return Outcome::too_long();
         }
         let parent = parent.path;
+        scan_way(st, &store, &guard, &parent.join(&name)?)?;
         if !way_is_open(&store, &guard, &parent)? {
             return Outcome::taken();
         }
@@ -1628,7 +1671,7 @@ pub async fn delete_folder_v3(
         let store = st.store(slug)?;
         let guard = store.lock_recovered(&st.journal)?;
         gate_locked(st, &store)?;
-        let Some(e) = source_of(&store, &guard, id)? else {
+        let Some(e) = source_of(st, &store, &guard, id)? else {
             return Outcome::refused(E_DELETE_MISSING, MSG_DELETE_MISSING);
         };
         if crate::store::is_native_folder(&e.path) {
@@ -1675,8 +1718,9 @@ enum Target {
 /// source when the target folder is its own folder and the source itself does not take the
 /// name (a move, which may rename in place); then the source's own path is its target.
 fn target_of(
+    state: &AppState,
     store: &Store,
-    guard: &StoreGuard,
+    guard: &WriteGuard,
     source: &Entry,
     to_path: &str,
     autorename: bool,
@@ -1713,6 +1757,7 @@ fn target_of(
     if in_place && to == source.path {
         return Ok(Target::Path(to));
     }
+    scan_way(state, store, guard, &to)?;
     if !way_is_open(store, guard, &parent)? {
         return taken();
     }
@@ -1756,7 +1801,7 @@ pub async fn move_v3(
         let store = st.store(slug)?;
         let guard = store.lock_recovered(&st.journal)?;
         gate_locked(st, &store)?;
-        let Some(src) = source_of(&store, &guard, id)? else {
+        let Some(src) = source_of(st, &store, &guard, id)? else {
             return Outcome::refused(E_MOVE_MISSING, MSG_MOVE_MISSING);
         };
         let Some(to_path) = t.to_path else {
@@ -1765,7 +1810,7 @@ pub async fn move_v3(
         if crate::store::is_native_folder(&src.path) {
             return Outcome::native();
         }
-        let to = match target_of(&store, &guard, &src, &to_path, t.autorename, true)? {
+        let to = match target_of(st, &store, &guard, &src, &to_path, t.autorename, true)? {
             Target::Path(p) => p,
             Target::Refused(o) => return Ok(o),
         };
@@ -1811,13 +1856,13 @@ pub async fn copy_v3(
         let store = st.store(slug)?;
         let guard = store.lock_recovered(&st.journal)?;
         gate_locked(st, &store)?;
-        let Some(src) = source_of(&store, &guard, id)? else {
+        let Some(src) = source_of(st, &store, &guard, id)? else {
             return Outcome::refused(E_COPY_MISSING, MSG_COPY_MISSING);
         };
         let Some(to_path) = t.to_path else {
             return Outcome::taken();
         };
-        let to = match target_of(&store, &guard, &src, &to_path, t.autorename, false)? {
+        let to = match target_of(st, &store, &guard, &src, &to_path, t.autorename, false)? {
             Target::Path(p) => p,
             Target::Refused(o) => return Ok(o),
         };

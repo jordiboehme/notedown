@@ -13,7 +13,7 @@ use crate::auth::Auth;
 use crate::diag::{Capture, Clock, LogEntry, LogKind, ProtocolLog, SystemClock};
 use crate::journal::{Journal, JournalOptions};
 use crate::push::{PushPlanner, PushTiming};
-use crate::store::{ScanHold, ScanOptions, ScanReport, Store, WirePath, WriteGuard};
+use crate::store::{ScanHold, ScanOptions, ScanReport, Store, WriteGuard};
 use crate::sync::staging::{self, StagingLocks};
 use crate::sync::{SyncLocks, UrlSigner};
 use crate::{Config, Error, Result};
@@ -158,7 +158,7 @@ impl AppState {
     }
 
     /// The bytes of every file the account's listing shows, reused for [`USAGE_CACHE_MS`].
-    /// Blocking: it may list (and hash) the whole tree under the store lock.
+    /// Blocking: it walks the whole tree under the store lock (no ids, no hashing).
     pub fn used_bytes(&self, slug: &str) -> Result<u64> {
         let now = self.now_ms();
         if let Some((at, used)) = self
@@ -173,11 +173,8 @@ impl AppState {
         }
         let store = self.store(slug)?;
         let guard = store.lock_recovered(&self.journal)?;
-        let used = store
-            .list(&guard, &WirePath::root(), true)?
-            .iter()
-            .map(|e| e.size)
-            .sum();
+        // No listing: it would give hand-added files ids without a scan journaling them.
+        let used = store.disk_bytes(&guard)?;
         drop(guard);
         self.usage
             .lock()
@@ -274,12 +271,63 @@ impl AppState {
             return Err(Error::ScanHold(store.slug().to_string()));
         }
         if report.released {
-            eprintln!(
-                "notedown cloud: account {}: the files are back, device sync goes on",
-                store.slug()
-            );
+            match before {
+                Ok(Some(_)) => eprintln!(
+                    "notedown cloud: account {}: the files are back, device sync goes on",
+                    store.slug()
+                ),
+                _ => eprintln!(
+                    "notedown cloud: account {}: removed a scan hold file that couldn't be read, \
+                     device sync goes on",
+                    store.slug()
+                ),
+            }
         }
         Ok(report)
+    }
+
+    /// Print the warning of [`scan_hold_warning`] for every account that is held already (from
+    /// an earlier run), and a line for a hold file that can't be read. `serve` calls it once at
+    /// start: a scan prints the warning only when it writes the hold. Blocking.
+    pub fn warn_existing_holds(&self) {
+        let accounts = match self.auth.accounts().list() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("notedown cloud: scan hold: {e}");
+                return;
+            }
+        };
+        for account in accounts {
+            let slug = &account.slug;
+            let path = self
+                .auth
+                .accounts()
+                .account_dir(slug)
+                .join(crate::store::SCAN_HOLD_FILE);
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    eprintln!(
+                        "notedown cloud: warning: account {slug}: can't read {}: {e}. Device \
+                         sync is on hold.",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            match serde_json::from_slice::<ScanHold>(&bytes) {
+                Ok(hold) => eprintln!(
+                    "notedown cloud: warning: {}",
+                    scan_hold_warning(slug, &hold)
+                ),
+                Err(e) => eprintln!(
+                    "notedown cloud: warning: account {slug}: can't read {}: {e}. Device sync \
+                     is on hold.",
+                    path.display()
+                ),
+            }
+        }
     }
 
     /// One timer pass: a whole-tree scan of every account ([`AppState::run_scan`]). An account
@@ -410,6 +458,10 @@ pub async fn serve_until(
     // The scan of the data folder for changes made by hand: the first pass right now (after
     // the startup sweeps of `AppState::open`), then every `scan_interval` seconds; stopped when
     // this returns. Started after the follower, so the changes it finds are pushed.
+    let st = state.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || st.warn_existing_holds()).await {
+        eprintln!("notedown cloud: scan hold: {e}");
+    }
     let _scanner = state.config.scan_period().map(|period| {
         let state = state.clone();
         AbortOnDrop(tokio::spawn(async move {

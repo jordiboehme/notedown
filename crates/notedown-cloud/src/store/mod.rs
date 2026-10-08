@@ -812,6 +812,32 @@ impl Store {
         Ok(entries)
     }
 
+    /// The bytes of every file a recursive listing of the root would show, from a walk that
+    /// neither assigns ids nor touches the registry or the cache (`usedCapacity`). A tree that
+    /// broke meanwhile is `Error::StoreDamaged`, as for [`Store::list`].
+    pub fn disk_bytes(&self, guard: &StoreGuard) -> Result<u64> {
+        self.check_guard(guard)?;
+        let before = self.check_tree(false)?;
+        let mut all = Vec::new();
+        if let Some(found) = list::resolve(&self.files, &WirePath::root())?
+            && found.kind == Kind::Folder
+        {
+            list::walk(
+                &found,
+                true,
+                &mut all,
+                &self.vanished_damage(before.imported),
+            )?;
+        }
+        let after = self.check_tree(false)?;
+        self.check_same_tree(&before, &after)?;
+        Ok(all
+            .iter()
+            .filter(|f| f.kind == Kind::File)
+            .map(|f| f.meta.len())
+            .sum())
+    }
+
     /// Build entries: assign missing ids in one log append, hash files through the cache, write
     /// the cache once. A file that vanished meanwhile was deleted and is skipped.
     fn entries(&self, found: Vec<Found>) -> Result<Vec<Entry>> {

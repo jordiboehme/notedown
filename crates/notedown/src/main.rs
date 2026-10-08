@@ -1215,6 +1215,19 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
         } else {
             println!("recycle bin: never pruned");
         }
+        if config.scan_interval > 0 {
+            println!(
+                "scan of the data folder: every {} s, at sync start and before listings",
+                config.scan_interval
+            );
+        } else {
+            println!("scan of the data folder: at sync start and before listings (no timer)");
+        }
+        match config.scan_min_files {
+            0 => println!("scan hold: off"),
+            1 => println!("scan hold: when the account would be left without files"),
+            n => println!("scan hold: when fewer than {n} files would be left"),
+        }
         println!("press Ctrl-C to stop");
         std::io::stdout().flush()?;
         serve_until(listeners, state.clone(), async {

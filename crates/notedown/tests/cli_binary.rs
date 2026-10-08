@@ -244,6 +244,33 @@ fn serve_refuse_sync_flag_counts_for_one_run_and_keeps_server_toml() {
         ),
         "{out}"
     );
+    assert!(
+        out.contains("\nscan of the data folder: every 300 s, at sync start and before listings\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("\nscan hold: when the account would be left without files\n"),
+        "{out}"
+    );
+}
+
+#[test]
+fn serve_names_the_scan_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("server.toml"),
+        "listen = [\"127.0.0.1:0\"]\nscan_interval = 0\nscan_min_files = 5\n",
+    )
+    .unwrap();
+    let out = serve_startup(dir.path(), &[]);
+    assert!(
+        out.contains("\nscan of the data folder: at sync start and before listings (no timer)\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("\nscan hold: when fewer than 5 files would be left\n"),
+        "{out}"
+    );
 }
 
 /// `notedown cloud journal <action> --data <dir> <rest>`, the documented argument order.

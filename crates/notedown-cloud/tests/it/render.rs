@@ -630,3 +630,119 @@ fn a_note_edited_by_hand_before_the_scan_is_rendered_from_its_bytes() {
     // Nothing new until it changes again.
     assert_eq!(fx.pass(), PassReport::default());
 }
+
+/// Files and an empty folder outside `<root>/acc` (and a `.pdf` file inside it, the PDF path
+/// of an empty note path) that bad manifest rows point at. They must all survive.
+struct Sentinels {
+    files: Vec<PathBuf>,
+    empty: PathBuf,
+}
+
+impl Sentinels {
+    fn new(fx: &Fx) -> Sentinels {
+        let outside = fx.root().join("outside");
+        std::fs::create_dir_all(outside.join("empty")).unwrap();
+        std::fs::create_dir_all(fx.out()).unwrap();
+        let files = vec![
+            outside.join("tax.pdf"),
+            outside.join("rel.pdf"),
+            fx.out().join(".pdf"),
+        ];
+        for f in &files {
+            std::fs::write(f, b"%PDF-1.7 keep").unwrap();
+        }
+        Sentinels {
+            files,
+            empty: outside.join("empty"),
+        }
+    }
+
+    /// Row paths: absolute, with `..` (one at a file, one in the empty folder), empty.
+    fn bad_paths(fx: &Fx) -> Vec<String> {
+        vec![
+            fx.root().join("outside/tax.note").display().to_string(),
+            "../outside/rel.note".to_string(),
+            "../outside/empty/x.note".to_string(),
+            String::new(),
+        ]
+    }
+
+    fn check(&self) {
+        for f in &self.files {
+            assert_eq!(
+                std::fs::read(f).unwrap(),
+                b"%PDF-1.7 keep",
+                "{}",
+                f.display()
+            );
+        }
+        assert!(self.empty.is_dir(), "{}", self.empty.display());
+    }
+}
+
+#[test]
+fn rows_with_bad_paths_of_gone_notes_touch_nothing() {
+    let fx = Fx::new();
+    fx.write("NOTE/Note/a.note", &fixture_note("test1"));
+    fx.scan();
+    fx.pass();
+    let sentinels = Sentinels::new(&fx);
+    let mut m = fx.manifest();
+    for (i, path) in Sentinels::bad_paths(&fx).into_iter().enumerate() {
+        let row = manifest::Row {
+            path,
+            md5: "0".repeat(32),
+            pdf: true,
+        };
+        m.notes.insert((900_000 + i).to_string(), row);
+    }
+    manifest::save(&fx.out(), &m).unwrap();
+    let r = fx.pass();
+    assert!(r.deleted.is_empty() && r.moved.is_empty(), "{r:?}");
+    sentinels.check();
+    // The bad rows are gone from the manifest.
+    assert_eq!(fx.manifest().notes.len(), 1);
+    fx.pass_all();
+    sentinels.check();
+}
+
+#[test]
+fn a_live_note_with_a_bad_row_path_touches_nothing_outside() {
+    for i in 0..4 {
+        let fx = Fx::new();
+        let path = Sentinels::bad_paths(&fx)[i].clone();
+        let bytes = fixture_note("test1");
+        fx.write("NOTE/Note/a.note", &bytes);
+        fx.scan();
+        fx.pass();
+        let sentinels = Sentinels::new(&fx);
+        let id = fx.id("NOTE/Note/a.note").unwrap();
+        let bad = |fx: &Fx| {
+            let mut m = fx.manifest();
+            m.notes.insert(
+                id.to_string(),
+                manifest::Row {
+                    path: path.clone(),
+                    md5: md5_hex(&bytes),
+                    pdf: true,
+                },
+            );
+            manifest::save(&fx.out(), &m).unwrap();
+        };
+        // Same MD5, other path: without the check this would be a move from outside.
+        bad(&fx);
+        let r = fx.pass();
+        assert!(r.moved.is_empty() && r.deleted.is_empty(), "{path}: {r:?}");
+        sentinels.check();
+        assert!(fx.out().join("NOTE/Note/a.pdf").is_file());
+        // `--all` renders every note and deletes the old PDF of each row.
+        bad(&fx);
+        let r = fx.pass_all();
+        assert!(r.moved.is_empty() && r.deleted.is_empty(), "{path}: {r:?}");
+        sentinels.check();
+        assert_eq!(
+            fx.manifest().notes[&id.to_string()].path,
+            "NOTE/Note/a.note"
+        );
+    }
+}

@@ -384,10 +384,22 @@ impl Pass {
         self.m.notes.insert(key.to_string(), row);
     }
 
+    /// The file at `rel` below `<root>/<slug>/`; `None` when `rel` is not a wire path in its
+    /// plain form (absolute, with `..`, empty), so no path of a row or a note can reach a file
+    /// outside the account folder.
+    fn file_of(&self, rel: &str) -> Option<PathBuf> {
+        manifest::is_wire_path(rel)
+            .then(|| WirePath::parse_named(rel).ok())
+            .flatten()
+            .map(|w| w.to_fs(&self.dir))
+    }
+
     /// Move the PDF of a moved note. False when the old PDF is gone (render it instead).
     fn move_pdf(&mut self, key: &str, row: &Row, n: &Note, md5: &str) -> Result<bool> {
         let (old, new) = (pdf_path_of(&row.path), pdf_path_of(&n.path));
-        let (from, to) = (self.dir.join(&old), self.dir.join(&new));
+        let (Some(from), Some(to)) = (self.file_of(&old), self.file_of(&new)) else {
+            return Ok(false);
+        };
         if !from.is_file() {
             return Ok(false);
         }
@@ -434,8 +446,10 @@ impl Pass {
             self.report.kept_foreign.push(new);
             return Ok(());
         }
+        let Some(target) = self.file_of(&new) else {
+            return Ok(());
+        };
         self.release(&new, key);
-        let target = self.dir.join(&new);
         if let Err(e) = crate::fsutil::write_atomic(&target, &pdf, false) {
             // The row stays as it was, so the next pass tries again.
             eprintln!("notedown render: {slug}: {}: {e}", n.path);
@@ -444,7 +458,9 @@ impl Pass {
         }
         if let Some(old) = old
             && old != new
-            && !same_file(&self.dir.join(&old), &target)
+            && !self
+                .file_of(&old)
+                .is_some_and(|old| same_file(&old, &target))
         {
             self.remove_pdf(&old)?;
         }
@@ -459,7 +475,9 @@ impl Pass {
     /// before a crash and the PDFs of earlier passes after the manifest was lost. Any other
     /// file, a PDF from another program too, stays foreign, also on the first pass.
     fn is_ours(&self, rel: &str, own: Option<&str>) -> bool {
-        let target = self.dir.join(rel);
+        let Some(target) = self.file_of(rel) else {
+            return false;
+        };
         let Ok(meta) = std::fs::symlink_metadata(&target) else {
             return true;
         };
@@ -474,7 +492,10 @@ impl Pass {
         {
             return true;
         }
-        if own.is_some_and(|own| same_file(&self.dir.join(own), &target)) {
+        if own
+            .and_then(|own| self.file_of(own))
+            .is_some_and(|own| same_file(&own, &target))
+        {
             return true;
         }
         is_notedown_pdf(&target)
@@ -488,9 +509,11 @@ impl Pass {
             .retain(|k, r| k == key || !r.pdf || pdf_path_of(&r.path) != rel);
     }
 
-    /// Delete one of our PDFs; one that is gone already is fine.
+    /// Delete one of our PDFs; one that is gone already is fine. A bad path deletes nothing.
     fn remove_pdf(&mut self, rel: &str) -> Result<()> {
-        let path = self.dir.join(rel);
+        let Some(path) = self.file_of(rel) else {
+            return Ok(());
+        };
         match std::fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -507,9 +530,19 @@ impl Pass {
     }
 
     /// Remove the folders that lost a file and are empty now, up to the account folder
-    /// (exclusive). A folder that holds anything else stays.
+    /// (exclusive). A folder that holds anything else stays. Only folders strictly below the
+    /// account folder by plain names (no `..`) are touched.
     fn prune_empty(&mut self) {
         for folder in std::mem::take(&mut self.emptied) {
+            let below = folder.strip_prefix(&self.dir).is_ok_and(|rel| {
+                rel.components().next().is_some()
+                    && rel
+                        .components()
+                        .all(|c| matches!(c, std::path::Component::Normal(_)))
+            });
+            if !below {
+                continue;
+            }
             let mut d = folder.as_path();
             while d != self.dir && d.starts_with(&self.dir) {
                 if std::fs::remove_dir(d).is_err() {

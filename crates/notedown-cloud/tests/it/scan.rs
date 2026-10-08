@@ -1627,7 +1627,7 @@ mod served {
     use axum::http::Request;
     use notedown_cloud::auth::{Accounts, Imported, expected_login_hash, md5_hex};
     use notedown_cloud::journal::{Event, EventBody, Origin};
-    use notedown_cloud::push::{RECONNECT_REASON, follow_once, start_seq, tick};
+    use notedown_cloud::push::{follow_once, start_seq, tick};
     use notedown_cloud::server::{AppState, router, scan_hold_warning, serve_listeners};
     use notedown_cloud::socket::Outbound;
     use notedown_cloud::store::{SCAN_HOLD_FILE, ScanHold, Store};
@@ -2055,7 +2055,7 @@ mod served {
     struct Pushed {
         s: Server,
         cursor: u64,
-        rx: tokio::sync::mpsc::Receiver<Outbound>,
+        _rx: tokio::sync::mpsc::Receiver<Outbound>,
         inbound: notedown_cloud::socket::LastInbound,
     }
 
@@ -2063,15 +2063,15 @@ mod served {
         fn new() -> Pushed {
             let s = Server::with(Config {
                 protect: false,
-                push: PushMode::Reconnect,
                 ..Config::default()
             });
+            assert_eq!(s.state.config.push, PushMode::Detail);
             let cursor = start_seq(&s.state).unwrap();
             let (rx, inbound) = s.state.sockets.register("jordi", SERIAL, "sid", s.now());
             Pushed {
                 s,
                 cursor,
-                rx,
+                _rx: rx,
                 inbound,
             }
         }
@@ -2085,19 +2085,29 @@ mod served {
             tick(&self.s.state, now)
         }
 
-        fn closed(&mut self) -> bool {
-            let mut out = Vec::new();
-            while let Ok(o) = self.rx.try_recv() {
-                out.push(o);
-            }
-            match out.as_slice() {
-                [] => false,
-                [Outbound::Close(reason)] => {
-                    assert_eq!(*reason, RECONNECT_REASON);
-                    true
-                }
-                other => panic!("{other:?}"),
-            }
+        /// A heartbeat of the device now: `(messageType, originalName)` of each item of the
+        /// push it gets, sorted; empty when it gets none.
+        fn pushed(&mut self) -> Vec<(String, String)> {
+            let now = self.s.now();
+            self.inbound.store(now, Ordering::SeqCst);
+            let Some(frame) = self.s.state.sockets.deliver("jordi", SERIAL, "sid", now) else {
+                return Vec::new();
+            };
+            let v: Value = serde_json::from_str(frame.strip_prefix("42").unwrap()).unwrap();
+            let m: Value = serde_json::from_str(v[1].as_str().unwrap()).unwrap();
+            let mut items: Vec<(String, String)> = m["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| {
+                    (
+                        i["messageType"].as_str().unwrap().to_string(),
+                        i["originalName"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+            items.sort();
+            items
         }
     }
 
@@ -2107,7 +2117,11 @@ mod served {
         p.s.write(&format!("{DOC}/a.txt"), b"a");
         p.s.state.scan_all();
         assert_eq!(p.follow_and_tick(), 1);
-        assert!(p.closed());
+        assert_eq!(p.pushed(), [download("a.txt")]);
+    }
+
+    fn download(name: &str) -> (String, String) {
+        ("DOWNLOADFILE".to_string(), name.to_string())
     }
 
     #[test]
@@ -2123,14 +2137,14 @@ mod served {
         assert!(p.s.marker().is_file());
         // The created events wait for the push gate.
         assert_eq!(p.follow_and_tick(), 0);
-        assert!(!p.closed());
+        assert!(p.pushed().is_empty());
         // The files come back: the hold ends and the waiting push goes out.
         p.s.write(&a, b"a");
         p.s.write(&b, b"b");
         p.s.state.scan_all();
         assert!(!p.s.marker().exists());
         assert_eq!(p.follow_and_tick(), 1);
-        assert!(p.closed());
+        assert_eq!(p.pushed(), [download("a.txt"), download("b.txt")]);
     }
 
     #[test]

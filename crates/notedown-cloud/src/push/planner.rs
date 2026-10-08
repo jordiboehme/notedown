@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
+use super::changes::Changes;
 use crate::journal::{Event, EventBody, Origin};
 
 /// Quiet time after the newest pending event before a push goes out.
@@ -17,8 +18,9 @@ pub const MAX_WAIT_MS: u64 = 10_000;
 /// Minimum time between two pushes to one target (Ratta drops pushes closer than 5 s).
 pub const MIN_GAP_MS: u64 = 5000;
 
-/// The most events a [`Pending`] keeps for the detail mode.
-const MAX_PENDING_EVENTS: usize = 200;
+/// After a push whose items could not be built, the next try waits this long: about one
+/// heartbeat of the device (`docs/sync-protocol.md` 4.3).
+pub const RETRY_MS: u64 = 5000;
 
 /// The timing rules of the planner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,11 +51,9 @@ pub struct Pending {
     /// The cause recorded for `equipmentNo`: the device serial of the newest pending event, or
     /// `None` for CLI and scan changes.
     pub cause: Option<String>,
-    /// The pending relevant events, oldest first (for the detail mode), capped at 200.
-    pub events: Vec<Event>,
-    /// The cap dropped events, so `events` is not the full list: the detail mode sends
-    /// `STARTSYNC` instead.
-    pub truncated: bool,
+    /// The pending changes, collapsed per file or folder (for the detail mode). Bounded by
+    /// the number of entries of the account, not by the number of events.
+    pub changes: Changes,
 }
 
 #[derive(Debug, Default)]
@@ -61,6 +61,8 @@ struct Target {
     pending: Option<Pending>,
     covered_seq: u64,
     last_push_ms: Option<u64>,
+    /// The items of the pending push could not be built: no new try before this time.
+    retry_ms: Option<u64>,
 }
 
 /// Decides which (account, device) gets a push and when. Keys are `(slug, serial)`.
@@ -120,17 +122,12 @@ impl PushPlanner {
                 last_ms: now_ms,
                 max_seq: 0,
                 cause: None,
-                events: Vec::new(),
-                truncated: false,
+                changes: Changes::default(),
             });
             p.last_ms = now_ms;
             p.max_seq = p.max_seq.max(event.seq);
             p.cause = event.device.clone();
-            if p.events.len() == MAX_PENDING_EVENTS {
-                p.events.remove(0);
-                p.truncated = true;
-            }
-            p.events.push(event.clone());
+            p.changes.apply(event);
         }
     }
 
@@ -149,10 +146,9 @@ impl PushPlanner {
         {
             t.pending = None;
         }
-        // A push that stays pending keeps only the events the sync did not see.
+        // A push that stays pending keeps only the changes the sync did not see.
         if let Some(p) = &mut t.pending {
-            let covered = t.covered_seq;
-            p.events.retain(|e| e.seq > covered);
+            p.changes.retain_after(t.covered_seq);
         }
     }
 
@@ -169,7 +165,8 @@ impl PushPlanner {
                 let rested = t
                     .last_push_ms
                     .is_none_or(|l| now_ms.saturating_sub(l) >= self.timing.min_gap_ms);
-                settled && rested
+                let retry = t.retry_ms.is_none_or(|r| now_ms >= r);
+                settled && rested && retry
             })
             .map(|(k, _)| k.clone())
             .collect();
@@ -177,15 +174,45 @@ impl PushPlanner {
         out
     }
 
-    /// The push to `(slug, serial)` was handed over at `now_ms`: the pending state is cleared.
-    pub fn sent(&mut self, slug: &str, serial: &str, now_ms: u64) {
-        if let Some(t) = self
+    /// The push to `(slug, serial)` was handed over at `now_ms` (or had nothing to tell): the
+    /// pending state is cleared. Returns whether the items of this target had failed before.
+    pub fn sent(&mut self, slug: &str, serial: &str, now_ms: u64) -> bool {
+        let Some(t) = self
             .targets
             .get_mut(&(slug.to_string(), serial.to_string()))
-        {
-            t.pending = None;
-            t.last_push_ms = Some(now_ms);
-        }
+        else {
+            return false;
+        };
+        t.pending = None;
+        t.last_push_ms = Some(now_ms);
+        t.retry_ms.take().is_some()
+    }
+
+    /// The pending push to `(slug, serial)` has nothing to tell (every change in it was undone,
+    /// like a file created and deleted again): it is dropped without counting as a push. Returns
+    /// whether the items of this target had failed before.
+    pub fn drop_pending(&mut self, slug: &str, serial: &str) -> bool {
+        let Some(t) = self
+            .targets
+            .get_mut(&(slug.to_string(), serial.to_string()))
+        else {
+            return false;
+        };
+        t.pending = None;
+        t.retry_ms.take().is_some()
+    }
+
+    /// The items of the push to `(slug, serial)` could not be built at `now_ms`: the push stays
+    /// pending and is tried again [`RETRY_MS`] later. Returns whether this is the first failure
+    /// in a row (the one to log).
+    pub fn failed(&mut self, slug: &str, serial: &str, now_ms: u64) -> bool {
+        let t = self
+            .targets
+            .entry((slug.to_string(), serial.to_string()))
+            .or_default();
+        let first = t.retry_ms.is_none();
+        t.retry_ms = Some(now_ms + RETRY_MS);
+        first
     }
 
     pub fn pending(&self, slug: &str, serial: &str) -> Option<&Pending> {
@@ -379,22 +406,27 @@ mod tests {
     }
 
     #[test]
-    fn covered_drops_the_seen_events_from_a_pending_push_that_stays() {
+    fn covered_drops_the_seen_changes_from_a_pending_push_that_stays() {
         let mut p = planner();
         for seq in [8, 9, 12] {
-            p.observe(&ev(Origin::Cli, None, seq, created()), &targets(), 0);
+            let mut e = ev(Origin::Cli, None, seq, created());
+            if let EventBody::FileCreated { id, .. } = &mut e.body {
+                *id = seq;
+            }
+            p.observe(&e, &targets(), 0);
         }
         p.covered("acc", "B", 10);
         let seqs: Vec<u64> = p
             .pending("acc", "B")
             .unwrap()
-            .events
+            .changes
+            .in_order()
             .iter()
-            .map(|e| e.seq)
+            .map(|c| c.last_seq)
             .collect();
         assert_eq!(seqs, [12]);
         // the other target's pending push is untouched
-        assert_eq!(p.pending("acc", "A").unwrap().events.len(), 3);
+        assert_eq!(p.pending("acc", "A").unwrap().changes.len(), 3);
     }
 
     #[test]
@@ -464,35 +496,40 @@ mod tests {
     }
 
     #[test]
-    fn events_are_capped_at_200_dropping_the_oldest() {
+    fn many_events_are_kept_collapsed_per_entry_without_a_cap() {
         let mut p = planner();
         let t = vec!["B".to_string()];
-        for i in 1..=250u64 {
-            p.observe(&ev(Origin::Cli, None, i, created()), &t, i);
+        for i in 1..=10_000u64 {
+            p.observe(&ev(Origin::Cli, None, i, modified()), &t, i);
         }
         let pd = p.pending("acc", "B").unwrap();
-        assert_eq!(pd.events.len(), 200);
-        assert_eq!(pd.events[0].seq, 51);
-        assert_eq!(pd.events[199].seq, 250);
-        assert!(pd.truncated);
+        assert_eq!(pd.changes.len(), 1);
+        assert_eq!(pd.max_seq, 10_000);
+        let mut e = ev(Origin::Cli, None, 10_001, created());
+        if let EventBody::FileCreated { id, .. } = &mut e.body {
+            *id = 2;
+        }
+        p.observe(&e, &t, 10_001);
+        assert_eq!(p.pending("acc", "B").unwrap().changes.len(), 2);
     }
 
     #[test]
-    fn exactly_200_events_are_not_truncated_and_201_are() {
+    fn a_failed_build_keeps_the_push_and_waits_before_the_next_try() {
         let mut p = planner();
-        let t = vec!["B".to_string()];
-        for i in 1..=200u64 {
-            p.observe(&ev(Origin::Cli, None, i, created()), &t, i);
-        }
-        assert!(!p.pending("acc", "B").unwrap().truncated);
-        p.observe(&ev(Origin::Cli, None, 201, created()), &t, 201);
-        let pd = p.pending("acc", "B").unwrap();
-        assert!(pd.truncated);
-        assert_eq!(pd.events.len(), 200);
-        // A push that was sent starts a new, complete list.
-        p.sent("acc", "B", 300);
-        p.observe(&ev(Origin::Cli, None, 202, created()), &t, 400);
-        assert!(!p.pending("acc", "B").unwrap().truncated);
+        p.observe(&ev(Origin::Cli, None, 1, created()), &targets(), 0);
+        let b = ("acc".to_string(), "B".to_string());
+        assert!(p.due(2000).contains(&b));
+        assert!(p.failed("acc", "B", 2000));
+        assert!(is_pending(&p, "B"));
+        assert!(!p.due(2000 + RETRY_MS - 1).contains(&b));
+        assert!(p.due(2000 + RETRY_MS).contains(&b));
+        // Still failing: not the first failure, nothing new to log.
+        assert!(!p.failed("acc", "B", 2000 + RETRY_MS));
+        // A push that goes out ends the failure, once.
+        assert!(p.sent("acc", "B", 20_000));
+        assert!(!p.sent("acc", "B", 30_000));
+        p.observe(&ev(Origin::Cli, None, 2, created()), &targets(), 31_000);
+        assert!(p.due(40_000).contains(&b));
     }
 
     #[test]

@@ -17,8 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use notedown_cloud::auth::{Accounts, Imported, expected_login_hash, md5_hex};
 use notedown_cloud::journal::{Event, EventBody, FileKind, Origin, new_op_id};
 use notedown_cloud::push::{
-    RECONNECT_REASON, file_syn_message, follow_once, server_message_frame, start_seq,
-    startsync_item, tick,
+    RETRY_MS, file_syn_message, follow_once, server_message_frame, start_seq, startsync_item, tick,
 };
 use notedown_cloud::server::{AppState, router, serve_listeners};
 use notedown_cloud::socket::{LIVENESS_MS, LastInbound, Outbound, RESEND_MS};
@@ -90,7 +89,8 @@ fn mark_imported(data: &Path) {
 }
 
 impl Fixture {
-    /// The message tests use `startsync`; `reconnect` (the default) closes the socket.
+    /// Most message tests use `startsync`: its one item is easy to compare. `detail` is the
+    /// default ([`detail_fixture`]).
     fn new() -> Fixture {
         Self::with(
             Config {
@@ -287,12 +287,50 @@ fn message(frame: &str) -> (Vec<Value>, u64) {
     )
 }
 
+/// The default push mode, `detail`.
 fn detail_fixture() -> Fixture {
-    let config = Config {
-        push: PushMode::Detail,
-        ..Config::default()
-    };
-    Fixture::with(config, true)
+    let f = Fixture::with(Config::default(), true);
+    assert_eq!(f.state.config.push, PushMode::Detail);
+    f
+}
+
+/// A journal event of the CLI for account `jordi`.
+fn cli_event(body: EventBody) -> Event {
+    Event::new("jordi", Origin::Cli, None, &new_op_id(), body)
+}
+
+fn file_created(id: u64, name: &str) -> EventBody {
+    EventBody::FileCreated {
+        id,
+        path: format!("NOTE/Note/{name}"),
+        kind: FileKind::Note,
+        md5: "0".repeat(32),
+        size: 1,
+        pages_changed: None,
+    }
+}
+
+/// The protocol log lines whose message contains `text`.
+fn log_messages(data: &Path, text: &str) -> Vec<String> {
+    let mut files: Vec<_> = std::fs::read_dir(data.join("logs"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .flat_map(|f| {
+            std::fs::read_to_string(f)
+                .unwrap()
+                .lines()
+                .filter_map(|l| {
+                    let v: Value = serde_json::from_str(l).unwrap();
+                    v["message"].as_str().map(str::to_string)
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|m| m.contains(text))
+        .collect()
 }
 
 #[test]
@@ -693,34 +731,119 @@ fn a_silent_session_keeps_the_push_until_a_frame_arrives() {
 }
 
 #[test]
-fn a_truncated_detail_push_sends_startsync() {
+fn detail_sends_every_change_collapsed_per_file_in_one_message() {
     let mut f = detail_fixture();
-    // One event more than the 200 a pending push keeps.
-    let mut events: Vec<Event> = (0..201u64)
-        .map(|i| {
-            Event::new(
-                "jordi",
-                Origin::Cli,
-                None,
-                &new_op_id(),
-                EventBody::FileCreated {
-                    id: 1000 + i,
-                    path: format!("/NOTE/Note/n{i}.note"),
-                    kind: FileKind::Note,
-                    md5: "0".repeat(32),
-                    size: 1,
-                    pages_changed: None,
-                },
-            )
-        })
-        .collect();
+    // 1500 new files, each changed 3 times after; 200 more created and deleted again.
+    let mut events: Vec<Event> = Vec::new();
+    for i in 0..1500u64 {
+        events.push(cli_event(file_created(5000 + i, &format!("n{i}.note"))));
+    }
+    for round in 1..=3u64 {
+        for i in 0..1500u64 {
+            events.push(cli_event(EventBody::FileModified {
+                id: 5000 + i,
+                path: format!("NOTE/Note/n{i}.note"),
+                kind: FileKind::Note,
+                md5: format!("{round:032}"),
+                prev_md5: "0".repeat(32),
+                size: round + 1,
+                pages_changed: None,
+            }));
+        }
+    }
+    for i in 0..200u64 {
+        events.push(cli_event(file_created(9000 + i, &format!("gone{i}.note"))));
+        events.push(cli_event(EventBody::FileDeleted {
+            id: 9000 + i,
+            path: format!("NOTE/Note/gone{i}.note"),
+            recycle: format!("gone{i}.note"),
+        }));
+    }
     f.state.journal.append(&mut events).unwrap();
-    assert_eq!(f.follow(), 201);
+    assert_eq!(f.follow(), 6400);
+    {
+        let planner = f.state.push.lock().unwrap();
+        assert_eq!(planner.pending("jordi", A).unwrap().changes.len(), 1700);
+    }
     f.advance_ms(2000);
-    let t = f.now();
-    assert_eq!(tick(&f.state, t), 2);
-    assert_eq!(f.ping(A), Some(startsync(None, t, t)));
-    assert_eq!(f.ping(B), Some(startsync(None, t, t)));
+    assert_eq!(tick(&f.state, f.now()), 2);
+    // Every file in one message, in journal order, with its latest content.
+    let (items, _) = message(&f.ping(A).unwrap());
+    assert_eq!(items.len(), 1500);
+    for (i, item) in items.iter().enumerate() {
+        assert_eq!(item["messageType"], "DOWNLOADFILE");
+        assert_eq!(item["id"], 5000 + i as u64);
+        assert_eq!(item["originalName"], format!("n{i}.note"));
+        assert_eq!(item["md5"], format!("{:032}", 3));
+        assert_eq!(item["size"], 4);
+    }
+    assert_eq!(message(&f.ping(B).unwrap()).0, items);
+}
+
+#[test]
+fn a_file_created_and_deleted_again_sends_nothing() {
+    let mut f = detail_fixture();
+    let mut events = vec![
+        cli_event(file_created(77, "x.note")),
+        cli_event(EventBody::FileDeleted {
+            id: 77,
+            path: "NOTE/Note/x.note".into(),
+            recycle: "x.note".into(),
+        }),
+    ];
+    f.state.journal.append(&mut events).unwrap();
+    f.follow();
+    assert!(f.pending(A) && f.pending(B));
+    f.advance_ms(2000);
+    assert_eq!(tick(&f.state, f.now()), 0);
+    assert!(!f.pending(A) && !f.pending(B));
+    assert_eq!(f.ping(A), None);
+    assert_eq!(f.ping(B), None);
+    // The next change goes out without waiting for a push gap.
+    f.put("a.note");
+    f.follow();
+    f.advance_ms(2000);
+    assert_eq!(tick(&f.state, f.now()), 2);
+}
+
+#[test]
+fn an_unreadable_id_registry_keeps_the_push_and_tries_again() {
+    let mut f = detail_fixture();
+    f.put("a.note");
+    f.follow();
+    // A broken line in the registry's log: the parent folder ids can't be read.
+    let log = f.data().join("accounts/jordi/ids.jsonl");
+    let good = std::fs::read(&log).unwrap_or_default();
+    let mut bad = good.clone();
+    bad.extend_from_slice(b"not json\n");
+    std::fs::write(&log, &bad).unwrap();
+    f.advance_ms(2000);
+    assert_eq!(tick(&f.state, f.now()), 0);
+    assert!(f.pending(A) && f.pending(B));
+    assert_eq!(f.ping(A), None);
+    // No new try before about one heartbeat, then a try per heartbeat; one log line per target.
+    f.advance_ms(RETRY_MS as i64 - 1);
+    assert_eq!(tick(&f.state, f.now()), 0);
+    for _ in 0..3 {
+        f.advance_ms(RETRY_MS as i64);
+        f.heartbeat(A);
+        f.heartbeat(B);
+        assert_eq!(tick(&f.state, f.now()), 0);
+        assert!(f.pending(A) && f.pending(B));
+    }
+    assert_eq!(log_messages(f.data(), "can't be sent").len(), 2);
+    // The registry is good again: the push goes out at the next try, in full.
+    std::fs::write(&log, &good).unwrap();
+    f.advance_ms(RETRY_MS as i64);
+    f.heartbeat(A);
+    f.heartbeat(B);
+    assert_eq!(tick(&f.state, f.now()), 2);
+    let (items, _) = message(&f.ping(A).unwrap());
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["messageType"], "DOWNLOADFILE");
+    assert!(items[0]["directoryId"].is_u64());
+    assert_eq!(log_messages(f.data(), "can be sent again").len(), 2);
+    assert_eq!(log_messages(f.data(), "can't be sent").len(), 2);
 }
 
 #[test]
@@ -764,39 +887,6 @@ fn the_follower_starts_at_the_end_of_the_journal() {
         state.sockets.deliver("jordi", A, "sid-a", state.now_ms()),
         None
     );
-}
-
-// ---- reconnect ----
-
-#[test]
-fn reconnect_closes_the_socket_of_each_bound_device_once() {
-    let mut f = Fixture::with(Config::default(), true);
-    f.put("a.note");
-    f.follow();
-    f.advance_ms(2000);
-    assert_eq!(tick(&f.state, f.now()), 2);
-    for serial in [A, B] {
-        match f.outbound(serial).as_slice() {
-            [Outbound::Close(reason)] => assert_eq!(*reason, RECONNECT_REASON),
-            other => panic!("{serial}: {other:?}"),
-        }
-        assert!(!f.pending(serial));
-    }
-    f.advance_ms(6000);
-    assert_eq!(tick(&f.state, f.now()), 0);
-}
-
-#[test]
-fn reconnect_skips_a_silent_session_and_keeps_the_push() {
-    let mut f = Fixture::with(Config::default(), true);
-    f.put("a.note");
-    f.follow();
-    f.advance_ms(16_000);
-    f.heartbeat(A);
-    assert_eq!(tick(&f.state, f.now()), 1);
-    assert_eq!(f.outbound(A).len(), 1);
-    assert!(f.outbound(B).is_empty());
-    assert!(f.pending(B));
 }
 
 // ---- the real loop ----
@@ -983,71 +1073,4 @@ async fn the_server_sends_a_detail_push_after_the_ratta_ping_reply() {
         .await
         .unwrap();
     assert_eq!(live.recv().await, r#"42["ratta_ping","Received"]"#);
-}
-
-/// The default `reconnect`: the server closes the WebSocket (code 1001, reason `sync`) after a
-/// put, and sends no socket.io disconnect packet before it.
-#[tokio::test]
-async fn the_server_closes_the_socket_of_a_connected_device_after_a_put() {
-    let dir = tempfile::tempdir().unwrap();
-    seed_account(dir.path(), true);
-    let state = AppState::open(Config::default(), dir.path()).unwrap();
-    state
-        .auth
-        .devices()
-        .update("jordi", A, |d| d.bound = true)
-        .unwrap();
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    let server = tokio::spawn(serve_listeners(vec![l], state.clone()));
-
-    let now = state.now_ms();
-    let (code, _) = state.auth.challenge(EMAIL, now).unwrap();
-    let hash = expected_login_hash(&md5_hex("secret"), &code);
-    let token = state.auth.login(EMAIL, &hash, A, now).unwrap().token;
-    let url = format!(
-        "ws://{addr}/socket.io/?token={token}&type={A}&random=1791270408879&sign=c2lnbmF0dXJlLXZhbHVl&EIO=3&transport=websocket"
-    );
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-    let mut texts = Vec::new();
-    while texts.len() < 2 {
-        if let Some(Ok(Message::Text(t))) = ws.next().await {
-            texts.push(t.to_string());
-        }
-    }
-    assert_eq!(texts[1], "40");
-
-    let src = tempfile::tempdir().unwrap();
-    let file = src.path().join("pushed.note");
-    std::fs::write(&file, b"pushed").unwrap();
-    notedown_cloud::put::put(
-        dir.path(),
-        "jordi",
-        &state.journal,
-        &file,
-        "NOTE/Note",
-        None,
-    )
-    .unwrap();
-
-    let close = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Close(frame))) => return frame,
-                Some(Ok(Message::Text(t))) => {
-                    assert_ne!(t.as_str(), "41", "no socket.io disconnect before the close");
-                    // Keep the session live past the liveness limit.
-                    let _ = ws.send(Message::text("2")).await;
-                }
-                Some(Ok(_)) => continue,
-                other => panic!("connection ended without a close frame: {other:?}"),
-            }
-        }
-    })
-    .await
-    .expect("a close within 15 s")
-    .expect("a close frame");
-    assert_eq!(u16::from(close.code), 1001);
-    assert_eq!(close.reason.as_str(), RECONNECT_REASON);
-    server.abort();
 }

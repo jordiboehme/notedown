@@ -1,5 +1,6 @@
-//! The detail push (`push = "detail"`, D2): one `FILE-SYN` item per pending file or folder
-//! event instead of one `STARTSYNC`, with the fields of section 4.5 of the protocol notes.
+//! The detail push (`push = "detail"`, the default, D2): one `FILE-SYN` item per changed file
+//! or folder, with the fields of section 4.5 of the protocol notes. The pending events are
+//! collapsed per entry first ([`Changes`]).
 //!
 //! Ids come from the event; the parent folder ids are looked up in the id registry of the store
 //! (no store lock needed). A field the event cannot fill, or a parent that is not known any
@@ -8,7 +9,7 @@
 use serde::Serialize;
 
 use super::PushItem;
-use crate::journal::{Event, EventBody};
+use super::changes::{Change, Changes};
 use crate::store::{Store, WirePath};
 
 /// One item. The field order is the order of the 4.5 example; `None` is left out.
@@ -63,93 +64,99 @@ fn name_of(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
-/// The item of one event; `None` for an event that is no file or folder change. `equipmentNo`
-/// is [`super::equipment_no`] of the device that caused the change. Its `timestamp` is
-/// `built_ms`, the time the item is built (4.5).
-fn item(event: &Event, store: &Store, built_ms: u64) -> crate::Result<Option<Item>> {
-    let mut it = Item {
-        equipment_no: super::equipment_no(event.device.as_deref()),
-        file_type: "FILE",
+/// A fresh item of `change` built at `built_ms`: `equipmentNo` is [`super::equipment_no`] of
+/// the device behind its newest event, `timestamp` the build time (4.5).
+fn base(change: &Change, built_ms: u64) -> Item {
+    Item {
+        equipment_no: super::equipment_no(change.device.as_deref()),
+        file_type: if change.folder { "FOLDE" } else { "FILE" },
         timestamp: built_ms,
         ..Item::default()
-    };
-    match &event.body {
-        // A new file and a changed file are both downloaded (4.7).
-        EventBody::FileCreated {
-            id,
-            path,
-            md5,
-            size,
-            ..
-        }
-        | EventBody::FileModified {
-            id,
-            path,
-            md5,
-            size,
-            ..
-        } => {
-            it.message_type = "DOWNLOADFILE";
-            located(&mut it, store, *id, path)?;
-            it.new_name = it.original_name.clone();
-            it.new_path = it.original_path.clone();
-            it.md5 = Some(md5.clone());
-            it.size = Some(*size);
-        }
-        EventBody::FileDeleted { id, path, .. } => {
-            it.message_type = "DELETEFILE";
-            located(&mut it, store, *id, path)?;
-        }
-        EventBody::FileMoved { id, path, old_path } => {
-            it.message_type = moved(
-                &mut it,
-                store,
-                *id,
-                path,
-                old_path,
-                "MODIFYFILE",
-                "MOVEFILE",
-            )?;
-        }
-        EventBody::FileCopied {
-            id,
-            source_id,
-            path,
-        } => {
-            it.message_type = "COPYFILE";
-            let (go, new_path) = parent_of(store, path)?;
-            it.id = Some(*source_id);
-            it.new_id = Some(*id);
-            it.new_name = Some(name_of(path));
-            it.go_directory_id = go;
-            it.new_path = Some(new_path);
-        }
-        EventBody::FolderCreated { id, path } => {
-            it.message_type = "ADDFOLDER";
-            it.file_type = "FOLDE";
-            located(&mut it, store, *id, path)?;
-            it.size = Some(0);
-        }
-        EventBody::FolderDeleted { id, path } => {
-            it.message_type = "DELETEFOLDER";
-            it.file_type = "FOLDE";
-            located(&mut it, store, *id, path)?;
-        }
-        EventBody::FolderMoved { id, path, old_path } => {
-            it.file_type = "FOLDE";
-            it.message_type = moved(
-                &mut it,
-                store,
-                *id,
-                path,
-                old_path,
-                "MODIFYFOLDER",
-                "MOVEFOLDER",
-            )?;
-        }
-        _ => return Ok(None),
     }
-    Ok(Some(it))
+}
+
+/// The items of one collapsed change, by the item rules of 4.5:
+///
+/// - a new entry (created or copied after the last push) gives `DOWNLOADFILE`, `COPYFILE` or
+///   `ADDFOLDER` at its path now, or nothing when it is deleted again;
+/// - a deleted entry the device knows gives `DELETEFILE` or `DELETEFOLDER` at the path the
+///   device knows;
+/// - an entry the device knows at another path gives `MODIFY*` (same folder) or `MOVE*`;
+/// - a file the device knows with new content gives `DOWNLOADFILE` (after the move, when it
+///   moved too: one item alone would leave the device with a stale copy).
+fn items_of(change: &Change, store: &Store, built_ms: u64) -> crate::Result<Vec<Item>> {
+    let id = change.id;
+    let mut out = Vec::new();
+    match (&change.known_path, &change.path) {
+        (None, None) => {}
+        (None, Some(path)) => {
+            let mut it = base(change, built_ms);
+            if change.folder {
+                it.message_type = "ADDFOLDER";
+                located(&mut it, store, id, path)?;
+                it.size = Some(0);
+            } else if let Some((md5, size)) = &change.content {
+                download(&mut it, store, id, path, md5, *size)?;
+            } else if let Some(source_id) = change.copy_of {
+                it.message_type = "COPYFILE";
+                let (go, new_path) = parent_of(store, path)?;
+                it.id = Some(source_id);
+                it.new_id = Some(id);
+                it.new_name = Some(name_of(path));
+                it.go_directory_id = go;
+                it.new_path = Some(new_path);
+            } else {
+                return Ok(out);
+            }
+            out.push(it);
+        }
+        (Some(known), None) => {
+            let mut it = base(change, built_ms);
+            it.message_type = if change.folder {
+                "DELETEFOLDER"
+            } else {
+                "DELETEFILE"
+            };
+            located(&mut it, store, id, known)?;
+            out.push(it);
+        }
+        (Some(known), Some(path)) => {
+            if known != path {
+                let mut it = base(change, built_ms);
+                let (rename, mv) = if change.folder {
+                    ("MODIFYFOLDER", "MOVEFOLDER")
+                } else {
+                    ("MODIFYFILE", "MOVEFILE")
+                };
+                it.message_type = moved(&mut it, store, id, path, known, rename, mv)?;
+                out.push(it);
+            }
+            if let (false, Some((md5, size))) = (change.folder, &change.content) {
+                let mut it = base(change, built_ms);
+                download(&mut it, store, id, path, md5, *size)?;
+                out.push(it);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A `DOWNLOADFILE` item: a new and a changed file are both downloaded (4.7).
+fn download(
+    it: &mut Item,
+    store: &Store,
+    id: u64,
+    path: &str,
+    md5: &str,
+    size: u64,
+) -> crate::Result<()> {
+    it.message_type = "DOWNLOADFILE";
+    located(it, store, id, path)?;
+    it.new_name = it.original_name.clone();
+    it.new_path = it.original_path.clone();
+    it.md5 = Some(md5.to_string());
+    it.size = Some(size);
+    Ok(())
 }
 
 /// `id`, `originalName`, `directoryId` and `originalPath` of an entry at `path`.
@@ -187,16 +194,17 @@ fn moved(
     Ok(kind)
 }
 
-/// The items of `events` built at `built_ms`: one per file or folder event, in journal order.
-/// Fails only when the id registry cannot be read.
+/// The items of `changes` built at `built_ms`, in the order of [`Changes::in_order`]: one per
+/// changed file or folder (two for a file the device knows that moved and got new content), none
+/// for an entry created and deleted again. Fails only when the id registry cannot be read.
 pub fn detail_items(
-    events: &[Event],
+    changes: &Changes,
     store: &Store,
     built_ms: u64,
 ) -> crate::Result<Vec<PushItem>> {
-    let mut items = Vec::with_capacity(events.len());
-    for event in events {
-        if let Some(it) = item(event, store, built_ms)? {
+    let mut items = Vec::with_capacity(changes.len());
+    for change in changes.in_order() {
+        for it in items_of(change, store, built_ms)? {
             items.push(PushItem::new(&it, false));
         }
     }
@@ -206,7 +214,7 @@ pub fn detail_items(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::{FileKind, Origin};
+    use crate::journal::{Event, EventBody, FileKind, Origin};
     use crate::push::file_syn_message;
     use crate::store::Kind;
 
@@ -240,11 +248,33 @@ mod tests {
         e
     }
 
+    /// The items of `events` (journal order, `seq` from 1) collapsed and built at 1000.
+    fn build(store: &Store, events: &[Event]) -> Vec<PushItem> {
+        let mut changes = Changes::default();
+        for (i, e) in events.iter().enumerate() {
+            let mut e = e.clone();
+            e.seq = i as u64 + 1;
+            changes.apply(&e);
+        }
+        detail_items(&changes, store, 1000).unwrap()
+    }
+
     /// The items of `events` as JSON text, comma-separated.
     fn items(store: &Store, events: &[Event]) -> String {
-        let items = detail_items(events, store, 1000).unwrap();
+        let items = build(store, events);
         let v: Vec<&str> = items.iter().map(|i| i.json()).collect();
         v.join(",")
+    }
+
+    /// The `messageType` of each item of `events`.
+    fn types(store: &Store, events: &[Event]) -> Vec<String> {
+        build(store, events)
+            .iter()
+            .map(|i| {
+                let v: serde_json::Value = serde_json::from_str(i.json()).unwrap();
+                v["messageType"].as_str().unwrap().to_string()
+            })
+            .collect()
     }
 
     fn created() -> EventBody {
@@ -368,7 +398,10 @@ mod tests {
     #[test]
     fn no_item_and_no_message_has_null_or_msg() {
         let (_d, s) = store();
-        let all = detail_items(&every_event(), &s, 1000).unwrap();
+        let all: Vec<PushItem> = every_event()
+            .iter()
+            .flat_map(|e| build(&s, std::slice::from_ref(e)))
+            .collect();
         assert_eq!(all.len(), GOLDEN.len());
         let m = file_syn_message(&all, 5);
         assert!(!m.contains(":null") && !m.contains(r#""msg""#), "{m}");
@@ -386,15 +419,16 @@ mod tests {
     }
 
     #[test]
-    fn a_burst_gives_one_item_per_event_in_order() {
+    fn a_burst_gives_one_item_per_file_in_order() {
         let (_d, s) = store();
         let events: Vec<Event> = ["a", "b", "c"]
             .iter()
-            .map(|n| {
+            .zip(1..)
+            .map(|(n, id)| {
                 ev(
                     None,
                     EventBody::FileCreated {
-                        id: 1,
+                        id,
                         path: format!("NOTE/Note/{n}.note"),
                         kind: FileKind::Note,
                         md5: "m".into(),
@@ -404,11 +438,8 @@ mod tests {
                 )
             })
             .collect();
-        let m: serde_json::Value = serde_json::from_str(&file_syn_message(
-            &detail_items(&events, &s, 1000).unwrap(),
-            5,
-        ))
-        .unwrap();
+        let m: serde_json::Value =
+            serde_json::from_str(&file_syn_message(&build(&s, &events), 5)).unwrap();
         let names: Vec<&str> = m["data"]
             .as_array()
             .unwrap()
@@ -444,10 +475,146 @@ mod tests {
     #[test]
     fn device_events_give_no_item() {
         let (_d, s) = store();
-        assert!(
-            detail_items(&[ev(Some("SN1"), EventBody::DeviceBound)], &s, 1000)
-                .unwrap()
-                .is_empty()
+        assert!(build(&s, &[ev(Some("SN1"), EventBody::DeviceBound)]).is_empty());
+    }
+
+    fn modified(path: &str, md5: &str) -> EventBody {
+        EventBody::FileModified {
+            id: 4711,
+            path: path.into(),
+            kind: FileKind::Note,
+            md5: md5.into(),
+            prev_md5: "p".into(),
+            size: 20,
+            pages_changed: None,
+        }
+    }
+
+    fn file_moved(old: &str, new: &str) -> EventBody {
+        EventBody::FileMoved {
+            id: 4711,
+            path: new.into(),
+            old_path: old.into(),
+        }
+    }
+
+    fn file_deleted(path: &str) -> EventBody {
+        EventBody::FileDeleted {
+            id: 4711,
+            path: path.into(),
+            recycle: "r".into(),
+        }
+    }
+
+    #[test]
+    fn a_new_file_changed_again_is_one_download_with_the_latest_content() {
+        let (_d, s) = store();
+        let events = [
+            ev(None, created()),
+            ev(None, modified("NOTE/Note/Work/a.pdf", "m9")),
+            ev(None, file_moved("NOTE/Note/Work/a.pdf", "NOTE/Note/b.pdf")),
+        ];
+        let out = items(&s, &events);
+        assert_eq!(
+            out,
+            r#"{"messageType":"DOWNLOADFILE","equipmentNo":"null-null","fileType":"FILE","id":4711,"originalName":"b.pdf","newName":"b.pdf","md5":"m9","size":20,"directoryId":1001,"originalPath":"NOTE/Note/","newPath":"NOTE/Note/","timestamp":1000}"#
         );
+    }
+
+    #[test]
+    fn a_new_file_deleted_again_gives_no_item() {
+        let (_d, s) = store();
+        let events = [
+            ev(None, created()),
+            ev(None, file_deleted("NOTE/Note/Work/a.pdf")),
+        ];
+        assert!(build(&s, &events).is_empty());
+    }
+
+    #[test]
+    fn two_moves_are_one_move_from_the_first_place_to_the_last() {
+        let (_d, s) = store();
+        let events = [
+            ev(None, file_moved("NOTE/Note/a.note", "NOTE/Note/b.note")),
+            ev(
+                None,
+                file_moved("NOTE/Note/b.note", "NOTE/Note/Work/c.note"),
+            ),
+        ];
+        assert_eq!(
+            items(&s, &events),
+            r#"{"messageType":"MOVEFILE","equipmentNo":"null-null","fileType":"FILE","id":4711,"originalName":"a.note","newName":"c.note","directoryId":1001,"goDirectoryId":1002,"originalPath":"NOTE/Note/","newPath":"NOTE/Note/Work/","timestamp":1000}"#
+        );
+        // Moved back to where it was: nothing changed for the device.
+        let back = [
+            ev(None, file_moved("NOTE/Note/a.note", "NOTE/Note/b.note")),
+            ev(None, file_moved("NOTE/Note/b.note", "NOTE/Note/a.note")),
+        ];
+        assert!(build(&s, &back).is_empty());
+    }
+
+    #[test]
+    fn a_delete_after_a_move_names_the_place_the_device_knows() {
+        let (_d, s) = store();
+        let events = [
+            ev(
+                None,
+                file_moved("NOTE/Note/a.note", "NOTE/Note/Work/b.note"),
+            ),
+            ev(Some("SN2"), file_deleted("NOTE/Note/Work/b.note")),
+        ];
+        assert_eq!(
+            items(&s, &events),
+            r#"{"messageType":"DELETEFILE","equipmentNo":"SN2-null","fileType":"FILE","id":4711,"originalName":"a.note","directoryId":1001,"originalPath":"NOTE/Note/","timestamp":1000}"#
+        );
+    }
+
+    #[test]
+    fn a_known_file_that_moved_and_changed_gives_the_move_then_the_download() {
+        let (_d, s) = store();
+        let events = [
+            ev(None, modified("NOTE/Note/a.note", "m1")),
+            ev(
+                None,
+                file_moved("NOTE/Note/a.note", "NOTE/Note/Work/a.note"),
+            ),
+        ];
+        assert_eq!(types(&s, &events), ["MOVEFILE", "DOWNLOADFILE"]);
+        let out = items(&s, &events);
+        assert!(out.ends_with(r#""md5":"m1","size":20,"directoryId":1002,"originalPath":"NOTE/Note/Work/","newPath":"NOTE/Note/Work/","timestamp":1000}"#), "{out}");
+    }
+
+    #[test]
+    fn a_new_folder_comes_before_the_files_put_into_it() {
+        let (_d, s) = store();
+        let events = [
+            ev(
+                None,
+                EventBody::FolderCreated {
+                    id: 77,
+                    path: "NOTE/Note/New".into(),
+                },
+            ),
+            ev(
+                None,
+                EventBody::FileCreated {
+                    id: 78,
+                    path: "NOTE/Note/New/a.note".into(),
+                    kind: FileKind::Note,
+                    md5: "m".into(),
+                    size: 1,
+                    pages_changed: None,
+                },
+            ),
+            ev(
+                None,
+                EventBody::FolderMoved {
+                    id: 77,
+                    path: "NOTE/Note/Work/New".into(),
+                    old_path: "NOTE/Note/New".into(),
+                },
+            ),
+        ];
+        assert_eq!(types(&s, &events), ["ADDFOLDER", "DOWNLOADFILE"]);
     }
 }

@@ -3,9 +3,9 @@
 //! The follower reads the journal events after its cursor and feeds them to the planner. The
 //! cursor lives in memory only: it starts at the journal's `last_seq` when the server starts
 //! (D11), so older changes never cause a push, and a restart drops pending pushes (D6). The tick
-//! hands every due push that D8 allows to the device's socket session: `reconnect` closes it,
-//! `startsync` and `detail` put their items into its queue, which the session sends after its
-//! next heartbeat reply (`docs/sync-protocol.md` 4.4).
+//! hands every due push that D8 allows to the device's socket session: `detail` and `startsync`
+//! put their items into its queue, which the session sends after its next heartbeat reply
+//! (`docs/sync-protocol.md` 4.4).
 
 use std::collections::HashMap;
 use std::sync::{Arc, MutexGuard};
@@ -80,8 +80,13 @@ pub fn follow_once(state: &AppState, last_seq: &mut u64) -> crate::Result<usize>
     Ok(read)
 }
 
-/// The close reason of a `reconnect` push.
-pub const RECONNECT_REASON: &str = "sync";
+/// One line on stderr and one marker in the protocol log.
+fn log_marker(state: &AppState, message: String) {
+    eprintln!("notedown cloud: {message}");
+    let mut m = LogEntry::new(LogKind::Marker);
+    m.message = Some(message);
+    state.log.record(m);
+}
 
 /// One tick at `now_ms`: hand over every due push that D8 allows. Returns the pushes handed
 /// over. A target that fails a gate keeps its pending push. Blocking (it reads `account.json`).
@@ -109,32 +114,46 @@ pub fn tick(state: &AppState, now_ms: u64) -> usize {
         let Some(pending) = planner.pending(&slug, &serial) else {
             continue;
         };
-        if state.config.push == PushMode::Reconnect {
-            // Only the WebSocket is closed, without a socket.io disconnect packet (`41`): a
-            // client treats a server disconnect as final and does not connect again.
-            if state
-                .sockets
-                .close(&slug, &serial, RECONNECT_REASON, now_ms)
-            {
-                planner.sent(&slug, &serial, now_ms);
-                sent += 1;
+        let items = if state.config.push == PushMode::Startsync {
+            vec![startsync_item(pending.cause.as_deref(), now_ms)]
+        } else {
+            // Every pending change, however many (Ratta has no cap either, 4.4). When the id
+            // registry can't be read, the push stays pending and is tried again after a
+            // heartbeat; only the first failure in a row is logged.
+            let built = state
+                .store(&slug)
+                .and_then(|store| detail_items(&pending.changes, &store, now_ms));
+            match built {
+                Ok(items) => items,
+                Err(e) => {
+                    if planner.failed(&slug, &serial, now_ms) {
+                        log_marker(
+                            state,
+                            format!(
+                                "push: the changes for {serial} of account {slug} can't be \
+                                 sent, the push waits and is tried again: {e}"
+                            ),
+                        );
+                    }
+                    continue;
+                }
             }
-            continue;
-        }
-        let cause = pending.cause.as_deref();
-        // `detail` falls back to `STARTSYNC` when the cap dropped events (the list would be
-        // partial) or when its items cannot be built.
-        let detail = (state.config.push == PushMode::Detail && !pending.truncated)
-            .then(|| {
-                let store = state.store(&slug).ok()?;
-                detail_items(&pending.events, &store, now_ms).ok()
-            })
-            .flatten()
-            .filter(|items| !items.is_empty());
-        let items = detail.unwrap_or_else(|| vec![startsync_item(cause, now_ms)]);
-        if state.sockets.queue(&slug, &serial, items, now_ms) {
-            planner.sent(&slug, &serial, now_ms);
+        };
+        // An entry created and deleted again leaves nothing to tell: the push is done without a
+        // message.
+        let recovered = if items.is_empty() {
+            planner.drop_pending(&slug, &serial)
+        } else if state.sockets.queue(&slug, &serial, items, now_ms) {
             sent += 1;
+            planner.sent(&slug, &serial, now_ms)
+        } else {
+            false
+        };
+        if recovered {
+            log_marker(
+                state,
+                format!("push: the changes for {serial} of account {slug} can be sent again"),
+            );
         }
     }
     sent

@@ -193,13 +193,18 @@ fn cloud_account_add_list_passwd_remove() {
 
 /// Start `notedown serve` on a loopback port and return the startup lines up to the stop hint.
 fn serve_startup(data: &std::path::Path, extra: &[&str]) -> String {
-    use std::io::BufRead;
+    serve_startup_with_stderr(data, extra).0
+}
+
+/// The start lines of `notedown serve` on stdout, and what it wrote on stderr until then.
+fn serve_startup_with_stderr(data: &std::path::Path, extra: &[&str]) -> (String, String) {
+    use std::io::{BufRead, Read};
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
         .args(["serve", "--data"])
         .arg(data)
         .args(extra)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
     let mut lines = String::new();
@@ -216,7 +221,33 @@ fn serve_startup(data: &std::path::Path, extra: &[&str]) -> String {
     }
     let _ = child.kill();
     let _ = child.wait();
-    lines
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    (lines, err)
+}
+
+#[test]
+fn serve_reads_the_old_push_reconnect_as_detail_and_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    let toml = dir.path().join("server.toml");
+    let text = "listen = [\"127.0.0.1:0\"]\npush = \"reconnect\"\n";
+    std::fs::write(&toml, text).unwrap();
+    let (out, err) = serve_startup_with_stderr(dir.path(), &[]);
+    assert!(out.contains("\npush mode: detail ("), "{out}");
+    assert_eq!(err.matches("push = \"reconnect\"").count(), 1, "{err}");
+    assert!(
+        err.contains(
+            "warning: server.toml: push = \"reconnect\" is gone, using \"detail\". Remove the \
+             line or set push = \"detail\".\n"
+        ),
+        "{err}"
+    );
+    assert_eq!(std::fs::read_to_string(&toml).unwrap(), text);
 }
 
 #[test]
@@ -240,7 +271,7 @@ fn serve_refuse_sync_flag_counts_for_one_run_and_keeps_server_toml() {
     assert!(out.contains("sync mode: accept (protect: on)"), "{out}");
     assert!(
         out.contains(
-            "\npush mode: reconnect (the device's socket is closed, it syncs when it connects again)\n"
+            "\npush mode: detail (each changed file and folder, after the device's next heartbeat)\n"
         ),
         "{out}"
     );

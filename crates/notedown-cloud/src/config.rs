@@ -29,18 +29,17 @@ pub enum SyncMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PushMode {
-    /// Close the device's socket. The device connects again within seconds and runs a full
-    /// sync on every new connection (`docs/sync-protocol.md` 9.3).
-    #[default]
-    Reconnect,
-    /// One `STARTSYNC` item, queued and sent after the device's next heartbeat reply as Ratta
-    /// sends its pushes (`docs/sync-protocol.md` 4.4). Firmware 3.29.42 acknowledges it but does
-    /// not sync.
-    Startsync,
     /// One item per changed file or folder in Ratta's form, queued and sent after the device's
-    /// next heartbeat reply, again until the device answers `Received` (4.4). Falls back to
-    /// `startsync` when the items cannot be built or the list of changes was cut at its cap.
+    /// next heartbeat reply, again until the device answers `Received`
+    /// (`docs/sync-protocol.md` 4.4). Every pending change is sent, collapsed per file or
+    /// folder. When the items can't be built the push waits and is tried again. The value
+    /// `"reconnect"` of older versions reads as this one ([`Config::load_or_create`] warns).
+    #[default]
+    #[serde(alias = "reconnect")]
     Detail,
+    /// One `STARTSYNC` item, queued and sent after the device's next heartbeat reply as Ratta
+    /// sends its pushes (4.4). Firmware 3.29.42 acknowledges it but does not sync.
+    Startsync,
     /// No pushes; the device syncs on its own schedule.
     Off,
 }
@@ -64,10 +63,10 @@ pub struct Config {
     /// `"accept"` (default) exchanges files with the device. `"refuse"` answers every sync
     /// with a busy error (capture only). `notedown serve --refuse-sync` sets it for one run.
     pub sync: SyncMode,
-    /// `"reconnect"` (default) closes a connected device's socket after a change it did not make
-    /// itself (a `notedown cloud put`, another device's upload), so it connects again and syncs.
-    /// `"startsync"` sends one `STARTSYNC` message, `"detail"` sends the changed items instead,
-    /// both after the device's next heartbeat; `"off"` sends nothing.
+    /// What a connected device gets after a change it did not make itself (a
+    /// `notedown cloud put`, another device's upload), after its next heartbeat. `"detail"`
+    /// (default) sends one item per changed file or folder, `"startsync"` one `STARTSYNC`
+    /// message, `"off"` nothing.
     pub push: PushMode,
     /// Write full, masked dumps of every request and frame to `capture/`. For one capture
     /// session only: the dumps have no size cap and no rotation. The `--capture` flag of
@@ -106,7 +105,7 @@ impl Default for Config {
             trusted_proxies: Vec::new(),
             protect: true,
             sync: SyncMode::Accept,
-            push: PushMode::Reconnect,
+            push: PushMode::Detail,
             capture: false,
             log_retention_days: 30,
             log_max_bytes: 1024 * 1024 * 1024,
@@ -137,6 +136,12 @@ impl Config {
 
     /// Load `<data>/server.toml`; write the defaults when it does not exist yet.
     pub fn load_or_create(data_dir: &Path) -> Result<Config> {
+        Ok(Self::load_with_warnings(data_dir)?.0)
+    }
+
+    /// [`Config::load_or_create`], plus the warnings about the file for `notedown serve` to
+    /// print. The file is never rewritten for them.
+    pub fn load_with_warnings(data_dir: &Path) -> Result<(Config, Vec<String>)> {
         let path = Self::path(data_dir);
         match std::fs::read_to_string(&path) {
             Ok(text) => {
@@ -145,12 +150,12 @@ impl Config {
                     message: e.to_string(),
                 })?;
                 config.validate(&path)?;
-                Ok(config)
+                Ok((config, warnings(&text)))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let config = Config::default();
                 config.save(data_dir)?;
-                Ok(config)
+                Ok((config, Vec::new()))
             }
             Err(e) => Err(io_err(&path)(e)),
         }
@@ -202,6 +207,19 @@ impl Config {
         );
         crate::fsutil::write_atomic(&path, text.as_bytes(), false)
     }
+}
+
+/// The warnings about a `server.toml` that loaded: values of older versions that still work.
+fn warnings(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let table: toml::Table = toml::from_str(text).unwrap_or_default();
+    if table.get("push").and_then(|v| v.as_str()) == Some("reconnect") {
+        out.push(format!(
+            "{CONFIG_FILE}: push = \"reconnect\" is gone, using \"detail\". Remove the line or \
+             set push = \"detail\"."
+        ));
+    }
+    out
 }
 
 #[cfg(test)]

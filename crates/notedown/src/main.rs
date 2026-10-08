@@ -1345,7 +1345,7 @@ fn host_ipv4s() -> Vec<std::net::Ipv4Addr> {
 fn serve_command(args: ServeArgs) -> Result<ExitCode> {
     use notedown_cloud::Config;
     use notedown_cloud::server::{AppState, bind, serve_until};
-    let mut config = Config::load_or_create(&args.data)?;
+    let (mut config, config_warnings) = Config::load_with_warnings(&args.data)?;
     // The flag counts for this run only; server.toml is not rewritten.
     let capture_from_file = config.capture && !args.capture;
     config.capture |= args.capture;
@@ -1385,6 +1385,9 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
                  session only, the dumps have no size cap. Set capture = false and use --capture."
             );
         }
+        for warning in &config_warnings {
+            eprintln!("warning: {warning}");
+        }
         match config.sync {
             notedown_cloud::SyncMode::Refuse => {
                 println!("sync mode: refuse (capture only, no files are exchanged)");
@@ -1397,11 +1400,10 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
                 println!(
                     "push mode: {}",
                     match config.push {
-                        notedown_cloud::PushMode::Reconnect => {
-                            "reconnect (the device's socket is closed, it syncs when it connects again)"
+                        notedown_cloud::PushMode::Detail => {
+                            "detail (each changed file and folder, after the device's next heartbeat)"
                         }
                         notedown_cloud::PushMode::Startsync => "startsync",
-                        notedown_cloud::PushMode::Detail => "detail",
                         notedown_cloud::PushMode::Off => "off (devices sync on their own schedule)",
                     }
                 );

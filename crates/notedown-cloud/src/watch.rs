@@ -115,22 +115,29 @@ pub async fn run(state: Arc<AppState>, quiet: Duration) {
     let off = |e: &dyn std::fmt::Display| {
         eprintln!("notedown cloud: watch: {e}, hand changes wait for the timer scan");
     };
-    // File systems report canonical paths (`/private/var` on macOS for `/var`).
-    let dir = match std::fs::canonicalize(state.data_dir.join("accounts")) {
-        Ok(d) => d,
-        Err(e) => return off(&e),
-    };
+    let accounts = state.data_dir.join("accounts");
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    // The callback runs on notify's thread; after an abort the receiver is gone.
-    let mut watcher = match notify::recommended_watcher(move |r| {
-        let _ = tx.send(r);
-    }) {
-        Ok(w) => w,
+    // The setup runs off the async threads: a recursive watch on Linux walks the whole tree.
+    let setup = tokio::task::spawn_blocking(move || {
+        // File systems report canonical paths (`/private/var` on macOS for `/var`).
+        let dir = std::fs::canonicalize(&accounts).map_err(|e| e.to_string())?;
+        // The callback runs on notify's thread; after an abort the receiver is gone.
+        let mut watcher = notify::recommended_watcher(move |r| {
+            let _ = tx.send(r);
+        })
+        .map_err(|e| e.to_string())?;
+        watcher
+            .watch(&dir, RecursiveMode::Recursive)
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>((dir, watcher))
+    })
+    .await;
+    // The watcher lives as long as this function, so the channel stays open.
+    let (dir, _watcher) = match setup {
+        Ok(Ok(w)) => w,
+        Ok(Err(e)) => return off(&e),
         Err(e) => return off(&e),
     };
-    if let Err(e) = watcher.watch(&dir, RecursiveMode::Recursive) {
-        return off(&e);
-    }
     let mut batch = Batch::default();
     let mut busy: BTreeMap<String, Scope> = BTreeMap::new();
     let mut reported = HashSet::new();

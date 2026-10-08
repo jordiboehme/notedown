@@ -779,6 +779,7 @@ async fn the_follower_renders_after_a_put_and_a_quiet_time() {
         Timing {
             quiet: Duration::from_millis(200),
             poll: Duration::from_millis(50),
+            retry: Duration::from_millis(100),
         },
     ));
     // The start pass.
@@ -805,4 +806,121 @@ async fn the_follower_renders_after_a_put_and_a_quiet_time() {
     })
     .await;
     task.abort();
+}
+
+/// A served state with `render_dir` set, the follower running with short timing.
+struct Followed {
+    data: tempfile::TempDir,
+    root: PathBuf,
+    state: std::sync::Arc<notedown_cloud::server::AppState>,
+    task: tokio::task::JoinHandle<()>,
+    _render: tempfile::TempDir,
+}
+
+impl Followed {
+    async fn start() -> Followed {
+        use notedown_cloud::render::follow::{Timing, run};
+        use std::time::Duration;
+        let data = tempfile::tempdir().unwrap();
+        let render = tempfile::tempdir().unwrap();
+        Accounts::new(data.path())
+            .create("acc", "acc@example.org", "secret")
+            .unwrap();
+        let config = notedown_cloud::Config {
+            render_dir: Some(render.path().to_string_lossy().to_string()),
+            ..notedown_cloud::Config::default()
+        };
+        let root = config.render_root(data.path()).unwrap();
+        let state = notedown_cloud::server::AppState::open(config, data.path()).unwrap();
+        let task = tokio::spawn(run(
+            state.clone(),
+            root.clone(),
+            Timing {
+                quiet: Duration::from_millis(200),
+                poll: Duration::from_millis(50),
+                retry: Duration::from_millis(100),
+            },
+        ));
+        let f = Followed {
+            data,
+            root,
+            state,
+            task,
+            _render: render,
+        };
+        until("the start pass", || f.root.join("acc").exists()).await;
+        f
+    }
+
+    /// Put test1 as `n.note`; the last journal seq.
+    async fn put(&self) -> u64 {
+        let src = self.data.path().join("n.note");
+        std::fs::write(&src, fixture_note("test1")).unwrap();
+        let st = self.state.clone();
+        let r = tokio::task::spawn_blocking(move || {
+            notedown_cloud::put::put(&st.data_dir, "acc", &st.journal, &src, "/NOTE/Note", None)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        *r.seqs.last().unwrap()
+    }
+
+    fn pdf(&self) -> PathBuf {
+        self.root.join("acc/NOTE/Note/n.pdf")
+    }
+
+    fn cursor(&self) -> u64 {
+        self.state
+            .journal
+            .cursor("render")
+            .unwrap()
+            .map_or(0, |c| c.seq)
+    }
+}
+
+async fn until(what: &str, mut ok: impl FnMut() -> bool) {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ok() {
+        assert!(
+            std::time::Instant::now() < end,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_pass_is_tried_again_when_the_render_folder_comes_back() {
+    let f = Followed::start().await;
+    std::fs::remove_dir_all(&f.root).unwrap();
+    let last = f.put().await;
+    // Several quiet and retry times: the passes fail and hold the cursor.
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    assert!(f.cursor() < last, "the cursor moved past a failed pass");
+    std::fs::create_dir_all(&f.root).unwrap();
+    until("the PDF", || f.pdf().exists()).await;
+    until("the cursor", || f.cursor() >= last).await;
+    f.task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_busy_account_is_tried_again_when_the_lock_is_released() {
+    let f = Followed::start().await;
+    let lock_path = f.root.join("acc").join(LOCK_FILE);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    lock.lock().unwrap();
+    let last = f.put().await;
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    assert!(!f.pdf().exists());
+    assert!(f.cursor() < last);
+    drop(lock);
+    until("the PDF", || f.pdf().exists()).await;
+    until("the cursor", || f.cursor() >= last).await;
+    f.task.abort();
 }

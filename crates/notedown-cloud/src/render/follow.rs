@@ -1,7 +1,7 @@
 //! The `render` consumer: one pass per account at start, then a pass for each account whose
 //! notes changed, after a quiet time, so a sync of many notes is one pass.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,12 +19,15 @@ pub struct Timing {
     pub quiet: Duration,
     /// How often the journal is read.
     pub poll: Duration,
+    /// How long an account whose pass failed waits for the next try.
+    pub retry: Duration,
 }
 
 impl Timing {
     pub const DEFAULT: Timing = Timing {
         quiet: Duration::from_secs(2),
         poll: Duration::from_secs(1),
+        retry: Duration::from_secs(30),
     };
 }
 
@@ -62,8 +65,16 @@ fn pass_line(slug: &str, r: &PassReport) -> Option<String> {
     ))
 }
 
-/// One pass for `slug`, off the async threads. `true` when the account was busy.
-async fn pass(state: &Arc<AppState>, root: &Path, slug: &str) -> bool {
+/// What a pass came to.
+enum Outcome {
+    Done,
+    /// Another pass held the render lock.
+    Busy,
+    Failed(String),
+}
+
+/// One pass for `slug`, off the async threads.
+async fn pass(state: &Arc<AppState>, root: &Path, slug: &str) -> Outcome {
     let st = state.clone();
     let root = root.to_path_buf();
     let name = slug.to_string();
@@ -80,19 +91,68 @@ async fn pass(state: &Arc<AppState>, root: &Path, slug: &str) -> bool {
     })
     .await;
     match done {
+        Ok(Ok(report)) if report.busy => Outcome::Busy,
         Ok(Ok(report)) => {
             if let Some(line) = pass_line(slug, &report) {
                 eprintln!("{line}");
             }
-            report.busy
+            Outcome::Done
         }
-        Ok(Err(e)) => {
-            eprintln!("notedown render: {slug}: {e}");
-            false
-        }
-        Err(e) => {
-            eprintln!("notedown render: {slug}: {e}");
-            false
+        Ok(Err(e)) => Outcome::Failed(e.to_string()),
+        Err(e) => Outcome::Failed(e.to_string()),
+    }
+}
+
+/// The accounts that exist now; `None` when the list can't be read.
+async fn account_slugs(state: &Arc<AppState>) -> Option<Vec<String>> {
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || {
+        st.auth
+            .accounts()
+            .list()
+            .map(|l| l.into_iter().map(|a| a.slug).collect())
+    })
+    .await
+    .ok()?
+    .ok()
+}
+
+/// The accounts waiting for a pass, each with the time of its next try, and the last error
+/// text of those that failed.
+struct Pending {
+    due: BTreeMap<String, Instant>,
+    errors: BTreeMap<String, String>,
+}
+
+impl Pending {
+    /// Run the pass of `slug` and file the outcome.
+    async fn attempt(&mut self, state: &Arc<AppState>, root: &Path, slug: &str, t: Timing) {
+        match pass(state, root, slug).await {
+            Outcome::Done => {
+                self.due.remove(slug);
+                if self.errors.remove(slug).is_some() {
+                    eprintln!("notedown render: {slug}: works again");
+                }
+            }
+            Outcome::Busy => {
+                self.due.insert(slug.to_string(), Instant::now() + t.poll);
+            }
+            Outcome::Failed(text) => {
+                // An account that was removed meanwhile has nothing to render.
+                if account_slugs(state)
+                    .await
+                    .is_some_and(|l| !l.iter().any(|s| s == slug))
+                {
+                    self.due.remove(slug);
+                    self.errors.remove(slug);
+                    return;
+                }
+                if self.errors.get(slug) != Some(&text) {
+                    eprintln!("notedown render: {slug}: {text}");
+                    self.errors.insert(slug.to_string(), text);
+                }
+                self.due.insert(slug.to_string(), Instant::now() + t.retry);
+            }
         }
     }
 }
@@ -139,33 +199,46 @@ fn read_batch(state: &AppState, from: u64) -> crate::Result<Batch> {
     Ok(batch)
 }
 
-/// Render at start, then after note events and a quiet time. Never returns; stop it by
-/// aborting the task.
+/// Render at start, then after note events and a quiet time. An account whose pass failed
+/// or found the lock busy is tried again (every `retry` or `poll`) and holds the cursor.
+/// Never returns; stop it by aborting the task.
 pub async fn run(state: Arc<AppState>, root: PathBuf, timing: Timing) {
     let st = state.clone();
-    let mut seq = match tokio::task::spawn_blocking(move || st.journal.last_seq()).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            eprintln!("notedown render: journal: {e}");
-            0
-        }
+    let start = tokio::task::spawn_blocking(move || {
+        let seq = st.journal.last_seq();
+        let slugs = st.auth.accounts().list();
+        (seq, slugs)
+    })
+    .await;
+    let (mut seq, slugs) = match start {
+        Ok((seq, slugs)) => (
+            seq.unwrap_or_else(|e| {
+                eprintln!("notedown render: journal: {e}");
+                0
+            }),
+            slugs.map(|l| l.into_iter().map(|a| a.slug).collect::<Vec<_>>()),
+        ),
         Err(e) => {
-            eprintln!("notedown render: journal: {e}");
-            0
+            eprintln!("notedown render: {e}");
+            (0, Ok(Vec::new()))
         }
     };
-    match state.auth.accounts().list() {
-        Ok(accounts) => {
-            for a in accounts {
-                pass(&state, &root, &a.slug).await;
+    let mut pending = Pending {
+        due: BTreeMap::new(),
+        errors: BTreeMap::new(),
+    };
+    match slugs {
+        Ok(slugs) => {
+            for slug in slugs {
+                pending.attempt(&state, &root, &slug, timing).await;
             }
         }
         Err(e) => eprintln!("notedown render: accounts: {e}"),
     }
-    set_cursor(&state, seq).await;
+    if pending.due.is_empty() {
+        set_cursor(&state, seq).await;
+    }
 
-    let mut pending: BTreeSet<String> = BTreeSet::new();
-    let mut last_wake = Instant::now();
     let mut warned = false;
     loop {
         tokio::time::sleep(timing.poll).await;
@@ -181,26 +254,31 @@ pub async fn run(state: Arc<AppState>, root: PathBuf, timing: Timing) {
                     seq = batch.last;
                 }
                 if batch.woke {
-                    pending.extend(batch.accounts);
-                    last_wake = Instant::now();
-                } else if pending.is_empty() && batch.last >= from {
+                    let at = Instant::now() + timing.quiet;
+                    for slug in batch.accounts {
+                        pending.due.insert(slug, at);
+                    }
+                } else if pending.due.is_empty() && batch.last >= from {
                     set_cursor(&state, seq).await;
                 }
             }
             Ok(Err(e)) => eprintln!("notedown render: journal: {e}"),
             Err(e) => eprintln!("notedown render: journal: {e}"),
         }
-        if pending.is_empty() || last_wake.elapsed() < timing.quiet {
+        let now = Instant::now();
+        let ready: Vec<String> = pending
+            .due
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(slug, _)| slug.clone())
+            .collect();
+        if ready.is_empty() {
             continue;
         }
-        let mut busy = BTreeSet::new();
-        for slug in std::mem::take(&mut pending) {
-            if pass(&state, &root, &slug).await {
-                busy.insert(slug);
-            }
+        for slug in ready {
+            pending.attempt(&state, &root, &slug, timing).await;
         }
-        pending = busy;
-        if pending.is_empty() {
+        if pending.due.is_empty() {
             set_cursor(&state, seq).await;
         }
     }

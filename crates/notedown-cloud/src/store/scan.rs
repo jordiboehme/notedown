@@ -459,7 +459,9 @@ impl Store {
 
     /// The events of `plan` in journal order (see [`ScanReport`]), with the page events of
     /// every new or changed note right after its file event, and the page records to write
-    /// after the registry.
+    /// after the registry. The notes are indexed in path order, new and changed ones together,
+    /// so the first copy of a note gets its `FILE_ID` and the others their path key, as a
+    /// snapshot of the same tree gives them (see [`crate::pages::scan_note`]).
     fn scan_events(&self, plan: &Plan) -> (Vec<Event>, Vec<SideWrite>) {
         let mut bodies = Vec::new();
         let mut writes = Vec::new();
@@ -472,6 +474,42 @@ impl Store {
         } else {
             Default::default()
         };
+        let moved_notes: Vec<(WirePath, WirePath)> = plan
+            .moved
+            .iter()
+            .filter(|(_, from, _)| is_note(from))
+            .map(|(_, from, d)| (from.clone(), d.path.clone()))
+            .collect();
+        // A moved note keeps its FILE_ID record: no other note of this scan takes that key.
+        let mut claims = crate::pages::move_claims(&by_path, &moved_notes);
+        let mut notes: Vec<(u64, &OnDisk, Option<&str>)> = plan
+            .new_files
+            .iter()
+            .map(|n| (n.id, &n.entry, None))
+            .chain(
+                plan.modified
+                    .iter()
+                    .map(|(id, d)| (*id, d, Some(d.prev.as_deref().unwrap_or_default()))),
+            )
+            .filter(|(_, d, _)| is_note(&d.path))
+            .collect();
+        notes.sort_by(|a, b| a.1.path.cmp(&b.1.path));
+        let mut pages: HashMap<u64, (Option<u64>, Vec<EventBody>)> = HashMap::new();
+        for (id, d, prev) in notes {
+            let (changed, events, w) = crate::pages::scan_note(
+                self,
+                &d.path,
+                id,
+                &d.md5,
+                d.size,
+                prev,
+                &by_path,
+                &mut claims,
+            );
+            writes.extend(w);
+            pages.insert(id, (changed, events));
+        }
+        let mut pages_of = |id: u64| pages.remove(&id).unwrap_or_default();
         for n in &plan.new_folders {
             bodies.push(EventBody::FolderCreated {
                 id: n.id,
@@ -479,38 +517,31 @@ impl Store {
             });
         }
         for n in &plan.new_files {
-            let (kind, pages_changed, pages) =
-                self.scan_pages(n.id, &n.entry, None, &by_path, &mut writes);
+            let (pages_changed, page_events) = pages_of(n.id);
             bodies.push(EventBody::FileCreated {
                 id: n.id,
                 path: n.entry.path.display(),
-                kind,
+                kind: FileKind::of(n.entry.path.name().unwrap_or_default()),
                 md5: n.entry.md5.clone(),
                 size: n.entry.size,
                 pages_changed,
             });
-            bodies.extend(pages);
+            bodies.extend(page_events);
         }
         for (id, d) in &plan.modified {
-            let prev = d.prev.clone().unwrap_or_default();
-            let (kind, pages_changed, pages) =
-                self.scan_pages(*id, d, Some(&prev), &by_path, &mut writes);
+            let (pages_changed, page_events) = pages_of(*id);
             bodies.push(EventBody::FileModified {
                 id: *id,
                 path: d.path.display(),
-                kind,
+                kind: FileKind::of(d.path.name().unwrap_or_default()),
                 md5: d.md5.clone(),
-                prev_md5: prev,
+                prev_md5: d.prev.clone().unwrap_or_default(),
                 size: d.size,
                 pages_changed,
             });
-            bodies.extend(pages);
+            bodies.extend(page_events);
         }
-        let mut moved_notes = Vec::new();
         for (id, from, d) in &plan.moved {
-            if is_note(from) {
-                moved_notes.push((from.clone(), d.path.clone()));
-            }
             bodies.push(EventBody::FileMoved {
                 id: *id,
                 path: d.path.display(),
@@ -537,26 +568,6 @@ impl Store {
             .map(|b| Event::new(&self.slug, Origin::Scan, None, &op_id, b))
             .collect();
         (events, writes)
-    }
-
-    /// The kind of the file `d` (store id `id`) and, for a note, `pagesChanged` and its page
-    /// events; its record changes go to `writes`. `prev` is the MD5 before a change.
-    fn scan_pages(
-        &self,
-        id: u64,
-        d: &OnDisk,
-        prev: Option<&str>,
-        by_path: &crate::pages::RecordsByPath,
-        writes: &mut Vec<SideWrite>,
-    ) -> (FileKind, Option<u64>, Vec<EventBody>) {
-        let kind = FileKind::of(d.path.name().unwrap_or_default());
-        if kind != FileKind::Note {
-            return (kind, None, Vec::new());
-        }
-        let (changed, events, w) =
-            crate::pages::scan_note(self, &d.path, id, &d.md5, d.size, prev, by_path);
-        writes.extend(w);
-        (kind, changed, events)
     }
 
     /// After the journal append: the registry ops in one log append, then the cache. After a

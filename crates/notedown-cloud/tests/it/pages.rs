@@ -1294,3 +1294,182 @@ fn a_commit_rewrites_no_record_with_the_same_bytes_and_removes_a_dropped_one() {
     assert!(!path.exists());
     assert_eq!(f.record(FID2).unwrap().path, "NOTE/Note/a.note");
 }
+
+// ------------------------------------------------------------ copies found by one scan
+
+impl Fixture {
+    /// Place a file by hand (parents too), without the store.
+    fn place(&self, path: &str, bytes: &[u8]) {
+        let p = self.store.fs_path(&wp(path));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, bytes).unwrap();
+    }
+
+    /// A whole-tree scan. Returns the events it journaled.
+    fn scan(&self) -> Vec<Event> {
+        use notedown_cloud::store::ScanOptions;
+        let before = self.journal.last_seq().unwrap();
+        let g = self.store.lock_recovered(&self.journal).unwrap();
+        self.store
+            .scan(&g, &self.journal, &ScanOptions::all(1), 1_791_270_000_000)
+            .unwrap();
+        drop(g);
+        self.since(before)
+    }
+
+    /// The record names in `pages/` with their bytes.
+    fn records(&self) -> BTreeMap<String, Vec<u8>> {
+        record_files(self)
+            .into_iter()
+            .map(|(k, (_, _, b))| (k, b))
+            .collect()
+    }
+}
+
+fn path_key(path: &str) -> String {
+    format!("path:{}", md5_hex(path.as_bytes()))
+}
+
+/// The keys of the `page.added` events of each file, by the path of its file event.
+fn added_keys(events: &[Event]) -> BTreeMap<String, Vec<String>> {
+    let mut paths: BTreeMap<u64, String> = BTreeMap::new();
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for e in events {
+        match &e.body {
+            EventBody::FileCreated { id, path, .. } | EventBody::FileModified { id, path, .. } => {
+                paths.insert(*id, path.clone());
+            }
+            EventBody::PageAdded { id, file_id, .. } => {
+                out.entry(paths[id].clone())
+                    .or_default()
+                    .push(file_id.clone());
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Assert that `path` has the record under `key` and that its `page.added` events carry it.
+fn keyed(f: &Fixture, events: &[Event], path: &str, key: &str) {
+    let name = match key.strip_prefix("path:") {
+        Some(md5) => format!("path-{md5}"),
+        None => key.to_string(),
+    };
+    let rec = f
+        .record(&name)
+        .unwrap_or_else(|| panic!("no record {name}"));
+    assert_eq!((rec.file_id.as_str(), rec.path.as_str()), (key, path));
+    let keys = &added_keys(events)[path];
+    assert_eq!(keys.len(), 3);
+    assert!(keys.iter().all(|k| k == key), "{path}: {keys:?}");
+}
+
+#[test]
+fn a_scan_keys_the_second_copy_of_a_note_by_its_path() {
+    let f = Fixture::new();
+    f.place("NOTE/Note/a.note", &abc(Some(FID), ["s", "s", "s"]));
+    f.place("NOTE/Note/b.note", &abc(Some(FID), ["s", "s", "s"]));
+    let ev = f.scan();
+    keyed(&f, &ev, "NOTE/Note/a.note", FID);
+    keyed(&f, &ev, "NOTE/Note/b.note", &path_key("NOTE/Note/b.note"));
+    assert_eq!(
+        f.record(&path_key_file("NOTE/Note/b.note"))
+            .unwrap()
+            .note_id
+            .as_deref(),
+        Some(FID)
+    );
+    assert_eq!(f.records().len(), 2);
+}
+
+#[test]
+fn a_scan_keeps_the_file_id_with_the_indexed_note() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/m.note", &abc(Some(FID), ["s", "s", "s"]));
+    // the copy comes first in path order; the record on disk still wins
+    f.place("NOTE/Note/a.note", &abc(Some(FID), ["s", "s", "s"]));
+    let ev = f.scan();
+    keyed(&f, &ev, "NOTE/Note/a.note", &path_key("NOTE/Note/a.note"));
+    assert_eq!(f.record(FID).unwrap().path, "NOTE/Note/m.note");
+    assert_eq!(f.records().len(), 2);
+}
+
+#[test]
+fn a_scan_gives_the_file_id_to_the_first_copy_in_path_order() {
+    let f = Fixture::new();
+    // placed in another order than the path order
+    f.place("NOTE/Note/c.note", &abc(Some(FID), ["s", "s", "s"]));
+    f.place("NOTE/Note/b/x.note", &abc(Some(FID), ["s", "t", "s"]));
+    f.place("NOTE/Note/a.note", &abc(Some(FID), ["t", "s", "s"]));
+    let ev = f.scan();
+    keyed(&f, &ev, "NOTE/Note/a.note", FID);
+    keyed(
+        &f,
+        &ev,
+        "NOTE/Note/b/x.note",
+        &path_key("NOTE/Note/b/x.note"),
+    );
+    keyed(&f, &ev, "NOTE/Note/c.note", &path_key("NOTE/Note/c.note"));
+    assert_eq!(f.records().len(), 3);
+}
+
+#[test]
+fn a_scan_and_a_snapshot_key_the_same_tree_the_same_way() {
+    let f = Fixture::new();
+    // a note the store knows without a record, then changed by hand: it is a modified file
+    // for the scan and comes first in path order
+    f.place("NOTE/Note/a.note", &abc(Some(FID), ["s", "s", "s"]));
+    {
+        let g = f.store.lock_recovered(&f.journal).unwrap();
+        f.store.list(&g, &WirePath::root(), true).unwrap();
+    }
+    f.place("NOTE/Note/a.note", &abc(Some(FID), ["t", "s", "s"]));
+    f.place("NOTE/Note/z.note", &abc(Some(FID), ["s", "s", "s"]));
+    f.place("NOTE/Note/b/x.note", &abc(Some(FID), ["s", "t", "s"]));
+    f.place("NOTE/Note/b/y.note", &abc(Some(FID2), ["s", "t", "s"]));
+    f.place("NOTE/Note/n.note", &abc(None, ["s", "t", "s"]));
+    let ev = f.scan();
+    assert_eq!(
+        types(&ev).iter().filter(|t| **t == "file.modified").count(),
+        1
+    );
+    let scanned = f.records();
+    assert_eq!(scanned.len(), 5);
+    assert_eq!(f.record(FID).unwrap().path, "NOTE/Note/a.note");
+    std::fs::remove_dir_all(f.store.account_dir().join(PAGES_DIR)).unwrap();
+    snapshot(&f);
+    assert_eq!(f.records(), scanned);
+}
+
+#[test]
+fn a_scan_keys_a_copy_by_its_path_while_the_original_is_renamed() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/m.note", &abc(Some(FID), ["s", "s", "s"]));
+    std::fs::rename(
+        f.store.fs_path(&wp("NOTE/Note/m.note")),
+        f.store.fs_path(&wp("NOTE/Note/z.note")),
+    )
+    .unwrap();
+    // an edited copy: other bytes, so the rename still pairs
+    f.place("NOTE/Note/a.note", &abc(Some(FID), ["s", "t", "s"]));
+    let ev = f.scan();
+    assert!(types(&ev).contains(&"file.moved"));
+    keyed(&f, &ev, "NOTE/Note/a.note", &path_key("NOTE/Note/a.note"));
+    assert_eq!(f.record(FID).unwrap().path, "NOTE/Note/z.note");
+    assert_eq!(f.records().len(), 2);
+}
+
+#[test]
+fn a_scan_gives_a_free_file_id_to_a_copy() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/m.note", &abc(Some(FID), ["s", "s", "s"]));
+    std::fs::remove_file(f.store.fs_path(&wp("NOTE/Note/m.note"))).unwrap();
+    // other bytes, so no move pairs; the record's path is gone, so the FILE_ID is free
+    f.place("NOTE/Note/a.note", &abc(Some(FID), ["s", "t", "s"]));
+    f.place("NOTE/Note/b.note", &abc(Some(FID), ["s", "u", "s"]));
+    let ev = f.scan();
+    assert!(types(&ev).contains(&"file.deleted"));
+    keyed(&f, &ev, "NOTE/Note/a.note", FID);
+    keyed(&f, &ev, "NOTE/Note/b.note", &path_key("NOTE/Note/b.note"));
+}

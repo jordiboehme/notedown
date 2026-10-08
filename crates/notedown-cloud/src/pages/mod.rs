@@ -27,7 +27,15 @@
 //! has the documented shape (`F` + letters and digits, docs/note-format.md 3.1), else
 //! `path:<md5 of the wire path>` ([`note_key`]); the file is `<FILE_ID>.json` or
 //! `path-<md5>.json`. A copy has the `FILE_ID` of its original: when that `FILE_ID` is already
-//! indexed for another path that still exists, the new file is keyed by its path.
+//! indexed for another path that still exists, the new file is keyed by its path. A record for
+//! a path that is gone frees its `FILE_ID`.
+//!
+//! A scan plans all its records before it writes any. It indexes its new and changed notes in
+//! path order, and a `FILE_ID` it gave to an earlier note, or one whose record moves along with
+//! a note the scan moves, counts like a record for another path. A record on disk for an
+//! existing path still comes first. So of several copies the first in path order gets the
+//! `FILE_ID` and the others their path key, as in a snapshot of the same tree. The page events
+//! of a note carry its key.
 //!
 //! # The state before a write
 //!
@@ -422,16 +430,52 @@ fn is_file_at(store: &Store, wire: &str) -> bool {
     WirePath::parse_named(wire).is_ok_and(|p| store.fs_path(&p).is_file())
 }
 
+/// The `FILE_ID`s a scan has given to notes in this batch, each with the wire path of its note.
+/// The records of these notes are written only after the whole batch is planned.
+pub(crate) type Claims = HashMap<String, String>;
+
 /// The key for the note with `note_id` at `target`: the `FILE_ID`, unless a record of that
-/// `FILE_ID` describes another path that still exists (a copy); then the path key.
-fn choose_key(store: &Store, note_id: Option<&str>, target: &WirePath) -> String {
+/// `FILE_ID` describes another path that still exists (a copy); then the path key. With
+/// `claims` (a scan), a `FILE_ID` claimed for another path in the same batch counts as such a
+/// record, and a `FILE_ID` the note gets is claimed for `target`. A record on disk for an
+/// existing path wins over a claim.
+fn choose_key(
+    store: &Store,
+    note_id: Option<&str>,
+    target: &WirePath,
+    claims: Option<&mut Claims>,
+) -> String {
     let Some(id) = note_id else {
         return path_key(target);
     };
-    match read_record(store, id) {
-        Some(r) if r.path != target.display() && is_file_at(store, &r.path) => path_key(target),
-        _ => id.to_string(),
+    let display = target.display();
+    if read_record(store, id).is_some_and(|r| r.path != display && is_file_at(store, &r.path)) {
+        return path_key(target);
     }
+    if let Some(claims) = claims {
+        match claims.get(id) {
+            Some(path) if *path != display => return path_key(target),
+            Some(_) => {}
+            None => {
+                claims.insert(id.to_string(), display);
+            }
+        }
+    }
+    id.to_string()
+}
+
+/// The claims of the notes a scan moves (see [`Claims`]): each `FILE_ID` record of an old path
+/// goes with its note to the new path ([`move_records`]), so that `FILE_ID` is taken there.
+pub(crate) fn move_claims(by_path: &RecordsByPath, notes: &[(WirePath, WirePath)]) -> Claims {
+    let mut claims = Claims::new();
+    for (old, new) in notes {
+        for (key, _) in by_path.get(&old.display()).into_iter().flatten() {
+            if !key.starts_with("path:") {
+                claims.insert(key.clone(), new.display());
+            }
+        }
+    }
+    claims
 }
 
 /// Read and fingerprint a note on disk, refusing files over `limit` before reading.
@@ -523,9 +567,14 @@ struct Write<'a> {
     known: Option<Before>,
 }
 
-fn compute(store: &Store, w: &Write<'_>, note: NoteFingerprint) -> PageDiff {
+fn compute(
+    store: &Store,
+    w: &Write<'_>,
+    note: NoteFingerprint,
+    claims: Option<&mut Claims>,
+) -> PageDiff {
     let note_id = valid_file_id(note.file_id.as_deref());
-    let key = choose_key(store, note_id.as_deref(), w.target);
+    let key = choose_key(store, note_id.as_deref(), w.target, claims);
     let mut d = match &w.current_md5 {
         None => diff(&[], &note.pages),
         Some(md5) => {
@@ -575,7 +624,7 @@ fn index_bytes(store: &Store, w: &Write<'_>, bytes: Vec<u8>) -> PageDiff {
         return PageDiff::failed(w.target, too_large(bytes.len() as u64, w.limit));
     }
     match fingerprint_note(bytes) {
-        Ok(note) => compute(store, w, note),
+        Ok(note) => compute(store, w, note, None),
         Err(reason) => PageDiff::failed(w.target, reason),
     }
 }
@@ -676,7 +725,7 @@ pub fn plan_page_events_with_limit(
         known: None,
     };
     let diff = match fingerprint_file(&source, limit) {
-        Ok(note) => compute(store, &w, note),
+        Ok(note) => compute(store, &w, note, None),
         Err(reason) => PageDiff::failed(&target, reason),
     };
     let changed = diff.pages_changed();
@@ -775,7 +824,10 @@ pub(crate) fn move_records(
 /// `prev_md5` (the MD5 the store knew), under any key, found in `by_path` (read once per scan
 /// with [`records_by_path`]); without one, the new file is the
 /// baseline and the diff is empty. `None` for `prev_md5` is a new note: every page is added.
+/// The key is chosen against `claims` too, the `FILE_ID`s given out earlier in the same scan
+/// (see [`choose_key`]), so the scan calls this for its notes in path order.
 /// Never fails: a note that does not parse gives `page.index_failed`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_note(
     store: &Store,
     path: &WirePath,
@@ -784,6 +836,7 @@ pub(crate) fn scan_note(
     size: u64,
     prev_md5: Option<&str>,
     by_path: &RecordsByPath,
+    claims: &mut Claims,
 ) -> (Option<u64>, Vec<EventBody>, Vec<SideWrite>) {
     let w = Write {
         target: path,
@@ -802,7 +855,7 @@ pub(crate) fn scan_note(
         }),
     };
     let diff = match fingerprint_file(&store.fs_path(path), MAX_NOTE_BYTES) {
-        Ok(note) => compute(store, &w, note),
+        Ok(note) => compute(store, &w, note, Some(claims)),
         Err(reason) => PageDiff::failed(path, reason),
     };
     let mut writes = Vec::new();
@@ -876,7 +929,7 @@ pub(crate) fn snapshot_note(
     match fingerprint_file(&store.fs_path(path), MAX_NOTE_BYTES) {
         Ok(note) => {
             let note_id = valid_file_id(note.file_id.as_deref());
-            let key = choose_key(store, note_id.as_deref(), path);
+            let key = choose_key(store, note_id.as_deref(), path, None);
             let events: Vec<EventBody> = note
                 .pages
                 .iter()

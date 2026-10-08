@@ -2258,6 +2258,31 @@ mod served {
         server.await.unwrap().unwrap();
     }
 
+    /// Open issue: a watch scan runs one scan per changed folder, so a file moved by hand from
+    /// one folder to a sibling is a delete plus a create with a new id (a whole-tree scan pairs
+    /// it as a move). With the last file of an account, the scan of the old folder even holds.
+    #[test]
+    #[ignore = "open issue: a watch scan does not pair a move across sibling folders"]
+    fn a_move_across_folders_keeps_its_id_in_a_watch_scan() {
+        use notedown_cloud::watch::Scope;
+        let s = Server::new();
+        for i in 0..5 {
+            s.write(&format!("{DOC}/k{i}.txt"), format!("k{i}").as_bytes());
+        }
+        s.write(&format!("{DOC}/a.txt"), b"a");
+        s.state.scan_all();
+        std::fs::create_dir_all(s.fs("NOTE/Note")).unwrap();
+        std::fs::rename(s.fs(&format!("{DOC}/a.txt")), s.fs("NOTE/Note/a.txt")).unwrap();
+        let scope = Scope::Folders(
+            [DOC, "NOTE/Note"]
+                .into_iter()
+                .map(|p| notedown_cloud::store::WirePath::parse_named(p).unwrap())
+                .collect(),
+        );
+        s.state.scan_account("jordi", &scope);
+        assert_eq!(s.kinds()[6..].to_vec(), vec!["file.moved"]);
+    }
+
     // ------------------------------------------------ every device route scans first
 
     fn origins(s: &Server) -> Vec<(&'static str, Origin)> {

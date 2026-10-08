@@ -321,6 +321,8 @@ fn an_unreadable_note_gets_no_pdf_and_is_not_retried() {
     assert_eq!(r.failed.len(), 1, "{r:?}");
     assert_eq!(r.failed[0].0, "NOTE/Note/a.note");
     assert!(!r.failed[0].1.is_empty());
+    // A note that doesn't render is no disk error: the server doesn't try it again.
+    assert_eq!(r.retry, None);
     assert!(r.written.is_empty());
     assert!(!fx.out().join("NOTE/Note/a.pdf").exists());
     let id = fx.id("NOTE/Note/a.note").unwrap();
@@ -937,6 +939,31 @@ async fn a_busy_account_is_tried_again_when_the_lock_is_released() {
     assert!(!f.pdf().exists());
     assert!(f.cursor() < last);
     drop(lock);
+    until("the PDF", || f.pdf().exists()).await;
+    until("the cursor", || f.cursor() >= last).await;
+    f.task.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pdf_that_could_not_be_written_is_written_by_the_retry() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Followed::start().await;
+    let folder = f.root.join("acc/NOTE/Note");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Root may write into a read-only folder: then this test can't make the write fail.
+    if std::fs::write(folder.join("probe"), b"").is_ok() {
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        f.task.abort();
+        return;
+    }
+    let last = f.put().await;
+    // The PDF can't be written: the pass counts as failed and the cursor stays before the note.
+    until("a failed pass", || f.failures() >= 1).await;
+    assert!(!f.pdf().exists());
+    assert!(f.cursor() < last, "the cursor moved past a failed write");
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
     until("the PDF", || f.pdf().exists()).await;
     until("the cursor", || f.cursor() >= last).await;
     f.task.abort();

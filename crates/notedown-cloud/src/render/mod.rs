@@ -52,6 +52,10 @@ pub struct PassReport {
     pub kept_foreign: Vec<String>,
     /// Another pass held the render lock; nothing was done.
     pub busy: bool,
+    /// The first disk error of the pass (`<note path>: <error>`): a note could not be read or
+    /// its PDF not written. Its row stays as it was, and another pass may work, so the server
+    /// tries again. A note that can't be rendered is no disk error.
+    pub retry: Option<String>,
 }
 
 /// The wire path with its last `.note` extension (any case) replaced by `.pdf`; a path without
@@ -335,7 +339,7 @@ impl Pass {
         let (md5, bytes) = match &disk.md5 {
             Some(md5) => (md5.clone(), None),
             None => {
-                let Ok(bytes) = std::fs::read(&disk.fs_path) else {
+                let Some(bytes) = self.read_note(n, &disk.fs_path) else {
                     return Ok(());
                 };
                 (md5_hex(&bytes), Some(bytes))
@@ -363,8 +367,9 @@ impl Pass {
             Some(bytes) => bytes,
             None => {
                 // The cache row was current at the listing; a note that changed since (its
-                // bytes don't match) or can't be read is left for the next pass.
-                let Ok(bytes) = std::fs::read(&disk.fs_path) else {
+                // bytes don't match) is left for the next pass, which its change wakes. One that
+                // can't be read is tried again.
+                let Some(bytes) = self.read_note(n, &disk.fs_path) else {
                     return Ok(());
                 };
                 if md5_hex(&bytes) != md5 {
@@ -374,6 +379,27 @@ impl Pass {
             }
         };
         self.render_one(&key, row.as_ref(), n, &md5, bytes)
+    }
+
+    /// The bytes of a note. A note that is gone now waits for the scan, which journals the
+    /// change and wakes the next pass. Any other read error is a disk error to try again.
+    fn read_note(&mut self, n: &Note, fs_path: &Path) -> Option<Vec<u8>> {
+        match std::fs::read(fs_path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                self.disk_error(n, io_err(fs_path)(e).to_string());
+                None
+            }
+        }
+    }
+
+    /// A note failed on the disk: it counts as failed, and the pass asks to be tried again.
+    fn disk_error(&mut self, n: &Note, e: String) {
+        if self.report.retry.is_none() {
+            self.report.retry = Some(format!("{}: {e}", n.path));
+        }
+        self.report.failed.push((n.path.clone(), e));
     }
 
     fn set_row(&mut self, key: &str, n: &Note, md5: &str, pdf: bool) {
@@ -452,9 +478,8 @@ impl Pass {
         };
         self.release(&new, key);
         if let Err(e) = crate::fsutil::write_atomic(&target, &pdf, false) {
-            // The row stays as it was, so the next pass tries again.
-            eprintln!("notedown render: {slug}: {}: {e}", n.path);
-            self.report.failed.push((n.path.clone(), e.to_string()));
+            // The row stays as it was, so the retry renders the note again.
+            self.disk_error(n, e.to_string());
             return Ok(());
         }
         if let Some(old) = old

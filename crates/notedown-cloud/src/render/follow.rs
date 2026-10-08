@@ -20,7 +20,8 @@ pub struct Timing {
     pub quiet: Duration,
     /// How often the journal is read.
     pub poll: Duration,
-    /// How long an account whose pass failed waits for the next try.
+    /// How long an account whose pass failed (also on a note's disk error) waits for the next
+    /// try.
     pub retry: Duration,
 }
 
@@ -93,6 +94,16 @@ async fn pass(state: &Arc<AppState>, root: &Path, slug: &str) -> Outcome {
     .await;
     match done {
         Ok(Ok(report)) if report.busy => Outcome::Busy,
+        Ok(Ok(report)) if report.retry.is_some() => {
+            // The PDFs that were done still get their line; the disk error is the failure.
+            if report.written.len() + report.moved.len() + report.deleted.len() > 0
+                && let Some(line) = pass_line(slug, &report)
+            {
+                eprintln!("{line}");
+            }
+            let text = report.retry.unwrap_or_default();
+            Outcome::Failed(format!("{text}, trying again"))
+        }
         Ok(Ok(report)) => {
             if let Some(line) = pass_line(slug, &report) {
                 eprintln!("{line}");

@@ -432,6 +432,8 @@ The device exports in `tests/fixtures/device/` differ from the goldens [verified
 
 So the device composites `result = level * below / 255` for anti-aliasing codes [inferred from the over-black and over-white cases; intermediate backgrounds not observed].
 
+notedown's `RenderStyle::Device` uses the table of 5.3 since 2026-10-08. So its output changed for the raw codes `0x00`, `0x01`, `0x30`, `0x31`, `0x50`, `0x51`, `0xFE`, `0xFF` and the named marker codes `0x67` and `0x68`. The notes behind the device exports (t1 and t2, page 1) contain none of these codes, so the exports still match with 0 differing pixels [verified by code counts]. How the device exports these codes is not known [unknown].
+
 ### 6.3 Other images
 
 - Link bitmaps are RATTA_RLE (`LINKPROTOCAL`) images of exactly `LINKRECT` width x height pixels, row-major [verified: the run totals of all six link bitmaps in content equal width x height of their rects, e.g. 537 x 84 = 45108]. The four links created in 2024 store an all-transparent bitmap (8, 8, 6 and 8 bytes) [verified]. The two newer ones (3918 and 5660 bytes) hold ink: for the first, every non-transparent pixel equals the MAINLAYER pixel at the same page position, and the page has extra pixels in the rect (link icon, other strokes) [verified]; the second differs from the current page in 1625 pixels, probably because the page was edited after the link was made [inferred]. So the link bitmap is a snapshot of the linked handwriting at creation time [inferred].

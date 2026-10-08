@@ -913,7 +913,9 @@ impl Store {
 
     /// [`Store::list`] that takes the walk of the scan of the same scope right before it under
     /// the same guard ([`Store::scan_walked`]), so the tree is walked once. `None`, or a walk of
-    /// another scope or depth, walks it.
+    /// another scope or depth, walks it. The size and time of a reused walk come from the
+    /// scan's walk, a moment older than a fresh walk, and the MD5 read later can be newer than
+    /// them; the next listing corrects it.
     pub(crate) fn list_walked(
         &self,
         guard: &StoreGuard,

@@ -222,8 +222,8 @@ pub async fn run(state: Arc<AppState>, root: PathBuf, timing: Timing) {
     run_counted(state, root, timing, Arc::new(AtomicU64::new(0))).await
 }
 
-/// [`run`], counting every failed pass in `failed` (tests wait for a failure with it). Not for
-/// production use.
+/// [`run`], counting every failed pass in `failed`. [`run`] uses it with a counter of its own;
+/// tests pass their own counter to wait for a failure.
 #[doc(hidden)]
 pub async fn run_counted(
     state: Arc<AppState>,

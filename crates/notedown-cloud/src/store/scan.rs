@@ -292,7 +292,8 @@ impl Store {
             .map(|(report, _)| report)
     }
 
-    /// The scan of [`Store::scan_until`], with the walk when the scan applied.
+    /// The scan, with the walk when it applied. With `stop_after_journal` it stops after the
+    /// journal append, as [`Store::scan_until`] does.
     fn scan_inner(
         &self,
         guard: &WriteGuard,

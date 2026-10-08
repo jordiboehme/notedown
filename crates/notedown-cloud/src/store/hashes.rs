@@ -186,6 +186,12 @@ impl HashCache {
         })
     }
 
+    /// Set the row of the file `path` to `row`, a row the caller knows to be right.
+    pub fn insert(&mut self, path: &WirePath, row: HashRow) {
+        self.rows.insert(path.display(), row);
+        self.dirty = true;
+    }
+
     /// Rows at `from` and below move to `to` (a rename keeps size and mtime).
     pub fn moved(&mut self, from: &WirePath, to: &WirePath) {
         let keys: Vec<String> = self.keys_under(from);

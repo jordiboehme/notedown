@@ -745,6 +745,29 @@ impl Store {
         self.flush_hashes(&mut state)
     }
 
+    /// Cache the MD5 of the file at `path` that a put just wrote, with the size, mtime and ctime
+    /// seen right after the rename. A later write changes the ctime, so a scan sees it.
+    pub(super) fn remember_md5(
+        &self,
+        guard: &StoreGuard,
+        path: &WirePath,
+        written: commit::WrittenFile,
+        md5: &str,
+    ) -> Result<()> {
+        self.check_guard(guard)?;
+        let mut state = self.state();
+        state.hashes.insert(
+            path,
+            hashes::HashRow {
+                size: written.size,
+                mtime_ns: written.mtime_ns,
+                ctime_ns: Some(written.ctime_ns),
+                md5: md5.to_string(),
+            },
+        );
+        self.flush_hashes(&mut state)
+    }
+
     fn flush_hashes(&self, state: &mut State) -> Result<()> {
         state.hashes.flush(&self.account_dir)?;
         state.hashes_stamp = Some(stamp(&self.account_dir.join(hashes::HASHES_FILE)));

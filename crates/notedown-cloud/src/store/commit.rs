@@ -298,6 +298,15 @@ impl Deref for WriteGuard {
     }
 }
 
+/// The facts of a file a `put` wrote, taken right after its rename: they make a cache row that
+/// is right when the file is still the staged one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WrittenFile {
+    pub(super) size: u64,
+    pub(super) mtime_ns: u64,
+    pub(super) ctime_ns: u64,
+}
+
 /// Test hook: stop a commit at a step, as a crash there would. Not for production use.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1138,7 +1147,8 @@ impl Store {
         }
         // 2. data change, then the registry
         let stop = crash == Some(CrashPoint::BeforeRename) && has_rename_stop(&commit.op);
-        if let Err(e) = self.apply(&commit.op, stop, crash) {
+        let mut written = None;
+        if let Err(e) = self.apply(&commit.op, stop, crash, &mut written) {
             match self.is_applied(guard, &commit.op) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -1160,7 +1170,7 @@ impl Store {
             // A folder to prune was not empty: the intent must not promise its event.
             super::write_atomic_short(&self.pending_path(), &crate::fsutil::json_bytes(&commit))?;
         }
-        self.finish_registry(guard, &commit.op)?;
+        self.finish_registry(guard, &commit.op, written)?;
         self.finish_recycle(&commit.op)?;
         for w in &commit.side_writes {
             if let Err(e) = self.write_side(w) {
@@ -1215,12 +1225,14 @@ impl Store {
     /// Perform the data change durably. `stop_before_rename` (test hook) ends a `put` after its
     /// folders and recycle copy, and a move through a temp name between its two renames, as a
     /// crash there would. `hook` (test hook) can also make the second rename of such a move
-    /// fail, or place a file at its target first.
+    /// fail, or place a file at its target first. For a `put`, `written` gets the file facts of
+    /// the target when the rename kept the staged file as it was (see [`WrittenFile`]).
     fn apply(
         &self,
         op: &PendingOp,
         stop_before_rename: bool,
         hook: Option<CrashPoint>,
+        written: &mut Option<WrittenFile>,
     ) -> Result<()> {
         match op {
             PendingOp::Put {
@@ -1228,6 +1240,7 @@ impl Store {
                 staged,
                 folders,
                 recycle,
+                size,
                 ..
             } => {
                 let target = self.fs_path(&wire(path)?);
@@ -1243,7 +1256,22 @@ impl Store {
                 std::fs::File::open(&staged)
                     .and_then(|f| f.sync_all())
                     .map_err(io_err(&staged))?;
-                crate::fsutil::rename_durable(&staged, &target)
+                // A rename keeps size and mtime: the target is the staged file as it was seen
+                // here when both stats agree (and with the size the put promised).
+                let before = std::fs::metadata(&staged).map_err(io_err(&staged))?;
+                crate::fsutil::rename_durable(&staged, &target)?;
+                if let Ok(after) = std::fs::metadata(&target)
+                    && after.len() == before.len()
+                    && after.len() == *size
+                    && super::hashes::mtime_ns(&after) == super::hashes::mtime_ns(&before)
+                {
+                    *written = Some(WrittenFile {
+                        size: after.len(),
+                        mtime_ns: super::hashes::mtime_ns(&after),
+                        ctime_ns: super::hashes::ctime_ns(&after),
+                    });
+                }
+                Ok(())
             }
             PendingOp::Copy {
                 source,
@@ -1389,13 +1417,22 @@ impl Store {
     }
 
     /// Bring the id registry (and for a put the MD5 cache) in line with an applied change.
-    /// Idempotent.
-    fn finish_registry(&self, guard: &StoreGuard, op: &PendingOp) -> Result<()> {
+    /// Idempotent. `written` is only known to the normal commit: recovery passes `None`.
+    fn finish_registry(
+        &self,
+        guard: &StoreGuard,
+        op: &PendingOp,
+        written: Option<WrittenFile>,
+    ) -> Result<()> {
         match op {
             // The id was assigned (durably) while planning, before the intent was written. The
             // cached MD5 of a replaced file is the old one: it goes, or the next scan would
-            // journal the put again as a change made by hand.
-            PendingOp::Put { path, .. } => self.forget_md5(guard, &wire(path)?),
+            // journal the put again as a change made by hand. When the commit saw the file it
+            // wrote, the row of that file takes its place, with the ctime as the baseline.
+            PendingOp::Put { path, md5, .. } => match written {
+                Some(w) => self.remember_md5(guard, &wire(path)?, w, md5),
+                None => self.forget_md5(guard, &wire(path)?),
+            },
             PendingOp::Copy { .. }
             | PendingOp::CreateFolder { .. }
             | PendingOp::Unchanged { .. } => Ok(()),
@@ -1734,7 +1771,7 @@ impl Store {
             });
         }
         self.settle_prune(&mut commit.op, &mut commit.events)?;
-        self.finish_registry(guard, &commit.op)?;
+        self.finish_registry(guard, &commit.op, None)?;
         self.finish_recycle(&commit.op)?;
         let seqs = {
             let lock = journal.lock()?;

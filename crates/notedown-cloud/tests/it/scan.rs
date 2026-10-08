@@ -1115,6 +1115,81 @@ fn a_put_that_replaces_a_file_is_not_journaled_again_by_the_scan() {
     assert_eq!(fx.events().len(), before);
 }
 
+/// A put keeps the cache row of the file it wrote, with the ctime of the target, so a hand edit
+/// right after it (same size, mtime set back) is journaled by the next scan.
+#[test]
+fn a_hand_edit_right_after_a_put_is_journaled() {
+    use notedown_cloud::put::put;
+    let fx = Fx::imported();
+    let src = fx.dir.path().join("src.txt");
+    std::fs::write(&src, b"one").unwrap();
+    put(fx.dir.path(), "jordi", &fx.journal, &src, "INBOX", None).unwrap();
+    let path = "INBOX/src.txt";
+    let id = fx.id(path).unwrap();
+    let target = fx.fs(path);
+    let old_mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
+    std::fs::write(&target, b"two").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&target)
+        .unwrap()
+        .set_modified(old_mtime)
+        .unwrap();
+    let before = fx.events().len();
+    let report = fx.scan();
+    assert_eq!(paths(&report.modified), vec![path.to_string()]);
+    let events = fx.events();
+    assert_eq!(events.len(), before + 1);
+    let last = events.last().unwrap();
+    assert_eq!(last.origin, Origin::Scan);
+    assert_eq!(
+        last.body,
+        EventBody::FileModified {
+            id,
+            path: path.into(),
+            kind: FileKind::Document,
+            md5: md5_hex(b"two"),
+            prev_md5: md5_hex(b"one"),
+            size: 3,
+            pages_changed: None,
+        }
+    );
+}
+
+/// A put that a crash cut after the rename leaves no cache row: recovery can't prove the file
+/// is still what the put wrote, so a scan hashes it silently.
+#[test]
+fn a_recovered_put_drops_the_row() {
+    use notedown_cloud::store::CrashPoint;
+    let fx = Fx::imported();
+    let path = format!("{DOC}/a.txt");
+    fx.write(&path, b"old");
+    fx.seed();
+    let staging = fx.store.account_dir().join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let staged = staging.join("f");
+    std::fs::write(&staged, b"new").unwrap();
+    {
+        let g = fx.store.lock_recovered(&fx.journal).unwrap();
+        let c = fx
+            .store
+            .plan_put(&g, &wp(&path), &staged, Origin::Device, None)
+            .unwrap();
+        fx.store
+            .commit_until(&g, c, &fx.journal, Some(CrashPoint::BeforeAppend))
+            .unwrap();
+    }
+    // The next lock recovers the put.
+    drop(fx.store.lock_recovered(&fx.journal).unwrap());
+    let cache = String::from_utf8(fx.account_file("hashes.json").unwrap()).unwrap();
+    assert!(!cache.contains(&path), "{cache}");
+    let before = fx.events().len();
+    assert_eq!(fx.scan(), ScanReport::default());
+    assert_eq!(fx.events().len(), before);
+    let cache = String::from_utf8(fx.account_file("hashes.json").unwrap()).unwrap();
+    assert!(cache.contains(&md5_hex(b"new")));
+}
+
 /// `put` scans the folders on its way first, as a device upload does: a folder and a file made
 /// by hand there are journaled by the scan before the put's own event.
 #[test]

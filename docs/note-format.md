@@ -354,7 +354,7 @@ t1 MAINLAYER bitmap at 5037, bytes 11616-11619: `62 86 df 00` = 896 transparent 
 
 ### 5.3 Color codes
 
-Two mappings from code to gray are known, and they differ on a few codes. supernotelib uses two tables, "X2" for signature versions 20230015 and higher and "X" for older files [reference]. Ratta's renderer uses one table for versions 20230015 and higher, and an old decoder that paints only a few codes below that version (5.2, section 1) [ratta-notelib]. The golden images and the test vectors in section 11 follow Ratta's table since 2026-10-08 (before: supernotelib's X2 table) [verified pixel-exactly for every code that occurs]. Which mapping the device screen shows is not known [unknown]; a reader should offer both.
+Two mappings from code to gray are known, and they differ on a few codes. supernotelib uses two tables, "X2" for signature versions 20230015 and higher and "X" for older files [reference]. Ratta's renderer uses one table for versions 20230015 and higher, and an old decoder that paints only a few codes below that version (5.2, section 1) [ratta-notelib]. The golden images and the test vectors in section 11 follow Ratta's table since 2026-10-08 (before: supernotelib's X2 table) [consistent with the updated goldens]. Which mapping the device screen shows is not known [unknown]; a reader should offer both.
 
 | Code | Name (supernotelib) | supernotelib X2 | supernotelib X (older) | Ratta, from 20230015 | Ratta, below 20230015 | Raw count in the current sample layers |
 |---|---|---|---|---|---|---|

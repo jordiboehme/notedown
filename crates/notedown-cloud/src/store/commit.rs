@@ -1214,7 +1214,8 @@ impl Store {
     /// followed by exactly `pages` and one plain name (no `..`, `.`, root or prefix part). A
     /// regular file that already has the new bytes is left alone, and a missing file needs no
     /// removal. A change is visible right away, but its folder is only noted in `batch` (also
-    /// for a file left alone): the caller syncs it with [`Store::sync_sides`] before it returns.
+    /// for a file left alone or already gone): the caller syncs it with [`Store::sync_sides`]
+    /// before it returns.
     pub(super) fn write_side(&self, w: &SideWrite, batch: &mut SideBatch) -> Result<()> {
         use std::path::Component;
         let confined = w.path.strip_prefix(&self.account_dir).is_ok_and(|rel| {
@@ -1241,7 +1242,11 @@ impl Store {
                     batch.dirs.insert(parent);
                     Ok(())
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                // Gone already: an earlier run may have died before its folder sync.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    batch.dirs.insert(parent);
+                    Ok(())
+                }
                 Err(e) => Err(io_err(&w.path)(e)),
             };
         };

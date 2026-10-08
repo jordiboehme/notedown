@@ -1258,3 +1258,39 @@ fn a_snapshot_after_a_scan_rewrites_no_record() {
     snapshot(&f);
     assert_eq!(record_files(&f), scanned);
 }
+
+#[test]
+fn a_commit_rewrites_no_record_with_the_same_bytes_and_removes_a_dropped_one() {
+    use notedown_cloud::store::SideWrite;
+    use std::os::unix::fs::MetadataExt;
+    let f = Fixture::new();
+    f.put("NOTE/Note/a.note", &abc(Some(FID), ["s", "s", "s"]));
+    let path = f.record_path(FID);
+    let stamp = |p: &PathBuf| {
+        let m = std::fs::symlink_metadata(p).unwrap();
+        (m.ino(), m.modified().unwrap())
+    };
+    let before = stamp(&path);
+    let bytes = std::fs::read(&path).unwrap();
+    // a commit whose page step has the record's bytes leaves the file alone
+    {
+        let g = f.store.lock_recovered(&f.journal).unwrap();
+        let staged = f.stage(b"pdf");
+        let mut c = f
+            .store
+            .plan_put(&g, &wp("INBOX/a.pdf"), &staged, Origin::Device, None)
+            .unwrap();
+        c.side_writes.push(SideWrite {
+            path: path.clone(),
+            bytes: Some(bytes.clone()),
+        });
+        f.store.commit(&g, c, &f.journal).unwrap();
+    }
+    assert_eq!(stamp(&path), before);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    // a note with another FILE_ID at the path drops the old record and writes the new one
+    let (_, ev) = f.put("NOTE/Note/a.note", &abc(Some(FID2), ["s", "s", "s"]));
+    assert!(ev.iter().any(|e| e.body.type_name() == "page.removed"));
+    assert!(!path.exists());
+    assert_eq!(f.record(FID2).unwrap().path, "NOTE/Note/a.note");
+}

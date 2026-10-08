@@ -486,6 +486,78 @@ fn a_render_dir_inside_the_accounts_is_refused() {
 }
 
 #[test]
+fn an_account_without_files_gets_no_pdf_and_keeps_no_files() {
+    let data = tempfile::tempdir().unwrap();
+    let render = tempfile::tempdir().unwrap();
+    Accounts::new(data.path())
+        .create("acc", "acc@example.org", "secret")
+        .unwrap();
+    let store = Store::open(data.path(), "acc").unwrap();
+    let files = store.files_dir().to_path_buf();
+    if files.exists() {
+        std::fs::remove_dir_all(&files).unwrap();
+    }
+    let r = pass(&store, render.path());
+    assert_eq!(r, PassReport::default());
+    assert!(!files.exists(), "the pass created files/");
+    assert!(!render.path().join("acc").join(MANIFEST_FILE).exists());
+}
+
+#[test]
+fn a_render_folder_on_the_data_folder_is_refused() {
+    let render_err = |store: &Store, root: &Path| {
+        render_account(
+            store,
+            root,
+            &PassOptions {
+                all: false,
+                wait_for_lock: true,
+            },
+        )
+        .unwrap_err()
+        .to_string()
+    };
+    // The data folder as the render root: `<root>/acc` would be a folder of the data folder.
+    let fx = Fx::new();
+    let err = render_err(&fx.store, fx.data.path());
+    assert!(err.contains("inside the data folder"), "{err}");
+    assert!(!fx.data.path().join("acc").exists());
+
+    // A data folder named like the account, with its parent as the render root: `<root>/acc`
+    // would be the data folder itself.
+    let parent = tempfile::tempdir().unwrap();
+    let data = parent.path().join("acc");
+    std::fs::create_dir(&data).unwrap();
+    Accounts::new(&data)
+        .create("acc", "acc@example.org", "secret")
+        .unwrap();
+    let store = Store::open(&data, "acc").unwrap();
+    {
+        let g = store.lock().unwrap();
+        store.ensure_native_folders(&g).unwrap();
+    }
+    let err = render_err(&store, parent.path());
+    assert!(err.contains("inside the data folder"), "{err}");
+    assert!(!data.join(MANIFEST_FILE).exists());
+    assert!(!data.join(LOCK_FILE).exists());
+
+    // The parent of a data folder with another name is fine.
+    let other = tempfile::tempdir().unwrap();
+    let data = other.path().join("notedown-data");
+    std::fs::create_dir(&data).unwrap();
+    Accounts::new(&data)
+        .create("acc", "acc@example.org", "secret")
+        .unwrap();
+    let store = Store::open(&data, "acc").unwrap();
+    {
+        let g = store.lock().unwrap();
+        store.ensure_native_folders(&g).unwrap();
+    }
+    assert!(!pass(&store, other.path()).busy);
+    assert!(other.path().join("acc").join(MANIFEST_FILE).exists());
+}
+
+#[test]
 fn a_busy_lock_skips_the_pass_without_waiting() {
     let fx = Fx::new();
     fx.write("NOTE/Note/a.note", &fixture_note("test1"));

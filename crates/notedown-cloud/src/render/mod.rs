@@ -79,6 +79,11 @@ pub fn render_account(store: &Store, root: &Path, opts: &PassOptions) -> Result<
             ..PassReport::default()
         });
     };
+    // An account without `files/` has nothing to render. The pass reads the store only, so
+    // it never lets the store lock create the folder; the manifest and the PDFs stay.
+    if !store.files_dir().is_dir() {
+        return Ok(PassReport::default());
+    }
     let notes = list_notes(store)?;
     let m = manifest::load(&dir);
     let mut pass = Pass {
@@ -97,7 +102,8 @@ pub fn render_account(store: &Store, root: &Path, opts: &PassOptions) -> Result<
     Ok(pass.report)
 }
 
-/// `<root>/<slug>`, created. `root` must be an existing folder outside the accounts.
+/// `<root>/<slug>`, created. `root` must be an existing folder, and `<root>/<slug>` must be
+/// neither the data folder nor inside it (`root` may be the data folder's parent).
 fn account_dir(store: &Store, root: &Path) -> Result<PathBuf> {
     let invalid = |message: String| Error::Invalid {
         what: "render_dir",
@@ -106,17 +112,26 @@ fn account_dir(store: &Store, root: &Path) -> Result<PathBuf> {
     if !root.is_dir() {
         return Err(invalid(format!("{} doesn't exist", root.display())));
     }
-    let real_root = root.canonicalize().map_err(io_err(root))?;
-    if let Some(accounts) = store.account_dir().parent()
-        && let Ok(real_accounts) = accounts.canonicalize()
-        && real_root.starts_with(&real_accounts)
+    let dir = root.join(store.slug());
+    // The real path: through a symlink at `<root>/<slug>` too, when it is there.
+    let real_dir = match dir.canonicalize() {
+        Ok(real) => real,
+        Err(_) => root
+            .canonicalize()
+            .map_err(io_err(root))?
+            .join(store.slug()),
+    };
+    // `<data>/accounts/<slug>` is the account folder.
+    if let Some(data) = store.account_dir().parent().and_then(Path::parent)
+        && let Ok(real_data) = data.canonicalize()
+        && real_dir.starts_with(&real_data)
     {
         return Err(invalid(format!(
-            "{} is inside the data folder's accounts",
-            root.display()
+            "{} is inside the data folder {} or is that folder",
+            dir.display(),
+            data.display()
         )));
     }
-    let dir = root.join(store.slug());
     std::fs::create_dir_all(&dir).map_err(io_err(&dir))?;
     Ok(dir)
 }

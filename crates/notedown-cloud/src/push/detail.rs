@@ -171,8 +171,8 @@ fn final_path(change: &Change, store: &Store) -> crate::Result<Option<String>> {
     }))
 }
 
-/// `path` with its deepest moved ancestor replaced: `moves` are the folders the device knows
-/// that the same push moves, as (path the device knows, path now).
+/// `path` with its deepest moved ancestor replaced: `moves` are the folder moves sent to the
+/// device before the item, as (path the device knows, path now).
 fn rebase(path: &str, moves: &[(String, String)]) -> String {
     let mut best: Option<&(String, String)> = None;
     for m in moves {

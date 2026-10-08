@@ -38,13 +38,13 @@ fn is_note(path: &str) -> bool {
     FileKind::of(name) == FileKind::Note
 }
 
-/// Whether an event can change the PDFs: a file event of a note (by its path's extension),
-/// a folder move or delete.
+/// Whether an event can change the PDFs: a file event of a note (by its path's extension; a
+/// move by its old path too), a folder move or delete.
 pub fn wakes(body: &EventBody) -> bool {
     match body {
+        EventBody::FileMoved { path, old_path, .. } => is_note(path) || is_note(old_path),
         EventBody::FileCreated { path, .. }
         | EventBody::FileModified { path, .. }
-        | EventBody::FileMoved { path, .. }
         | EventBody::FileCopied { path, .. }
         | EventBody::FileDeleted { path, .. } => is_note(path),
         EventBody::FolderMoved { .. } | EventBody::FolderDeleted { .. } => true,
@@ -337,6 +337,16 @@ mod tests {
             path: "NOTE/B".into(),
             old_path: "NOTE/A".into()
         }));
+        let moved = |path: &str, old_path: &str| EventBody::FileMoved {
+            id: 4,
+            path: path.into(),
+            old_path: old_path.into(),
+        };
+        assert!(wakes(&moved("NOTE/x.note", "NOTE/y.note")));
+        // A note renamed to another kind, or back: its PDF goes or comes.
+        assert!(wakes(&moved("NOTE/x.note.bak", "NOTE/x.note")));
+        assert!(wakes(&moved("NOTE/x.note", "NOTE/x.txt")));
+        assert!(!wakes(&moved("NOTE/x.txt", "NOTE/y.txt")));
         assert!(wakes(&EventBody::FolderDeleted {
             id: 3,
             path: "NOTE/B".into()

@@ -223,6 +223,10 @@ struct TreeCheck {
 pub(crate) struct Walk {
     found: Vec<Found>,
     before: TreeCheck,
+    /// The scope of the walk and whether it went below its direct children. A listing of
+    /// another scope or depth does not reuse it.
+    scope: WirePath,
+    recursive: bool,
 }
 
 struct State {
@@ -893,7 +897,8 @@ impl Store {
     }
 
     /// [`Store::list`] that takes the walk of the scan of the same scope right before it under
-    /// the same guard ([`Store::scan_walked`]), so the tree is walked once. `None` walks it.
+    /// the same guard ([`Store::scan_walked`]), so the tree is walked once. `None`, or a walk of
+    /// another scope or depth, walks it.
     pub(crate) fn list_walked(
         &self,
         guard: &StoreGuard,
@@ -907,6 +912,9 @@ impl Store {
         // files. So the tree is checked before the walk and again after the last read of
         // `files/` (the hashing in `entries`), and the folders must be the same ones. A reused
         // walk brings the check from before it.
+        // A walk of another scope or depth is dropped: a top-level walk taken for a full
+        // listing would make the device delete files and drop rows of the hash cache.
+        let walk = walk.filter(|w| w.scope == *path && w.recursive == recursive);
         let (before, mut all) = match walk {
             Some(walk) => {
                 // The scan's walk holds the scope itself too (a file or folder below the root).

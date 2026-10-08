@@ -492,6 +492,8 @@ impl Store {
         let walk = Walk {
             found: kept,
             before,
+            scope: opts.scope.clone(),
+            recursive: opts.recursive,
         };
         Ok((disk, parents, cache, walk))
     }
@@ -1313,6 +1315,49 @@ mod tests {
             all.iter()
                 .any(|e| e.path_display == "NOTE/Note/work/Sub/b.note")
         );
+    }
+
+    #[test]
+    fn a_walk_of_another_scope_is_not_reused() {
+        let (_dir, store, journal) = imported_account();
+        write_by_hand(&store, "NOTE/Note/Work/a.note", b"a");
+        write_by_hand(&store, "NOTE/Note/top.note", b"top");
+        let deep = scope_of("NOTE/Note/Work/a.note");
+        let g = store.lock_recovered(&journal).unwrap();
+        let all = store.list(&g, &WirePath::root(), true).unwrap();
+        assert!(
+            all.iter()
+                .any(|e| e.path_display == "NOTE/Note/Work/a.note")
+        );
+        assert!(store.cached_md5(&g, &deep).unwrap().is_some());
+        // A scan of the root's direct children only, then a listing of the whole tree.
+        let top_only = ScanOptions {
+            recursive: false,
+            ..ScanOptions::all(0)
+        };
+        let (_, walk) = store.scan_walked(&g, &journal, &top_only, 1).unwrap();
+        assert!(walk.is_some());
+        let listed = store
+            .list_walked(&g, &WirePath::root(), true, walk)
+            .unwrap();
+        assert_eq!(listed, store.list(&g, &WirePath::root(), true).unwrap());
+        assert!(
+            listed
+                .iter()
+                .any(|e| e.path_display == "NOTE/Note/Work/a.note")
+        );
+        assert!(store.cached_md5(&g, &deep).unwrap().is_some());
+        // A walk of another folder is not taken for the root either.
+        let opts = ScanOptions {
+            scope: scope_of("NOTE/Note"),
+            ..ScanOptions::all(0)
+        };
+        let (_, walk) = store.scan_walked(&g, &journal, &opts, 1).unwrap();
+        let listed = store
+            .list_walked(&g, &WirePath::root(), true, walk)
+            .unwrap();
+        assert_eq!(listed, store.list(&g, &WirePath::root(), true).unwrap());
+        assert!(store.cached_md5(&g, &deep).unwrap().is_some());
     }
 
     #[test]

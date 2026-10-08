@@ -653,6 +653,91 @@ async fn a_scan_after_a_replace_finds_nothing() {
     assert_eq!(s.events().len(), before);
 }
 
+/// Write `bytes` over the file at `path` by hand and set its mtime back, so only the ctime
+/// tells the change apart.
+fn edit_by_hand_keeping_mtime(path: &Path, bytes: &[u8]) {
+    let old_mtime = std::fs::metadata(path).unwrap().modified().unwrap();
+    std::fs::write(path, bytes).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(old_mtime)
+        .unwrap();
+}
+
+/// A whole-tree scan through `store`, which must journal the hand edit of `INBOX/x.pdf` with
+/// the uploaded MD5 as `prevMd5`.
+fn assert_scan_journals_the_hand_edit(s: &Server, store: &Store) {
+    let before = s.events().len();
+    let g = store.lock_recovered(&s.state.journal).unwrap();
+    let report = store
+        .scan(
+            &g,
+            &s.state.journal,
+            &notedown_cloud::store::ScanOptions::all(1),
+            s.state.now_ms(),
+        )
+        .unwrap();
+    drop(g);
+    let modified: Vec<String> = report.modified.iter().map(WirePath::display).collect();
+    assert_eq!(modified, vec!["INBOX/x.pdf".to_string()]);
+    let events = s.events();
+    assert_eq!(events.len(), before + 1);
+    let last = events.last().unwrap();
+    assert_eq!(last["type"], "file.modified");
+    assert_eq!(last["path"], "INBOX/x.pdf");
+    assert_eq!(last["prevMd5"], md5_of(b"one"));
+    assert_eq!(last["md5"], md5_of(b"two"));
+}
+
+/// An upload writes its cache row before it answers: a store opened after a stop (nothing
+/// flushed on the way) still knows the uploaded MD5, so a later edit by hand is journaled.
+#[tokio::test]
+async fn an_uploaded_row_survives_a_stop_and_a_hand_edit_is_journaled() {
+    let s = Server::new();
+    let t = s.session().await;
+    assert_ok(&s.upload(&t, "INBOX", "x.pdf", b"one").await);
+    // A fresh store, as after a server stop: only what is on disk.
+    let store = Store::open(s.data(), "jordi").unwrap();
+    edit_by_hand_keeping_mtime(&s.files().join("INBOX/x.pdf"), b"two");
+    assert_scan_journals_the_hand_edit(&s, &store);
+}
+
+/// A CLI command that writes `hashes.json` while the server runs makes the server reload the
+/// cache at its next lock. The uploaded row is in that file, so a later edit by hand is
+/// journaled.
+#[tokio::test]
+async fn an_uploaded_row_survives_a_cache_write_by_the_cli() {
+    let s = Server::new();
+    let t = s.session().await;
+    assert_ok(&s.upload(&t, "INBOX", "x.pdf", b"one").await);
+    let hashes = s.account().join("hashes.json");
+    let stamp = || {
+        std::fs::metadata(&hashes)
+            .ok()
+            .map(|m| (m.modified().unwrap(), m.len()))
+    };
+    let written = stamp();
+    // A CLI put into another folder: its own store, its own write of the cache.
+    let src = s.data().join("src.pdf");
+    std::fs::write(&src, b"from the cli").unwrap();
+    notedown_cloud::put::put(
+        s.data(),
+        "jordi",
+        &s.state.journal,
+        &src,
+        "DOCUMENT/Document",
+        None,
+    )
+    .unwrap();
+    assert_ne!(stamp(), written, "the CLI wrote the cache");
+    edit_by_hand_keeping_mtime(&s.files().join("INBOX/x.pdf"), b"two");
+    // The server's own store: its next lock reloads the cache from disk.
+    let store = s.state.store("jordi").unwrap();
+    assert_scan_journals_the_hand_edit(&s, &store);
+}
+
 #[tokio::test]
 async fn finish_joins_the_parent_folder_and_the_name_and_takes_the_size_as_string() {
     let s = Server::new();

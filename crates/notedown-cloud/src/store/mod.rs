@@ -762,10 +762,12 @@ impl Store {
         md5: &str,
     ) -> Result<()> {
         self.check_guard(guard)?;
-        // A new row stays in memory: it's a cache, and the next flush writes it. A reload after
-        // another process wrote the file (see `lock`) drops the row, which is safe. A row that
-        // replaces one is written at once: the old row on disk would make the next scan of
-        // another process (or after a crash) journal the put again as a change by hand.
+        // A new row stays in memory until the caller calls `flush_cache` (the CLI put and the
+        // device upload do that before they answer). Until then a stop, or a reload after
+        // another process wrote the file (see `lock`), drops it, and a later edit by hand isn't
+        // journaled. A row that replaces one is written at once: the old row on disk would make
+        // the next scan of another process (or after a crash) journal the put again as a change
+        // by hand.
         let mut state = self.state();
         let replaced = state.hashes.cached(path).is_some();
         state.hashes.insert(
@@ -789,8 +791,9 @@ impl Store {
         Ok(self.state().hashes.cached(path).map(str::to_string))
     }
 
-    /// Write the MD5 cache if a commit changed it (a put keeps a row in memory only). A process
-    /// that ends after one write calls this; a server leaves it to the next flush.
+    /// Write the MD5 cache if a commit or a listing changed it (a put of a new file keeps its
+    /// row in memory only). A put or a copy calls this before it answers, so the row of the
+    /// file it wrote survives a stop and a cache write by another process.
     pub fn flush_cache(&self, guard: &StoreGuard) -> Result<()> {
         self.check_guard(guard)?;
         let mut state = self.state();

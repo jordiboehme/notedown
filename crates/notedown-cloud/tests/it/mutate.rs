@@ -1188,6 +1188,44 @@ async fn a_copy_gets_a_new_id_and_journals_file_copied() {
     assert_eq!(r["entriesVO"]["path_display"], "INBOX/a(2).pdf");
 }
 
+/// A copy writes the cache row of the new file before it answers: a store opened after a stop
+/// still knows its MD5, so a later edit by hand (same size, mtime set back) is journaled.
+#[tokio::test]
+async fn a_copied_file_keeps_its_row_after_a_stop_and_a_hand_edit_is_journaled() {
+    let s = Server::new();
+    let t = s.session().await;
+    s.put("INBOX/a.pdf", b"one");
+    let a = s.id_of(&t, "INBOX/a.pdf").await;
+    assert_ok(&s.cp(&t, &a, "/INBOX/b.pdf", false).await);
+    // A fresh store, as after a server stop: only what is on disk.
+    let store = Store::open(s.data(), "jordi").unwrap();
+    let copy = s.files().join("INBOX/b.pdf");
+    let old_mtime = std::fs::metadata(&copy).unwrap().modified().unwrap();
+    std::fs::write(&copy, b"two").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&copy)
+        .unwrap()
+        .set_modified(old_mtime)
+        .unwrap();
+    let n = s.events().len();
+    let g = store.lock_recovered(&s.state.journal).unwrap();
+    let report = store
+        .scan(
+            &g,
+            &s.state.journal,
+            &notedown_cloud::store::ScanOptions::all(1),
+            s.state.now_ms(),
+        )
+        .unwrap();
+    drop(g);
+    assert_eq!(report.modified, vec![wp("INBOX/b.pdf")]);
+    let ev = s.events_after(n);
+    assert_eq!(types(&ev), ["file.modified"]);
+    assert_eq!(ev[0]["prevMd5"], md5_of(b"one"));
+    assert_eq!(ev[0]["md5"], md5_of(b"two"));
+}
+
 #[tokio::test]
 async fn a_copied_note_gets_page_events_after_file_copied() {
     let s = Server::new();

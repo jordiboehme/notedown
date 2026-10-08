@@ -1239,8 +1239,12 @@ fn finish_claimed(
     };
     crate::pages::plan_page_events(store, &guard, &mut commit);
     store.commit(&guard, commit, &state.journal)?;
-    let listed = store
-        .entry(&guard, target)?
+    let found = store.entry(&guard, target)?;
+    // The file's cache row goes to disk before the answer, as the CLI put does: a row in
+    // memory only is lost at a stop or when another process writes the cache, and a later
+    // edit by hand would then be taken in without an event.
+    store.flush_cache(&guard)?;
+    let listed = found
         .filter(|e| e.tag == Kind::File)
         .ok_or_else(|| Error::Invalid {
             what: "upload",
@@ -1896,6 +1900,9 @@ pub async fn copy_v3(
             }
         }
         let e = entry_after(&store, &guard, &to)?;
+        // The listing hashed a copied file: its row goes to disk before the answer, as for an
+        // upload.
+        store.flush_cache(&guard)?;
         Ok(Outcome::Done(json!({"entriesVO": entry_value(Some(&e))})))
     })
     .await

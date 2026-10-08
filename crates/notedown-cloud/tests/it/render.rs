@@ -555,3 +555,32 @@ fn a_foreign_pdf_at_the_target_is_kept_once_a_manifest_exists() {
         b"%PDF-1.7 mine"
     );
 }
+
+/// Open issue: the pass lists through `Store::list`, which gives new files ids and caches new
+/// MD5s without events, so the next scan misses hand changes made before the pass (a new
+/// note is not journaled, an edit is not journaled, a rename is journaled as a delete only).
+#[test]
+#[ignore = "needs a ruling: the pass's listing must not hide hand changes from the scan"]
+fn a_pass_before_a_scan_keeps_hand_changes_for_the_scan() {
+    let fx = Fx::new();
+    fx.write("NOTE/Note/k.note", &fixture_note("test1"));
+    fx.write("NOTE/Note/r.note", &fixture_note("test1"));
+    fx.scan();
+    fx.write("NOTE/Note/n.note", &fixture_note("test1"));
+    fx.write("NOTE/Note/k.note", &fixture_note("test2"));
+    fx.rename("NOTE/Note/r.note", "NOTE/Note/r2.note");
+    fx.pass();
+    let g = fx.store.lock_recovered(&fx.journal).unwrap();
+    let rep = fx
+        .store
+        .scan(&g, &fx.journal, &ScanOptions::all(0), NOW)
+        .unwrap();
+    let p = |x: &str| WirePath::parse_named(x).unwrap();
+    assert_eq!(rep.created, vec![p("NOTE/Note/n.note")]);
+    assert_eq!(rep.modified, vec![p("NOTE/Note/k.note")]);
+    assert_eq!(
+        rep.moved,
+        vec![(p("NOTE/Note/r.note"), p("NOTE/Note/r2.note"))]
+    );
+    assert!(rep.deleted.is_empty(), "{:?}", rep.deleted);
+}

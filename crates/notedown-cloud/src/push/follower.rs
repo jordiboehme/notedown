@@ -101,9 +101,12 @@ pub fn tick(state: &AppState, now_ms: u64) -> usize {
         let open = *gates
             .entry(slug.clone())
             .or_insert_with(|| gate_open(state, &slug));
+        // A session whose last push still waits for `Received` gets no new items: the changes
+        // go on collapsing in the planner, so the session queue stays small.
         if !open
             || state.sync_locks.holder(&slug, now_ms).is_some()
             || !state.sockets.is_connected(&slug, &serial, now_ms)
+            || state.sockets.awaiting_received(&slug, &serial)
         {
             continue;
         }

@@ -55,8 +55,9 @@ struct Queue {
 
 impl Queue {
     /// Add `items`. No item is dropped: like Ratta, the queue keeps everything until the device
-    /// answers `Received` or the session ends (4.4). Each push adds at most the collapsed
-    /// changes of the account, and a push goes out at most once per 5 s.
+    /// answers `Received` or the session ends (4.4). The push tick queues nothing while sent
+    /// items wait for `Received` ([`SocketRegistry::awaiting_received`]), so the queue doesn't grow
+    /// while the device doesn't answer: it holds the pushes of one heartbeat interval at most.
     fn push(&mut self, items: Vec<PushItem>) {
         self.new.extend(items);
     }
@@ -165,6 +166,15 @@ impl SocketRegistry {
             }
             _ => false,
         }
+    }
+
+    /// Whether the live session of this device has sent items that wait for `Received`. The push
+    /// tick then keeps its push pending: the changes go on collapsing in the planner instead of
+    /// piling up in the queue of a device that does not acknowledge.
+    pub fn awaiting_received(&self, slug: &str, serial: &str) -> bool {
+        self.lock()
+            .get(&(slug.to_string(), serial.to_string()))
+            .is_some_and(|e| !e.queue.sent.is_empty())
     }
 
     /// The `ServerMessage` frame that session `sid` sends right after the reply to its
@@ -299,6 +309,21 @@ mod tests {
         assert_eq!(delivered(&frame).0, texts(&[item(2)]));
         r.received("jordi", "SN1", "a");
         assert_eq!(r.deliver("jordi", "SN1", "a", 10_000), None);
+    }
+
+    #[test]
+    fn sent_items_await_received() {
+        let r = SocketRegistry::new();
+        let _rx = r.register("jordi", "SN1", "a", 0).0;
+        assert!(!r.awaiting_received("jordi", "SN1"));
+        assert!(r.queue("jordi", "SN1", vec![item(1)], 0));
+        // Queued, not sent yet.
+        assert!(!r.awaiting_received("jordi", "SN1"));
+        assert!(r.deliver("jordi", "SN1", "a", 0).is_some());
+        assert!(r.awaiting_received("jordi", "SN1"));
+        r.received("jordi", "SN1", "a");
+        assert!(!r.awaiting_received("jordi", "SN1"));
+        assert!(!r.awaiting_received("jordi", "SN2"));
     }
 
     #[test]

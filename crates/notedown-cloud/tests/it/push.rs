@@ -638,6 +638,44 @@ fn received_within_5_s_sends_nothing_twice() {
 }
 
 #[test]
+fn no_new_items_are_queued_until_the_device_answers_received() {
+    let mut f = detail_fixture();
+    f.put("a.note");
+    f.follow();
+    f.advance_ms(2000);
+    assert_eq!(tick(&f.state, f.now()), 2);
+    // A gets the push and doesn't acknowledge it; B hasn't had a heartbeat yet.
+    assert!(f.ping(A).is_some());
+    f.advance_ms(MIN_GAP);
+    f.put("b.note");
+    f.follow();
+    f.advance_ms(2000);
+    assert_eq!(tick(&f.state, f.now()), 1);
+    assert!(f.pending(A) && !f.pending(B));
+    // A gets only the first push again, B both pushes merged.
+    let names = |frame: String| -> Vec<String> {
+        message(&frame)
+            .0
+            .iter()
+            .map(|i| i["originalName"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(names(f.ping_again(A)), ["a.note"]);
+    assert_eq!(names(f.ping(B).unwrap()), ["a.note", "b.note"]);
+    // More changes while A doesn't answer collapse in the planner.
+    f.put("c.note");
+    f.follow();
+    f.advance_ms(2000);
+    f.heartbeat(A);
+    assert_eq!(tick(&f.state, f.now()), 0);
+    // Received: the waiting changes go out with the next tick, in one push.
+    f.received(A);
+    assert_eq!(tick(&f.state, f.now()), 1);
+    assert!(!f.pending(A));
+    assert_eq!(names(f.ping(A).unwrap()), ["b.note", "c.note"]);
+}
+
+#[test]
 fn startsync_pushes_merge_into_one_item() {
     let mut f = Fixture::new();
     f.put("a.note");

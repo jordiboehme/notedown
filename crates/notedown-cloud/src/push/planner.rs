@@ -52,7 +52,8 @@ pub struct Pending {
     /// `None` for CLI and scan changes.
     pub cause: Option<String>,
     /// The pending changes, collapsed per file or folder (for the detail mode). Bounded by
-    /// the number of entries of the account, not by the number of events.
+    /// the entries of the account and the entries deleted since the last push, not by the
+    /// number of events.
     pub changes: Changes,
 }
 
@@ -145,6 +146,7 @@ impl PushPlanner {
             .is_some_and(|p| p.max_seq <= t.covered_seq)
         {
             t.pending = None;
+            t.retry_ms = None;
         }
         // A push that stays pending keeps only the changes the sync did not see.
         if let Some(p) = &mut t.pending {
@@ -493,6 +495,19 @@ mod tests {
         p.observe(&e, &targets(), 0);
         assert!(p.pending("x", "A").is_some());
         assert!(p.pending("y", "A").is_none() && p.pending("acc", "A").is_none());
+    }
+
+    #[test]
+    fn covered_ends_a_failure_with_the_push_it_drops() {
+        let mut p = planner();
+        p.observe(&ev(Origin::Cli, None, 1, created()), &targets(), 0);
+        assert!(p.failed("acc", "B", 2000));
+        p.covered("acc", "B", 5);
+        assert!(!is_pending(&p, "B"));
+        // A new push is due at once, and its first failure is logged again.
+        p.observe(&ev(Origin::Cli, None, 6, created()), &targets(), 2100);
+        assert!(p.due(4100).contains(&("acc".to_string(), "B".to_string())));
+        assert!(p.failed("acc", "B", 4100));
     }
 
     #[test]

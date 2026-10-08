@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use super::PushItem;
 use super::changes::{Change, Changes};
-use crate::store::{Store, WirePath};
+use crate::store::{Kind, Store, WirePath};
 
 /// One item. The field order is the order of the 4.5 example; `None` is left out.
 #[derive(Serialize, Default)]
@@ -75,7 +75,8 @@ fn base(change: &Change, built_ms: u64) -> Item {
     }
 }
 
-/// The items of one collapsed change, by the item rules of 4.5:
+/// The items of one collapsed change, by the item rules of 4.5. `known` is the path the device
+/// knows (after the folder items of the same push, see [`detail_items`]), `path` the path now.
 ///
 /// - a new entry (created or copied after the last push) gives `DOWNLOADFILE`, `COPYFILE` or
 ///   `ADDFOLDER` at its path now, or nothing when it is deleted again;
@@ -84,10 +85,16 @@ fn base(change: &Change, built_ms: u64) -> Item {
 /// - an entry the device knows at another path gives `MODIFY*` (same folder) or `MOVE*`;
 /// - a file the device knows with new content gives `DOWNLOADFILE` (after the move, when it
 ///   moved too: one item alone would leave the device with a stale copy).
-fn items_of(change: &Change, store: &Store, built_ms: u64) -> crate::Result<Vec<Item>> {
+fn items_of(
+    change: &Change,
+    known: Option<&str>,
+    path: Option<&str>,
+    store: &Store,
+    built_ms: u64,
+) -> crate::Result<Vec<Item>> {
     let id = change.id;
     let mut out = Vec::new();
-    match (&change.known_path, &change.path) {
+    match (known, path) {
         (None, None) => {}
         (None, Some(path)) => {
             let mut it = base(change, built_ms);
@@ -141,6 +148,99 @@ fn items_of(change: &Change, store: &Store, built_ms: u64) -> crate::Result<Vec<
     Ok(out)
 }
 
+/// A path in the store's display form (`NOTE/Note/a.note`), as far as it parses.
+fn norm(path: &str) -> String {
+    WirePath::parse_named(path).map_or_else(|_| path.to_string(), |p| p.display())
+}
+
+/// The path of a live entry now: the store's path of its id (a parent folder may have moved
+/// after the entry's own events), else the path of its newest event. `None` for a deleted
+/// entry.
+fn final_path(change: &Change, store: &Store) -> crate::Result<Option<String>> {
+    let Some(path) = &change.path else {
+        return Ok(None);
+    };
+    let want = if change.folder {
+        Kind::Folder
+    } else {
+        Kind::File
+    };
+    Ok(Some(match store.kind_and_path_of(change.id)? {
+        Some((kind, p)) if kind == want => p.display(),
+        _ => norm(path),
+    }))
+}
+
+/// `path` with its deepest moved ancestor replaced: `moves` are the folders the device knows
+/// that the same push moves, as (path the device knows, path now).
+fn rebase(path: &str, moves: &[(String, String)]) -> String {
+    let mut best: Option<&(String, String)> = None;
+    for m in moves {
+        let under = path.len() > m.0.len()
+            && path.starts_with(m.0.as_str())
+            && path.as_bytes()[m.0.len()] == b'/';
+        if under && best.is_none_or(|b| m.0.len() > b.0.len()) {
+            best = Some(m);
+        }
+    }
+    match best {
+        Some((from, to)) => format!("{to}{}", &path[from.len()..]),
+        None => path.to_string(),
+    }
+}
+
+/// The items of `changes` built at `built_ms`: one per changed file or folder (two for a file
+/// the device knows that moved and got new content), none for an entry created and deleted
+/// again. Fails only when the id registry cannot be read.
+///
+/// Every live entry is named at its path now ([`final_path`]), and every path the device knows
+/// is rebased onto the moves of its parent folders in the same push. The items go out in an
+/// order the device can follow: first the folders that are new or moved, parents before
+/// children; then the copies (their source is still as the device has it); then the other file
+/// items; then the deletes, in journal order. A change of the same entry is in the order of
+/// its first event ([`Changes::in_order`]).
+pub fn detail_items(
+    changes: &Changes,
+    store: &Store,
+    built_ms: u64,
+) -> crate::Result<Vec<PushItem>> {
+    let list = changes.in_order();
+    let mut paths = Vec::with_capacity(list.len());
+    for change in &list {
+        paths.push(final_path(change, store)?);
+    }
+    let moves: Vec<(String, String)> = list
+        .iter()
+        .zip(&paths)
+        .filter(|(c, _)| c.folder)
+        .filter_map(|(c, now)| Some((norm(c.known_path.as_ref()?), now.clone()?)))
+        .filter(|(from, to)| from != to)
+        .collect();
+    // (group, depth) per item list: 0 folders, 1 copies, 2 files, 3 deletes.
+    let mut groups: Vec<((u8, usize), Vec<Item>)> = Vec::with_capacity(list.len());
+    for (change, now) in list.iter().zip(&paths) {
+        let known = change
+            .known_path
+            .as_deref()
+            .map(|k| rebase(&norm(k), &moves));
+        let items = items_of(change, known.as_deref(), now.as_deref(), store, built_ms)?;
+        let key = match now {
+            None => (3, 0),
+            Some(p) if change.folder => (0, p.matches('/').count()),
+            Some(_) if change.known_path.is_none() && change.content.is_none() => (1, 0),
+            Some(_) => (2, 0),
+        };
+        groups.push((key, items));
+    }
+    // A stable sort: the journal order stays within a group.
+    groups.sort_by_key(|(key, _)| *key);
+    Ok(groups
+        .into_iter()
+        .flat_map(|(_, items)| items)
+        .map(|it| PushItem::new(&it, false))
+        .collect())
+}
+
 /// A `DOWNLOADFILE` item: a new and a changed file are both downloaded (4.7).
 fn download(
     it: &mut Item,
@@ -192,23 +292,6 @@ fn moved(
     };
     it.new_path = Some(new_path);
     Ok(kind)
-}
-
-/// The items of `changes` built at `built_ms`, in the order of [`Changes::in_order`]: one per
-/// changed file or folder (two for a file the device knows that moved and got new content), none
-/// for an entry created and deleted again. Fails only when the id registry cannot be read.
-pub fn detail_items(
-    changes: &Changes,
-    store: &Store,
-    built_ms: u64,
-) -> crate::Result<Vec<PushItem>> {
-    let mut items = Vec::with_capacity(changes.len());
-    for change in changes.in_order() {
-        for it in items_of(change, store, built_ms)? {
-            items.push(PushItem::new(&it, false));
-        }
-    }
-    Ok(items)
 }
 
 #[cfg(test)]
@@ -584,21 +667,46 @@ mod tests {
         assert!(out.ends_with(r#""md5":"m1","size":20,"directoryId":1002,"originalPath":"NOTE/Note/Work/","newPath":"NOTE/Note/Work/","timestamp":1000}"#), "{out}");
     }
 
+    /// Give `path` an id in the store, as the store has it after the events of a test.
+    fn assign(s: &Store, path: &str, kind: Kind) -> u64 {
+        let g = s.lock().unwrap();
+        s.assign(&g, &WirePath::parse_named(path).unwrap(), kind)
+            .unwrap()
+    }
+
+    /// The items of `events` as parsed JSON.
+    fn parsed(s: &Store, events: &[Event]) -> Vec<serde_json::Value> {
+        build(s, events)
+            .iter()
+            .map(|i| serde_json::from_str(i.json()).unwrap())
+            .collect()
+    }
+
+    fn folder_moved(id: u64, old: &str, new: &str) -> EventBody {
+        EventBody::FolderMoved {
+            id,
+            path: new.into(),
+            old_path: old.into(),
+        }
+    }
+
     #[test]
-    fn a_new_folder_comes_before_the_files_put_into_it() {
+    fn a_file_put_into_a_new_folder_that_then_moves_is_named_at_its_place_now() {
         let (_d, s) = store();
+        let folder = assign(&s, "NOTE/Note/Work/New", Kind::Folder);
+        let file = assign(&s, "NOTE/Note/Work/New/a.note", Kind::File);
         let events = [
             ev(
                 None,
                 EventBody::FolderCreated {
-                    id: 77,
+                    id: folder,
                     path: "NOTE/Note/New".into(),
                 },
             ),
             ev(
                 None,
                 EventBody::FileCreated {
-                    id: 78,
+                    id: file,
                     path: "NOTE/Note/New/a.note".into(),
                     kind: FileKind::Note,
                     md5: "m".into(),
@@ -608,13 +716,115 @@ mod tests {
             ),
             ev(
                 None,
-                EventBody::FolderMoved {
-                    id: 77,
-                    path: "NOTE/Note/Work/New".into(),
-                    old_path: "NOTE/Note/New".into(),
-                },
+                folder_moved(folder, "NOTE/Note/New", "NOTE/Note/Work/New"),
             ),
         ];
-        assert_eq!(types(&s, &events), ["ADDFOLDER", "DOWNLOADFILE"]);
+        let items = parsed(&s, &events);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["messageType"], "ADDFOLDER");
+        assert_eq!(items[0]["originalPath"], "NOTE/Note/Work/");
+        assert_eq!(items[0]["originalName"], "New");
+        assert_eq!(items[1]["messageType"], "DOWNLOADFILE");
+        assert_eq!(items[1]["newPath"], "NOTE/Note/Work/New/");
+        assert_eq!(items[1]["directoryId"], folder);
+    }
+
+    #[test]
+    fn a_known_file_changed_then_its_folder_moved_is_downloaded_after_the_move() {
+        let (_d, s) = store();
+        let folder = assign(&s, "NOTE/Note/Q", Kind::Folder);
+        let file = assign(&s, "NOTE/Note/Q/f.note", Kind::File);
+        let events = [
+            ev(
+                None,
+                EventBody::FileModified {
+                    id: file,
+                    path: "NOTE/Note/P/f.note".into(),
+                    kind: FileKind::Note,
+                    md5: "m2".into(),
+                    prev_md5: "m1".into(),
+                    size: 3,
+                    pages_changed: None,
+                },
+            ),
+            ev(None, folder_moved(folder, "NOTE/Note/P", "NOTE/Note/Q")),
+        ];
+        let items = parsed(&s, &events);
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0]["messageType"], "MODIFYFOLDER");
+        assert_eq!(items[0]["originalName"], "P");
+        assert_eq!(items[0]["newName"], "Q");
+        assert_eq!(items[1]["messageType"], "DOWNLOADFILE");
+        assert_eq!(items[1]["originalPath"], "NOTE/Note/Q/");
+        assert_eq!(items[1]["directoryId"], folder);
+        assert_eq!(items[1]["md5"], "m2");
+    }
+
+    #[test]
+    fn nested_folder_moves_go_parent_first_with_rebased_paths() {
+        let (_d, s) = store();
+        let outer = assign(&s, "NOTE/Note/Work/A2", Kind::Folder);
+        let inner = assign(&s, "NOTE/Note/Work/A2/C", Kind::Folder);
+        let events = [
+            // The inner folder is renamed first, then the outer one moves.
+            ev(None, folder_moved(inner, "NOTE/Note/A/B", "NOTE/Note/A/C")),
+            ev(
+                None,
+                folder_moved(outer, "NOTE/Note/A", "NOTE/Note/Work/A2"),
+            ),
+        ];
+        let items = parsed(&s, &events);
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0]["messageType"], "MOVEFOLDER");
+        assert_eq!(items[0]["originalPath"], "NOTE/Note/");
+        assert_eq!(items[0]["originalName"], "A");
+        assert_eq!(items[0]["newPath"], "NOTE/Note/Work/");
+        assert_eq!(items[0]["newName"], "A2");
+        assert_eq!(items[1]["messageType"], "MODIFYFOLDER");
+        assert_eq!(items[1]["originalPath"], "NOTE/Note/Work/A2/");
+        assert_eq!(items[1]["originalName"], "B");
+        assert_eq!(items[1]["newName"], "C");
+        assert_eq!(items[1]["directoryId"], outer);
+    }
+
+    #[test]
+    fn a_delete_in_a_folder_that_moves_names_the_place_after_the_move() {
+        let (_d, s) = store();
+        let folder = assign(&s, "NOTE/Note/Q", Kind::Folder);
+        let events = [
+            ev(None, file_deleted("NOTE/Note/P/e.note")),
+            ev(None, folder_moved(folder, "NOTE/Note/P", "NOTE/Note/Q")),
+        ];
+        let items = parsed(&s, &events);
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0]["messageType"], "MODIFYFOLDER");
+        assert_eq!(items[1]["messageType"], "DELETEFILE");
+        assert_eq!(items[1]["originalPath"], "NOTE/Note/Q/");
+        assert_eq!(items[1]["directoryId"], folder);
+    }
+
+    #[test]
+    fn a_copy_of_a_new_file_is_a_download_and_a_copy_comes_before_deletes() {
+        let (_d, s) = store();
+        let copy = |id, source_id, name: &str| EventBody::FileCopied {
+            id,
+            source_id,
+            path: format!("NOTE/Note/{name}"),
+        };
+        let events = [ev(None, created()), ev(None, copy(4712, 4711, "d.pdf"))];
+        let items = parsed(&s, &events);
+        let kinds: Vec<&str> = items
+            .iter()
+            .map(|i| i["messageType"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["DOWNLOADFILE", "DOWNLOADFILE"]);
+        assert_eq!(items[1]["id"], 4712);
+        assert_eq!(items[1]["md5"], "m5");
+        // A source the device has, deleted after the copy: the copy goes first.
+        let events = [
+            ev(None, copy(4712, 4711, "d.note")),
+            ev(None, file_deleted("NOTE/Note/e.note")),
+        ];
+        assert_eq!(types(&s, &events), ["COPYFILE", "DELETEFILE"]);
     }
 }

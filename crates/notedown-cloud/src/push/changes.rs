@@ -3,7 +3,8 @@
 //! Ratta merges every pending item into one push, without a cap (`docs/sync-protocol.md` 4.4).
 //! notedown keeps no list of events for that: each event updates the net change of its entry
 //! (a file or folder id), so the pending state of a target never holds more entries than the
-//! account has, however many events arrive before the push goes out.
+//! account has (plus the entries deleted since the last push), however many events arrive
+//! before the push goes out.
 
 use std::collections::HashMap;
 
@@ -17,11 +18,19 @@ pub struct Change {
     /// The path the device knows: the path before the first pending event. `None` when the
     /// entry was created or copied after the last push.
     pub known_path: Option<String>,
-    /// The path now; `None` when the entry is deleted.
+    /// The path in the newest event; `None` when the entry is deleted. The item takes the path
+    /// of the store when it is built (a parent folder may have moved since).
     pub path: Option<String>,
+    /// The path before the newest event: what the device knows after a sync that saw every
+    /// event but the newest ([`Changes::retain_after`]).
+    pub prev_path: Option<String>,
+    /// The newest event gave the file new content.
+    pub last_content: bool,
     /// The latest md5 and size of a file whose content is new (created or modified).
     pub content: Option<(String, u64)>,
-    /// The source id of the copy that made the file, while its content did not change after.
+    /// The source id of the copy that made the file, while its content did not change after. A
+    /// copy of a source that is new or changed in the same window takes the source's content
+    /// instead: the device's copy of the source would be stale or missing.
     pub copy_of: Option<u64>,
     /// The device behind the newest event (`equipmentNo`), `None` for CLI and scan changes.
     pub device: Option<String>,
@@ -131,6 +140,18 @@ impl Changes {
         let Some((folder, id, step)) = step(&event.body) else {
             return;
         };
+        // What the device has of a copy's source: nothing or old bytes when the source is new or
+        // changed in this window. Then the copy is a new file with the source's content.
+        let source = match &step {
+            Step::New {
+                copy_of: Some(src), ..
+            } => self
+                .entries
+                .get(&(false, *src))
+                .filter(|s| s.known_path.is_none() || s.content.is_some())
+                .map(|s| (s.content.clone(), s.copy_of)),
+            _ => None,
+        };
         let c = self.entries.entry((folder, id)).or_insert_with(|| {
             let known_path = match &step {
                 Step::New { .. } => None,
@@ -141,6 +162,8 @@ impl Changes {
                 folder,
                 id,
                 path: known_path.clone(),
+                prev_path: None,
+                last_content: false,
                 known_path,
                 content: None,
                 copy_of: None,
@@ -149,6 +172,7 @@ impl Changes {
                 last_seq: event.seq,
             }
         });
+        c.prev_path = c.path.clone();
         match step {
             Step::New {
                 path,
@@ -158,6 +182,10 @@ impl Changes {
                 c.path = Some(path.to_string());
                 c.content = content.map(|(m, s)| (m.to_string(), s));
                 c.copy_of = copy_of;
+                if let Some((content, copy_of)) = source {
+                    c.copy_of = if content.is_some() { None } else { copy_of };
+                    c.content = content;
+                }
             }
             Step::Modified { path, md5, size } => {
                 c.path = Some(path.to_string());
@@ -171,15 +199,34 @@ impl Changes {
                 c.copy_of = None;
             }
         }
+        c.last_content =
+            c.content.is_some() && matches!(step, Step::New { .. } | Step::Modified { .. });
         c.device = event.device.clone();
         c.last_seq = c.last_seq.max(event.seq);
     }
 
     /// Drop the changes a sync up to `seq` has seen: those whose newest event is at or before
     /// `seq`. A change with events on both sides of `seq` (a race of the sync start with the
-    /// follower) is kept whole.
+    /// follower) keeps only its newest event: the device knows the path before it, and the
+    /// content is new only when that event changed it. With two or more events after `seq`
+    /// the older ones count as seen, which is the closest the collapsed state can tell.
     pub fn retain_after(&mut self, seq: u64) {
         self.entries.retain(|_, c| c.last_seq > seq);
+        for c in self.entries.values_mut() {
+            if c.first_seq <= seq {
+                c.known_path = c.prev_path.clone();
+                if !c.last_content {
+                    c.content = None;
+                }
+                c.copy_of = None;
+                c.first_seq = c.last_seq;
+            }
+        }
+    }
+
+    /// The change of the file `id`, if it has one.
+    pub fn file(&self, id: u64) -> Option<&Change> {
+        self.entries.get(&(false, id))
     }
 
     /// The number of entries with a pending change.
@@ -325,6 +372,72 @@ mod tests {
         }
         assert_eq!(c.len(), 3);
         assert!(c.in_order().iter().all(|ch| ch.last_seq > 9_990));
+    }
+
+    fn deleted(id: u64, path: &str) -> EventBody {
+        EventBody::FileDeleted {
+            id,
+            path: path.into(),
+            recycle: "r".into(),
+        }
+    }
+
+    fn apply_at(c: &mut Changes, seq: u64, body: EventBody) {
+        c.apply(&ev(seq, body));
+    }
+
+    #[test]
+    fn a_sync_between_create_and_delete_leaves_a_delete() {
+        let mut c = Changes::default();
+        apply_at(&mut c, 5, created(1, "N/a", "m"));
+        apply_at(&mut c, 12, deleted(1, "N/a"));
+        c.retain_after(10);
+        let ch = only(&c);
+        assert_eq!(ch.known_path.as_deref(), Some("N/a"));
+        assert_eq!(ch.path, None);
+    }
+
+    #[test]
+    fn a_sync_between_create_and_move_leaves_a_move_without_content() {
+        let mut c = Changes::default();
+        apply_at(&mut c, 5, created(1, "N/a", "m"));
+        apply_at(&mut c, 12, moved(1, "N/a", "N/b"));
+        c.retain_after(10);
+        let ch = only(&c);
+        assert_eq!(ch.known_path.as_deref(), Some("N/a"));
+        assert_eq!(ch.path.as_deref(), Some("N/b"));
+        assert_eq!(ch.content, None);
+        assert_eq!(ch.first_seq, 12);
+        // A change of content after the sync stays new content.
+        let mut c = Changes::default();
+        apply_at(&mut c, 5, created(1, "N/a", "m"));
+        apply_at(&mut c, 12, modified(1, "N/a", "m2"));
+        c.retain_after(10);
+        assert_eq!(only(&c).content, Some(("m2".into(), 2)));
+        assert_eq!(only(&c).known_path.as_deref(), Some("N/a"));
+    }
+
+    #[test]
+    fn a_copy_of_a_new_or_changed_source_takes_its_content() {
+        let copied = |id, source_id| EventBody::FileCopied {
+            id,
+            source_id,
+            path: format!("N/copy{id}"),
+        };
+        // new source
+        let c = changes(vec![created(1, "N/a", "m1"), copied(2, 1)]);
+        let copy = c.file(2).unwrap();
+        assert_eq!(
+            (copy.content.clone(), copy.copy_of),
+            (Some(("m1".into(), 1)), None)
+        );
+        // changed source
+        let c = changes(vec![modified(1, "N/a", "m2"), copied(2, 1)]);
+        assert_eq!(c.file(2).unwrap().content, Some(("m2".into(), 2)));
+        // a source the device has as it is: a copy
+        let c = changes(vec![moved(1, "N/a", "N/b"), copied(2, 1)]);
+        let copy = c.file(2).unwrap();
+        assert_eq!((copy.content.clone(), copy.copy_of), (None, Some(1)));
     }
 
     #[test]

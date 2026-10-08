@@ -849,7 +849,8 @@ fn put_command(args: PutArgs) -> Result<ExitCode> {
         &args.file,
         &args.to,
         args.name.as_deref(),
-    )?;
+    )
+    .map_err(|e| held_error(&args.data, &args.account, e))?;
     let what = match r.outcome {
         PutOutcome::Created => "created",
         PutOutcome::Replaced => "replaced, the old version is in the recycle bin",
@@ -968,7 +969,17 @@ fn scan_account(
 ) -> Result<bool> {
     use notedown_cloud::store::{ScanOptions, Store};
     let store = Store::open(data, slug)?;
-    let guard = store.lock_recovered(journal)?;
+    let guard = if args.dry_run {
+        // A dry run writes nothing, so it can't finish an unfinished change either.
+        store.lock_unless_pending()?.ok_or_else(|| {
+            anyhow!(
+                "account {slug} has an unfinished change. Run the scan without --dry-run, or \
+                 start the server, to finish it first"
+            )
+        })?
+    } else {
+        store.lock_recovered(journal)?
+    };
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
@@ -997,14 +1008,11 @@ fn scan_account(
             hold.left,
             hold.min
         );
+        let accept = notedown_cloud::server::accept_command(data, slug);
         if args.dry_run {
-            println!(
-                "Device sync would be put on hold. If that's on purpose, run: notedown cloud scan --account {slug} --accept"
-            );
+            println!("Device sync would be put on hold. If that's on purpose, run: {accept}");
         } else {
-            println!(
-                "Device sync is on hold. If that's on purpose, run: notedown cloud scan --account {slug} --accept"
-            );
+            println!("Device sync is on hold. If that's on purpose, run: {accept}");
         }
         return Ok(true);
     }
@@ -1028,6 +1036,18 @@ fn scan_account(
         println!("account {slug}: {text}");
     }
     Ok(false)
+}
+
+/// `e`, with the way out when it is a scan hold of account `slug`.
+fn held_error(data: &Path, slug: &str, e: notedown_cloud::Error) -> anyhow::Error {
+    match e {
+        notedown_cloud::Error::ScanHold(_) => anyhow!(
+            "account {slug} is on hold: files are gone from the data folder. Put them back, or \
+             if that's on purpose, run: {}",
+            notedown_cloud::server::accept_command(data, slug)
+        ),
+        e => e.into(),
+    }
 }
 
 fn scan_command(args: ScanArgs) -> Result<ExitCode> {
@@ -1194,8 +1214,25 @@ fn journal_command(data: &Path, action: JournalAction) -> Result<ExitCode> {
             })?;
         }
         JournalAction::Snapshot { account, .. } => {
-            let store = notedown_cloud::store::Store::open(data, &account)?;
+            use notedown_cloud::store::{ScanOptions, Store};
+            let min_files = notedown_cloud::Config::load_or_default(data)?.scan_min_files;
+            let store = Store::open(data, &account)?;
             let guard = store.lock_recovered(&journal)?;
+            // The changes made by hand first: the snapshot must not give them ids without
+            // their events.
+            let report = store.scan(
+                &guard,
+                &journal,
+                &ScanOptions::all(min_files),
+                journal.now_ms(),
+            )?;
+            if report.held.is_some() {
+                return Err(held_error(
+                    data,
+                    &account,
+                    notedown_cloud::Error::ScanHold(account.clone()),
+                ));
+            }
             let seqs = store.snapshot(&guard, &journal)?;
             match (seqs.first(), seqs.last()) {
                 (Some(a), Some(b)) => println!(

@@ -339,6 +339,8 @@ fn cloud_journal_recovers_snapshots_and_tails() {
     assert_eq!(ev[0]["opId"], "op-x");
     assert!(!d.join("accounts/jordi/pending.json").exists());
 
+    // The folder and the file made by hand are journaled by a scan first (seq 2 to 4), so the
+    // snapshot gives nothing an id without its event.
     let out = journal(d, &["snapshot", "--account", "jordi"]);
     assert!(
         out.status.success(),
@@ -347,32 +349,91 @@ fn cloud_journal_recovers_snapshots_and_tails() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "journaled 3 events for account jordi (seq 2 to 4)\n"
+        "journaled 3 events for account jordi (seq 5 to 7)\n"
     );
     let ev = lines(&journal(d, &["tail"]));
-    assert_eq!(ev.len(), 4);
-    let types: Vec<&str> = ev.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    let got: Vec<(&str, &str)> = ev
+        .iter()
+        .map(|e| (e["type"].as_str().unwrap(), e["origin"].as_str().unwrap()))
+        .collect();
     assert_eq!(
-        types,
+        got,
         [
-            "folder.created",
-            "folder.created",
-            "folder.created",
-            "file.created"
+            ("folder.created", "repair"),
+            ("folder.created", "scan"),
+            ("folder.created", "scan"),
+            ("file.created", "scan"),
+            ("folder.created", "snapshot"),
+            ("folder.created", "snapshot"),
+            ("file.created", "snapshot"),
         ]
     );
-    assert_eq!(ev[3]["path"], "INBOX/a.pdf");
-    assert_eq!(ev[3]["kind"], "document");
-    assert_eq!(ev[3]["origin"], "snapshot");
-    let ev = lines(&journal(d, &["tail", "--from", "3"]));
+    assert_eq!(ev[6]["path"], "INBOX/a.pdf");
+    assert_eq!(ev[6]["kind"], "document");
+    let ev = lines(&journal(d, &["tail", "--from", "6"]));
     assert_eq!(
         ev.iter()
             .map(|e| e["seq"].as_u64().unwrap())
             .collect::<Vec<_>>(),
-        [3, 4]
+        [6, 7]
     );
     let out = journal(d, &["snapshot", "--account", "ghost"]);
     assert!(!out.status.success());
+}
+
+/// A snapshot while a scan holds the account refuses and names the way out.
+#[test]
+fn cloud_journal_snapshot_refuses_while_the_account_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let files = scan_account(d, "jordi");
+    std::fs::write(files.join("INBOX/a.pdf"), "one").unwrap();
+    assert!(scan(d, &["--account", "jordi"]).status.success());
+    std::fs::remove_file(files.join("INBOX/a.pdf")).unwrap();
+    let before = lines(&journal(d, &["tail"])).len();
+    let out = journal(d, &["snapshot", "--account", "jordi"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("account jordi is on hold"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "run: notedown cloud scan --data {} --account jordi --accept",
+            d.display()
+        )),
+        "{err}"
+    );
+    assert!(d.join("accounts/jordi/scan-hold.json").is_file());
+    assert_eq!(lines(&journal(d, &["tail"])).len(), before);
+}
+
+/// `put` refuses the same way while the account is held.
+#[test]
+fn cloud_put_refuses_while_the_account_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let files = scan_account(d, "jordi");
+    std::fs::write(files.join("INBOX/a.pdf"), "one").unwrap();
+    assert!(scan(d, &["--account", "jordi"]).status.success());
+    std::fs::remove_file(files.join("INBOX/a.pdf")).unwrap();
+    assert_eq!(scan(d, &["--account", "jordi"]).status.code(), Some(1));
+    let src = d.join("b.pdf");
+    std::fs::write(&src, "two").unwrap();
+    let out = notedown(&[
+        "cloud",
+        "put",
+        "--data",
+        d.to_str().unwrap(),
+        "--account",
+        "jordi",
+        "--to",
+        "INBOX",
+        src.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("account jordi is on hold"), "{err}");
+    assert!(err.contains("--data"), "{err}");
+    assert!(!files.join("INBOX/b.pdf").exists());
 }
 
 #[cfg(unix)]
@@ -1181,6 +1242,24 @@ fn cloud_scan_dry_run_writes_nothing_then_a_scan_counts_the_changes() {
     assert!(!stdout(&out).contains('\u{2014}'));
 }
 
+/// A dry run writes nothing, so it can't finish an unfinished change: it refuses.
+#[test]
+fn cloud_scan_dry_run_refuses_an_unfinished_change() {
+    let dir = journal_fixture();
+    let d = dir.path();
+    let before = tree(d);
+    let out = scan(d, &["--account", "jordi", "--dry-run"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("account jordi has an unfinished change"),
+        "{err}"
+    );
+    assert!(err.contains("without --dry-run"), "{err}");
+    assert_eq!(tree(d), before);
+    assert!(d.join("accounts/jordi/pending.json").is_file());
+}
+
 #[test]
 fn cloud_scan_holds_on_an_empty_folder_until_accepted() {
     let dir = tempfile::tempdir().unwrap();
@@ -1197,8 +1276,12 @@ fn cloud_scan_holds_on_an_empty_folder_until_accepted() {
     let text = stdout(&out);
     assert!(text.contains("would delete 2 files"), "{text}");
     assert!(text.contains("only 0 would be left"), "{text}");
+    // The command names the data folder, which it needs, so it can be copied as it is.
     assert!(
-        text.contains("run: notedown cloud scan --account jordi --accept"),
+        text.contains(&format!(
+            "run: notedown cloud scan --data {} --account jordi --accept",
+            d.display()
+        )),
         "{text}"
     );
     assert!(!text.contains('\u{2014}'));

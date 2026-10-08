@@ -991,9 +991,14 @@ impl Live {
 
     /// `notedown cloud put` of a small note into `NOTE/Note`.
     fn put(&self) {
+        self.put_named("pushed.note");
+    }
+
+    /// `notedown cloud put` of a small note `name` into `NOTE/Note`.
+    fn put_named(&self, name: &str) {
         let src = tempfile::tempdir().unwrap();
-        let file = src.path().join("pushed.note");
-        std::fs::write(&file, b"pushed").unwrap();
+        let file = src.path().join(name);
+        std::fs::write(&file, name.as_bytes()).unwrap();
         notedown_cloud::put::put(
             self.dir.path(),
             "jordi",
@@ -1111,4 +1116,30 @@ async fn the_server_sends_a_detail_push_after_the_ratta_ping_reply() {
         .await
         .unwrap();
     assert_eq!(live.recv().await, r#"42["ratta_ping","Received"]"#);
+}
+
+/// The running follower keeps its journal reader between steps: a second change after the
+/// first push is pushed on its own, without the first one again.
+#[tokio::test]
+async fn a_second_change_gets_its_own_detail_push() {
+    let mut live = Live::start(Config {
+        push: PushMode::Detail,
+        ..Config::default()
+    })
+    .await;
+    live.put();
+    let frames = live.ping_until_push().await;
+    let (items, _) = message(&frames[1]);
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["newName"], "pushed.note");
+    assert!(
+        live.exchange(r#"420["ClientMessage","Received"]"#, 0)
+            .await
+            .is_empty()
+    );
+    live.put_named("second.note");
+    let frames = live.ping_until_push().await;
+    let (items, _) = message(&frames[1]);
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["newName"], "second.note");
 }

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::{PassOptions, PassReport, render_account};
-use crate::journal::{EventBody, FileKind};
+use crate::journal::{EventBody, FileKind, JournalTail};
 use crate::server::AppState;
 
 /// The name of the journal cursor of this consumer.
@@ -189,14 +189,15 @@ struct Batch {
     unreadable: bool,
 }
 
-fn read_batch(state: &AppState, from: u64) -> crate::Result<Batch> {
+/// The events of `tail` (which starts at `from`) since its last batch.
+fn read_batch(tail: &mut JournalTail, from: u64) -> crate::Result<Batch> {
     let mut batch = Batch {
         last: from.saturating_sub(1),
         accounts: BTreeSet::new(),
         woke: false,
         unreadable: false,
     };
-    for item in state.journal.read_from(from)? {
+    for item in tail.next_batch()? {
         match item {
             Ok(event) => {
                 if event.seq < from {
@@ -268,11 +269,25 @@ pub async fn run_counted(
     }
 
     let mut warned = false;
+    // The journal reader at `seq + 1`, kept between polls so each poll parses only new lines;
+    // only a cache: when it is lost or failed, the next poll makes a new one from `seq`.
+    let mut tail: Option<JournalTail> = None;
     loop {
         tokio::time::sleep(timing.poll).await;
         let st = state.clone();
         let from = seq + 1;
-        match tokio::task::spawn_blocking(move || read_batch(&st, from)).await {
+        let kept = tail.take().filter(|t| t.next_seq() == from);
+        let read = tokio::task::spawn_blocking(move || {
+            let mut t = kept.unwrap_or_else(|| st.journal.tail(from));
+            let batch = read_batch(&mut t, from);
+            (batch.is_ok().then_some(t), batch)
+        })
+        .await;
+        let read = read.map(|(t, batch)| {
+            tail = t;
+            batch
+        });
+        match read {
             Ok(Ok(batch)) => {
                 if batch.unreadable && !warned {
                     warned = true;

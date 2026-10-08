@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use super::{PushPlanner, detail_items, startsync_item};
 use crate::diag::{LogEntry, LogKind};
+use crate::journal::JournalTail;
 use crate::server::AppState;
 use crate::{PushMode, SyncMode};
 
@@ -49,12 +50,23 @@ fn bound_targets(state: &AppState, slug: &str) -> Vec<String> {
 /// Returns the number of events read. A line that cannot be read is skipped and logged as one
 /// marker in the protocol log. Blocking.
 pub fn follow_once(state: &AppState, last_seq: &mut u64) -> crate::Result<usize> {
+    follow_tail(state, &mut state.journal.tail(*last_seq + 1), last_seq)
+}
+
+/// [`follow_once`] with a tail reader that the running follower keeps between steps, so each
+/// step parses only the lines appended since the last one. `tail` must start at
+/// `*last_seq + 1`.
+fn follow_tail(
+    state: &AppState,
+    tail: &mut JournalTail,
+    last_seq: &mut u64,
+) -> crate::Result<usize> {
     let now = state.now_ms();
     // The bound devices per account, read once per step.
     let mut targets: HashMap<String, Vec<String>> = HashMap::new();
     let mut read = 0;
     let mut bad: Vec<String> = Vec::new();
-    for item in state.journal.read_from(*last_seq + 1)? {
+    for item in tail.next_batch()? {
         let event = match item {
             Ok(event) => event,
             Err(e) => {
@@ -227,6 +239,9 @@ pub struct Follower {
     /// the whole history.
     cursor: Option<u64>,
     seen: Option<(usize, u64)>,
+    /// The journal reader at `cursor + 1`; only a cache: when it is lost or failed, the next
+    /// step makes a new one from the cursor.
+    tail: Option<JournalTail>,
 }
 
 impl Follower {
@@ -238,6 +253,7 @@ impl Follower {
             state,
             cursor: None,
             seen: None,
+            tail: None,
         };
         f.step().await;
         f
@@ -246,25 +262,29 @@ impl Follower {
     /// One follow step: take the start position, or read the new events when the journal
     /// changed. The stamp is read first: an append during the read changes it again.
     async fn step(&mut self) {
-        let (at, seen) = (self.cursor, self.seen);
+        let (at, seen, tail) = (self.cursor, self.seen, self.tail.take());
         let step = blocking(&self.state, move |st| -> crate::Result<_> {
             let stamp = journal_stamp(st)?;
-            let next = match at {
-                None => start_seq(st)?,
-                Some(seq) if Some(stamp) == seen => seq,
+            let (next, tail) = match at {
+                None => (start_seq(st)?, None),
+                Some(seq) if Some(stamp) == seen => (seq, tail),
                 Some(mut seq) => {
-                    follow_once(st, &mut seq)?;
-                    seq
+                    let mut tail = tail
+                        .filter(|t| t.next_seq() == seq + 1)
+                        .unwrap_or_else(|| st.journal.tail(seq + 1));
+                    follow_tail(st, &mut tail, &mut seq)?;
+                    (seq, Some(tail))
                 }
             };
-            Ok((stamp, next))
+            Ok((stamp, next, tail))
         })
         .await;
         match step {
             // Kept only after a good step, so a failed read is tried again.
-            Some(Ok((stamp, next))) => {
+            Some(Ok((stamp, next, tail))) => {
                 self.seen = Some(stamp);
                 self.cursor = Some(next);
+                self.tail = tail;
             }
             Some(Err(e)) => eprintln!("notedown cloud: push: journal: {e}"),
             None => {}

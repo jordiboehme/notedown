@@ -192,6 +192,145 @@ fn a_torn_last_line_is_ignored_and_cut_before_the_next_append() {
     assert_eq!(seqs(&j), vec![1, 2, 3]);
 }
 
+// ---------------------------------------------------------------- tail reader
+
+/// The seqs of the next batch of `tail`; every line must be readable.
+fn batch(tail: &mut notedown_cloud::journal::JournalTail) -> Vec<u64> {
+    tail.next_batch()
+        .unwrap()
+        .into_iter()
+        .map(|e| e.unwrap().seq)
+        .collect()
+}
+
+/// The length of one event line, from a scratch journal.
+fn line_len() -> u64 {
+    let scratch = tempfile::tempdir().unwrap();
+    let sj = journal_with(scratch.path(), 1 << 20, clock(T0));
+    sj.append(&mut [ev(1)]).unwrap();
+    std::fs::metadata(&sj.files().unwrap()[0].1).unwrap().len()
+}
+
+#[test]
+fn a_tail_returns_each_append_once_and_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let j = Journal::open(dir.path()).unwrap();
+    let mut tail = j.tail(1);
+    assert!(batch(&mut tail).is_empty());
+    j.append(&mut [ev(1), ev(2)]).unwrap();
+    assert_eq!(batch(&mut tail), vec![1, 2]);
+    assert!(batch(&mut tail).is_empty());
+    j.append(&mut [ev(3)]).unwrap();
+    j.append(&mut [ev(4)]).unwrap();
+    assert_eq!(batch(&mut tail), vec![3, 4]);
+    assert_eq!(tail.next_seq(), 5);
+    // A tail from the middle skips the older events.
+    assert_eq!(batch(&mut j.tail(3)), vec![3, 4]);
+    assert!(batch(&mut j.tail(5)).is_empty());
+}
+
+#[test]
+fn a_tail_reads_a_torn_line_only_once_it_is_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let j = Journal::open(dir.path()).unwrap();
+    j.append(&mut [ev(1)]).unwrap();
+    let mut tail = j.tail(1);
+    assert_eq!(batch(&mut tail), vec![1]);
+    let file = j.files().unwrap()[0].1.clone();
+    let one = std::fs::read(&file).unwrap();
+    j.append(&mut [ev(2)]).unwrap();
+    let full = std::fs::read(&file).unwrap();
+    let half = one.len() + (full.len() - one.len()) / 2;
+    std::fs::write(&file, &full[..half]).unwrap();
+    assert!(batch(&mut tail).is_empty());
+    std::fs::write(&file, &full[..full.len() - 1]).unwrap();
+    assert!(batch(&mut tail).is_empty());
+    std::fs::write(&file, &full).unwrap();
+    assert_eq!(batch(&mut tail), vec![2]);
+    assert!(batch(&mut tail).is_empty());
+}
+
+/// Lines added to a file after the tail read it, and a rotation right after: the batch has
+/// both, in order.
+#[test]
+fn a_tail_follows_a_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let j = journal_with(dir.path(), line_len() * 2, clock(T0));
+    j.append(&mut [ev(1)]).unwrap();
+    let mut tail = j.tail(1);
+    assert_eq!(batch(&mut tail), vec![1]);
+    j.append(&mut [ev(2)]).unwrap(); // still file 1 (the cap is checked before)
+    j.append(&mut [ev(3)]).unwrap(); // file 3
+    assert_eq!(j.files().unwrap().len(), 2);
+    assert_eq!(batch(&mut tail), vec![2, 3]);
+    for n in 4..=9 {
+        j.append(&mut [ev(n)]).unwrap();
+    }
+    assert!(j.files().unwrap().len() > 3);
+    assert_eq!(batch(&mut tail), (4..=9).collect::<Vec<_>>());
+    assert!(batch(&mut tail).is_empty());
+}
+
+/// The file the tail reads is removed: it starts over as `read_from` does from the next seq,
+/// so nothing comes twice; the events of the removed file are gone, as for `read_from`.
+#[test]
+fn a_tail_whose_file_vanished_starts_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let j = journal_with(dir.path(), line_len() * 2, clock(T0));
+    j.append(&mut [ev(1)]).unwrap();
+    let mut tail = j.tail(1);
+    assert_eq!(batch(&mut tail), vec![1]);
+    j.append(&mut [ev(2)]).unwrap();
+    j.append(&mut [ev(3)]).unwrap();
+    let files = j.files().unwrap();
+    assert_eq!(files.len(), 2);
+    std::fs::remove_file(&files[0].1).unwrap();
+    assert_eq!(batch(&mut tail), vec![3]);
+    j.append(&mut [ev(4)]).unwrap();
+    assert_eq!(batch(&mut tail), vec![4]);
+}
+
+/// The file the tail reads gets shorter: the tail starts over and returns only seqs it did
+/// not return yet. Lines written again under a seq it returned already are not returned.
+#[test]
+fn a_tail_whose_file_was_cut_starts_over_without_repeats() {
+    let dir = tempfile::tempdir().unwrap();
+    let j = Journal::open(dir.path()).unwrap();
+    j.append(&mut [ev(1), ev(2)]).unwrap();
+    let mut tail = j.tail(1);
+    assert_eq!(batch(&mut tail), vec![1, 2]);
+    let file = j.files().unwrap()[0].1.clone();
+    let text = std::fs::read(&file).unwrap();
+    std::fs::write(&file, b"").unwrap();
+    assert!(batch(&mut tail).is_empty());
+    std::fs::write(&file, &text).unwrap();
+    j.append(&mut [ev(3)]).unwrap();
+    assert_eq!(batch(&mut tail), vec![3]);
+    // Cut back to the first line: the next append reuses seq 2 and 3, which the tail
+    // returned already; seq 4 is new.
+    let first = text.iter().position(|b| *b == b'\n').unwrap() + 1;
+    std::fs::write(&file, &text[..first]).unwrap();
+    assert_eq!(j.append(&mut [ev(5), ev(6), ev(7)]).unwrap(), vec![2, 3, 4]);
+    assert_eq!(batch(&mut tail), vec![4]);
+}
+
+#[test]
+fn a_tail_returns_a_bad_line_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let j = Journal::open(dir.path()).unwrap();
+    j.append(&mut [ev(1)]).unwrap();
+    let file = j.files().unwrap()[0].1.clone();
+    let mut text = std::fs::read(&file).unwrap();
+    text.extend_from_slice(b"not json\n");
+    std::fs::write(&file, &text).unwrap();
+    let mut tail = j.tail(1);
+    let items = tail.next_batch().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].as_ref().unwrap().seq, 1);
+    assert!(items[1].is_err());
+    assert!(tail.next_batch().unwrap().is_empty());
+}
+
 #[test]
 fn an_empty_newest_file_keeps_its_first_seq() {
     let dir = tempfile::tempdir().unwrap();

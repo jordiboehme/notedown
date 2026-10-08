@@ -165,6 +165,31 @@ fn tail_lines(path: &Path, max: usize) -> Result<(Vec<String>, u64)> {
     Ok((lines, complete.unwrap_or(0)))
 }
 
+/// The journal files in `dir`, sorted by their first `seq`.
+fn list_files(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    let mut out = Vec::new();
+    let entries = std::fs::read_dir(dir).map_err(io_err(dir))?;
+    for entry in entries {
+        let entry = entry.map_err(io_err(dir))?;
+        if let Some(first) = entry.file_name().to_str().and_then(parse_file_name)
+            && entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+        {
+            out.push((first, entry.path()));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// The index of the file where a read from `from` starts: the newest whose first `seq` is at
+/// or below `from`, else the first.
+fn start_index(files: &[(u64, PathBuf)], from: u64) -> usize {
+    files
+        .iter()
+        .rposition(|(first, _)| *first <= from)
+        .unwrap_or(0)
+}
+
 fn first_line(path: &Path) -> Result<Option<String>> {
     let f = std::fs::File::open(path).map_err(io_err(path))?;
     let mut line = Vec::new();
@@ -235,18 +260,7 @@ impl Journal {
 
     /// The journal files, sorted by their first `seq`.
     pub fn files(&self) -> Result<Vec<(u64, PathBuf)>> {
-        let mut out = Vec::new();
-        let entries = std::fs::read_dir(&self.dir).map_err(io_err(&self.dir))?;
-        for entry in entries {
-            let entry = entry.map_err(io_err(&self.dir))?;
-            if let Some(first) = entry.file_name().to_str().and_then(parse_file_name)
-                && entry.file_type().map(|t| t.is_file()).unwrap_or(false)
-            {
-                out.push((first, entry.path()));
-            }
-        }
-        out.sort();
-        Ok(out)
+        list_files(&self.dir)
     }
 
     /// Take the journal lock (exclusive, blocking). Hold it to look at the tail and append in
@@ -281,15 +295,22 @@ impl Journal {
     /// returned. A line that cannot be read is an `Err` item.
     pub fn read_from(&self, from: u64) -> Result<ReadFrom> {
         let files = self.files()?;
-        let start = files
-            .iter()
-            .rposition(|(first, _)| *first <= from)
-            .unwrap_or(0);
+        let start = start_index(&files, from);
         Ok(ReadFrom {
             files: files.into_iter().skip(start).map(|(_, p)| p).collect(),
             current: None,
             from,
         })
+    }
+
+    /// A reader that returns the events with `seq >= from` and then, on each further call,
+    /// only the events appended since, without parsing the journal again ([`JournalTail`]).
+    pub fn tail(&self, from: u64) -> JournalTail {
+        JournalTail {
+            dir: self.dir.clone(),
+            next: from,
+            at: None,
+        }
     }
 
     /// The cursor of consumer `name`, if it has one.
@@ -470,6 +491,141 @@ impl Iterator for ReadFrom {
             };
             if event.seq >= self.from {
                 return Some(Ok(event));
+            }
+        }
+    }
+}
+
+/// The reader of [`Journal::tail`]: it keeps the file it reads and the byte offset after the
+/// last complete line it returned, so each [`JournalTail::next_batch`] parses only new lines.
+///
+/// The rules:
+/// - A batch holds every complete line appended since the last batch, across rotated files, in
+///   order. A torn or unfinished last line stays unread until it is complete.
+/// - Only events with `seq` at or above the next one wanted are returned: each `seq` at most
+///   once, also when lines are read twice after a fallback.
+/// - A line that cannot be parsed is an `Err` item, returned once.
+/// - When the file vanished or became shorter than the offset, the tail starts over as
+///   [`Journal::read_from`] does from the next `seq` wanted. Lines rewritten under a `seq`
+///   that was returned already are not returned again.
+#[derive(Debug)]
+pub struct JournalTail {
+    dir: PathBuf,
+    /// The lowest `seq` still to return.
+    next: u64,
+    /// The file being read: its first `seq`, its path and the offset after the last complete
+    /// line read.
+    at: Option<(u64, PathBuf, u64)>,
+}
+
+impl JournalTail {
+    /// The lowest `seq` the next batch can return.
+    pub fn next_seq(&self) -> u64 {
+        self.next
+    }
+
+    /// The events appended since the last batch (see [`JournalTail`]). A file system error
+    /// ends the batch: the events read before it are returned, and the error only when there
+    /// are none; the next call reads on from the last complete line.
+    pub fn next_batch(&mut self) -> Result<Vec<Result<Event>>> {
+        let mut out = Vec::new();
+        match self.read_all(&mut out) {
+            Ok(()) => Ok(out),
+            Err(_) if !out.is_empty() => Ok(out),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn read_all(&mut self, out: &mut Vec<Result<Event>>) -> Result<()> {
+        // Starting over after a vanished or shorter file; bounded, so a file that keeps
+        // vanishing can't hold the caller.
+        let mut restarts = 0;
+        loop {
+            let files = list_files(&self.dir)?;
+            let (first, path, offset) = match self.at.take() {
+                Some(at) => at,
+                None => match files.get(start_index(&files, self.next)) {
+                    Some((first, path)) => (*first, path.clone(), 0),
+                    None => return Ok(()),
+                },
+            };
+            // Listed before the read: once a newer file exists, the writer never appends to
+            // this one again, so the read below sees all of it.
+            let newer = files.iter().find(|(f, _)| *f > first).cloned();
+            let len = match std::fs::metadata(&path) {
+                Ok(m) => Some(m.len()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    self.at = Some((first, path.clone(), offset));
+                    return Err(io_err(&path)(e));
+                }
+            };
+            if len.is_none_or(|len| len < offset) {
+                // Removed, or cut: start over as `read_from` does from the next `seq`.
+                restarts += 1;
+                if restarts > 8 {
+                    return Ok(());
+                }
+                continue;
+            }
+            let end = match self.read_file(&path, offset, out) {
+                Ok(end) => end,
+                Err((end, e)) => {
+                    self.at = Some((first, path, end));
+                    return Err(e);
+                }
+            };
+            match newer {
+                Some((first, path)) => self.at = Some((first, path, 0)),
+                None => {
+                    self.at = Some((first, path, end));
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Read the complete lines of `path` from `offset` into `out`; the offset after the last
+    /// complete line. On an error, that offset and the error.
+    fn read_file(
+        &mut self,
+        path: &Path,
+        offset: u64,
+        out: &mut Vec<Result<Event>>,
+    ) -> std::result::Result<u64, (u64, Error)> {
+        let mut f = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) => return Err((offset, io_err(path)(e))),
+        };
+        if let Err(e) = f.seek(SeekFrom::Start(offset)) {
+            return Err((offset, io_err(path)(e)));
+        }
+        let mut reader = BufReader::new(f);
+        let mut end = offset;
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Err(e) => return Err((end, io_err(path)(e))),
+                Ok(0) => return Ok(end),
+                Ok(_) => {}
+            }
+            if line.last() != Some(&b'\n') {
+                // A torn or unfinished last line: read again once it is complete.
+                return Ok(end);
+            }
+            end += line.len() as u64;
+            line.pop();
+            match serde_json::from_slice::<Event>(&line) {
+                Ok(event) if event.seq >= self.next => {
+                    self.next = event.seq + 1;
+                    out.push(Ok(event));
+                }
+                Ok(_) => {}
+                Err(e) => out.push(Err(corrupt(
+                    path,
+                    format!("journal line cannot be read: {e}"),
+                ))),
             }
         }
     }

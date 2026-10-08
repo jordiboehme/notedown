@@ -2264,6 +2264,71 @@ mod served {
         server.await.unwrap().unwrap();
     }
 
+    /// A hand change while a device holds the sync lock: the watch keeps the scope and scans it
+    /// after the device ends its sync, without another change on disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_watch_waits_for_the_sync_lock() {
+        use std::time::{Duration, Instant};
+        let s = Server::with(Config {
+            protect: false,
+            scan_interval: 0,
+            watch: true,
+            ..Config::default()
+        });
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(notedown_cloud::server::serve_until(
+            vec![l],
+            s.state.clone(),
+            async {
+                let _ = rx.await;
+            },
+        ));
+        let created = |rel: &str| {
+            s.events().iter().any(|e| {
+                e.origin == Origin::Scan
+                    && matches!(&e.body, EventBody::FileCreated { path, .. } if path == rel)
+            })
+        };
+        // A first hand change, written again every 5 s, shows that the watch is running.
+        let warm = format!("{DOC}/warm.txt");
+        let end = Instant::now() + Duration::from_secs(20);
+        let mut again = Instant::now();
+        while !created(&warm) {
+            assert!(Instant::now() < end, "the watch did not start in 20 s");
+            if Instant::now() >= again {
+                s.write(&warm, b"warm");
+                again = Instant::now() + Duration::from_secs(5);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // The start scans, so the file is written after it.
+        assert_ok(&s.start().await);
+        assert_eq!(s.holder().as_deref(), Some(SERIAL));
+        let held = format!("{DOC}/held.txt");
+        s.write(&held, b"held");
+        // Longer than the quiet time of the watch (2 s): its round finds the account busy.
+        let until = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < until {
+            assert!(!created(&held), "scanned while the device held the lock");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert_ok(&s.end().await);
+        assert_eq!(s.holder(), None);
+        let end = Instant::now() + Duration::from_secs(20);
+        while !created(&held) {
+            assert!(
+                Instant::now() < end,
+                "no scan event in 20 s after the lock was released"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tx.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
     /// A data folder without `accounts/` at start: the watch starts once it appears.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_watch_starts_when_the_accounts_folder_appears() {

@@ -13,6 +13,7 @@ mod import;
 mod journal;
 mod mutate;
 mod pages;
+mod perf;
 mod push;
 mod recycle;
 mod scan;

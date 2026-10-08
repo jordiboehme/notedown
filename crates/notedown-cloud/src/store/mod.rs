@@ -838,6 +838,12 @@ impl Store {
     /// neither assigns ids nor touches the registry or the cache (`usedCapacity`). A tree that
     /// broke meanwhile is `Error::StoreDamaged`, as for [`Store::list`].
     pub fn disk_bytes(&self, guard: &StoreGuard) -> Result<u64> {
+        Ok(self.disk_usage(guard)?.1)
+    }
+
+    /// The number of files and their bytes, from the walk of [`Store::disk_bytes`] (no ids, no
+    /// registry, no cache).
+    pub fn disk_usage(&self, guard: &StoreGuard) -> Result<(u64, u64)> {
         self.check_guard(guard)?;
         let before = self.check_tree(false)?;
         let mut all = Vec::new();
@@ -853,11 +859,11 @@ impl Store {
         }
         let after = self.check_tree(false)?;
         self.check_same_tree(&before, &after)?;
-        Ok(all
-            .iter()
-            .filter(|f| f.kind == Kind::File)
-            .map(|f| f.meta.len())
-            .sum())
+        let files = all.iter().filter(|f| f.kind == Kind::File);
+        Ok((
+            files.clone().count() as u64,
+            files.map(|f| f.meta.len()).sum(),
+        ))
     }
 
     /// Build entries: assign missing ids in one log append, hash files through the cache, write

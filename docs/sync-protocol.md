@@ -1141,7 +1141,7 @@ Notes:
 - A file is listed only after it is completely written and renamed into place [proposal].
 - The server hashes files lazily and caches by size and mtime; a changed file found by the scan gets a `file.modified` journal entry (a cached MD5 is reused only when size, mtime and ctime all match) and appears with its new hash at the next device listing [proposal].
 - One account, one writer: the sync lock serializes device syncs; web actions take the same lock briefly [proposal; Ratta itself never sends `E0079` and checks the lock only in `synchronous/start`, 3.0].
-- Out-of-band deletes are dangerous (the device deletes its copy); the scan journals them as `file.deleted` with `origin:"scan"`, an empty `recycle` and no copy in `recycle/`, because it never has the bytes. A scan that would leave fewer than `scan_min_files` files in the account is held instead of applied (3.0.1): nothing is journaled, device sync answers `E0079` (`scan_hold`) until the files are back or `notedown cloud scan --accept` runs. The operator documentation says that a delete by hand is a real delete [proposal].
+- Out-of-band deletes are dangerous (the device deletes its copy); the scan journals them as `file.deleted` with `origin:"scan"`, an empty `recycle` and no copy in `recycle/`, because it never has the bytes. A scan that would leave fewer than `scan_min_files` files in the account is held instead of applied (3.0.1): nothing is journaled, device sync answers `E0079` (`scan_hold`) until the files are back or `notedown cloud scan --data <dir> --account <slug> --accept` runs. The operator documentation says that a delete by hand is a real delete [proposal].
 
 #### 8.3.5 Change journal for ingestion
 

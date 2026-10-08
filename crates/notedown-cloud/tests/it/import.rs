@@ -369,6 +369,48 @@ fn a_second_import_is_refused_without_replace() {
     assert!(folders.contains("EXPORT"));
 }
 
+/// An import without --replace on a held account refuses and leaves the hold and the journal
+/// as they are: it must not journal the held deletes and open the way for them.
+#[test]
+fn an_import_without_replace_refuses_on_a_held_account() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (backup, _, _) = backup_tree(tmp.path());
+    let data = data_with_account();
+    run_import(data.path(), &backup, false).unwrap();
+    let (listed, _) = store_view(data.path());
+    let files_dir = data.path().join("accounts/jordi/files");
+    for path in listed.keys().skip(1) {
+        std::fs::remove_file(files_dir.join(path)).unwrap();
+    }
+    std::fs::write(data.path().join("server.toml"), "scan_min_files = 2\n").unwrap();
+    let journal = Journal::open(data.path()).unwrap();
+    let store = Store::open(data.path(), "jordi").unwrap();
+    {
+        let g = store.lock_recovered(&journal).unwrap();
+        let report = store
+            .scan(
+                &g,
+                &journal,
+                &notedown_cloud::store::ScanOptions::all(2),
+                journal.now_ms(),
+            )
+            .unwrap();
+        assert!(report.held.is_some());
+    }
+    let marker = data.path().join("accounts/jordi/scan-hold.json");
+    let hold = std::fs::read(&marker).unwrap();
+    let before = events(data.path()).len();
+    let err = run_import(data.path(), &backup, false).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("--replace"), "{text}");
+    assert!(text.contains("--data"), "{text}");
+    assert_eq!(std::fs::read(&marker).unwrap(), hold);
+    assert_eq!(events(data.path()).len(), before);
+    // With --replace the import goes ahead and the hold ends.
+    run_import(data.path(), &backup, true).unwrap();
+    assert!(!marker.exists());
+}
+
 #[test]
 fn a_bad_name_in_the_backup_refuses_the_whole_import() {
     let tmp = tempfile::tempdir().unwrap();

@@ -881,7 +881,12 @@ fn local_time(ms: u64, offset: time::UtcOffset) -> String {
 fn recycle_prune_command(args: RecyclePruneArgs) -> Result<ExitCode> {
     use notedown_cloud::journal::{Journal, Origin};
     use notedown_cloud::store::{RecycleReason, Store};
-    let store = Store::open(&args.data, &args.account)?;
+    // A dry run leaves the registry log as it is.
+    let store = if args.dry_run {
+        Store::open_no_compact(&args.data, &args.account)?
+    } else {
+        Store::open(&args.data, &args.account)?
+    };
     // Never write server.toml here, and a dry run creates nothing at all.
     let config = notedown_cloud::Config::load_or_default(&args.data)?;
     let journal = if args.dry_run {

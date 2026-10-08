@@ -543,14 +543,30 @@ pub fn import(
     let store = Store::open_for_import(data, slug)?;
     let guard = store.lock_recovered(journal)?;
     // The changes made by hand are journaled first, so the listing below gives nothing an id
-    // without its event. It never holds: the import replaces the tree anyway, and it ends a
-    // hold that is there.
-    store.scan(
+    // without its event. When the import goes ahead for sure (--replace, or no file on disk)
+    // it replaces the tree, so this scan never holds and ends a hold that is there. Otherwise
+    // the import may still be refused below, so the scan holds as the server's would, and a
+    // hold refuses the import: the held deletes must not be journaled by an import that then
+    // doesn't happen.
+    let empty = store.disk_usage(&guard)?.0 == 0;
+    let min_files = if options.replace || empty {
+        0
+    } else {
+        crate::Config::load_or_default(data)?.scan_min_files
+    };
+    let report = store.scan(
         &guard,
         journal,
-        &crate::store::ScanOptions::all(0),
+        &crate::store::ScanOptions::all(min_files),
         journal.now_ms(),
     )?;
+    if report.held.is_some() {
+        return Err(failed(format!(
+            "account {slug} is on hold: files are gone from the data folder. Use --replace to \
+             replace the tree with the backup, or if the delete is on purpose, run: {}",
+            crate::server::accept_command(data, slug)
+        )));
+    }
     let present = listed_files(&store, &guard)?;
     if present > 0 && !options.replace {
         return Err(failed(format!(

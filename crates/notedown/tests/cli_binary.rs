@@ -1453,3 +1453,31 @@ fn cloud_scan_hold_counts_files_not_folders_and_a_dry_run_only_would_hold() {
     );
     assert!(text.contains("Device sync is on hold."), "{text}");
 }
+
+#[test]
+fn render_pdf_writes_one_pdf_and_no_pngs() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = std::path::PathBuf::from(NOTE).with_file_name("test1.note");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["render", "--pdf", "--keep-template", "--out"])
+        .arg(dir.path())
+        .arg(&note)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pdf = dir.path().join("test1.pdf");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        pdf.display().to_string()
+    );
+    assert!(std::fs::read(&pdf).unwrap().starts_with(b"%PDF-"));
+    let names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names.len(), 1, "{names:?}");
+}

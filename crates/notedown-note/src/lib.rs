@@ -25,6 +25,7 @@ mod meta;
 mod model;
 mod notebook;
 mod page;
+mod pdf;
 mod recognition;
 mod render;
 mod resolve;
@@ -46,6 +47,7 @@ pub use model::{
     TitleStyle, VersionPolicy,
 };
 pub use notebook::Notebook;
+pub use pdf::RENDERER_ID;
 pub use recognition::{
     ArchiveEntry, InkBink, InkStroke, RecognArchive, RecognElement, RecognText, RecognWord,
     Recognition, WordBox, decode_ink_bink, decode_recogn_file, decode_recogn_text,

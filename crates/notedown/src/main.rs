@@ -27,7 +27,7 @@ struct Cli {
 enum Command {
     /// Convert .note and .png files (or folders of them) to Markdown
     Convert(ConvertArgs),
-    /// Render the pages of a .note file as PNG images
+    /// Render the pages of a .note file as PNG images, or as one PDF with --pdf
     Render(RenderArgs),
     /// Manage the OCR model files
     Model {
@@ -317,6 +317,9 @@ struct RenderArgs {
     /// Keep the template (ruled lines, grid) in the images
     #[arg(long)]
     keep_template: bool,
+    /// Write one PDF with all pages instead of one PNG per page
+    #[arg(long)]
+    pdf: bool,
 }
 
 #[derive(Subcommand)]
@@ -512,6 +515,13 @@ fn render(args: RenderArgs) -> Result<ExitCode> {
         include_background: args.keep_template,
         ..RenderOptions::default()
     };
+    if args.pdf {
+        let path = dir.join(format!("{stem}.pdf"));
+        let bytes = nb.render_pdf(&opts).context("cannot render the PDF")?;
+        std::fs::write(&path, bytes).with_context(|| format!("cannot write {}", path.display()))?;
+        println!("{}", path.display());
+        return Ok(ExitCode::SUCCESS);
+    }
     for i in 0..nb.pages.len() {
         let img = nb
             .render_page(i, &opts)

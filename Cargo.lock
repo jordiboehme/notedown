@@ -1503,6 +1503,8 @@ dependencies = [
  "base64 0.23.1",
  "const-hex",
  "image",
+ "miniz_oxide 0.9.1",
+ "pdf-writer",
  "serde",
  "serde_json",
  "sha2",
@@ -1586,6 +1588,18 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "windows-link",
+]
+
+[[package]]
+name = "pdf-writer"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5e456864a7a304047bff84977dc6fb162bd956475d40ba50b2dcecaada7f753"
+dependencies = [
+ "bitflags",
+ "itoa",
+ "memchr",
+ "ryu",
 ]
 
 [[package]]

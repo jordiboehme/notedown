@@ -16,6 +16,7 @@ use crate::push::{PushPlanner, PushTiming};
 use crate::store::{ScanHold, ScanOptions, ScanReport, Store, Walk, WriteGuard};
 use crate::sync::staging::{self, StagingLocks};
 use crate::sync::{SyncLocks, UrlSigner};
+use crate::watch::Scope;
 use crate::{Config, Error, Result};
 
 pub use crate::api::router;
@@ -53,6 +54,17 @@ pub struct AppState {
     part_max: AtomicU64,
     /// The largest single upload or merged file ([`staging::FILE_MAX`]).
     file_max: AtomicU64,
+}
+
+/// What [`AppState::scan_account`] came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanOutcome {
+    /// The scan ran (its errors were logged).
+    Done,
+    /// A device holds the sync lock of the account: try again later.
+    Busy,
+    /// Nothing to scan: no account, no `files/` folder, or the protect gate is closed.
+    Skipped,
 }
 
 /// Marker flag: the file system of the data folder changes the Unicode normalization of file
@@ -345,9 +357,8 @@ impl AppState {
         }
     }
 
-    /// One timer pass: a whole-tree scan of every account ([`AppState::run_scan`]). An account
-    /// is skipped while a device holds its sync lock, while its protect gate is closed and when
-    /// it has no `files/` folder. Errors are logged and never stop the pass. Blocking.
+    /// One timer pass: a whole-tree scan of every account ([`AppState::scan_account`]). Errors
+    /// are logged and never stop the pass. Blocking.
     pub fn scan_all(&self) {
         let accounts = match self.auth.accounts().list() {
             Ok(a) => a,
@@ -357,38 +368,88 @@ impl AppState {
             }
         };
         for account in accounts {
-            let slug = &account.slug;
-            let files = self
-                .auth
-                .accounts()
-                .account_dir(slug)
-                .join(crate::store::FILES_DIR);
-            if !files.is_dir()
-                || (self.config.protect && account.imported.is_none())
-                || self.sync_locks.holder(slug, self.now_ms()).is_some()
-            {
-                continue;
+            self.scan_account_of(&account, &Scope::Whole);
+        }
+    }
+
+    /// Scan `scope` of account `slug` for changes made by hand ([`AppState::run_scan`], each
+    /// folder recursive, under one store lock). Skipped when the account or its `files/` folder
+    /// does not exist or its protect gate is closed; busy while a device holds its sync lock.
+    /// Errors are logged. Blocking.
+    pub fn scan_account(&self, slug: &str, scope: &Scope) -> ScanOutcome {
+        match self.auth.accounts().get(slug) {
+            Ok(Some(account)) => self.scan_account_of(&account, scope),
+            Ok(None) => ScanOutcome::Skipped,
+            Err(e) => {
+                eprintln!("notedown cloud: account {slug}: scan failed: {e}");
+                ScanOutcome::Skipped
             }
-            let scanned = self.store(slug).and_then(|store| {
-                let guard = store.lock_recovered(&self.journal)?;
-                // A device may have started its sync, or an import may have closed the protect
-                // gate, while this pass waited for the store lock.
-                if self.sync_locks.holder(slug, self.now_ms()).is_some() {
-                    return Ok(());
-                }
-                crate::api::files::protect_locked(self, slug)?;
-                self.run_scan(
-                    &store,
-                    &guard,
-                    &ScanOptions::all(self.config.scan_min_files),
-                )
-                .map(drop)
-            });
-            match scanned {
-                Ok(()) | Err(Error::ScanHold(_)) | Err(Error::GateClosed(_)) => {}
+        }
+    }
+
+    fn scan_account_of(&self, account: &crate::auth::Account, scope: &Scope) -> ScanOutcome {
+        let slug = &account.slug;
+        let files = self
+            .auth
+            .accounts()
+            .account_dir(slug)
+            .join(crate::store::FILES_DIR);
+        if !files.is_dir() || (self.config.protect && account.imported.is_none()) {
+            return ScanOutcome::Skipped;
+        }
+        if self.sync_locks.holder(slug, self.now_ms()).is_some() {
+            return ScanOutcome::Busy;
+        }
+        let min_files = self.config.scan_min_files;
+        let options: Vec<ScanOptions> = match scope {
+            Scope::Whole => vec![ScanOptions::all(min_files)],
+            Scope::Folders(folders) => folders
+                .iter()
+                .map(|folder| ScanOptions {
+                    scope: folder.clone(),
+                    recursive: true,
+                    dry_run: false,
+                    accept: false,
+                    min_files,
+                })
+                .collect(),
+        };
+        let store = match self.store(slug) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("notedown cloud: account {slug}: scan failed: {e}");
+                return ScanOutcome::Done;
+            }
+        };
+        let guard = match store.lock_recovered(&self.journal) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("notedown cloud: account {slug}: scan failed: {e}");
+                return ScanOutcome::Done;
+            }
+        };
+        // A device may have started its sync, or an import may have closed the protect gate,
+        // while this scan waited for the store lock.
+        if self.sync_locks.holder(slug, self.now_ms()).is_some() {
+            return ScanOutcome::Busy;
+        }
+        match crate::api::files::protect_locked(self, slug) {
+            Ok(()) => {}
+            Err(Error::GateClosed(_)) => return ScanOutcome::Skipped,
+            Err(e) => {
+                eprintln!("notedown cloud: account {slug}: scan failed: {e}");
+                return ScanOutcome::Done;
+            }
+        }
+        for opts in &options {
+            match self.run_scan(&store, &guard, opts) {
+                Ok(_) => {}
+                // Every further folder would hold too.
+                Err(Error::ScanHold(_)) => break,
                 Err(e) => eprintln!("notedown cloud: account {slug}: scan failed: {e}"),
             }
         }
+        ScanOutcome::Done
     }
 
     /// Milliseconds since the epoch, from the clock.
@@ -537,6 +598,14 @@ pub async fn serve_until(
             state.clone(),
             root,
             crate::render::follow::Timing::DEFAULT,
+        )))
+    });
+    // Folders changed by hand are scanned 2 s after the last change; the timer stays as a
+    // backstop. Stopped when this returns.
+    let _watcher = state.config.watch.then(|| {
+        AbortOnDrop(tokio::spawn(crate::watch::run(
+            state.clone(),
+            crate::watch::QUIET,
         )))
     });
     // The hourly staging and temp file sweep (the first one ran at start) and the recycle bin

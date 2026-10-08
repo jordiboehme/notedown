@@ -2213,6 +2213,51 @@ mod served {
         assert_eq!(s.kinds(), vec!["file.created"]);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_added_by_hand_is_journaled_by_the_watch() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        seed_imported(dir.path());
+        let config = Config {
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
+            scan_interval: 0,
+            watch: true,
+            ..Config::default()
+        };
+        let state = AppState::open(config, dir.path()).unwrap();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(notedown_cloud::server::serve_until(
+            vec![l],
+            state.clone(),
+            async {
+                let _ = rx.await;
+            },
+        ));
+        // Time for the watch to be registered.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let file = dir.path().join("accounts/jordi/files/NOTE/Note/hand.pdf");
+        std::fs::write(&file, b"%PDF-1.4 hand").unwrap();
+        let journal = notedown_cloud::journal::Journal::open_no_create(dir.path());
+        let found = |journal: &notedown_cloud::journal::Journal| {
+            journal.read_from(1).unwrap().any(|e| {
+                let e = e.unwrap();
+                e.origin == Origin::Scan
+                    && matches!(&e.body, EventBody::FileCreated { path, .. } if path == "NOTE/Note/hand.pdf")
+            })
+        };
+        let end = Instant::now() + Duration::from_secs(10);
+        while !found(&journal) {
+            assert!(
+                Instant::now() < end,
+                "no scan event for the hand change in 10 s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tx.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
     // ------------------------------------------------ every device route scans first
 
     fn origins(s: &Server) -> Vec<(&'static str, Origin)> {

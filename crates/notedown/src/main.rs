@@ -1516,6 +1516,7 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
             Some(root) => println!("render: {}", root.display()),
             None => println!("render: off"),
         }
+        println!("watch: {}", if config.watch { "on" } else { "off" });
         if config.recycle_prune {
             println!(
                 "recycle bin: keeps {} newest, {} daily, {} monthly, deleted files {} days",

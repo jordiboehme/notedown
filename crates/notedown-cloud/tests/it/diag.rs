@@ -518,6 +518,7 @@ fn config_defaults_created_and_round_trip() {
         recycle_keep_deleted_days: 30,
         scan_interval: 0,
         scan_min_files: 25,
+        watch: false,
         render_dir: Some("~/PDFs".into()),
     };
     custom.save(dir.path()).unwrap();

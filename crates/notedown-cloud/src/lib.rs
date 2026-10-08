@@ -25,6 +25,7 @@ pub mod server;
 pub mod socket;
 pub mod store;
 pub mod sync;
+pub mod watch;
 
 pub use config::{Config, PushMode, SyncMode};
 pub use diag::{Clock, LogEntry, LogKind, ProtocolLog, SystemClock};

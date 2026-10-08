@@ -95,6 +95,10 @@ pub struct Config {
     /// left in the account (an empty data folder, an unmounted volume): device sync waits until
     /// the files are back or `notedown cloud scan --accept` runs. 0 never holds.
     pub scan_min_files: u64,
+    /// Watch the data folder for files changed by hand and scan the changed folders after 2 s
+    /// without a new change. The timer scan (`scan_interval`) stays as a backstop. false turns
+    /// the watch off.
+    pub watch: bool,
     /// A folder where the server keeps a PDF of every note, one subfolder per account. A
     /// leading `~/` is the home folder, a relative path is relative to the data folder. Not
     /// set: nothing is rendered. The folder must exist; the server creates only the account
@@ -122,6 +126,7 @@ impl Default for Config {
             recycle_keep_deleted_days: 90,
             scan_interval: 300,
             scan_min_files: 1,
+            watch: true,
             render_dir: None,
         }
     }
@@ -321,10 +326,19 @@ mod tests {
             "recycle_keep_deleted_days = 90",
             "scan_interval = 300",
             "scan_min_files = 1",
+            "watch = true",
         ] {
             assert!(text.contains(key), "{key} missing in:\n{text}");
         }
         assert!(!text.contains("render_dir"), "{text}");
+    }
+
+    #[test]
+    fn watch_false_loads() {
+        let d = dir();
+        assert!(Config::default().watch);
+        std::fs::write(Config::path(d.path()), "watch = false\n").unwrap();
+        assert!(!Config::load_or_create(d.path()).unwrap().watch);
     }
 
     fn render_root_of(value: Option<&str>) -> Option<PathBuf> {

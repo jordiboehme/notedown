@@ -30,6 +30,7 @@ zip.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
 dirs.workspace = true
+notify.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "io-util"] }

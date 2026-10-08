@@ -445,6 +445,7 @@ fn fingerprint_file(path: &Path, limit: u64) -> Result<NoteFingerprint, String> 
 }
 
 /// The note at a path before a write.
+#[derive(Clone)]
 struct Before {
     /// The record that describes it, or a stale record for that path.
     key: Option<String>,
@@ -517,6 +518,8 @@ struct Write<'a> {
     /// MD5 of the file at `target` before the write; `None` for a new file.
     current_md5: Option<String>,
     limit: u64,
+    /// The state before, when the caller knows it (the old file is no longer on disk).
+    known: Option<Before>,
 }
 
 fn compute(store: &Store, w: &Write<'_>, note: NoteFingerprint) -> PageDiff {
@@ -525,7 +528,10 @@ fn compute(store: &Store, w: &Write<'_>, note: NoteFingerprint) -> PageDiff {
     let mut d = match &w.current_md5 {
         None => diff(&[], &note.pages),
         Some(md5) => {
-            let b = before(store, w.target, md5, &key, w.limit);
+            let b = match &w.known {
+                Some(b) => b.clone(),
+                None => before(store, w.target, md5, &key, w.limit),
+            };
             let mut d = if b.note_id != note_id {
                 // another note at this path: all old pages go, all new pages come
                 let mut d = diff(&[], &note.pages);
@@ -588,6 +594,7 @@ pub fn index_note(store: &Store, guard: &StoreGuard, path: &WirePath, bytes: Vec
         size: bytes.len() as u64,
         current_md5,
         limit: MAX_NOTE_BYTES,
+        known: None,
     };
     index_bytes(store, &w, bytes)
 }
@@ -665,6 +672,7 @@ pub fn plan_page_events_with_limit(
         size,
         current_md5,
         limit,
+        known: None,
     };
     let diff = match fingerprint_file(&source, limit) {
         Ok(note) => compute(store, &w, note),
@@ -726,8 +734,15 @@ pub fn plan_page_move(store: &Store, _guard: &WriteGuard, commit: &mut Commit) {
             }
         }
     }
+    commit.side_writes.extend(move_records(store, &notes));
+}
+
+/// The record changes for notes that moved from the first path to the second (see
+/// [`plan_page_move`]): the record's `path` follows, and a record keyed by the old path is
+/// re-keyed by the new path. Empty when no note has a record.
+pub(crate) fn move_records(store: &Store, notes: &[(WirePath, WirePath)]) -> Vec<SideWrite> {
     if notes.is_empty() {
-        return;
+        return Vec::new();
     }
     // One pass over the records, instead of parsing every moved note for its FILE_ID.
     let by_path = records_by_path(store);
@@ -737,14 +752,59 @@ pub fn plan_page_move(store: &Store, _guard: &WriteGuard, commit: &mut Commit) {
             r.path = new.display();
             if key.starts_with("path:") {
                 writes.extend(record_write(store, &key, None));
-                r.file_id = path_key(&new);
+                r.file_id = path_key(new);
             }
             // `r.file_id` is `key` (checked by read_record) or the new path key
             let bytes = crate::fsutil::json_bytes(&r);
             writes.extend(record_write(store, &r.file_id, Some(bytes)));
         }
     }
-    commit.side_writes.extend(writes);
+    writes
+}
+
+/// The page index of a note the scan found new or changed on disk (store id `id`, `md5`,
+/// `size`): `pagesChanged` for its file event, the page events, and the record changes. The
+/// old note is no longer on disk, so the state before is the record for this path with
+/// `prev_md5` (the MD5 the store knew), under any key; without one, the new file is the
+/// baseline and the diff is empty. `None` for `prev_md5` is a new note: every page is added.
+/// Never fails: a note that does not parse gives `page.index_failed`.
+pub(crate) fn scan_note(
+    store: &Store,
+    path: &WirePath,
+    id: u64,
+    md5: &str,
+    size: u64,
+    prev_md5: Option<&str>,
+) -> (Option<u64>, Vec<EventBody>, Vec<SideWrite>) {
+    let w = Write {
+        target: path,
+        md5: md5.to_string(),
+        size,
+        current_md5: prev_md5.map(str::to_string),
+        limit: MAX_NOTE_BYTES,
+        known: prev_md5.and_then(|prev| {
+            let records = records_by_path(store).remove(&path.display())?;
+            let (key, r) = records.into_iter().find(|(_, r)| r.md5 == prev)?;
+            Some(Before {
+                key: Some(key),
+                note_id: r.note_id,
+                pages: r.pages,
+            })
+        }),
+    };
+    let diff = match fingerprint_file(&store.fs_path(path), MAX_NOTE_BYTES) {
+        Ok(note) => compute(store, &w, note),
+        Err(reason) => PageDiff::failed(path, reason),
+    };
+    let mut writes = Vec::new();
+    for key in &diff.drop_records {
+        writes.extend(record_write(store, key, None));
+    }
+    if let Some(record) = &diff.record {
+        let bytes = crate::fsutil::json_bytes(record);
+        writes.extend(record_write(store, &record.file_id, Some(bytes)));
+    }
+    (diff.pages_changed(), diff.events(id), writes)
 }
 
 /// Every valid record in `pages/` by its `path`, with its key.

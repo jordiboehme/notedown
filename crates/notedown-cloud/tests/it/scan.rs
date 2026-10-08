@@ -1,0 +1,861 @@
+//! The scan of changes made by hand in `files/` (`Store::scan`), on a store in a temp folder.
+//! Files are placed, changed and removed directly on disk, as a person would. The baseline is
+//! made with a listing, which gives ids and caches the MD5s without journal events.
+
+use std::path::{Path, PathBuf};
+
+use md5::{Digest, Md5};
+use notedown_cloud::Error;
+use notedown_cloud::auth::{Accounts, Imported};
+use notedown_cloud::journal::{Event, EventBody, FileKind, Journal, Origin};
+use notedown_cloud::pages::fingerprint_note;
+use notedown_cloud::store::{SCAN_HOLD_FILE, ScanOptions, ScanReport, Store, WirePath};
+
+const EMAIL: &str = "jordi@example.org";
+/// 2026-10-06 08:20 UTC.
+const NOW: u64 = 1_791_270_000_000;
+const DOC: &str = "DOCUMENT/Document";
+
+fn wp(s: &str) -> WirePath {
+    WirePath::parse_named(s).unwrap()
+}
+
+fn md5_hex(bytes: &[u8]) -> String {
+    const_hex::encode(Md5::digest(bytes))
+}
+
+fn fixture_note(name: &str) -> Vec<u8> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    std::fs::read(root.join(format!("tests/fixtures/notes/{name}.note"))).unwrap()
+}
+
+struct Fx {
+    dir: tempfile::TempDir,
+    store: Store,
+    journal: Journal,
+}
+
+impl Fx {
+    /// An imported account with its native folders (ids without events).
+    fn imported() -> Fx {
+        let fx = Fx::plain();
+        let accounts = Accounts::new(fx.dir.path());
+        let mut a = accounts.get("jordi").unwrap().unwrap();
+        a.imported = Some(Imported {
+            at: "2026-10-06T10:00:00Z".into(),
+            source: "/backup/Supernote".into(),
+            files: 0,
+            bytes: 0,
+        });
+        accounts.save(&a).unwrap();
+        fx
+    }
+
+    /// An account that was never imported, with its native folders (ids without events).
+    fn plain() -> Fx {
+        let dir = tempfile::tempdir().unwrap();
+        Accounts::new(dir.path())
+            .create("jordi", EMAIL, "secret")
+            .unwrap();
+        let store = Store::open(dir.path(), "jordi").unwrap();
+        {
+            let g = store.lock().unwrap();
+            store.ensure_native_folders(&g).unwrap();
+        }
+        let journal = Journal::open(dir.path()).unwrap();
+        Fx {
+            dir,
+            store,
+            journal,
+        }
+    }
+
+    fn fs(&self, rel: &str) -> PathBuf {
+        self.store.fs_path(&wp(rel))
+    }
+
+    /// Place a file by hand (parents too).
+    fn write(&self, rel: &str, bytes: &[u8]) {
+        let p = self.fs(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, bytes).unwrap();
+    }
+
+    fn rm(&self, rel: &str) {
+        std::fs::remove_file(self.fs(rel)).unwrap();
+    }
+
+    /// Give every file on disk an id and a cached MD5, without events (a listing).
+    fn seed(&self) {
+        let g = self.store.lock().unwrap();
+        self.store.list(&g, &WirePath::root(), true).unwrap();
+    }
+
+    fn id(&self, rel: &str) -> Option<u64> {
+        self.store.id_of(&wp(rel)).unwrap()
+    }
+
+    fn try_scan(&self, opts: &ScanOptions, now: u64) -> notedown_cloud::Result<ScanReport> {
+        let g = self.store.lock_recovered(&self.journal).unwrap();
+        self.store.scan(&g, &self.journal, opts, now)
+    }
+
+    fn scan_with(&self, opts: &ScanOptions) -> ScanReport {
+        self.try_scan(opts, NOW).unwrap()
+    }
+
+    fn scan(&self) -> ScanReport {
+        self.scan_with(&ScanOptions::all(1))
+    }
+
+    fn events(&self) -> Vec<Event> {
+        self.journal
+            .read_from(1)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect()
+    }
+
+    fn bodies(&self) -> Vec<EventBody> {
+        self.events().into_iter().map(|e| e.body).collect()
+    }
+
+    fn account_file(&self, name: &str) -> Option<Vec<u8>> {
+        std::fs::read(self.store.account_dir().join(name)).ok()
+    }
+
+    /// The registry and cache files, to check that nothing was written.
+    fn state_files(&self) -> Vec<Option<Vec<u8>>> {
+        ["ids.json", "ids.jsonl", "hashes.json"]
+            .iter()
+            .map(|n| self.account_file(n))
+            .collect()
+    }
+
+    fn hold_marker(&self) -> Option<serde_json::Value> {
+        self.account_file(SCAN_HOLD_FILE)
+            .map(|b| serde_json::from_slice(&b).unwrap())
+    }
+}
+
+fn kind_names(bodies: &[EventBody]) -> Vec<&'static str> {
+    bodies
+        .iter()
+        .map(|b| match b {
+            EventBody::FileCreated { .. } => "file.created",
+            EventBody::FileModified { .. } => "file.modified",
+            EventBody::FileMoved { .. } => "file.moved",
+            EventBody::FileDeleted { .. } => "file.deleted",
+            EventBody::FolderCreated { .. } => "folder.created",
+            EventBody::FolderDeleted { .. } => "folder.deleted",
+            EventBody::PageAdded { .. } => "page.added",
+            EventBody::PageRemoved { .. } => "page.removed",
+            _ => "other",
+        })
+        .collect()
+}
+
+fn paths(v: &[WirePath]) -> Vec<String> {
+    v.iter().map(WirePath::display).collect()
+}
+
+// ---------------------------------------------------------------- what the scan journals
+
+#[test]
+fn a_file_added_by_hand_is_journaled_as_created_by_the_scan() {
+    let fx = Fx::imported();
+    let path = format!("{DOC}/a.pdf");
+    fx.write(&path, b"hello");
+    let report = fx.scan();
+    let id = fx.id(&path).expect("an id was assigned");
+    let events = fx.events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    let e = &events[0];
+    assert_eq!(e.origin, Origin::Scan);
+    assert_eq!(e.device, None);
+    assert_eq!(
+        e.body,
+        EventBody::FileCreated {
+            id,
+            path: path.clone(),
+            kind: FileKind::Document,
+            md5: md5_hex(b"hello"),
+            size: 5,
+            pages_changed: None,
+        }
+    );
+    let line = serde_json::to_value(e).unwrap();
+    assert_eq!(line["origin"], "scan");
+    assert!(line.get("device").is_none());
+    assert_eq!(paths(&report.created), vec![path]);
+    assert_eq!(report.seqs, vec![e.seq]);
+    // A second scan finds nothing.
+    let again = fx.scan();
+    assert_eq!(again, ScanReport::default());
+    assert_eq!(fx.events().len(), 1);
+}
+
+#[test]
+fn a_new_folder_with_files_gives_folder_then_file_events() {
+    let fx = Fx::imported();
+    fx.write("Work/a.txt", b"a");
+    fx.write("Work/Sub/b.txt", b"bb");
+    fx.scan();
+    let bodies = fx.bodies();
+    assert_eq!(
+        kind_names(&bodies),
+        vec![
+            "folder.created",
+            "folder.created",
+            "file.created",
+            "file.created"
+        ]
+    );
+    let EventBody::FolderCreated { id, path } = &bodies[0] else {
+        unreachable!()
+    };
+    assert_eq!(path, "Work");
+    assert_eq!(Some(*id), fx.id("Work"));
+    let EventBody::FolderCreated { path, .. } = &bodies[1] else {
+        unreachable!()
+    };
+    assert_eq!(path, "Work/Sub");
+    for b in &bodies[2..] {
+        let EventBody::FileCreated { id, path, .. } = b else {
+            unreachable!()
+        };
+        assert_eq!(Some(*id), fx.id(path));
+    }
+    // All events of one scan share one opId.
+    let events = fx.events();
+    assert!(events.iter().all(|e| e.op_id == events[0].op_id));
+}
+
+#[test]
+fn a_file_changed_by_hand_is_journaled_as_modified() {
+    let fx = Fx::imported();
+    let path = format!("{DOC}/a.txt");
+    fx.write(&path, b"one");
+    fx.seed();
+    let id = fx.id(&path).unwrap();
+    fx.write(&path, b"three");
+    let report = fx.scan();
+    assert_eq!(
+        fx.bodies(),
+        vec![EventBody::FileModified {
+            id,
+            path: path.clone(),
+            kind: FileKind::Document,
+            md5: md5_hex(b"three"),
+            prev_md5: md5_hex(b"one"),
+            size: 5,
+            pages_changed: None,
+        }]
+    );
+    assert_eq!(fx.id(&path), Some(id));
+    assert_eq!(paths(&report.modified), vec![path]);
+    assert_eq!(fx.scan(), ScanReport::default());
+}
+
+#[test]
+fn a_file_without_a_cached_md5_is_hashed_silently() {
+    let fx = Fx::imported();
+    let path = format!("{DOC}/a.txt");
+    fx.write(&path, b"one");
+    fx.seed();
+    std::fs::remove_file(fx.store.account_dir().join("hashes.json")).unwrap();
+    // A fresh store reads the missing cache.
+    let store = Store::open(fx.dir.path(), "jordi").unwrap();
+    let g = store.lock_recovered(&fx.journal).unwrap();
+    let report = store
+        .scan(&g, &fx.journal, &ScanOptions::all(1), NOW)
+        .unwrap();
+    assert_eq!(report, ScanReport::default());
+    assert!(fx.events().is_empty());
+    assert!(fx.account_file("hashes.json").is_some());
+}
+
+#[test]
+fn a_file_deleted_by_hand_is_journaled_as_deleted_and_its_id_is_dropped() {
+    let fx = Fx::imported();
+    let path = format!("{DOC}/a.txt");
+    fx.write(&path, b"one");
+    fx.write(&format!("{DOC}/keep.txt"), b"keep");
+    fx.seed();
+    let id = fx.id(&path).unwrap();
+    fx.rm(&path);
+    let report = fx.scan();
+    assert_eq!(
+        fx.bodies(),
+        vec![EventBody::FileDeleted {
+            id,
+            path: path.clone(),
+            recycle: String::new(),
+        }]
+    );
+    assert_eq!(fx.id(&path), None);
+    assert_eq!(paths(&report.deleted), vec![path]);
+    assert_eq!(report.held, None);
+}
+
+#[test]
+fn a_folder_deleted_by_hand_gives_file_then_folder_deletes() {
+    let fx = Fx::imported();
+    fx.write("Work/a.txt", b"a");
+    fx.write("Work/Sub/b.txt", b"bb");
+    fx.write(&format!("{DOC}/keep.txt"), b"keep");
+    fx.seed();
+    let work = fx.id("Work").unwrap();
+    let sub = fx.id("Work/Sub").unwrap();
+    std::fs::remove_dir_all(fx.fs("Work")).unwrap();
+    fx.scan();
+    let bodies = fx.bodies();
+    assert_eq!(
+        kind_names(&bodies),
+        vec![
+            "file.deleted",
+            "file.deleted",
+            "folder.deleted",
+            "folder.deleted"
+        ]
+    );
+    assert_eq!(
+        bodies[2],
+        EventBody::FolderDeleted {
+            id: sub,
+            path: "Work/Sub".into()
+        }
+    );
+    assert_eq!(
+        bodies[3],
+        EventBody::FolderDeleted {
+            id: work,
+            path: "Work".into()
+        }
+    );
+    for p in ["Work", "Work/Sub", "Work/a.txt", "Work/Sub/b.txt"] {
+        assert_eq!(fx.id(p), None, "{p}");
+    }
+    assert!(fx.id(&format!("{DOC}/keep.txt")).is_some());
+}
+
+#[test]
+fn a_file_moved_by_hand_keeps_its_id() {
+    let fx = Fx::imported();
+    let from = format!("{DOC}/a.txt");
+    fx.write(&from, b"content");
+    fx.seed();
+    let id = fx.id(&from).unwrap();
+    std::fs::create_dir_all(fx.fs("Work")).unwrap();
+    std::fs::rename(fx.fs(&from), fx.fs("Work/b.txt")).unwrap();
+    let report = fx.scan();
+    let bodies = fx.bodies();
+    assert_eq!(kind_names(&bodies), vec!["folder.created", "file.moved"]);
+    assert_eq!(
+        bodies[1],
+        EventBody::FileMoved {
+            id,
+            path: "Work/b.txt".into(),
+            old_path: from.clone(),
+        }
+    );
+    assert_eq!(fx.id("Work/b.txt"), Some(id));
+    assert_eq!(fx.id(&from), None);
+    assert_eq!(report.moved, vec![(wp(&from), wp("Work/b.txt"))]);
+    assert_eq!(fx.scan(), ScanReport::default());
+}
+
+#[test]
+fn a_case_only_rename_by_hand_keeps_its_id() {
+    let fx = Fx::imported();
+    let from = format!("{DOC}/report.txt");
+    let to = format!("{DOC}/Report.txt");
+    fx.write(&from, b"content");
+    fx.seed();
+    let id = fx.id(&from).unwrap();
+    std::fs::rename(fx.fs(&from), fx.fs(&to)).unwrap();
+    fx.scan();
+    assert_eq!(
+        fx.bodies(),
+        vec![EventBody::FileMoved {
+            id,
+            path: to.clone(),
+            old_path: from.clone(),
+        }]
+    );
+    assert_eq!(fx.id(&to), Some(id));
+    assert_eq!(fx.id(&from), None);
+}
+
+#[test]
+fn two_identical_files_moved_at_once_are_not_paired() {
+    let fx = Fx::imported();
+    fx.write(&format!("{DOC}/x1.txt"), b"same");
+    fx.write(&format!("{DOC}/x2.txt"), b"same");
+    fx.write(&format!("{DOC}/keep.txt"), b"keep");
+    fx.seed();
+    let old = [
+        fx.id(&format!("{DOC}/x1.txt")).unwrap(),
+        fx.id(&format!("{DOC}/x2.txt")).unwrap(),
+    ];
+    for (a, b) in [("x1", "y1"), ("x2", "y2")] {
+        std::fs::rename(
+            fx.fs(&format!("{DOC}/{a}.txt")),
+            fx.fs(&format!("{DOC}/{b}.txt")),
+        )
+        .unwrap();
+    }
+    fx.scan();
+    assert_eq!(
+        kind_names(&fx.bodies()),
+        vec![
+            "file.created",
+            "file.created",
+            "file.deleted",
+            "file.deleted"
+        ]
+    );
+    for b in ["y1", "y2"] {
+        let id = fx.id(&format!("{DOC}/{b}.txt")).unwrap();
+        assert!(!old.contains(&id));
+    }
+}
+
+#[test]
+fn a_note_added_by_hand_gets_its_page_index() {
+    let fx = Fx::imported();
+    let path = "NOTE/Note/t.note";
+    let bytes = fixture_note("test1");
+    fx.write(path, &bytes);
+    fx.scan();
+    let id = fx.id(path).unwrap();
+    let bodies = fx.bodies();
+    let EventBody::FileCreated {
+        kind,
+        pages_changed,
+        md5,
+        ..
+    } = &bodies[0]
+    else {
+        panic!("{bodies:?}")
+    };
+    assert_eq!(*kind, FileKind::Note);
+    assert_eq!(*md5, md5_hex(&bytes));
+    let n = pages_changed.expect("the note was indexed");
+    assert!(n > 0);
+    assert_eq!(bodies.len() as u64, 1 + n);
+    assert!(
+        bodies[1..]
+            .iter()
+            .all(|b| matches!(b, EventBody::PageAdded { id: i, .. } if *i == id))
+    );
+    let records = std::fs::read_dir(fx.store.account_dir().join("pages"))
+        .unwrap()
+        .count();
+    assert_eq!(records, 1);
+}
+
+#[test]
+fn a_note_changed_by_hand_is_compared_with_its_record() {
+    let fx = Fx::imported();
+    let path = "NOTE/Note/t.note";
+    fx.write(path, &fixture_note("test1"));
+    fx.scan();
+    // Another note at the same path: its pages are compared with the record of the old one,
+    // not with the new file on disk (which would give no page events).
+    fx.write(path, &fixture_note("test2"));
+    let before = fx.events().len();
+    fx.scan();
+    let bodies: Vec<EventBody> = fx.bodies().split_off(before);
+    let EventBody::FileModified { pages_changed, .. } = &bodies[0] else {
+        panic!("{bodies:?}")
+    };
+    let old = fingerprint_note(fixture_note("test1")).unwrap().pages.len();
+    let new = fingerprint_note(fixture_note("test2")).unwrap().pages.len();
+    assert_eq!(*pages_changed, Some((old + new) as u64));
+    let mut expect = vec!["file.modified"];
+    expect.extend(std::iter::repeat_n("page.removed", old));
+    expect.extend(std::iter::repeat_n("page.added", new));
+    assert_eq!(kind_names(&bodies), expect);
+}
+
+#[test]
+fn a_note_moved_by_hand_takes_its_record_along() {
+    let fx = Fx::imported();
+    fx.write("NOTE/Note/t.note", &fixture_note("test1"));
+    fx.scan();
+    let before = fx.events().len();
+    std::fs::rename(fx.fs("NOTE/Note/t.note"), fx.fs("NOTE/Note/u.note")).unwrap();
+    fx.scan();
+    let bodies: Vec<EventBody> = fx.bodies().split_off(before);
+    assert_eq!(kind_names(&bodies), vec!["file.moved"]);
+    let pages = fx.store.account_dir().join("pages");
+    let texts: Vec<String> = std::fs::read_dir(&pages)
+        .unwrap()
+        .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect();
+    assert_eq!(texts.len(), 1);
+    assert!(texts[0].contains("NOTE/Note/u.note"), "{}", texts[0]);
+}
+
+#[test]
+fn a_dry_run_changes_nothing() {
+    let fx = Fx::imported();
+    fx.write(&format!("{DOC}/mod.txt"), b"one");
+    fx.write(&format!("{DOC}/gone.txt"), b"gone");
+    fx.write(&format!("{DOC}/keep.txt"), b"keep");
+    fx.seed();
+    fx.write(&format!("{DOC}/mod.txt"), b"three");
+    fx.rm(&format!("{DOC}/gone.txt"));
+    fx.write("Work/new.txt", b"new");
+    let state = fx.state_files();
+    let opts = ScanOptions {
+        dry_run: true,
+        ..ScanOptions::all(1)
+    };
+    let report = fx.scan_with(&opts);
+    assert_eq!(paths(&report.created), vec!["Work", "Work/new.txt"]);
+    assert_eq!(paths(&report.modified), vec![format!("{DOC}/mod.txt")]);
+    assert_eq!(paths(&report.deleted), vec![format!("{DOC}/gone.txt")]);
+    assert!(report.seqs.is_empty());
+    assert_eq!(fx.state_files(), state);
+    assert!(fx.events().is_empty());
+    assert_eq!(fx.id("Work/new.txt"), None);
+    // The same scan for real still sees everything.
+    let real = fx.scan();
+    assert_eq!(real.created, report.created);
+    assert_eq!(real.modified, report.modified);
+    assert_eq!(real.deleted, report.deleted);
+}
+
+#[test]
+fn a_dry_run_reports_a_hold_without_writing_the_marker() {
+    let fx = Fx::imported();
+    fx.write(&format!("{DOC}/a.txt"), b"a");
+    fx.seed();
+    fx.rm(&format!("{DOC}/a.txt"));
+    let report = fx.scan_with(&ScanOptions {
+        dry_run: true,
+        ..ScanOptions::all(1)
+    });
+    let hold = report.held.expect("held");
+    assert_eq!((hold.gone, hold.left, hold.min), (1, 0, 1));
+    assert_eq!(fx.hold_marker(), None);
+}
+
+#[test]
+fn a_scoped_scan_only_sees_its_folder() {
+    let fx = Fx::imported();
+    fx.write("Work/a.txt", b"a");
+    fx.write("Other/b.txt", b"b");
+    let report = fx.scan_with(&ScanOptions {
+        scope: wp("Work"),
+        recursive: true,
+        ..ScanOptions::all(1)
+    });
+    assert_eq!(paths(&report.created), vec!["Work", "Work/a.txt"]);
+    assert_eq!(fx.id("Other"), None);
+    assert_eq!(fx.id("Other/b.txt"), None);
+    assert_eq!(
+        kind_names(&fx.bodies()),
+        vec!["folder.created", "file.created"]
+    );
+}
+
+#[test]
+fn a_non_recursive_scan_sees_direct_children_only() {
+    let fx = Fx::imported();
+    fx.write("Work/a.txt", b"a");
+    fx.write("Work/Sub/b.txt", b"b");
+    let report = fx.scan_with(&ScanOptions {
+        scope: wp("Work"),
+        recursive: false,
+        ..ScanOptions::all(1)
+    });
+    assert_eq!(
+        paths(&report.created),
+        vec!["Work", "Work/Sub", "Work/a.txt"]
+    );
+    assert_eq!(fx.id("Work/Sub/b.txt"), None);
+    // A gone child folder takes its whole subtree along.
+    fx.seed();
+    fx.write(&format!("{DOC}/keep.txt"), b"keep");
+    fx.seed();
+    std::fs::remove_dir_all(fx.fs("Work/Sub")).unwrap();
+    let report = fx.scan_with(&ScanOptions {
+        scope: wp("Work"),
+        recursive: false,
+        ..ScanOptions::all(1)
+    });
+    assert_eq!(paths(&report.deleted), vec!["Work/Sub/b.txt", "Work/Sub"]);
+    assert_eq!(fx.id("Work/Sub/b.txt"), None);
+}
+
+// ---------------------------------------------------------------- mass delete
+
+fn many(fx: &Fx, folder: &str, n: usize) -> Vec<String> {
+    let names: Vec<String> = (0..n).map(|i| format!("{folder}/f{i:02}.txt")).collect();
+    for (i, p) in names.iter().enumerate() {
+        fx.write(p, format!("file {i}").as_bytes());
+    }
+    names
+}
+
+#[test]
+fn deleting_every_file_holds_and_applies_nothing() {
+    let fx = Fx::imported();
+    let files = many(&fx, DOC, 5);
+    fx.seed();
+    for f in &files {
+        fx.rm(f);
+    }
+    let state = fx.state_files();
+    let report = fx.scan();
+    let hold = report.held.clone().expect("held");
+    assert_eq!((hold.gone, hold.left, hold.min, hold.at), (5, 0, 1, NOW));
+    assert_eq!(hold.examples, files);
+    assert!(report.seqs.is_empty());
+    assert!(fx.events().is_empty());
+    assert_eq!(fx.state_files(), state);
+    let marker = fx.hold_marker().expect("marker");
+    assert_eq!(marker["gone"], 5);
+    assert_eq!(marker["left"], 0);
+    assert_eq!(marker["min"], 1);
+    assert_eq!(marker["at"], NOW);
+    assert_eq!(fx.store.scan_hold().unwrap(), Some(hold));
+    // While the files stay gone the marker is kept as it is.
+    let bytes = fx.account_file(SCAN_HOLD_FILE);
+    let again = fx.try_scan(&ScanOptions::all(1), NOW + 5000).unwrap();
+    assert!(again.held.is_some());
+    assert_eq!(fx.account_file(SCAN_HOLD_FILE), bytes);
+}
+
+#[test]
+fn a_large_cleanup_that_leaves_one_file_never_holds() {
+    let fx = Fx::imported();
+    let files = many(&fx, DOC, 20);
+    fx.seed();
+    for f in &files[1..] {
+        fx.rm(f);
+    }
+    let report = fx.scan();
+    assert_eq!(report.held, None);
+    assert_eq!(report.deleted.len(), 19);
+    assert_eq!(fx.events().len(), 19);
+    assert_eq!(fx.hold_marker(), None);
+}
+
+#[test]
+fn scan_min_files_counts_the_whole_account_in_a_scoped_scan() {
+    let fx = Fx::imported();
+    let work = many(&fx, "Work", 3);
+    many(&fx, DOC, 2);
+    fx.seed();
+    for f in &work {
+        fx.rm(f);
+    }
+    let report = fx.scan_with(&ScanOptions {
+        scope: wp("Work"),
+        recursive: true,
+        ..ScanOptions::all(1)
+    });
+    assert_eq!(report.held, None);
+    assert_eq!(report.deleted.len(), 3);
+}
+
+#[test]
+fn scan_min_files_zero_never_holds() {
+    let fx = Fx::imported();
+    let files = many(&fx, DOC, 5);
+    fx.seed();
+    for f in &files {
+        fx.rm(f);
+    }
+    let report = fx.scan_with(&ScanOptions::all(0));
+    assert_eq!(report.held, None);
+    assert_eq!(fx.events().len(), 5);
+}
+
+#[test]
+fn a_higher_scan_min_files_holds_earlier() {
+    let fx = Fx::imported();
+    let files = many(&fx, DOC, 9);
+    fx.seed();
+    for f in &files[..5] {
+        fx.rm(f);
+    }
+    let report = fx.scan_with(&ScanOptions::all(5));
+    let hold = report.held.expect("held");
+    assert_eq!((hold.gone, hold.left, hold.min), (5, 4, 5));
+    assert!(fx.events().is_empty());
+    // With four left and a minimum of four it applies.
+    let report = fx.scan_with(&ScanOptions::all(4));
+    assert_eq!(report.held, None);
+    assert!(report.released);
+    assert_eq!(fx.events().len(), 5);
+}
+
+#[test]
+fn an_empty_files_folder_on_a_never_imported_account_holds() {
+    let fx = Fx::plain();
+    many(&fx, DOC, 3);
+    many(&fx, "Work", 2);
+    fx.seed();
+    let files = fx.store.files_dir().to_path_buf();
+    std::fs::remove_dir_all(&files).unwrap();
+    std::fs::create_dir(&files).unwrap();
+    let state = fx.state_files();
+    let report = fx.scan();
+    let hold = report.held.expect("held");
+    assert_eq!((hold.gone, hold.left), (5, 0));
+    assert_eq!(fx.state_files(), state);
+    assert!(fx.events().is_empty());
+    assert!(fx.hold_marker().is_some());
+    // Accepted: the files go, the native folders are never deleted by a scan.
+    let report = fx.scan_with(&ScanOptions {
+        accept: true,
+        ..ScanOptions::all(1)
+    });
+    assert!(report.released);
+    let bodies = fx.bodies();
+    let folders: Vec<&String> = bodies
+        .iter()
+        .filter_map(|b| match b {
+            EventBody::FolderDeleted { path, .. } => Some(path),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(folders, vec!["Work"]);
+    assert!(fx.id("NOTE/Note").is_some());
+}
+
+#[test]
+fn the_hold_is_released_when_the_files_come_back() {
+    let fx = Fx::imported();
+    let files = many(&fx, DOC, 5);
+    fx.seed();
+    let aside = fx.dir.path().join("aside");
+    std::fs::rename(fx.fs(DOC), &aside).unwrap();
+    std::fs::create_dir(fx.fs(DOC)).unwrap();
+    assert!(fx.scan().held.is_some());
+    std::fs::remove_dir(fx.fs(DOC)).unwrap();
+    std::fs::rename(&aside, fx.fs(DOC)).unwrap();
+    let report = fx.scan();
+    assert_eq!(report.held, None);
+    assert!(report.released);
+    assert_eq!(fx.hold_marker(), None);
+    assert_eq!(fx.store.scan_hold().unwrap(), None);
+    // Nothing changed: no events, the ids are the old ones.
+    assert!(fx.events().is_empty());
+    assert!(fx.id(&files[0]).is_some());
+}
+
+/// A scoped scan sees nothing gone in its folder, but it can't tell whether the files elsewhere
+/// came back: the hold of a whole-tree scan stays.
+#[test]
+fn a_scoped_scan_never_releases_the_hold() {
+    let fx = Fx::imported();
+    let files = many(&fx, DOC, 5);
+    fx.write("Work/a.txt", b"a");
+    fx.seed();
+    fx.rm("Work/a.txt");
+    for f in &files {
+        fx.rm(f);
+    }
+    assert!(fx.scan().held.is_some());
+    let bytes = fx.account_file(SCAN_HOLD_FILE);
+    fx.write("INBOX/new.txt", b"new");
+    let report = fx.scan_with(&ScanOptions {
+        scope: wp("INBOX"),
+        recursive: true,
+        ..ScanOptions::all(1)
+    });
+    assert!(!report.released);
+    assert_eq!(report.held, None);
+    assert_eq!(paths(&report.created), vec!["INBOX/new.txt"]);
+    assert_eq!(fx.account_file(SCAN_HOLD_FILE), bytes);
+}
+
+#[test]
+fn accept_applies_the_mass_delete_and_removes_the_hold() {
+    let fx = Fx::imported();
+    let files = many(&fx, DOC, 5);
+    fx.seed();
+    for f in &files {
+        fx.rm(f);
+    }
+    assert!(fx.scan().held.is_some());
+    let report = fx.scan_with(&ScanOptions {
+        accept: true,
+        ..ScanOptions::all(1)
+    });
+    assert_eq!(report.held, None);
+    assert!(report.released);
+    assert_eq!(report.deleted.len(), 5);
+    assert_eq!(fx.events().len(), 5);
+    assert_eq!(fx.hold_marker(), None);
+    // Without a hold, accept is a normal scan.
+    fx.write(&format!("{DOC}/new.txt"), b"new");
+    let report = fx.scan_with(&ScanOptions {
+        accept: true,
+        ..ScanOptions::all(1)
+    });
+    assert!(!report.released);
+    assert_eq!(report.created.len(), 1);
+}
+
+// ---------------------------------------------------------------- safety
+
+#[test]
+fn the_registry_is_never_ahead_of_the_journal() {
+    let fx = Fx::imported();
+    let path = format!("{DOC}/a.txt");
+    fx.write(&path, b"one");
+    fx.seed();
+    fx.write(&path, b"three");
+    fx.write(&format!("{DOC}/new.txt"), b"new");
+    let state = fx.state_files();
+    // A folder where the journal lock file belongs: every append fails.
+    let g = fx.store.lock_recovered(&fx.journal).unwrap();
+    let lock = fx.journal.dir().join(".lock");
+    let _ = std::fs::remove_file(&lock);
+    std::fs::create_dir(&lock).unwrap();
+    let r = fx.store.scan(&g, &fx.journal, &ScanOptions::all(1), NOW);
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(fx.state_files(), state);
+    assert_eq!(fx.id(&format!("{DOC}/new.txt")), None);
+    drop(g);
+    std::fs::remove_dir(&lock).unwrap();
+    // The same store object scans again: the change is still found.
+    fx.scan();
+    assert_eq!(
+        kind_names(&fx.bodies()),
+        vec!["file.created", "file.modified"]
+    );
+}
+
+#[test]
+fn hidden_and_temp_files_are_never_seen() {
+    let fx = Fx::imported();
+    fx.write(".hidden", b"x");
+    fx.write(&format!("{DOC}/.nd-1-2.tmp"), b"x");
+    fx.write(&format!("{DOC}/.DS_Store"), b"x");
+    fx.write(".Trash/a.txt", b"x");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/etc", fx.fs("link")).unwrap();
+    let report = fx.scan();
+    assert_eq!(report, ScanReport::default());
+    assert!(fx.events().is_empty());
+}
+
+#[test]
+fn a_broken_tree_is_never_scanned() {
+    let fx = Fx::imported();
+    fx.write(&format!("{DOC}/a.txt"), b"a");
+    fx.seed();
+    let g = fx.store.lock_recovered(&fx.journal).unwrap();
+    std::fs::remove_dir_all(fx.fs("DOCUMENT")).unwrap();
+    let r = fx.store.scan(&g, &fx.journal, &ScanOptions::all(0), NOW);
+    assert!(matches!(r, Err(Error::StoreDamaged { .. })), "{r:?}");
+    assert!(fx.events().is_empty());
+}

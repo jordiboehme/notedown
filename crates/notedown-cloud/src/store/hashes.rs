@@ -105,7 +105,6 @@ impl HashCache {
     }
 
     /// The last cached MD5 of `path`, without touching the disk (it may be stale).
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by the scan"))]
     pub fn cached(&self, path: &WirePath) -> Option<&str> {
         self.rows.get(&path.display()).map(|r| r.md5.as_str())
     }

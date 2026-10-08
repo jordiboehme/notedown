@@ -15,6 +15,7 @@ mod mutate;
 mod pages;
 mod push;
 mod recycle;
+mod scan;
 mod serve;
 mod socket;
 mod store;

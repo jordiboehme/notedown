@@ -18,6 +18,7 @@ mod list;
 mod path;
 pub mod recycle;
 pub mod retention;
+mod scan;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -38,6 +39,7 @@ pub use path::WirePath;
 pub use recycle::{
     IndexLine, PruneFailure, PruneReport, RECYCLE_INDEX, RecycleEntry, RecycleReason,
 };
+pub use scan::{SCAN_HOLD_FILE, ScanHold, ScanOptions, ScanReport};
 
 use hashes::HashCache;
 use ids::{Op, Registry};

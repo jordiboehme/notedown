@@ -436,7 +436,7 @@ impl Store {
         Ok(())
     }
 
-    fn check_write(&self, guard: &WriteGuard) -> Result<()> {
+    pub(super) fn check_write(&self, guard: &WriteGuard) -> Result<()> {
         self.check_guard(guard)?;
         self.check_no_pending()
     }
@@ -1170,7 +1170,7 @@ impl Store {
     /// Write a side file atomically (its folder is created if needed), or remove it. Only a
     /// file directly inside `<account>/pages/` is accepted: the path must be the account folder
     /// followed by exactly `pages` and one plain name (no `..`, `.`, root or prefix part).
-    fn write_side(&self, w: &SideWrite) -> Result<()> {
+    pub(super) fn write_side(&self, w: &SideWrite) -> Result<()> {
         use std::path::Component;
         let confined = w.path.strip_prefix(&self.account_dir).is_ok_and(|rel| {
             let parts: Vec<Component<'_>> = rel.components().collect();

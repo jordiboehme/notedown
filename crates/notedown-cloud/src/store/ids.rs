@@ -84,6 +84,13 @@ impl Registry {
         self.next
     }
 
+    /// Every row: id, kind and path, by id.
+    pub fn rows(&self) -> impl Iterator<Item = (u64, Kind, &WirePath)> {
+        self.by_id
+            .iter()
+            .map(|(id, (kind, path))| (*id, *kind, path))
+    }
+
     fn insert(&mut self, id: u64, kind: Kind, path: WirePath) {
         if let Some(old) = self.by_path.insert(path.clone(), id)
             && old != id

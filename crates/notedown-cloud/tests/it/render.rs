@@ -814,12 +814,16 @@ struct Followed {
     root: PathBuf,
     state: std::sync::Arc<notedown_cloud::server::AppState>,
     task: tokio::task::JoinHandle<()>,
+    /// The failed passes of the follower.
+    failed: std::sync::Arc<std::sync::atomic::AtomicU64>,
     _render: tempfile::TempDir,
 }
 
 impl Followed {
+    /// The follower is started and its start pass is done (it set the cursor), so nothing
+    /// writes into the render folder any more.
     async fn start() -> Followed {
-        use notedown_cloud::render::follow::{Timing, run};
+        use notedown_cloud::render::follow::{Timing, run_counted};
         use std::time::Duration;
         let data = tempfile::tempdir().unwrap();
         let render = tempfile::tempdir().unwrap();
@@ -832,7 +836,8 @@ impl Followed {
         };
         let root = config.render_root(data.path()).unwrap();
         let state = notedown_cloud::server::AppState::open(config, data.path()).unwrap();
-        let task = tokio::spawn(run(
+        let failed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let task = tokio::spawn(run_counted(
             state.clone(),
             root.clone(),
             Timing {
@@ -840,16 +845,27 @@ impl Followed {
                 poll: Duration::from_millis(50),
                 retry: Duration::from_millis(100),
             },
+            failed.clone(),
         ));
         let f = Followed {
             data,
             root,
             state,
             task,
+            failed,
             _render: render,
         };
-        until("the start pass", || f.root.join("acc").exists()).await;
+        // The account folder appears at the start of the pass; the cursor is set at its end.
+        until("the start pass", || {
+            f.state.journal.cursor("render").unwrap().is_some()
+        })
+        .await;
+        assert!(f.root.join("acc").is_dir());
         f
+    }
+
+    fn failures(&self) -> u64 {
+        self.failed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Put test1 as `n.note`; the last journal seq.
@@ -879,8 +895,9 @@ impl Followed {
     }
 }
 
+/// Poll `ok` until it holds; a generous bound, so a slow machine can't fail a test.
 async fn until(what: &str, mut ok: impl FnMut() -> bool) {
-    let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !ok() {
         assert!(
             std::time::Instant::now() < end,
@@ -895,8 +912,8 @@ async fn a_failed_pass_is_tried_again_when_the_render_folder_comes_back() {
     let f = Followed::start().await;
     std::fs::remove_dir_all(&f.root).unwrap();
     let last = f.put().await;
-    // Several quiet and retry times: the passes fail and hold the cursor.
-    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    // The pass fails and is tried again, failing again: the cursor stays before the note.
+    until("two failed passes", || f.failures() >= 2).await;
     assert!(f.cursor() < last, "the cursor moved past a failed pass");
     std::fs::create_dir_all(&f.root).unwrap();
     until("the PDF", || f.pdf().exists()).await;

@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::{PassOptions, PassReport, render_account};
@@ -122,6 +123,8 @@ async fn account_slugs(state: &Arc<AppState>) -> Option<Vec<String>> {
 struct Pending {
     due: BTreeMap<String, Instant>,
     errors: BTreeMap<String, String>,
+    /// Counts every failed pass ([`run_counted`]).
+    failed: Arc<AtomicU64>,
 }
 
 impl Pending {
@@ -147,6 +150,7 @@ impl Pending {
                     self.errors.remove(slug);
                     return;
                 }
+                self.failed.fetch_add(1, Ordering::SeqCst);
                 if self.errors.get(slug) != Some(&text) {
                     eprintln!("notedown render: {slug}: {text}");
                     self.errors.insert(slug.to_string(), text);
@@ -203,6 +207,18 @@ fn read_batch(state: &AppState, from: u64) -> crate::Result<Batch> {
 /// or found the lock busy is tried again (every `retry` or `poll`) and holds the cursor.
 /// Never returns; stop it by aborting the task.
 pub async fn run(state: Arc<AppState>, root: PathBuf, timing: Timing) {
+    run_counted(state, root, timing, Arc::new(AtomicU64::new(0))).await
+}
+
+/// [`run`], counting every failed pass in `failed` (tests wait for a failure with it). Not for
+/// production use.
+#[doc(hidden)]
+pub async fn run_counted(
+    state: Arc<AppState>,
+    root: PathBuf,
+    timing: Timing,
+    failed: Arc<AtomicU64>,
+) {
     let st = state.clone();
     let start = tokio::task::spawn_blocking(move || {
         let seq = st.journal.last_seq();
@@ -226,6 +242,7 @@ pub async fn run(state: Arc<AppState>, root: PathBuf, timing: Timing) {
     let mut pending = Pending {
         due: BTreeMap::new(),
         errors: BTreeMap::new(),
+        failed,
     };
     match slugs {
         Ok(slugs) => {

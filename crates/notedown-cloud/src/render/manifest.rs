@@ -9,7 +9,10 @@ use crate::store::WirePath;
 
 pub const MANIFEST_FILE: &str = ".notedown-render.json";
 
-/// The format version written.
+/// The format version written. `Row::target` was added later without a new version: it is
+/// optional and written only for a note whose PDF name collided. An older binary ignores the
+/// field, so after a downgrade it looks for such a PDF at the plain name, renders it there
+/// and leaves the old file behind.
 pub const VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,16 +50,27 @@ pub fn path(dir: &Path) -> PathBuf {
     dir.join(MANIFEST_FILE)
 }
 
-/// The manifest of `dir`; empty when it is missing or can't be read (every note then counts
-/// as new, which is safe: a PDF the pass doesn't know it never deletes). A row whose path or
-/// target is not a wire path in its plain form (absolute, with `..`, empty), or whose target
-/// is no `.pdf`, is dropped: the file is only a file in the render folder, and nothing in it
-/// may name a file outside or a file that is not a PDF.
+/// The manifest of `dir`, rows with bad paths dropped (see [`drop_bad_rows`]).
 pub fn load(dir: &Path) -> Manifest {
-    let mut m: Manifest = std::fs::read(path(dir))
+    let mut m = read(dir);
+    drop_bad_rows(&mut m);
+    m
+}
+
+/// The manifest of `dir` as the file holds it; empty when it is missing or can't be read
+/// (every note then counts as new, which is safe: a PDF the pass doesn't know it never
+/// deletes).
+pub fn read(dir: &Path) -> Manifest {
+    std::fs::read(path(dir))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// Drop every row whose path or target is not a wire path in its plain form (absolute, with
+/// `..`, empty), or whose target is no `.pdf`: the file is only a file in the render folder,
+/// and nothing in it may name a file outside or a file that is not a PDF.
+pub fn drop_bad_rows(m: &mut Manifest) {
     m.notes.retain(|_, row| {
         is_wire_path(&row.path)
             && row
@@ -64,7 +78,6 @@ pub fn load(dir: &Path) -> Manifest {
                 .as_deref()
                 .is_none_or(|t| t.ends_with(".pdf") && is_wire_path(t))
     });
-    m
 }
 
 /// Whether `text` is a wire path naming a file or folder, written as the store writes it:

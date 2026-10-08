@@ -487,26 +487,27 @@ fn two_notes_with_the_same_pdf_path_get_two_pdfs() {
     if fx.fs("NOTE/Note/a.NOTE").exists() {
         return;
     }
+    fx.scan();
+    assert_eq!(fx.pass().written, s(&["NOTE/Note/a.pdf"]));
+    let pdf = std::fs::read(fx.out().join("NOTE/Note/a.pdf")).unwrap();
+
+    // `a.NOTE` sorts first, but `a.note` had its PDF first and keeps it.
     fx.write("NOTE/Note/a.NOTE", &fixture_note("test2"));
     fx.scan();
     let r = fx.pass();
-    let mut written = r.written.clone();
-    written.sort();
-    assert_eq!(written, s(&["NOTE/Note/a.note.pdf", "NOTE/Note/a.pdf"]));
+    assert_eq!(r.written, s(&["NOTE/Note/a.NOTE.pdf"]));
+    assert!(r.moved.is_empty() && r.deleted.is_empty(), "{r:?}");
+    assert_eq!(
+        std::fs::read(fx.out().join("NOTE/Note/a.pdf")).unwrap(),
+        pdf
+    );
     assert_eq!(fx.pass(), PassReport::default());
 
-    // `a.NOTE` sorts first and kept `a.pdf`. Once it is gone, `a.note` takes `a.pdf`.
     std::fs::remove_file(fx.fs("NOTE/Note/a.NOTE")).unwrap();
     fx.scan();
     let r = fx.pass();
-    assert_eq!(r.deleted, s(&["NOTE/Note/a.pdf"]));
-    assert_eq!(
-        r.moved,
-        vec![(
-            "NOTE/Note/a.note.pdf".to_string(),
-            "NOTE/Note/a.pdf".to_string()
-        )]
-    );
+    assert_eq!(r.deleted, s(&["NOTE/Note/a.NOTE.pdf"]));
+    assert!(r.moved.is_empty() && r.written.is_empty(), "{r:?}");
     assert_eq!(fx.files(), BTreeSet::from(["NOTE/Note/a.pdf".to_string()]));
     assert_eq!(fx.pass(), PassReport::default());
 }
@@ -900,8 +901,11 @@ fn rows_with_bad_paths_of_gone_notes_touch_nothing() {
     let r = fx.pass();
     assert!(r.deleted.is_empty() && r.moved.is_empty(), "{r:?}");
     sentinels.check();
-    // The bad rows are gone from the manifest.
+    // The bad rows are gone from the manifest, also from the file.
     assert_eq!(fx.manifest().notes.len(), 1);
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fx.out().join(MANIFEST_FILE)).unwrap()).unwrap();
+    assert_eq!(raw["notes"].as_object().unwrap().len(), 1, "{raw}");
     fx.pass_all();
     sentinels.check();
 }

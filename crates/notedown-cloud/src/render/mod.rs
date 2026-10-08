@@ -68,15 +68,32 @@ pub fn pdf_path_of(wire_path: &str) -> String {
     }
 }
 
-/// The PDF path of every note, by note path. `paths` are the wire paths of all registered
-/// notes, sorted in byte order. Two PDF paths collide when they are equal without case (a
-/// render folder may ignore case even when the data folder doesn't). The first note keeps
-/// [`pdf_path_of`]; a later one gets its full name plus `.pdf`, and ` (2)`, ` (3)` ... before
-/// `.pdf` while that collides too. The same notes always give the same paths.
-pub fn assign_targets<'a>(paths: impl IntoIterator<Item = &'a str>) -> HashMap<String, String> {
+/// The PDF path of every note, by note path. `notes` are the wire paths of all registered
+/// notes, sorted in byte order, each with the PDF path it owns (its row has a PDF and the same
+/// path). Two PDF paths collide when they are equal without case (a render folder may ignore
+/// case even when the data folder doesn't).
+///
+/// A note keeps the PDF path it owns; of two owned paths that collide, the note that sorts
+/// first keeps it. Every other note, in order, gets [`pdf_path_of`] when that is free, else
+/// its full name plus `.pdf`, then ` (2)`, ` (3)` ... before `.pdf`. A note never moves back
+/// to the plain name when it becomes free, so the names stay stable.
+pub fn assign_targets<'a>(
+    notes: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+) -> HashMap<String, String> {
+    let notes: Vec<_> = notes.into_iter().collect();
     let mut taken = HashSet::new();
     let mut out = HashMap::new();
-    for path in paths {
+    for &(path, owned) in &notes {
+        if let Some(owned) = owned
+            && taken.insert(fold(owned))
+        {
+            out.insert(path.to_string(), owned.to_string());
+        }
+    }
+    for &(path, _) in &notes {
+        if out.contains_key(path) {
+            continue;
+        }
         let mut target = pdf_path_of(path);
         if taken.contains(&fold(&target)) {
             target = format!("{path}.pdf");
@@ -320,34 +337,81 @@ struct Pass {
 impl Pass {
     /// A pass on the account folder `dir`, with its manifest loaded.
     fn new(slug: &str, dir: PathBuf, all: bool) -> Pass {
-        let m = manifest::load(&dir);
-        Pass {
+        // `saved` is the file as it is, so rows dropped here are removed from it too.
+        let saved = manifest::read(&dir);
+        let mut m = saved.clone();
+        manifest::drop_bad_rows(&mut m);
+        let mut pass = Pass {
             slug: slug.to_string(),
             stale: all || m.renderer != RENDERER_ID,
             dir,
-            saved: m.clone(),
+            saved,
             m,
             report: PassReport::default(),
             emptied: BTreeSet::new(),
             changes: 0,
+        };
+        pass.split_shared_pdfs();
+        pass
+    }
+
+    /// Rows of an older manifest whose PDF paths differ only in case can name one file (on a
+    /// render folder that ignores case). The note that sorts first keeps the file and is
+    /// rendered again; the rows of the others are dropped, so they get their own PDF.
+    fn split_shared_pdfs(&mut self) {
+        let mut groups: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for (key, row) in &self.m.notes {
+            if row.pdf {
+                groups
+                    .entry(fold(&row.pdf_path()))
+                    .or_default()
+                    .push((row.path.clone(), key.clone()));
+            }
+        }
+        for mut group in groups.into_values().filter(|g| g.len() > 1) {
+            group.sort();
+            let first = group[0].1.clone();
+            let Some(file) = self.file_of(&self.m.notes[&first].pdf_path()) else {
+                continue;
+            };
+            let mut shared = false;
+            for (_, key) in &group[1..] {
+                if self
+                    .file_of(&self.m.notes[key].pdf_path())
+                    .is_some_and(|other| same_file(&file, &other))
+                {
+                    self.m.notes.remove(key);
+                    shared = true;
+                }
+            }
+            if shared && let Some(row) = self.m.notes.get_mut(&first) {
+                // The file may hold the PDF of another note: render this one again.
+                row.md5.clear();
+            }
         }
     }
 
     fn run(&mut self, notes: &[Note]) -> Result<()> {
-        let targets = assign_targets(notes.iter().map(|n| n.path.as_str()));
+        let owned: Vec<Option<String>> = notes
+            .iter()
+            .map(|n| {
+                self.m
+                    .notes
+                    .get(&n.id.to_string())
+                    .filter(|r| r.pdf && r.path == n.path)
+                    .map(Row::pdf_path)
+            })
+            .collect();
+        let targets = assign_targets(
+            notes
+                .iter()
+                .zip(&owned)
+                .map(|(n, o)| (n.path.as_str(), o.as_deref())),
+        );
         // Gone notes first, so a PDF that a later note moves or writes to the same path is
         // never deleted as the PDF of a gone note.
         self.drop_gone(notes)?;
-        // Then the notes whose PDF moves, so a PDF path is free before another note takes it
-        // (on a render folder that ignores case, `A.pdf` is the file `a.pdf`).
-        let moves = |n: &Note| {
-            self.m
-                .notes
-                .get(&n.id.to_string())
-                .is_some_and(|r| r.pdf && r.pdf_path() != targets[&n.path])
-        };
-        let (first, rest): (Vec<&Note>, Vec<&Note>) = notes.iter().partition(|n| moves(n));
-        for note in first.into_iter().chain(rest) {
+        for note in notes {
             self.note(note, &targets[&note.path])?;
         }
         self.prune_empty();
@@ -687,8 +751,37 @@ mod tests {
     use super::*;
 
     fn targets(paths: &[&str]) -> Vec<String> {
-        let t = assign_targets(paths.iter().copied());
-        paths.iter().map(|p| t[*p].clone()).collect()
+        owned_targets(&paths.iter().map(|p| (*p, None)).collect::<Vec<_>>())
+    }
+
+    fn owned_targets(notes: &[(&str, Option<&str>)]) -> Vec<String> {
+        let t = assign_targets(notes.iter().copied());
+        notes.iter().map(|(p, _)| t[*p].clone()).collect()
+    }
+
+    #[test]
+    fn a_note_keeps_the_pdf_path_it_owns() {
+        // `a.note` had `a.pdf` first; `A.note` sorts first but is new.
+        assert_eq!(
+            owned_targets(&[
+                ("NOTE/Note/A.note", None),
+                ("NOTE/Note/a.note", Some("NOTE/Note/a.pdf")),
+            ]),
+            ["NOTE/Note/A.note.pdf", "NOTE/Note/a.pdf"]
+        );
+        // A full name stays when the plain name is free again.
+        assert_eq!(
+            owned_targets(&[("NOTE/Note/a.note", Some("NOTE/Note/a.note.pdf"))]),
+            ["NOTE/Note/a.note.pdf"]
+        );
+        // Two owned paths that collide: the first note keeps its path.
+        assert_eq!(
+            owned_targets(&[
+                ("NOTE/Note/A.note", Some("NOTE/Note/A.pdf")),
+                ("NOTE/Note/a.note", Some("NOTE/Note/a.pdf")),
+            ]),
+            ["NOTE/Note/A.pdf", "NOTE/Note/a.note.pdf"]
+        );
     }
 
     #[test]
@@ -763,6 +856,23 @@ mod tests {
         pass.report
     }
 
+    fn fixture2(dir: &Path, name: &str) -> PathBuf {
+        let src =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/notes/test2.note");
+        let to = dir.join(name);
+        std::fs::copy(src, &to).unwrap();
+        to
+    }
+
+    /// The PDF the pass writes for the note file at `path`.
+    fn pdf_of(path: &Path) -> Vec<u8> {
+        render_pdf(std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn read(out: &Path, rel: &str) -> Vec<u8> {
+        std::fs::read(out.join(rel)).unwrap()
+    }
+
     /// Two notes that map to the same PDF, driven through the pass directly: their note files
     /// sit under other names, so this runs on a disk that ignores case too.
     #[test]
@@ -771,12 +881,13 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
         let (one, two) = (
             fixture(src.path(), "one.note"),
-            fixture(src.path(), "two.note"),
+            fixture2(src.path(), "two.note"),
         );
         let notes = [
             note(2, "NOTE/Note/a.NOTE", &two),
             note(1, "NOTE/Note/a.note", &one),
         ];
+        // Both are new: byte order decides.
         let r = run(out.path(), &notes);
         let mut written = r.written.clone();
         written.sort();
@@ -785,65 +896,139 @@ mod tests {
         assert_eq!(m.notes["1"].pdf_path(), "NOTE/Note/a.note.pdf");
         assert_eq!(m.notes["2"].pdf_path(), "NOTE/Note/a.pdf");
         assert_eq!(m.notes["1"].path, "NOTE/Note/a.note");
+        assert_eq!(read(out.path(), "NOTE/Note/a.pdf"), pdf_of(&two));
+        assert_eq!(read(out.path(), "NOTE/Note/a.note.pdf"), pdf_of(&one));
 
         let bytes = std::fs::read(manifest::path(out.path())).unwrap();
         assert_eq!(run(out.path(), &notes), PassReport::default());
         assert_eq!(std::fs::read(manifest::path(out.path())).unwrap(), bytes);
 
-        // The first note is gone: its PDF is deleted and the other one takes `a.pdf`.
+        // The first note is gone: its PDF is deleted, the other one keeps its name.
         let r = run(out.path(), &notes[1..]);
         assert_eq!(r.deleted, ["NOTE/Note/a.pdf"]);
-        assert_eq!(
-            r.moved,
-            [(
-                "NOTE/Note/a.note.pdf".to_string(),
-                "NOTE/Note/a.pdf".to_string()
-            )]
-        );
-        assert!(r.written.is_empty(), "{r:?}");
-        assert!(out.path().join("NOTE/Note/a.pdf").is_file());
-        assert!(!out.path().join("NOTE/Note/a.note.pdf").exists());
-        let m = manifest::load(out.path());
-        assert_eq!(m.notes.len(), 1);
-        assert_eq!(m.notes["1"].pdf_path(), "NOTE/Note/a.pdf");
-        assert_eq!(m.notes["1"].target, None);
+        assert!(r.moved.is_empty() && r.written.is_empty(), "{r:?}");
+        assert!(!out.path().join("NOTE/Note/a.pdf").exists());
+        assert_eq!(read(out.path(), "NOTE/Note/a.note.pdf"), pdf_of(&one));
         assert_eq!(run(out.path(), &notes[1..]), PassReport::default());
     }
 
-    /// A data folder that keeps case with a render folder that ignores it: `A.note` appears
-    /// next to `a.note`, sorts first and takes `A.pdf`, the same file as `a.pdf` there. The
-    /// PDF of `a.note` moves away first, so neither PDF holds the other note.
+    /// The device's own `a.note` has `a.pdf`; `A.note` placed next to it (it sorts first) gets
+    /// its full name. On a render folder that ignores case, `A.pdf` would be `a.pdf`.
     #[test]
-    fn a_note_that_takes_the_pdf_path_of_another_moves_that_pdf_first() {
+    fn a_note_keeps_its_pdf_when_another_note_collides() {
         let src = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
-        let one = fixture(src.path(), "one.note");
-        let two = src.path().join("two.note");
-        let test2 =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/notes/test2.note");
-        std::fs::copy(test2, &two).unwrap();
+        let (one, two) = (
+            fixture(src.path(), "one.note"),
+            fixture2(src.path(), "two.note"),
+        );
         let lower = note(1, "NOTE/Note/a.note", &one);
         run(out.path(), std::slice::from_ref(&lower));
-        let pdf_one = std::fs::read(out.path().join("NOTE/Note/a.pdf")).unwrap();
+        let pdf_one = read(out.path(), "NOTE/Note/a.pdf");
 
         let notes = [note(2, "NOTE/Note/A.note", &two), lower];
         let r = run(out.path(), &notes);
-        assert_eq!(
-            r.moved,
-            [(
-                "NOTE/Note/a.pdf".to_string(),
-                "NOTE/Note/a.note.pdf".to_string()
-            )]
+        assert_eq!(r.written, ["NOTE/Note/A.note.pdf"]);
+        assert!(r.moved.is_empty() && r.deleted.is_empty(), "{r:?}");
+        assert_eq!(read(out.path(), "NOTE/Note/a.pdf"), pdf_one);
+        assert_eq!(read(out.path(), "NOTE/Note/A.note.pdf"), pdf_of(&two));
+        assert_eq!(run(out.path(), &notes), PassReport::default());
+    }
+
+    /// A note missing on disk keeps its PDF and its path when a colliding note appears.
+    #[test]
+    fn a_missing_note_keeps_its_pdf_when_another_note_collides() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let (one, two) = (
+            fixture(src.path(), "one.note"),
+            fixture2(src.path(), "two.note"),
         );
-        assert_eq!(r.written, ["NOTE/Note/A.pdf"]);
-        assert_eq!(
-            std::fs::read(out.path().join("NOTE/Note/a.note.pdf")).unwrap(),
-            pdf_one
+        run(out.path(), &[note(1, "NOTE/Note/a.note", &one)]);
+        let pdf_one = read(out.path(), "NOTE/Note/a.pdf");
+
+        let missing = Note {
+            id: 1,
+            path: "NOTE/Note/a.note".into(),
+            on_disk: None,
+        };
+        let notes = [note(2, "NOTE/Note/a.NOTE", &two), missing];
+        let r = run(out.path(), &notes);
+        assert_eq!(r.written, ["NOTE/Note/a.NOTE.pdf"]);
+        assert!(r.moved.is_empty() && r.deleted.is_empty(), "{r:?}");
+        assert_eq!(read(out.path(), "NOTE/Note/a.pdf"), pdf_one);
+        assert_eq!(read(out.path(), "NOTE/Note/a.NOTE.pdf"), pdf_of(&two));
+        let m = manifest::load(out.path());
+        assert_eq!(m.notes["1"].pdf_path(), "NOTE/Note/a.pdf");
+        assert_eq!(run(out.path(), &notes), PassReport::default());
+    }
+
+    /// `b.note` moves to `c.note` while a new `B.note` takes `B.pdf`, which is `b.pdf` on a
+    /// render folder that ignores case. Each note ends with its own PDF.
+    #[test]
+    fn a_new_note_on_the_old_pdf_of_a_moved_note_gets_its_own_pdf() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let (one, two) = (
+            fixture(src.path(), "one.note"),
+            fixture2(src.path(), "two.note"),
         );
-        assert_ne!(
-            std::fs::read(out.path().join("NOTE/Note/A.pdf")).unwrap(),
-            pdf_one
+        run(out.path(), &[note(1, "NOTE/Note/b.note", &one)]);
+        let notes = [
+            note(2, "NOTE/Note/B.note", &two),
+            note(1, "NOTE/Note/c.note", &one),
+        ];
+        run(out.path(), &notes);
+        assert_eq!(read(out.path(), "NOTE/Note/B.pdf"), pdf_of(&two));
+        assert_eq!(read(out.path(), "NOTE/Note/c.pdf"), pdf_of(&one));
+        let m = manifest::load(out.path());
+        assert_eq!(m.notes["1"].pdf_path(), "NOTE/Note/c.pdf");
+        assert_eq!(m.notes["2"].pdf_path(), "NOTE/Note/B.pdf");
+        assert_eq!(run(out.path(), &notes), PassReport::default());
+    }
+
+    /// A manifest from before collisions were handled: `A.note -> A.pdf` and `a.note -> a.pdf`
+    /// on a render folder that ignores case are one file. One pass gives each note its own PDF.
+    #[test]
+    fn two_rows_on_one_file_get_their_own_pdfs() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let (one, two) = (
+            fixture(src.path(), "one.note"),
+            fixture2(src.path(), "two.note"),
         );
+        let dir = out.path().join("NOTE/Note");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.pdf"), pdf_of(&two)).unwrap();
+        if !dir.join("A.pdf").exists() {
+            // A render folder that keeps case: two files, nothing to repair.
+            return;
+        }
+        let row = |path: &str, file: &Path| Row {
+            path: path.into(),
+            md5: md5_hex(&std::fs::read(file).unwrap()),
+            pdf: true,
+            target: None,
+        };
+        let mut m = Manifest {
+            version: manifest::VERSION,
+            renderer: RENDERER_ID.into(),
+            ..Manifest::default()
+        };
+        m.notes.insert("1".into(), row("NOTE/Note/A.note", &one));
+        m.notes.insert("2".into(), row("NOTE/Note/a.note", &two));
+        manifest::save(out.path(), &m).unwrap();
+
+        let notes = [
+            note(1, "NOTE/Note/A.note", &one),
+            note(2, "NOTE/Note/a.note", &two),
+        ];
+        run(out.path(), &notes);
+        assert_eq!(read(out.path(), "NOTE/Note/A.pdf"), pdf_of(&one));
+        assert_eq!(read(out.path(), "NOTE/Note/a.note.pdf"), pdf_of(&two));
+        let m = manifest::load(out.path());
+        assert_eq!(m.notes["1"].pdf_path(), "NOTE/Note/A.pdf");
+        assert_eq!(m.notes["2"].pdf_path(), "NOTE/Note/a.note.pdf");
         assert_eq!(run(out.path(), &notes), PassReport::default());
     }
 }

@@ -13,8 +13,9 @@ use time::{Date, Month, OffsetDateTime, format_description::well_known::Rfc3339}
 
 use super::capture::Capture;
 use super::mask::{
-    MAX_BODY_BYTES, MAX_FIELD_BYTES, Origin, cap_text, cut_body, has_duplicate_keys, mask_form,
-    mask_headers, mask_json_from, mask_jwts, mask_raw_json_from,
+    MAX_BODY_BYTES, MAX_FIELD_BYTES, Origin, cap_text, cap_text_of, cut_body, has_duplicate_keys,
+    json_cut_point, json_len, mask_form, mask_headers, mask_json_within, mask_jwts,
+    mask_raw_json_from,
 };
 use super::rotate::{LogFile, plan_deletions};
 use crate::{Result, io_err};
@@ -145,50 +146,145 @@ impl LogEntry {
             .message
             .take()
             .map(|m| cap_text(&mask_jwts(&m), MAX_FIELD_BYTES));
-        // A raw body with a repeated key is left out (see `mask_raw_json_from`); the flag keeps
-        // the fact that the device sent one.
-        let dup = |r: &Option<String>| r.as_deref().is_some_and(has_duplicate_keys);
-        if (dup(&self.request_body_raw) || dup(&self.response_body_raw))
-            && !self.flags.iter().any(|f| f == FLAG_DUPLICATE_KEYS)
-        {
-            self.flags.push(FLAG_DUPLICATE_KEYS.to_string());
-        }
         // Request bodies and in-frames come from the device, responses and out-frames from the
         // server (`code` is masked only in device data, see `Origin`).
-        let (body, raw) = sanitize_body(
+        let request = sanitize_body(
             self.request_body.take(),
             self.request_body_raw.take(),
             Origin::Client,
         );
-        (self.request_body, self.request_body_raw) = (body, raw);
-        let (body, raw) = sanitize_body(
+        (self.request_body, self.request_body_raw) = (request.body, request.raw);
+        let response = sanitize_body(
             self.response_body.take(),
             self.response_body_raw.take(),
             Origin::Server,
         );
-        (self.response_body, self.response_body_raw) = (body, raw);
+        (self.response_body, self.response_body_raw) = (response.body, response.raw);
+        // A raw body with a repeated key is left out (see `mask_raw_json_from`); the flag keeps
+        // the fact that the device sent one.
+        if (request.duplicate_keys || response.duplicate_keys)
+            && !self.flags.iter().any(|f| f == FLAG_DUPLICATE_KEYS)
+        {
+            self.flags.push(FLAG_DUPLICATE_KEYS.to_string());
+        }
         self
     }
+}
+
+/// A body and its raw text as they are logged.
+struct Sanitized {
+    body: Option<Value>,
+    raw: Option<String>,
+    /// The raw text (the part of it that was looked at) has a repeated key.
+    duplicate_keys: bool,
 }
 
 /// Mask and cut a body and its raw text. The raw text is kept only when its masked form differs
 /// from the masked, re-serialized body, and only when it can be masked safely
 /// ([`mask_raw_json_from`]).
-fn sanitize_body(
-    body: Option<Value>,
-    raw: Option<String>,
-    origin: Origin,
-) -> (Option<Value>, Option<String>) {
+///
+/// A body whose masked keys and leaves fit [`MAX_BODY_BYTES`] is masked whole, as is a raw text
+/// of at most that size (or whose masked form fits it). A larger one is cut first and only the kept part is masked: the body as a value
+/// ([`mask_json_within`]), the raw text at the end of a value, closed again so that it is still
+/// JSON ([`json_cut_point`]) and so gets every check of [`mask_raw_json_from`]. What is cut off
+/// never reaches the log. The cut note then names the size before masking.
+fn sanitize_body(body: Option<Value>, raw: Option<String>, origin: Origin) -> Sanitized {
+    let raw = raw.map(|r| {
+        let masked = mask_raw_kept(&r, origin);
+        (r.len(), masked)
+    });
+    let duplicate_keys = raw.as_ref().is_some_and(|(_, m)| m.duplicate_keys);
     let Some(body) = body else {
-        return (None, None);
+        return Sanitized {
+            body: None,
+            raw: None,
+            duplicate_keys,
+        };
     };
-    let masked = mask_json_from(&body, origin);
-    let reserialized = masked.to_string();
-    let raw = raw
-        .and_then(|r| mask_raw_json_from(&r, origin))
-        .filter(|r| *r != reserialized)
-        .map(|r| cap_text(&r, MAX_BODY_BYTES));
-    (Some(cut_body(&masked)), raw)
+    let (masked, body_cut) = mask_json_within(&body, origin, MAX_BODY_BYTES);
+    let text = masked.to_string();
+    let logged_body = if body_cut {
+        Value::String(cap_text_of(&text, MAX_BODY_BYTES, json_len(&body)))
+    } else {
+        cut_body(&masked)
+    };
+    let raw = raw.and_then(|(len, m)| {
+        let r = m.text?;
+        let same = if body_cut || m.cut {
+            // Only the first MAX_BODY_BYTES of each are logged.
+            r.len() > MAX_BODY_BYTES
+                && text.len() > MAX_BODY_BYTES
+                && r.as_bytes()[..MAX_BODY_BYTES] == text.as_bytes()[..MAX_BODY_BYTES]
+        } else {
+            r == text
+        };
+        (!same).then(|| {
+            if m.cut {
+                cap_text_of(&r, MAX_BODY_BYTES, len)
+            } else {
+                cap_text(&r, MAX_BODY_BYTES)
+            }
+        })
+    });
+    Sanitized {
+        body: Some(logged_body),
+        raw,
+        duplicate_keys,
+    }
+}
+
+/// A raw text after [`mask_raw_kept`].
+struct RawMasked {
+    /// The masked text, `None` when it cannot be masked safely.
+    text: Option<String>,
+    /// `text` is only the first part of the raw text, closed again.
+    cut: bool,
+    duplicate_keys: bool,
+}
+
+/// Mask a raw text with [`mask_raw_json_from`]: whole when it is at most [`MAX_BODY_BYTES`] long
+/// or its masked form would fit that size, else only a first part that ends after a complete
+/// value and is closed again, long enough to fill [`MAX_BODY_BYTES`] once masked.
+fn mask_raw_kept(raw: &str, origin: Origin) -> RawMasked {
+    let whole = || RawMasked {
+        text: mask_raw_json_from(raw, origin),
+        cut: false,
+        duplicate_keys: has_duplicate_keys(raw),
+    };
+    if raw.len() <= MAX_BODY_BYTES {
+        return whole();
+    }
+    let mut min = MAX_BODY_BYTES;
+    loop {
+        let Some((end, close)) = json_cut_point(raw, min) else {
+            return whole();
+        };
+        let kept = format!("{}{close}", &raw[..end]);
+        if has_duplicate_keys(&kept) {
+            return RawMasked {
+                text: None,
+                cut: true,
+                duplicate_keys: true,
+            };
+        }
+        let Some(masked) = mask_raw_json_from(&kept, origin) else {
+            return RawMasked {
+                text: None,
+                cut: true,
+                duplicate_keys: false,
+            };
+        };
+        // The closing brackets must lie after the part that is logged.
+        if masked.len() > MAX_BODY_BYTES + close.len() {
+            return RawMasked {
+                text: Some(masked),
+                cut: true,
+                duplicate_keys: false,
+            };
+        }
+        // Masking made the part shorter: take more.
+        min = end.max(min).saturating_mul(2);
+    }
 }
 
 struct State {

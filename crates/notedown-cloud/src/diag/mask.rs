@@ -181,6 +181,102 @@ pub fn mask_json_from(value: &Value, origin: Origin) -> Value {
     }
 }
 
+/// [`mask_json_from`] that stops once the masked text passes `budget` bytes: the rest of every
+/// open array and object is left out. Returns the masked value and whether something was left
+/// out; without a cut the value equals the one of [`mask_json_from`].
+///
+/// Only the masked keys and leaves are counted (no quotes, escapes or punctuation), so a cut means
+/// the masked text of the whole value is over `budget` too, and the text of the kept value agrees
+/// with it beyond `budget` bytes. Keys and leaves are masked whole before they are kept, never cut.
+pub(crate) fn mask_json_within(value: &Value, origin: Origin, budget: usize) -> (Value, bool) {
+    let mut used = 0;
+    let mut cut = false;
+    let masked = mask_within(value, origin, budget, &mut used, &mut cut);
+    (masked, cut)
+}
+
+fn mask_within(
+    value: &Value,
+    origin: Origin,
+    budget: usize,
+    used: &mut usize,
+    cut: &mut bool,
+) -> Value {
+    let leaf_len = |v: &Value| match v {
+        Value::String(s) => s.len(),
+        _ => 1,
+    };
+    match value {
+        Value::Object(map) => {
+            // The entries in the order of the masked object: by masked key, and of two keys that
+            // mask to the same one the later wins, as when `mask_json_from` collects them.
+            let entries: BTreeMap<String, (&String, &Value)> =
+                map.iter().map(|(k, v)| (mask_jwts(k), (k, v))).collect();
+            let mut out = serde_json::Map::new();
+            for (key, (k, v)) in entries {
+                if *used > budget {
+                    *cut = true;
+                    break;
+                }
+                *used += key.len();
+                let v = if is_sensitive_key_from(k, origin) {
+                    let m = mask_value(v);
+                    *used += leaf_len(&m);
+                    m
+                } else {
+                    mask_within(v, origin, budget, used, cut)
+                };
+                out.insert(key, v);
+                if *cut {
+                    break;
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => {
+            let mut out = Vec::new();
+            for v in items {
+                if *used > budget {
+                    *cut = true;
+                    break;
+                }
+                out.push(mask_within(v, origin, budget, used, cut));
+                if *cut {
+                    break;
+                }
+            }
+            Value::Array(out)
+        }
+        Value::String(s) => {
+            let m = mask_text_from(s, origin);
+            *used += m.len();
+            Value::String(m)
+        }
+        other => {
+            *used += 1;
+            other.clone()
+        }
+    }
+}
+
+/// The length of the JSON text of a value, without building the text.
+pub(crate) fn json_len(value: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    // Writing a `Value` to a writer that never fails cannot fail.
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
+}
+
 fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -395,6 +491,88 @@ impl<'de> serde::de::Visitor<'de> for DupVisitor {
     }
 }
 
+/// Where a JSON text can be cut so that the kept part, closed again, is still JSON: the end of
+/// the first array element or object member that ends at or after byte `min` while an array or
+/// object is still open, and the brackets that close the open ones. `None` when the text ends
+/// before (nothing to cut) or does not read as JSON.
+pub(crate) fn json_cut_point(s: &str, min: usize) -> Option<(usize, String)> {
+    let b = s.as_bytes();
+    // Open containers: `{` or `[`, and for an object whether a key comes next.
+    let mut open: Vec<(u8, bool)> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let end = match b[i] {
+            b' ' | b'\t' | b'\n' | b'\r' | b':' => {
+                i += 1;
+                continue;
+            }
+            b',' => {
+                if let Some((b'{', key_next)) = open.last_mut() {
+                    *key_next = true;
+                }
+                i += 1;
+                continue;
+            }
+            c @ (b'{' | b'[') => {
+                open.push((c, c == b'{'));
+                i += 1;
+                continue;
+            }
+            c @ (b'}' | b']') => {
+                let (o, _) = open.pop()?;
+                if (o == b'{') != (c == b'}') {
+                    return None;
+                }
+                i + 1
+            }
+            b'"' => {
+                let mut k = i + 1;
+                loop {
+                    match b.get(k)? {
+                        b'\\' => k += 2,
+                        b'"' => break,
+                        _ => k += 1,
+                    }
+                }
+                if let Some((b'{', key_next)) = open.last_mut()
+                    && *key_next
+                {
+                    // A key, not a value.
+                    *key_next = false;
+                    i = k + 1;
+                    continue;
+                }
+                k + 1
+            }
+            _ => {
+                let mut k = i;
+                while k < b.len()
+                    && !matches!(
+                        b[k],
+                        b',' | b']' | b'}' | b':' | b' ' | b'\t' | b'\n' | b'\r'
+                    )
+                {
+                    k += 1;
+                }
+                k
+            }
+        };
+        if open.is_empty() {
+            return None;
+        }
+        if end >= min {
+            let close = open
+                .iter()
+                .rev()
+                .map(|(o, _)| if *o == b'{' { '}' } else { ']' })
+                .collect();
+            return Some((end, close));
+        }
+        i = end;
+    }
+    None
+}
+
 fn is_key_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
 }
@@ -513,6 +691,12 @@ pub fn mask_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, Stri
 
 /// Cut a text at `max` bytes (on a char boundary) and append a note.
 pub fn cap_text(s: &str, max: usize) -> String {
+    cap_text_of(s, max, s.len())
+}
+
+/// [`cap_text`] for a text that is the kept part of a longer one: the note names `total`, the
+/// size of the whole.
+pub(crate) fn cap_text_of(s: &str, max: usize, total: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
@@ -520,7 +704,7 @@ pub fn cap_text(s: &str, max: usize) -> String {
     while !s.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}... <cut: {} of {} bytes kept>", &s[..end], end, s.len())
+    format!("{}... <cut: {} of {} bytes kept>", &s[..end], end, total)
 }
 
 /// Cut a body larger than [`MAX_BODY_BYTES`]: it becomes a string holding a prefix and a note.
@@ -531,4 +715,94 @@ pub fn cut_body(value: &Value) -> Value {
         return value.clone();
     }
     Value::String(cap_text(&text, MAX_BODY_BYTES))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJ1c2VySWQiOjF9.c2lnbmF0dXJl";
+
+    fn samples() -> Vec<Value> {
+        vec![
+            json!({"a": 1, "password": "pw", "token": {"inner": "SECRET"}, "n": null}),
+            json!([{"code": 123456, "x": JWT}, "{\"token\":\"abc\"}", "a=1&sign=2", [true, 1.5]]),
+            json!({"entries": (0..200).map(|i| json!({"name": format!("f{i}"), "sign": "s", "t": JWT})).collect::<Vec<_>>()}),
+            json!("plain"),
+            // A JWT-shaped key sorts as its placeholder; two such keys of the same length mask
+            // to the same key.
+            json!({"a": 1, JWT: "first", "b": [1, 2], "eyJhbGciOiJIUzI1NiJ9.eyJ1c2VySWQiOjJ9.c2lnbmF0dXJl": "second"}),
+        ]
+    }
+
+    #[test]
+    fn mask_within_without_a_cut_equals_mask_json_from() {
+        for origin in [Origin::Client, Origin::Server] {
+            for v in samples() {
+                assert_eq!(
+                    mask_json_within(&v, origin, usize::MAX),
+                    (mask_json_from(&v, origin), false)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mask_within_keeps_the_masked_text_up_to_the_budget() {
+        for origin in [Origin::Client, Origin::Server] {
+            for v in samples() {
+                let full = mask_json_from(&v, origin).to_string();
+                for budget in (0..full.len() + 10).step_by(29) {
+                    let (kept, cut) = mask_json_within(&v, origin, budget);
+                    if cut {
+                        let text = kept.to_string();
+                        assert!(full.len() > budget, "{budget}");
+                        assert!(text.len() > budget, "{budget}");
+                        assert_eq!(text[..budget], full[..budget], "{budget}");
+                    } else {
+                        assert_eq!(kept, mask_json_from(&v, origin), "{budget}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn json_len_is_the_length_of_the_text() {
+        for v in samples() {
+            assert_eq!(json_len(&v), v.to_string().len());
+        }
+    }
+
+    #[test]
+    fn json_cut_point_closes_to_valid_json() {
+        let texts = [
+            r#"{"a]": "}\"{", "b" : [1, 2.5e3, true, null, {"c": "x\\"}], "d": {}}"#,
+            r#"[ {"k":"v"} , [ [ ] ] , "s" , -1 ]"#,
+            "{\n  \"a\": 1,\n  \"b\": [\"x\", \"y\"]\n}",
+        ];
+        for t in texts {
+            let mut cuts = 0;
+            for min in 0..=t.len() + 1 {
+                match json_cut_point(t, min) {
+                    Some((end, close)) => {
+                        assert!(end >= min && end < t.len(), "{t} {min}");
+                        let kept = format!("{}{close}", &t[..end]);
+                        serde_json::from_str::<Value>(&kept)
+                            .unwrap_or_else(|e| panic!("{kept}: {e}"));
+                        cuts += 1;
+                    }
+                    None => assert!(min > 0, "{t}"),
+                }
+            }
+            assert!(cuts > 0, "{t}");
+        }
+        // Not JSON, or nothing to cut.
+        assert_eq!(json_cut_point("]", 0), None);
+        assert_eq!(json_cut_point("[1}", 3), None);
+        assert_eq!(json_cut_point(r#""abc"#, 0), None);
+        assert_eq!(json_cut_point("42", 0), None);
+        assert_eq!(json_cut_point("[1]", 3), None);
+    }
 }

@@ -964,3 +964,213 @@ fn duplicate_keys_never_let_a_secret_through_raw_text() {
     let (text, _) = one_line(dir.path());
     assert!(!text.contains("hunter2"), "{text}");
 }
+
+// ---- body sizes: small bodies log as before, large ones are cut before they are masked ----
+
+/// The lines that the log wrote for small bodies before large bodies were cut first. They must
+/// not change.
+#[test]
+fn small_bodies_log_exactly_as_before() {
+    let x = "x".repeat(MAX_BODY_BYTES - 20);
+    let ones = format!("[{}]", vec!["1"; 40_000].join(","));
+    let expected = [
+        r#"{"ts":"2026-10-06T12:00:00Z","kind":"request","method":"POST","path":"/api/a","request_body":{"a":"y","code":"<masked:6 chars>","e":"{\"token\":\"<masked:3 chars>\"}","password":"<masked:8 chars>","t":"<masked:50 chars>","z":1.5},"request_body_raw":"{\"z\":1.50,\"password\":\"<masked:8 chars>\",\"code\":\"<masked:6 chars>\",\"a\":\"y\",\"t\":\"<masked:50 chars>\",\"e\":\"{\\\"token\\\":\\\"<masked:3 chars>\\\"}\"}"}"#.to_string(),
+        r#"{"ts":"2026-10-06T12:00:00Z","kind":"request","response_body":{"a":"y","code":123456,"e":"{\"token\":\"<masked:3 chars>\"}","password":"<masked:8 chars>","t":"<masked:50 chars>","z":1.5},"response_body_raw":"{\"z\":1.50,\"password\":\"<masked:8 chars>\",\"code\":123456,\"a\":\"y\",\"t\":\"<masked:50 chars>\",\"e\":\"{\\\"token\\\":\\\"<masked:3 chars>\\\"}\"}"}"#.to_string(),
+        r#"{"ts":"2026-10-06T12:00:00Z","kind":"request","method":"POST","path":"/api/b","request_body":{"a":1,"password":"<masked:1 chars>"},"flags":["duplicate_keys"]}"#.to_string(),
+        format!(
+            r#"{{"ts":"2026-10-06T12:00:00Z","kind":"request","method":"POST","path":"/api/c","request_body":{{"a":"{x}"}},"request_body_raw":"{{\"a\": \"{x}\"}}"}}"#
+        ),
+        r#"{"ts":"2026-10-06T12:00:00Z","kind":"request","method":"POST","path":"/api/d","request_body":{"token":"<masked:65636 chars>"},"request_body_raw":"{\"token\": \"<masked:65636 chars>\"}"}"#.to_string(),
+        format!(
+            r#"{{"ts":"2026-10-06T12:00:00Z","kind":"request","response_body":"{}... <cut: {} of {} bytes kept>"}}"#,
+            &ones[..MAX_BODY_BYTES],
+            MAX_BODY_BYTES,
+            ones.len()
+        ),
+    ];
+    let entries = pin_entries();
+    assert_eq!(entries.len(), expected.len());
+    for (e, want) in entries.into_iter().zip(expected) {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        log.record(e);
+        let (text, _) = one_line(dir.path());
+        assert_eq!(text.trim_end(), want);
+    }
+}
+
+/// Small bodies pinned by [`small_bodies_log_exactly_as_before`]: client and server `code`, a JWT,
+/// JSON inside a string, a raw text that differs (`1.50`), duplicate keys, a body just under the
+/// cap, a body only over the cap before it is masked, and a body whose leaves fit the cap but whose
+/// text does not.
+fn pin_entries() -> Vec<LogEntry> {
+    let mut out = Vec::new();
+    let raw = format!(
+        r#"{{"z":1.50,"password":"SECRETPW","code":123456,"a":"y","t":"{JWT}","e":"{{\"token\":\"abc\"}}"}}"#
+    );
+    let mut e = req("/api/a");
+    e.request_body = Some(serde_json::from_str(&raw).unwrap());
+    e.request_body_raw = Some(raw.clone());
+    out.push(e);
+    let mut e = LogEntry::new(LogKind::Request);
+    e.response_body = Some(serde_json::from_str(&raw).unwrap());
+    e.response_body_raw = Some(raw);
+    out.push(e);
+    let raw = r#"{"password":"hunter2","password":"x","a":1}"#;
+    let mut e = req("/api/b");
+    e.request_body = Some(serde_json::from_str(raw).unwrap());
+    e.request_body_raw = Some(raw.into());
+    out.push(e);
+    let raw = format!(r#"{{"a": "{}"}}"#, "x".repeat(MAX_BODY_BYTES - 20));
+    let mut e = req("/api/c");
+    e.request_body = Some(serde_json::from_str(&raw).unwrap());
+    e.request_body_raw = Some(raw);
+    out.push(e);
+    let raw = format!(r#"{{"token": "{}"}}"#, "y".repeat(MAX_BODY_BYTES + 100));
+    let mut e = req("/api/d");
+    e.request_body = Some(serde_json::from_str(&raw).unwrap());
+    e.request_body_raw = Some(raw);
+    out.push(e);
+    let mut e = LogEntry::new(LogKind::Request);
+    e.response_body = Some(Value::Array(vec![json!(1); 40_000]));
+    out.push(e);
+    out
+}
+
+/// A listing over the body cap as the server writes it (keys not in the order of a parsed
+/// value): secrets in the first entries and in the last one, which is cut off.
+fn large_listing() -> (Value, String) {
+    let late_jwt = "eyJsYXRlIjoxfQ.eyJsYXRlIjoxfQ.bGF0ZQ";
+    let entries: Vec<String> = (0..3000)
+        .map(|i| {
+            let (pw, jwt) = match i {
+                0..3 => (format!("EARLYPW{i}"), JWT),
+                2999 => ("LATEPW".to_string(), late_jwt),
+                _ => ("".to_string(), "none"),
+            };
+            format!(
+                r#"{{"name":"file-{i}.note","password":"{pw}","code":"98765{i}","data":"{jwt}","size":{i}}}"#
+            )
+        })
+        .collect();
+    let raw = format!(r#"{{"success":true,"entries":[{}]}}"#, entries.join(","));
+    (serde_json::from_str(&raw).unwrap(), raw)
+}
+
+#[test]
+fn a_large_body_is_cut_before_it_is_masked_and_logs_no_secret() {
+    use notedown_cloud::diag::{mask_json_from, mask_raw_json_from};
+    let (body, raw) = large_listing();
+    for origin in [Origin::Client, Origin::Server] {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = notedown_cloud::diag::Capture::open(dir.path()).unwrap();
+        let log = open_log(dir.path()).with_capture(capture);
+        let mut e = req("/api/file/list/query");
+        if origin == Origin::Client {
+            e.request_body = Some(body.clone());
+            e.request_body_raw = Some(raw.clone());
+        } else {
+            e.response_body = Some(body.clone());
+            e.response_body_raw = Some(raw.clone());
+        }
+        log.record(e);
+        let (text, v) = one_line(dir.path());
+        for secret in ["EARLYPW", "LATEPW", "eyJ"] {
+            assert!(!text.contains(secret), "{secret}");
+        }
+        assert_eq!(text.contains("987650"), origin == Origin::Server);
+        let field = if origin == Origin::Client {
+            "request_body"
+        } else {
+            "response_body"
+        };
+        // The kept part is the start of the whole body masked, as before; the note names the
+        // size before masking.
+        let logged = v[field].as_str().unwrap();
+        let whole = mask_json_from(&body, origin).to_string();
+        assert_eq!(logged[..MAX_BODY_BYTES], whole[..MAX_BODY_BYTES]);
+        assert_eq!(
+            &logged[MAX_BODY_BYTES..],
+            format!(
+                "... <cut: {MAX_BODY_BYTES} of {} bytes kept>",
+                body.to_string().len()
+            )
+        );
+        assert!(logged.contains(r#""password":"<masked:8 chars>""#));
+        assert!(logged.contains(&format!(r#""data":"<masked:{} chars>""#, JWT.len())));
+        // The raw text is cut and masked the same way.
+        let logged = v[format!("{field}_raw")].as_str().unwrap();
+        let whole = mask_raw_json_from(&raw, origin).unwrap();
+        assert_eq!(logged[..MAX_BODY_BYTES], whole[..MAX_BODY_BYTES]);
+        assert_eq!(
+            &logged[MAX_BODY_BYTES..],
+            format!("... <cut: {MAX_BODY_BYTES} of {} bytes kept>", raw.len())
+        );
+        assert!(v.get("flags").is_none(), "{:?}", v.get("flags"));
+        for entry in std::fs::read_dir(dir.path().join("capture")).unwrap() {
+            let dump = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            for secret in ["EARLYPW", "LATEPW", "eyJ"] {
+                assert!(!dump.contains(secret), "{secret}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_large_body_with_repeated_keys_leaks_neither_value() {
+    let entries: Vec<String> = (0..3000)
+        .map(|i| format!(r#"{{"name":"file-{i}.note"}}"#))
+        .collect();
+    let entries = entries.join(",");
+    let token_obj = r#"{"token":"hunter2","token":"hunter3"}"#;
+    for (raw, kept_dup) in [
+        // Both in the kept part: the raw text is left out and the flag is set.
+        (
+            format!(r#"{{"a":{token_obj},"entries":[{entries}]}}"#),
+            true,
+        ),
+        // One before the cut, one after.
+        (
+            format!(r#"{{"password":"hunter2","entries":[{entries}],"password":"hunter3"}}"#),
+            false,
+        ),
+        // Both after the cut.
+        (
+            format!(r#"{{"entries":[{entries}],"z":{token_obj}}}"#),
+            false,
+        ),
+        // An escaped key name in the kept part that the substring masker cannot read, its
+        // plain twin after the cut: only the structural check on the kept part stops it.
+        (
+            esc(&format!(
+                r#"{{"PASSW":"hunter2","entries":[{entries}],"password":"x"}}"#
+            )),
+            false,
+        ),
+        // A secret object under a sensitive key in the kept part.
+        (
+            format!(r#"{{"a":{{"token":{{"x":"hunter2"}}}},"entries":[{entries}]}}"#),
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let mut e = req("/api/x");
+        e.request_body = Some(serde_json::from_str(&raw).unwrap());
+        e.request_body_raw = Some(raw.clone());
+        log.record(e);
+        let (text, v) = one_line(dir.path());
+        assert!(!text.contains("hunter"), "{}", &raw[..80]);
+        assert!(v["request_body"].as_str().unwrap().contains("<cut: "));
+        assert_eq!(
+            v.get("flags").is_some(),
+            kept_dup,
+            "{}: {:?}",
+            &raw[..80],
+            v.get("flags")
+        );
+        if kept_dup {
+            assert!(v.get("request_body_raw").is_none());
+        }
+    }
+}

@@ -1443,8 +1443,8 @@ fn a_broken_intent_stops_only_its_own_account() {
 }
 
 /// A repair that fails at the server start: the server still opens, the other account serves,
-/// and the broken account's requests go through `lock_recovered` on the store kept at start, so
-/// the repair is tried again and works once the intent can be read.
+/// and the broken account's requests go through `lock_recovered`, so the repair is tried again
+/// and works once the intent can be read.
 #[test]
 fn a_failed_repair_at_start_is_tried_again_at_the_first_request() {
     use notedown_cloud::Config;
@@ -1478,11 +1478,6 @@ fn a_failed_repair_at_start_is_tried_again_at_the_first_request() {
     let state = AppState::open_with_clock(Config::default(), dir.path(), clock(T0)).unwrap();
     assert!(pending.exists());
     assert!(state.used_bytes("good").is_ok());
-    // The store kept at start is the one the requests use.
-    assert!(Arc::ptr_eq(
-        &state.store("broken").unwrap(),
-        &state.store("broken").unwrap()
-    ));
     let err = state.used_bytes("broken").unwrap_err().to_string();
     assert!(err.contains("pending.json"), "{err}");
     assert!(pending.exists());

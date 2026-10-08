@@ -303,9 +303,15 @@ fn same_file(a: &Path, b: &Path) -> bool {
             _ => false,
         }
     }
+    // `canonicalize` gives the spelling on disk, so two spellings of one file on a
+    // case-insensitive folder compare equal, and two real files on a case-sensitive folder
+    // don't.
     #[cfg(not(unix))]
     {
-        a.as_os_str().eq_ignore_ascii_case(b.as_os_str()) && a.exists()
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
     }
 }
 

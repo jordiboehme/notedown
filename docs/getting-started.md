@@ -210,7 +210,7 @@ After `notedown cloud import --replace` every file gets a new id. The old versio
 
 ## PDFs of your notes
 
-Set `render_dir` in `server.toml` to a folder, for example `render_dir = "~/Documents/Supernote PDFs"`. The folder must exist. The subfolder of an account must not be the data folder or lie inside it. The server keeps a PDF of every note there, in one subfolder per account, with the same folders as on the device. A changed note is rendered again a few seconds after the sync. A moved or deleted note moves or deletes its PDF. Other files in that folder are never touched. To render everything again, run `notedown cloud render --data <data folder> --all`. For one note without the server, run `notedown render <file.note> --pdf`.
+Set `render_dir` in `server.toml` to a folder, for example `render_dir = "~/Documents/Supernote PDFs"`. The folder must exist. The subfolder of an account must not be the data folder, lie inside it or hold it. The server keeps a PDF of every note there, in one subfolder per account, with the same folders as on the device. A changed note is rendered again a few seconds after the sync. A moved or deleted note moves or deletes its PDF. Other files in that folder are never touched. To render everything again, run `notedown cloud render --data <data folder> --all`. For one note without the server, run `notedown render <file.note> --pdf`.
 
 ## What to expect
 

@@ -577,6 +577,50 @@ fn a_render_folder_on_the_data_folder_is_refused() {
 }
 
 #[test]
+fn a_render_folder_that_holds_the_data_folder_is_refused() {
+    // `<root>/acc` holds the data folder: the pass would write next to it.
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("acc/notedown-data");
+    std::fs::create_dir_all(&data).unwrap();
+    Accounts::new(&data)
+        .create("acc", "acc@example.org", "secret")
+        .unwrap();
+    let store = Store::open(&data, "acc").unwrap();
+    {
+        let g = store.lock().unwrap();
+        store.ensure_native_folders(&g).unwrap();
+    }
+    let err = render_account(
+        &store,
+        root.path(),
+        &PassOptions {
+            all: false,
+            wait_for_lock: true,
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("holds the data folder"), "{err}");
+    assert!(!root.path().join("acc").join(MANIFEST_FILE).exists());
+    assert!(!root.path().join("acc").join(LOCK_FILE).exists());
+
+    // A root that holds the data folder while `<root>/acc` does not is fine.
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("notedown-data");
+    std::fs::create_dir(&data).unwrap();
+    Accounts::new(&data)
+        .create("acc", "acc@example.org", "secret")
+        .unwrap();
+    let store = Store::open(&data, "acc").unwrap();
+    {
+        let g = store.lock().unwrap();
+        store.ensure_native_folders(&g).unwrap();
+    }
+    assert!(!pass(&store, root.path()).busy);
+    assert!(root.path().join("acc").join(MANIFEST_FILE).exists());
+}
+
+#[test]
 fn a_busy_lock_skips_the_pass_without_waiting() {
     let fx = Fx::new();
     fx.write("NOTE/Note/a.note", &fixture_note("test1"));

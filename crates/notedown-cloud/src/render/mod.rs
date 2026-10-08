@@ -103,7 +103,7 @@ pub fn render_account(store: &Store, root: &Path, opts: &PassOptions) -> Result<
 }
 
 /// `<root>/<slug>`, created. `root` must be an existing folder, and `<root>/<slug>` must be
-/// neither the data folder nor inside it (`root` may be the data folder's parent).
+/// neither the data folder, nor inside it, nor hold it (`root` may hold the data folder).
 fn account_dir(store: &Store, root: &Path) -> Result<PathBuf> {
     let invalid = |message: String| Error::Invalid {
         what: "render_dir",
@@ -124,13 +124,22 @@ fn account_dir(store: &Store, root: &Path) -> Result<PathBuf> {
     // `<data>/accounts/<slug>` is the account folder.
     if let Some(data) = store.account_dir().parent().and_then(Path::parent)
         && let Ok(real_data) = data.canonicalize()
-        && real_dir.starts_with(&real_data)
     {
-        return Err(invalid(format!(
-            "{} is inside the data folder {} or is that folder",
-            dir.display(),
-            data.display()
-        )));
+        if real_dir.starts_with(&real_data) {
+            return Err(invalid(format!(
+                "{} is inside the data folder {} or is that folder",
+                dir.display(),
+                data.display()
+            )));
+        }
+        // The other way round, the pass would write PDFs and prune folders next to the data.
+        if real_data.starts_with(&real_dir) {
+            return Err(invalid(format!(
+                "{} holds the data folder {}",
+                dir.display(),
+                data.display()
+            )));
+        }
     }
     std::fs::create_dir_all(&dir).map_err(io_err(&dir))?;
     Ok(dir)

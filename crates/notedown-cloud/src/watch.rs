@@ -18,6 +18,22 @@ pub const QUIET: Duration = Duration::from_secs(2);
 /// How long the scopes of an account whose sync lock was held wait at most for the next try.
 const RETRY: Duration = Duration::from_secs(5);
 
+/// The times of the watch (tests use shorter ones).
+#[derive(Debug, Clone, Copy)]
+pub struct Timing {
+    /// How long no new event may arrive before the changed folders are scanned.
+    pub quiet: Duration,
+    /// How often a missing `<data>/accounts` is looked for again.
+    pub missing: Duration,
+}
+
+impl Timing {
+    pub const DEFAULT: Timing = Timing {
+        quiet: QUIET,
+        missing: Duration::from_secs(30),
+    };
+}
+
 /// What a watch scan covers in one account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
@@ -107,41 +123,79 @@ struct Batch {
     all: bool,
 }
 
-/// Watch `<data>/accounts` and scan the changed folders of each account after `quiet` without
-/// a new event ([`AppState::scan_account`]). The scopes of an account whose sync lock is held
-/// are kept for the next round, which starts after the next quiet time, at the latest after
-/// 5 s. Runs until aborted; returns at once (with a warning) when the watch can't start.
-pub async fn run(state: Arc<AppState>, quiet: Duration) {
+/// Why the watch could not start.
+enum SetupError {
+    /// `<data>/accounts` does not exist (yet).
+    Missing,
+    Failed(String),
+}
+
+/// Start a recursive watch on `accounts` that sends its events to `tx`; the canonical path of
+/// `accounts` and the watcher. Blocking: a recursive watch on Linux walks the whole tree.
+fn setup(
+    accounts: &Path,
+    tx: tokio::sync::mpsc::UnboundedSender<notify::Result<notify::Event>>,
+) -> Result<(PathBuf, notify::RecommendedWatcher), SetupError> {
+    let failed = |e: &dyn std::fmt::Display| SetupError::Failed(e.to_string());
+    // File systems report canonical paths (`/private/var` on macOS for `/var`).
+    let dir = std::fs::canonicalize(accounts).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => SetupError::Missing,
+        _ => failed(&e),
+    })?;
+    // The callback runs on notify's thread; after an abort the receiver is gone.
+    let mut watcher = notify::recommended_watcher(move |r| {
+        let _ = tx.send(r);
+    })
+    .map_err(|e| failed(&e))?;
+    watcher
+        .watch(&dir, RecursiveMode::Recursive)
+        .map_err(|e| failed(&e))?;
+    Ok((dir, watcher))
+}
+
+/// Watch `<data>/accounts` and scan the changed folders of each account after `timing.quiet`
+/// without a new event ([`AppState::scan_account`]). The scopes of an account whose sync lock
+/// is held are kept for the next round, which starts after the next quiet time, at the latest
+/// after 5 s. While `<data>/accounts` does not exist, it is looked for every `timing.missing`;
+/// once it appears, every account is scanned whole once and the watch starts. Runs until
+/// aborted; returns at once (with a warning) when the watch can't start.
+pub async fn run(state: Arc<AppState>, timing: Timing) {
+    let quiet = timing.quiet;
     let off = |e: &dyn std::fmt::Display| {
         eprintln!("notedown cloud: watch: {e}, hand changes wait for the timer scan");
     };
     let accounts = state.data_dir.join("accounts");
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    // The setup runs off the async threads: a recursive watch on Linux walks the whole tree.
-    let setup = tokio::task::spawn_blocking(move || {
-        // File systems report canonical paths (`/private/var` on macOS for `/var`).
-        let dir = std::fs::canonicalize(&accounts).map_err(|e| e.to_string())?;
-        // The callback runs on notify's thread; after an abort the receiver is gone.
-        let mut watcher = notify::recommended_watcher(move |r| {
-            let _ = tx.send(r);
-        })
-        .map_err(|e| e.to_string())?;
-        watcher
-            .watch(&dir, RecursiveMode::Recursive)
-            .map_err(|e| e.to_string())?;
-        Ok::<_, String>((dir, watcher))
-    })
-    .await;
+    let mut late = false;
     // The watcher lives as long as this function, so the channel stays open.
-    let (dir, _watcher) = match setup {
-        Ok(Ok(w)) => w,
-        Ok(Err(e)) => return off(&e),
-        Err(e) => return off(&e),
+    let (dir, _watcher) = loop {
+        let (path, tx) = (accounts.clone(), tx.clone());
+        match tokio::task::spawn_blocking(move || setup(&path, tx)).await {
+            Ok(Ok(w)) => break w,
+            Ok(Err(SetupError::Missing)) => {
+                if !late {
+                    eprintln!(
+                        "notedown cloud: watch: {} does not exist yet, the watch starts when \
+                         it appears",
+                        accounts.display()
+                    );
+                }
+                late = true;
+                tokio::time::sleep(timing.missing).await;
+            }
+            Ok(Err(SetupError::Failed(e))) => return off(&e),
+            Err(e) => return off(&e),
+        }
     };
-    let mut batch = Batch::default();
+    drop(tx);
+    let mut batch = Batch {
+        // Files may have come in before the watch started.
+        all: late,
+        ..Batch::default()
+    };
+    let mut due: Option<Instant> = late.then(|| Instant::now() + quiet);
     let mut busy: BTreeMap<String, Scope> = BTreeMap::new();
     let mut reported = HashSet::new();
-    let mut due: Option<Instant> = None;
     loop {
         let received = match due {
             None => rx.recv().await,

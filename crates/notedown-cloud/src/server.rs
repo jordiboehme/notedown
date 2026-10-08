@@ -604,7 +604,7 @@ pub async fn serve_until(
     let _watcher = state.config.watch.then(|| {
         AbortOnDrop(tokio::spawn(crate::watch::run(
             state.clone(),
-            crate::watch::QUIET,
+            crate::watch::Timing::DEFAULT,
         )))
     });
     // The hourly staging and temp file sweep (the first one ran at start) and the recycle bin

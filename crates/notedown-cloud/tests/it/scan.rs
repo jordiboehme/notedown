@@ -2260,6 +2260,51 @@ mod served {
         server.await.unwrap().unwrap();
     }
 
+    /// A data folder without `accounts/` at start: the watch starts once it appears.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_watch_starts_when_the_accounts_folder_appears() {
+        use notedown_cloud::watch::Timing;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            scan_interval: 0,
+            watch: true,
+            ..Config::default()
+        };
+        let state = AppState::open(config, dir.path()).unwrap();
+        assert!(!dir.path().join("accounts").exists());
+        let watch = tokio::spawn(notedown_cloud::watch::run(
+            state.clone(),
+            Timing {
+                quiet: Duration::from_millis(200),
+                missing: Duration::from_millis(50),
+            },
+        ));
+        // Long enough for the watch to look for the folder and miss it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!watch.is_finished(), "the watch stopped");
+        seed_imported(dir.path());
+        let rel = "NOTE/Note/hand.pdf";
+        let file = dir.path().join("accounts/jordi/files").join(rel);
+        std::fs::write(&file, b"%PDF-1.4 hand").unwrap();
+        let found = || {
+            state.journal.read_from(1).unwrap().any(|e| {
+                let e = e.unwrap();
+                e.origin == Origin::Scan
+                    && matches!(&e.body, EventBody::FileCreated { path, .. } if path == rel)
+            })
+        };
+        let end = Instant::now() + Duration::from_secs(10);
+        while !found() {
+            assert!(
+                Instant::now() < end,
+                "no scan event for the hand change in 10 s"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        watch.abort();
+    }
+
     /// A held account whose files come back into one folder: the watch scope of that folder
     /// scans the whole tree, so the hold ends at once.
     #[test]

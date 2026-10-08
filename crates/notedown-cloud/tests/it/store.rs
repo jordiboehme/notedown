@@ -322,7 +322,7 @@ fn a_second_store_sees_ids_assigned_by_another_handle() {
 // ---------------------------------------------------------------- hashes
 
 #[test]
-fn md5_is_cached_and_recomputed_on_size_or_mtime_change() {
+fn md5_is_cached_and_recomputed_on_size_mtime_or_ctime_change() {
     let (dir, store) = setup();
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
     let file = put(dir.path(), "INBOX/a.txt", b"aaaa");
@@ -335,11 +335,12 @@ fn md5_is_cached_and_recomputed_on_size_or_mtime_change() {
     assert_eq!(v["INBOX/a.txt"]["size"], 4);
     assert_eq!(v["INBOX/a.txt"]["md5"], md5_hex(b"aaaa"));
     assert!(v["INBOX/a.txt"]["mtime_ns"].is_u64());
+    assert!(v["INBOX/a.txt"]["ctime_ns"].is_u64());
 
-    // same size and mtime: the cached value is served (proves the cache is used)
+    // same size and mtime set back, but the write moved the ctime: recomputed
     std::fs::write(&file, b"bbbb").unwrap();
     set_mtime(&file, t0);
-    assert_eq!(store.md5_of(&g, &p).unwrap(), md5_hex(b"aaaa"));
+    assert_eq!(store.md5_of(&g, &p).unwrap(), md5_hex(b"bbbb"));
 
     // mtime differs: recomputed
     set_mtime(&file, t0 + Duration::from_secs(5));
@@ -362,14 +363,13 @@ fn the_hash_cache_survives_restart() {
         store.md5_of(&g, &wp("INBOX/a.txt")).unwrap();
     }
     drop(store);
-    std::fs::write(&file, b"bbbb").unwrap();
-    set_mtime(&file, t0);
+    // The file is untouched, so the reloaded row is reused: a planted MD5 is served.
+    let cache = account_dir(dir.path()).join("hashes.json");
+    let text = std::fs::read_to_string(&cache).unwrap();
+    std::fs::write(&cache, text.replace(&md5_hex(b"aaaa"), "planted")).unwrap();
     let store = Store::open(dir.path(), SLUG).unwrap();
     let g = store.lock().unwrap();
-    assert_eq!(
-        store.md5_of(&g, &wp("INBOX/a.txt")).unwrap(),
-        md5_hex(b"aaaa")
-    );
+    assert_eq!(store.md5_of(&g, &wp("INBOX/a.txt")).unwrap(), "planted");
 }
 
 #[test]

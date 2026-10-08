@@ -1,5 +1,5 @@
-//! The MD5 cache `hashes.json`: wire path -> `{size, mtime_ns, md5}`. A file is hashed again
-//! when its size or mtime differs from the cached row.
+//! The MD5 cache `hashes.json`: wire path -> `{size, mtime_ns, ctime_ns, md5}`. A file is hashed
+//! again when its size, mtime or ctime differs from the cached row.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -19,6 +19,9 @@ pub(crate) const HASHES_FILE: &str = "hashes.json";
 pub(crate) struct HashRow {
     pub size: u64,
     pub mtime_ns: u64,
+    /// Missing in rows written before the ctime was checked: such a row never matches.
+    #[serde(default)]
+    pub ctime_ns: Option<u64>,
     pub md5: String,
 }
 
@@ -34,6 +37,24 @@ pub(crate) fn mtime_ns(meta: &std::fs::Metadata) -> u64 {
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// Nanoseconds since the epoch of the last inode change (0 before it, and 0 off unix). Unlike
+/// the mtime, a tool can't set it back.
+#[cfg(unix)]
+pub(crate) fn ctime_ns(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let (secs, nanos) = (meta.ctime(), meta.ctime_nsec());
+    u64::try_from(secs)
+        .ok()
+        .zip(u64::try_from(nanos).ok())
+        .and_then(|(s, n)| s.checked_mul(1_000_000_000)?.checked_add(n))
+        .unwrap_or(0)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn ctime_ns(_meta: &std::fs::Metadata) -> u64 {
+    0
 }
 
 /// Milliseconds since the epoch (0 before it), the wire's `lastUpdateTime`.
@@ -83,8 +104,14 @@ impl HashCache {
         }
     }
 
-    /// The MD5 of the regular file `fs_path` (wire path `key`), from the cache when size and
-    /// mtime match `meta`, else hashed and cached. A file that changes while it is hashed is
+    /// The last cached MD5 of `path`, without touching the disk (it may be stale).
+    #[cfg_attr(not(test), expect(dead_code, reason = "used by the scan"))]
+    pub fn cached(&self, path: &WirePath) -> Option<&str> {
+        self.rows.get(&path.display()).map(|r| r.md5.as_str())
+    }
+
+    /// The MD5 of the regular file `fs_path` (wire path `key`), from the cache when size, mtime
+    /// and ctime match `meta`, else hashed and cached. A file that changes while it is hashed is
     /// not cached.
     pub fn md5(
         &mut self,
@@ -93,21 +120,23 @@ impl HashCache {
         meta: &std::fs::Metadata,
     ) -> std::io::Result<String> {
         let key = key.display();
-        let (size, mtime) = (meta.len(), mtime_ns(meta));
+        let (size, mtime, ctime) = (meta.len(), mtime_ns(meta), ctime_ns(meta));
         if let Some(row) = self.rows.get(&key)
             && row.size == size
             && row.mtime_ns == mtime
+            && row.ctime_ns == Some(ctime)
         {
             return Ok(row.md5.clone());
         }
         let md5 = md5_file(fs_path)?;
         let after = std::fs::metadata(fs_path)?;
-        if after.len() == size && mtime_ns(&after) == mtime {
+        if after.len() == size && mtime_ns(&after) == mtime && ctime_ns(&after) == ctime {
             self.rows.insert(
                 key,
                 HashRow {
                     size,
                     mtime_ns: mtime,
+                    ctime_ns: Some(ctime),
                     md5: md5.clone(),
                 },
             );
@@ -166,5 +195,94 @@ impl HashCache {
         )?;
         self.dirty = false;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn wp(s: &str) -> WirePath {
+        WirePath::parse(s).unwrap()
+    }
+
+    fn md5_of(cache: &mut HashCache, key: &WirePath, fs: &Path) -> String {
+        let meta = std::fs::metadata(fs).unwrap();
+        cache.md5(key, fs, &meta).unwrap()
+    }
+
+    #[test]
+    fn row_is_reused_when_size_mtime_and_ctime_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = dir.path().join("a.txt");
+        std::fs::write(&fs, b"one").unwrap();
+        let key = wp("a.txt");
+        let mut cache = HashCache::default();
+        let first = md5_of(&mut cache, &key, &fs);
+        // Plant a wrong MD5 in the row: a reuse returns it, a re-hash would not.
+        cache.rows.get_mut("a.txt").unwrap().md5 = "planted".into();
+        assert_eq!(md5_of(&mut cache, &key, &fs), "planted");
+        assert_ne!(first, "planted");
+    }
+
+    #[test]
+    fn same_size_rewrite_with_old_mtime_is_hashed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = dir.path().join("a.txt");
+        std::fs::write(&fs, b"one").unwrap();
+        let old = std::fs::metadata(&fs).unwrap().modified().unwrap();
+        let key = wp("a.txt");
+        let mut cache = HashCache::default();
+        let first = md5_of(&mut cache, &key, &fs);
+        // The ctime moves with the write even when the mtime is set back (`touch -r`).
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&fs, b"two").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&fs)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let meta = std::fs::metadata(&fs).unwrap();
+        assert_eq!(mtime_ns(&meta), cache.rows["a.txt"].mtime_ns);
+        let second = md5_of(&mut cache, &key, &fs);
+        assert_ne!(first, second);
+        assert_eq!(second, md5_file(&fs).unwrap());
+    }
+
+    #[test]
+    fn row_without_ctime_is_hashed_once_then_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = dir.path().join("a.txt");
+        std::fs::write(&fs, b"one").unwrap();
+        let meta = std::fs::metadata(&fs).unwrap();
+        let old = format!(
+            r#"{{"a.txt":{{"size":{},"mtime_ns":{},"md5":"planted"}}}}"#,
+            meta.len(),
+            mtime_ns(&meta)
+        );
+        std::fs::write(dir.path().join(HASHES_FILE), old).unwrap();
+        let mut cache = HashCache::load(dir.path()).unwrap();
+        let key = wp("a.txt");
+        let fresh = md5_of(&mut cache, &key, &fs);
+        assert_eq!(fresh, md5_file(&fs).unwrap());
+        assert!(cache.dirty);
+        cache.rows.get_mut("a.txt").unwrap().md5 = "planted".into();
+        assert_eq!(md5_of(&mut cache, &key, &fs), "planted");
+    }
+
+    #[test]
+    fn cached_returns_the_stored_md5() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = dir.path().join("a.txt");
+        std::fs::write(&fs, b"one").unwrap();
+        let key = wp("a.txt");
+        let mut cache = HashCache::default();
+        assert_eq!(cache.cached(&key), None);
+        let md5 = md5_of(&mut cache, &key, &fs);
+        assert_eq!(cache.cached(&key), Some(md5.as_str()));
+        assert_eq!(cache.cached(&wp("other.txt")), None);
     }
 }

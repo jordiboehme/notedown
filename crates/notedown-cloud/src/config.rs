@@ -194,9 +194,14 @@ impl Config {
         if raw.is_empty() {
             return None;
         }
-        let path = match raw.strip_prefix("~/") {
-            Some(rest) => dirs::home_dir()?.join(rest),
-            None => PathBuf::from(raw),
+        // `~` and `~/...` are the home folder; `~user` is not expanded.
+        let path = if raw == "~" {
+            dirs::home_dir()?
+        } else {
+            match raw.strip_prefix("~/") {
+                Some(rest) => dirs::home_dir()?.join(rest),
+                None => PathBuf::from(raw),
+            }
         };
         Some(if path.is_absolute() {
             path
@@ -360,6 +365,13 @@ mod tests {
             Some(dirs::home_dir().unwrap().join("x"))
         );
         assert_eq!(render_root_of(Some("/abs")), Some(PathBuf::from("/abs")));
+        assert_eq!(render_root_of(Some("~")), dirs::home_dir());
+        assert_eq!(render_root_of(Some(" ~ ")), dirs::home_dir());
+        // `~user` is not expanded: a folder of that name in the data folder.
+        assert_eq!(
+            render_root_of(Some("~other/x")),
+            Some(PathBuf::from("/data/~other/x"))
+        );
         assert_eq!(render_root_of(None), None);
         assert_eq!(render_root_of(Some("")), None);
         assert_eq!(render_root_of(Some("  ")), None);

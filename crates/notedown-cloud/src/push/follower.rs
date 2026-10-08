@@ -267,7 +267,12 @@ impl Follower {
             let stamp = journal_stamp(st)?;
             let (next, tail) = match at {
                 None => (start_seq(st)?, None),
-                Some(seq) if Some(stamp) == seen => (seq, tail),
+                // A tail that stopped early reads on, also when the journal did not change.
+                Some(seq)
+                    if Some(stamp) == seen && !tail.as_ref().is_some_and(|t| t.is_behind()) =>
+                {
+                    (seq, tail)
+                }
                 Some(mut seq) => {
                     let mut tail = tail
                         .filter(|t| t.next_seq() == seq + 1)
@@ -282,7 +287,9 @@ impl Follower {
         match step {
             // Kept only after a good step, so a failed read is tried again.
             Some(Ok((stamp, next, tail))) => {
-                self.seen = Some(stamp);
+                // The stamp of a batch that stopped early is not kept, so the next step reads.
+                let behind = tail.as_ref().is_some_and(|t| t.is_behind());
+                self.seen = (!behind).then_some(stamp);
                 self.cursor = Some(next);
                 self.tail = tail;
             }
@@ -313,4 +320,56 @@ impl Follower {
 /// start position is taken first ([`Follower::start`]).
 pub async fn run(state: Arc<AppState>) {
     Follower::start(state).await.run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::journal::{Event, EventBody, Journal, JournalOptions, Origin};
+
+    fn ev(n: u64) -> Event {
+        Event::new(
+            "jordi",
+            Origin::Cli,
+            None,
+            &format!("op-{n}"),
+            EventBody::FolderCreated {
+                id: 1000 + n,
+                path: format!("F{n}"),
+            },
+        )
+    }
+
+    /// A batch cut short by a file that can't be read: the next step reads on, also when the
+    /// journal did not change since.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_partial_batch_is_read_on_at_the_next_step() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::open(crate::Config::default(), dir.path()).unwrap();
+        let mut f = Follower::start(state.clone()).await;
+        assert_eq!(f.cursor, Some(0));
+        // A cap of one byte: every append starts a new file.
+        let j = Journal::open_with(
+            dir.path(),
+            JournalOptions {
+                max_file_bytes: 1,
+                ..JournalOptions::default()
+            },
+        )
+        .unwrap();
+        for n in 1..=3 {
+            j.append(&mut [ev(n)]).unwrap();
+        }
+        let files = j.files().unwrap();
+        assert_eq!(files.len(), 3);
+        let last = &files[2].1;
+        std::fs::set_permissions(last, std::fs::Permissions::from_mode(0o000)).unwrap();
+        f.step().await;
+        assert_eq!(f.cursor, Some(2));
+        std::fs::set_permissions(last, std::fs::Permissions::from_mode(0o644)).unwrap();
+        f.step().await;
+        assert_eq!(f.cursor, Some(3));
+    }
 }

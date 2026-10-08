@@ -1,7 +1,7 @@
 //! The watch of the data folder: files changed by hand are scanned a short quiet time after the
 //! last change, so they reach the device within seconds. The timer scan stays as a backstop.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,13 +23,14 @@ const RETRY: Duration = Duration::from_secs(5);
 pub enum Scope {
     /// The whole tree.
     Whole,
-    /// These folders, each recursive. None lies below another.
-    Folders(BTreeSet<WirePath>),
+    /// This folder, recursive: the lowest folder that holds all changed paths. One scan sees a
+    /// file moved between two of its subfolders as a move and keeps its id.
+    Folder(WirePath),
 }
 
-/// The scopes of the changed `paths` per account. `accounts_dir` is the canonical
-/// `<data>/accounts`. With `rescan` (events were lost), every account named by a path is
-/// scanned whole.
+/// The scope of the changed `paths` per account: the lowest folder that holds all of them (the
+/// whole tree when that is the root). `accounts_dir` is the canonical `<data>/accounts`. With
+/// `rescan` (events were lost), every account named by a path is scanned whole.
 pub fn scopes_of(accounts_dir: &Path, paths: &[PathBuf], rescan: bool) -> BTreeMap<String, Scope> {
     let mut out = BTreeMap::new();
     for path in paths {
@@ -39,9 +40,6 @@ pub fn scopes_of(accounts_dir: &Path, paths: &[PathBuf], rescan: bool) -> BTreeM
     }
     out
 }
-
-/// More folders than this in one account give one whole-tree scan.
-const MAX_FOLDERS: usize = 64;
 
 /// The account and scope of one changed path; `None` for a path the watch ignores.
 fn scope_of(accounts_dir: &Path, path: &Path, rescan: bool) -> Option<(String, Scope)> {
@@ -65,41 +63,38 @@ fn scope_of(accounts_dir: &Path, path: &Path, rescan: bool) -> Option<(String, S
         names.push(name);
     }
     let scope = match names.split_last() {
+        // A name the wire can't carry: the timer scan reports it.
         Some((_, parent)) if !parent.is_empty() => {
-            // A name the wire can't carry: the timer scan reports it.
-            let folder = WirePath::parse_named(&parent.join("/")).ok()?;
-            Scope::Folders(BTreeSet::from([folder]))
+            Scope::Folder(WirePath::parse_named(&parent.join("/")).ok()?)
         }
         _ => Scope::Whole,
     };
     Some((slug.to_string(), scope))
 }
 
-/// Add `scope` to the scopes of `slug` in `map`: a folder below another one is dropped, and more
-/// than [`MAX_FOLDERS`] folders become [`Scope::Whole`].
+/// Add `scope` to the scope of `slug` in `map`: two folders give their lowest common folder,
+/// the root gives [`Scope::Whole`].
 fn merge(map: &mut BTreeMap<String, Scope>, slug: String, scope: Scope) {
     let merged = match (map.remove(&slug), scope) {
         (None, s) => s,
-        (Some(Scope::Whole), _) | (_, Scope::Whole) => Scope::Whole,
-        (Some(Scope::Folders(mut a)), Scope::Folders(b)) => {
-            a.extend(b);
-            Scope::Folders(a)
-        }
-    };
-    let merged = match merged {
-        Scope::Folders(all) => {
-            let top: BTreeSet<WirePath> = all
+        (Some(Scope::Folder(a)), Scope::Folder(b)) => {
+            let common = a
+                .segments()
                 .iter()
-                .filter(|f| !all.iter().any(|g| g != *f && f.starts_with(g)))
-                .cloned()
-                .collect();
-            if top.len() > MAX_FOLDERS {
+                .zip(b.segments())
+                .take_while(|(x, y)| x == y)
+                .count();
+            if common == 0 {
                 Scope::Whole
             } else {
-                Scope::Folders(top)
+                // Both are valid paths, so their common prefix is one too.
+                match WirePath::parse_named(&a.segments()[..common].join("/")) {
+                    Ok(folder) => Scope::Folder(folder),
+                    Err(_) => Scope::Whole,
+                }
             }
         }
-        whole => whole,
+        _ => Scope::Whole,
     };
     map.insert(slug, merged);
 }
@@ -232,7 +227,7 @@ mod tests {
     fn folders(s: &Scope) -> Vec<String> {
         match s {
             Scope::Whole => vec!["<whole>".into()],
-            Scope::Folders(f) => f.iter().map(|w| w.to_string()).collect(),
+            Scope::Folder(f) => vec![f.to_string()],
         }
     }
 
@@ -266,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn a_scope_under_another_is_dropped_and_accounts_stay_apart() {
+    fn a_folder_and_one_below_it_scan_the_upper_one_and_accounts_stay_apart() {
         let s = scopes_of(
             &acc(),
             &[
@@ -281,19 +276,30 @@ mod tests {
     }
 
     #[test]
-    fn more_than_64_folders_scan_the_whole_tree() {
-        let paths: Vec<PathBuf> = (0..65)
-            .map(|i| p(&format!("me/files/NOTE/F{i}/a.note")))
-            .collect();
-        let s = scopes_of(&acc(), &paths, false);
+    fn sibling_folders_scan_their_parent() {
+        let s = scopes_of(
+            &acc(),
+            &[
+                p("me/files/NOTE/Note/A/a.note"),
+                p("me/files/NOTE/Note/B/a.note"),
+                p("me/files/NOTE/Note/B/C/b.note"),
+            ],
+            false,
+        );
+        assert_eq!(folders(&s["me"]), ["NOTE/Note"]);
+    }
+
+    #[test]
+    fn folders_without_a_common_folder_scan_the_whole_tree() {
+        let s = scopes_of(
+            &acc(),
+            &[
+                p("me/files/DOCUMENT/Document/a.pdf"),
+                p("me/files/NOTE/Note/a.pdf"),
+            ],
+            false,
+        );
         assert!(matches!(s["me"], Scope::Whole));
-        let paths: Vec<PathBuf> = (0..64)
-            .map(|i| p(&format!("me/files/NOTE/F{i}/a.note")))
-            .collect();
-        assert!(matches!(
-            scopes_of(&acc(), &paths, false)["me"],
-            Scope::Folders(_)
-        ));
     }
 
     #[test]

@@ -372,8 +372,8 @@ impl AppState {
         }
     }
 
-    /// Scan `scope` of account `slug` for changes made by hand ([`AppState::run_scan`], each
-    /// folder recursive, under one store lock). Skipped when the account or its `files/` folder
+    /// Scan `scope` of account `slug` for changes made by hand ([`AppState::run_scan`],
+    /// recursive, under the store lock). Skipped when the account or its `files/` folder
     /// does not exist or its protect gate is closed; busy while a device holds its sync lock.
     /// Errors are logged. Blocking.
     pub fn scan_account(&self, slug: &str, scope: &Scope) -> ScanOutcome {
@@ -400,19 +400,15 @@ impl AppState {
         if self.sync_locks.holder(slug, self.now_ms()).is_some() {
             return ScanOutcome::Busy;
         }
-        let min_files = self.config.scan_min_files;
-        let options: Vec<ScanOptions> = match scope {
-            Scope::Whole => vec![ScanOptions::all(min_files)],
-            Scope::Folders(folders) => folders
-                .iter()
-                .map(|folder| ScanOptions {
-                    scope: folder.clone(),
-                    recursive: true,
-                    dry_run: false,
-                    accept: false,
-                    min_files,
-                })
-                .collect(),
+        let opts = match scope {
+            Scope::Whole => ScanOptions::all(self.config.scan_min_files),
+            Scope::Folder(folder) => ScanOptions {
+                scope: folder.clone(),
+                recursive: true,
+                dry_run: false,
+                accept: false,
+                min_files: self.config.scan_min_files,
+            },
         };
         let store = match self.store(slug) {
             Ok(s) => s,
@@ -441,13 +437,9 @@ impl AppState {
                 return ScanOutcome::Done;
             }
         }
-        for opts in &options {
-            match self.run_scan(&store, &guard, opts) {
-                Ok(_) => {}
-                // Every further folder would hold too.
-                Err(Error::ScanHold(_)) => break,
-                Err(e) => eprintln!("notedown cloud: account {slug}: scan failed: {e}"),
-            }
+        match self.run_scan(&store, &guard, &opts) {
+            Ok(_) | Err(Error::ScanHold(_)) => {}
+            Err(e) => eprintln!("notedown cloud: account {slug}: scan failed: {e}"),
         }
         ScanOutcome::Done
     }

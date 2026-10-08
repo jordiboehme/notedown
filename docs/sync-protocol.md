@@ -1302,3 +1302,13 @@ Device test on 2026-10-07 (times UTC), "Auto Sync" on, against notedown with dig
 - With "Auto Sync" on, digest changes go out on their own within seconds, without `synchronous/start`: a new note digest went out as `add/summary` at 18:36:05; a handwritten comment as `upload/apply/summary`, the `.mark` upload and `update/summary` with `commentHandwriteName`, `handwriteInnerName` and `handwriteMD5` (18:36:36); a new category as `add/summary/group` (18:36:53); moving the digest into it as `update/summary` with `parentUniqueIdentifier` (18:36:57). The stored `.mark` matched `handwriteMD5`. The device's `fileName` is used as the `.mark` name and echoed as `innerName`; the device accepted that (part of unknown 5). The author set on the device travels in `metadata.author`.
 - A new to-do (19:06:07) went out as `schedule/group/all` and `schedule/task/all` (pull first), then `POST schedule/task` for the new task and `PUT schedule/task/list` with the other tasks of the group (their `sort` and `sortTime` changed).
 - Device paging for digests is `{"page":0,"size":0}` for both group and hash queries (part of unknown 6).
+
+### 9.5 Scan results [capture:nomad-3.29.42]
+
+Device test on 2026-10-08 against notedown with the scan (3.0.1) and the scan follow-ups. Three changes were made by hand in the data folder while the server ran, then the device synced:
+
+- A PDF added to `INBOX` reached the device.
+- A file renamed only in case on the disk showed up on the device under the new spelling. The scan kept its id, so the device did not download it again as a new file.
+- A deleted file was deleted on the device too. The sync was not held: far more files were left than `scan_min_files`.
+
+All three passed. Still open: the device test of `push = "detail"` (9.3).

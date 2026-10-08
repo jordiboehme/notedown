@@ -196,7 +196,7 @@ If the device doesn't sync after a `put`, start a manual sync. The `push` settin
 
 A delete by hand is a real delete. The old file isn't in the recycle bin, because notedown never sees its bytes. Move files out of the folder instead of deleting them if you want a copy.
 
-One safety stop: if a scan would delete files and leave fewer than `scan_min_files` files in the account, notedown doesn't apply it. The default is 1, so an empty folder or an unmounted disk stops it. Device sync then waits, because the device would delete everything it has. Put the files back and the stop lifts by itself at the next scan. If you really want those files gone, run `notedown cloud scan --data ~/notedown-data --account me --accept`. Deleting your last file on purpose needs `--accept` too. Set `scan_min_files = 0` to turn the stop off. `notedown serve` prints a warning when it stops.
+One safety stop: if a scan would delete files and leave fewer than `scan_min_files` files in the account, notedown doesn't apply it. The default is 1, so an empty folder or an unmounted disk stops it. Device sync then waits, because the device would delete everything it has. Put the files back and the stop lifts by itself at the next scan. With the watch on, that takes a few seconds. If you really want those files gone, run `notedown cloud scan --data ~/notedown-data --account me --accept`. Deleting your last file on purpose needs `--accept` too. Set `scan_min_files = 0` to turn the stop off. `notedown serve` prints a warning when it stops.
 
 **Watch the changes.** `notedown cloud journal tail --data ~/notedown-data --follow` prints every change as a JSON line while it happens. Each line has a `seq` number. Start at a later one with `--from <seq>`.
 

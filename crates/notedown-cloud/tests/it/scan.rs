@@ -2260,6 +2260,93 @@ mod served {
         server.await.unwrap().unwrap();
     }
 
+    /// A held account whose files come back into one folder: the watch scope of that folder
+    /// scans the whole tree, so the hold ends at once.
+    #[test]
+    fn a_folder_scan_of_a_held_account_scans_the_whole_tree() {
+        let s = Server::new();
+        let (a, b) = (format!("{DOC}/a.txt"), format!("{DOC}/b.txt"));
+        s.write(&a, b"a");
+        s.write(&b, b"b");
+        s.state.scan_all();
+        s.rm(&a);
+        s.rm(&b);
+        s.state.scan_all();
+        assert!(s.marker().is_file());
+        s.write(&a, b"a");
+        s.write(&b, b"b");
+        let folder = notedown_cloud::store::WirePath::parse_named(DOC).unwrap();
+        assert_eq!(
+            s.state
+                .scan_account("jordi", &notedown_cloud::watch::Scope::Folder(folder)),
+            ScanOutcome::Done
+        );
+        assert!(!s.marker().exists());
+        assert_eq!(s.kinds(), vec!["file.created", "file.created"]);
+    }
+
+    /// The same with a hold file that can't be read: the folder scan scans the whole tree and
+    /// removes it.
+    #[test]
+    fn a_folder_scan_with_an_unreadable_hold_scans_the_whole_tree() {
+        let s = Server::new();
+        s.write(&format!("{DOC}/a.txt"), b"a");
+        s.state.scan_all();
+        std::fs::write(s.marker(), b"not json").unwrap();
+        let folder = notedown_cloud::store::WirePath::parse_named(DOC).unwrap();
+        assert_eq!(
+            s.state
+                .scan_account("jordi", &notedown_cloud::watch::Scope::Folder(folder)),
+            ScanOutcome::Done
+        );
+        assert!(!s.marker().exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_watch_lifts_a_hold_when_the_files_come_back_by_hand() {
+        use std::time::{Duration, Instant};
+        let s = Server::with(Config {
+            protect: false,
+            scan_interval: 0,
+            watch: true,
+            ..Config::default()
+        });
+        let (a, b) = (format!("{DOC}/a.txt"), format!("{DOC}/b.txt"));
+        s.write(&a, b"a");
+        s.write(&b, b"b");
+        s.state.scan_all();
+        s.rm(&a);
+        s.rm(&b);
+        s.state.scan_all();
+        assert!(s.marker().is_file());
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(notedown_cloud::server::serve_until(
+            vec![l],
+            s.state.clone(),
+            async {
+                let _ = rx.await;
+            },
+        ));
+        // Time for the watch to be registered; the files are written again when the first
+        // write came too early.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let end = Instant::now() + Duration::from_secs(20);
+        let mut again = Instant::now();
+        while s.marker().exists() {
+            assert!(Instant::now() < end, "the hold is still there after 20 s");
+            if Instant::now() >= again {
+                s.write(&a, b"a");
+                s.write(&b, b"b");
+                again = Instant::now() + Duration::from_secs(5);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(s.state.store("jordi").unwrap().scan_hold().unwrap(), None);
+        tx.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
     /// A file moved by hand between two folders, scanned as the watch does: the scope of the
     /// two changed paths is their lowest common folder, so one scan pairs the move.
     fn moved_by_watch_scan(

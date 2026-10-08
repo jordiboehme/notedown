@@ -90,6 +90,7 @@ pub fn render_account(store: &Store, root: &Path, opts: &PassOptions) -> Result<
         slug: store.slug().to_string(),
         stale: opts.all || m.renderer != RENDERER_ID,
         dir,
+        saved: m.clone(),
         m,
         report: PassReport::default(),
         emptied: BTreeSet::new(),
@@ -290,6 +291,9 @@ struct Pass {
     /// `<root>/<slug>`.
     dir: PathBuf,
     m: Manifest,
+    /// The manifest as the file holds it (loaded or last saved), so an unchanged one is not
+    /// written again: a cloud folder would see a file change on every pass.
+    saved: Manifest,
     /// Every row counts as out of date for rendering (`--all` or another renderer id). The rows
     /// still say which PDFs are ours.
     stale: bool,
@@ -311,14 +315,19 @@ impl Pass {
         Ok(())
     }
 
-    /// Write the manifest. Only a finished pass names the current renderer: after a crash
-    /// with another renderer id, the next pass renders every note again.
+    /// Write the manifest when it changed. Only a finished pass names the current renderer:
+    /// after a crash with another renderer id, the next pass renders every note again.
     fn save(&mut self, finished: bool) -> Result<()> {
         self.m.version = manifest::VERSION;
         if finished {
             self.m.renderer = RENDERER_ID.to_string();
         }
-        manifest::save(&self.dir, &self.m)
+        if self.m == self.saved {
+            return Ok(());
+        }
+        manifest::save(&self.dir, &self.m)?;
+        self.saved = self.m.clone();
+        Ok(())
     }
 
     fn changed(&mut self) -> Result<()> {

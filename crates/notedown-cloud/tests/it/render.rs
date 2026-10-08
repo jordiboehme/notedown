@@ -183,6 +183,34 @@ fn a_new_note_gets_its_pdf_and_a_manifest_row() {
 }
 
 #[test]
+fn a_pass_without_changes_leaves_the_manifest_alone() {
+    let fx = Fx::new();
+    fx.write("NOTE/Note/a.note", &fixture_note("test1"));
+    fx.scan();
+    fx.pass();
+    let path = fx.out().join(MANIFEST_FILE);
+    let (bytes, meta) = (
+        std::fs::read(&path).unwrap(),
+        std::fs::metadata(&path).unwrap(),
+    );
+    assert_eq!(fx.pass(), PassReport::default());
+    let after = std::fs::metadata(&path).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(after.ino(), meta.ino(), "the manifest was written again");
+    }
+    assert_eq!(after.modified().unwrap(), meta.modified().unwrap());
+
+    // A change saves it again.
+    fx.write("NOTE/Note/a.note", &fixture_note("test2"));
+    fx.scan();
+    fx.pass();
+    assert_ne!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
 fn a_changed_note_is_rendered_again() {
     let fx = Fx::new();
     fx.write("NOTE/Note/a.note", &fixture_note("test1"));

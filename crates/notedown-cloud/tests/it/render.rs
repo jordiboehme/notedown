@@ -477,6 +477,40 @@ fn an_upper_case_extension_is_rendered() {
     assert!(names(&fx.out().join("NOTE/Note")).contains("X.pdf"));
 }
 
+/// Two notes that differ only in the case of the extension, on a data folder that keeps
+/// case. A temp folder that ignores case can't hold both: then the test does nothing, and the
+/// unit tests of `render` drive the pass with such paths instead.
+#[test]
+fn two_notes_with_the_same_pdf_path_get_two_pdfs() {
+    let fx = Fx::new();
+    fx.write("NOTE/Note/a.note", &fixture_note("test1"));
+    if fx.fs("NOTE/Note/a.NOTE").exists() {
+        return;
+    }
+    fx.write("NOTE/Note/a.NOTE", &fixture_note("test2"));
+    fx.scan();
+    let r = fx.pass();
+    let mut written = r.written.clone();
+    written.sort();
+    assert_eq!(written, s(&["NOTE/Note/a.note.pdf", "NOTE/Note/a.pdf"]));
+    assert_eq!(fx.pass(), PassReport::default());
+
+    // `a.NOTE` sorts first and kept `a.pdf`. Once it is gone, `a.note` takes `a.pdf`.
+    std::fs::remove_file(fx.fs("NOTE/Note/a.NOTE")).unwrap();
+    fx.scan();
+    let r = fx.pass();
+    assert_eq!(r.deleted, s(&["NOTE/Note/a.pdf"]));
+    assert_eq!(
+        r.moved,
+        vec![(
+            "NOTE/Note/a.note.pdf".to_string(),
+            "NOTE/Note/a.pdf".to_string()
+        )]
+    );
+    assert_eq!(fx.files(), BTreeSet::from(["NOTE/Note/a.pdf".to_string()]));
+    assert_eq!(fx.pass(), PassReport::default());
+}
+
 #[test]
 fn a_missing_render_dir_is_an_error_and_creates_nothing() {
     let fx = Fx::new();
@@ -858,6 +892,7 @@ fn rows_with_bad_paths_of_gone_notes_touch_nothing() {
             path,
             md5: "0".repeat(32),
             pdf: true,
+            target: None,
         };
         m.notes.insert((900_000 + i).to_string(), row);
     }
@@ -890,6 +925,7 @@ fn a_live_note_with_a_bad_row_path_touches_nothing_outside() {
                     path: path.clone(),
                     md5: md5_hex(&bytes),
                     pdf: true,
+                    target: None,
                 },
             );
             manifest::save(&fx.out(), &m).unwrap();

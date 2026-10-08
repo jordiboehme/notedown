@@ -19,7 +19,7 @@ use md5::{Digest, Md5};
 use notedown_note::{Notebook, RENDERER_ID, RenderOptions, RenderStyle, VersionPolicy};
 
 use crate::journal::FileKind;
-use crate::store::{Store, WirePath};
+use crate::store::{Store, WirePath, fold};
 use crate::{Error, Result, io_err};
 use manifest::{Manifest, Row};
 
@@ -68,6 +68,30 @@ pub fn pdf_path_of(wire_path: &str) -> String {
     }
 }
 
+/// The PDF path of every note, by note path. `paths` are the wire paths of all registered
+/// notes, sorted in byte order. Two PDF paths collide when they are equal without case (a
+/// render folder may ignore case even when the data folder doesn't). The first note keeps
+/// [`pdf_path_of`]; a later one gets its full name plus `.pdf`, and ` (2)`, ` (3)` ... before
+/// `.pdf` while that collides too. The same notes always give the same paths.
+pub fn assign_targets<'a>(paths: impl IntoIterator<Item = &'a str>) -> HashMap<String, String> {
+    let mut taken = HashSet::new();
+    let mut out = HashMap::new();
+    for path in paths {
+        let mut target = pdf_path_of(path);
+        if taken.contains(&fold(&target)) {
+            target = format!("{path}.pdf");
+            let mut k = 2;
+            while taken.contains(&fold(&target)) {
+                target = format!("{path} ({k}).pdf");
+                k += 1;
+            }
+        }
+        taken.insert(fold(&target));
+        out.insert(path.to_string(), target);
+    }
+    out
+}
+
 /// One pass for the account of `store`: write, move or delete the PDFs below `<root>/<slug>/`
 /// so they match the store's notes. `root` must exist. The store lock is held only while the
 /// registry and the MD5 cache are read, never while a note is read or rendered.
@@ -85,17 +109,7 @@ pub fn render_account(store: &Store, root: &Path, opts: &PassOptions) -> Result<
         return Ok(PassReport::default());
     }
     let notes = list_notes(store)?;
-    let m = manifest::load(&dir);
-    let mut pass = Pass {
-        slug: store.slug().to_string(),
-        stale: opts.all || m.renderer != RENDERER_ID,
-        dir,
-        saved: m.clone(),
-        m,
-        report: PassReport::default(),
-        emptied: BTreeSet::new(),
-        changes: 0,
-    };
+    let mut pass = Pass::new(store.slug(), dir, opts.all);
     let result = pass.run(&notes);
     // Also after an error: the rows of the work done so far stay true.
     pass.save(result.is_ok())?;
@@ -304,12 +318,37 @@ struct Pass {
 }
 
 impl Pass {
+    /// A pass on the account folder `dir`, with its manifest loaded.
+    fn new(slug: &str, dir: PathBuf, all: bool) -> Pass {
+        let m = manifest::load(&dir);
+        Pass {
+            slug: slug.to_string(),
+            stale: all || m.renderer != RENDERER_ID,
+            dir,
+            saved: m.clone(),
+            m,
+            report: PassReport::default(),
+            emptied: BTreeSet::new(),
+            changes: 0,
+        }
+    }
+
     fn run(&mut self, notes: &[Note]) -> Result<()> {
+        let targets = assign_targets(notes.iter().map(|n| n.path.as_str()));
         // Gone notes first, so a PDF that a later note moves or writes to the same path is
         // never deleted as the PDF of a gone note.
         self.drop_gone(notes)?;
-        for note in notes {
-            self.note(note)?;
+        // Then the notes whose PDF moves, so a PDF path is free before another note takes it
+        // (on a render folder that ignores case, `A.pdf` is the file `a.pdf`).
+        let moves = |n: &Note| {
+            self.m
+                .notes
+                .get(&n.id.to_string())
+                .is_some_and(|r| r.pdf && r.pdf_path() != targets[&n.path])
+        };
+        let (first, rest): (Vec<&Note>, Vec<&Note>) = notes.iter().partition(|n| moves(n));
+        for note in first.into_iter().chain(rest) {
+            self.note(note, &targets[&note.path])?;
         }
         self.prune_empty();
         Ok(())
@@ -353,7 +392,7 @@ impl Pass {
                 continue;
             };
             if row.pdf {
-                let pdf = pdf_path_of(&row.path);
+                let pdf = row.pdf_path();
                 self.remove_pdf(&pdf)?;
                 self.report.deleted.push(pdf);
             }
@@ -362,7 +401,8 @@ impl Pass {
         Ok(())
     }
 
-    fn note(&mut self, n: &Note) -> Result<()> {
+    /// Bring the PDF of note `n` up to date; `target` is its PDF path in this pass.
+    fn note(&mut self, n: &Note, target: &str) -> Result<()> {
         // A registered note that is missing on disk waits for the scan: its PDF stays.
         let Some(disk) = &n.on_disk else {
             return Ok(());
@@ -384,15 +424,15 @@ impl Pass {
             && !self.stale
             && row.md5 == md5
         {
-            if row.path == n.path {
+            if row.path == n.path && (!row.pdf || row.pdf_path() == target) {
                 return Ok(());
             }
             if !row.pdf {
                 // A note that failed and moved: still no PDF, and no retry until it changes.
-                self.set_row(&key, n, &md5, false);
+                self.set_row(&key, n, &md5, None);
                 return self.changed();
             }
-            if self.move_pdf(&key, row, n, &md5)? {
+            if self.move_pdf(&key, row, n, target, &md5)? {
                 return self.changed();
             }
         }
@@ -411,7 +451,7 @@ impl Pass {
                 bytes
             }
         };
-        self.render_one(&key, row.as_ref(), n, &md5, bytes)
+        self.render_one(&key, row.as_ref(), n, target, &md5, bytes)
     }
 
     /// The bytes of a note. A note that is gone now waits for the scan, which journals the
@@ -435,11 +475,15 @@ impl Pass {
         self.report.failed.push((n.path.clone(), e));
     }
 
-    fn set_row(&mut self, key: &str, n: &Note, md5: &str, pdf: bool) {
+    /// The row of note `n`; `target` is the path of its PDF, `None` when it has none.
+    fn set_row(&mut self, key: &str, n: &Note, md5: &str, target: Option<&str>) {
         let row = Row {
             path: n.path.clone(),
             md5: md5.to_string(),
-            pdf,
+            pdf: target.is_some(),
+            target: target
+                .filter(|t| *t != pdf_path_of(&n.path))
+                .map(str::to_string),
         };
         self.m.notes.insert(key.to_string(), row);
     }
@@ -455,8 +499,15 @@ impl Pass {
     }
 
     /// Move the PDF of a moved note. False when the old PDF is gone (render it instead).
-    fn move_pdf(&mut self, key: &str, row: &Row, n: &Note, md5: &str) -> Result<bool> {
-        let (old, new) = (pdf_path_of(&row.path), pdf_path_of(&n.path));
+    fn move_pdf(
+        &mut self,
+        key: &str,
+        row: &Row,
+        n: &Note,
+        target: &str,
+        md5: &str,
+    ) -> Result<bool> {
+        let (old, new) = (row.pdf_path(), target.to_string());
         let (Some(from), Some(to)) = (self.file_of(&old), self.file_of(&new)) else {
             return Ok(false);
         };
@@ -473,7 +524,7 @@ impl Pass {
         }
         crate::fsutil::rename_durable(&from, &to)?;
         self.note_emptied(&from);
-        self.set_row(key, n, md5, true);
+        self.set_row(key, n, md5, Some(&new));
         self.report.moved.push((old, new));
         Ok(true)
     }
@@ -484,12 +535,13 @@ impl Pass {
         key: &str,
         row: Option<&Row>,
         n: &Note,
+        target: &str,
         md5: &str,
         bytes: Vec<u8>,
     ) -> Result<()> {
         let slug = self.slug.clone();
-        let new = pdf_path_of(&n.path);
-        let old = row.filter(|r| r.pdf).map(|r| pdf_path_of(&r.path));
+        let new = target.to_string();
+        let old = row.filter(|r| r.pdf).map(Row::pdf_path);
         let pdf = match render_pdf(bytes) {
             Ok(pdf) => pdf,
             Err(e) => {
@@ -497,7 +549,7 @@ impl Pass {
                 if let Some(old) = &old {
                     self.remove_pdf(old)?;
                 }
-                self.set_row(key, n, md5, false);
+                self.set_row(key, n, md5, None);
                 self.report.failed.push((n.path.clone(), e));
                 return self.changed();
             }
@@ -523,7 +575,7 @@ impl Pass {
         {
             self.remove_pdf(&old)?;
         }
-        self.set_row(key, n, md5, true);
+        self.set_row(key, n, md5, Some(&new));
         self.report.written.push(new);
         self.changed()
     }
@@ -543,12 +595,7 @@ impl Pass {
         if !meta.is_file() {
             return false;
         }
-        if self
-            .m
-            .notes
-            .values()
-            .any(|r| r.pdf && pdf_path_of(&r.path) == rel)
-        {
+        if self.m.notes.values().any(|r| r.pdf && r.pdf_path() == rel) {
             return true;
         }
         if own
@@ -560,12 +607,31 @@ impl Pass {
         is_notedown_pdf(&target)
     }
 
-    /// Drop the rows of other notes whose PDF is at `rel`: the pass is about to replace that
-    /// file. Such a note gets a new PDF when its turn comes (or in the next pass).
+    /// Drop the rows of other notes whose PDF is at `rel`, also under another spelling of the
+    /// same file: the pass is about to replace that file. Such a note gets a new PDF when its
+    /// turn comes (or in the next pass).
     fn release(&mut self, rel: &str, key: &str) {
-        self.m
-            .notes
-            .retain(|k, r| k == key || !r.pdf || pdf_path_of(&r.path) != rel);
+        let target = self.file_of(rel);
+        let key_rel = fold(rel);
+        let mut drop = Vec::new();
+        for (k, r) in &self.m.notes {
+            if k == key || !r.pdf {
+                continue;
+            }
+            let pdf = r.pdf_path();
+            let same = pdf == rel
+                || (fold(&pdf) == key_rel
+                    && target
+                        .as_deref()
+                        .zip(self.file_of(&pdf))
+                        .is_some_and(|(t, p)| same_file(t, &p)));
+            if same {
+                drop.push(k.clone());
+            }
+        }
+        for k in drop {
+            self.m.notes.remove(&k);
+        }
     }
 
     /// Delete one of our PDFs; one that is gone already is fine. A bad path deletes nothing.
@@ -613,5 +679,171 @@ impl Pass {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn targets(paths: &[&str]) -> Vec<String> {
+        let t = assign_targets(paths.iter().copied());
+        paths.iter().map(|p| t[*p].clone()).collect()
+    }
+
+    #[test]
+    fn colliding_notes_get_their_full_name() {
+        // Byte order: `a.NOTE` before `a.note`.
+        assert_eq!(
+            targets(&["NOTE/Note/a.NOTE", "NOTE/Note/a.note"]),
+            ["NOTE/Note/a.pdf", "NOTE/Note/a.note.pdf"]
+        );
+        // Case of the stem too: a render folder that ignores case can't hold both.
+        assert_eq!(
+            targets(&["NOTE/Note/A.note", "NOTE/Note/a.note", "NOTE/Note/b.note"]),
+            ["NOTE/Note/A.pdf", "NOTE/Note/a.note.pdf", "NOTE/Note/b.pdf"]
+        );
+        // The full name is taken too: a number is added.
+        assert_eq!(
+            targets(&[
+                "NOTE/Note/A.note",
+                "NOTE/Note/a.NOTE.note",
+                "NOTE/Note/a.note"
+            ]),
+            [
+                "NOTE/Note/A.pdf",
+                "NOTE/Note/a.NOTE.pdf",
+                "NOTE/Note/a.note (2).pdf"
+            ]
+        );
+        assert_eq!(
+            targets(&[
+                "NOTE/Note/A.note",
+                "NOTE/Note/a (2).note",
+                "NOTE/Note/a.NOTE.note",
+                "NOTE/Note/a.note",
+            ]),
+            [
+                "NOTE/Note/A.pdf",
+                "NOTE/Note/a (2).pdf",
+                "NOTE/Note/a.NOTE.pdf",
+                "NOTE/Note/a.note (2).pdf",
+            ]
+        );
+        // Other folders don't collide.
+        assert_eq!(
+            targets(&["NOTE/Note/V/a.note", "NOTE/Note/a.NOTE"]),
+            ["NOTE/Note/V/a.pdf", "NOTE/Note/a.pdf"]
+        );
+    }
+
+    fn fixture(dir: &Path, name: &str) -> PathBuf {
+        let src =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/notes/test1.note");
+        let to = dir.join(name);
+        std::fs::copy(src, &to).unwrap();
+        to
+    }
+
+    fn note(id: u64, path: &str, fs_path: &Path) -> Note {
+        Note {
+            id,
+            path: path.into(),
+            on_disk: Some(OnDisk {
+                fs_path: fs_path.to_path_buf(),
+                md5: None,
+            }),
+        }
+    }
+
+    fn run(dir: &Path, notes: &[Note]) -> PassReport {
+        let mut pass = Pass::new("acc", dir.to_path_buf(), false);
+        pass.run(notes).unwrap();
+        pass.save(true).unwrap();
+        pass.report
+    }
+
+    /// Two notes that map to the same PDF, driven through the pass directly: their note files
+    /// sit under other names, so this runs on a disk that ignores case too.
+    #[test]
+    fn two_notes_with_the_same_pdf_get_two_pdfs() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let (one, two) = (
+            fixture(src.path(), "one.note"),
+            fixture(src.path(), "two.note"),
+        );
+        let notes = [
+            note(2, "NOTE/Note/a.NOTE", &two),
+            note(1, "NOTE/Note/a.note", &one),
+        ];
+        let r = run(out.path(), &notes);
+        let mut written = r.written.clone();
+        written.sort();
+        assert_eq!(written, ["NOTE/Note/a.note.pdf", "NOTE/Note/a.pdf"]);
+        let m = manifest::load(out.path());
+        assert_eq!(m.notes["1"].pdf_path(), "NOTE/Note/a.note.pdf");
+        assert_eq!(m.notes["2"].pdf_path(), "NOTE/Note/a.pdf");
+        assert_eq!(m.notes["1"].path, "NOTE/Note/a.note");
+
+        let bytes = std::fs::read(manifest::path(out.path())).unwrap();
+        assert_eq!(run(out.path(), &notes), PassReport::default());
+        assert_eq!(std::fs::read(manifest::path(out.path())).unwrap(), bytes);
+
+        // The first note is gone: its PDF is deleted and the other one takes `a.pdf`.
+        let r = run(out.path(), &notes[1..]);
+        assert_eq!(r.deleted, ["NOTE/Note/a.pdf"]);
+        assert_eq!(
+            r.moved,
+            [(
+                "NOTE/Note/a.note.pdf".to_string(),
+                "NOTE/Note/a.pdf".to_string()
+            )]
+        );
+        assert!(r.written.is_empty(), "{r:?}");
+        assert!(out.path().join("NOTE/Note/a.pdf").is_file());
+        assert!(!out.path().join("NOTE/Note/a.note.pdf").exists());
+        let m = manifest::load(out.path());
+        assert_eq!(m.notes.len(), 1);
+        assert_eq!(m.notes["1"].pdf_path(), "NOTE/Note/a.pdf");
+        assert_eq!(m.notes["1"].target, None);
+        assert_eq!(run(out.path(), &notes[1..]), PassReport::default());
+    }
+
+    /// A data folder that keeps case with a render folder that ignores it: `A.note` appears
+    /// next to `a.note`, sorts first and takes `A.pdf`, the same file as `a.pdf` there. The
+    /// PDF of `a.note` moves away first, so neither PDF holds the other note.
+    #[test]
+    fn a_note_that_takes_the_pdf_path_of_another_moves_that_pdf_first() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let one = fixture(src.path(), "one.note");
+        let two = src.path().join("two.note");
+        let test2 =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/notes/test2.note");
+        std::fs::copy(test2, &two).unwrap();
+        let lower = note(1, "NOTE/Note/a.note", &one);
+        run(out.path(), std::slice::from_ref(&lower));
+        let pdf_one = std::fs::read(out.path().join("NOTE/Note/a.pdf")).unwrap();
+
+        let notes = [note(2, "NOTE/Note/A.note", &two), lower];
+        let r = run(out.path(), &notes);
+        assert_eq!(
+            r.moved,
+            [(
+                "NOTE/Note/a.pdf".to_string(),
+                "NOTE/Note/a.note.pdf".to_string()
+            )]
+        );
+        assert_eq!(r.written, ["NOTE/Note/A.pdf"]);
+        assert_eq!(
+            std::fs::read(out.path().join("NOTE/Note/a.note.pdf")).unwrap(),
+            pdf_one
+        );
+        assert_ne!(
+            std::fs::read(out.path().join("NOTE/Note/A.pdf")).unwrap(),
+            pdf_one
+        );
+        assert_eq!(run(out.path(), &notes), PassReport::default());
     }
 }

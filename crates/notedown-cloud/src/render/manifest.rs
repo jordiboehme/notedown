@@ -27,6 +27,20 @@ pub struct Row {
     pub md5: String,
     /// False: the note failed to render and has no PDF.
     pub pdf: bool,
+    /// The PDF path below `<root>/<slug>/` when it is not `pdf_path_of(path)`: the note shares
+    /// that PDF path with another note (see `assign_targets`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+}
+
+impl Row {
+    /// The PDF path of the row below `<root>/<slug>/`.
+    pub fn pdf_path(&self) -> String {
+        match &self.target {
+            Some(t) => t.clone(),
+            None => super::pdf_path_of(&self.path),
+        }
+    }
 }
 
 pub fn path(dir: &Path) -> PathBuf {
@@ -34,15 +48,22 @@ pub fn path(dir: &Path) -> PathBuf {
 }
 
 /// The manifest of `dir`; empty when it is missing or can't be read (every note then counts
-/// as new, which is safe: a PDF the pass doesn't know it never deletes). A row whose path is
-/// not a wire path in its plain form (absolute, with `..`, empty) is dropped: the file is only
-/// a file in the render folder, and nothing in it may name a file outside.
+/// as new, which is safe: a PDF the pass doesn't know it never deletes). A row whose path or
+/// target is not a wire path in its plain form (absolute, with `..`, empty), or whose target
+/// is no `.pdf`, is dropped: the file is only a file in the render folder, and nothing in it
+/// may name a file outside or a file that is not a PDF.
 pub fn load(dir: &Path) -> Manifest {
     let mut m: Manifest = std::fs::read(path(dir))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
-    m.notes.retain(|_, row| is_wire_path(&row.path));
+    m.notes.retain(|_, row| {
+        is_wire_path(&row.path)
+            && row
+                .target
+                .as_deref()
+                .is_none_or(|t| t.ends_with(".pdf") && is_wire_path(t))
+    });
     m
 }
 
@@ -86,6 +107,7 @@ mod tests {
             path: p.into(),
             md5: "0".repeat(32),
             pdf: true,
+            target: None,
         };
         let mut m = Manifest {
             version: VERSION,
@@ -96,8 +118,15 @@ mod tests {
         m.notes.insert("2".into(), row("/abs/a.note"));
         m.notes.insert("3".into(), row("../a.note"));
         m.notes.insert("4".into(), row(""));
+        let target = |t: &str| Row {
+            target: Some(t.into()),
+            ..row("NOTE/Note/a.NOTE")
+        };
+        m.notes.insert("5".into(), target("NOTE/Note/a.NOTE.pdf"));
+        m.notes.insert("6".into(), target("../a.pdf"));
+        m.notes.insert("7".into(), target("NOTE/Note/a.note"));
         save(d.path(), &m).unwrap();
         let loaded = load(d.path());
-        assert_eq!(loaded.notes.keys().collect::<Vec<_>>(), ["1"]);
+        assert_eq!(loaded.notes.keys().collect::<Vec<_>>(), ["1", "5"]);
     }
 }

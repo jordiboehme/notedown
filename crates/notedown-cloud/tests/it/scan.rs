@@ -2236,10 +2236,7 @@ mod served {
                 let _ = rx.await;
             },
         ));
-        // Time for the watch to be registered.
-        tokio::time::sleep(Duration::from_millis(500)).await;
         let file = dir.path().join("accounts/jordi/files/NOTE/Note/hand.pdf");
-        std::fs::write(&file, b"%PDF-1.4 hand").unwrap();
         let journal = notedown_cloud::journal::Journal::open_no_create(dir.path());
         let found = |journal: &notedown_cloud::journal::Journal| {
             journal.read_from(1).unwrap().any(|e| {
@@ -2248,12 +2245,19 @@ mod served {
                     && matches!(&e.body, EventBody::FileCreated { path, .. } if path == "NOTE/Note/hand.pdf")
             })
         };
-        let end = Instant::now() + Duration::from_secs(10);
+        // The file is written again every 5 s, so a watch registered late still sees a change.
+        // Not more often: each write starts the watch's quiet time (2 s) again.
+        let end = Instant::now() + Duration::from_secs(20);
+        let mut again = Instant::now();
         while !found(&journal) {
             assert!(
                 Instant::now() < end,
-                "no scan event for the hand change in 10 s"
+                "no scan event for the hand change in 20 s"
             );
+            if Instant::now() >= again {
+                std::fs::write(&file, b"%PDF-1.4 hand").unwrap();
+                again = Instant::now() + Duration::from_secs(5);
+            }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         tx.send(()).unwrap();

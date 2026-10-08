@@ -23,7 +23,7 @@ mod scan;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
@@ -238,7 +238,12 @@ pub struct Store {
     announce_wait: bool,
     /// Whether the probe at open found that the file system keeps names byte-exact.
     names_preserved: bool,
+    /// Test hook: runs right before a scan hashes a file ([`Store::set_scan_hash_hook`]).
+    hash_hook: Mutex<Option<HashHook>>,
 }
+
+/// See [`Store::set_scan_hash_hook`].
+type HashHook = Arc<dyn Fn(&WirePath) + Send + Sync>;
 
 /// Take the store lock file of an account (`accounts/<slug>/.store.lock`, exclusive). It tries
 /// first; when another process holds it and `announce` names the account, it prints "waiting
@@ -348,6 +353,7 @@ impl Store {
             import_mode,
             announce_wait,
             names_preserved: true,
+            hash_hook: Mutex::new(None),
         };
         store.names_preserved = probe_names_preserved(&store.account_dir);
         if !store.names_preserved {
@@ -721,6 +727,15 @@ impl Store {
             .map_err(io_err(&found.fs_path))?;
         self.flush_hashes(&mut state)?;
         Ok(md5)
+    }
+
+    /// Drop the cached MD5 of the file at `path` (a write replaced it). The next read hashes
+    /// it again, and a scan caches it without an event, as for any file without a row.
+    pub(super) fn forget_md5(&self, guard: &StoreGuard, path: &WirePath) -> Result<()> {
+        self.check_guard(guard)?;
+        let mut state = self.state();
+        state.hashes.removed_file(path);
+        self.flush_hashes(&mut state)
     }
 
     fn flush_hashes(&self, state: &mut State) -> Result<()> {

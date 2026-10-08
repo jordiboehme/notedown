@@ -630,6 +630,29 @@ async fn a_replace_without_protect_keeps_no_copy() {
     assert!(!s.account().join("recycle").exists());
 }
 
+/// A device upload over an existing file leaves no stale MD5 behind: a scan afterwards finds
+/// nothing to journal.
+#[tokio::test]
+async fn a_scan_after_a_replace_finds_nothing() {
+    let s = Server::new();
+    let t = s.session().await;
+    s.upload(&t, "INBOX", "x.pdf", b"one").await;
+    s.upload(&t, "INBOX", "x.pdf", b"two, longer").await;
+    let before = s.events().len();
+    let store = Store::open(s.data(), "jordi").unwrap();
+    let g = store.lock_recovered(&s.state.journal).unwrap();
+    let report = store
+        .scan(
+            &g,
+            &s.state.journal,
+            &notedown_cloud::store::ScanOptions::all(1),
+            s.state.now_ms(),
+        )
+        .unwrap();
+    assert_eq!(report, notedown_cloud::store::ScanReport::default());
+    assert_eq!(s.events().len(), before);
+}
+
 #[tokio::test]
 async fn finish_joins_the_parent_folder_and_the_name_and_takes_the_size_as_string() {
     let s = Server::new();

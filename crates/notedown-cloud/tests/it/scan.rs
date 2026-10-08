@@ -641,6 +641,126 @@ fn a_non_recursive_scan_sees_direct_children_only() {
     assert_eq!(fx.id("Work/Sub/b.txt"), None);
 }
 
+/// A file replaced by hand with a folder of the same name, seen by a scan of a folder below it:
+/// the file's row is journaled as deleted, never dropped without an event.
+#[test]
+fn a_file_above_the_scope_that_became_a_folder_is_journaled_as_deleted() {
+    let fx = Fx::imported();
+    fx.write("INBOX/A", b"a file");
+    fx.write(&format!("{DOC}/keep.txt"), b"keep");
+    fx.seed();
+    let old = fx.id("INBOX/A").unwrap();
+    fx.rm("INBOX/A");
+    fx.write("INBOX/A/B/x.txt", b"x");
+    let report = fx.scan_with(&ScanOptions {
+        scope: wp("INBOX/A/B"),
+        recursive: false,
+        ..ScanOptions::all(1)
+    });
+    assert_eq!(
+        paths(&report.created),
+        vec!["INBOX/A", "INBOX/A/B", "INBOX/A/B/x.txt"]
+    );
+    assert_eq!(paths(&report.deleted), vec!["INBOX/A"]);
+    let bodies = fx.bodies();
+    assert_eq!(
+        kind_names(&bodies),
+        vec![
+            "folder.created",
+            "folder.created",
+            "file.created",
+            "file.deleted"
+        ]
+    );
+    assert!(
+        matches!(&bodies[3], EventBody::FileDeleted { id, path, .. } if *id == old && path == "INBOX/A"),
+        "{bodies:?}"
+    );
+    let now = fx.id("INBOX/A").unwrap();
+    assert_ne!(now, old);
+    assert_eq!(
+        fx.store.kind_and_path_of(now).unwrap().map(|(k, _)| k),
+        Some(Kind::Folder)
+    );
+}
+
+// ---------------------------------------------------------------- changes while hashed
+
+/// A file that changes while the scan hashes it is there (never gone) but gets no event this
+/// time; the next scan journals it with the right MD5s.
+#[test]
+fn a_file_that_changes_while_hashed_is_left_for_the_next_scan() {
+    let fx = Fx::imported();
+    let (old, new) = (format!("{DOC}/a.txt"), format!("{DOC}/new.txt"));
+    fx.write(&old, b"one");
+    fx.seed();
+    let id = fx.id(&old).unwrap();
+    // Changed by hand, so the scan hashes both files.
+    fx.write(&old, b"two");
+    fx.write(&new, b"n");
+    // A person writes each of them again while the scan reads it (once).
+    let pending =
+        std::sync::Mutex::new(vec![(old.clone(), fx.fs(&old)), (new.clone(), fx.fs(&new))]);
+    fx.store.set_scan_hash_hook(move |path| {
+        let mut pending = pending.lock().unwrap();
+        if let Some(i) = pending.iter().position(|(p, _)| *p == path.display()) {
+            let (p, f) = pending.remove(i);
+            std::fs::write(f, format!("{p} changed while it was read")).unwrap();
+        }
+    });
+    let report = fx.scan();
+    assert_eq!(report, ScanReport::default());
+    assert!(fx.events().is_empty(), "{:?}", fx.events());
+    assert_eq!(fx.id(&new), None);
+    assert_eq!(fx.id(&old), Some(id));
+    let report = fx.scan();
+    assert_eq!(paths(&report.created), vec![new.clone()]);
+    assert_eq!(paths(&report.modified), vec![old.clone()]);
+    let modified = fx
+        .bodies()
+        .iter()
+        .find_map(|b| match b {
+            EventBody::FileModified {
+                id: i,
+                md5,
+                prev_md5,
+                ..
+            } if *i == id => Some((md5.clone(), prev_md5.clone())),
+            _ => None,
+        })
+        .expect("file.modified");
+    let now = std::fs::read(fx.fs(&old)).unwrap();
+    assert_eq!(modified, (md5_hex(&now), md5_hex(b"one")));
+}
+
+/// A file that vanishes while the scan hashes it is gone.
+#[test]
+fn a_file_that_vanishes_while_hashed_is_gone() {
+    let fx = Fx::imported();
+    let path = format!("{DOC}/a.txt");
+    fx.write(&path, b"a");
+    fx.write(&format!("{DOC}/keep.txt"), b"keep");
+    fx.seed();
+    let id = fx.id(&path).unwrap();
+    // Changed by hand, so the scan reads it.
+    fx.write(&path, b"aa");
+    let fs = fx.fs(&path);
+    let key = path.clone();
+    fx.store.set_scan_hash_hook(move |p| {
+        if p.display() == key {
+            let _ = std::fs::remove_file(&fs);
+        }
+    });
+    let report = fx.scan();
+    assert_eq!(paths(&report.deleted), vec![path.clone()]);
+    assert!(
+        matches!(&fx.bodies()[..], [EventBody::FileDeleted { id: i, .. }] if *i == id),
+        "{:?}",
+        fx.bodies()
+    );
+    assert_eq!(fx.id(&path), None);
+}
+
 // ---------------------------------------------------------------- mass delete
 
 fn many(fx: &Fx, folder: &str, n: usize) -> Vec<String> {
@@ -977,6 +1097,22 @@ fn a_move_needs_the_cached_size_too() {
         kind_names(&fx.bodies()),
         vec!["file.created", "file.deleted"]
     );
+}
+
+/// A `put` that replaces a file leaves no stale MD5 behind: the next scan finds nothing.
+#[test]
+fn a_put_that_replaces_a_file_is_not_journaled_again_by_the_scan() {
+    use notedown_cloud::put::{PutOutcome, put};
+    let fx = Fx::imported();
+    let src = fx.dir.path().join("src.txt");
+    std::fs::write(&src, b"one").unwrap();
+    put(fx.dir.path(), "jordi", &fx.journal, &src, "INBOX", None).unwrap();
+    std::fs::write(&src, b"two, longer").unwrap();
+    let r = put(fx.dir.path(), "jordi", &fx.journal, &src, "INBOX", None).unwrap();
+    assert_eq!(r.outcome, PutOutcome::Replaced);
+    let before = fx.events().len();
+    assert_eq!(fx.scan(), ScanReport::default());
+    assert_eq!(fx.events().len(), before);
 }
 
 #[test]

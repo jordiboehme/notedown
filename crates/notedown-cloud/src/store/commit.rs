@@ -1377,12 +1377,15 @@ impl Store {
         })
     }
 
-    /// Bring the id registry in line with an applied change. Idempotent.
+    /// Bring the id registry (and for a put the MD5 cache) in line with an applied change.
+    /// Idempotent.
     fn finish_registry(&self, guard: &StoreGuard, op: &PendingOp) -> Result<()> {
         match op {
-            // The id was assigned (durably) while planning, before the intent was written.
-            PendingOp::Put { .. }
-            | PendingOp::Copy { .. }
+            // The id was assigned (durably) while planning, before the intent was written. The
+            // cached MD5 of a replaced file is the old one: it goes, or the next scan would
+            // journal the put again as a change made by hand.
+            PendingOp::Put { path, .. } => self.forget_md5(guard, &wire(path)?),
+            PendingOp::Copy { .. }
             | PendingOp::CreateFolder { .. }
             | PendingOp::Unchanged { .. } => Ok(()),
             PendingOp::Move { id, to, prune, .. } => {

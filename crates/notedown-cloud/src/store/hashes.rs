@@ -117,14 +117,39 @@ impl HashCache {
     }
 
     /// The MD5 of the regular file `fs_path` (wire path `key`), from the cache when size, mtime
-    /// and ctime match `meta`, else hashed and cached. A file that changes while it is hashed is
-    /// not cached.
+    /// and ctime match `meta`, else hashed and cached. A file that changes while it is hashed
+    /// gives the MD5 of what was read, which may be no version of the file at all: see
+    /// [`HashCache::md5_checked`].
     pub fn md5(
         &mut self,
         key: &WirePath,
         fs_path: &Path,
         meta: &std::fs::Metadata,
     ) -> std::io::Result<String> {
+        self.hash(key, fs_path, meta).map(|(md5, _)| md5)
+    }
+
+    /// [`HashCache::md5`], but `None` when the file changed while it was hashed (its size, mtime
+    /// or ctime after the read differs from `meta`). Such a file is not cached, and its old row
+    /// stays as it was: it no longer matches the file, and it still holds the MD5 before the
+    /// change for the next try.
+    pub fn md5_checked(
+        &mut self,
+        key: &WirePath,
+        fs_path: &Path,
+        meta: &std::fs::Metadata,
+    ) -> std::io::Result<Option<String>> {
+        let (md5, stable) = self.hash(key, fs_path, meta)?;
+        Ok(stable.then_some(md5))
+    }
+
+    /// The MD5 and whether the file stayed the same while it was hashed.
+    fn hash(
+        &mut self,
+        key: &WirePath,
+        fs_path: &Path,
+        meta: &std::fs::Metadata,
+    ) -> std::io::Result<(String, bool)> {
         let key = key.display();
         let (size, mtime, ctime) = (meta.len(), mtime_ns(meta), ctime_ns(meta));
         if let Some(row) = self.rows.get(&key)
@@ -132,11 +157,12 @@ impl HashCache {
             && row.mtime_ns == mtime
             && row.ctime_ns == Some(ctime)
         {
-            return Ok(row.md5.clone());
+            return Ok((row.md5.clone(), true));
         }
         let md5 = md5_file(fs_path)?;
         let after = std::fs::metadata(fs_path)?;
-        if after.len() == size && mtime_ns(&after) == mtime && ctime_ns(&after) == ctime {
+        let stable = after.len() == size && mtime_ns(&after) == mtime && ctime_ns(&after) == ctime;
+        if stable {
             self.rows.insert(
                 key,
                 HashRow {
@@ -147,10 +173,17 @@ impl HashCache {
                 },
             );
             self.dirty = true;
-        } else if self.rows.remove(&key).is_some() {
-            self.dirty = true;
         }
-        Ok(md5)
+        Ok((md5, stable))
+    }
+
+    /// Whether the row of `key` matches `meta`, so [`HashCache::md5`] would not read the file.
+    pub fn is_current(&self, key: &WirePath, meta: &std::fs::Metadata) -> bool {
+        self.rows.get(&key.display()).is_some_and(|row| {
+            row.size == meta.len()
+                && row.mtime_ns == mtime_ns(meta)
+                && row.ctime_ns == Some(ctime_ns(meta))
+        })
     }
 
     /// Rows at `from` and below move to `to` (a rename keeps size and mtime).
@@ -169,6 +202,34 @@ impl HashCache {
     pub fn removed(&mut self, path: &WirePath) {
         for key in self.keys_under(path) {
             self.rows.remove(&key);
+            self.dirty = true;
+        }
+    }
+
+    /// The row of the file `path` is dropped (rows below it are not looked at).
+    pub fn removed_file(&mut self, path: &WirePath) {
+        if self.rows.remove(&path.display()).is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Rows at each of `folders` and below are dropped, in one pass over the cache.
+    pub fn removed_all(&mut self, folders: &[WirePath]) {
+        if folders.is_empty() {
+            return;
+        }
+        let tops: std::collections::HashSet<String> =
+            folders.iter().map(WirePath::display).collect();
+        let before = self.rows.len();
+        // A key lies below a folder when the folder is the key itself or one of its prefixes
+        // that ends before a `/`.
+        self.rows.retain(|key, _| {
+            !(tops.contains(key)
+                || key
+                    .match_indices('/')
+                    .any(|(i, _)| tops.contains(&key[..i])))
+        });
+        if self.rows.len() != before {
             self.dirty = true;
         }
     }
@@ -277,6 +338,46 @@ mod tests {
         assert!(cache.dirty);
         cache.rows.get_mut("a.txt").unwrap().md5 = "planted".into();
         assert_eq!(md5_of(&mut cache, &key, &fs), "planted");
+    }
+
+    #[test]
+    fn a_file_that_changes_while_hashed_is_not_cached_and_keeps_its_old_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = dir.path().join("a.txt");
+        std::fs::write(&fs, b"one").unwrap();
+        let key = wp("a.txt");
+        let mut cache = HashCache::default();
+        let first = md5_of(&mut cache, &key, &fs);
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&fs, b"two").unwrap();
+        // The stat the walk took, then a write before the hash ends.
+        let meta = std::fs::metadata(&fs).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&fs, b"three").unwrap();
+        assert_eq!(cache.md5_checked(&key, &fs, &meta).unwrap(), None);
+        assert_eq!(cache.cached(&key), Some(first.as_str()));
+        assert!(!cache.is_current(&key, &std::fs::metadata(&fs).unwrap()));
+    }
+
+    #[test]
+    fn removed_all_drops_folders_by_whole_segments() {
+        let mut cache = HashCache::default();
+        for k in ["a/b/x", "a/bc/y", "a/b", "c/d", "e"] {
+            cache.rows.insert(
+                k.into(),
+                HashRow {
+                    size: 1,
+                    mtime_ns: 1,
+                    ctime_ns: Some(1),
+                    md5: "m".into(),
+                },
+            );
+        }
+        cache.removed_all(&[wp("a/b"), wp("c")]);
+        let left: Vec<&str> = cache.rows.keys().map(String::as_str).collect();
+        assert_eq!(left, vec!["a/bc/y", "e"]);
+        cache.removed_file(&wp("e"));
+        assert_eq!(cache.cached(&wp("e")), None);
     }
 
     #[test]

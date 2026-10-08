@@ -337,7 +337,9 @@ fn md5_is_cached_and_recomputed_on_size_mtime_or_ctime_change() {
     assert!(v["INBOX/a.txt"]["mtime_ns"].is_u64());
     assert!(v["INBOX/a.txt"]["ctime_ns"].is_u64());
 
-    // same size and mtime set back, but the write moved the ctime: recomputed
+    // same size and mtime set back, but the write moved the ctime: recomputed (after a pause:
+    // the ctime clock of some file systems is coarse)
+    std::thread::sleep(Duration::from_millis(20));
     std::fs::write(&file, b"bbbb").unwrap();
     set_mtime(&file, t0);
     assert_eq!(store.md5_of(&g, &p).unwrap(), md5_hex(b"bbbb"));

@@ -50,6 +50,10 @@ pub const SCAN_HOLD_FILE: &str = "scan-hold.json";
 /// How many paths [`ScanHold::examples`] lists at most.
 const HOLD_EXAMPLES: usize = 10;
 
+/// From this many files to hash, a scan says on stderr that it can take a while (the first scan
+/// after an upgrade hashes every file once).
+const LONG_HASH: usize = 100;
+
 /// What [`Store::scan`] looks at and how.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanOptions {
@@ -116,13 +120,15 @@ pub struct ScanHold {
 }
 
 /// A file or folder of the scope on disk. `md5` and `prev` are for files: the fresh MD5 and the
-/// cached one before this scan.
+/// cached one before this scan. `unstable` is a file that changed while it was hashed: it is
+/// there, but its MD5 is unknown until the next scan.
 struct OnDisk {
     path: WirePath,
     kind: Kind,
     size: u64,
     md5: String,
     prev: Option<String>,
+    unstable: bool,
 }
 
 /// A new entry with the id it gets.
@@ -239,7 +245,8 @@ impl Store {
     /// found. Under `guard`; nothing on disk below `files/` is changed. A tree that breaks
     /// while it is read (`files/` or a native folder of an imported account gone or swapped) is
     /// `Error::StoreDamaged`, so a broken tree never journals deletes. A file that vanishes
-    /// while it is hashed counts as gone.
+    /// while it is hashed counts as gone. A file that changes while it is hashed counts as
+    /// there, but gets no id and no event this time: the next scan journals it.
     pub fn scan(
         &self,
         guard: &WriteGuard,
@@ -364,14 +371,30 @@ impl Store {
                 found.push(top);
             }
         }
+        let to_hash = found
+            .iter()
+            .filter(|f| f.kind == Kind::File && !cache.is_current(&f.path, &f.meta))
+            .count();
+        if to_hash > LONG_HASH {
+            eprintln!(
+                "notedown cloud: account {}: checking {to_hash} files, this can take a while",
+                self.slug
+            );
+        }
+        let hook = self.hash_hook();
         let mut disk = Vec::with_capacity(found.len());
         for f in found {
-            let (md5, prev) = match f.kind {
-                Kind::Folder => (String::new(), None),
+            let (md5, prev, unstable) = match f.kind {
+                Kind::Folder => (String::new(), None, false),
                 Kind::File => {
                     let prev = cache.cached(&f.path).map(str::to_string);
-                    match cache.md5(&f.path, &f.fs_path, &f.meta) {
-                        Ok(md5) => (md5, prev),
+                    if let Some(hook) = &hook {
+                        hook(&f.path);
+                    }
+                    match cache.md5_checked(&f.path, &f.fs_path, &f.meta) {
+                        Ok(Some(md5)) => (md5, prev, false),
+                        // Changed while it was hashed: the MD5 may be of no version at all.
+                        Ok(None) => (String::new(), prev, true),
                         // Removed while the scan ran: it is gone.
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                         Err(e) => return Err(io_err(&f.fs_path)(e)),
@@ -388,6 +411,7 @@ impl Store {
                 kind: f.kind,
                 md5,
                 prev,
+                unstable,
             });
         }
         let after = self.check_tree(false)?;
@@ -518,22 +542,42 @@ impl Store {
         (kind, changed, events)
     }
 
-    /// After the journal append: the registry ops in one log append, then the cache (the rows
-    /// of gone and moved paths dropped; after a whole-tree scan only the files on disk kept).
+    /// After the journal append: the registry ops in one log append, then the cache (after a
+    /// whole-tree scan only the rows of the files on disk kept, else the rows of gone and moved
+    /// paths dropped).
     fn finish_scan(&self, plan: &Plan, mut cache: HashCache, opts: &ScanOptions) -> Result<()> {
-        for g in plan.gone_files.iter().chain(&plan.gone_folders) {
-            cache.removed(&g.path);
-        }
-        for (_, from, _) in &plan.moved {
-            cache.removed(from);
+        if opts.scope.is_root() && opts.recursive {
+            cache.retain(&plan.files_on_disk);
+        } else {
+            // By exact key for files (a moved file's old path is a file too), and one pass for
+            // every gone folder: a large delete by hand stays linear in the cache.
+            for g in &plan.gone_files {
+                cache.removed_file(&g.path);
+            }
+            for (_, from, _) in &plan.moved {
+                cache.removed_file(from);
+            }
+            let folders: Vec<WirePath> = plan.gone_folders.iter().map(|g| g.path.clone()).collect();
+            cache.removed_all(&folders);
         }
         let mut state = self.state();
         self.append(&mut state, &plan.ops())?;
-        if opts.scope.is_root() && opts.recursive {
-            cache.retain(&plan.files_on_disk);
-        }
         state.hashes = cache;
         self.flush_hashes(&mut state)
+    }
+
+    /// Run `hook` with the wire path of each file a scan of this store is about to hash, as a
+    /// person changing or removing it at that moment would. Test hook.
+    #[doc(hidden)]
+    pub fn set_scan_hash_hook(&self, hook: impl Fn(&WirePath) + Send + Sync + 'static) {
+        *self.hash_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(hook));
+    }
+
+    fn hash_hook(&self) -> Option<super::HashHook> {
+        self.hash_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn hold_path(&self) -> std::path::PathBuf {
@@ -620,6 +664,19 @@ fn plan(
             .collect();
         gone.extend(below);
     }
+    // A folder above the scope whose row is a file (a file replaced by hand with a folder of
+    // the same name): the file is gone, and the folder is new below.
+    for path in &parents {
+        if let Some(id) = reg.id_of(path)
+            && reg.get(id).is_some_and(|(k, _)| *k == Kind::File)
+        {
+            gone.push(Gone {
+                id,
+                kind: Kind::File,
+                path: path.clone(),
+            });
+        }
+    }
     let gone_ids: HashSet<u64> = gone.iter().map(|g| g.id).collect();
     let left_outside = reg
         .rows()
@@ -648,10 +705,15 @@ fn plan(
             size: 0,
             md5: String::new(),
             prev: None,
+            unstable: false,
         })
         .collect();
     let mut new_files = Vec::new();
     for d in disk {
+        if d.unstable {
+            // Present, so never gone; journaled by a later scan once it holds still.
+            continue;
+        }
         if !has_row(&d.path, d.kind) {
             match d.kind {
                 Kind::Folder => new_folders.push(d),

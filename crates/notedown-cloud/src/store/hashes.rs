@@ -80,6 +80,26 @@ pub(crate) fn md5_file(path: &Path) -> std::io::Result<String> {
     Ok(const_hex::encode(hasher.finalize()))
 }
 
+/// The MD5 of the file `fs_path` and whether it stayed the same while it was read: its size,
+/// mtime and ctime after the read equal `meta`. Needs no cache, so several threads can hash at
+/// once.
+pub(crate) fn md5_stable(
+    fs_path: &Path,
+    meta: &std::fs::Metadata,
+) -> std::io::Result<(String, bool)> {
+    let md5 = md5_file(fs_path)?;
+    let after = std::fs::metadata(fs_path)?;
+    let stable = after.len() == meta.len()
+        && mtime_ns(&after) == mtime_ns(meta)
+        && ctime_ns(&after) == ctime_ns(meta);
+    Ok((md5, stable))
+}
+
+/// Whether `row` was cached for the file as it is in `meta`.
+fn row_matches(row: &HashRow, meta: &std::fs::Metadata) -> bool {
+    row.size == meta.len() && row.mtime_ns == mtime_ns(meta) && row.ctime_ns == Some(ctime_ns(meta))
+}
+
 impl HashCache {
     pub fn load(dir: &Path) -> Result<HashCache> {
         let path = dir.join(HASHES_FILE);
@@ -150,40 +170,38 @@ impl HashCache {
         fs_path: &Path,
         meta: &std::fs::Metadata,
     ) -> std::io::Result<(String, bool)> {
-        let key = key.display();
-        let (size, mtime, ctime) = (meta.len(), mtime_ns(meta), ctime_ns(meta));
-        if let Some(row) = self.rows.get(&key)
-            && row.size == size
-            && row.mtime_ns == mtime
-            && row.ctime_ns == Some(ctime)
+        if let Some(row) = self.rows.get(&key.display())
+            && row_matches(row, meta)
         {
             return Ok((row.md5.clone(), true));
         }
-        let md5 = md5_file(fs_path)?;
-        let after = std::fs::metadata(fs_path)?;
-        let stable = after.len() == size && mtime_ns(&after) == mtime && ctime_ns(&after) == ctime;
+        let (md5, stable) = md5_stable(fs_path, meta)?;
         if stable {
-            self.rows.insert(
-                key,
-                HashRow {
-                    size,
-                    mtime_ns: mtime,
-                    ctime_ns: Some(ctime),
-                    md5: md5.clone(),
-                },
-            );
-            self.dirty = true;
+            self.hashed(key, meta, &md5);
         }
         Ok((md5, stable))
     }
 
+    /// Cache `md5` for the file `key` as it was in `meta`: the result of [`md5_stable`] when it
+    /// was stable.
+    pub fn hashed(&mut self, key: &WirePath, meta: &std::fs::Metadata, md5: &str) {
+        self.rows.insert(
+            key.display(),
+            HashRow {
+                size: meta.len(),
+                mtime_ns: mtime_ns(meta),
+                ctime_ns: Some(ctime_ns(meta)),
+                md5: md5.to_string(),
+            },
+        );
+        self.dirty = true;
+    }
+
     /// Whether the row of `key` matches `meta`, so [`HashCache::md5`] would not read the file.
     pub fn is_current(&self, key: &WirePath, meta: &std::fs::Metadata) -> bool {
-        self.rows.get(&key.display()).is_some_and(|row| {
-            row.size == meta.len()
-                && row.mtime_ns == mtime_ns(meta)
-                && row.ctime_ns == Some(ctime_ns(meta))
-        })
+        self.rows
+            .get(&key.display())
+            .is_some_and(|row| row_matches(row, meta))
     }
 
     /// Set the row of the file `path` to `row`, a row the caller knows to be right.

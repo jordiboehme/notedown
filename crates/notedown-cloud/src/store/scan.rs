@@ -35,11 +35,12 @@
 //! scope came back.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 use super::commit::{SideBatch, SideWrite, WriteGuard};
-use super::hashes::HashCache;
+use super::hashes::{HashCache, md5_stable};
 use super::ids::{Op, Registry};
 use super::{Kind, Store, WirePath, is_native_folder, list};
 use crate::journal::{Event, EventBody, FileKind, Journal, Origin, new_op_id};
@@ -54,6 +55,12 @@ const HOLD_EXAMPLES: usize = 10;
 /// From this many files to hash, a scan says on stderr that it can take a while (the first scan
 /// after an upgrade hashes every file once).
 const LONG_HASH: usize = 100;
+
+/// From this many files to hash, a scan hashes them on several threads.
+const PARALLEL_HASH: usize = 8;
+
+/// A scan hashes on at most this many threads.
+const HASH_THREADS: usize = 4;
 
 /// What [`Store::scan`] looks at and how.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,7 +364,8 @@ impl Store {
     /// whole-tree scan, else only the rows of the files found. Returns the entries of the scope
     /// (files with a fresh MD5 and the cached one), the folders above it and the copy. The store's
     /// cache is not touched: a scan that holds or stops early leaves it as it was. The tree is
-    /// checked before and after, like [`Store::list`] does.
+    /// checked before and after, like [`Store::list`] does. The files to hash are read on a few
+    /// threads ([`hash_files`]); the results go into the copy in walk order.
     fn scan_disk(&self, opts: &ScanOptions) -> Result<(Vec<OnDisk>, Vec<WirePath>, HashCache)> {
         let before = self.check_tree(false)?;
         let mut found = Vec::new();
@@ -388,27 +396,45 @@ impl Store {
                 )
             }
         };
-        let to_hash = found
+        // The files whose row is not current, in walk order. A current file gets the cached MD5
+        // and is not read.
+        let to_hash: Vec<usize> = found
             .iter()
-            .filter(|f| f.kind == Kind::File && !cache.is_current(&f.path, &f.meta))
-            .count();
-        if to_hash > LONG_HASH {
+            .enumerate()
+            .filter(|(_, f)| f.kind == Kind::File && !cache.is_current(&f.path, &f.meta))
+            .map(|(i, _)| i)
+            .collect();
+        if to_hash.len() > LONG_HASH {
             eprintln!(
-                "notedown cloud: account {}: checking {to_hash} files, this can take a while",
-                self.slug
+                "notedown cloud: account {}: checking {} files, this can take a while",
+                self.slug,
+                to_hash.len()
             );
         }
         let hook = self.hash_hook();
+        let mut hashed = hash_files(&found, &to_hash, hook.as_deref()).into_iter();
+        let mut next_hashed = to_hash.iter().copied().peekable();
         let mut disk = Vec::with_capacity(found.len());
-        for f in found {
+        for (i, f) in found.into_iter().enumerate() {
             let (md5, prev, unstable) = match f.kind {
                 Kind::Folder => (String::new(), None, false),
                 Kind::File => {
                     let prev = cache.cached(&f.path).map(str::to_string);
-                    if let Some(hook) = &hook {
-                        hook(&f.path);
-                    }
-                    match cache.md5_checked(&f.path, &f.fs_path, &f.meta) {
+                    let read = if next_hashed.next_if_eq(&i).is_some() {
+                        let read = hashed.next().expect("one result per file to hash");
+                        read.map(|(md5, stable)| {
+                            if stable {
+                                cache.hashed(&f.path, &f.meta, &md5);
+                            }
+                            stable.then_some(md5)
+                        })
+                    } else {
+                        if let Some(hook) = &hook {
+                            hook(&f.path);
+                        }
+                        cache.md5_checked(&f.path, &f.fs_path, &f.meta)
+                    };
+                    match read {
                         Ok(Some(md5)) => (md5, prev, false),
                         // Changed while it was hashed: the MD5 may be of no version at all.
                         Ok(None) => (String::new(), prev, true),
@@ -618,7 +644,8 @@ impl Store {
     }
 
     /// Run `hook` with the wire path of each file a scan of this store is about to hash, as a
-    /// person changing or removing it at that moment would. Test hook.
+    /// person changing or removing it at that moment would. It may run on several threads at once.
+    /// Test hook.
     #[doc(hidden)]
     pub fn set_scan_hash_hook(&self, hook: impl Fn(&WirePath) + Send + Sync + 'static) {
         *self.hash_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(hook));
@@ -887,10 +914,172 @@ fn plan(
     p
 }
 
+/// [`md5_stable`] of each file `found[i]` for `i` in `to_hash` (ascending), with `hook` run right
+/// before each read. The results are in the order of `to_hash`. From [`PARALLEL_HASH`] files the
+/// reads run on up to [`HASH_THREADS`] threads. After an error other than a missing file no new
+/// file is started: every file before the failed one still has its result, so the first error in
+/// order is the one the serial loop would meet. The tail after it is left out.
+fn hash_files(
+    found: &[list::Found],
+    to_hash: &[usize],
+    hook: Option<&(dyn Fn(&WirePath) + Send + Sync)>,
+) -> Vec<std::io::Result<(String, bool)>> {
+    let read = |i: usize| {
+        let f = &found[i];
+        if let Some(hook) = hook {
+            hook(&f.path);
+        }
+        md5_stable(&f.fs_path, &f.meta)
+    };
+    let failed = |r: &std::io::Result<(String, bool)>| {
+        r.as_ref()
+            .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound)
+    };
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(HASH_THREADS)
+        .min(to_hash.len());
+    if to_hash.len() < PARALLEL_HASH || threads < 2 {
+        let mut out = Vec::with_capacity(to_hash.len());
+        for &i in to_hash {
+            let r = read(i);
+            let stop = failed(&r);
+            out.push(r);
+            if stop {
+                break;
+            }
+        }
+        return out;
+    }
+    // Each thread takes the next file in order, so the files before a failed one are all taken.
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let mut slots: Vec<Option<std::io::Result<(String, bool)>>> =
+        (0..to_hash.len()).map(|_| None).collect();
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    while !stop.load(Ordering::Relaxed) {
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&i) = to_hash.get(k) else { break };
+                        let r = read(i);
+                        if failed(&r) {
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                        done.push((k, r));
+                    }
+                    done
+                })
+            })
+            .collect();
+        for worker in workers {
+            // A panic in a thread (only the test hook can panic) goes on in the caller.
+            let done = worker
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e));
+            for (k, r) in done {
+                slots[k] = Some(r);
+            }
+        }
+    });
+    slots.into_iter().map_while(|r| r).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::ids::tests::{Rng, random_path, random_registry};
     use super::*;
+
+    /// The files `name -> bytes` in `dir`, as the walk finds them.
+    fn found_files(dir: &std::path::Path, files: &[(String, Vec<u8>)]) -> Vec<list::Found> {
+        files
+            .iter()
+            .map(|(name, bytes)| {
+                let fs_path = dir.join(name);
+                std::fs::write(&fs_path, bytes).unwrap();
+                list::Found {
+                    path: WirePath::parse(name).unwrap(),
+                    meta: std::fs::metadata(&fs_path).unwrap(),
+                    fs_path,
+                    kind: Kind::File,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hash_files_on_threads_gives_each_file_its_md5_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<(String, Vec<u8>)> = (0..PARALLEL_HASH * 5)
+            .map(|i| {
+                // Some files take more than one read of the hash buffer (256 KiB).
+                let len = if i % 9 == 4 { 700 * 1024 + i } else { 50 + i };
+                (
+                    format!("f{i:02}"),
+                    (0..len).map(|b| (b ^ i) as u8).collect(),
+                )
+            })
+            .collect();
+        let found = found_files(dir.path(), &files);
+        // Every file but each seventh, so the results must follow the indices given.
+        let to_hash: Vec<usize> = (0..found.len()).filter(|i| i % 7 != 0).collect();
+        let threads = std::sync::Mutex::new(HashSet::new());
+        let hook = |_: &WirePath| {
+            threads.lock().unwrap().insert(std::thread::current().id());
+            // Long enough that every thread gets a file.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        let out = hash_files(&found, &to_hash, Some(&hook));
+        assert_eq!(out.len(), to_hash.len());
+        for (&i, r) in to_hash.iter().zip(out) {
+            let (md5, stable) = r.unwrap();
+            assert_eq!(
+                md5,
+                super::super::hashes::md5_file(&found[i].fs_path).unwrap()
+            );
+            assert!(stable, "{}", found[i].path.display());
+        }
+        let parallel = std::thread::available_parallelism().map_or(1, |n| n.get());
+        if parallel > 1 {
+            assert!(threads.lock().unwrap().len() > 1);
+        }
+    }
+
+    #[test]
+    fn hash_files_on_threads_stops_at_an_error_with_every_file_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<(String, Vec<u8>)> = (0..PARALLEL_HASH * 4)
+            .map(|i| (format!("f{i:02}"), format!("file {i}").into_bytes()))
+            .collect();
+        let mut found = found_files(dir.path(), &files);
+        // A folder in place of a file: reading it fails with an error other than a missing file.
+        let bad = PARALLEL_HASH * 2;
+        std::fs::remove_file(&found[bad].fs_path).unwrap();
+        std::fs::create_dir(&found[bad].fs_path).unwrap();
+        // And a file removed before it: that one only counts as gone.
+        let missing = 3;
+        std::fs::remove_file(&found[missing].fs_path).unwrap();
+        found[bad].meta = std::fs::metadata(&found[bad].fs_path).unwrap();
+        let to_hash: Vec<usize> = (0..found.len()).collect();
+        let out = hash_files(&found, &to_hash, None);
+        assert!(out.len() > bad, "{}", out.len());
+        for (i, r) in out.iter().enumerate().take(bad) {
+            match r {
+                Ok((md5, true)) => {
+                    assert_eq!(
+                        *md5,
+                        super::super::hashes::md5_file(&found[i].fs_path).unwrap()
+                    );
+                }
+                Err(e) if i == missing => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+                other => panic!("{i}: {other:?}"),
+            }
+        }
+        let e = out[bad].as_ref().unwrap_err();
+        assert_ne!(e.kind(), std::io::ErrorKind::NotFound);
+    }
 
     /// The gone rows and the files left outside the scope as a walk of every registry row finds
     /// them (the plan before the scope queries).

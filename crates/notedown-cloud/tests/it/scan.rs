@@ -824,6 +824,103 @@ fn a_file_that_vanishes_while_hashed_is_gone() {
     assert_eq!(fx.id(&path), None);
 }
 
+/// Enough changed files for the scan to hash them on several threads: each gets the MD5 of its
+/// bytes, a file removed while the threads hash is gone and a file changed while it is hashed
+/// is left for the next scan.
+#[test]
+fn many_files_hashed_on_threads_keep_their_md5_and_the_per_file_rules() {
+    let fx = Fx::imported();
+    // Well above the count from which the scan hashes on threads (8).
+    let names: Vec<String> = (0..40).map(|i| format!("{DOC}/t{i:02}.txt")).collect();
+    for (i, p) in names.iter().enumerate() {
+        fx.write(p, format!("file {i}").as_bytes());
+    }
+    fx.seed();
+    let body = |i: usize| -> Vec<u8> {
+        // Some files take more than one read of the hash buffer (256 KiB).
+        let len = if i % 10 == 3 { 600 * 1024 + i } else { 100 + i };
+        (0..len).map(|b| (b * 7 + i) as u8).collect()
+    };
+    for (i, p) in names.iter().enumerate() {
+        fx.write(p, &body(i));
+    }
+    let gone = [names[5].clone(), names[31].clone()];
+    let changed = names[17].clone();
+    let later = b"changed while it was read".to_vec();
+    let removed: Vec<(String, PathBuf)> = gone.iter().map(|p| (p.clone(), fx.fs(p))).collect();
+    let rewrite = std::sync::Mutex::new(Some((changed.clone(), fx.fs(&changed), later.clone())));
+    let caller = std::thread::current().id();
+    let other_thread = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = other_thread.clone();
+    fx.store.set_scan_hash_hook(move |p| {
+        if std::thread::current().id() != caller {
+            seen.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some((_, fs)) = removed.iter().find(|(k, _)| *k == p.display()) {
+            let _ = std::fs::remove_file(fs);
+        }
+        let mut rewrite = rewrite.lock().unwrap();
+        if rewrite.as_ref().is_some_and(|(k, _, _)| *k == p.display()) {
+            let (_, fs, bytes) = rewrite.take().unwrap();
+            std::fs::write(fs, bytes).unwrap();
+        }
+    });
+    let report = fx.scan();
+    if std::thread::available_parallelism().map_or(1, |n| n.get()) > 1 {
+        assert!(other_thread.load(std::sync::atomic::Ordering::Relaxed));
+    }
+    assert_eq!(paths(&report.deleted), gone.to_vec());
+    let kept: Vec<String> = names
+        .iter()
+        .filter(|p| !gone.contains(p) && **p != changed)
+        .cloned()
+        .collect();
+    assert_eq!(paths(&report.modified), kept);
+    let changed_id = fx.id(&changed).unwrap();
+    let bodies = fx.bodies();
+    assert!(
+        !bodies.iter().any(|b| matches!(
+            b,
+            EventBody::FileModified { id, .. } | EventBody::FileDeleted { id, .. }
+                if *id == changed_id
+        )),
+        "{bodies:?}"
+    );
+    for (i, p) in names.iter().enumerate().filter(|(_, p)| kept.contains(p)) {
+        let id = fx.id(p).unwrap();
+        assert!(
+            bodies.iter().any(|b| matches!(
+                b,
+                EventBody::FileModified { id: m, md5, prev_md5, .. }
+                    if *m == id
+                        && *md5 == md5_hex(&body(i))
+                        && *prev_md5 == md5_hex(format!("file {i}").as_bytes())
+            )),
+            "{p}: {bodies:?}"
+        );
+    }
+    // The next scan journals the changed file with the right MD5s.
+    let before = fx.bodies().len();
+    let report = fx.scan();
+    assert_eq!(paths(&report.modified), vec![changed.clone()]);
+    assert!(report.deleted.is_empty() && report.created.is_empty());
+    let bodies = fx.bodies();
+    assert!(
+        bodies[before..].iter().any(|b| matches!(
+            b,
+            EventBody::FileModified { id, md5, prev_md5, .. }
+                if *id == changed_id
+                    && *md5 == md5_hex(&later)
+                    && *prev_md5 == md5_hex(b"file 17")
+        )),
+        "{bodies:?}"
+    );
+    // The cache holds the right rows: a third scan finds nothing to do.
+    let events = fx.events().len();
+    assert_eq!(fx.scan(), ScanReport::default());
+    assert_eq!(fx.events().len(), events);
+}
+
 // ---------------------------------------------------------------- mass delete
 
 fn many(fx: &Fx, folder: &str, n: usize) -> Vec<String> {

@@ -765,6 +765,7 @@ fn import_file(
         None,
         PutOptions {
             create_parents: true,
+            drop_md5: true,
             ..PutOptions::default()
         },
     );

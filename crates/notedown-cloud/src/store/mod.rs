@@ -755,6 +755,8 @@ impl Store {
         md5: &str,
     ) -> Result<()> {
         self.check_guard(guard)?;
+        // Only the memory: it's a cache, and the next flush writes it. A reload after another
+        // process wrote the file (see `lock`) drops the row, which is safe.
         let mut state = self.state();
         state.hashes.insert(
             path,
@@ -765,6 +767,20 @@ impl Store {
                 md5: md5.to_string(),
             },
         );
+        Ok(())
+    }
+
+    /// The cached MD5 of the file at `path`, without touching the disk (it may be stale).
+    pub fn cached_md5(&self, guard: &StoreGuard, path: &WirePath) -> Result<Option<String>> {
+        self.check_guard(guard)?;
+        Ok(self.state().hashes.cached(path).map(str::to_string))
+    }
+
+    /// Write the MD5 cache if a commit changed it (a put keeps a row in memory only). A process
+    /// that ends after one write calls this; a server leaves it to the next flush.
+    pub fn flush_cache(&self, guard: &StoreGuard) -> Result<()> {
+        self.check_guard(guard)?;
+        let mut state = self.state();
         self.flush_hashes(&mut state)
     }
 

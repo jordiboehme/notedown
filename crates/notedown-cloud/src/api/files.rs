@@ -1213,6 +1213,7 @@ fn finish_claimed(
         recycle_at_ms: a.protect.then_some(a.now_ms),
         // The one hash of the staged bytes, under the store lock, before any id is assigned.
         expect_md5: Some(a.content_hash.clone()),
+        drop_md5: false,
     };
     let planned = store.plan_put_with(
         &guard,

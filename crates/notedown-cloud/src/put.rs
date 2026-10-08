@@ -155,6 +155,7 @@ fn stage_and_commit(
     };
     crate::pages::plan_page_events(store, &guard, &mut commit);
     let seqs = store.commit(&guard, commit, journal)?;
+    store.flush_cache(&guard)?;
     Ok(PutResult {
         id,
         path: path.clone(),

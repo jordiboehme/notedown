@@ -1786,6 +1786,7 @@ const NEW_PARENTS: PutOptions = PutOptions {
     create_parents: true,
     recycle_at_ms: None,
     expect_md5: None,
+    drop_md5: false,
 };
 
 fn protect_at(ms: u64) -> PutOptions {
@@ -1793,6 +1794,7 @@ fn protect_at(ms: u64) -> PutOptions {
         create_parents: true,
         recycle_at_ms: Some(ms),
         expect_md5: None,
+        drop_md5: false,
     }
 }
 

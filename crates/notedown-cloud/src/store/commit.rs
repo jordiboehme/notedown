@@ -161,6 +161,9 @@ pub struct PutOptions {
     /// `Error::Invalid { what: "content hash" }` before anything is planned or assigned, so the
     /// caller hashes the staged file only once (here, under the store lock).
     pub expect_md5: Option<String>,
+    /// Drop the cache row of the written file instead of keeping the put's MD5 (the import,
+    /// which has no use for the row, and whose files are looked at again by `verify`).
+    pub drop_md5: bool,
 }
 
 /// The `what` of the error [`Store::plan_put_with`] returns for a wrong `expect_md5`.
@@ -190,6 +193,10 @@ pub struct Commit {
     /// them, so they must be files whose loss is harmless.
     #[serde(skip)]
     pub side_writes: Vec<SideWrite>,
+    /// A put drops the cache row of its file instead of keeping the put's MD5. Not part of the
+    /// intent: recovery always drops it.
+    #[serde(skip)]
+    pub drop_md5: bool,
 }
 
 /// A file directly inside `<account>/pages/` that a commit writes (atomically) or removes after
@@ -227,6 +234,7 @@ impl Commit {
             op,
             events,
             side_writes: Vec::new(),
+            drop_md5: false,
         }
     }
 
@@ -639,7 +647,9 @@ impl Store {
             folders,
             recycle,
         };
-        Ok(Commit::new(origin, device, op, events))
+        let mut commit = Commit::new(origin, device, op, events);
+        commit.drop_md5 = options.drop_md5;
+        Ok(commit)
     }
 
     /// The folders of `parent` (itself included) that do not exist yet, parents first. Each is
@@ -1170,6 +1180,7 @@ impl Store {
             // A folder to prune was not empty: the intent must not promise its event.
             super::write_atomic_short(&self.pending_path(), &crate::fsutil::json_bytes(&commit))?;
         }
+        let written = written.filter(|_| !commit.drop_md5);
         self.finish_registry(guard, &commit.op, written)?;
         self.finish_recycle(&commit.op)?;
         for w in &commit.side_writes {

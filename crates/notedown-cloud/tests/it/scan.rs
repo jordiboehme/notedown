@@ -1135,6 +1135,13 @@ fn a_hand_edit_right_after_a_put_is_journaled() {
         .unwrap()
         .set_modified(old_mtime)
         .unwrap();
+    {
+        let g = fx.store.lock().unwrap();
+        assert_eq!(
+            fx.store.cached_md5(&g, &wp(path)).unwrap(),
+            Some(md5_hex(b"one"))
+        );
+    }
     let before = fx.events().len();
     let report = fx.scan();
     assert_eq!(paths(&report.modified), vec![path.to_string()]);
@@ -1154,6 +1161,87 @@ fn a_hand_edit_right_after_a_put_is_journaled() {
             pages_changed: None,
         }
     );
+}
+
+/// A put in the server's way keeps the row in memory and doesn't rewrite `hashes.json`.
+#[test]
+fn a_put_of_a_new_file_keeps_its_row_without_rewriting_the_cache() {
+    let fx = Fx::imported();
+    fx.write(&format!("{DOC}/a.txt"), b"a");
+    fx.seed();
+    let stamp = || {
+        let m = std::fs::metadata(fx.store.account_dir().join("hashes.json")).unwrap();
+        (m.modified().unwrap(), m.len(), ctime(&m))
+    };
+    let before = stamp();
+    let staging = fx.store.account_dir().join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let staged = staging.join("f");
+    std::fs::write(&staged, b"new file").unwrap();
+    let path = format!("{DOC}/b.txt");
+    let g = fx.store.lock_recovered(&fx.journal).unwrap();
+    let c = fx
+        .store
+        .plan_put(&g, &wp(&path), &staged, Origin::Device, None)
+        .unwrap();
+    fx.store.commit(&g, c, &fx.journal).unwrap();
+    assert_eq!(
+        fx.store.cached_md5(&g, &wp(&path)).unwrap(),
+        Some(md5_hex(b"new file"))
+    );
+    drop(g);
+    assert_eq!(stamp(), before);
+    // The next flush point writes the row.
+    let g = fx.store.lock_recovered(&fx.journal).unwrap();
+    fx.store.flush_cache(&g).unwrap();
+    let rows: serde_json::Value =
+        serde_json::from_slice(&fx.account_file("hashes.json").unwrap()).unwrap();
+    assert_eq!(rows[&path]["md5"], md5_hex(b"new file"));
+}
+
+/// A put with `drop_md5` (the import's) leaves no row for the file, and a scan hashes it
+/// silently.
+#[test]
+fn a_put_with_drop_md5_leaves_no_row() {
+    use notedown_cloud::store::PutOptions;
+    let fx = Fx::imported();
+    let staging = fx.store.account_dir().join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let staged = staging.join("f");
+    std::fs::write(&staged, b"imported").unwrap();
+    let path = format!("{DOC}/c.txt");
+    let g = fx.store.lock_recovered(&fx.journal).unwrap();
+    let c = fx
+        .store
+        .plan_put_with(
+            &g,
+            &wp(&path),
+            &staged,
+            Origin::Cli,
+            None,
+            PutOptions {
+                drop_md5: true,
+                ..PutOptions::default()
+            },
+        )
+        .unwrap();
+    fx.store.commit(&g, c, &fx.journal).unwrap();
+    assert_eq!(fx.store.cached_md5(&g, &wp(&path)).unwrap(), None);
+    drop(g);
+    let before = fx.events().len();
+    assert_eq!(fx.scan(), ScanReport::default());
+    assert_eq!(fx.events().len(), before);
+}
+
+#[cfg(unix)]
+fn ctime(m: &std::fs::Metadata) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    m.ctime_nsec() + m.ctime() * 1_000_000_000
+}
+
+#[cfg(not(unix))]
+fn ctime(_: &std::fs::Metadata) -> i64 {
+    0
 }
 
 /// A put that a crash cut after the rename leaves no cache row: recovery can't prove the file
@@ -1182,7 +1270,8 @@ fn a_recovered_put_drops_the_row() {
     // The next lock recovers the put.
     drop(fx.store.lock_recovered(&fx.journal).unwrap());
     let cache = String::from_utf8(fx.account_file("hashes.json").unwrap()).unwrap();
-    assert!(!cache.contains(&path), "{cache}");
+    let rows: serde_json::Value = serde_json::from_str(&cache).unwrap();
+    assert!(rows.get(&path).is_none(), "{cache}");
     let before = fx.events().len();
     assert_eq!(fx.scan(), ScanReport::default());
     assert_eq!(fx.events().len(), before);

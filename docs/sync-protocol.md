@@ -255,7 +255,7 @@ The reconcile writes no action rows and sends no socket push. Devices learn abou
 - Ratta detects changes by size only. Size plus modification time, with a lazy re-hash, is stricter and correct.
 - Ratta turns out-of-band renames and moves into delete plus add with a new id. Rename detection (same size and hash) is optional.
 - Never rename user files on disk. A case conflict is journaled instead and follows the rule of 3.0 item 1 (an exact name wins, a name that matches two entries only without case answers `E0322`, `case_ambiguous`).
-- Ratta's reconcile writes no action rows and sends no push. Journal entries with `origin:"fs"` (8.3) and a push go beyond Ratta and stay compatible with the device.
+- Ratta's reconcile writes no action rows and sends no push. Journal entries with `origin:"scan"` (8.3) and a push go beyond Ratta and stay compatible with the device.
 - Decide whether to filter hidden and temporary files (`._*`, `.DS_Store`, editor swap files); Ratta takes them into the catalog.
 - Ratta's disk layout has `Document`, `Note` and `MyStyle` at the top of `Supernote/`, while the wire uses `DOCUMENT/Document`, `NOTE/Note` and `NOTE/MyStyle`. This matters when a Ratta data directory is imported.
 - Keep the recycle bin outside the scanned tree (outside `files/`); Ratta's recycle bin is outside its data tree too.
@@ -1139,7 +1139,7 @@ Notes:
 - A file is listed only after it is completely written and renamed into place [proposal].
 - The server hashes files lazily and caches by size and mtime; a changed file found by the scan gets a `file.modified` journal entry and appears with its new hash at the next device listing [proposal].
 - One account, one writer: the sync lock serializes device syncs; web actions take the same lock briefly [proposal; Ratta itself never sends `E0079` and checks the lock only in `synchronous/start`, 3.0].
-- Out-of-band deletes are dangerous (the device deletes its copy); the scan journals them as `file.deleted` with `origin:"fs"` and keeps a copy in `recycle/` only if it still has the bytes (it usually will not), so the operator documentation must say: delete through the server, not the file system [proposal].
+- Out-of-band deletes are dangerous (the device deletes its copy); the scan journals them as `file.deleted` with `origin:"scan"` and keeps a copy in `recycle/` only if it still has the bytes (it usually will not), so the operator documentation must say: delete through the server, not the file system [proposal].
 
 #### 8.3.5 Change journal for ingestion
 

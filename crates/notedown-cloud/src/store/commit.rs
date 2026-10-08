@@ -2058,7 +2058,8 @@ pub(crate) type RecoveredStores = (Vec<(String, Result<Recovery>)>, Vec<Store>);
 
 /// [`recover_all`] that also hands back the stores it opened (also those whose recovery
 /// failed: [`Store::lock_recovered`] tries again), so the server start keeps them instead of
-/// loading each registry again. They no longer announce a busy store lock.
+/// loading each registry again. They no longer announce a busy store lock. A store whose
+/// recovery did something compacts its id log, as a fresh open would.
 pub(crate) fn recover_all_keeping(data_dir: &Path, journal: &Journal) -> Result<RecoveredStores> {
     let accounts = crate::auth::Accounts::new(data_dir);
     let mut out = Vec::new();
@@ -2070,9 +2071,20 @@ pub(crate) fn recover_all_keeping(data_dir: &Path, journal: &Journal) -> Result<
         }
         // A running import holds the store lock for its whole run: say why this waits.
         let r = Store::open_announced(data_dir, &account.slug).and_then(|mut store| {
-            let r = store
-                .lock()
-                .and_then(|guard| store.recover(&guard, journal));
+            let r = store.lock().and_then(|guard| {
+                let r = store.recover(&guard, journal)?;
+                // The repair may have appended registry lines; the kept store folds them in
+                // now instead of at the first hourly sweep.
+                if r != Recovery::Clean
+                    && let Err(e) = store.compact_ids(&guard)
+                {
+                    eprintln!(
+                        "notedown cloud: account {}: compacting the id log failed: {e}",
+                        account.slug
+                    );
+                }
+                Ok(r)
+            });
             store.announce_wait = false;
             stores.push(store);
             r

@@ -621,6 +621,21 @@ impl Store {
         })
     }
 
+    /// Fold `ids.jsonl` into `ids.json` under the store lock, as [`Store::open`] does, and
+    /// keep the stamps current, so the next use does not load the registry again. Nothing
+    /// happens when the log is empty.
+    pub(crate) fn compact_ids(&self, guard: &StoreGuard) -> Result<()> {
+        self.check_guard(guard)?;
+        if Registry::log_is_empty(&self.account_dir) {
+            return Ok(());
+        }
+        let mut state = self.state();
+        self.refresh_ids(&mut state, true)?;
+        state.ids.compact(&self.account_dir)?;
+        state.ids_stamp = Some(self.ids_stamps());
+        Ok(())
+    }
+
     /// An error unless `guard` is the lock of this store.
     pub(crate) fn check_guard(&self, guard: &StoreGuard) -> Result<()> {
         if guard.account_dir == self.account_dir {

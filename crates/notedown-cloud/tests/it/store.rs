@@ -1246,6 +1246,50 @@ fn a_server_start_loads_the_registry_once_up_to_the_first_listing() {
     }
 }
 
+/// A start whose crash repair writes registry lines compacts them before the server serves,
+/// and still loads the registry once up to the first listing.
+#[test]
+fn a_server_start_compacts_the_ids_a_repair_wrote() {
+    use notedown_cloud::Config;
+    use notedown_cloud::journal::{Journal, Origin};
+    use notedown_cloud::server::AppState;
+    use notedown_cloud::store::CrashPoint;
+    let dir = account_with_ids(true);
+    let acc = account_dir(dir.path());
+    let log = acc.join("ids.jsonl");
+    {
+        let journal = Journal::open(dir.path()).unwrap();
+        let store = Store::open(dir.path(), SLUG).unwrap();
+        let g = store.lock_recovered(&journal).unwrap();
+        let c = store
+            .plan_move(
+                &g,
+                &wp("NOTE/Note/a.note"),
+                &wp("NOTE/Note/z.note"),
+                Origin::Cli,
+                None,
+            )
+            .unwrap();
+        store
+            .commit_until(&g, c, &journal, Some(CrashPoint::BeforeAppend))
+            .unwrap();
+    }
+    assert!(acc.join("pending.json").exists());
+    assert!(!log.exists());
+    let before = notedown_cloud::store::registry_loads(&acc);
+    let state = AppState::open(Config::default(), dir.path()).unwrap();
+    assert!(!acc.join("pending.json").exists());
+    assert!(
+        std::fs::metadata(&log).map_or(true, |m| m.len() == 0),
+        "the repair's id lines are still in ids.jsonl"
+    );
+    let store = state.store(SLUG).unwrap();
+    let g = store.lock().unwrap();
+    let listed = store.list(&g, &WirePath::root(), true).unwrap();
+    assert!(paths(&listed).contains(&"NOTE/Note/z.note".to_string()));
+    assert_eq!(notedown_cloud::store::registry_loads(&acc) - before, 1);
+}
+
 #[test]
 fn registered_files_and_current_md5_change_nothing() {
     let (dir, store) = setup();

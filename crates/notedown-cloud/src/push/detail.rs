@@ -194,7 +194,7 @@ fn rebase(path: &str, moves: &[(String, String)]) -> String {
 /// again. Fails only when the id registry cannot be read.
 ///
 /// Every live entry is named at its path now ([`final_path`]), and every path the device knows
-/// is rebased onto the moves of its parent folders in the same push. The items go out in an
+/// is rebased onto the moves of its parent folders that go out before it. The items go out in an
 /// order the device can follow: first the folders that are new or moved, parents before
 /// children; then the copies (their source is still as the device has it); then the other file
 /// items; then the deletes, in journal order. A change of the same entry is in the order of
@@ -209,34 +209,46 @@ pub fn detail_items(
     for change in &list {
         paths.push(final_path(change, store)?);
     }
-    let moves: Vec<(String, String)> = list
-        .iter()
-        .zip(&paths)
-        .filter(|(c, _)| c.folder)
-        .filter_map(|(c, now)| Some((norm(c.known_path.as_ref()?), now.clone()?)))
-        .filter(|(from, to)| from != to)
-        .collect();
-    // (group, depth) per item list: 0 folders, 1 copies, 2 files, 3 deletes.
-    let mut groups: Vec<((u8, usize), Vec<Item>)> = Vec::with_capacity(list.len());
-    for (change, now) in list.iter().zip(&paths) {
+    // (group, depth) per change: 0 folders, 1 copies, 2 files, 3 deletes.
+    let key_of = |change: &Change, now: &Option<String>| match now {
+        None => (3u8, 0usize),
+        Some(p) if change.folder => (0, p.matches('/').count()),
+        Some(_) if change.known_path.is_none() && change.content.is_none() => (1, 0),
+        Some(_) => (2, 0),
+    };
+    let mut order: Vec<usize> = (0..list.len()).collect();
+    // A stable sort: the journal order stays within a group.
+    order.sort_by_key(|&i| key_of(list[i], &paths[i]));
+    // The folder moves the device has already been sent, in the order they go out. A path the
+    // device knows is rebased only by these, so each item names the place the device has at
+    // the moment it runs the item. Folders go first, so copies, files and deletes see all of
+    // them.
+    let mut emitted: Vec<(String, String)> = Vec::new();
+    let mut out = Vec::with_capacity(list.len());
+    for i in order {
+        let (change, now) = (&list[i], &paths[i]);
         let known = change
             .known_path
             .as_deref()
-            .map(|k| rebase(&norm(k), &moves));
-        let items = items_of(change, known.as_deref(), now.as_deref(), store, built_ms)?;
-        let key = match now {
-            None => (3, 0),
-            Some(p) if change.folder => (0, p.matches('/').count()),
-            Some(_) if change.known_path.is_none() && change.content.is_none() => (1, 0),
-            Some(_) => (2, 0),
-        };
-        groups.push((key, items));
+            .map(|k| rebase(&norm(k), &emitted));
+        out.extend(items_of(
+            change,
+            known.as_deref(),
+            now.as_deref(),
+            store,
+            built_ms,
+        )?);
+        if change.folder
+            && let (Some(from), Some(to)) = (change.known_path.as_deref(), now)
+        {
+            let from = norm(from);
+            if &from != to {
+                emitted.push((from, to.clone()));
+            }
+        }
     }
-    // A stable sort: the journal order stays within a group.
-    groups.sort_by_key(|(key, _)| *key);
-    Ok(groups
+    Ok(out
         .into_iter()
-        .flat_map(|(_, items)| items)
         .map(|it| PushItem::new(&it, false))
         .collect())
 }
@@ -774,6 +786,14 @@ mod tests {
             ),
         ];
         let items = parsed(&s, &events);
+        let mut tree = device_tree(&[
+            "NOTE",
+            "NOTE/Note",
+            "NOTE/Note/Work",
+            "NOTE/Note/A",
+            "NOTE/Note/A/B",
+        ]);
+        apply_on_device(&mut tree, &items);
         assert_eq!(items.len(), 2, "{items:?}");
         assert_eq!(items[0]["messageType"], "MOVEFOLDER");
         assert_eq!(items[0]["originalPath"], "NOTE/Note/");
@@ -826,5 +846,204 @@ mod tests {
             ev(None, file_deleted("NOTE/Note/e.note")),
         ];
         assert_eq!(types(&s, &events), ["COPYFILE", "DELETEFILE"]);
+    }
+
+    /// Applies `items` in order to a device tree (a set of folder paths without trailing
+    /// slash) and fails when an item names a path the device doesn't have at that point.
+    fn apply_on_device(tree: &mut std::collections::BTreeSet<String>, items: &[serde_json::Value]) {
+        fn join(parent: &str, name: &str) -> String {
+            let p = parent.trim_end_matches('/');
+            if p.is_empty() {
+                name.to_string()
+            } else {
+                format!("{p}/{name}")
+            }
+        }
+        fn has_parent(tree: &std::collections::BTreeSet<String>, parent: &str) -> bool {
+            let p = parent.trim_end_matches('/');
+            p.is_empty() || tree.contains(p)
+        }
+        for it in items {
+            let kind = it["messageType"].as_str().unwrap();
+            let from_parent = it["originalPath"].as_str().unwrap_or("");
+            let from = join(from_parent, it["originalName"].as_str().unwrap_or(""));
+            match kind {
+                "MOVEFOLDER" | "MODIFYFOLDER" => {
+                    assert!(tree.contains(&from), "{kind}: device has no {from}: {it}");
+                    let to_parent = it["newPath"].as_str().unwrap();
+                    assert!(
+                        has_parent(tree, to_parent),
+                        "{kind}: no parent {to_parent}: {it}"
+                    );
+                    let to = join(to_parent, it["newName"].as_str().unwrap());
+                    let moved: Vec<String> = tree
+                        .iter()
+                        .filter(|p| *p == &from || p.starts_with(&format!("{from}/")))
+                        .cloned()
+                        .collect();
+                    for p in moved {
+                        tree.remove(&p);
+                        tree.insert(format!("{to}{}", &p[from.len()..]));
+                    }
+                }
+                "ADDFOLDER" => {
+                    assert!(has_parent(tree, from_parent), "ADDFOLDER: no parent: {it}");
+                    tree.insert(from);
+                }
+                "DELETEFOLDER" => {
+                    assert!(
+                        tree.contains(&from),
+                        "DELETEFOLDER: device has no {from}: {it}"
+                    );
+                    tree.retain(|p| p != &from && !p.starts_with(&format!("{from}/")));
+                }
+                "DELETEFILE" | "MOVEFILE" | "MODIFYFILE" => {
+                    assert!(
+                        has_parent(tree, from_parent),
+                        "{kind}: no folder {from_parent}: {it}"
+                    );
+                }
+                "DOWNLOADFILE" | "COPYFILE" => {
+                    let to_parent = it["newPath"].as_str().unwrap_or(from_parent);
+                    assert!(
+                        has_parent(tree, to_parent),
+                        "{kind}: no folder {to_parent}: {it}"
+                    );
+                }
+                other => panic!("unexpected item {other}"),
+            }
+        }
+    }
+
+    fn device_tree(paths: &[&str]) -> std::collections::BTreeSet<String> {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    fn modified_at(id: u64, path: &str) -> EventBody {
+        EventBody::FileModified {
+            id,
+            path: path.into(),
+            kind: FileKind::Note,
+            md5: "m2".into(),
+            prev_md5: "m1".into(),
+            size: 3,
+            pages_changed: None,
+        }
+    }
+
+    #[test]
+    fn an_inner_folder_that_moves_out_before_its_outer_folder_moves_deep() {
+        let (_d, s) = store();
+        // Now: B at NOTE/Note/X/B, A at NOTE/Note/Work/P/A. The device has NOTE/Note/A/B.
+        assign(&s, "NOTE/Note/X", Kind::Folder);
+        assign(&s, "NOTE/Note/Work/P", Kind::Folder);
+        let a = assign(&s, "NOTE/Note/Work/P/A", Kind::Folder);
+        let b = assign(&s, "NOTE/Note/X/B", Kind::Folder);
+        let events = [
+            ev(None, folder_moved(b, "NOTE/Note/A/B", "NOTE/Note/X/B")),
+            ev(None, folder_moved(a, "NOTE/Note/A", "NOTE/Note/Work/P/A")),
+        ];
+        let mut tree = device_tree(&[
+            "NOTE",
+            "NOTE/Note",
+            "NOTE/Note/Work",
+            "NOTE/Note/Work/P",
+            "NOTE/Note/X",
+            "NOTE/Note/A",
+            "NOTE/Note/A/B",
+        ]);
+        apply_on_device(&mut tree, &parsed(&s, &events));
+        assert!(
+            tree.contains("NOTE/Note/X/B") && tree.contains("NOTE/Note/Work/P/A"),
+            "{tree:?}"
+        );
+    }
+
+    #[test]
+    fn a_deep_outer_folder_that_moves_up_and_its_inner_folder_moves_under_a_new_folder() {
+        let (_d, s) = store();
+        // Device: NOTE/Note/Work/A/B. Now: A at NOTE/Note/A, B at NOTE/Note/A/N/B (N is new).
+        let a = assign(&s, "NOTE/Note/A", Kind::Folder);
+        let n = assign(&s, "NOTE/Note/A/N", Kind::Folder);
+        let b = assign(&s, "NOTE/Note/A/N/B", Kind::Folder);
+        let events = [
+            ev(None, folder_moved(a, "NOTE/Note/Work/A", "NOTE/Note/A")),
+            ev(
+                None,
+                EventBody::FolderCreated {
+                    id: n,
+                    path: "NOTE/Note/A/N".into(),
+                },
+            ),
+            ev(None, folder_moved(b, "NOTE/Note/A/B", "NOTE/Note/A/N/B")),
+        ];
+        let mut tree = device_tree(&[
+            "NOTE",
+            "NOTE/Note",
+            "NOTE/Note/Work",
+            "NOTE/Note/Work/A",
+            "NOTE/Note/Work/A/B",
+        ]);
+        apply_on_device(&mut tree, &parsed(&s, &events));
+        assert!(tree.contains("NOTE/Note/A/N/B"), "{tree:?}");
+    }
+
+    #[test]
+    fn three_nested_folders_that_all_move() {
+        let (_d, s) = store();
+        // Device: NOTE/Note/A/B/C. Now: C at NOTE/Note/C, B at NOTE/Note/Work/B,
+        // A at NOTE/Note/Work/B/A.
+        let c = assign(&s, "NOTE/Note/C", Kind::Folder);
+        let b = assign(&s, "NOTE/Note/Work/B", Kind::Folder);
+        let a = assign(&s, "NOTE/Note/Work/B/A", Kind::Folder);
+        let events = [
+            ev(None, folder_moved(c, "NOTE/Note/A/B/C", "NOTE/Note/C")),
+            ev(None, folder_moved(b, "NOTE/Note/A/B", "NOTE/Note/Work/B")),
+            ev(None, folder_moved(a, "NOTE/Note/A", "NOTE/Note/Work/B/A")),
+        ];
+        let mut tree = device_tree(&[
+            "NOTE",
+            "NOTE/Note",
+            "NOTE/Note/Work",
+            "NOTE/Note/A",
+            "NOTE/Note/A/B",
+            "NOTE/Note/A/B/C",
+        ]);
+        apply_on_device(&mut tree, &parsed(&s, &events));
+        for p in ["NOTE/Note/C", "NOTE/Note/Work/B", "NOTE/Note/Work/B/A"] {
+            assert!(tree.contains(p), "{p} missing in {tree:?}");
+        }
+    }
+
+    #[test]
+    fn nested_moves_with_a_changed_and_a_deleted_file_inside() {
+        let (_d, s) = store();
+        assign(&s, "NOTE/Note/X", Kind::Folder);
+        assign(&s, "NOTE/Note/Work/P", Kind::Folder);
+        let a = assign(&s, "NOTE/Note/Work/P/A", Kind::Folder);
+        let b = assign(&s, "NOTE/Note/X/B", Kind::Folder);
+        let f = assign(&s, "NOTE/Note/X/B/f.note", Kind::File);
+        let events = [
+            ev(None, folder_moved(b, "NOTE/Note/A/B", "NOTE/Note/X/B")),
+            ev(None, folder_moved(a, "NOTE/Note/A", "NOTE/Note/Work/P/A")),
+            ev(None, modified_at(f, "NOTE/Note/X/B/f.note")),
+            ev(None, file_deleted("NOTE/Note/Work/P/A/e.note")),
+        ];
+        let mut tree = device_tree(&[
+            "NOTE",
+            "NOTE/Note",
+            "NOTE/Note/Work",
+            "NOTE/Note/Work/P",
+            "NOTE/Note/X",
+            "NOTE/Note/A",
+            "NOTE/Note/A/B",
+        ]);
+        let items = parsed(&s, &events);
+        apply_on_device(&mut tree, &items);
+        let del = items
+            .iter()
+            .find(|i| i["messageType"] == "DELETEFILE")
+            .unwrap();
+        assert_eq!(del["originalPath"], "NOTE/Note/Work/P/A/");
     }
 }

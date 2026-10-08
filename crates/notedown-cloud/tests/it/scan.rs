@@ -684,6 +684,69 @@ fn a_file_above_the_scope_that_became_a_folder_is_journaled_as_deleted() {
     );
 }
 
+/// A scoped scan reads only its folder: changes by hand elsewhere are not journaled, and the
+/// registry and cache rows there stay as they are until a scan that sees them.
+#[test]
+fn a_scoped_scan_leaves_the_rows_of_other_folders_alone() {
+    let fx = Fx::imported();
+    fx.write("A/a.txt", b"a");
+    fx.write("B/changed.txt", b"one");
+    fx.write("B/gone.txt", b"gone");
+    fx.seed();
+    let ids = (
+        fx.id("B/changed.txt").unwrap(),
+        fx.id("B/gone.txt").unwrap(),
+    );
+    let rows_of_b = || {
+        let rows: serde_json::Value =
+            serde_json::from_slice(&fx.account_file("hashes.json").unwrap()).unwrap();
+        (rows["B/changed.txt"].clone(), rows["B/gone.txt"].clone())
+    };
+    let before = rows_of_b();
+    fx.write("B/changed.txt", b"two, longer");
+    fx.rm("B/gone.txt");
+    fx.write("B/new.txt", b"new");
+    fx.write("A/b.txt", b"b");
+    // The root without recursion (the first scope of every write), then the folder A.
+    let root = fx.scan_with(&ScanOptions {
+        recursive: false,
+        ..ScanOptions::all(1)
+    });
+    assert_eq!(root, ScanReport::default());
+    let report = fx.scan_with(&ScanOptions {
+        scope: wp("A"),
+        recursive: true,
+        ..ScanOptions::all(1)
+    });
+    assert_eq!(paths(&report.created), vec!["A/b.txt"]);
+    assert!(report.modified.is_empty() && report.deleted.is_empty());
+    assert_eq!(kind_names(&fx.bodies()), vec!["file.created"]);
+    assert_eq!(fx.id("B/changed.txt"), Some(ids.0));
+    assert_eq!(fx.id("B/gone.txt"), Some(ids.1));
+    assert_eq!(fx.id("B/new.txt"), None);
+    {
+        let g = fx.store.lock().unwrap();
+        let cached = |p: &str| fx.store.cached_md5(&g, &wp(p)).unwrap();
+        assert_eq!(cached("B/changed.txt"), Some(md5_hex(b"one")));
+        assert_eq!(cached("B/gone.txt"), Some(md5_hex(b"gone")));
+    }
+    assert_eq!(rows_of_b(), before);
+    // A whole-tree scan then journals the three changes in B, with the MD5 before the change.
+    let report = fx.scan();
+    assert_eq!(paths(&report.created), vec!["B/new.txt"]);
+    assert_eq!(paths(&report.modified), vec!["B/changed.txt"]);
+    assert_eq!(paths(&report.deleted), vec!["B/gone.txt"]);
+    let bodies = fx.bodies();
+    assert!(
+        bodies.iter().any(|b| matches!(
+            b,
+            EventBody::FileModified { id, md5, prev_md5, .. }
+                if *id == ids.0 && *md5 == md5_hex(b"two, longer") && *prev_md5 == md5_hex(b"one")
+        )),
+        "{bodies:?}"
+    );
+}
+
 // ---------------------------------------------------------------- changes while hashed
 
 /// A file that changes while the scan hashes it is there (never gone) but gets no event this
@@ -987,6 +1050,111 @@ fn accept_applies_the_mass_delete_and_removes_the_hold() {
     });
     assert!(!report.released);
     assert_eq!(report.created.len(), 1);
+}
+
+/// A scoped scan that holds keeps nothing of what it hashed: the next scan still knows the MD5
+/// before a change by hand and journals it.
+#[test]
+fn a_held_scoped_scan_keeps_the_old_md5_for_the_next_scan() {
+    let fx = Fx::imported();
+    let files = many(&fx, DOC, 3);
+    fx.write("INBOX/x.txt", b"one");
+    fx.seed();
+    let id = fx.id("INBOX/x.txt").unwrap();
+    for f in &files {
+        fx.rm(f);
+    }
+    assert!(fx.scan_with(&ScanOptions::all(2)).held.is_some());
+    let state = fx.state_files();
+    fx.write("INBOX/x.txt", b"two, longer");
+    let report = fx.scan_with(&ScanOptions {
+        scope: wp("INBOX"),
+        recursive: false,
+        ..ScanOptions::all(2)
+    });
+    assert!(report.held.is_some());
+    assert_eq!(paths(&report.modified), vec!["INBOX/x.txt"]);
+    assert!(fx.events().is_empty());
+    assert_eq!(fx.state_files(), state);
+    {
+        let g = fx.store.lock().unwrap();
+        assert_eq!(
+            fx.store.cached_md5(&g, &wp("INBOX/x.txt")).unwrap(),
+            Some(md5_hex(b"one"))
+        );
+    }
+    let report = fx.scan_with(&ScanOptions {
+        accept: true,
+        ..ScanOptions::all(2)
+    });
+    assert_eq!(paths(&report.modified), vec!["INBOX/x.txt"]);
+    assert_eq!(report.deleted.len(), 3);
+    let bodies = fx.bodies();
+    assert!(
+        bodies.iter().any(|b| matches!(
+            b,
+            EventBody::FileModified { id: i, md5, prev_md5, .. }
+                if *i == id && *md5 == md5_hex(b"two, longer") && *prev_md5 == md5_hex(b"one")
+        )),
+        "{bodies:?}"
+    );
+}
+
+/// The hold of a scoped scan counts every file of the account that would be left: the files
+/// outside the scope, also the ones below a gone child folder that a scan without recursion
+/// doesn't walk.
+#[test]
+fn a_scoped_scan_counts_the_files_left_in_the_whole_account() {
+    for recursive in [true, false] {
+        for other in [true, false] {
+            let fx = Fx::imported();
+            fx.write("Work/a.txt", b"a");
+            many(&fx, "Work/Sub", 3);
+            if other {
+                fx.write("Other/keep.txt", b"keep");
+            }
+            fx.seed();
+            fx.rm("Work/a.txt");
+            std::fs::remove_dir_all(fx.fs("Work/Sub")).unwrap();
+            let left = usize::from(other);
+            let opts = ScanOptions {
+                scope: wp("Work"),
+                recursive,
+                min_files: left as u64 + 1,
+                ..ScanOptions::all(1)
+            };
+            let case = format!("recursive {recursive}, other {other}");
+            // One file fewer to keep: no hold.
+            let dry = fx.scan_with(&ScanOptions {
+                dry_run: true,
+                min_files: left as u64,
+                ..opts.clone()
+            });
+            assert_eq!(dry.held, None, "{case}");
+            assert_eq!(dry.deleted.len(), 5, "{case}");
+            let state = fx.state_files();
+            let report = fx.scan_with(&opts);
+            let hold = report.held.expect("held");
+            assert_eq!(
+                (hold.gone, hold.left, hold.min),
+                (4, left, left as u64 + 1),
+                "{case}"
+            );
+            assert_eq!(
+                paths(&report.deleted),
+                vec![
+                    "Work/Sub/f00.txt",
+                    "Work/Sub/f01.txt",
+                    "Work/Sub/f02.txt",
+                    "Work/a.txt",
+                    "Work/Sub"
+                ],
+                "{case}"
+            );
+            assert!(fx.events().is_empty(), "{case}");
+            assert_eq!(fx.state_files(), state, "{case}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------- safety

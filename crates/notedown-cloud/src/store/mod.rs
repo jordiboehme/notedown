@@ -755,9 +755,12 @@ impl Store {
         md5: &str,
     ) -> Result<()> {
         self.check_guard(guard)?;
-        // Only the memory: it's a cache, and the next flush writes it. A reload after another
-        // process wrote the file (see `lock`) drops the row, which is safe.
+        // A new row stays in memory: it's a cache, and the next flush writes it. A reload after
+        // another process wrote the file (see `lock`) drops the row, which is safe. A row that
+        // replaces one is written at once: the old row on disk would make the next scan of
+        // another process (or after a crash) journal the put again as a change by hand.
         let mut state = self.state();
+        let replaced = state.hashes.cached(path).is_some();
         state.hashes.insert(
             path,
             hashes::HashRow {
@@ -767,6 +770,9 @@ impl Store {
                 md5: md5.to_string(),
             },
         );
+        if replaced {
+            self.flush_hashes(&mut state)?;
+        }
         Ok(())
     }
 
@@ -905,8 +911,11 @@ impl Store {
         ))
     }
 
-    /// Build entries: assign missing ids in one log append, hash files through the cache, write
-    /// the cache once. A file that vanished meanwhile was deleted and is skipped.
+    /// Build entries: assign missing ids in one log append, hash files through the cache. A
+    /// fresh row stays in memory until the next flush (a scan, a listing of the whole tree,
+    /// [`Store::flush_cache`]), so a lookup never rewrites the whole cache file. A row lost in a
+    /// crash only costs a hash later: it holds the size, mtime and ctime it is for. A file that
+    /// vanished meanwhile was deleted and is skipped.
     fn entries(&self, found: Vec<Found>) -> Result<Vec<Entry>> {
         let mut state = self.state();
         let mut ops = Vec::new();
@@ -950,7 +959,6 @@ impl Store {
                 path: f.path,
             });
         }
-        self.flush_hashes(&mut state)?;
         Ok(out)
     }
 

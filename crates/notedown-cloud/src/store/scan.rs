@@ -18,13 +18,14 @@
 //! direct children when the scan is not recursive. A gone folder in the scope takes its whole
 //! subtree along. Parents of the scope that have no id yet are created too.
 //!
-//! The scan never renames, moves or deletes anything in `files/`. Under the store lock it plans
-//! on copies of the registry and the cache, reserves the new ids in the registry log (the next
-//! id only, no rows), appends the events to the journal (one batch, one `opId`,
-//! `origin: "scan"`), then the registry ops in one log append and the cache, then the page
-//! records. A crash after the journal append journals the same changes again at the next scan
-//! (with new ids; the reserved ones stay unused); the registry is never ahead of the journal,
-//! and no id the journal used is handed out again.
+//! The scan never renames, moves or deletes anything in `files/`. Under the store lock it hashes
+//! into a copy of the cache (for a scoped scan only the rows of the files it found), plans
+//! against the registry, reserves the new ids in the registry log (the next id only, no rows),
+//! appends the events to the journal (one batch, one `opId`, `origin: "scan"`), then the
+//! registry ops in one log append and the cache, then the page records. A crash after the
+//! journal append journals the same changes again at the next scan (with new ids; the reserved
+//! ones stay unused); the registry is never ahead of the journal, and no id the journal used is
+//! handed out again.
 //!
 //! A plan that removes files holds instead of applying when fewer than `min_files` files would
 //! be left in the whole account (an empty data folder, an unmounted volume). It writes
@@ -269,12 +270,13 @@ impl Store {
         stop_after_journal: bool,
     ) -> Result<ScanReport> {
         self.check_write(guard)?;
-        let (reg, mut cache) = {
+        let (disk, parents, cache) = self.scan_disk(opts)?;
+        // The cache rows of gone paths come from the store's cache: the walk hashed only paths
+        // on disk, so the copy holds no rows for them.
+        let plan = {
             let state = self.state();
-            (state.ids.clone(), state.hashes.clone())
+            plan(&state.ids, &state.hashes, opts, disk, parents)
         };
-        let (disk, parents) = self.scan_disk(opts, &mut cache)?;
-        let plan = plan(&reg, &cache, opts, disk, parents);
         let mut report = plan.report();
         // An unreadable marker counts as one: it is replaced or removed.
         let marker = self.scan_hold();
@@ -347,14 +349,12 @@ impl Store {
         Ok(report)
     }
 
-    /// Walk the scope and hash its files through `cache`. Returns the entries of the scope and
-    /// the folders above it (each with a fresh MD5 and the cached one). The tree is checked
-    /// before and after, like [`Store::list`] does.
-    fn scan_disk(
-        &self,
-        opts: &ScanOptions,
-        cache: &mut HashCache,
-    ) -> Result<(Vec<OnDisk>, Vec<WirePath>)> {
+    /// Walk the scope and hash its files through a copy of the cache: the whole cache for a
+    /// whole-tree scan, else only the rows of the files found. Returns the entries of the scope
+    /// (files with a fresh MD5 and the cached one), the folders above it and the copy. The store's
+    /// cache is not touched: a scan that holds or stops early leaves it as it was. The tree is
+    /// checked before and after, like [`Store::list`] does.
+    fn scan_disk(&self, opts: &ScanOptions) -> Result<(Vec<OnDisk>, Vec<WirePath>, HashCache)> {
         let before = self.check_tree(false)?;
         let mut found = Vec::new();
         let mut parents = Vec::new();
@@ -371,6 +371,19 @@ impl Store {
                 found.push(top);
             }
         }
+        let mut cache = {
+            let state = self.state();
+            if opts.scope.is_root() && opts.recursive {
+                state.hashes.clone()
+            } else {
+                state.hashes.subset(
+                    found
+                        .iter()
+                        .filter(|f| f.kind == Kind::File)
+                        .map(|f| &f.path),
+                )
+            }
+        };
         let to_hash = found
             .iter()
             .filter(|f| f.kind == Kind::File && !cache.is_current(&f.path, &f.meta))
@@ -416,7 +429,7 @@ impl Store {
         }
         let after = self.check_tree(false)?;
         self.check_same_tree(&before, &after)?;
-        Ok((disk, parents))
+        Ok((disk, parents, cache))
     }
 
     /// The scope on disk, and in `parents` the folders above it. `None` when the scope or one
@@ -542,27 +555,30 @@ impl Store {
         (kind, changed, events)
     }
 
-    /// After the journal append: the registry ops in one log append, then the cache (after a
-    /// whole-tree scan only the rows of the files on disk kept, else the rows of gone and moved
-    /// paths dropped).
+    /// After the journal append: the registry ops in one log append, then the cache. After a
+    /// whole-tree scan its copy replaces the cache, with only the rows of the files on disk
+    /// kept. After a scoped scan the rows it hashed go into the cache and the rows of gone and
+    /// moved paths are dropped.
     fn finish_scan(&self, plan: &Plan, mut cache: HashCache, opts: &ScanOptions) -> Result<()> {
+        let mut state = self.state();
+        self.append(&mut state, &plan.ops())?;
         if opts.scope.is_root() && opts.recursive {
             cache.retain(&plan.files_on_disk);
+            state.hashes = cache;
         } else {
+            let hashes = &mut state.hashes;
+            hashes.absorb(cache);
             // By exact key for files (a moved file's old path is a file too), and one pass for
             // every gone folder: a large delete by hand stays linear in the cache.
             for g in &plan.gone_files {
-                cache.removed_file(&g.path);
+                hashes.removed_file(&g.path);
             }
             for (_, from, _) in &plan.moved {
-                cache.removed_file(from);
+                hashes.removed_file(from);
             }
             let folders: Vec<WirePath> = plan.gone_folders.iter().map(|g| g.path.clone()).collect();
-            cache.removed_all(&folders);
+            hashes.removed_all(&folders);
         }
-        let mut state = self.state();
-        self.append(&mut state, &plan.ops())?;
-        state.hashes = cache;
         self.flush_hashes(&mut state)
     }
 
@@ -635,6 +651,85 @@ impl Store {
     }
 }
 
+/// The registry rows that are gone (see [`plan`]) and the files that would be left outside the
+/// scope. Reads only the rows of the scope, of the subtrees of gone folders and of `parents`,
+/// never every row: the count of all files comes from the registry.
+fn gone_rows(
+    reg: &Registry,
+    opts: &ScanOptions,
+    on_disk: &HashMap<&WirePath, Kind>,
+    parents: &[WirePath],
+) -> (Vec<Gone>, usize) {
+    // Rows of the scope whose path holds no entry of their kind. Membership in the walk
+    // decides, never a stat: a file system that ignores case finds `a.txt` after a rename to
+    // `A.txt`.
+    // The whole tree is every row: read them in id order, without the path index.
+    let scope_rows: Vec<(u64, Kind, &WirePath)> = if opts.scope.is_root() && opts.recursive {
+        reg.rows().collect()
+    } else {
+        reg.scope_rows(&opts.scope, opts.recursive)
+    };
+    let files_in_scope = scope_rows.iter().filter(|r| r.1 == Kind::File).count();
+    let mut gone: Vec<Gone> = scope_rows
+        .into_iter()
+        .filter(|(_, kind, path)| on_disk.get(path) != Some(kind))
+        .map(|(id, kind, path)| Gone {
+            id,
+            kind,
+            path: path.clone(),
+        })
+        .collect();
+    // Gone files outside the scope: below a gone folder, or above the scope.
+    let mut gone_outside = 0;
+    if !opts.recursive {
+        // A gone folder takes its subtree along, which a scan that is not recursive doesn't see.
+        let tops: Vec<WirePath> = gone
+            .iter()
+            .filter(|g| g.kind == Kind::Folder)
+            .map(|g| g.path.clone())
+            .collect();
+        let mut known: HashSet<u64> = gone.iter().map(|g| g.id).collect();
+        for top in &tops {
+            for (id, kind, path) in reg.subtree_rows(top) {
+                // Tops nest when the scope itself is gone: each row once.
+                if known.insert(id) {
+                    if kind == Kind::File && !in_scope(&opts.scope, opts.recursive, path) {
+                        gone_outside += 1;
+                    }
+                    gone.push(Gone {
+                        id,
+                        kind,
+                        path: path.clone(),
+                    });
+                }
+            }
+        }
+    }
+    // A folder above the scope whose row is a file (a file replaced by hand with a folder of
+    // the same name): the file is gone, and the folder is new below.
+    for path in parents {
+        if let Some(id) = reg.id_of(path)
+            && reg.get(id).is_some_and(|(k, _)| *k == Kind::File)
+        {
+            if !in_scope(&opts.scope, opts.recursive, path) {
+                gone_outside += 1;
+            }
+            gone.push(Gone {
+                id,
+                kind: Kind::File,
+                path: path.clone(),
+            });
+        }
+    }
+    // Every file row is in the scope or outside it, and the gone ones outside are counted above
+    // (each id once: a parent above the scope is never below it).
+    let left_outside = reg
+        .files()
+        .saturating_sub(files_in_scope)
+        .saturating_sub(gone_outside);
+    (gone, left_outside)
+}
+
 /// Compare the scope on disk (`disk`, hashed; `parents` are the folders above the scope) with
 /// the registry rows in the scope and plan the changes (see the module docs). `cache` holds the
 /// MD5s the store knew for the gone paths (the walk only hashed paths on disk).
@@ -651,61 +746,7 @@ fn plan(
             .is_some_and(|(k, _)| *k == kind)
     };
     let on_disk: HashMap<&WirePath, Kind> = disk.iter().map(|d| (&d.path, d.kind)).collect();
-    // Rows of the scope whose path holds no entry of their kind. Membership in the walk
-    // decides, never a stat: a file system that ignores case finds `a.txt` after a rename to
-    // `A.txt`.
-    let mut gone: Vec<Gone> = reg
-        .rows()
-        .filter(|(_, kind, path)| {
-            in_scope(&opts.scope, opts.recursive, path) && on_disk.get(path) != Some(kind)
-        })
-        .map(|(id, kind, path)| Gone {
-            id,
-            kind,
-            path: path.clone(),
-        })
-        .collect();
-    if !opts.recursive {
-        // A gone folder takes its subtree along, which a scan that is not recursive doesn't see.
-        let tops: Vec<WirePath> = gone
-            .iter()
-            .filter(|g| g.kind == Kind::Folder)
-            .map(|g| g.path.clone())
-            .collect();
-        let known: HashSet<u64> = gone.iter().map(|g| g.id).collect();
-        let below: Vec<Gone> = reg
-            .rows()
-            .filter(|(id, _, path)| !known.contains(id) && tops.iter().any(|t| path.starts_with(t)))
-            .map(|(id, kind, path)| Gone {
-                id,
-                kind,
-                path: path.clone(),
-            })
-            .collect();
-        gone.extend(below);
-    }
-    // A folder above the scope whose row is a file (a file replaced by hand with a folder of
-    // the same name): the file is gone, and the folder is new below.
-    for path in &parents {
-        if let Some(id) = reg.id_of(path)
-            && reg.get(id).is_some_and(|(k, _)| *k == Kind::File)
-        {
-            gone.push(Gone {
-                id,
-                kind: Kind::File,
-                path: path.clone(),
-            });
-        }
-    }
-    let gone_ids: HashSet<u64> = gone.iter().map(|g| g.id).collect();
-    let left_outside = reg
-        .rows()
-        .filter(|(id, kind, path)| {
-            *kind == Kind::File
-                && !gone_ids.contains(id)
-                && !in_scope(&opts.scope, opts.recursive, path)
-        })
-        .count();
+    let (gone, left_outside) = gone_rows(reg, opts, &on_disk, &parents);
 
     let mut p = Plan {
         left: left_outside + disk.iter().filter(|d| d.kind == Kind::File).count(),
@@ -823,4 +864,117 @@ fn plan(
     p.new_folders = new_folders.into_iter().map(&mut with_id).collect();
     p.new_files = new_files.into_iter().map(&mut with_id).collect();
     p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::ids::tests::{Rng, random_path, random_registry};
+    use super::*;
+
+    /// The gone rows and the files left outside the scope as a walk of every registry row finds
+    /// them (the plan before the scope queries).
+    fn gone_rows_by_walk(
+        reg: &Registry,
+        opts: &ScanOptions,
+        on_disk: &HashMap<&WirePath, Kind>,
+        parents: &[WirePath],
+    ) -> (Vec<u64>, usize) {
+        let mut gone: Vec<(u64, Kind)> = reg
+            .rows()
+            .filter(|(_, kind, path)| {
+                in_scope(&opts.scope, opts.recursive, path) && on_disk.get(path) != Some(kind)
+            })
+            .map(|(id, kind, _)| (id, kind))
+            .collect();
+        if !opts.recursive {
+            let tops: Vec<&WirePath> = gone
+                .iter()
+                .filter(|g| g.1 == Kind::Folder)
+                .filter_map(|g| reg.get(g.0).map(|(_, p)| p))
+                .collect();
+            let known: HashSet<u64> = gone.iter().map(|g| g.0).collect();
+            let below: Vec<(u64, Kind)> = reg
+                .rows()
+                .filter(|(id, _, path)| {
+                    !known.contains(id) && tops.iter().any(|t| path.starts_with(t))
+                })
+                .map(|(id, kind, _)| (id, kind))
+                .collect();
+            gone.extend(below);
+        }
+        for path in parents {
+            if let Some(id) = reg.id_of(path)
+                && reg.get(id).is_some_and(|(k, _)| *k == Kind::File)
+            {
+                gone.push((id, Kind::File));
+            }
+        }
+        let gone_ids: HashSet<u64> = gone.iter().map(|g| g.0).collect();
+        let left_outside = reg
+            .rows()
+            .filter(|(id, kind, path)| {
+                *kind == Kind::File
+                    && !gone_ids.contains(id)
+                    && !in_scope(&opts.scope, opts.recursive, path)
+            })
+            .count();
+        let mut ids: Vec<u64> = gone.iter().map(|g| g.0).collect();
+        ids.sort_unstable();
+        (ids, left_outside)
+    }
+
+    #[test]
+    fn the_scope_queries_find_what_a_walk_of_every_row_finds() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        for seed in 1..=300 {
+            let reg = random_registry(seed, 50);
+            let rows: Vec<(Kind, WirePath)> = reg.rows().map(|(_, k, p)| (k, p.clone())).collect();
+            // On disk: some rows as they are, some with the other kind, the rest gone.
+            let disk: Vec<(WirePath, Kind)> = rows
+                .iter()
+                .filter_map(|(k, p)| match rng.next() % 4 {
+                    0 => None,
+                    1 => Some((
+                        p.clone(),
+                        if *k == Kind::File {
+                            Kind::Folder
+                        } else {
+                            Kind::File
+                        },
+                    )),
+                    _ => Some((p.clone(), *k)),
+                })
+                .collect();
+            let on_disk: HashMap<&WirePath, Kind> = disk.iter().map(|(p, k)| (p, *k)).collect();
+            // Scopes: the root, rows of each kind and paths without a row.
+            let mut scopes = vec![WirePath::root()];
+            scopes.extend((0..4).map(|_| random_path(&mut rng)));
+            scopes.extend(
+                (0..4)
+                    .filter(|_| !rows.is_empty())
+                    .map(|_| rng.pick(&rows).1.clone()),
+            );
+            for scope in scopes {
+                // Every folder above the scope, as the walk passes them.
+                let parents: Vec<WirePath> = (1..scope.segments().len())
+                    .map(|n| WirePath::from_segments(scope.segments()[..n].to_vec()).unwrap())
+                    .collect();
+                for recursive in [true, false] {
+                    let opts = ScanOptions {
+                        scope: scope.clone(),
+                        recursive,
+                        ..ScanOptions::all(1)
+                    };
+                    let (gone, left) = gone_rows(&reg, &opts, &on_disk, &parents);
+                    let mut ids: Vec<u64> = gone.iter().map(|g| g.id).collect();
+                    ids.sort_unstable();
+                    assert_eq!(
+                        (ids, left),
+                        gone_rows_by_walk(&reg, &opts, &on_disk, &parents),
+                        "seed {seed}, scope {scope:?}, recursive {recursive}"
+                    );
+                }
+            }
+        }
+    }
 }

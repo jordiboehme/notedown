@@ -142,6 +142,19 @@ impl WirePath {
         Some(WirePath { segments })
     }
 
+    /// A range bound right after the subtree of this path's ancestor with `depth` segments (the
+    /// path itself when `depth` is its length): that ancestor with a NUL after its last name. In
+    /// the order of paths it comes after everything below the ancestor and before its next
+    /// sibling, as no real name holds a NUL. Only a bound, never a real path. `depth` is 1 to
+    /// the length of the path.
+    pub(crate) fn subtree_end(&self, depth: usize) -> WirePath {
+        let mut segments = self.segments[..depth].to_vec();
+        if let Some(last) = segments.last_mut() {
+            last.push('\0');
+        }
+        WirePath { segments }
+    }
+
     /// True if any segment starts with `.`. Listings hide such paths.
     pub fn is_hidden(&self) -> bool {
         self.segments.iter().any(|s| s.starts_with('.'))

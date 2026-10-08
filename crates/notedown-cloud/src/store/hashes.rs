@@ -240,6 +240,31 @@ impl HashCache {
         }
     }
 
+    /// A copy of the rows of `paths` only (those that have one), not dirty: a scoped scan hashes
+    /// into it instead of a copy of the whole cache.
+    pub fn subset<'a>(&self, paths: impl IntoIterator<Item = &'a WirePath>) -> HashCache {
+        let rows = paths
+            .into_iter()
+            .filter_map(|p| {
+                let key = p.display();
+                let row = self.rows.get(&key)?.clone();
+                Some((key, row))
+            })
+            .collect();
+        HashCache { rows, dirty: false }
+    }
+
+    /// Take over every row of `part` (a [`HashCache::subset`] after hashing) that differs from
+    /// the row here. Rows `part` does not hold stay as they are.
+    pub fn absorb(&mut self, part: HashCache) {
+        for (key, row) in part.rows {
+            if self.rows.get(&key) != Some(&row) {
+                self.rows.insert(key, row);
+                self.dirty = true;
+            }
+        }
+    }
+
     /// Keep only the rows of `seen` (after a full listing).
     pub fn retain(&mut self, seen: &std::collections::HashSet<String>) {
         let before = self.rows.len();

@@ -518,12 +518,14 @@ fn config_defaults_created_and_round_trip() {
         recycle_keep_deleted_days: 30,
         scan_interval: 0,
         scan_min_files: 25,
+        render_dir: Some("~/PDFs".into()),
     };
     custom.save(dir.path()).unwrap();
     assert_eq!(Config::load_or_create(dir.path()).unwrap(), custom);
     let text = std::fs::read_to_string(dir.path().join("server.toml")).unwrap();
     assert!(text.contains("\nsync = \"refuse\"\n"), "{text}");
     assert!(text.contains("\npush = \"off\"\n"), "{text}");
+    assert!(text.contains("\nrender_dir = \"~/PDFs\"\n"), "{text}");
 }
 
 #[test]

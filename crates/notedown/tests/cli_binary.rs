@@ -1481,3 +1481,83 @@ fn render_pdf_writes_one_pdf_and_no_pngs() {
         .collect();
     assert_eq!(names.len(), 1, "{names:?}");
 }
+
+/// A data folder with account `acc` and test1 at `NOTE/Note/a.note`.
+fn render_fixture() -> tempfile::TempDir {
+    let data = tempfile::tempdir().unwrap();
+    let out = cloud(
+        data.path(),
+        &[
+            "add",
+            "acc",
+            "--email",
+            "acc@example.org",
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let note = data.path().join("accounts/acc/files/NOTE/Note/a.note");
+    std::fs::create_dir_all(note.parent().unwrap()).unwrap();
+    std::fs::copy(NOTE.replace("test2", "test1"), &note).unwrap();
+    data
+}
+
+#[test]
+fn cloud_render_writes_the_pdfs_of_an_account() {
+    let data = render_fixture();
+    let render = tempfile::tempdir().unwrap();
+    std::fs::write(
+        data.path().join("server.toml"),
+        format!("render_dir = {:?}\n", render.path().display().to_string()),
+    )
+    .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["cloud", "render", "--data"])
+        .arg(data.path())
+        .args(["--account", "acc"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    assert!(text.contains("written NOTE/Note/a.pdf\n"), "{text}");
+    assert!(
+        text.contains("acc: written: 1, moved: 0, deleted: 0, failed: 0"),
+        "{text}"
+    );
+    assert!(render.path().join("acc/NOTE/Note/a.pdf").exists());
+
+    let again = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["cloud", "render", "--all", "--data"])
+        .arg(data.path())
+        .output()
+        .unwrap();
+    assert!(
+        again.status.success(),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert!(stdout(&again).contains("written: 1"), "{}", stdout(&again));
+}
+
+#[test]
+fn cloud_render_without_render_dir_fails() {
+    let data = render_fixture();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["cloud", "render", "--data"])
+        .arg(data.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("server.toml has no render_dir"), "{err}");
+    assert!(!data.path().join("server.toml").exists());
+}

@@ -20,6 +20,7 @@ pub mod localtime;
 pub mod pages;
 pub mod push;
 pub mod put;
+pub mod render;
 pub mod server;
 pub mod socket;
 pub mod store;

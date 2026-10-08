@@ -95,6 +95,12 @@ pub struct Config {
     /// left in the account (an empty data folder, an unmounted volume): device sync waits until
     /// the files are back or `notedown cloud scan --accept` runs. 0 never holds.
     pub scan_min_files: u64,
+    /// A folder where the server keeps a PDF of every note, one subfolder per account. A
+    /// leading `~/` is the home folder, a relative path is relative to the data folder. Not
+    /// set: nothing is rendered. The folder must exist; the server creates only the account
+    /// subfolders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_dir: Option<String>,
 }
 
 impl Default for Config {
@@ -116,6 +122,7 @@ impl Default for Config {
             recycle_keep_deleted_days: 90,
             scan_interval: 300,
             scan_min_files: 1,
+            render_dir: None,
         }
     }
 }
@@ -174,6 +181,23 @@ impl Config {
     /// The time between two timer scans; `None` when `scan_interval` is 0 (no timer).
     pub fn scan_period(&self) -> Option<std::time::Duration> {
         (self.scan_interval > 0).then(|| std::time::Duration::from_secs(self.scan_interval))
+    }
+
+    /// The render folder of `render_dir`, resolved; `None` when it is not set or empty.
+    pub fn render_root(&self, data_dir: &Path) -> Option<PathBuf> {
+        let raw = self.render_dir.as_deref()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let path = match raw.strip_prefix("~/") {
+            Some(rest) => dirs::home_dir()?.join(rest),
+            None => PathBuf::from(raw),
+        };
+        Some(if path.is_absolute() {
+            path
+        } else {
+            data_dir.join(path)
+        })
     }
 
     /// Refuse values the server can't work with. `path` is the file named in the message.
@@ -300,5 +324,38 @@ mod tests {
         ] {
             assert!(text.contains(key), "{key} missing in:\n{text}");
         }
+        assert!(!text.contains("render_dir"), "{text}");
+    }
+
+    fn render_root_of(value: Option<&str>) -> Option<PathBuf> {
+        let c = Config {
+            render_dir: value.map(str::to_string),
+            ..Config::default()
+        };
+        c.render_root(Path::new("/data"))
+    }
+
+    #[test]
+    fn render_root_resolves_render_dir() {
+        assert_eq!(
+            render_root_of(Some("out")),
+            Some(PathBuf::from("/data/out"))
+        );
+        assert_eq!(
+            render_root_of(Some("~/x")),
+            Some(dirs::home_dir().unwrap().join("x"))
+        );
+        assert_eq!(render_root_of(Some("/abs")), Some(PathBuf::from("/abs")));
+        assert_eq!(render_root_of(None), None);
+        assert_eq!(render_root_of(Some("")), None);
+        assert_eq!(render_root_of(Some("  ")), None);
+    }
+
+    #[test]
+    fn render_dir_is_read_from_the_file() {
+        let d = dir();
+        std::fs::write(Config::path(d.path()), "render_dir = \"out\"\n").unwrap();
+        let c = Config::load_or_default(d.path()).unwrap();
+        assert_eq!(c.render_root(d.path()), Some(d.path().join("out")));
     }
 }

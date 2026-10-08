@@ -91,6 +91,22 @@ enum CloudAction {
     /// them, so the device follows. The server does this by itself; run it to see the result
     /// at once, or with --accept after a hold
     Scan(ScanArgs),
+    /// Write a PDF of every note into the render_dir of server.toml, and move or delete the
+    /// PDFs of moved or deleted notes. Safe while the server runs
+    Render(CloudRenderArgs),
+}
+
+#[derive(clap::Args)]
+struct CloudRenderArgs {
+    /// The data folder
+    #[arg(long, value_name = "DIR")]
+    data: PathBuf,
+    /// Only this account (default: every account)
+    #[arg(long)]
+    account: Option<String>,
+    /// Render every note again, also those that didn't change
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(clap::Args)]
@@ -676,6 +692,10 @@ fn cloud_command(action: CloudAction) -> Result<ExitCode> {
             }
             scan_command(args)
         }
+        CloudAction::Render(args) => {
+            recover_accounts(&args.data)?;
+            render_command(args)
+        }
     }
 }
 
@@ -1056,6 +1076,79 @@ fn scan_account(
         println!("account {slug}: {text}");
     }
     Ok(false)
+}
+
+/// One render pass for one account, printed. Returns true when a note failed.
+fn render_one_account(data: &Path, slug: &str, root: &Path, all: bool) -> Result<bool> {
+    use notedown_cloud::render::{PassOptions, render_account};
+    let store = notedown_cloud::store::Store::open_announced(data, slug)?;
+    let opts = PassOptions {
+        all,
+        wait_for_lock: true,
+    };
+    let r = render_account(&store, root, &opts)?;
+    for p in &r.written {
+        println!("written {p}");
+    }
+    for (from, to) in &r.moved {
+        println!("moved {from} -> {to}");
+    }
+    for p in &r.deleted {
+        println!("deleted {p}");
+    }
+    for (p, e) in &r.failed {
+        println!("failed {p}: {e}");
+    }
+    for p in &r.kept_foreign {
+        println!("kept {p} (not written by notedown)");
+    }
+    println!(
+        "{slug}: written: {}, moved: {}, deleted: {}, failed: {}",
+        r.written.len(),
+        r.moved.len(),
+        r.deleted.len(),
+        r.failed.len()
+    );
+    Ok(!r.failed.is_empty())
+}
+
+fn render_command(args: CloudRenderArgs) -> Result<ExitCode> {
+    if !args.data.is_dir() {
+        return Err(anyhow!(
+            "data folder {} does not exist",
+            args.data.display()
+        ));
+    }
+    // Never write server.toml here.
+    let config = notedown_cloud::Config::load_or_default(&args.data)?;
+    let root = config
+        .render_root(&args.data)
+        .ok_or_else(|| anyhow!("server.toml has no render_dir"))?;
+    let slugs = match &args.account {
+        Some(slug) => vec![slug.clone()],
+        None => notedown_cloud::auth::Accounts::new(&args.data)
+            .list()?
+            .into_iter()
+            .map(|a| a.slug)
+            .collect(),
+    };
+    let mut failed = false;
+    for slug in &slugs {
+        // With --account the error ends the command; otherwise the other accounts still run.
+        match render_one_account(&args.data, slug, &root, args.all) {
+            Ok(f) => failed |= f,
+            Err(e) if args.account.is_some() => return Err(e),
+            Err(e) => {
+                eprintln!("error: account {slug}: {e}");
+                failed = true;
+            }
+        }
+    }
+    Ok(if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 /// `e`, with the way out when it is a scan hold of account `slug`.

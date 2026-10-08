@@ -29,6 +29,7 @@ notedown-note.workspace = true
 zip.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
+dirs.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "io-util"] }

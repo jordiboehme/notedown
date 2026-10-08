@@ -16,6 +16,7 @@ mod pages;
 mod perf;
 mod push;
 mod recycle;
+mod render;
 mod scan;
 mod serve;
 mod socket;

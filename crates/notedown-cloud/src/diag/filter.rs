@@ -325,7 +325,7 @@ impl Filter {
             };
             out = replace_words(&out, &word, &with);
         }
-        self.scrub_ips(&out)
+        cut_unknown(&self.scrub_ips(&out))
     }
 
     fn scrub_ips(&mut self, s: &str) -> String {
@@ -662,6 +662,88 @@ fn split_host_port(text: &str) -> (&str, Option<&str>) {
     (text, None)
 }
 
+/// Words of the data folder's own layout that may stand in a path of a message.
+const LAYOUT: &[&str] = &[
+    "accounts",
+    "files",
+    "recycle",
+    "staging",
+    "journal",
+    "logs",
+    "capture",
+    "share",
+    "devices",
+    "digests",
+    "tasks",
+    "items",
+    "groups",
+    "marks",
+    "pages",
+    "consumers",
+    "keys",
+];
+
+/// A part of a scrubbed message that may stay: a stand-in, a placeholder, a fixed folder, a
+/// layout word, digits, `~` or empty.
+fn is_safe_part(p: &str) -> bool {
+    let p = p.trim_end_matches([':', ',', ';', '.', ')']);
+    let stand_in = |prefix: &str| {
+        p.strip_prefix(prefix)
+            .is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let name = p.strip_prefix("n-").is_some_and(|r| {
+        let hex = r.split('.').next().unwrap_or_default();
+        (hex.len() == 4 || hex.len() == 8) && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    });
+    p.is_empty()
+        || p == "~"
+        || p == "<data>"
+        || p == "<person>"
+        || name
+        || stand_in("acct-")
+        || stand_in("dev-")
+        || stand_in("ip-")
+        || is_placeholder(p)
+        || super::standin::FIXED_FOLDERS.contains(&p)
+        || LAYOUT.contains(&p)
+        || p.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The last step of the free-text scrub (spec 8, point 9): a path (a word that starts with
+/// `/`, `~/`, `<data>/` or a fixed folder) or a quoted part that still holds something
+/// unknown hides the rest of the message, so a name that is on no list never shows.
+fn cut_unknown(text: &str) -> String {
+    let mut pos = 0;
+    for word in text.split_inclusive(char::is_whitespace) {
+        let w = word.trim_end();
+        let core = w.trim_start_matches(['(', '[', '\'', '"']);
+        let first = core.split('/').next().unwrap_or_default();
+        let is_path = core.contains('/')
+            && (core.starts_with('/')
+                || first == "~"
+                || first == "<data>"
+                || super::standin::FIXED_FOLDERS.contains(&first));
+        let unsafe_path = is_path && !core.split('/').all(is_safe_part);
+        let quote = w.find(['"', '\'']);
+        if unsafe_path {
+            return format!("{}{}", &text[..pos], hidden(&text[pos..]));
+        }
+        if let Some(q) = quote {
+            // The quoted part runs to the matching quote, also across spaces.
+            let open = w.as_bytes()[q];
+            let start = pos + q + 1;
+            let end = text[start..]
+                .find(open as char)
+                .map_or(text.len(), |i| start + i);
+            if !is_safe_part(&text[start..end]) {
+                return format!("{}{}", &text[..pos + q], hidden(&text[pos + q..]));
+            }
+        }
+        pos += word.len();
+    }
+    text.to_string()
+}
+
 /// Replace `word` where it stands as a whole word: no letter or digit right before or after.
 fn replace_words(text: &str, word: &str, with: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -886,7 +968,7 @@ mod tests {
         let mut f = Filter::new(false, StandIns::new(4), scrub);
         let out = f.text(
             "account jordi: recovery failed: /Users/x/data/accounts/jordi/files/NOTE/Note/Secret.note: \
-             gone, see /Users/x/log, device SN1 at 10.0.0.7, mail jordi@example.org, a data",
+             gone, see /Users/x/logs, device SN1 at 10.0.0.7, mail jordi@example.org, a data",
         );
         assert!(
             out.starts_with(
@@ -895,7 +977,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains(".note: gone, see ~/log, device dev-1 at ip-1, mail <person>, n-"),
+            out.contains(".note: gone, see ~/logs, device dev-1 at ip-1, mail <person>, n-"),
             "{out}"
         );
         assert!(out.ends_with(" data"), "{out}");
@@ -952,6 +1034,36 @@ mod tests {
         );
         let text = "render_dir = \"~/PDFs\"\n";
         assert_eq!(f.server_toml(text).unwrap(), text);
+    }
+
+    #[test]
+    fn unknown_paths_and_quotes_hide_the_rest_of_a_message() {
+        let mut f = filter();
+        for (text, prefix, name) in [
+            (
+                "render: /Volumes/Private Disk/PDFs: no space",
+                "render: <text:",
+                "Private",
+            ),
+            (
+                "invalid type: string \"Lunch with Anna\", expected u64",
+                "invalid type: string <text:",
+                "Lunch",
+            ),
+            ("x NOTE/Note/Ghost.note collides", "x <text:", "Ghost"),
+        ] {
+            let out = f.text(text);
+            assert!(
+                out.starts_with(prefix) && !out.contains(name),
+                "{text} gave {out}"
+            );
+        }
+        // known parts stay
+        let kept = "sync lock taken for a write without synchronous/start";
+        assert_eq!(f.text(kept), kept);
+        let kept = "missing <data>/accounts/acct-1/files/NOTE/Note/n-12ab.note: \"n-12ab\" 'NOTE'";
+        assert_eq!(f.text(kept), kept);
+        assert_eq!(f.text("NOTE/Note is missing"), "NOTE/Note is missing");
     }
 
     #[test]

@@ -46,6 +46,12 @@ pub const SECRETS: &[&str] = &[
     "bring papers",
     "Private list",
     "Digest group name",
+    "Lunch with Anna",
+    "Ghost file",
+    "ghost file",
+    "Private Disk",
+    "Volumes",
+    "Vanished",
 ];
 
 pub struct Fixture {
@@ -226,6 +232,15 @@ fn write_log(data: &Path) {
             "message": format!("account {SLUG}: recovery failed: {data_dir}/accounts/{SLUG}/files/NOTE/Note/Secret plans.note: gone")}),
         json!({"ts": ts(hour - 9 * minute), "kind": "marker", "device": SERIAL_1, "flags": ["implicit_lock"],
             "message": format!("account {SLUG}: sync lock taken for a write without synchronous/start")}),
+        json!({"ts": ts(hour - 10 * minute), "kind": "request", "device": SERIAL_1, "method": "POST",
+            "path": "/api/file/3/files/upload/apply", "response_status": 200,
+            "response_body": {"success": false, "errorCode": "E0001",
+                "errorMsg": "invalid type: string \"Lunch with Anna\", expected u64"},
+            "success": false, "message": format!("account {SLUG}: \"Ghost file.note\" collides with \"ghost file.note\"")}),
+        json!({"ts": ts(hour - 11 * minute), "kind": "marker",
+            "message": "render: /Volumes/Private Disk/PDFs/x: no space left"}),
+        json!({"ts": ts(hour - 12 * minute), "kind": "marker", "flags": ["store_damaged"],
+            "message": format!("the store of account {SLUG} is damaged: NOTE/Note/Vanished folder is missing")}),
         json!({"ts": ts(Duration::from_secs(10 * 24 * 3600)), "kind": "request", "device": SERIAL_1,
             "method": "POST", "path": "/api/old"}),
     ];

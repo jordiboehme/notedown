@@ -157,6 +157,13 @@ fn read_facts(opts: &DiagnoseOptions) -> Result<Facts> {
     let mut behind_all = 0;
     for (_, path) in journal.files().unwrap_or_default() {
         read_lines(&path, &mut |v| {
+            // Names of the journal's history (also of files gone since) are real values too.
+            for key in ["path", "oldPath", "recycle"] {
+                if let Some(p) = v.get(key).and_then(Value::as_str) {
+                    needles.add_path(p);
+                    scrub.names.extend(p.split('/').map(String::from));
+                }
+            }
             let seq = v.get("seq").and_then(Value::as_u64).unwrap_or(0);
             let account = v.get("account").and_then(Value::as_str).unwrap_or_default();
             let last = last_seq.entry(account.to_string()).or_default();
@@ -168,6 +175,11 @@ fn read_facts(opts: &DiagnoseOptions) -> Result<Facts> {
             Ok(())
         })?;
     }
+    scrub
+        .names
+        .retain(|n| !n.is_empty() && !n.bytes().all(|b| b.is_ascii_digit()));
+    scrub.names.sort();
+    scrub.names.dedup();
     let config = Config::load_or_default(data).unwrap_or_default();
     let mut states = Vec::new();
     let mut scans = Vec::new();

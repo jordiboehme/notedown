@@ -1,13 +1,16 @@
 //! Diagnostics: the always-on protocol log and `notedown cloud diagnose`.
 
+pub mod bundle;
 mod capture;
 pub mod check;
 pub mod collect;
 pub mod filter;
 mod log;
 mod mask;
+pub mod report;
 mod rotate;
 pub mod standin;
+pub mod state;
 
 pub use capture::Capture;
 pub use log::{

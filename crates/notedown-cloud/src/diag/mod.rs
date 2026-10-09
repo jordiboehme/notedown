@@ -1,6 +1,8 @@
 //! Diagnostics: the always-on protocol log and `notedown cloud diagnose`.
 
 mod capture;
+pub mod check;
+pub mod collect;
 pub mod filter;
 mod log;
 mod mask;

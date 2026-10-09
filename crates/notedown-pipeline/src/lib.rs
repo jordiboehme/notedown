@@ -5,6 +5,7 @@ pub mod model;
 pub mod page;
 pub mod region;
 pub mod store;
+pub mod text;
 pub mod toon;
 
 pub use config::PipelineConfig;

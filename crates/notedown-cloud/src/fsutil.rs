@@ -1,12 +1,31 @@
 //! Durable file writes: unique temp file, fsync, rename, fsync of the folder.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{Result, io_err};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// `path` with symlinks resolved, also when its end does not exist yet: the longest existing
+/// ancestor is resolved and the rest is joined to it. `..` in the missing rest stays as written.
+pub fn real_path(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(real) = cur.canonicalize() {
+            return rest.iter().rev().fold(real, |p, part| p.join(part));
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                cur = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
 
 /// Flush a folder's entries (a created or renamed file) to disk. A no-op where a folder cannot be
 /// opened for this (non-Unix).

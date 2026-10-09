@@ -10,6 +10,9 @@ use crate::{Error, Result, io_err};
 
 pub const CONFIG_FILE: &str = "server.toml";
 
+/// The render folder in the data folder when `render_dir` is not set.
+pub const DEFAULT_RENDER_DIR: &str = "share";
+
 /// The comment above `capture` in the written `server.toml`.
 pub const CAPTURE_COMMENT: &str = "# For one capture session only. The dumps in capture/ have no size cap \
      and no rotation.\n# Prefer `notedown serve --capture`, which counts for one run.";
@@ -99,9 +102,10 @@ pub struct Config {
     /// without a new change. The timer scan (`scan_interval`) stays as a backstop. false turns
     /// the watch off.
     pub watch: bool,
-    /// A folder where the server keeps a PDF of every note, one subfolder per account. A
-    /// leading `~/` is the home folder, a relative path is relative to the data folder. Not
-    /// set: nothing is rendered. The folder must exist; the server creates only the account
+    /// A folder where the server keeps a PDF of every note, one subfolder per account. Not
+    /// set: `<data>/share` ([`DEFAULT_RENDER_DIR`]), created when needed. Empty: nothing is
+    /// rendered. Otherwise an absolute path or one that starts with `~` (the home folder),
+    /// outside the data folder; that folder must exist, the server creates only the account
     /// subfolders.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_dir: Option<String>,
@@ -188,9 +192,13 @@ impl Config {
         (self.scan_interval > 0).then(|| std::time::Duration::from_secs(self.scan_interval))
     }
 
-    /// The render folder of `render_dir`, resolved; `None` when it is not set or empty.
+    /// The render folder of `render_dir`, resolved: `<data>/share` when it is not set, `None`
+    /// when it is empty (rendering is off).
     pub fn render_root(&self, data_dir: &Path) -> Option<PathBuf> {
-        let raw = self.render_dir.as_deref()?.trim();
+        let Some(raw) = self.render_dir.as_deref() else {
+            return Some(data_dir.join(DEFAULT_RENDER_DIR));
+        };
+        let raw = raw.trim();
         if raw.is_empty() {
             return None;
         }
@@ -222,6 +230,44 @@ impl Config {
                     message: format!("{key} must be at least 1"),
                 });
             }
+        }
+        self.validate_render_dir(path)
+    }
+
+    /// A set `render_dir` must be absolute (or start with `~`) and lie outside the data folder,
+    /// the folder of `path`. A folder that holds the data folder is left to the render pass,
+    /// which refuses it only when the account subfolder would hold the data folder.
+    fn validate_render_dir(&self, path: &Path) -> Result<()> {
+        let refuse = |message: String| Error::Config {
+            path: path.to_path_buf(),
+            message,
+        };
+        let Some(raw) = self.render_dir.as_deref().map(str::trim) else {
+            return Ok(());
+        };
+        if raw.is_empty() {
+            return Ok(());
+        }
+        if !(raw == "~" || raw.starts_with("~/") || Path::new(raw).is_absolute()) {
+            return Err(refuse(format!(
+                "render_dir = \"{raw}\" must be an absolute path or start with ~/; leave it \
+                 out to use {DEFAULT_RENDER_DIR}/ in the data folder"
+            )));
+        }
+        // `server.toml` alone has the parent "", the current folder.
+        let data = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let Some(root) = self.render_root(data) else {
+            return Ok(());
+        };
+        if crate::fsutil::real_path(&root).starts_with(crate::fsutil::real_path(data)) {
+            return Err(refuse(format!(
+                "render_dir = \"{raw}\" must be outside the data folder {}; leave it out to \
+                 use {DEFAULT_RENDER_DIR}/ in the data folder",
+                data.display()
+            )));
         }
         Ok(())
     }
@@ -357,31 +403,77 @@ mod tests {
     #[test]
     fn render_root_resolves_render_dir() {
         assert_eq!(
-            render_root_of(Some("out")),
-            Some(PathBuf::from("/data/out"))
-        );
-        assert_eq!(
             render_root_of(Some("~/x")),
             Some(dirs::home_dir().unwrap().join("x"))
         );
         assert_eq!(render_root_of(Some("/abs")), Some(PathBuf::from("/abs")));
         assert_eq!(render_root_of(Some("~")), dirs::home_dir());
         assert_eq!(render_root_of(Some(" ~ ")), dirs::home_dir());
-        // `~user` is not expanded: a folder of that name in the data folder.
-        assert_eq!(
-            render_root_of(Some("~other/x")),
-            Some(PathBuf::from("/data/~other/x"))
-        );
-        assert_eq!(render_root_of(None), None);
+        // Not set: the default folder in the data folder.
+        assert_eq!(render_root_of(None), Some(PathBuf::from("/data/share")));
+        // Empty: rendering is off.
         assert_eq!(render_root_of(Some("")), None);
         assert_eq!(render_root_of(Some("  ")), None);
+    }
+
+    fn validate_render(data: &Path, value: &str) -> Result<()> {
+        Config {
+            render_dir: Some(value.to_string()),
+            ..Config::default()
+        }
+        .validate(&Config::path(data))
+    }
+
+    #[test]
+    fn a_relative_render_dir_is_refused() {
+        let d = dir();
+        for value in ["out", "share", "~other/x", "./x"] {
+            let err = validate_render(d.path(), value).unwrap_err().to_string();
+            assert!(err.contains("absolute"), "{value}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_render_dir_in_the_data_folder_is_refused() {
+        let d = dir();
+        let data = d.path().join("data");
+        std::fs::create_dir_all(data.join("share")).unwrap();
+        for inside in [data.clone(), data.join("share"), data.join("pdf")] {
+            let err = validate_render(&data, &inside.to_string_lossy())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("outside the data folder"), "{inside:?}: {err}");
+        }
+        // Through a symlink to the data folder too.
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&data, &link).unwrap();
+        let err = validate_render(&data, &link.join("pdf").to_string_lossy())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside the data folder"), "{err}");
+    }
+
+    #[test]
+    fn a_render_dir_outside_the_data_folder_is_accepted() {
+        let d = dir();
+        let data = d.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        // A sibling whose name starts with the data folder's name is outside.
+        let sibling = d.path().join("data-share");
+        assert!(validate_render(&data, &sibling.to_string_lossy()).is_ok());
+        assert!(validate_render(&data, "").is_ok());
+        assert!(validate_render(&data, "~/PDFs").is_ok());
+        // A folder that holds the data folder is the render pass's business (the home folder).
+        assert!(validate_render(&data, &d.path().to_string_lossy()).is_ok());
     }
 
     #[test]
     fn render_dir_is_read_from_the_file() {
         let d = dir();
-        std::fs::write(Config::path(d.path()), "render_dir = \"out\"\n").unwrap();
+        std::fs::write(Config::path(d.path()), "render_dir = \"/abs/pdf\"\n").unwrap();
         let c = Config::load_or_default(d.path()).unwrap();
-        assert_eq!(c.render_root(d.path()), Some(d.path().join("out")));
+        assert_eq!(c.render_root(d.path()), Some(PathBuf::from("/abs/pdf")));
+        std::fs::write(Config::path(d.path()), "render_dir = \"pdf\"\n").unwrap();
+        assert!(Config::load_or_default(d.path()).is_err());
     }
 }

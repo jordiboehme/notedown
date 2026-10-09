@@ -91,8 +91,8 @@ enum CloudAction {
     /// them, so the device follows. The server does this by itself; run it to see the result
     /// at once, or with --accept after a hold
     Scan(ScanArgs),
-    /// Write a PDF of every note into the render_dir of server.toml, and move or delete the
-    /// PDFs of moved or deleted notes. Safe while the server runs
+    /// Write a PDF of every note into the render_dir of server.toml (default: share/ in the data
+    /// folder), and move or delete the PDFs of moved or deleted notes. Safe while the server runs
     Render(CloudRenderArgs),
 }
 
@@ -1123,7 +1123,7 @@ fn render_command(args: CloudRenderArgs) -> Result<ExitCode> {
     let config = notedown_cloud::Config::load_or_default(&args.data)?;
     let root = config
         .render_root(&args.data)
-        .ok_or_else(|| anyhow!("server.toml has no render_dir"))?;
+        .ok_or_else(|| anyhow!("render_dir is empty in server.toml: rendering is off"))?;
     let slugs = match &args.account {
         Some(slug) => vec![slug.clone()],
         None => notedown_cloud::auth::Accounts::new(&args.data)

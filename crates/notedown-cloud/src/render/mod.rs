@@ -21,6 +21,8 @@ mod pass;
 
 use std::path::{Path, PathBuf};
 
+use crate::config::DEFAULT_RENDER_DIR;
+use crate::fsutil::real_path;
 use crate::store::Store;
 use crate::{Error, Result, io_err};
 
@@ -83,12 +85,21 @@ pub fn render_account(store: &Store, root: &Path, opts: &PassOptions) -> Result<
 }
 
 /// `<root>/<slug>`, created. `root` must be an existing folder, and `<root>/<slug>` must be
-/// neither the data folder, nor inside it, nor hold it (`root` may hold the data folder).
+/// neither the data folder, nor inside it, nor hold it (`root` may hold the data folder). The
+/// one exception is the default `<data>/share` ([`DEFAULT_RENDER_DIR`]), which is created when
+/// it is missing.
 fn account_dir(store: &Store, root: &Path) -> Result<PathBuf> {
     let invalid = |message: String| Error::Invalid {
         what: "render_dir",
         message,
     };
+    // `<data>/accounts/<slug>` is the account folder.
+    let data = store.account_dir().parent().and_then(Path::parent);
+    let default_root = data.map(|d| real_path(&d.join(DEFAULT_RENDER_DIR)));
+    let is_default = default_root.as_deref() == Some(real_path(root).as_path());
+    if is_default {
+        std::fs::create_dir_all(root).map_err(io_err(root))?;
+    }
     if !root.is_dir() {
         return Err(invalid(format!("{} doesn't exist", root.display())));
     }
@@ -101,11 +112,15 @@ fn account_dir(store: &Store, root: &Path) -> Result<PathBuf> {
             .map_err(io_err(root))?
             .join(store.slug()),
     };
-    // `<data>/accounts/<slug>` is the account folder.
-    if let Some(data) = store.account_dir().parent().and_then(Path::parent)
+    if let Some(data) = data
         && let Ok(real_data) = data.canonicalize()
     {
-        if real_dir.starts_with(&real_data) {
+        // Only `<data>/share/<slug>` itself, not a symlink there that leads elsewhere.
+        let own = is_default
+            && default_root
+                .as_ref()
+                .is_some_and(|d| real_dir == d.join(store.slug()));
+        if real_dir.starts_with(&real_data) && !own {
             return Err(invalid(format!(
                 "{} is inside the data folder {} or is that folder",
                 dir.display(),

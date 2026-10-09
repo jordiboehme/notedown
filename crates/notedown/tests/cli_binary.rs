@@ -275,7 +275,13 @@ fn serve_refuse_sync_flag_counts_for_one_run_and_keeps_server_toml() {
         ),
         "{out}"
     );
-    assert!(out.contains("\nrender: off\n"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "\nrender: {}\n",
+            dir.path().join("share").display()
+        )),
+        "{out}"
+    );
     assert!(out.contains("\nwatch: on\n"), "{out}");
     assert!(
         out.contains("\nscan of the data folder: every 300 s, at sync start and before listings\n"),
@@ -1565,8 +1571,9 @@ fn cloud_render_writes_the_pdfs_of_an_account() {
 }
 
 #[test]
-fn cloud_render_without_render_dir_fails() {
+fn cloud_render_with_an_empty_render_dir_fails() {
     let data = render_fixture();
+    std::fs::write(data.path().join("server.toml"), "render_dir = \"\"\n").unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
         .args(["cloud", "render", "--data"])
         .arg(data.path())
@@ -1574,6 +1581,23 @@ fn cloud_render_without_render_dir_fails() {
         .unwrap();
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("server.toml has no render_dir"), "{err}");
+    assert!(err.contains("rendering is off"), "{err}");
+    assert!(!data.path().join("share").exists());
+}
+
+#[test]
+fn cloud_render_without_render_dir_writes_into_share() {
+    let data = render_fixture();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["cloud", "render", "--data"])
+        .arg(data.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(data.path().join("share/acc/NOTE/Note/a.pdf").is_file());
     assert!(!data.path().join("server.toml").exists());
 }

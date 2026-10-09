@@ -570,6 +570,61 @@ fn a_render_dir_inside_the_accounts_is_refused() {
 }
 
 #[test]
+fn the_default_share_folder_is_created_in_the_data_folder() {
+    let fx = Fx::new();
+    let root = fx.data.path().join("share");
+    fx.write("NOTE/Note/a.note", &fixture_note("test1"));
+    fx.scan();
+    let r = pass(&fx.store, &root);
+    assert_eq!(r.written, s(&["NOTE/Note/a.pdf"]));
+    assert!(root.join("acc/NOTE/Note/a.pdf").is_file());
+}
+
+#[test]
+fn a_symlink_in_the_share_folder_that_leads_into_the_data_folder_is_refused() {
+    let fx = Fx::new();
+    let root = fx.data.path().join("share");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(fx.data.path().join("other")).unwrap();
+    std::os::unix::fs::symlink(fx.data.path().join("other"), root.join("acc")).unwrap();
+    let err = render_account(
+        &fx.store,
+        &root,
+        &PassOptions {
+            all: false,
+            wait_for_lock: true,
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("inside the data folder"), "{err}");
+}
+
+#[test]
+fn another_folder_in_the_data_folder_is_refused() {
+    let fx = Fx::new();
+    for root in [
+        fx.data.path().join("pdf"),
+        fx.data.path().join("share/x"),
+        fx.data.path().to_path_buf(),
+    ] {
+        std::fs::create_dir_all(&root).unwrap();
+        let err = render_account(
+            &fx.store,
+            &root,
+            &PassOptions {
+                all: false,
+                wait_for_lock: true,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("inside the data folder"), "{root:?}: {err}");
+        assert!(!root.join("acc").exists(), "{root:?}");
+    }
+}
+
+#[test]
 fn an_account_without_files_gets_no_pdf_and_keeps_no_files() {
     let data = tempfile::tempdir().unwrap();
     let render = tempfile::tempdir().unwrap();

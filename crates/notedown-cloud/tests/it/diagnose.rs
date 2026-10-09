@@ -91,6 +91,8 @@ pub fn fixture() -> Fixture {
         ("DOCUMENT/Document/a", b"three"),
         ("NOTE/Note/Trips/Spain/beach.png", b"four"),
         ("NOTE/Note/Meeting 3.5 Smith/x.note", b"five"),
+        // a name that is also a protocol key (`data` of a push frame)
+        ("DOCUMENT/Document/data", b"six"),
     ] {
         write(&files.join(rel), bytes);
     }
@@ -115,7 +117,8 @@ pub fn fixture() -> Fixture {
         &acc.join("digests/items/1.json"),
         json!({"id": 1, "content": "my private digest text",
             "sourcePath": "/storage/ABCD-1234/Books/Hidden Book.epub", "commentStr": "comment words",
-            "isDeleted": "N", "md5Hash": "2b78a16daaecd6328ead00f430446d6e"})
+            "isDeleted": "N", "md5Hash": "2b78a16daaecd6328ead00f430446d6e",
+            "equipmentNo": "null-null"})
         .to_string()
         .as_bytes(),
     );
@@ -235,9 +238,9 @@ fn write_log(data: &Path) {
 fn account_state_counts_files_recycle_digests_and_todos() {
     let fx = fixture();
     let s = account_state(&fx.data(), SLUG).unwrap();
-    assert_eq!(s.files, 5);
+    assert_eq!(s.files, 6);
     assert_eq!(s.notes, 3);
-    assert_eq!(s.bytes, 3 + 3 + 5 + 4 + 4);
+    assert_eq!(s.bytes, 3 + 3 + 5 + 4 + 4 + 3);
     // the native folders, Trips, Spain and the meeting folder
     assert_eq!(s.folders, 8 + 3);
     assert_eq!((s.recycle_entries, s.recycle_bytes), (1, 3));

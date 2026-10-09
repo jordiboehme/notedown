@@ -49,7 +49,6 @@ const KEEP: &[&str] = &[
     "size",
     "position",
     "pagesChanged",
-    "recycle",
     "deletedAt",
     "lastUpdateTime",
     "createTime",
@@ -140,6 +139,8 @@ const NAME: &[&str] = &[
     "sourcePath",
     "commentHandwriteName",
     "handwriteInnerName",
+    // the path below `recycle/` of a deleted file
+    "recycle",
 ];
 
 const DEVICE: &[&str] = &["equipmentNo", "device", "serial"];
@@ -174,7 +175,7 @@ const KEPT_QUERY: &[&str] = &[
 const EVENTS: &[&str] = &["ServerMessage", "ClientMessage", "ratta_ping"];
 
 /// Device values that are no serial and stay.
-const NO_SERIAL: &[&str] = &["", "null-null"];
+pub const NO_SERIAL: &[&str] = &["", "null-null"];
 
 /// The class of a value by its key.
 pub fn class_of(key: &str) -> Class {
@@ -269,11 +270,15 @@ impl Filter {
         }
     }
 
+    /// `acct-N` for an account slug. Another value under an account key (the login sends the
+    /// e-mail address as `account`) is hidden, so `acct-N` always means an account.
     pub fn account(&mut self, slug: &str) -> String {
         if self.private {
             slug.to_string()
-        } else {
+        } else if self.scrub.slugs.is_empty() || self.scrub.slugs.iter().any(|s| s == slug) {
             self.standins.account(slug)
+        } else {
+            hidden(slug)
         }
     }
 
@@ -854,6 +859,17 @@ mod tests {
         assert_eq!(out["title"], "<text:8 chars>");
         assert_eq!(out["parts"][0]["name"], "strokes");
         assert_eq!(out["token"], "<masked:3 chars>");
+        let deleted = f.journal_line(&json!({"type": "file.deleted",
+            "recycle": "1791466487188/NOTE/Note/Secret.note", "path": "NOTE/Note/Secret.note"}));
+        let recycle = deleted["recycle"].as_str().unwrap();
+        assert!(
+            recycle.starts_with("1791466487188/NOTE/Note/n-"),
+            "{recycle}"
+        );
+        assert_eq!(
+            deleted["recycle"].as_str().unwrap().rsplit('/').next(),
+            deleted["path"].as_str().unwrap().rsplit('/').next()
+        );
         assert!(!out.to_string().contains("Secret") && !out.to_string().contains("Old"));
     }
 
@@ -883,6 +899,18 @@ mod tests {
             "{out}"
         );
         assert!(out.ends_with(" data"), "{out}");
+    }
+
+    #[test]
+    fn an_account_key_that_holds_no_slug_is_hidden() {
+        let scrub = Scrub {
+            slugs: vec!["jordi".into()],
+            ..Scrub::default()
+        };
+        let mut f = Filter::new(false, StandIns::new(4), scrub);
+        let out = f.json(&json!({"account": "jordi@example.org"}));
+        assert_eq!(out["account"], "<text:17 chars>");
+        assert_eq!(f.account("jordi"), "acct-1");
     }
 
     #[test]

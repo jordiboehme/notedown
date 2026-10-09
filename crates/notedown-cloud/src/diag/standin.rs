@@ -91,9 +91,10 @@ impl StandIns {
     }
 
     /// The stand-in of one name segment: `n-` plus hex, and the extension when it is short
-    /// ASCII. Fixed folders and empty segments stay.
+    /// ASCII. Fixed folders, digits only (the time folders of the recycle bin) and empty
+    /// segments stay.
     pub fn segment(&mut self, s: &str) -> String {
-        if s.is_empty() || FIXED_FOLDERS.contains(&s) {
+        if s.is_empty() || FIXED_FOLDERS.contains(&s) || s.bytes().all(|b| b.is_ascii_digit()) {
             return s.to_string();
         }
         if let Some(done) = self.names.get(s) {
@@ -218,6 +219,7 @@ mod tests {
             assert_eq!(s.segment(f), f);
         }
         assert_eq!(s.path("/NOTE/Note/"), "/NOTE/Note/");
+        assert_eq!(s.segment("1791466487188"), "1791466487188");
     }
 
     #[test]

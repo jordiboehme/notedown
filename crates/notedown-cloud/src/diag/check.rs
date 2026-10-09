@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-use super::filter::is_vocab_key;
+use super::filter::{NO_SERIAL, is_vocab_key};
 use super::standin::FIXED_FOLDERS;
 
 /// The real values a safe bundle must not show.
@@ -22,7 +22,8 @@ impl Needles {
     }
 
     /// Add one value. Values that the bundle shows anyway are not searched: digits only, an MD5,
-    /// `Y`, `N`, a fixed folder and the empty string.
+    /// `Y`, `N`, a fixed folder, a device value that is no serial (`null-null`) and the empty
+    /// string.
     pub fn add(&mut self, s: &str) {
         if !is_exempt(s) {
             self.set.insert(s.to_string());
@@ -54,6 +55,7 @@ fn is_exempt(s: &str) -> bool {
         || s == "Y"
         || s == "N"
         || FIXED_FOLDERS.contains(&s)
+        || NO_SERIAL.contains(&s)
         || s.bytes().all(|b| b.is_ascii_digit())
         || (s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
 }
@@ -126,7 +128,7 @@ fn walk(needles: &Needles, key: &str, v: &Value) -> Option<String> {
         Value::String(s) => string_hit(needles, s).then(|| key.to_string()),
         Value::Array(items) => items.iter().find_map(|i| walk(needles, key, i)),
         Value::Object(map) => map.iter().find_map(|(k, item)| {
-            if needles.set.contains(k) {
+            if !is_identifier(k) && needles.set.contains(k) {
                 Some("<key>".to_string())
             } else {
                 walk(needles, k, item)
@@ -134,6 +136,14 @@ fn walk(needles: &Needles, key: &str, v: &Value) -> Option<String> {
         }),
         _ => None,
     }
+}
+
+/// A key made of ASCII letters, digits, `_` and `-` only: protocol vocabulary such as `data`,
+/// `code` or `msg`, never compared with names (a folder may be called `data`). A key such as
+/// `x.note` or `My Notes` is compared.
+fn is_identifier(k: &str) -> bool {
+    k.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// A whole value or segment, or a hit inside JSON held by the string (after an optional
@@ -221,7 +231,14 @@ mod tests {
 
     #[test]
     fn digits_md5_and_flags_are_not_needles() {
-        let n = needles(&["2024", "98405d2b143a6c9a0d7d9888cbe7ccd4", "Y", "N", ""]);
+        let n = needles(&[
+            "2024",
+            "98405d2b143a6c9a0d7d9888cbe7ccd4",
+            "Y",
+            "N",
+            "",
+            "null-null",
+        ]);
         assert!(n.is_empty());
     }
 
@@ -233,12 +250,14 @@ mod tests {
     }
 
     #[test]
-    fn object_keys_are_searched() {
-        let n = needles(&["Secret"]);
+    fn object_keys_are_searched_unless_they_look_like_protocol_keys() {
+        let n = needles(&["Secret plans.note", "data"]);
         assert_eq!(
-            check_json(&n, "f", &json!({"a": {"Secret": 1}}), false).map(|l| l.key),
+            check_json(&n, "f", &json!({"a": {"Secret plans.note": 1}}), false).map(|l| l.key),
             Some("<key>".into())
         );
+        let frame = r#"42["ServerMessage","{\"code\":\"200\",\"data\":[]}"]"#;
+        assert!(check_json(&n, "f", &json!({"response_body": frame}), true).is_none());
     }
 
     #[test]

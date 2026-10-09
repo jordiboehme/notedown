@@ -22,11 +22,18 @@
 //!   keeps its old block (bytes, id, box) whenever its matched reading has a
 //!   normalized similarity of at least 0.8, also when it joined through step
 //!   3, ownership or the net; below 0.8 it takes the new reading and counts a
-//!   `region_missed` (once). A merge or split match takes the new reading,
-//!   because it carries text of other blocks. Only
-//!   an unmatched block is removed and goes into `replaces`. Owning a taken
-//!   reading also pulls in the paragraph whose last line was re-read with new
-//!   ink below it, so that line does not appear twice.
+//!   `region_missed` (once). Two exceptions take the matched reading's text
+//!   instead of the old bytes: a line of the old text that is missing from
+//!   the matched reading but present (normalized similarity of at least 0.8,
+//!   line by line) in another taken reading that overlaps the block, because
+//!   the old bytes would show that line twice; and a merge match, because the
+//!   reading carries the text of a block that does not survive and the old
+//!   bytes would lose it. Neither exception depends on the half-box split
+//!   rule: a reading that lies half inside the block but holds none of its
+//!   lines costs it nothing. Only an unmatched block is removed and goes into
+//!   `replaces`. Owning a taken reading also pulls in the paragraph whose
+//!   last line was re-read with new ink below it, so the line rule above can
+//!   see both readings and that line does not appear twice.
 //! - Step 4: labels `Diagram`, `Figure` and `Image` count as one label (the
 //!   converter renders all three as a diagram). Candidates must overlap. A
 //!   merge (a new block that covers two or more touched old blocks of its
@@ -123,6 +130,12 @@ fn owner_of(new: &Rect, old: &[Rect]) -> Option<usize> {
         }
     }
     best.map(|(i, _, _)| i)
+}
+
+/// True when a line of `text` reads like `line` (normalized similarity of at
+/// least `SAFETY_NET`).
+fn holds_line(text: &str, line: &str) -> bool {
+    text.lines().any(|l| similarity(line, l) >= SAFETY_NET)
 }
 
 fn by_position(bbox: [u32; 4]) -> (u32, u32) {
@@ -306,10 +319,22 @@ pub fn compose(
         };
         let sim = similarity(&old[i].text, &n.text);
         // A block outside the region keeps its bytes when its reading is
-        // close; a merge or a split brings text of other blocks, so the new
-        // reading wins there.
+        // close, unless a line of its old text left the reading for another
+        // taken reading over its box (the line would appear twice), or the
+        // reading is a merge that carries the text of a block that does not
+        // survive (that text would be lost).
+        let line_elsewhere = old[i].text.lines().any(|line| {
+            !line.trim().is_empty()
+                && !holds_line(&n.text, line)
+                && (0..new.len()).any(|k| {
+                    k != j
+                        && taken[k]
+                        && old_r[i].intersects(&new_r[k])
+                        && holds_line(&new[k].text, line)
+                })
+        });
         let keep_old = same_text(&old[i].text, &n.text)
-            || (!in_region[i] && sim >= SAFETY_NET && !merge[j] && !split[i]);
+            || (!in_region[i] && sim >= SAFETY_NET && !merge[j] && !line_elsewhere);
         if !in_region[i] && !netted[i] && sim < SAFETY_NET {
             region_missed += 1;
         }
@@ -1144,6 +1169,102 @@ mod tests {
         assert_eq!(c.blocks[0], olds[0]);
         assert_eq!(texts(&c)[1], ("b2", "Call the bank"));
         assert!(c.blocks[1].replaces.is_empty());
+        assert_eq!(c.region_missed, 0);
+        assert_eq!(next, 3);
+    }
+
+    #[test]
+    fn a_reread_last_line_under_half_inside_its_paragraph_does_not_appear_twice() {
+        // The reading that holds the re-read last line lies only a third
+        // inside b1, so b1 is no split; b1 must still give up its old bytes,
+        // because "Line six." lives in the other reading.
+        let paragraph = "Line one.\nLine two.\nLine three.\nLine four.\nLine five.\nLine six.";
+        let first_five = "Line one.\nLine two.\nLine three.\nLine four.\nLine five.";
+        assert!(similarity(paragraph, first_five) >= SAFETY_NET);
+        let olds = [old("b1", "Text", [100, 100, 900, 700], paragraph)];
+        let news = [
+            new("Text", [100, 100, 900, 590], first_five),
+            new(
+                "Text",
+                [100, 600, 900, 900],
+                "Line six.\nNew line one.\nNew line two.",
+            ),
+        ];
+        let mut next = 2;
+        let c = compose(
+            &olds,
+            &news,
+            &region(&[[100, 720, 900, 880]]),
+            PAGE,
+            &mut next,
+        );
+        let page: String = c.blocks.iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(page.matches("Line six.").count(), 1);
+        assert_eq!(
+            texts(&c),
+            [
+                ("b1", first_five),
+                ("b2", "Line six.\nNew line one.\nNew line two."),
+            ]
+        );
+        assert_eq!(c.region_missed, 0);
+        assert!(c.replaced.is_empty());
+        assert_eq!(next, 3);
+    }
+
+    #[test]
+    fn a_reading_half_inside_an_untouched_paragraph_does_not_cost_its_bytes() {
+        // A new reading lies exactly half inside b1 (a split by the box
+        // rule), but holds none of b1's lines; b1's own reading is close, so
+        // b1 keeps its bytes.
+        let paragraph = "Line one.\nLine two.\nLine three.\nLine four.\nLine five.\nLine six.";
+        let noisy = "Line one.\nLine two.\nLine three.\nLine four.\nLine five.\nLine six";
+        assert!(similarity(paragraph, noisy) >= SAFETY_NET && paragraph != noisy);
+        let olds = [old("b1", "Text", [100, 100, 900, 700], paragraph)];
+        let news = [
+            new("Text", [100, 100, 900, 690], noisy),
+            new("Text", [100, 500, 900, 900], "New line one.\nNew line two."),
+        ];
+        let mut next = 2;
+        let c = compose(
+            &olds,
+            &news,
+            &region(&[[100, 720, 900, 880]]),
+            PAGE,
+            &mut next,
+        );
+        assert_eq!(c.blocks.len(), 2);
+        assert_eq!(c.blocks[0], olds[0]);
+        assert_eq!(texts(&c)[1], ("b2", "New line one.\nNew line two."));
+        assert!(c.blocks[1].replaces.is_empty());
+        assert_eq!(c.region_missed, 0);
+        assert_eq!(next, 3);
+    }
+
+    #[test]
+    fn a_merge_outside_the_region_takes_the_whole_reading() {
+        // The region touches only the short second line. The merged reading
+        // matches b1 by similarity; b1 lies outside the region, but keeping
+        // its old bytes would lose "ok", which has no other place to live.
+        let long = "Meeting with Anna on Friday about the budget for next year";
+        let merged = "Meeting with Anna on Friday about the budget for next year ok";
+        assert!(similarity(long, merged) >= SAFETY_NET);
+        let olds = [
+            old("b1", "Text", [100, 100, 900, 300], long),
+            old("b2", "Text", [100, 300, 900, 330], "ok"),
+        ];
+        let news = [new("Text", [100, 100, 900, 330], merged)];
+        let mut next = 3;
+        let c = compose(
+            &olds,
+            &news,
+            &region(&[[850, 305, 900, 325]]),
+            PAGE,
+            &mut next,
+        );
+        assert_eq!(texts(&c), [("b1", merged)]);
+        assert_eq!(c.blocks[0].replaces, vec!["b2"]);
+        assert_eq!(c.replaced, vec![("b2".to_string(), vec!["b1".to_string()])]);
         assert_eq!(c.region_missed, 0);
         assert_eq!(next, 3);
     }

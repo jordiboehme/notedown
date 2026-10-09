@@ -22,18 +22,24 @@
 //!   keeps its old block (bytes, id, box) whenever its matched reading has a
 //!   normalized similarity of at least 0.8, also when it joined through step
 //!   3, ownership or the net; below 0.8 it takes the new reading and counts a
-//!   `region_missed` (once). Two exceptions take the matched reading's text
-//!   instead of the old bytes: a line of the old text that is missing from
-//!   the matched reading but present (normalized similarity of at least 0.8,
-//!   line by line) in another taken reading that overlaps the block, because
-//!   the old bytes would show that line twice; and a merge match, because the
-//!   reading carries the text of a block that does not survive and the old
-//!   bytes would lose it. Neither exception depends on the half-box split
-//!   rule: a reading that lies half inside the block but holds none of its
-//!   lines costs it nothing. Only an unmatched block is removed and goes into
-//!   `replaces`. Owning a taken reading also pulls in the paragraph whose
-//!   last line was re-read with new ink below it, so the line rule above can
-//!   see both readings and that line does not appear twice.
+//!   `region_missed` (once). Three exceptions take the matched reading's
+//!   text instead of the old bytes, compared on words (markdown hard breaks,
+//!   punctuation and case stripped): the reading holds new ink (a line whose
+//!   similarity to every old line is below 0.5, or at least 3 more words
+//!   than the old text), because the old bytes would lose it; words of the
+//!   old text that the reading lacks turned up in another taken reading that
+//!   overlaps the block (at least 2 of them, or the word of a one-word old
+//!   line), because the old bytes would show that line twice; and a merge
+//!   match, because the reading carries the text of a block that does not
+//!   survive. None of these depends on the half-box split rule: a reading
+//!   that lies half inside the block but holds none of its words costs it
+//!   nothing. Known limits, accepted: a re-read line whose words are misread
+//!   in the other reading can appear twice; a short common word in an
+//!   overlapping taken reading can count as moved, so the block takes its
+//!   close reading without need. Only an unmatched block is removed and goes
+//!   into `replaces`. Owning a taken reading also pulls in the paragraph
+//!   whose last line was re-read with new ink below it, so the word rule
+//!   above can see both readings and that line does not appear twice.
 //! - Step 4: labels `Diagram`, `Figure` and `Image` count as one label (the
 //!   converter renders all three as a diagram). Candidates must overlap. A
 //!   merge (a new block that covers two or more touched old blocks of its
@@ -132,10 +138,74 @@ fn owner_of(new: &Rect, old: &[Rect]) -> Option<usize> {
     best.map(|(i, _, _)| i)
 }
 
-/// True when a line of `text` reads like `line` (normalized similarity of at
-/// least `SAFETY_NET`).
-fn holds_line(text: &str, line: &str) -> bool {
-    text.lines().any(|l| similarity(line, l) >= SAFETY_NET)
+/// A reading line this far from every old line is new ink.
+const NEW_LINE: f32 = 0.5;
+/// This many more words than the old text is new ink too.
+const NEW_WORDS: usize = 3;
+/// This many old words found in another reading mean a line moved there.
+const MOVED_WORDS: usize = 2;
+
+/// The words of a line for the keep-old check: without the markdown hard
+/// break (a trailing `\`), punctuation and case.
+fn words(line: &str) -> Vec<String> {
+    let line = line.trim_end();
+    let line = line.strip_suffix('\\').unwrap_or(line);
+    line.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// The non-empty lines of a text as words.
+fn line_words(text: &str) -> Vec<Vec<String>> {
+    text.lines().map(words).filter(|w| !w.is_empty()).collect()
+}
+
+/// Takes `word` out of `pool` once; false when it is not there.
+fn take_word(pool: &mut Vec<String>, word: &str) -> bool {
+    pool.iter()
+        .position(|w| w == word)
+        .map(|p| pool.swap_remove(p))
+        .is_some()
+}
+
+/// Whether the matched reading of a block outside the region wins over the
+/// old bytes, compared on words: it holds new ink (a line unlike every old
+/// line, or `NEW_WORDS` more words), or words of the old text that it lacks
+/// turned up in `others`, the other taken readings over the block (at least
+/// `MOVED_WORDS` of them, or the word of a one-word old line).
+fn reading_wins(old: &str, reading: &str, others: &[&str]) -> bool {
+    let old_lines = line_words(old);
+    let new_lines = line_words(reading);
+    let old_words: Vec<&str> = old_lines.iter().flatten().map(String::as_str).collect();
+    let mut new_words: Vec<String> = new_lines.iter().flatten().cloned().collect();
+    if new_words.len() >= old_words.len() + NEW_WORDS {
+        return true;
+    }
+    let unlike_every_old_line = |line: &Vec<String>| {
+        let line = line.join(" ");
+        old_lines
+            .iter()
+            .all(|o| similarity(&line, &o.join(" ")) < NEW_LINE)
+    };
+    if new_lines.iter().any(unlike_every_old_line) {
+        return true;
+    }
+    let mut elsewhere: Vec<String> = others
+        .iter()
+        .flat_map(|t| line_words(t))
+        .flatten()
+        .collect();
+    let found: Vec<&str> = old_words
+        .iter()
+        .filter(|w| !take_word(&mut new_words, w))
+        .filter(|w| take_word(&mut elsewhere, w))
+        .copied()
+        .collect();
+    found.len() >= MOVED_WORDS
+        || old_lines
+            .iter()
+            .any(|l| l.len() == 1 && found.contains(&l[0].as_str()))
 }
 
 fn by_position(bbox: [u32; 4]) -> (u32, u32) {
@@ -319,22 +389,19 @@ pub fn compose(
         };
         let sim = similarity(&old[i].text, &n.text);
         // A block outside the region keeps its bytes when its reading is
-        // close, unless a line of its old text left the reading for another
-        // taken reading over its box (the line would appear twice), or the
-        // reading is a merge that carries the text of a block that does not
-        // survive (that text would be lost).
-        let line_elsewhere = old[i].text.lines().any(|line| {
-            !line.trim().is_empty()
-                && !holds_line(&n.text, line)
-                && (0..new.len()).any(|k| {
-                    k != j
-                        && taken[k]
-                        && old_r[i].intersects(&new_r[k])
-                        && holds_line(&new[k].text, line)
-                })
-        });
+        // close, unless the reading holds new ink or words of the old text
+        // moved to another taken reading over its box (`reading_wins`), or
+        // the reading is a merge that carries the text of a block that does
+        // not survive (that text would be lost).
+        let others: Vec<&str> = (0..new.len())
+            .filter(|&k| k != j && taken[k] && old_r[i].intersects(&new_r[k]))
+            .map(|k| new[k].text.as_str())
+            .collect();
         let keep_old = same_text(&old[i].text, &n.text)
-            || (!in_region[i] && sim >= SAFETY_NET && !merge[j] && !line_elsewhere);
+            || (!in_region[i]
+                && sim >= SAFETY_NET
+                && !merge[j]
+                && !reading_wins(&old[i].text, &n.text, &others));
         if !in_region[i] && !netted[i] && sim < SAFETY_NET {
             region_missed += 1;
         }
@@ -1265,6 +1332,168 @@ mod tests {
         assert_eq!(texts(&c), [("b1", merged)]);
         assert_eq!(c.blocks[0].replaces, vec!["b2"]);
         assert_eq!(c.replaced, vec![("b2".to_string(), vec!["b1".to_string()])]);
+        assert_eq!(c.region_missed, 0);
+        assert_eq!(next, 3);
+    }
+
+    /// Three paragraph lines the way the converter writes them: a markdown
+    /// hard break ends every line but the last.
+    const THREE_LINES: &str = "Meeting with Anna on Friday about the budget.\\\nCall Bob about the invoice for March.\\\nSend the draft to the team by Monday.";
+
+    fn short_last_line_reread(b_box: [u32; 4]) -> Composed {
+        let old_text = format!("{THREE_LINES}\\\nok");
+        assert!(similarity(&old_text, THREE_LINES) >= SAFETY_NET);
+        let olds = [old("b1", "Text", [100, 100, 900, 700], &old_text)];
+        let news = [
+            new("Text", [100, 100, 900, 580], THREE_LINES),
+            new("Text", b_box, "ok\\\nNew line."),
+        ];
+        let mut next = 2;
+        let c = compose(
+            &olds,
+            &news,
+            &region(&[[100, 720, 900, 880]]),
+            PAGE,
+            &mut next,
+        );
+        assert_eq!(next, 3);
+        c
+    }
+
+    #[test]
+    fn a_short_reread_last_line_with_a_hard_break_does_not_appear_twice() {
+        // bs58: "ok" becomes "ok\" as the first line of piece B, which lies
+        // 58% inside b1.
+        let c = short_last_line_reread([100, 590, 900, 780]);
+        let page: String = c.blocks.iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(page.matches("ok").count(), 1);
+        assert_eq!(texts(&c), [("b1", THREE_LINES), ("b2", "ok\\\nNew line.")]);
+        assert_eq!(c.region_missed, 0);
+        assert!(c.replaced.is_empty());
+    }
+
+    #[test]
+    fn a_short_reread_last_line_under_half_inside_does_not_appear_twice() {
+        // bs33: as above, with piece B only a third inside b1.
+        let c = short_last_line_reread([100, 600, 900, 900]);
+        let page: String = c.blocks.iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(page.matches("ok").count(), 1);
+        assert_eq!(texts(&c), [("b1", THREE_LINES), ("b2", "ok\\\nNew line.")]);
+        assert_eq!(c.region_missed, 0);
+        assert!(c.replaced.is_empty());
+    }
+
+    #[test]
+    fn a_reread_last_line_joined_with_new_ink_does_not_appear_twice() {
+        // x03: piece B reads the old last line and the new ink as one line.
+        let paragraph = "Line one.\nLine two.\nLine three.\nLine four.\nLine five.\nLine six.";
+        let first_five = "Line one.\nLine two.\nLine three.\nLine four.\nLine five.";
+        let olds = [old("b1", "Text", [100, 100, 900, 700], paragraph)];
+        let news = [
+            new("Text", [100, 100, 900, 580], first_five),
+            new("Text", [100, 590, 900, 780], "Line six. New line one."),
+        ];
+        let mut next = 2;
+        let c = compose(
+            &olds,
+            &news,
+            &region(&[[100, 720, 900, 780]]),
+            PAGE,
+            &mut next,
+        );
+        let page: String = c.blocks.iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(page.matches("Line six.").count(), 1);
+        assert_eq!(page.matches("New line one.").count(), 1);
+        assert_eq!(
+            texts(&c),
+            [("b1", first_five), ("b2", "Line six. New line one.")]
+        );
+        assert_eq!(c.region_missed, 0);
+        assert!(c.replaced.is_empty());
+    }
+
+    #[test]
+    fn a_reread_last_line_that_shared_its_old_line_does_not_appear_twice() {
+        // x05: the old text held "Line five. Line six." as one line.
+        let paragraph = "Line one.\nLine two.\nLine three.\nLine four.\nLine five. Line six.";
+        let first_five = "Line one.\nLine two.\nLine three.\nLine four.\nLine five.";
+        let olds = [old("b1", "Text", [100, 100, 900, 700], paragraph)];
+        let news = [
+            new("Text", [100, 100, 900, 580], first_five),
+            new("Text", [100, 590, 900, 780], "Line six.\nNew line."),
+        ];
+        let mut next = 2;
+        let c = compose(
+            &olds,
+            &news,
+            &region(&[[100, 720, 900, 780]]),
+            PAGE,
+            &mut next,
+        );
+        let page: String = c.blocks.iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(page.matches("Line six.").count(), 1);
+        assert_eq!(page.matches("New line.").count(), 1);
+        assert_eq!(
+            texts(&c),
+            [("b1", first_five), ("b2", "Line six.\nNew line.")]
+        );
+        assert_eq!(c.region_missed, 0);
+        assert!(c.replaced.is_empty());
+    }
+
+    #[test]
+    fn new_ink_read_into_a_close_reading_is_not_lost() {
+        // x07: a line written just below b1 is read into b1's own reading,
+        // which stays close to the old text; b1 lies outside the region.
+        let paragraph = "Line one.\nLine two.\nLine three.\nLine four.\nLine five.\nLine six.";
+        let with_new =
+            "Line one.\nLine two.\nLine three.\nLine four.\nLine five.\nLine six.\nNew line.";
+        assert!(similarity(paragraph, with_new) >= SAFETY_NET);
+        let olds = [old("b1", "Text", [100, 100, 900, 700], paragraph)];
+        let news = [new("Text", [100, 100, 900, 790], with_new)];
+        let mut next = 2;
+        let c = compose(
+            &olds,
+            &news,
+            &region(&[[100, 720, 900, 780]]),
+            PAGE,
+            &mut next,
+        );
+        let page: String = c.blocks.iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(page.matches("New line.").count(), 1);
+        assert_eq!(page.matches("Line six.").count(), 1);
+        assert_eq!(texts(&c), [("b1", with_new)]);
+        assert!(!c.unchanged);
+        assert_eq!(c.region_missed, 0);
+        assert!(c.replaced.is_empty());
+        assert_eq!(next, 2);
+    }
+
+    #[test]
+    fn an_edit_read_into_a_neighbours_close_reading_is_not_lost() {
+        // x13: the edited short line "ok!" is read into the long line above
+        // it, whose reading covers only 40% of the short line's box.
+        let long = "Meeting with Anna on Friday about the budget for next year";
+        let reading = "Meeting with Anna on Friday about the budget for next year\\\nok!";
+        assert!(similarity(long, reading) >= SAFETY_NET);
+        let olds = [
+            old("b1", "Text", [100, 100, 900, 300], long),
+            old("b2", "Text", [100, 300, 900, 350], "ok"),
+        ];
+        let news = [new("Text", [100, 100, 900, 320], reading)];
+        let mut next = 3;
+        let c = compose(
+            &olds,
+            &news,
+            &region(&[[850, 310, 900, 340]]),
+            PAGE,
+            &mut next,
+        );
+        let page: String = c.blocks.iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(page.matches("ok").count(), 1);
+        assert_eq!(page.matches("ok!").count(), 1);
+        assert_eq!(texts(&c), [("b1", reading)]);
+        assert!(!c.unchanged);
         assert_eq!(c.region_missed, 0);
         assert_eq!(next, 3);
     }

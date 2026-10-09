@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 const-hex.workspace = true
+notedown-cloud.workspace = true
 notedown-note.workspace = true
 sha2.workspace = true
 serde.workspace = true

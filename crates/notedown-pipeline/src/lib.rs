@@ -1,8 +1,10 @@
 //! The notedown pipeline: page text, changes for agents and the config that drives them.
 
 pub mod config;
+pub mod model;
 pub mod page;
 pub mod region;
+pub mod store;
 pub mod toon;
 
 pub use config::PipelineConfig;
@@ -24,6 +26,17 @@ pub enum Error {
     Encode(#[from] serde_json::Error),
     #[error("note: {0}")]
     Note(#[from] notedown_note::NoteError),
+    #[error(transparent)]
+    Cloud(#[from] notedown_cloud::Error),
+    #[error("another notedown pipeline runs for this data folder")]
+    WriterBusy,
+    #[error("invalid {what}: {message}")]
+    Invalid { what: &'static str, message: String },
+    #[error("{path}: {message}")]
+    Corrupt {
+        path: std::path::PathBuf,
+        message: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

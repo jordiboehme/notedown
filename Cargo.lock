@@ -1585,6 +1585,7 @@ name = "notedown-pipeline"
 version = "0.1.0"
 dependencies = [
  "const-hex",
+ "notedown-cloud",
  "notedown-note",
  "serde",
  "serde_json",

@@ -1,12 +1,13 @@
 //! Stroke lists of a note page: what the change detection compares.
 
 use notedown_note::Notebook;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::Result;
 
 /// One live ink stroke: a short hash and its box in page pixels.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StrokeEntry {
     pub hash: String,
     /// `[left, top, right, bottom]` in page pixels.

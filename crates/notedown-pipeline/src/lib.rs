@@ -1,6 +1,8 @@
 //! The notedown pipeline: page text, changes for agents and the config that drives them.
 
 pub mod config;
+pub mod page;
+pub mod region;
 pub mod toon;
 
 pub use config::PipelineConfig;
@@ -18,6 +20,10 @@ pub enum Error {
         path: std::path::PathBuf,
         source: std::io::Error,
     },
+    #[error("stroke encoding: {0}")]
+    Encode(#[from] serde_json::Error),
+    #[error("note: {0}")]
+    Note(#[from] notedown_note::NoteError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

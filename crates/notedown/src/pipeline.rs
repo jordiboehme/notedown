@@ -48,9 +48,18 @@ pub trait PageSource {
     }
 }
 
-struct NoteSource<'a> {
+pub struct NoteSource<'a> {
     notebook: &'a Notebook,
     keep_template: bool,
+}
+
+impl<'a> NoteSource<'a> {
+    pub fn new(notebook: &'a Notebook, keep_template: bool) -> Self {
+        Self {
+            notebook,
+            keep_template,
+        }
+    }
 }
 
 impl PageSource for NoteSource<'_> {

@@ -2,3 +2,4 @@
 *.debug.json
 .DS_Store
 /tests/fixtures/local/
+.superpowers/

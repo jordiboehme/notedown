@@ -891,7 +891,7 @@ Ratta's web delete and restore [ratta-server] (analyzed):
 
 ### 6.5 Sharing
 
-`POST /api/file/share/record/add {fileId, shareWay}` (`0` PDF, `1` PNG) only records a share [ratta-server]. Device-side share and the device conversion DTOs (`TerminalUploadConvert*`, share URL with `ttl`) exist in the jar without routes in this build [ratta-server]. Whether the Nomad calls the share route is [unknown]; untested on hardware by any source [community:ultrabridge].
+`POST /api/file/share/record/add {fileId, shareWay}` (`0` PDF, `1` PNG) only records a share [ratta-server]. Device-side share and the device conversion DTOs (`TerminalUploadConvert*`, share URL with `ttl`) exist in the jar without routes in this build [ratta-server]. The Nomad never calls the share route (9.6) [capture:nomad-3.29.42]. Its "Share via QR Code" goes to Ratta's own service, not to the Private Cloud: the code holds a `https://viewer.supernote.com/share/?shareId=<id>&fileType=<n>` link that is valid for one day, and the server gets no request for it. notedown has nothing to record.
 
 ### 6.6 File conversion requests
 
@@ -901,7 +901,7 @@ Ratta's web delete and restore [ratta-server] (analyzed):
 | `POST /api/file/note/to/png` | `id`, `host` | `pngPageVOList[]` of `{pageNo, url}` | [ratta-server] [ratta-web] |
 | `POST /api/file/pdfwithmark/to/pdf` | `id` | `url` (PDF with its `.mark` annotations merged) | [ratta-server] [ratta-web] [community:ultrabridge] |
 
-Ratta delegates to `notelib`; errors `E0314` parse failure, `E0315` wrong type, `E0316` already converting [ratta-server]. Not seen during device syncs [community:ultrabridge 0b]. A server without a renderer can answer with an error envelope [inferred]; notedown can render `.note` itself [proposal].
+Ratta delegates to `notelib`; errors `E0314` parse failure, `E0315` wrong type, `E0316` already converting [ratta-server]. Not seen during device syncs [community:ultrabridge 0b]. The Nomad's export renders on the device and does not call them either (9.6) [capture:nomad-3.29.42]. A server without a renderer can answer with an error envelope [inferred]; notedown can render `.note` itself [proposal].
 
 ### 6.7 Server info and parameters
 
@@ -1097,7 +1097,6 @@ Goal set by Jordi: every device-facing feature of Ratta's server, no email, no d
       sort/<taskListId>.json
     recycle/<deletedAtMs>/<original relative path>   deleted files, restorable
     recycle/index.jsonl             {id, path, deletedAt, by}
-    shares.jsonl                    share records
     outbox/<equipmentNo>.jsonl      pending socket pushes (DELETE_DIGEST and others), cleared when sent
     logins.jsonl                    login history (optional)
     staging/<uploadId>/             chunks and single uploads before finish (hidden from listings)
@@ -1129,7 +1128,7 @@ Notes:
 | Auto sync | `/socket.io/` | `outbox/<equipmentNo>.jsonl` for pushes that must not be lost | connection registry |
 | Digests | 5.3 endpoints | `digests/` tree, one JSON per record, `.mark` beside it, `groups/`, `tags.json`; soft delete = `isDeleted:"Y"` kept until purged | id index (rebuilt at start) |
 | Tasks | 6.1 endpoints | `tasks/groups`, `tasks/items`, `tasks/sort`; each JSON = the wire record; `nextSyncToken` = max `lastModified` served | none |
-| Sharing | `share/record/add` | append to `shares.jsonl` | none |
+| Sharing | `share/record/add` | not needed: the Nomad never calls it (9.6); the route stays refused | none |
 | Conversion | `note/to/pdf`, `note/to/png`, `pdfwithmark/to/pdf` | notedown's own `.note` renderer; outputs cached in `convert/` and served by signed `oss/download` URLs | job state |
 | System parameters | `official/system/base/param`, `file/query/server` | constants from `server.toml` | none |
 | Web UI API | 6.8 endpoints | same state as above; web MFA (TOTP) secrets, if offered, in `account.json` | web sessions |
@@ -1190,7 +1189,7 @@ From the mapper files and the endpoints above [ratta-server] [inferred]:
 | `t_schedule_task`, `t_schedule_task_group`, `t_schedule_sort`, `t_schedule_recur_task` | tasks | yes | `tasks/` tree |
 | `u_login_record` | login history | no | `logins.jsonl` |
 | `f_recycle_file` | recycle bin | web only | `recycle/` |
-| `f_share_record`, `f_terminal_share_file` | shares | device use unknown | `shares.jsonl` |
+| `f_share_record`, `f_terminal_share_file` | shares | no (9.6) | none |
 | `f_file_convert`, `f_terminal_file_convert` | conversion jobs | web, device use unknown | in-memory jobs + `convert/` cache |
 | `f_file_his_sync` | legacy history sync | no (no route) | none |
 | `f_file_server_change` | migration between Ratta storage backends | no | none |
@@ -1213,7 +1212,7 @@ Two mappers reference tables that the shipped schema does not create (`f_composi
 | 4 | Whether device deletes go to Ratta's recycle bin | Answered in 3.5 (`delete_folder_v3`): no, a device delete is a hard delete [ratta-server] (analyzed) |
 | 5 | `.mark` name for digest handwriting (device name echoed or server name), `digest_id` in the `.note` = `metadata.unique_identifier`? | Create a note digest with a handwritten comment on the Nomad, sync to the Ratta stack, compare the `.note` text box JSON with `t_summary` and the `digest` directory |
 | 6 | Device use of digest tags, paging sizes, group delete push | Same capture, plus deleting a group in the web UI (Ratta web UI has no digest view: use the database) |
-| 7 | Device use of share and conversion endpoints and of `send/password/unlock/code` | Trigger share/export and "forgot lock password" on the device during a capture |
+| 7 | Device use of share and conversion endpoints and of `send/password/unlock/code` | Partly answered in 9.6: export and "Share via QR Code" call neither share nor conversion routes. Still open: `send/password/unlock/code` ("forgot lock password" on the device during a capture) |
 | 8 | Which HTTP status codes the device accepts for errors (200 + `success:false` vs 4xx) | Stub returns chosen errors; observe retries and `flag` |
 | 9 | Moving an already synced device from Ratta's server to notedown: the device's sync database holds Ratta ids | Test with a copy of the data: the device should see new ids and treat files by path and hash; confirm no deletes happen (opennotecloud reports this works) |
 | 10 | Device-side storage of digests and tasks | Not needed for the server; optional via ADB file listing |
@@ -1312,4 +1311,16 @@ Device test on 2026-10-08 against notedown with the scan (3.0.1) and the scan fo
 - A file renamed only in case on the disk showed up on the device under the new spelling. The scan kept its id, so the device did not download it again as a new file.
 - A deleted file was deleted on the device too. The sync was not held: far more files were left than `scan_min_files`.
 
-All three passed. Still open: the device test of `push = "detail"` (9.3).
+All three passed.
+
+### 9.6 Detail push, render and share results [capture:nomad-3.29.42]
+
+Device test on 2026-10-09 (times UTC), "Auto Sync" on, `push = "detail"`, folder watch on. All changes were made by hand in the data folder while the server ran, with no `cloud scan`:
+
+- Each change was pushed 5 to 8 seconds after it was made, and the Nomad applied it without a manual sync: `ADDFOLDER` for a new folder, `DOWNLOADFILE` for a new note, `MODIFYFILE` for a rename, `MOVEFILE` for a move into the parent folder, `DELETEFILE` and `DELETEFOLDER`.
+- A copy made in Finder is a new file to the server and goes out as `DOWNLOADFILE`. `COPYFILE` is only sent for a copy made through the API, so it stays untested with one device.
+- When the Nomad had closed its socket (sleep), it synced on reconnect and fetched the new file itself. The push for that file still went out after the sync; the Nomad answered it with one `query_v3` and did nothing else.
+- A folder with 30 notes, moved in at once: one push with one `ADDFOLDER` and 30 `DOWNLOADFILE` items (12:18:23). The Nomad fetched each file once and was done at 12:18:28. Deleting the folder: one push with 30 `DELETEFILE` items and one `DELETEFOLDER` (12:19:35). The file deletes are not folded into the folder delete.
+- `render_dir`: the first pass wrote 41 PDFs for 41 notes. A note changed on the Nomad was rendered again 2 seconds after its upload; the other PDFs stayed untouched.
+- Export to PDF and to PNG renders on the device. The result lands in `EXPORT/` (one PDF, or one PNG per page named `<note>_Page_<n>.png`) and syncs as a normal upload. No conversion route is called.
+- "Share via QR Code", tried twice (the second time after a restart of the Nomad): no request reached notedown. The QR code held a `viewer.supernote.com` link with a new `shareId` each time (`fileType=2`, then `fileType=1`), valid for one day. So sharing goes through Ratta's service even when the device uses a Private Cloud, and `share/record/add` is never called.

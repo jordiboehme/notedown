@@ -12,6 +12,14 @@
 //!   inside a touched old block is taken too. Without this, erasing the end of
 //!   a line shrinks the new box away from the region and the rest of the line
 //!   would be lost.
+//! - Step 3 (ruling, step 1 wins over a literal drop): an untouched old block
+//!   that shares its place with a taken new block (the new block covers at
+//!   least half of it, or lies at least half inside it) is not dropped but
+//!   joins the step-4 match pool as touched. A same-label match keeps its id,
+//!   and on equal normalized text its old bytes, so box jitter costs nothing.
+//!   Only an unmatched one is removed and goes into `replaces`. The "lies
+//!   inside" half stops a line from appearing twice (the last line of a
+//!   paragraph re-read together with new ink below it).
 //! - Step 4: labels `Diagram`, `Figure` and `Image` count as one label (the
 //!   converter renders all three as a diagram). Candidates must overlap. A
 //!   merge (a new block that covers two or more touched old blocks of its
@@ -28,9 +36,14 @@
 //!   `replaces` too (a merge that matched one side replaces the other).
 //! - Step 7: "the new blocks that overlap its box" are those whose overlap is
 //!   at least half of the old or of the new box, so a neighbour that grazes
-//!   the box is not read into it. A block that fails becomes touched, the new
-//!   blocks of its place are taken, and the normal matching runs (so it can
-//!   keep its id). No new block at its place gives similarity 0: it is removed.
+//!   the box is not read into it. When no new block passes that, every new
+//!   block that overlaps the box at all reads the place (a reading shifted
+//!   by jitter is still compared, and taken if the net fires). A block that
+//!   fails becomes touched, the new blocks of its place are taken, and the
+//!   normal matching runs (so it can keep its id). No new block over its box
+//!   gives similarity 0: it is removed. The net fires for one block at a
+//!   time and steps 2-3 run again before the next, so a block that the taken
+//!   reading covers joins through step 3 and does not count as missed.
 //! - Carried-over and matched blocks drop their old `replaces`: it records the
 //!   step from one version to the next; the note state keeps the history.
 //! - A matched block whose text is the same after normalization keeps its old
@@ -113,7 +126,6 @@ pub fn compose(
     // Steps 1 and 2: what the change touches.
     let mut touched: Vec<bool> = old_r.iter().map(|r| region.touches(r)).collect();
     let mut taken: Vec<bool> = new_r.iter().map(|r| region.touches(r)).collect();
-    let mut covered = vec![false; old.len()];
     let mut region_missed = 0;
     loop {
         let mut changed = false;
@@ -127,24 +139,32 @@ pub fn compose(
                 changed = true;
             }
         }
-        // Step 3: no double text.
+        // Step 3, no double text: an untouched block that shares its place
+        // with a taken new block joins the match pool (step 1 wins: box
+        // jitter must not cost it its id).
         for i in 0..old.len() {
-            if !touched[i]
-                && !covered[i]
-                && (0..new.len()).any(|j| taken[j] && new_r[j].overlap_share_of(&old_r[i]) >= COVER)
-            {
-                covered[i] = true;
+            if !touched[i] && (0..new.len()).any(|j| taken[j] && same_place(&old_r[i], &new_r[j])) {
+                touched[i] = true;
                 changed = true;
             }
         }
-        // Step 7: the safety net.
+        if changed {
+            continue;
+        }
+        // Step 7: the safety net, one block at a time, so a block that the
+        // taken reading covers joins through step 3 and is not counted.
         for i in 0..old.len() {
-            if touched[i] || covered[i] {
+            if touched[i] {
                 continue;
             }
             let mut place: Vec<usize> = (0..new.len())
                 .filter(|&j| same_place(&old_r[i], &new_r[j]))
                 .collect();
+            if place.is_empty() {
+                place = (0..new.len())
+                    .filter(|&j| old_r[i].intersects(&new_r[j]))
+                    .collect();
+            }
             place.sort_by_key(|&j| by_position(new[j].bbox));
             let reading: Vec<&str> = place.iter().map(|&j| new[j].text.as_str()).collect();
             if similarity(&old[i].text, &reading.join("\n")) < SAFETY_NET {
@@ -154,6 +174,7 @@ pub fn compose(
                     taken[j] = true;
                 }
                 changed = true;
+                break;
             }
         }
         if !changed {
@@ -212,15 +233,15 @@ pub fn compose(
         }
     }
 
-    // Who survives: untouched blocks not covered, and matched ones.
+    // Who survives: untouched blocks and matched ones.
     let survives: Vec<bool> = (0..old.len())
-        .map(|i| (!touched[i] && !covered[i]) || matched_old[i])
+        .map(|i| !touched[i] || matched_old[i])
         .collect();
 
     // The page: kept blocks verbatim, taken blocks with steps 5 and 6.
     let mut entries: Vec<(Option<String>, Block)> = Vec::new();
     for (i, b) in old.iter().enumerate() {
-        if !touched[i] && !covered[i] {
+        if !touched[i] {
             entries.push((
                 Some(b.id.clone()),
                 Block {
@@ -699,5 +720,226 @@ mod tests {
         assert!(c.replaced.is_empty());
         assert!(!c.unchanged);
         assert_eq!(next, 4);
+    }
+
+    fn texts(c: &Composed) -> Vec<(&str, &str)> {
+        c.blocks
+            .iter()
+            .map(|b| (b.id.as_str(), b.text.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn a_shifted_reading_with_the_same_text_keeps_the_block() {
+        // The new box of b1 overlaps only 40% of the old one: the half rule
+        // finds no reading there, any overlap does.
+        let olds = [
+            old("b1", "Text", [100, 100, 900, 200], "Call Bob"),
+            old("b2", "Text", [100, 600, 900, 700], "Todo"),
+        ];
+        let news = [
+            new("Text", [100, 160, 900, 260], "Call Bob"),
+            new("Text", [100, 600, 900, 700], "Todo"),
+        ];
+        let mut next = 3;
+        let c = compose(
+            &olds,
+            &news,
+            &region(&[[150, 620, 300, 680]]),
+            PAGE,
+            &mut next,
+        );
+        assert_eq!(c.region_missed, 0);
+        assert!(c.unchanged);
+        assert_eq!(c.blocks, olds);
+    }
+
+    #[test]
+    fn the_net_takes_a_shifted_reading() {
+        let olds = [
+            old("b1", "Text", [100, 100, 900, 200], "Meeting with Anna"),
+            old("b2", "Text", [100, 600, 900, 700], "Todo"),
+        ];
+        let news = [
+            new("Text", [100, 160, 900, 260], "Meet the bank team"),
+            new("Text", [100, 600, 900, 700], "Todo"),
+        ];
+        let mut next = 3;
+        let c = compose(
+            &olds,
+            &news,
+            &region(&[[150, 620, 300, 680]]),
+            PAGE,
+            &mut next,
+        );
+        assert_eq!(c.region_missed, 1);
+        assert_eq!(texts(&c), [("b1", "Meet the bank team"), ("b2", "Todo")]);
+    }
+
+    #[test]
+    fn jitter_does_not_cost_a_neighbour_its_id() {
+        // A stroke near the top of b2 touches the slightly grown new box of
+        // b1, whose text is the same.
+        let olds = [
+            old("b1", "Text", [100, 100, 900, 200], "Meeting  with Anna"),
+            old("b2", "Text", [100, 250, 900, 350], "Call Bob"),
+        ];
+        let news = [
+            new("Text", [100, 100, 900, 240], "Meeting with Anna"),
+            new("Text", [100, 250, 900, 350], "Call Bob"),
+        ];
+        let mut next = 3;
+        let c = compose(
+            &olds,
+            &news,
+            &region(&[[200, 230, 400, 260]]),
+            PAGE,
+            &mut next,
+        );
+        assert_eq!(c.blocks, olds);
+        assert!(c.unchanged);
+        assert_eq!(c.region_missed, 0);
+        assert!(c.replaced.is_empty());
+        assert_eq!(next, 3);
+    }
+
+    #[test]
+    fn a_reread_last_line_does_not_appear_twice() {
+        // The last line of b1 is read again together with new ink below it.
+        let paragraph = "Line one.\nLine two.\nLine three.\nLine four.\nLine five.\nLine six.";
+        let olds = [old("b1", "Text", [100, 100, 900, 700], paragraph)];
+        let news = [
+            new(
+                "Text",
+                [100, 100, 900, 580],
+                "Line one.\nLine two.\nLine three.\nLine four.\nLine five.",
+            ),
+            new("Text", [100, 590, 900, 780], "Line six.\nNew line."),
+        ];
+        let mut next = 2;
+        let c = compose(
+            &olds,
+            &news,
+            &region(&[[100, 720, 900, 780]]),
+            PAGE,
+            &mut next,
+        );
+        let page: String = c.blocks.iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(page.matches("Line six.").count(), 1);
+        assert_eq!(
+            texts(&c),
+            [
+                (
+                    "b1",
+                    "Line one.\nLine two.\nLine three.\nLine four.\nLine five."
+                ),
+                ("b2", "Line six.\nNew line."),
+            ]
+        );
+        assert!(c.replaced.is_empty());
+    }
+
+    #[test]
+    fn an_untouched_block_covered_by_a_new_diagram_is_replaced() {
+        let mermaid = "```mermaid\ngraph LR\nA --> B\n```";
+        let olds = [
+            old("b1", "Text", [100, 100, 500, 200], "A to B"),
+            old("b2", "Text", [100, 600, 900, 700], "Todo"),
+        ];
+        let news = [
+            new("Diagram", [80, 80, 700, 400], mermaid),
+            new("Text", [100, 600, 900, 700], "Todo"),
+        ];
+        let mut next = 3;
+        // Only the far corner of the diagram is new ink; b1 is untouched.
+        let c = compose(
+            &olds,
+            &news,
+            &region(&[[550, 300, 690, 390]]),
+            PAGE,
+            &mut next,
+        );
+        assert_eq!(texts(&c), [("b3", mermaid), ("b2", "Todo")]);
+        assert_eq!(c.blocks[0].replaces, vec!["b1"]);
+        assert_eq!(c.replaced, vec![("b1".to_string(), vec!["b3".to_string()])]);
+        assert_eq!(c.region_missed, 0);
+    }
+
+    #[test]
+    fn the_net_cascades_into_a_covered_block() {
+        // The net fires for b1; the reading it takes also covers b2, which
+        // then joins through step 3 and is not counted as missed.
+        let olds = [
+            old("b1", "Text", [100, 100, 900, 200], "Meeting with Anna"),
+            old("b2", "Text", [100, 200, 900, 300], "Call Bob"),
+            old("b3", "Text", [100, 600, 900, 700], "Todo"),
+        ];
+        let news = [
+            new("Text", [100, 100, 900, 300], "Meet the bank team\nCall Bob"),
+            new("Text", [100, 600, 900, 700], "Todo"),
+        ];
+        let mut next = 4;
+        let c = compose(
+            &olds,
+            &news,
+            &region(&[[150, 620, 300, 680]]),
+            PAGE,
+            &mut next,
+        );
+        assert_eq!(c.region_missed, 1);
+        assert_eq!(
+            texts(&c),
+            [("b4", "Meet the bank team\nCall Bob"), ("b3", "Todo")]
+        );
+        assert_eq!(c.blocks[0].replaces, vec!["b1", "b2"]);
+        assert_eq!(next, 5);
+    }
+
+    #[test]
+    fn a_merge_that_reads_like_one_side_keeps_its_id() {
+        let long = "Meeting with Anna on Friday about the budget for next year";
+        let merged = "Meeting with Anna on Friday about the budget for next year ok";
+        assert!(similarity(long, merged) >= SAFETY_NET);
+        let olds = [
+            old("b1", "Text", [100, 100, 900, 300], long),
+            old("b2", "Text", [100, 300, 900, 330], "ok"),
+        ];
+        let news = [new("Text", [100, 100, 900, 330], merged)];
+        let mut next = 3;
+        let c = compose(
+            &olds,
+            &news,
+            &region(&[[850, 290, 900, 320]]),
+            PAGE,
+            &mut next,
+        );
+        assert_eq!(texts(&c), [("b1", merged)]);
+        assert_eq!(c.blocks[0].replaces, vec!["b2"]);
+        assert_eq!(c.replaced, vec![("b2".to_string(), vec!["b1".to_string()])]);
+        assert_eq!(next, 3);
+    }
+
+    #[test]
+    fn a_split_with_one_close_piece_keeps_its_id() {
+        let whole = "Alpha beta gamma delta epsilon zeta";
+        let piece = "Alpha beta gamma delta epsilon";
+        assert!(similarity(whole, piece) >= SAFETY_NET);
+        let olds = [old("b1", "Text", [100, 100, 900, 500], whole)];
+        let news = [
+            new("Text", [100, 100, 900, 420], piece),
+            new("Text", [100, 430, 900, 500], "zeta"),
+        ];
+        let mut next = 5;
+        let c = compose(
+            &olds,
+            &news,
+            &region(&[[100, 400, 900, 450]]),
+            PAGE,
+            &mut next,
+        );
+        assert_eq!(texts(&c), [("b1", piece), ("b5", "zeta")]);
+        assert!(c.blocks[1].replaces.is_empty());
+        assert!(c.replaced.is_empty());
+        assert_eq!(next, 6);
     }
 }

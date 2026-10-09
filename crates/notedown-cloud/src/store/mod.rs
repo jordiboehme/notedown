@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 pub use commit::{
-    CONTENT_HASH_MISMATCH, Commit, CrashPoint, PENDING_FILE, PendingOp, PlannedFolder,
+    CONTENT_HASH_MISMATCH, Commit, CrashPoint, LockTry, PENDING_FILE, PendingOp, PlannedFolder,
     PruneAllReport, PutOptions, RECYCLE_DIR, Recovery, STALE_TEMP_AGE, SideWrite, WriteGuard,
     prune_all_recycle, recover_all, sweep_all_temps,
 };
@@ -290,6 +290,34 @@ pub fn take_store_lock(account_dir: &Path, announce: Option<&str>) -> Result<std
     Ok(file)
 }
 
+/// [`take_store_lock`] that gives up: it tries, then tries again every 50 ms until `wait` is
+/// over. `None` when the lock is still busy then. Never prints anything.
+pub fn take_store_lock_within(
+    account_dir: &Path,
+    wait: std::time::Duration,
+) -> Result<Option<std::fs::File>> {
+    let path = account_dir.join(STORE_LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(io_err(&path))?;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => return Err(io_err(&path)(e)),
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(50)));
+    }
+}
+
 /// The name of the normalization probe: `é` as one code point (NFC). A file system that
 /// stores names in NFD (HFS+, some network shares) gives it back as `e` plus a combining
 /// accent.
@@ -354,12 +382,38 @@ impl Store {
         Self::open_with(data_dir, slug, false, false, false)
     }
 
+    /// [`Store::open`] that takes no lock and compacts nothing, so it never waits for the
+    /// server (`notedown cloud diagnose`). The name probe runs. Lock with
+    /// [`Store::lock_unless_pending_within`].
+    pub fn open_unlocked(data_dir: &Path, slug: &str) -> Result<Store> {
+        Self::open_inner(data_dir, slug, false, false)
+    }
+
     fn open_with(
         data_dir: &Path,
         slug: &str,
         import_mode: bool,
         announce_wait: bool,
         compact: bool,
+    ) -> Result<Store> {
+        let store = Self::open_inner(data_dir, slug, import_mode, announce_wait)?;
+        let guard = store.lock()?;
+        {
+            let mut state = store.state();
+            if compact && !Registry::log_is_empty(&store.account_dir) {
+                state.ids.compact(&store.account_dir)?;
+                state.ids_stamp = Some(store.ids_stamps());
+            }
+        }
+        drop(guard);
+        Ok(store)
+    }
+
+    fn open_inner(
+        data_dir: &Path,
+        slug: &str,
+        import_mode: bool,
+        announce_wait: bool,
     ) -> Result<Store> {
         validate_slug(slug)?;
         let account_dir = Accounts::new(data_dir).account_dir(slug);
@@ -386,15 +440,6 @@ impl Store {
         if !store.names_preserved {
             eprintln!("warning: {}", store.names_warning());
         }
-        let guard = store.lock()?;
-        {
-            let mut state = store.state();
-            if compact && !Registry::log_is_empty(&store.account_dir) {
-                state.ids.compact(&store.account_dir)?;
-                state.ids_stamp = Some(store.ids_stamps());
-            }
-        }
-        drop(guard);
         Ok(store)
     }
 
@@ -451,6 +496,20 @@ impl Store {
     pub fn lock(&self) -> Result<StoreGuard> {
         let announce = self.announce_wait.then_some(self.slug.as_str());
         let file = take_store_lock(&self.account_dir, announce)?;
+        self.locked(file)
+    }
+
+    /// [`Store::lock`] that gives up after `wait` ([`take_store_lock_within`]): `None` when the
+    /// lock is still busy then.
+    pub fn lock_within(&self, wait: std::time::Duration) -> Result<Option<StoreGuard>> {
+        match take_store_lock_within(&self.account_dir, wait)? {
+            Some(file) => self.locked(file).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The rest of [`Store::lock`] once the lock file is held.
+    fn locked(&self, file: std::fs::File) -> Result<StoreGuard> {
         let guard = StoreGuard {
             _file: file,
             account_dir: self.account_dir.clone(),

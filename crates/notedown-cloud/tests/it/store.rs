@@ -7,7 +7,8 @@ use std::time::{Duration, SystemTime};
 use notedown_cloud::Error;
 use notedown_cloud::auth::Accounts;
 use notedown_cloud::store::{
-    Entry, Kind, NATIVE_FOLDERS, Store, Stored, WirePath, temp_path_in, write_atomic_short,
+    Entry, Kind, LockTry, NATIVE_FOLDERS, PENDING_FILE, Store, Stored, WirePath, temp_path_in,
+    write_atomic_short,
 };
 
 const SLUG: &str = "jordi";
@@ -1348,4 +1349,47 @@ fn registered_files_and_current_md5_change_nothing() {
         std::fs::read(account_dir(dir.path()).join("ids.jsonl")).ok(),
     );
     assert_eq!(before, after);
+}
+
+#[test]
+fn lock_within_gives_up_when_the_lock_stays_busy() {
+    let (dir, store) = setup();
+    let _held = notedown_cloud::store::take_store_lock(&account_dir(dir.path()), None).unwrap();
+    let started = std::time::Instant::now();
+    let got = store
+        .lock_unless_pending_within(Duration::from_millis(300))
+        .unwrap();
+    assert!(matches!(got, LockTry::Busy), "{got:?}");
+    let took = started.elapsed();
+    assert!(took >= Duration::from_millis(300), "{took:?}");
+    assert!(took < Duration::from_secs(2), "{took:?}");
+}
+
+#[test]
+fn lock_within_takes_a_free_lock() {
+    let (_dir, store) = setup();
+    let got = store.lock_unless_pending_within(Duration::ZERO).unwrap();
+    assert!(matches!(got, LockTry::Locked(_)), "{got:?}");
+}
+
+#[test]
+fn lock_within_reports_a_pending_change_and_lets_the_lock_go() {
+    let (dir, store) = setup();
+    let pending = account_dir(dir.path()).join(PENDING_FILE);
+    std::fs::write(&pending, b"{}").unwrap();
+    let got = store.lock_unless_pending_within(Duration::ZERO).unwrap();
+    assert!(matches!(got, LockTry::Pending), "{got:?}");
+    std::fs::remove_file(&pending).unwrap();
+    let got = store.lock_unless_pending_within(Duration::ZERO).unwrap();
+    assert!(matches!(got, LockTry::Locked(_)), "{got:?}");
+}
+
+#[test]
+fn open_unlocked_does_not_wait_for_the_lock() {
+    let (dir, _store) = setup();
+    let _held = notedown_cloud::store::take_store_lock(&account_dir(dir.path()), None).unwrap();
+    let started = std::time::Instant::now();
+    let store = Store::open_unlocked(dir.path(), SLUG).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(store.slug(), SLUG);
 }

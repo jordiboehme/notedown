@@ -298,6 +298,16 @@ impl std::fmt::Display for Recovery {
     }
 }
 
+/// What [`Store::lock_unless_pending_within`] got.
+#[derive(Debug)]
+pub enum LockTry {
+    Locked(WriteGuard),
+    /// Another process still held the store lock when the wait was over.
+    Busy,
+    /// An unfinished change is on disk; the lock was let go again.
+    Pending,
+}
+
 /// The store lock, taken through [`Store::lock_recovered`]: recovery ran under it, so the id
 /// registry is current. Planning (`plan_*`), [`Store::commit`] and [`Store::snapshot`] need it.
 /// It derefs to the [`StoreGuard`] for every other method.
@@ -455,6 +465,17 @@ impl Store {
             return Ok(None);
         }
         Ok(Some(WriteGuard { guard }))
+    }
+
+    /// [`Store::lock_unless_pending`] that gives up after `wait` ([`Store::lock_within`]).
+    pub fn lock_unless_pending_within(&self, wait: std::time::Duration) -> Result<LockTry> {
+        let Some(guard) = self.lock_within(wait)? else {
+            return Ok(LockTry::Busy);
+        };
+        if self.pending_path().exists() {
+            return Ok(LockTry::Pending);
+        }
+        Ok(LockTry::Locked(WriteGuard { guard }))
     }
 
     /// Refuse to plan or commit while an intent is on disk (a commit under this guard failed

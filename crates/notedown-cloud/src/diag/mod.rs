@@ -1,9 +1,11 @@
-//! Diagnostics: the always-on protocol log.
+//! Diagnostics: the always-on protocol log and `notedown cloud diagnose`.
 
 mod capture;
+pub mod filter;
 mod log;
 mod mask;
 mod rotate;
+pub mod standin;
 
 pub use capture::Capture;
 pub use log::{

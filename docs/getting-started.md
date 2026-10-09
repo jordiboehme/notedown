@@ -243,6 +243,22 @@ To come back later, never reuse the old backup: the device changed in the meanti
 
 **Login fails after a few tries.** The account is locked after 6 wrong passwords. `notedown cloud account --data ~/notedown-data passwd me` sets a new password and unlocks it.
 
+## When something goes wrong
+
+Run this, also while the server runs:
+
+```sh
+notedown cloud diagnose --data ~/notedown-data
+```
+
+It prints a short report: your devices, what they did in the last 3 days and a list of things that need a look. It also writes a zip with the report, the protocol log and the journal of that time, a summary of each account and a test scan. Attach the zip to a GitHub issue.
+
+The zip is safe to share. Note, folder and account names, device serials, IP addresses and the text of digests and to-dos are replaced by stand-ins such as `n-7f3a.note`, `acct-1` and `dev-1`. No file content and no password or token is in it. Before the zip is written, notedown checks it for every real name it knows. If one is left, it writes nothing and says so.
+
+- `--since 12h` or `--since 2026-10-09` sets another start of the time span.
+- `--device <serial>` and `--account <name>` keep only the lines of one device or account.
+- `--private` keeps the real names, for your own debugging. Don't share such a zip.
+
 ## Record the protocol (optional)
 
 This is for people who want to help document the device protocol. The server refuses every sync, so **no files are exchanged** and the device keeps all of its files.

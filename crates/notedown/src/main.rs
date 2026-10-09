@@ -94,6 +94,32 @@ enum CloudAction {
     /// Write a PDF of every note into the render_dir of server.toml (default: share/ in the data
     /// folder), and move or delete the PDFs of moved or deleted notes. Safe while the server runs
     Render(CloudRenderArgs),
+    /// Print a short report of what the server did and write a zip for a bug report. The zip
+    /// shows no note, folder or account names by default. Safe while the server runs
+    Diagnose(DiagnoseArgs),
+}
+
+#[derive(clap::Args)]
+struct DiagnoseArgs {
+    /// The data folder
+    #[arg(long, value_name = "DIR")]
+    data: PathBuf,
+    /// The start of the window: a date (2026-10-09), a time (2026-10-09T08:00:00Z) or a
+    /// duration back from now (30m, 12h, 3d)
+    #[arg(long, value_name = "TIME", default_value = "3d")]
+    since: String,
+    /// Only this device serial
+    #[arg(long, value_name = "SERIAL")]
+    device: Option<String>,
+    /// Only this account
+    #[arg(long)]
+    account: Option<String>,
+    /// Keep the real names in the zip, for your own use. Do not share such a zip
+    #[arg(long)]
+    private: bool,
+    /// The zip to write (default: notedown-diag-<time>.zip in the current folder)
+    #[arg(long, value_name = "FILE")]
+    out: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -696,7 +722,45 @@ fn cloud_command(action: CloudAction) -> Result<ExitCode> {
             recover_accounts(&args.data)?;
             render_command(args)
         }
+        // No recovery: diagnose writes nothing into the data folder.
+        CloudAction::Diagnose(args) => diagnose_command(args),
     }
+}
+
+fn diagnose_command(args: DiagnoseArgs) -> Result<ExitCode> {
+    use notedown_cloud::diag::bundle::{DiagnoseOptions, LOCK_WAIT, diagnose};
+    let now = time::OffsetDateTime::now_utc();
+    let local = notedown_cloud::localtime::local_utc_offset().unwrap_or(time::UtcOffset::UTC);
+    let since = notedown_cloud::diag::collect::parse_since(&args.since, now, local)?;
+    let out = args.out.unwrap_or_else(|| {
+        PathBuf::from(format!(
+            "notedown-diag-{:04}{:02}{:02}T{:02}{:02}{:02}Z.zip",
+            now.year(),
+            now.month() as u8,
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second()
+        ))
+    });
+    let done = diagnose(&DiagnoseOptions {
+        data: args.data,
+        since,
+        device: args.device,
+        account: args.account,
+        private: args.private,
+        out,
+        lock_wait: LOCK_WAIT,
+        test_keep_key: None,
+    })?;
+    print!("{}", done.report);
+    println!();
+    println!(
+        "Bundle written: {} ({})",
+        done.zip.display(),
+        mb(done.bytes)
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Bytes as megabytes with one decimal, for people.

@@ -1601,3 +1601,62 @@ fn cloud_render_without_render_dir_writes_into_share() {
     assert!(data.path().join("share/acc/NOTE/Note/a.pdf").is_file());
     assert!(!data.path().join("server.toml").exists());
 }
+
+#[test]
+fn cloud_diagnose_prints_the_report_and_writes_the_zip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let out = cloud(
+        &data,
+        &[
+            "add",
+            "jordi",
+            "--email",
+            "j@example.org",
+            "--password-stdin",
+        ],
+        Some("pw\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let zip = tmp.path().join("b.zip");
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+            .args(["cloud", "diagnose", "--data"])
+            .arg(&data)
+            .arg("--out")
+            .arg(&zip)
+            .output()
+            .unwrap()
+    };
+    let out = run();
+    let text = stdout(&out);
+    assert!(
+        out.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.starts_with("notedown "), "{text}");
+    assert!(text.contains("safe bundle"), "{text}");
+    assert!(!text.contains("jordi"), "{text}");
+    let last = text.lines().last().unwrap();
+    assert!(
+        last.starts_with(&format!("Bundle written: {}", zip.display())),
+        "{text}"
+    );
+    assert!(zip.is_file());
+    let again = run();
+    assert_eq!(again.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&again.stderr).contains("already exists"));
+    let bad = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["cloud", "diagnose", "--since", "soon", "--data"])
+        .arg(&data)
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("--since"));
+}

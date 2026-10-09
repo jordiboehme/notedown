@@ -30,6 +30,8 @@ pub enum Error {
     Cloud(#[from] notedown_cloud::Error),
     #[error("another notedown pipeline runs for this data folder")]
     WriterBusy,
+    #[error("the text store needs a repair before it is written")]
+    NeedsRepair,
     #[error("invalid {what}: {message}")]
     Invalid { what: &'static str, message: String },
     #[error("{path}: {message}")]

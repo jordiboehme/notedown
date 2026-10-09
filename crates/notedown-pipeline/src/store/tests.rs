@@ -46,7 +46,7 @@ fn seq_grows_and_survives_reopen() {
     let tmp = tempfile::tempdir().unwrap();
     {
         let w = WriterLock::take(tmp.path()).unwrap();
-        let store = TextStore::open(tmp.path(), "jordi").unwrap();
+        let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
         assert!(store.dir().is_dir());
         assert_eq!(store.last_seq().unwrap(), 0);
         let mut lines = vec![
@@ -59,7 +59,7 @@ fn seq_grows_and_survives_reopen() {
         assert!(lines[0].ts > 0, "the append stamps the time");
     }
     let w = WriterLock::take(tmp.path()).unwrap();
-    let store = TextStore::open(tmp.path(), "jordi").unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
     assert_eq!(store.last_seq().unwrap(), 2);
     let mut lines = vec![page_line(KEY, "P1", LineChange::Edited, vec![])];
     store.append(&w, &mut lines).unwrap();
@@ -79,7 +79,7 @@ fn seq_grows_and_survives_reopen() {
 fn a_torn_last_line_is_cut_at_start() {
     let tmp = tempfile::tempdir().unwrap();
     let w = WriterLock::take(tmp.path()).unwrap();
-    let store = TextStore::open(tmp.path(), "jordi").unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
     appended(&store, &w, 2);
     let log = store.dir().join("log.jsonl");
     let whole = std::fs::read(&log).unwrap();
@@ -101,7 +101,7 @@ fn a_torn_last_line_is_cut_at_start() {
 fn an_append_after_a_torn_line_cuts_it_first() {
     let tmp = tempfile::tempdir().unwrap();
     let w = WriterLock::take(tmp.path()).unwrap();
-    let store = TextStore::open(tmp.path(), "jordi").unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
     appended(&store, &w, 1);
     let log = store.dir().join("log.jsonl");
     let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
@@ -149,7 +149,7 @@ fn a_crash_between_log_and_state_is_reconciled() {
     };
     {
         let w = WriterLock::take(tmp.path()).unwrap();
-        let store = TextStore::open(tmp.path(), "jordi").unwrap();
+        let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
         let mut first = vec![page_line(
             KEY,
             "P1",
@@ -172,13 +172,13 @@ fn a_crash_between_log_and_state_is_reconciled() {
         store.append(&w, &mut second).unwrap();
     }
     let w = WriterLock::take(tmp.path()).unwrap();
-    let store = TextStore::open(tmp.path(), "jordi").unwrap();
+    let reader = TextStore::open(tmp.path(), "jordi").unwrap();
     let saved = NoteState {
         log_seq: 1,
         ..first_state()
     };
-    assert_eq!(store.note(KEY).unwrap().unwrap(), saved);
-    store.repair(&w).unwrap();
+    assert_eq!(reader.note(KEY).unwrap().unwrap(), saved);
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
 
     let state = store.note(KEY).unwrap().unwrap();
     let page = &state.pages[0];
@@ -214,7 +214,7 @@ fn a_crash_between_log_and_state_is_reconciled() {
 fn repair_applies_page_deletes_and_moves_and_never_reads_unscoped_as_deleted() {
     let tmp = tempfile::tempdir().unwrap();
     let w = WriterLock::take(tmp.path()).unwrap();
-    let store = TextStore::open(tmp.path(), "jordi").unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
     let mut state = first_state();
     state.pages.push(PageState {
         page_id: "P2".into(),
@@ -265,7 +265,7 @@ fn a_second_writer_is_refused() {
         "another notedown pipeline runs for this data folder"
     );
     assert!(tmp.path().join("pipeline/.writer.lock").is_file());
-    let store = TextStore::open(tmp.path(), "jordi").unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
     appended(&store, &w, 2);
     drop(w);
 
@@ -278,7 +278,7 @@ fn a_second_writer_is_refused() {
 fn ack_never_moves_back() {
     let tmp = tempfile::tempdir().unwrap();
     let w = WriterLock::take(tmp.path()).unwrap();
-    let store = TextStore::open(tmp.path(), "jordi").unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
     appended(&store, &w, 5);
     assert_eq!(store.bookmark("crystalline").unwrap(), None);
     assert_eq!(store.ack("crystalline", 4).unwrap().seq, 4);
@@ -312,7 +312,7 @@ fn ack_never_moves_back() {
 fn a_broken_bookmark_is_an_error() {
     let tmp = tempfile::tempdir().unwrap();
     let w = WriterLock::take(tmp.path()).unwrap();
-    let store = TextStore::open(tmp.path(), "jordi").unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
     appended(&store, &w, 3);
     let file = store.dir().join("consumers/crystalline.json");
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -329,7 +329,7 @@ fn a_broken_bookmark_is_an_error() {
 fn read_log_stops_at_up_to() {
     let tmp = tempfile::tempdir().unwrap();
     let w = WriterLock::take(tmp.path()).unwrap();
-    let store = TextStore::open(tmp.path(), "jordi").unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
     appended(&store, &w, 5);
     assert_eq!(seqs(&store, 1, Some(3)), vec![2, 3]);
     assert_eq!(seqs(&store, 3, None), vec![4, 5]);
@@ -347,7 +347,7 @@ fn read_log_stops_at_up_to() {
 fn a_broken_log_line_is_an_error() {
     let tmp = tempfile::tempdir().unwrap();
     let w = WriterLock::take(tmp.path()).unwrap();
-    let store = TextStore::open(tmp.path(), "jordi").unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
     appended(&store, &w, 1);
     let log = store.dir().join("log.jsonl");
     let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
@@ -360,7 +360,7 @@ fn a_broken_log_line_is_an_error() {
 fn note_keys_name_files_and_nothing_else() {
     let tmp = tempfile::tempdir().unwrap();
     let w = WriterLock::take(tmp.path()).unwrap();
-    let store = TextStore::open(tmp.path(), "jordi").unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
     let md5 = "0123456789abcdef0123456789abcdef";
     let key = format!("path:{md5}");
     let state = NoteState {
@@ -392,11 +392,11 @@ fn note_keys_name_files_and_nothing_else() {
 fn region_missed_adds_up_and_survives_reopen() {
     let tmp = tempfile::tempdir().unwrap();
     let w = WriterLock::take(tmp.path()).unwrap();
-    let store = TextStore::open(tmp.path(), "jordi").unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
     assert_eq!(store.stats().unwrap(), Stats::default());
     store.add_region_missed(&w, 2).unwrap();
     assert_eq!(store.add_region_missed(&w, 3).unwrap().region_missed, 5);
-    let store = TextStore::open(tmp.path(), "jordi").unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
     assert_eq!(store.stats().unwrap().region_missed, 5);
     assert!(store.dir().join("stats.json").is_file());
 }
@@ -413,7 +413,7 @@ fn a_bad_slug_is_refused() {
 fn repair_keeps_a_comeback_without_a_line() {
     let tmp = tempfile::tempdir().unwrap();
     let w = WriterLock::take(tmp.path()).unwrap();
-    let store = TextStore::open(tmp.path(), "jordi").unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
     store
         .append(
             &w,
@@ -442,7 +442,7 @@ fn repair_keeps_a_comeback_without_a_line() {
 fn repair_keeps_a_position_that_changed_without_a_line() {
     let tmp = tempfile::tempdir().unwrap();
     let w = WriterLock::take(tmp.path()).unwrap();
-    let store = TextStore::open(tmp.path(), "jordi").unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
     store
         .append(
             &w,
@@ -465,4 +465,90 @@ fn repair_keeps_a_position_that_changed_without_a_line() {
     store.save_note(&w, &state).unwrap();
     store.repair(&w).unwrap();
     assert_eq!(store.note(KEY).unwrap().unwrap().pages[0].position, 0);
+}
+
+#[test]
+fn a_note_with_lines_and_no_state_is_started_from_its_lines() {
+    let tmp = tempfile::tempdir().unwrap();
+    let w = WriterLock::take(tmp.path()).unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
+    let mut line = page_line(
+        KEY,
+        "P1",
+        LineChange::New,
+        vec![block("b1", "one"), block("b3", "three")],
+    );
+    line.path = Some("NOTE/Note/Plan.note".into());
+    line.position = Some(0);
+    store.append(&w, &mut [line]).unwrap();
+    // The process dies before the first save of the note.
+    drop(store);
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
+    let state = store.note(KEY).unwrap().expect("repair starts the state");
+    assert_eq!(state.key, KEY);
+    assert_eq!(state.path, "NOTE/Note/Plan.note");
+    assert_eq!(state.title, "Plan");
+    assert_eq!(state.pages.len(), 1);
+    assert_eq!(state.pages[0].blocks[1].text, "three");
+    assert_eq!(state.pages[0].seq, Some(1));
+    assert_eq!(
+        state.pages[0].strokes_hash, "",
+        "the worker checks the page again"
+    );
+    assert_eq!(state.next_block, 4, "no logged id is given out again");
+    assert_eq!(state.log_seq, 1);
+}
+
+#[test]
+fn a_write_needs_a_repair_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let w = WriterLock::take(tmp.path()).unwrap();
+    let reader = TextStore::open(tmp.path(), "jordi").unwrap();
+    let mut lines = [page_line(KEY, "P1", LineChange::New, vec![])];
+    let err = reader.append(&w, &mut lines).unwrap_err();
+    assert!(matches!(err, crate::Error::NeedsRepair), "{err:?}");
+    let err = reader.save_note(&w, &first_state()).unwrap_err();
+    assert!(matches!(err, crate::Error::NeedsRepair), "{err:?}");
+    assert!(reader.add_region_missed(&w, 1).is_err());
+    assert_eq!(reader.last_seq().unwrap(), 0);
+
+    // The writer's store repairs when it opens: a torn line is gone before the first write.
+    let log = reader.dir().join("log.jsonl");
+    std::fs::write(&log, b"{\"seq\":1").unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
+    assert_eq!(std::fs::read(&log).unwrap(), b"");
+    store.append(&w, &mut lines).unwrap();
+    assert_eq!(lines[0].seq, 1);
+    // A read-only store stays read-only.
+    assert!(reader.append(&w, &mut lines).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_append_blocks_writes_until_a_repair() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let w = WriterLock::take(tmp.path()).unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
+    appended(&store, &w, 2);
+    let log = store.dir().join("log.jsonl");
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let mut lines = [page_line(KEY, "P1", LineChange::Edited, vec![])];
+    assert!(store.append(&w, &mut lines).is_err());
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    // No state may claim the seqs of a failed append before a repair has read the log.
+    let err = store.save_note(&w, &first_state()).unwrap_err();
+    assert!(matches!(err, crate::Error::NeedsRepair), "{err:?}");
+    assert!(matches!(
+        store.append(&w, &mut lines).unwrap_err(),
+        crate::Error::NeedsRepair
+    ));
+    store.repair(&w).unwrap();
+    store.append(&w, &mut lines).unwrap();
+    assert_eq!(
+        seqs(&store, 0, None),
+        vec![1, 2, 3],
+        "complete lines are kept"
+    );
 }

@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -195,10 +196,14 @@ pub struct Stats {
     pub last_run_ms: u64,
 }
 
-/// The text store of one account.
-#[derive(Debug, Clone)]
+/// The text store of one account. [`TextStore::open`] gives a read-only store (the MCP
+/// server: reads and bookmarks); the writer opens it with [`TextStore::open_writer`], which
+/// repairs it first. The log, note states and stats are written only while the store is
+/// repaired: a failed append clears that until the next [`TextStore::repair`].
+#[derive(Debug)]
 pub struct TextStore {
     dir: PathBuf,
+    repaired: AtomicBool,
 }
 
 /// Only the `seq` of a log line.
@@ -213,7 +218,18 @@ impl TextStore {
         notedown_cloud::auth::validate_slug(slug)?;
         let dir = data.join(PIPELINE_DIR).join(slug);
         std::fs::create_dir_all(&dir).map_err(io_err(&dir))?;
-        Ok(TextStore { dir })
+        Ok(TextStore {
+            dir,
+            repaired: AtomicBool::new(false),
+        })
+    }
+
+    /// The store of account `slug` for the writer: [`open`](Self::open), then
+    /// [`repair`](Self::repair). Only such a store takes writes.
+    pub fn open_writer(data: &Path, slug: &str, w: &WriterLock) -> Result<TextStore> {
+        let store = TextStore::open(data, slug)?;
+        store.repair(w)?;
+        Ok(store)
     }
 
     /// `<data>/pipeline/<slug>`.
@@ -249,6 +265,15 @@ impl TextStore {
             .join(format!("{consumer}.json")))
     }
 
+    /// Errors unless a repair has run since the open or the last failed append.
+    fn writable(&self) -> Result<()> {
+        if self.repaired.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(Error::NeedsRepair)
+        }
+    }
+
     fn lock(&self) -> Result<std::fs::File> {
         lock_file(&self.dir.join(LOCK_FILE))
     }
@@ -273,15 +298,24 @@ impl TextStore {
     /// up to the newest log lines of its pages: the lines of the note past its `log_seq` are
     /// applied in log order. Only what a log line holds is taken (text,
     /// `pageHash`, position, deletions, path); the stroke list and the strokes hash stay, so
-    /// the worker checks such a page again. A log line of a note without a state file is left
-    /// alone: the worker finds that note new and reads it again.
-    pub fn repair(&self, w: &WriterLock) -> Result<()> {
+    /// the worker checks such a page again. A note with log lines and no state file (a crash
+    /// before its first save) gets a state started from its lines, so its logged block ids
+    /// are never given out again. Afterwards the store takes writes.
+    pub fn repair(&self, _w: &WriterLock) -> Result<()> {
+        self.repaired.store(false, Ordering::SeqCst);
         self.cut_torn()?;
         let mut notes: BTreeMap<String, (NoteState, NoteState)> = BTreeMap::new();
         for note in self.notes()? {
             notes.insert(note.key.clone(), (note.clone(), note));
         }
         self.read_log(0, None, &mut |line| {
+            if !notes.contains_key(&line.note) && notedown_cloud::pages::valid_key(&line.note) {
+                let start = NoteState {
+                    key: line.note.clone(),
+                    ..NoteState::default()
+                };
+                notes.insert(line.note.clone(), (start.clone(), start));
+            }
             if let Some((before, state)) = notes.get_mut(&line.note)
                 && line.seq > before.log_seq
             {
@@ -291,18 +325,32 @@ impl TextStore {
         })?;
         for (_, (before, after)) in notes {
             if before != after {
-                self.save_note(w, &after)?;
+                self.write_note(&after)?;
             }
         }
+        self.repaired.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     /// Appends `lines` with one write: sets their `seq` (the next numbers) and, where it is 0,
-    /// their `ts` (now). A torn last line is cut first.
+    /// their `ts` (now). A torn last line is cut first. A failed append keeps every complete
+    /// line (a reader may have seen it already, so its `seq` is never given out again) and
+    /// blocks all writes until the next [`repair`](Self::repair) has applied it.
     pub fn append(&self, _w: &WriterLock, lines: &mut [LogLine]) -> Result<()> {
+        self.writable()?;
         if lines.is_empty() {
             return Ok(());
         }
+        let result = self.append_lines(lines);
+        if result.is_err() {
+            self.repaired.store(false, Ordering::SeqCst);
+            // Only a torn tail goes; complete lines stay. The next repair cuts it otherwise.
+            let _ = self.cut_torn();
+        }
+        result
+    }
+
+    fn append_lines(&self, lines: &mut [LogLine]) -> Result<()> {
         let path = self.log_path();
         let (base, last) = self.cut_torn()?;
         let now = now_ms();
@@ -324,17 +372,19 @@ impl TextStore {
         if created {
             notedown_cloud::fsutil::fsync_dir(&self.dir)?;
         }
-        if let Err(e) = f.write_all(&bytes).and_then(|()| f.sync_data()) {
-            // Leave no partial batch behind.
-            let _ = f.set_len(base).and_then(|()| f.sync_all());
-            return Err(io_err(&path)(e));
-        }
-        Ok(())
+        f.write_all(&bytes)
+            .and_then(|()| f.sync_data())
+            .map_err(io_err(&path))
     }
 
     /// Writes the state of a note atomically, with `log_seq` set to the last log line. Call it
     /// after the [`append`](Self::append) of its lines.
     pub fn save_note(&self, _w: &WriterLock, note: &NoteState) -> Result<()> {
+        self.writable()?;
+        self.write_note(note)
+    }
+
+    fn write_note(&self, note: &NoteState) -> Result<()> {
         let path = self.note_path(&note.key)?;
         let mut note = note.clone();
         note.log_seq = self.last_seq()?;
@@ -456,6 +506,7 @@ impl TextStore {
     }
 
     fn update_stats(&self, change: impl FnOnce(&mut Stats)) -> Result<Stats> {
+        self.writable()?;
         let mut stats = self.stats()?;
         change(&mut stats);
         notedown_cloud::fsutil::write_atomic(
@@ -493,18 +544,16 @@ fn block_number(id: &str) -> Option<u64> {
 
 /// Applies a log line the state has not seen yet (its `seq` is past the state's `log_seq`).
 /// Lines are replayed in log order, so the newest one wins.
-fn apply_line(state: &mut NoteState, line: LogLine) {
+fn apply_line(state: &mut NoteState, mut line: LogLine) {
+    if let Some(path) = line.path.take() {
+        state.title = title_of(&path);
+        state.path = path;
+    }
     if line.change.is_note_change() {
-        match line.change {
-            LineChange::NoteDeleted => state.deleted = true,
-            LineChange::NoteMoved => {
-                if let Some(path) = line.path {
-                    state.title = title_of(&path);
-                    state.path = path;
-                }
-            }
-            // Leaving the scope is not a deletion (spec 4.5); the worker handles it.
-            _ => {}
+        // `note.moved` set the path above. Leaving the scope is not a deletion (spec 4.5); the
+        // worker handles it.
+        if line.change == LineChange::NoteDeleted {
+            state.deleted = true;
         }
         return;
     }

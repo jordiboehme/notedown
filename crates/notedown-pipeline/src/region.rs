@@ -22,6 +22,13 @@ impl Rect {
         self.x0 < other.x1 && other.x0 < self.x1 && self.y0 < other.y1 && other.y0 < self.y1
     }
 
+    /// Like `intersects`, but edges count: a box of zero width or height (a
+    /// dot, a straight line) touches what it lies on or crosses. Used for the
+    /// touch test of a change region, where a missed touch keeps stale text.
+    pub fn touches(&self, other: &Rect) -> bool {
+        self.x0 <= other.x1 && other.x0 <= self.x1 && self.y0 <= other.y1 && other.y0 <= self.y1
+    }
+
     /// The share (0..=1) of `other` that lies inside `self`.
     pub fn overlap_share_of(&self, other: &Rect) -> f32 {
         let area = other.area();
@@ -49,6 +56,18 @@ pub enum Region {
     Whole,
     Parts(Vec<Rect>),
     Empty,
+}
+
+impl Region {
+    /// True when `rect` touches the region (edges count, see `Rect::touches`).
+    /// `Whole` touches everything, `Empty` nothing.
+    pub fn touches(&self, rect: &Rect) -> bool {
+        match self {
+            Region::Whole => true,
+            Region::Parts(parts) => parts.iter().any(|p| p.touches(rect)),
+            Region::Empty => false,
+        }
+    }
 }
 
 /// The boxes of strokes that exist on one side only (added, erased or moved),
@@ -157,6 +176,26 @@ mod tests {
         assert!(!a.intersects(&r([10.0, 0.0, 20.0, 10.0])));
         assert_eq!(a.area(), 100.0);
         assert_eq!(a.overlap_share_of(&b), 0.5);
+    }
+
+    #[test]
+    fn a_line_stroke_touches_the_block_it_crosses() {
+        // A horizontal line has a box of zero height. Strictly inside a block
+        // `intersects` finds it, but not on the block's edge (an underline at
+        // the bottom of the box) or crossing an edge-on box. `touches` does.
+        let block = r([0.0, 0.0, 200.0, 100.0]);
+        let inside = r([100.0, 50.0, 300.0, 50.0]);
+        let underline = r([20.0, 100.0, 180.0, 100.0]);
+        let dot = r([200.0, 40.0, 200.0, 40.0]);
+        assert!(inside.intersects(&block) && inside.touches(&block));
+        assert!(!underline.intersects(&block));
+        assert!(underline.touches(&block));
+        assert!(!dot.intersects(&block));
+        assert!(dot.touches(&block));
+        assert!(Region::Parts(vec![underline]).touches(&block));
+        assert!(!Region::Parts(vec![underline]).touches(&r([0.0, 110.0, 200.0, 200.0])));
+        assert!(Region::Whole.touches(&block));
+        assert!(!Region::Empty.touches(&block));
     }
 
     #[test]

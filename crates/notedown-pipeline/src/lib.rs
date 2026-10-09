@@ -1,5 +1,6 @@
 //! The notedown pipeline: page text, changes for agents and the config that drives them.
 
+pub mod compose;
 pub mod config;
 pub mod model;
 pub mod page;

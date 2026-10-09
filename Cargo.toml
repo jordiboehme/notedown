@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/notedown-note", "crates/notedown-ocr", "crates/notedown-cloud", "crates/notedown"]
+members = ["crates/notedown-note", "crates/notedown-ocr", "crates/notedown-cloud", "crates/notedown-pipeline", "crates/notedown"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ rust-version = "1.99"
 notedown-note = { path = "crates/notedown-note", version = "0.1.0" }
 notedown-ocr = { path = "crates/notedown-ocr", version = "0.1.0" }
 notedown-cloud = { path = "crates/notedown-cloud", version = "0.1.0" }
+notedown-pipeline = { path = "crates/notedown-pipeline", version = "0.1.0" }
 thiserror = "=2.0.21"
 anyhow = "=1.0.104"
 base64 = "=0.23.1"

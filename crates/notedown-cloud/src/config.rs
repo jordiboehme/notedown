@@ -47,7 +47,7 @@ pub enum PushMode {
     Off,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Addresses to listen on.
@@ -109,6 +109,10 @@ pub struct Config {
     /// subfolders.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_dir: Option<String>,
+    /// The `[pipeline]` table of `notedown pipeline`. The server ignores it and keeps it as
+    /// written, so [`Config::save`] writes it back unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<toml::Table>,
 }
 
 impl Default for Config {
@@ -132,6 +136,7 @@ impl Default for Config {
             scan_min_files: 1,
             watch: true,
             render_dir: None,
+            pipeline: None,
         }
     }
 }
@@ -327,6 +332,26 @@ mod tests {
         );
         std::fs::write(Config::path(d.path()), "recycle_keep_latest = 0\n").unwrap();
         assert!(Config::load_or_default(d.path()).is_err());
+    }
+
+    #[test]
+    fn a_server_toml_with_a_pipeline_section_loads() {
+        let d = dir();
+        std::fs::write(
+            Config::path(d.path()),
+            "scan_interval = 60\n\n[pipeline]\nocr_settle = \"5m\"\ningest_folders = [\"NOTE/**\"]\n",
+        )
+        .unwrap();
+        let c = Config::load_or_default(d.path()).unwrap();
+        assert_eq!(c.scan_interval, 60);
+        let p = c.pipeline.clone().unwrap();
+        assert_eq!(p["ocr_settle"].as_str(), Some("5m"));
+        c.save(d.path()).unwrap();
+        let again = Config::load_or_default(d.path()).unwrap();
+        assert_eq!(again, c);
+        let text = std::fs::read_to_string(Config::path(d.path())).unwrap();
+        assert!(text.contains("[pipeline]"), "{text}");
+        assert!(Config::default().pipeline.is_none());
     }
 
     #[test]

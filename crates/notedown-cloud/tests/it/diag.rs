@@ -520,6 +520,7 @@ fn config_defaults_created_and_round_trip() {
         scan_min_files: 25,
         watch: false,
         render_dir: Some("~/PDFs".into()),
+        pipeline: None,
     };
     custom.save(dir.path()).unwrap();
     assert_eq!(Config::load_or_create(dir.path()).unwrap(), custom);

@@ -2,7 +2,9 @@
 
 pub mod compose;
 pub mod config;
+pub mod meta;
 pub mod model;
+pub mod ocr;
 pub mod page;
 pub mod region;
 pub mod store;
@@ -28,6 +30,10 @@ pub enum Error {
     Encode(#[from] serde_json::Error),
     #[error("note: {0}")]
     Note(#[from] notedown_note::NoteError),
+    #[error(transparent)]
+    Ocr(#[from] notedown_ocr::OcrError),
+    #[error("{0}")]
+    Read(String),
     #[error(transparent)]
     Cloud(#[from] notedown_cloud::Error),
     #[error("another notedown pipeline runs for this data folder")]

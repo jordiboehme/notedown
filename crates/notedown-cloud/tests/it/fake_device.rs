@@ -525,3 +525,85 @@ async fn a_whole_device_sync_runs_against_serve() {
         .unwrap();
     assert!(with_token.to_string().contains("<masked:"), "{with_token}");
 }
+
+/// `notedown cloud diagnose` runs again and again while a device syncs: every run finishes,
+/// and the sync gives the same files as without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn diagnose_runs_while_a_device_syncs() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use notedown_cloud::diag::bundle::{DiagnoseOptions, diagnose};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    Accounts::new(&data)
+        .create("jordi", EMAIL, PASSWORD)
+        .unwrap();
+    let source = backup(tmp.path());
+    let config = Config {
+        listen: vec!["127.0.0.1:0".parse().unwrap()],
+        ..Config::default()
+    };
+    let journal = Journal::open(&data).unwrap();
+    import::import(
+        &data,
+        "jordi",
+        &source,
+        &ImportOptions::default(),
+        &journal,
+        &mut |_: &str| {},
+    )
+    .unwrap();
+    drop(journal);
+    let listeners = bind(&config).await.unwrap();
+    let addr: SocketAddr = listeners[0].local_addr().unwrap();
+    let state = AppState::open(config, &data).unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve_until(listeners, state, async {
+        let _ = rx.await;
+    }));
+
+    let done = Arc::new(AtomicBool::new(false));
+    let diag = {
+        let done = done.clone();
+        let data = data.clone();
+        let outs = tmp.path().join("bundles");
+        std::fs::create_dir_all(&outs).unwrap();
+        std::thread::spawn(move || {
+            let mut runs = 0;
+            while !done.load(Ordering::SeqCst) || runs == 0 {
+                runs += 1;
+                let result = diagnose(&DiagnoseOptions {
+                    data: data.clone(),
+                    since: time::OffsetDateTime::now_utc() - std::time::Duration::from_secs(3600),
+                    device: None,
+                    account: None,
+                    private: false,
+                    out: outs.join(format!("b{runs}.zip")),
+                    lock_wait: std::time::Duration::from_secs(10),
+                    test_keep_key: None,
+                });
+                assert!(result.is_ok(), "run {runs}: {result:?}");
+            }
+            runs
+        })
+    };
+    let base = format!("http://{addr}");
+    tokio::task::spawn_blocking(move || run_device(base))
+        .await
+        .unwrap();
+    done.store(true, Ordering::SeqCst);
+    let runs = tokio::task::spawn_blocking(move || diag.join().unwrap())
+        .await
+        .unwrap();
+    tx.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    assert!(runs >= 1);
+
+    let files = data.join("accounts/jordi/files");
+    assert!(files.join("NOTE/Note/Work/New.note").exists());
+    assert!(files.join("NOTE/Note/Work/Old.note").exists());
+    assert!(!files.join("DOCUMENT/Document/Trip").exists());
+}

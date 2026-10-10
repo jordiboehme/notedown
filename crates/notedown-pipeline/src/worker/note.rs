@@ -102,7 +102,9 @@ pub(super) fn process(
     };
     let r = &rec.record;
     let mut errors = Errors::load(text.dir())?;
-    let mut state = text.note(key)?.unwrap_or_else(|| NoteState {
+    let stored = text.note(key)?;
+    let known = stored.is_some();
+    let mut state = stored.unwrap_or_else(|| NoteState {
         key: key.to_string(),
         path: r.path.clone(),
         title: title_of(&r.path),
@@ -130,6 +132,15 @@ pub(super) fn process(
     });
     let nb = match nb {
         Ok(nb) => nb,
+        // Deleted since `due` looked: the note is gone, not failed.
+        Err(_) if records::note_missing(data, slug, &r.path) => {
+            return super::due::note_gone(
+                &job.store,
+                &mut errors,
+                key,
+                known.then_some(&mut state),
+            );
+        }
         Err(e) => {
             eprintln!("notedown pipeline: {}: {e}", r.path);
             errors.fail(w, key, None, &e.to_string(), now)?;

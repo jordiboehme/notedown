@@ -576,6 +576,123 @@ fn a_deleted_note_gives_note_deleted() {
     );
 }
 
+fn note_file(d: &Data, path: &str) -> PathBuf {
+    d.data.join("accounts").join(SLUG).join("files").join(path)
+}
+
+#[test]
+fn a_missing_note_file_means_the_note_is_gone() {
+    let d = setup();
+    let key = d.put("test1", "NOTE/Note");
+    worker(&d, no_settle(), engine_reading("hello"))
+        .run_once(true)
+        .unwrap();
+    // Deleted by hand right after an edit the server indexed: the record stays, with work.
+    std::fs::remove_file(note_file(&d, "NOTE/Note/test1.note")).unwrap();
+    d.edit_record(&key, |r| {
+        r.pages[0] = with_parts(&r.pages[0], Some("0123456789abcdef"), None, None);
+    });
+    for _ in 0..3 {
+        let engine = engine_reading("hello");
+        let calls = engine.calls_handle();
+        let p = worker(&d, no_settle(), engine).run_once(true).unwrap();
+        assert_eq!(p.failed, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+    let log = d.log();
+    assert_eq!(log.len(), 2, "{log:?}");
+    assert_eq!(log[1].change, LineChange::NoteDeleted);
+    assert_eq!(log[1].note, key);
+    assert!(d.errors().is_empty(), "{:?}", d.errors());
+    let state = d.state(&key).unwrap();
+    assert!(state.deleted);
+    assert_eq!(state.pages[0].blocks[0].text, "hello");
+}
+
+#[test]
+fn a_missing_note_file_without_text_is_dropped_silently() {
+    let d = setup();
+    let key = d.put("test1", "NOTE/Note");
+    // A failed read first: a page entry in errors.jsonl, no text.
+    let engine = engine_reading("hello");
+    engine.fail_next(1);
+    assert_eq!(
+        worker(&d, no_settle(), engine)
+            .run_once(true)
+            .unwrap()
+            .failed,
+        1
+    );
+    // And a note entry with its tries used up, as an older version wrote for a missing file.
+    let errors = d.data.join("pipeline").join(SLUG).join("errors.jsonl");
+    let mut text = std::fs::read_to_string(&errors).unwrap();
+    text.push_str(&format!(
+        "{{\"note\":\"{key}\",\"tries\":3,\"lastError\":\"No such file or directory (os error 2)\",\"nextTry\":1}}\n"
+    ));
+    std::fs::write(&errors, text).unwrap();
+    assert_eq!(d.errors().len(), 2);
+    std::fs::remove_file(note_file(&d, "NOTE/Note/test1.note")).unwrap();
+    for _ in 0..2 {
+        let engine = engine_reading("hello");
+        let calls = engine.calls_handle();
+        let p = worker(&d, no_settle(), engine).run_once(true).unwrap();
+        assert_eq!(p.failed, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+    assert!(d.log().is_empty(), "{:?}", d.log());
+    assert!(d.errors().is_empty(), "{:?}", d.errors());
+    let state = d.state(&key).unwrap();
+    assert!(state.pages.iter().all(|p| p.seq.is_none()));
+    assert!(state.pages.iter().all(|p| p.state != PageOcrState::Failed));
+}
+
+#[test]
+fn a_note_file_deleted_while_another_note_is_read_is_gone() {
+    let d = setup();
+    let one = d.put("test1", "NOTE/Note");
+    let two = d.put("test2", "NOTE/Note");
+    let files = [
+        note_file(&d, "NOTE/Note/test1.note"),
+        note_file(&d, "NOTE/Note/test2.note"),
+    ];
+    // Both files go during the first OCR call: the note being read has its bytes already, the
+    // other one finds no file.
+    let engine = engine_reading("hello").on_call(move || {
+        for f in &files {
+            let _ = std::fs::remove_file(f);
+        }
+    });
+    let p = worker(&d, no_settle(), engine).run_once(true).unwrap();
+    assert_eq!(p.failed, 0);
+    assert!(d.errors().is_empty(), "{:?}", d.errors());
+    let read: Vec<&String> = [&one, &two]
+        .into_iter()
+        .filter(|k| {
+            d.state(k)
+                .is_some_and(|s| s.pages.iter().any(|p| p.seq.is_some()))
+        })
+        .collect();
+    assert_eq!(read.len(), 1, "one note was read before the files went");
+}
+
+#[test]
+fn a_note_file_that_cannot_be_read_stays_a_failure() {
+    let d = setup();
+    let key = d.put("test1", "NOTE/Note");
+    let file = note_file(&d, "NOTE/Note/test1.note");
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    let p = worker(&d, no_settle(), engine_reading("hello"))
+        .run_once(true)
+        .unwrap();
+    assert_eq!(p.failed, 1);
+    let errors = d.errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0]["note"], key.as_str());
+    assert!(errors[0]["pageId"].is_null());
+    assert!(d.log().is_empty());
+}
+
 #[test]
 fn a_moved_note_gives_note_moved() {
     let d = setup();

@@ -32,6 +32,8 @@ pub struct FakeEngine {
     calls: Arc<AtomicUsize>,
     fail_next: Arc<AtomicU32>,
     truncated: bool,
+    /// Runs before each call, as a person changing files while the engine reads.
+    on_call: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl FakeEngine {
@@ -42,7 +44,14 @@ impl FakeEngine {
             calls: Arc::default(),
             fail_next: Arc::default(),
             truncated: false,
+            on_call: None,
         }
+    }
+
+    /// Runs `f` before each call.
+    pub fn on_call(mut self, f: impl FnMut() + Send + 'static) -> Self {
+        self.on_call = Some(Box::new(f));
+        self
     }
 
     pub fn with_default(mut self, html: &str) -> Self {
@@ -82,6 +91,9 @@ impl FakeEngine {
 impl OcrEngine for FakeEngine {
     fn ocr_png(&mut self, png: &[u8]) -> Result<PageOcr, OcrError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(f) = &mut self.on_call {
+            f();
+        }
         let failing = self
             .fail_next
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))

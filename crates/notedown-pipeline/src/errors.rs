@@ -130,6 +130,17 @@ impl Errors {
         Ok(())
     }
 
+    /// Removes every entry of `note`, of its pages and of the note itself (a note that is gone);
+    /// saves when there was one.
+    pub fn clear_note(&mut self, _w: &WriterLock, note: &str) -> Result<()> {
+        let before = self.entries.len();
+        self.entries.retain(|e| e.note != note);
+        if self.entries.len() != before {
+            self.save()?;
+        }
+        Ok(())
+    }
+
     /// Removes every entry of `note` whose page is not in `keep` (a page that is gone).
     pub fn retain_pages(&mut self, _w: &WriterLock, note: &str, keep: &[&str]) -> Result<()> {
         let before = self.entries.len();
@@ -191,5 +202,12 @@ mod tests {
         assert_eq!(errors.entries().len(), 1);
         errors.clear(&w, "F1", None).unwrap();
         assert!(Errors::load(tmp.path()).unwrap().entries().is_empty());
+        errors.fail(&w, "F1", None, "gone", 30).unwrap();
+        errors.fail(&w, "F1", Some("P2"), "gone", 30).unwrap();
+        errors.fail(&w, "F2", Some("P1"), "boom", 30).unwrap();
+        errors.clear_note(&w, "F1").unwrap();
+        let left = Errors::load(tmp.path()).unwrap();
+        assert_eq!(left.entries().len(), 1);
+        assert_eq!(left.entries()[0].note, "F2");
     }
 }

@@ -123,7 +123,8 @@ fn keywords(
 /// (a gone key whose md5 and size are those of a new record without a state; no OCR),
 /// `note.deleted` for a note whose record is gone (also after `note.unscoped`),
 /// `note.moved` for a new path, `note.unscoped` (once, and only for a note with text) for a
-/// note that left the scope. A note that comes back (into the scope or after a deletion) gets
+/// note that left the scope. A note whose record is there but whose file is missing counts as
+/// deleted too ([`note_gone`]). A note that comes back (into the scope or after a deletion) gets
 /// a `new` line per page with text, with its last text, so a consumer that dropped it sees
 /// it again. Notes out of scope without a state get nothing.
 pub fn due(
@@ -134,7 +135,7 @@ pub fn due(
     now: u64,
 ) -> Result<Vec<DueNote>> {
     let recs = records::read(data, slug)?;
-    let errors = Errors::load(store.text.dir())?;
+    let mut errors = Errors::load(store.text.dir())?;
     let mut states: BTreeMap<String, NoteState> = store
         .text
         .notes()?
@@ -190,18 +191,47 @@ pub fn due(
             }
             continue;
         }
-        let state = match state {
-            Some(s) => {
-                enter(store, s, r)?;
-                Some(&*s)
-            }
-            None => None,
-        };
-        if let Some(d) = plan(key, rec, state, &errors, now) {
-            out.push(d);
+        // Planned before `enter`, which changes nothing the plan reads.
+        let work = plan(key, rec, state.as_deref(), &errors, now);
+        // A note file deleted by hand before the server's scan dropped its record: the note is
+        // gone. Looked at only for a note with work, errors, or to bring back, so an idle note
+        // costs no file check.
+        let reviving = state.as_ref().is_some_and(|s| s.deleted || s.unscoped);
+        let failing = errors.entries().iter().any(|e| e.note == *key);
+        if (work.is_some() || failing || reviving) && records::note_missing(data, slug, &r.path) {
+            note_gone(store, &mut errors, key, state)?;
+            continue;
         }
+        if let Some(s) = state {
+            enter(store, s, r)?;
+        }
+        out.extend(work);
     }
     Ok(out)
+}
+
+/// A note whose record is there but whose file is not (deleted by hand, and the server's scan
+/// has not dropped the record yet). It counts as deleted, like a note whose record is gone:
+/// `note.deleted` once for a note with text, nothing for one without. Its entries in
+/// `errors.jsonl` go, so it is never a failure.
+pub(super) fn note_gone(
+    store: &AccountStore,
+    errors: &mut Errors,
+    key: &str,
+    state: Option<&mut NoteState>,
+) -> Result<()> {
+    errors.clear_note(store.lock, key)?;
+    if let Some(state) = state.filter(|s| !s.deleted) {
+        if has_text(state) {
+            store.text.append(
+                store.lock,
+                &mut [LogLine::new(key, LineChange::NoteDeleted)],
+            )?;
+        }
+        state.deleted = true;
+        store.text.save_note(store.lock, state)?;
+    }
+    Ok(())
 }
 
 /// Moves the state of a note to its new key `new` at `path`: the same pages, blocks, ids and

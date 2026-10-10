@@ -215,6 +215,17 @@ pub fn note_file(data: &Path, slug: &str, path: &str) -> Result<PathBuf> {
     Ok(wire.to_fs(&account_dir(data, slug).join("files")))
 }
 
+/// Whether the note file at wire `path` is missing: it is not there, and the account's
+/// `files/` folder is. Any other error (a folder in its place, no access) is no answer, and
+/// without `files/` nothing is known, so neither counts as missing.
+pub fn note_missing(data: &Path, slug: &str, path: &str) -> bool {
+    let Ok(file) = note_file(data, slug, path) else {
+        return false;
+    };
+    matches!(std::fs::metadata(&file), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        && account_dir(data, slug).join("files").is_dir()
+}
+
 /// The page-index key of a link target. `file_id` is the raw `FILE_ID` of the target as the
 /// note stores it, `target` its device path. The key is the `FILE_ID` when a record has it as
 /// its key, else the key of the record whose `noteId` is that `FILE_ID` (a copy keyed by its

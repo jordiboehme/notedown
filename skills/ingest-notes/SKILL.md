@@ -58,12 +58,22 @@ Pass this section and the next one to every sub-agent, with its account slug, no
      example `notedown://<account>/F2024.../P2024...#b3`.
    - Put the note address `notedown://<account>/<key>` into the metadata key `resource`.
 4. Search before you write. A block that is already cited is updated, never ingested twice.
-   - With Crystalline 0.24.3 or later: `search_engrams` with
-     `metadata_filters: {"sources": {"$contains": "<anchor>"}}`.
-   - Before 0.24.3: `search_engrams` with `metadata_filters: {"resource": "notedown://<account>/<key>"}`,
-     then read the hits and check their `sources`.
-   - When you cannot tell the version, or the `$contains` filter gives an error, use the
-     `resource` search. An empty `$contains` result on an older server means nothing.
+   - By anchor: collect the anchors of the note, that is every block anchor in `textNow` and
+     every anchor in the `blocks` table (deleted and replaced blocks too). Find all engrams that
+     cite any of them in one call: `search_engrams` with
+     `metadata_filters: {"sources": {"$contains_any": [<anchors>]}}` and `limit: 100`. One call
+     takes at most 100 anchors; split a longer list. For one anchor,
+     `{"sources": {"$contains": "<anchor>"}}` does the same. The match is exact, so use the
+     anchors as the delta writes them.
+   - By note: `search_engrams` with `metadata_filters: {"resource": "notedown://<account>/<key>"}`.
+     It finds the engrams of the note that cite other blocks. New text on a topic one of them
+     already covers goes into that engram, not into a new one.
+   - Page through a search while its `count` is below `total`. A hit shows only a snippet: read
+     the engram with `read_engram` before you change it.
+   - Crystalline before 0.24.3 refuses the operators with an error such as
+     `unknown operator '$contains'`. Then use only the search by note, and compare the `sources`
+     of its hits with your anchors yourself. Where the operators work, an empty result is
+     reliable: no engram cites these anchors.
 5. Check the `change` of each note first. On `unscoped`, stop there for that note and retire
    nothing: the note only left the ingest scope. Then handle each entry of `whatChanged`:
    - `edited`: update the engrams that cite the anchor to the new text.
@@ -101,16 +111,17 @@ Pass this section and the next one to every sub-agent, with its account slug, no
 - A page whose heading ends in `unreadable` could not be read by OCR. Its `### unreadable`
   section holds the device's own handwriting recognition, or `no device text`. That text is
   only a hint for your report, never a source for engrams.
-- A note with `oldNote` got a new key by a move: search by the old key, then change `resource`
-  and the anchors in `sources` of those engrams to the new key. A note with only `oldPath` keeps
-  its key and its anchors.
+- A note with `oldNote` got a new key by a move: search with
+  `{"resource": "notedown://<account>/<oldNote>"}`, then change `resource` and the anchors in
+  `sources` of those engrams to the new key. A note with only `oldPath` keeps its key and its
+  anchors.
 - The legend: `textBefore` is the text when you last confirmed (or at your `since`).
   `wordDiff`: `[-...-]` removed, `[+...+]` added.
 - `### beforeUnknown` (without a block id) means the old versions of a page were pruned, so the
   text before is unknown. Its row in the blocks table names the page anchor
-  (`notedown://<account>/<key>/<pageId>`), not a block. Search by `resource` (the note address
-  `notedown://<account>/<key>`), then compare the block anchors in the `sources` of the hits
-  with the anchors in `textNow`: update the engrams that cite them, and treat only the blocks
-  no hit cites as new. Never treat the page's blocks as new only because a `$contains` search
-  found nothing.
+  (`notedown://<account>/<key>/<pageId>`), not a block. Search with `$contains_any` and all
+  block anchors of the page's `textNow`: update the engrams that cite them to the text now, and
+  treat only the blocks no hit cites as new. Without the operators (before 0.24.3), search by
+  `resource` and compare the `sources` of the hits with the anchors yourself. Never treat the
+  page's blocks as new without one of these two searches.
 - `get_block` with an anchor gives the current text of one block, or what replaced it.

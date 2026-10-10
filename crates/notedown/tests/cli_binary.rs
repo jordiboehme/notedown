@@ -1754,6 +1754,24 @@ fn json_out(out: &std::process::Output) -> serde_json::Value {
     serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {}", stdout(out)))
 }
 
+/// `2026-10-08 23:14 +02:00`: a time at this computer's offset, as the MCP server shows it.
+fn assert_local_time(v: &serde_json::Value) {
+    let t = v.as_str().unwrap_or_else(|| panic!("no time string: {v}"));
+    let b = t.as_bytes();
+    let digits = |r: std::ops::Range<usize>| r.into_iter().all(|i| b[i].is_ascii_digit());
+    assert!(
+        b.len() == 23
+            && digits(0..4)
+            && b[4] == b'-'
+            && b[10] == b' '
+            && b[13] == b':'
+            && b[16] == b' '
+            && (b[17] == b'+' || b[17] == b'-')
+            && b[20] == b':',
+        "{t}"
+    );
+}
+
 #[test]
 fn pipeline_changes_and_ack() {
     let dir = pipeline_fixture(&["jordi"]);
@@ -1807,7 +1825,16 @@ fn pipeline_changes_and_ack() {
         ],
     ));
     assert_eq!(ack["seq"], 3);
-    assert!(ack["updatedAt"].as_u64().unwrap() > 0, "{ack}");
+    assert_local_time(&ack["updatedAt"]);
+    assert!(ack.get("clamped").is_none(), "{ack}");
+    // An upTo past the log stops at its end and says so.
+    let past = json_out(&pipeline_cmd(
+        d,
+        &["ack", "--consumer", "agent", "--up-to", "99"],
+    ));
+    assert_eq!(past["seq"], 3, "{past}");
+    assert_eq!(past["clamped"], true, "{past}");
+    assert_eq!(past["logEnd"], 3, "{past}");
 
     let after = json_out(&pipeline_cmd(d, &["changes", "--consumer", "agent"]));
     assert_eq!(after["from"], 3);
@@ -1835,6 +1862,13 @@ fn pipeline_refuses_a_second_writer() {
         assert!(
             String::from_utf8_lossy(&out.stderr)
                 .contains("another notedown pipeline runs for this data folder"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // A refused writer says only that.
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr).lines().count(),
+            1,
             "{args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
@@ -1889,6 +1923,7 @@ fn consumers_lists_and_removes() {
     let list = json_out(&pipeline_cmd(d, &["consumers"]));
     assert_eq!(list["jordi"][0]["consumer"], "agent", "{list}");
     assert_eq!(list["jordi"][0]["seq"], 2, "{list}");
+    assert_local_time(&list["jordi"][0]["updatedAt"]);
     assert_eq!(list["anna"], serde_json::json!([]), "{list}");
     let one = json_out(&pipeline_cmd(d, &["consumers", "--account", "anna"]));
     assert_eq!(one, serde_json::json!({"anna": []}));
@@ -2044,4 +2079,29 @@ fn serve_pipeline_starts_the_pipeline_and_stops_it_with_the_server() {
     assert!(status.success(), "{status:?}");
     assert!(!alive(&pid), "the pipeline child still runs");
     notedown_pipeline::store::WriterLock::take(data).unwrap();
+}
+
+#[test]
+fn pipeline_once_without_the_model_says_so_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path();
+    notedown_cloud::auth::Accounts::new(data)
+        .create("jordi", "jordi@example.org", "secret")
+        .unwrap();
+    let journal = notedown_cloud::journal::Journal::open(data).unwrap();
+    notedown_cloud::put::put(
+        data,
+        "jordi",
+        &journal,
+        std::path::Path::new(NOTE),
+        "NOTE/Note",
+        None,
+    )
+    .unwrap();
+    let out = pipeline_cmd(data, &["--once"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    let message = "the OCR model is missing, run `notedown model pull`";
+    assert_eq!(err.matches(message).count(), 1, "{err}");
+    assert_eq!(stdout(&out), "");
 }

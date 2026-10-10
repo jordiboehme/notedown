@@ -257,7 +257,7 @@ fn line_chars(line: &LogLine) -> usize {
 }
 
 /// `2026-10-08 23:14 +02:00`: `ms` at the offset `local`.
-pub(crate) fn stamp(ms: u64, local: UtcOffset) -> String {
+pub fn stamp(ms: u64, local: UtcOffset) -> String {
     let format = time::macros::format_description!(
         "[year]-[month]-[day] [hour]:[minute] [offset_hour sign:mandatory]:[offset_minute]"
     );

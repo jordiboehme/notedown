@@ -1708,21 +1708,21 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
             1 => println!("scan hold: when the account would be left without files"),
             n => println!("scan hold: when fewer than {n} files would be left"),
         }
-        let child = if args.pipeline {
-            let child = start_pipeline(&args.data)?;
-            println!("pipeline: started notedown pipeline (pid {})", child.id());
-            Some(child)
-        } else {
-            None
-        };
-        let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+        // The handlers are in place before the child starts, so a stop signal always ends
+        // the server and with it the child.
+        let shutdown = Shutdown::new()?;
+        let child: PipelineChild = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let guard = PipelineGuard(child.clone());
         if args.pipeline {
+            let started = start_pipeline(&args.data)?;
+            println!("pipeline: started notedown pipeline (pid {})", started.id());
+            *child.lock().unwrap_or_else(|e| e.into_inner()) = Some(started);
             tokio::spawn(watch_pipeline(child.clone()));
         }
         println!("press Ctrl-C to stop");
         std::io::stdout().flush()?;
-        let served = serve_until(listeners, state.clone(), shutdown_signal()).await;
-        stop_pipeline(&child);
+        let served = serve_until(listeners, state.clone(), shutdown.wait()).await;
+        drop(guard);
         served?;
         println!("stopped");
         let (dropped, failed) = (state.log.dropped_lines(), state.log.capture_failures());
@@ -1737,23 +1737,41 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Waits for Ctrl-C or, on Unix, SIGTERM.
-async fn shutdown_signal() {
+/// Ctrl-C and, on Unix, SIGTERM. The handlers are in place once [`Shutdown::new`] returns
+/// (call it inside a tokio runtime).
+struct Shutdown {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        if let (Ok(mut int), Ok(mut term)) = (
-            signal(SignalKind::interrupt()),
-            signal(SignalKind::terminate()),
-        ) {
+    signals: (tokio::signal::unix::Signal, tokio::signal::unix::Signal),
+}
+
+impl Shutdown {
+    fn new() -> Result<Shutdown> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Shutdown {
+                signals: (
+                    signal(SignalKind::interrupt())?,
+                    signal(SignalKind::terminate())?,
+                ),
+            })
+        }
+        #[cfg(not(unix))]
+        Ok(Shutdown {})
+    }
+
+    async fn wait(self) {
+        #[cfg(unix)]
+        {
+            let (mut int, mut term) = self.signals;
             tokio::select! {
                 _ = int.recv() => {}
                 _ = term.recv() => {}
             }
-            return;
         }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
     }
-    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// `notedown pipeline --data <data>` as a child process of the server.
@@ -1793,13 +1811,48 @@ async fn watch_pipeline(child: PipelineChild) {
     }
 }
 
-/// Stops the pipeline child, if it still runs.
+/// How long the pipeline child gets to stop after SIGTERM before it is killed.
+const PIPELINE_STOP_WAIT: Duration = Duration::from_secs(5);
+
+/// The pipeline child of `serve --pipeline`. Dropping the guard stops the child, also on an
+/// error or a panic of the server.
+struct PipelineGuard(PipelineChild);
+
+impl Drop for PipelineGuard {
+    fn drop(&mut self) {
+        stop_pipeline(&self.0);
+    }
+}
+
+/// Stops the pipeline child, if it still runs: SIGTERM (it ends between two pages), then a
+/// kill after [`PIPELINE_STOP_WAIT`].
 fn stop_pipeline(child: &PipelineChild) {
     let mut guard = child.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(mut c) = guard.take() {
-        let _ = c.kill();
-        let _ = c.wait();
+    let Some(mut c) = guard.take() else {
+        return;
+    };
+    if let Ok(Some(_)) = c.try_wait() {
+        return;
     }
+    #[cfg(unix)]
+    {
+        let sent = std::process::Command::new("kill")
+            .args(["-TERM", &c.id().to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if sent {
+            let end = Instant::now() + PIPELINE_STOP_WAIT;
+            while Instant::now() < end {
+                if !matches!(c.try_wait(), Ok(None)) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    let _ = c.kill();
+    let _ = c.wait();
 }
 
 /// Sets the flag on Ctrl-C or SIGTERM. The handlers are in place when this returns.
@@ -1810,28 +1863,12 @@ fn stop_flag() -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    #[cfg(unix)]
-    let signals = {
-        use tokio::signal::unix::{SignalKind, signal};
+    let shutdown = {
         let _guard = runtime.enter();
-        (
-            signal(SignalKind::interrupt())?,
-            signal(SignalKind::terminate())?,
-        )
+        Shutdown::new()?
     };
     std::thread::spawn(move || {
-        runtime.block_on(async move {
-            #[cfg(unix)]
-            {
-                let (mut int, mut term) = signals;
-                tokio::select! {
-                    _ = int.recv() => {}
-                    _ = term.recv() => {}
-                }
-            }
-            #[cfg(not(unix))]
-            let _ = tokio::signal::ctrl_c().await;
-        });
+        runtime.block_on(shutdown.wait());
         flag.store(true, Ordering::SeqCst);
     });
     Ok(stop)
@@ -1856,10 +1893,16 @@ fn pipeline_command(args: PipelineArgs) -> Result<ExitCode> {
     });
     let mut worker = Worker::with_loader(&data, cfg, loader);
     if args.once || args.reocr {
-        let p = if args.reocr {
-            worker.reocr(args.note.as_deref())?
+        let done = if args.reocr {
+            worker.reocr(args.note.as_deref())
         } else {
-            worker.run_once(true)?
+            worker.run_once(true)
+        };
+        let p = match done {
+            Ok(p) => p,
+            // The worker said so already, in one line.
+            Err(notedown_pipeline::Error::ModelMissing) => return Ok(ExitCode::from(1)),
+            Err(e) => return Err(e.into()),
         };
         println!(
             "{} read, {} written, {} failed",
@@ -1874,11 +1917,14 @@ fn pipeline_command(args: PipelineArgs) -> Result<ExitCode> {
         });
     }
     let stop = stop_flag()?;
-    eprintln!(
-        "notedown pipeline: running for {}, press Ctrl-C to stop",
-        data.display()
-    );
-    worker.run(|| stop.load(std::sync::atomic::Ordering::SeqCst))?;
+    // Said only once the writer lock is held: a refused second writer prints only the refusal.
+    let started = || {
+        eprintln!(
+            "notedown pipeline: running for {}, press Ctrl-C to stop",
+            data.display()
+        )
+    };
+    worker.run_with_start(started, || stop.load(std::sync::atomic::Ordering::SeqCst))?;
     eprintln!("notedown pipeline: stopped");
     Ok(ExitCode::SUCCESS)
 }
@@ -1911,6 +1957,8 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
                     .map(|a| a.slug)
                     .collect(),
             };
+            let local =
+                notedown_cloud::localtime::local_utc_offset().unwrap_or(time::UtcOffset::UTC);
             let mut out = serde_json::Map::new();
             for slug in slugs {
                 // No text store yet: no bookmarks, and nothing is created for the listing.
@@ -1923,7 +1971,7 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
                         list.push(serde_json::json!({
                             "consumer": name,
                             "seq": b.seq,
-                            "updatedAt": b.updated_at,
+                            "updatedAt": delta::stamp(b.updated_at, local),
                         }));
                     }
                 }
@@ -1961,7 +2009,19 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
         } => {
             let slug = resolve_account(&data, account.as_deref())?;
             let store = TextStore::open(&data, &slug)?;
-            println!("{}", to_json(&store.ack(&consumer, up_to)?));
+            let local =
+                notedown_cloud::localtime::local_utc_offset().unwrap_or(time::UtcOffset::UTC);
+            let b = store.ack(&consumer, up_to)?;
+            let mut out = serde_json::json!({
+                "seq": b.seq,
+                "updatedAt": delta::stamp(b.updated_at, local),
+            });
+            // As the MCP ack says: an upTo past the log stops at its end.
+            if b.seq < up_to {
+                out["clamped"] = serde_json::Value::Bool(true);
+                out["logEnd"] = serde_json::Value::from(store.last_seq()?);
+            }
+            println!("{}", to_json(&out));
         }
     }
     Ok(ExitCode::SUCCESS)

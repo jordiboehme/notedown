@@ -46,6 +46,8 @@ const POLL: Duration = Duration::from_secs(1);
 const RESCAN_MS: u64 = 10 * 60 * 1000;
 /// After a failed pass, the next one.
 const ERROR_WAIT_MS: u64 = 60 * 1000;
+/// A failing prune is said at most this often per account.
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// The time source of the worker. Tests drive it; [`SystemClock`] is the real one.
 pub trait Clock: Send + Sync {
@@ -300,7 +302,20 @@ impl Worker {
     /// work. After each pass it prunes the text log of every account (at most once a day,
     /// spec 2.4). Returns when `stop` says so; it is asked between pages too.
     pub fn run(&mut self, stop: impl Fn() -> bool) -> Result<()> {
+        self.run_with_start(|| {}, stop)
+    }
+
+    /// [`run`](Self::run), calling `started` once the writer lock is held (a refused second
+    /// writer never calls it).
+    pub fn run_with_start(
+        &mut self,
+        started: impl FnOnce(),
+        stop: impl Fn() -> bool,
+    ) -> Result<()> {
         let lock = WriterLock::take(&self.data)?;
+        started();
+        // A failing prune is said at most once a day per account.
+        let mut prune_warned: BTreeMap<String, u64> = BTreeMap::new();
         let journal = Journal::open_no_create(&self.data);
         let mut done = journal.cursor(CONSUMER)?.map_or(0, |c| c.seq);
         let mut tail = journal.tail(done + 1);
@@ -337,8 +352,12 @@ impl Worker {
                         for (slug, text) in stores.iter() {
                             if let Err(e) =
                                 retention::prune(text, &lock, self.cfg.text_keep_days, now)
+                                && prune_warned
+                                    .get(slug)
+                                    .is_none_or(|&at| now.saturating_sub(at) >= DAY_MS)
                             {
                                 eprintln!("notedown pipeline: account {slug}: prune: {e}");
+                                prune_warned.insert(slug.clone(), now);
                             }
                         }
                         if let Some(t) = p.next_due {

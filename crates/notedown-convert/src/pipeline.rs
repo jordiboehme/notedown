@@ -510,6 +510,8 @@ pub fn convert_one(
         ));
     }
     let sha = const_hex::encode(Sha256::digest(&bytes));
+    // The generator names the notedown program. This crate shares the workspace version with
+    // the `notedown` binary (version.workspace = true), so its own version is the program's.
     let generator = format!("notedown/{}", env!("CARGO_PKG_VERSION"));
     let src = source_fields(input, output);
     if !opts.force

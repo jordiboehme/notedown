@@ -102,9 +102,7 @@ pub(super) fn process(
     };
     let r = &rec.record;
     let mut errors = Errors::load(text.dir())?;
-    let stored = text.note(key)?;
-    let known = stored.is_some();
-    let mut state = stored.unwrap_or_else(|| NoteState {
+    let mut state = text.note(key)?.unwrap_or_else(|| NoteState {
         key: key.to_string(),
         path: r.path.clone(),
         title: title_of(&r.path),
@@ -119,28 +117,23 @@ pub(super) fn process(
     if job.mode == Mode::Due && note_waits(errors.get(key, None), Some(&state), r, now) {
         return Ok(());
     }
+    let nb = records::note_file(data, slug, &r.path).and_then(|file| {
+        let bytes = std::fs::read(&file).map_err(|source| Error::Io { path: file, source })?;
+        Ok(Notebook::from_bytes(bytes, VersionPolicy::AllowUnknown)?)
+    });
+    // Moved or deleted by hand since `due` looked: skipped for this pass, untouched, until the
+    // server's scan moves or drops the record.
+    if nb.is_err() && records::note_missing(data, slug, &r.path) {
+        return Ok(());
+    }
     if state.md5 != r.md5 || state.size != r.size {
         // New bytes: a note that did not parse starts again with fresh tries.
         errors.clear(w, key, None)?;
     }
     state.path = r.path.clone();
     state.title = title_of(&r.path);
-
-    let nb = records::note_file(data, slug, &r.path).and_then(|file| {
-        let bytes = std::fs::read(&file).map_err(|source| Error::Io { path: file, source })?;
-        Ok(Notebook::from_bytes(bytes, VersionPolicy::AllowUnknown)?)
-    });
     let nb = match nb {
         Ok(nb) => nb,
-        // Deleted since `due` looked: the note is gone, not failed.
-        Err(_) if records::note_missing(data, slug, &r.path) => {
-            return super::due::note_gone(
-                &job.store,
-                &mut errors,
-                key,
-                known.then_some(&mut state),
-            );
-        }
         Err(e) => {
             eprintln!("notedown pipeline: {}: {e}", r.path);
             errors.fail(w, key, None, &e.to_string(), now)?;

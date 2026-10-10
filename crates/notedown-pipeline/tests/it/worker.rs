@@ -580,37 +580,62 @@ fn note_file(d: &Data, path: &str) -> PathBuf {
     d.data.join("accounts").join(SLUG).join("files").join(path)
 }
 
+impl Data {
+    /// Appends a note entry with its tries used up to `errors.jsonl`, as an older version wrote
+    /// for a missing note file.
+    fn add_exhausted_error(&self, key: &str) {
+        let path = self.data.join("pipeline").join(SLUG).join("errors.jsonl");
+        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+        text.push_str(&format!(
+            "{{\"note\":\"{key}\",\"tries\":3,\"lastError\":\"No such file or directory (os error 2)\",\"nextTry\":1}}\n"
+        ));
+        std::fs::write(&path, text).unwrap();
+    }
+}
+
+/// Runs the worker `n` times with an engine that must not be called; each run fails nothing.
+fn run_without_ocr(d: &Data, n: usize) {
+    for _ in 0..n {
+        let engine = engine_reading("hello");
+        let calls = engine.calls_handle();
+        let p = worker(d, no_settle(), engine).run_once(true).unwrap();
+        assert_eq!(p.failed, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+}
+
 #[test]
-fn a_missing_note_file_means_the_note_is_gone() {
+fn a_missing_note_file_waits_for_the_scan() {
     let d = setup();
     let key = d.put("test1", "NOTE/Note");
     worker(&d, no_settle(), engine_reading("hello"))
         .run_once(true)
         .unwrap();
+    let before = d.state(&key).unwrap();
     // Deleted by hand right after an edit the server indexed: the record stays, with work.
     std::fs::remove_file(note_file(&d, "NOTE/Note/test1.note")).unwrap();
     d.edit_record(&key, |r| {
         r.pages[0] = with_parts(&r.pages[0], Some("0123456789abcdef"), None, None);
     });
-    for _ in 0..3 {
-        let engine = engine_reading("hello");
-        let calls = engine.calls_handle();
-        let p = worker(&d, no_settle(), engine).run_once(true).unwrap();
-        assert_eq!(p.failed, 0);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-    }
+    run_without_ocr(&d, 2);
+    assert_eq!(d.log().len(), 1, "{:?}", d.log());
+    assert!(d.errors().is_empty(), "{:?}", d.errors());
+    assert_eq!(d.state(&key).unwrap(), before, "the state is untouched");
+
+    // The server's scan drops the record: now the note is deleted, once.
+    std::fs::remove_file(d.record_path(&key)).unwrap();
+    run_without_ocr(&d, 2);
     let log = d.log();
     assert_eq!(log.len(), 2, "{log:?}");
     assert_eq!(log[1].change, LineChange::NoteDeleted);
     assert_eq!(log[1].note, key);
-    assert!(d.errors().is_empty(), "{:?}", d.errors());
     let state = d.state(&key).unwrap();
     assert!(state.deleted);
     assert_eq!(state.pages[0].blocks[0].text, "hello");
 }
 
 #[test]
-fn a_missing_note_file_without_text_is_dropped_silently() {
+fn a_missing_note_file_without_text_waits_then_leaves_nothing() {
     let d = setup();
     let key = d.put("test1", "NOTE/Note");
     // A failed read first: a page entry in errors.jsonl, no text.
@@ -623,46 +648,103 @@ fn a_missing_note_file_without_text_is_dropped_silently() {
             .failed,
         1
     );
-    // And a note entry with its tries used up, as an older version wrote for a missing file.
-    let errors = d.data.join("pipeline").join(SLUG).join("errors.jsonl");
-    let mut text = std::fs::read_to_string(&errors).unwrap();
-    text.push_str(&format!(
-        "{{\"note\":\"{key}\",\"tries\":3,\"lastError\":\"No such file or directory (os error 2)\",\"nextTry\":1}}\n"
-    ));
-    std::fs::write(&errors, text).unwrap();
-    assert_eq!(d.errors().len(), 2);
+    d.add_exhausted_error(&key);
+    let errors = d.errors();
+    assert_eq!(errors.len(), 2);
     std::fs::remove_file(note_file(&d, "NOTE/Note/test1.note")).unwrap();
-    for _ in 0..2 {
-        let engine = engine_reading("hello");
-        let calls = engine.calls_handle();
-        let p = worker(&d, no_settle(), engine).run_once(true).unwrap();
-        assert_eq!(p.failed, 0);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-    }
+    run_without_ocr(&d, 2);
+    assert!(d.log().is_empty(), "{:?}", d.log());
+    assert_eq!(
+        d.errors(),
+        errors,
+        "nothing written while the record is there"
+    );
+
+    std::fs::remove_file(d.record_path(&key)).unwrap();
+    run_without_ocr(&d, 1);
     assert!(d.log().is_empty(), "{:?}", d.log());
     assert!(d.errors().is_empty(), "{:?}", d.errors());
-    let state = d.state(&key).unwrap();
-    assert!(state.pages.iter().all(|p| p.seq.is_none()));
-    assert!(state.pages.iter().all(|p| p.state != PageOcrState::Failed));
 }
 
 #[test]
-fn a_note_file_deleted_while_another_note_is_read_is_gone() {
+fn a_gone_record_clears_the_errors_of_its_note() {
     let d = setup();
-    let one = d.put("test1", "NOTE/Note");
-    let two = d.put("test2", "NOTE/Note");
+    let key = d.put("test1", "NOTE/Note");
+    let engine = engine_reading("hello");
+    engine.fail_next(1);
+    worker(&d, no_settle(), engine).run_once(true).unwrap();
+    d.add_exhausted_error(&key);
+    assert_eq!(d.errors().len(), 2);
+    // The record goes, the file stays.
+    std::fs::remove_file(d.record_path(&key)).unwrap();
+    run_without_ocr(&d, 1);
+    assert!(d.errors().is_empty(), "{:?}", d.errors());
+}
+
+#[test]
+fn a_path_keyed_note_moved_by_hand_waits_for_the_scan() {
+    let d = setup();
+    d.put("test1", "NOTE/Note");
+    let old = d.put_copy();
+    worker(&d, no_settle(), engine_reading("hello"))
+        .run_once(true)
+        .unwrap();
+    let before = d.state(&old).unwrap();
+    // Pending work: tries of an older version.
+    d.add_exhausted_error(&old);
+    let files = d.data.join("accounts").join(SLUG).join("files");
+    std::fs::rename(
+        files.join("NOTE/Note/copy.note"),
+        files.join("NOTE/Note/Moved.note"),
+    )
+    .unwrap();
+    // Moved by hand, the record not yet: nothing happens.
+    run_without_ocr(&d, 1);
+    let lines = d.log().len();
+    assert_eq!(d.state(&old).unwrap(), before);
+    // Put back for the helper, which moves the file and re-keys the record as the scan does.
+    std::fs::rename(
+        files.join("NOTE/Note/Moved.note"),
+        files.join("NOTE/Note/copy.note"),
+    )
+    .unwrap();
+    let new = d.move_path_keyed(&old, "NOTE/Note/Moved.note");
+    run_without_ocr(&d, 2);
+    let log = d.log();
+    let after: Vec<LineChange> = log[lines..].iter().map(|l| l.change).collect();
+    assert_eq!(after, [LineChange::NoteMoved], "{log:?}");
+    assert_eq!(log[lines].note, new);
+    assert_eq!(log[lines].old_note.as_deref(), Some(old.as_str()));
+    assert_eq!(
+        d.state(&new).unwrap().pages,
+        before.pages,
+        "same blocks and ids"
+    );
+    assert!(d.errors().is_empty(), "{:?}", d.errors());
+}
+
+/// A worker whose engine removes both note files at its first call: the note being read has
+/// its bytes already, the other one finds no file.
+fn remove_both_at_first_call(d: &Data) -> FakeEngine {
     let files = [
-        note_file(&d, "NOTE/Note/test1.note"),
-        note_file(&d, "NOTE/Note/test2.note"),
+        note_file(d, "NOTE/Note/test1.note"),
+        note_file(d, "NOTE/Note/test2.note"),
     ];
-    // Both files go during the first OCR call: the note being read has its bytes already, the
-    // other one finds no file.
-    let engine = engine_reading("hello").on_call(move || {
+    engine_reading("hello").on_call(move || {
         for f in &files {
             let _ = std::fs::remove_file(f);
         }
-    });
-    let p = worker(&d, no_settle(), engine).run_once(true).unwrap();
+    })
+}
+
+#[test]
+fn a_note_file_deleted_while_another_note_is_read_is_skipped() {
+    let d = setup();
+    let one = d.put("test1", "NOTE/Note");
+    let two = d.put("test2", "NOTE/Note");
+    let p = worker(&d, no_settle(), remove_both_at_first_call(&d))
+        .run_once(true)
+        .unwrap();
     assert_eq!(p.failed, 0);
     assert!(d.errors().is_empty(), "{:?}", d.errors());
     let read: Vec<&String> = [&one, &two]
@@ -673,6 +755,45 @@ fn a_note_file_deleted_while_another_note_is_read_is_gone() {
         })
         .collect();
     assert_eq!(read.len(), 1, "one note was read before the files went");
+}
+
+#[test]
+fn a_note_with_text_whose_file_goes_while_another_is_read_is_skipped() {
+    let d = setup();
+    let keys = [d.put("test1", "NOTE/Note"), d.put("test2", "NOTE/Note")];
+    worker(&d, no_settle(), engine_reading("hello"))
+        .run_once(true)
+        .unwrap();
+    let lines = d.log().len();
+    // Both change, so both are due.
+    for key in &keys {
+        d.edit_record(key, |r| {
+            r.pages[0] = with_parts(&r.pages[0], Some("0123456789abcdef"), None, None);
+        });
+    }
+    let before: Vec<NoteState> = keys.iter().map(|k| d.state(k).unwrap()).collect();
+    let p = worker(&d, no_settle(), remove_both_at_first_call(&d))
+        .run_once(true)
+        .unwrap();
+    assert_eq!(p.failed, 0);
+    assert!(d.errors().is_empty(), "{:?}", d.errors());
+    let log = d.log();
+    assert!(
+        log[lines..]
+            .iter()
+            .all(|l| l.change != LineChange::NoteDeleted),
+        "{log:?}"
+    );
+    let untouched = keys
+        .iter()
+        .zip(&before)
+        .filter(|(k, b)| d.state(k).as_ref() == Some(*b))
+        .count();
+    assert_eq!(
+        untouched, 1,
+        "the note without its file is skipped, untouched"
+    );
+    assert!(keys.iter().all(|k| !d.state(k).unwrap().deleted));
 }
 
 #[test]

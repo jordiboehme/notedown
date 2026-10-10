@@ -687,6 +687,9 @@ fn apply_line(state: &mut NoteState, mut line: LogLine) {
             }
             let page = &mut state.pages[i];
             page.seq = Some(line.seq);
+            if let Some(model) = line.model.take() {
+                state.model = Some(model);
+            }
             page.state = if line.truncated {
                 PageOcrState::Truncated
             } else {

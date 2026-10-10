@@ -7,9 +7,7 @@
 
 use std::fmt::Write as _;
 
-use notedown::document::{
-    Frontmatter, FrontmatterDigest, FrontmatterLink, HeaderFormat, PageOut, render_document,
-};
+use notedown::document::{Frontmatter, FrontmatterLink, HeaderFormat, PageOut, render_document};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -208,9 +206,9 @@ pub fn manifest_text(manifest: &Manifest) -> String {
 /// The note as an OKF document: frontmatter, then `## Page N` per page with the anchor of
 /// every block as an HTML comment before its text.
 ///
-/// The note state holds no OCR model and no source hash. The model is the label of the
-/// default model, the `source_sha256` is left empty (the note state keeps only the md5 of the
-/// file). The digests hold only their ids: page 0, no text and a zero rectangle.
+/// `generated.model` is the model of the newest page version, empty when the state does not
+/// know it. `source_sha256` is empty (the state keeps only the md5 of the file). Digests are
+/// left out: the state holds only their ids.
 pub fn note_document(note: &NoteState, slug: &str) -> String {
     let pages = note.pages.len();
     let description = if pages == 1 {
@@ -225,7 +223,7 @@ pub fn note_document(note: &NoteState, slug: &str) -> String {
         description,
         resource: note.path.clone(),
         generated_by: format!("notedown/{}", env!("CARGO_PKG_VERSION")),
-        generated_model: notedown_ocr::model::DEFAULT_MODEL.label.to_string(),
+        generated_model: note.model.clone().unwrap_or_default(),
         generated_at: at
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),
@@ -256,17 +254,8 @@ pub fn note_document(note: &NoteState, slug: &str) -> String {
                 target_md: None,
             })
             .collect(),
-        digests: note
-            .meta
-            .digests
-            .iter()
-            .map(|id| FrontmatterDigest {
-                page: 0,
-                digest_id: id.clone(),
-                text: String::new(),
-                rect: [0; 4],
-            })
-            .collect(),
+        // Left out until the note state holds the page, text and rectangle of each digest.
+        digests: Vec::new(),
         extra: Vec::new(),
         format: HeaderFormat::Okf,
         crlf: false,
@@ -481,6 +470,7 @@ Flow: A then B
             path: "NOTE/Note/Planview.note".into(),
             title: "Planview".into(),
             md5: "abc".into(),
+            model: Some("m1".into()),
             meta: NoteMeta {
                 keywords: vec!["plan".into()],
                 links: vec![MetaLink {
@@ -523,13 +513,13 @@ Flow: A then B
         );
         assert!(doc.contains("tags: [supernote]\n"), "{doc}");
         assert!(doc.contains("by: notedown/"), "{doc}");
-        assert!(doc.contains("model: \"chandra-ocr-2 Q4_K_M\""), "{doc}");
+        assert!(doc.contains("model: \"m1\""), "{doc}");
         assert!(doc.contains("  - \"plan\"\n"), "{doc}");
         assert!(
             doc.contains("target_path: \"NOTE/Note/Other.note\""),
             "{doc}"
         );
-        assert!(doc.contains("digest_id: \"D1\""), "{doc}");
+        assert!(!doc.contains("digests:"), "{doc}");
         assert!(doc.contains("pages: 2\n"), "{doc}");
         assert!(
             doc.contains(
@@ -581,5 +571,24 @@ Flow: A then B
             dj["notes"][0]["pages"][0]["whatChanged"][0]["block"],
             format!("{A}#b3")
         );
+    }
+
+    #[test]
+    fn the_note_document_round_trips_through_the_frontmatter_parser() {
+        let n = note();
+        let fm = Frontmatter::parse(&note_document(&n, "jordi")).expect("parses");
+        assert_eq!(fm.title, n.title);
+        assert_eq!(fm.resource, n.path);
+        assert_eq!(fm.generated_model, "m1");
+        assert_eq!(fm.pages, n.pages.len());
+        assert_eq!(fm.keywords, n.meta.keywords);
+        assert_eq!(fm.links.len(), 1);
+        assert_eq!(fm.links[0].page, 1);
+        assert_eq!(fm.links[0].target_path, "NOTE/Note/Other.note");
+        assert!(fm.digests.is_empty());
+        let mut unknown = n;
+        unknown.model = None;
+        let fm = Frontmatter::parse(&note_document(&unknown, "jordi")).expect("parses");
+        assert_eq!(fm.generated_model, "");
     }
 }

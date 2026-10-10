@@ -233,6 +233,9 @@ pub struct NoteState {
     pub size: u64,
     #[serde(default)]
     pub md5: String,
+    /// The OCR model that read the newest page version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default)]
     pub meta: NoteMeta,
     /// In page order.

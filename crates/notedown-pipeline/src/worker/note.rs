@@ -287,6 +287,7 @@ pub(super) fn process(
             let mut batch = [line];
             text.append(w, &mut batch)?;
             seq = Some(batch[0].seq);
+            state.model = Some(reading.model.clone());
             progress.versions += 1;
         }
         for (old, new_ids) in composed.replaced {

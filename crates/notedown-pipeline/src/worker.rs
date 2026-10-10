@@ -27,7 +27,7 @@ use notedown_cloud::auth::Accounts;
 use notedown_cloud::journal::Journal;
 use notedown_ocr::{OcrEngine, OcrError};
 
-pub use due::{AccountStore, DueNote, due};
+pub use due::{AccountStore, DueNote, KeywordCache, due};
 
 use crate::errors::Errors;
 use crate::records;
@@ -177,6 +177,8 @@ pub struct Worker {
     /// The pages already reported as missing from their note file, so each is told once
     /// until its record changes.
     told_missing: RefCell<BTreeSet<String>>,
+    /// The keywords of notes out of scope, so the keyword scope parses each note once.
+    keywords: RefCell<KeywordCache>,
 }
 
 impl Worker {
@@ -209,6 +211,7 @@ impl Worker {
             },
             clock: Arc::new(SystemClock),
             told_missing: RefCell::default(),
+            keywords: RefCell::default(),
         }
     }
 
@@ -245,7 +248,14 @@ impl Worker {
             };
             let now = self.clock.now_ms();
             // Note changes (moves, scope) first, so the states are current.
-            due(&self.data, &slug, &store, &self.cfg, now)?;
+            due(
+                &self.data,
+                &slug,
+                &store,
+                &self.cfg,
+                &mut self.keywords.borrow_mut(),
+                now,
+            )?;
             let recs = records::read(&self.data, &slug)?;
             let digests = records::digests(&self.data, &slug)?;
             for (key, rec) in &recs.records {
@@ -427,7 +437,14 @@ impl Worker {
                 }
                 let text = &stores[&slug];
                 let store = AccountStore { text, lock };
-                let notes = due(&self.data, &slug, &store, &self.cfg, now)?;
+                let notes = due(
+                    &self.data,
+                    &slug,
+                    &store,
+                    &self.cfg,
+                    &mut self.keywords.borrow_mut(),
+                    now,
+                )?;
                 if let Some(t) = Errors::load(text.dir())?.next_try(now) {
                     next_due = Some(next_due.map_or(t, |n| n.min(t)));
                 }

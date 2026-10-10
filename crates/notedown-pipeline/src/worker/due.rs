@@ -91,31 +91,78 @@ pub(super) fn has_text(state: &NoteState) -> bool {
     state.pages.iter().any(|p| p.seq.is_some())
 }
 
+/// The device keywords read from note files, by account and note key, with the md5 they were
+/// read at (`None`: the note did not parse). A note out of scope has no state to hold them, so
+/// without this every pass would parse it again.
+#[derive(Debug, Default)]
+pub struct KeywordCache(BTreeMap<(String, String), Known>);
+
+/// The keywords of one note file and the md5 they were read at.
+#[derive(Debug)]
+struct Known {
+    md5: String,
+    words: Option<Vec<String>>,
+}
+
+impl KeywordCache {
+    /// The keywords of note `key` of account `slug` at `md5`, from `read` only when they are
+    /// not known for these bytes.
+    fn get_or(
+        &mut self,
+        slug: &str,
+        key: &str,
+        md5: &str,
+        read: impl FnOnce() -> Option<Vec<String>>,
+    ) -> Option<Vec<String>> {
+        let id = (slug.to_string(), key.to_string());
+        if let Some(known) = self.0.get(&id)
+            && known.md5 == md5
+        {
+            return known.words.clone();
+        }
+        let words = read();
+        let md5 = md5.to_string();
+        self.0.insert(
+            id,
+            Known {
+                md5,
+                words: words.clone(),
+            },
+        );
+        words
+    }
+}
+
 /// The device keywords of a note for the scope check: from the state while its bytes are the
-/// ones it was read from, else from the note file (only when `ingest_keyword` is set).
+/// ones it was read from, else from the note file (only when `ingest_keyword` is set), read
+/// once per note bytes through `cache`.
 fn keywords(
     data: &Path,
     slug: &str,
     cfg: &PipelineConfig,
-    rec: &PageRecord,
+    cache: &mut KeywordCache,
+    (key, rec): (&str, &PageRecord),
     state: Option<&NoteState>,
 ) -> Vec<String> {
     let from_state = || state.map(|s| s.meta.keywords.clone()).unwrap_or_default();
     if cfg.ingest_keyword.is_none() || state.is_some_and(|s| s.md5 == rec.md5) {
         return from_state();
     }
-    let parsed = records::note_file(data, slug, &rec.path).and_then(|file| {
-        Ok(Notebook::open(&file, VersionPolicy::AllowUnknown)?
-            .keywords
-            .iter()
-            .filter_map(|k| k.text.as_deref())
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string)
-            .collect())
+    let parsed = cache.get_or(slug, key, &rec.md5, || {
+        let file = records::note_file(data, slug, &rec.path).ok()?;
+        let nb = Notebook::open(&file, VersionPolicy::AllowUnknown).ok()?;
+        Some(
+            nb.keywords
+                .iter()
+                .filter_map(|k| k.text.as_deref())
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect(),
+        )
     });
     // A note that does not parse keeps the scope it had.
-    parsed.unwrap_or_else(|_| from_state())
+    parsed.unwrap_or_else(from_state)
 }
 
 /// The due notes of account `slug`: its page records against its note states. On the way it
@@ -133,6 +180,7 @@ pub fn due(
     slug: &str,
     store: &AccountStore,
     cfg: &PipelineConfig,
+    cache: &mut KeywordCache,
     now: u64,
 ) -> Result<Vec<DueNote>> {
     let recs = records::read(data, slug)?;
@@ -162,7 +210,7 @@ pub fn due(
         if let Some((new, rec)) = target {
             let mut state = states.remove(&old).expect("listed above");
             // Same bytes, so the keywords of the state hold.
-            let words = keywords(data, slug, cfg, &rec, Some(&state));
+            let words = keywords(data, slug, cfg, cache, (&new, &rec), Some(&state));
             let listed = !state.unscoped && in_scope(cfg, &rec.path, &words);
             rekey(store, &mut state, &new, &rec.path, listed)?;
             // The tries of the old key are of no note any more.
@@ -197,7 +245,7 @@ pub fn due(
     for (key, rec) in &recs.records {
         let r = &rec.record;
         let state = states.get_mut(key);
-        let words = keywords(data, slug, cfg, r, state.as_deref());
+        let words = keywords(data, slug, cfg, cache, (key, r), state.as_deref());
         if !in_scope(cfg, &r.path, &words) {
             if let Some(state) = state {
                 leave_scope(store, state)?;
@@ -356,4 +404,35 @@ fn plan(
         pages,
         new: state.is_none_or(|s| !has_text(s)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keywords_are_read_once_per_note_bytes() {
+        let mut cache = KeywordCache::default();
+        let mut reads = 0;
+        let mut read = |words: &[&str]| {
+            reads += 1;
+            Some(words.iter().map(|w| w.to_string()).collect())
+        };
+        assert_eq!(
+            cache.get_or("a", "k", "m1", || read(&["ai"])),
+            Some(vec!["ai".into()])
+        );
+        assert_eq!(
+            cache.get_or("a", "k", "m1", || read(&["x"])),
+            Some(vec!["ai".into()])
+        );
+        // other bytes, another note or another account read again
+        assert_eq!(cache.get_or("a", "k", "m2", || read(&[])), Some(vec![]));
+        cache.get_or("a", "k2", "m2", || read(&[]));
+        cache.get_or("b", "k", "m2", || read(&[]));
+        // a note that did not parse is not read again either
+        assert_eq!(cache.get_or("a", "k3", "m", || None), None);
+        assert_eq!(cache.get_or("a", "k3", "m", || read(&["ai"])), None);
+        assert_eq!(reads, 4);
+    }
 }

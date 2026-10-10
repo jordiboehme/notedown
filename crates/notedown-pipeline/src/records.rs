@@ -174,27 +174,32 @@ pub fn digests(data: &Path, slug: &str) -> Result<Vec<Digest>> {
     Ok(out)
 }
 
-/// The digests that point to the note with `file_id` at wire `path`: by `metadata.note_fileId`,
-/// or by `sourcePath` (relative to the device storage root, like `Note/x.note`, so the wire
-/// path without its first segment). The id is `metadata.unique_identifier` (the `digest_id`
-/// of the note's text box), else the server id.
+/// The digests that point to the note with `file_id` at wire `path`: by
+/// `metadata.note_fileId`, or, only for a digest without one, by `sourcePath` (relative to the
+/// device storage root, like `Note/x.note`, so the wire path without its first segment). The
+/// id is `metadata.unique_identifier` (the `digest_id` of the note's text box), else the
+/// server id.
+///
+/// A copy keyed by its path (`path:<md5>`) has the `FILE_ID` of its original, so it gets the
+/// original's digests too.
 pub fn digests_of(digests: &[Digest], file_id: Option<&str>, path: &str) -> Vec<DigestRef> {
     let device_path = path.split_once('/').map_or(path, |(_, rest)| rest);
     digests
         .iter()
         .filter(|d| {
-            let by_id = file_id.is_some_and(|id| {
-                d.metadata
-                    .as_deref()
-                    .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
-                    .and_then(|m| m.get("note_fileId")?.as_str().map(|v| v == id))
-                    .unwrap_or(false)
-            });
-            let by_path = d
-                .source_path
+            let note_file_id = d
+                .metadata
                 .as_deref()
-                .is_some_and(|p| p.trim_start_matches('/') == device_path);
-            by_id || by_path
+                .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                .and_then(|m| m.get("note_fileId")?.as_str().map(str::to_string))
+                .filter(|id| !id.is_empty());
+            match note_file_id {
+                Some(id) => file_id == Some(id.as_str()),
+                None => d
+                    .source_path
+                    .as_deref()
+                    .is_some_and(|p| p.trim_start_matches('/') == device_path),
+            }
         })
         .map(|d| DigestRef {
             id: d.identity().unwrap_or_else(|| d.id.to_string()),
@@ -323,7 +328,7 @@ mod tests {
             "Note/old.note",
             "N",
         );
-        write(2, r#"{"note_fileId":"F9"}"#, "Note/a.note", "N");
+        write(2, r#"{"unique_identifier":"u2"}"#, "Note/a.note", "N");
         write(
             3,
             r#"{"note_fileId":"F1","unique_identifier":"u3"}"#,
@@ -336,12 +341,24 @@ mod tests {
             "Note/b.note",
             "N",
         );
+        // Another note's digest at this note's path: matched by its FILE_ID only.
+        write(
+            6,
+            r#"{"note_fileId":"F9","unique_identifier":"u6"}"#,
+            "Note/a.note",
+            "N",
+        );
+        // No metadata at all: by path, with the server id.
+        write(7, "", "Note/a.note", "N");
         std::fs::write(dir.join("5.json"), "{").unwrap();
         let all = digests(tmp.path(), "jordi").unwrap();
-        assert_eq!(all.iter().map(|d| d.id).collect::<Vec<_>>(), [1, 2, 4]);
+        assert_eq!(
+            all.iter().map(|d| d.id).collect::<Vec<_>>(),
+            [1, 2, 4, 6, 7]
+        );
         let found = digests_of(&all, Some("F1"), "NOTE/Note/a.note");
         let ids: Vec<&str> = found.iter().map(|d| d.id.as_str()).collect();
-        assert_eq!(ids, ["u1", "2"]);
+        assert_eq!(ids, ["u1", "u2", "7"]);
         assert_eq!(found[0].time_ms, Some(5));
         assert!(digests_of(&all, None, "NOTE/Note/c.note").is_empty());
     }

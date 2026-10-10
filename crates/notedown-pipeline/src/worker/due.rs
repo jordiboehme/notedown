@@ -156,10 +156,13 @@ pub fn due(
             .find(|(k, r)| {
                 !states.contains_key(*k) && r.record.md5 == st.md5 && r.record.size == st.size
             })
-            .map(|(k, r)| (k.clone(), r.record.path.clone()));
-        if let Some((new, path)) = target {
+            .map(|(k, r)| (k.clone(), r.record.clone()));
+        if let Some((new, rec)) = target {
             let mut state = states.remove(&old).expect("listed above");
-            rekey(store, &mut state, &new, &path)?;
+            // Same bytes, so the keywords of the state hold.
+            let words = keywords(data, slug, cfg, &rec, Some(&state));
+            let listed = !state.unscoped && in_scope(cfg, &rec.path, &words);
+            rekey(store, &mut state, &new, &rec.path, listed)?;
             states.insert(new, state);
         }
     }
@@ -202,16 +205,27 @@ pub fn due(
 }
 
 /// Moves the state of a note to its new key `new` at `path`: the same pages, blocks, ids and
-/// successors. A note with text gets `note.moved` under the new key with `oldNote`, `path`
-/// and `oldPath`; the line comes first, then the state under the new key, then the old state
-/// file goes (crash repair finishes the move from the line).
-fn rekey(store: &AccountStore, state: &mut NoteState, new: &str, path: &str) -> Result<()> {
+/// successors. A note with text gets `note.moved` under the new key with `oldNote`; `path` and
+/// `oldPath` only when the note is `listed` (it was not unscoped and its new path is in
+/// scope), since notes out of scope are not listed (spec 4.5). A note that moved out of scope
+/// gets its `note.unscoped` from the scope check after this. The line comes first, then the
+/// state under the new key, then the old state file goes (crash repair finishes the move from
+/// the line, which is why it always carries `oldNote`).
+fn rekey(
+    store: &AccountStore,
+    state: &mut NoteState,
+    new: &str,
+    path: &str,
+    listed: bool,
+) -> Result<()> {
     let old = std::mem::replace(&mut state.key, new.to_string());
     if has_text(state) {
         let mut line = LogLine::new(new, LineChange::NoteMoved);
         line.old_note = Some(old.clone());
-        line.path = Some(path.to_string());
-        line.old_path = Some(state.path.clone()).filter(|p| !p.is_empty());
+        if listed {
+            line.path = Some(path.to_string());
+            line.old_path = Some(state.path.clone()).filter(|p| !p.is_empty());
+        }
         store.text.append(store.lock, &mut [line])?;
     }
     state.path = path.to_string();

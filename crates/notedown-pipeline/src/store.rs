@@ -296,11 +296,14 @@ impl TextStore {
 
     /// Crash repair at the writer's start: cuts a torn last line, then brings every note state
     /// up to the newest log lines of its pages: the lines of the note past its `log_seq` are
-    /// applied in log order. Only what a log line holds is taken (text,
-    /// `pageHash`, position, deletions, path); the stroke list and the strokes hash stay, so
-    /// the worker checks such a page again. A note with log lines and no state file (a crash
-    /// before its first save) gets a state started from its lines, so its logged block ids
-    /// are never given out again. Afterwards the store takes writes.
+    /// applied in log order. Only what a log line holds is taken (text, `pageHash`, the
+    /// strokes and layers hashes, truncation, position, deletions, path); the stroke list
+    /// stays that of the version before, which only makes the next change region larger. A
+    /// note with log lines and no state file (a crash before its first save) gets a state
+    /// started from its lines, so its logged block ids are never given out again; a
+    /// `note.moved` line with `oldNote` (a re-keyed note) starts it from the old key's state,
+    /// and the old state file goes when it was saved before that line. Afterwards the store
+    /// takes writes.
     pub fn repair(&self, _w: &WriterLock) -> Result<()> {
         self.repaired.store(false, Ordering::SeqCst);
         self.cut_torn()?;
@@ -308,13 +311,25 @@ impl TextStore {
         for note in self.notes()? {
             notes.insert(note.key.clone(), (note.clone(), note));
         }
+        // Old keys of re-keyed notes with the seq of their move line.
+        let mut rekeyed: Vec<(String, String, u64)> = Vec::new();
         self.read_log(0, None, &mut |line| {
+            if let Some(old) = &line.old_note {
+                rekeyed.push((old.clone(), line.note.clone(), line.seq));
+            }
             if !notes.contains_key(&line.note) && notedown_cloud::pages::valid_key(&line.note) {
-                let start = NoteState {
+                let before = NoteState {
                     key: line.note.clone(),
                     ..NoteState::default()
                 };
-                notes.insert(line.note.clone(), (start.clone(), start));
+                let start = match line.old_note.as_ref().and_then(|old| notes.get(old)) {
+                    Some((_, old)) => NoteState {
+                        key: line.note.clone(),
+                        ..old.clone()
+                    },
+                    None => before.clone(),
+                };
+                notes.insert(line.note.clone(), (before, start));
             }
             if let Some((before, state)) = notes.get_mut(&line.note)
                 && line.seq > before.log_seq
@@ -323,12 +338,43 @@ impl TextStore {
             }
             Ok(())
         })?;
+        let mut gone = Vec::new();
+        for (old, new, seq) in rekeyed {
+            if notes.contains_key(&new)
+                && notes
+                    .get(&old)
+                    .is_some_and(|(before, _)| before.log_seq < seq)
+            {
+                notes.remove(&old);
+                gone.push(old);
+            }
+        }
         for (_, (before, after)) in notes {
             if before != after {
                 self.write_note(&after)?;
             }
         }
+        for old in gone {
+            self.delete_note_file(&old)?;
+        }
         self.repaired.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Removes the state file of note `key` (a note re-keyed by a move). Call it after the
+    /// `note.moved` line and the save of the state under its new key.
+    pub fn remove_note(&self, _w: &WriterLock, key: &str) -> Result<()> {
+        self.writable()?;
+        self.delete_note_file(key)
+    }
+
+    fn delete_note_file(&self, key: &str) -> Result<()> {
+        let path = self.note_path(key)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => notedown_cloud::fsutil::fsync_dir(&self.dir.join(NOTES_DIR))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err(&path)(e)),
+        }
         Ok(())
     }
 
@@ -598,10 +644,20 @@ fn apply_line(state: &mut NoteState, mut line: LogLine) {
             }
             let page = &mut state.pages[i];
             page.seq = Some(line.seq);
-            page.state = PageOcrState::Done;
+            page.state = if line.truncated {
+                PageOcrState::Truncated
+            } else {
+                PageOcrState::Done
+            };
             page.blocks = line.blocks;
             if let Some(hash) = line.page_hash {
                 page.page_hash = hash;
+            }
+            if let Some(hash) = line.strokes_hash {
+                page.strokes_hash = hash;
+            }
+            if let Some(hash) = line.layers_hash {
+                page.layers_hash = hash;
             }
             if let Some(pos) = line.position {
                 page.position = pos;

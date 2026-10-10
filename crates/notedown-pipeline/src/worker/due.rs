@@ -119,7 +119,9 @@ fn keywords(
 }
 
 /// The due notes of account `slug`: its page records against its note states. On the way it
-/// writes the lines of whole notes: `note.deleted` for a note whose record is gone,
+/// writes the lines of whole notes: `note.moved` with `oldNote` for a note re-keyed by a move
+/// (a gone key whose md5 and size are those of a new record without a state; no OCR),
+/// `note.deleted` for a note whose record is gone (also after `note.unscoped`),
 /// `note.moved` for a new path, `note.unscoped` (once, and only for a note with text) for a
 /// note that left the scope. A note that comes back (into the scope or after a deletion) gets
 /// a `new` line per page with text, with its last text, so a consumer that dropped it sees
@@ -139,9 +141,32 @@ pub fn due(
         .into_iter()
         .map(|n| (n.key.clone(), n))
         .collect();
+    // A note keyed by its path gets a new key when it moves: a gone key whose bytes are those
+    // of a new record without a state is that note, moved.
+    let gone: Vec<String> = states
+        .iter()
+        .filter(|(k, s)| !s.deleted && !s.md5.is_empty() && recs.gone(k))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for old in gone {
+        let st = &states[&old];
+        let target = recs
+            .records
+            .iter()
+            .find(|(k, r)| {
+                !states.contains_key(*k) && r.record.md5 == st.md5 && r.record.size == st.size
+            })
+            .map(|(k, r)| (k.clone(), r.record.path.clone()));
+        if let Some((new, path)) = target {
+            let mut state = states.remove(&old).expect("listed above");
+            rekey(store, &mut state, &new, &path)?;
+            states.insert(new, state);
+        }
+    }
     for (key, state) in states.iter_mut() {
         if !state.deleted && recs.gone(key) {
-            if has_text(state) && !state.unscoped {
+            // Also for a note that left the scope before: the consumer learns it is gone.
+            if has_text(state) {
                 store.text.append(
                     store.lock,
                     &mut [LogLine::new(key, LineChange::NoteDeleted)],
@@ -174,6 +199,25 @@ pub fn due(
         }
     }
     Ok(out)
+}
+
+/// Moves the state of a note to its new key `new` at `path`: the same pages, blocks, ids and
+/// successors. A note with text gets `note.moved` under the new key with `oldNote`, `path`
+/// and `oldPath`; the line comes first, then the state under the new key, then the old state
+/// file goes (crash repair finishes the move from the line).
+fn rekey(store: &AccountStore, state: &mut NoteState, new: &str, path: &str) -> Result<()> {
+    let old = std::mem::replace(&mut state.key, new.to_string());
+    if has_text(state) {
+        let mut line = LogLine::new(new, LineChange::NoteMoved);
+        line.old_note = Some(old.clone());
+        line.path = Some(path.to_string());
+        line.old_path = Some(state.path.clone()).filter(|p| !p.is_empty());
+        store.text.append(store.lock, &mut [line])?;
+    }
+    state.path = path.to_string();
+    state.title = title_of(path);
+    store.text.save_note(store.lock, state)?;
+    store.text.remove_note(store.lock, &old)
 }
 
 /// A note that left the scope: one `note.unscoped` line, without a path.

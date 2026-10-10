@@ -11,9 +11,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use notedown_cloud::appdata::{DIGESTS_DIR, Digest};
 use notedown_cloud::auth::Accounts;
 use notedown_cloud::pages::{PAGES_DIR, PageRecord, valid_file_id, valid_key};
 use notedown_cloud::store::WirePath;
+use notedown_note::DigestRef;
 
 use crate::{Error, Result};
 
@@ -139,6 +141,69 @@ fn read_one(path: &Path, key: &str) -> Option<Record> {
     Some(Record { record, changed_ms })
 }
 
+/// The live digest items of account `slug`, read from `accounts/<slug>/digests/items/*.json`
+/// (spec 2.1). A file that cannot be read is left out with a warning.
+pub fn digests(data: &Path, slug: &str) -> Result<Vec<Digest>> {
+    let dir = account_dir(data, slug).join(DIGESTS_DIR).join("items");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(io(&dir)(e)),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let path = entry.map_err(io(&dir))?.path();
+        let is_json = path.extension().is_some_and(|x| x == "json")
+            && !path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.'));
+        if !is_json {
+            continue;
+        }
+        let digest = std::fs::read(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|b| serde_json::from_slice::<Digest>(&b).map_err(|e| e.to_string()));
+        match digest {
+            Ok(d) if d.is_live() => out.push(d),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: {}: cannot be read: {e}", path.display()),
+        }
+    }
+    out.sort_by_key(|d| d.id);
+    Ok(out)
+}
+
+/// The digests that point to the note with `file_id` at wire `path`: by `metadata.note_fileId`,
+/// or by `sourcePath` (relative to the device storage root, like `Note/x.note`, so the wire
+/// path without its first segment). The id is `metadata.unique_identifier` (the `digest_id`
+/// of the note's text box), else the server id.
+pub fn digests_of(digests: &[Digest], file_id: Option<&str>, path: &str) -> Vec<DigestRef> {
+    let device_path = path.split_once('/').map_or(path, |(_, rest)| rest);
+    digests
+        .iter()
+        .filter(|d| {
+            let by_id = file_id.is_some_and(|id| {
+                d.metadata
+                    .as_deref()
+                    .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                    .and_then(|m| m.get("note_fileId")?.as_str().map(|v| v == id))
+                    .unwrap_or(false)
+            });
+            let by_path = d
+                .source_path
+                .as_deref()
+                .is_some_and(|p| p.trim_start_matches('/') == device_path);
+            by_id || by_path
+        })
+        .map(|d| DigestRef {
+            id: d.identity().unwrap_or_else(|| d.id.to_string()),
+            time_ms: d.creation_time.and_then(|t| u64::try_from(t).ok()),
+            source: None,
+        })
+        .collect()
+}
+
 /// The file of the note at wire `path`: `accounts/<slug>/files/<path>`.
 pub fn note_file(data: &Path, slug: &str, path: &str) -> Result<PathBuf> {
     let wire = WirePath::parse(path)?;
@@ -228,6 +293,57 @@ mod tests {
         );
         assert_eq!(key_of("F1.json").as_deref(), Some("F1"));
         assert_eq!(key_of("../x.json"), None);
+    }
+
+    #[test]
+    fn digests_are_found_by_file_id_or_source_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(digests(tmp.path(), "jordi").unwrap().is_empty());
+        let dir = tmp.path().join("accounts/jordi/digests/items");
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |id: u64, meta: &str, source: &str, deleted: &str| {
+            let d = Digest {
+                id,
+                metadata: Some(meta.to_string()),
+                source_path: Some(source.to_string()),
+                source_type: Some(2),
+                is_deleted: deleted.to_string(),
+                creation_time: Some(5),
+                ..Digest::default()
+            };
+            std::fs::write(
+                dir.join(format!("{id}.json")),
+                serde_json::to_vec(&d).unwrap(),
+            )
+            .unwrap();
+        };
+        write(
+            1,
+            r#"{"note_fileId":"F1","unique_identifier":"u1"}"#,
+            "Note/old.note",
+            "N",
+        );
+        write(2, r#"{"note_fileId":"F9"}"#, "Note/a.note", "N");
+        write(
+            3,
+            r#"{"note_fileId":"F1","unique_identifier":"u3"}"#,
+            "Note/a.note",
+            "Y",
+        );
+        write(
+            4,
+            r#"{"note_fileId":"F9","unique_identifier":"u4"}"#,
+            "Note/b.note",
+            "N",
+        );
+        std::fs::write(dir.join("5.json"), "{").unwrap();
+        let all = digests(tmp.path(), "jordi").unwrap();
+        assert_eq!(all.iter().map(|d| d.id).collect::<Vec<_>>(), [1, 2, 4]);
+        let found = digests_of(&all, Some("F1"), "NOTE/Note/a.note");
+        let ids: Vec<&str> = found.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, ["u1", "2"]);
+        assert_eq!(found[0].time_ms, Some(5));
+        assert!(digests_of(&all, None, "NOTE/Note/c.note").is_empty());
     }
 
     #[test]

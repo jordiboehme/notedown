@@ -165,6 +165,9 @@ fn a_crash_between_log_and_state_is_reconciled() {
         b4.replaces = vec!["b1".into()];
         let mut second = vec![page_line(KEY, "P1", LineChange::Edited, vec![b4])];
         second[0].page_hash = Some("h2".into());
+        second[0].strokes_hash = Some("s2".into());
+        second[0].layers_hash = Some("l2".into());
+        second[0].truncated = true;
         let mut moved = LogLine::new(KEY, LineChange::NoteMoved);
         moved.path = Some("NOTE/Note/Work/Plan2.note".into());
         moved.old_path = Some("NOTE/Note/Plan.note".into());
@@ -185,9 +188,11 @@ fn a_crash_between_log_and_state_is_reconciled() {
     assert_eq!(page.seq, Some(2));
     assert_eq!(page.blocks[0].text, "hello world");
     assert_eq!(page.page_hash, "h2");
-    assert_eq!(page.state, PageOcrState::Done);
-    // What the log does not hold stays, so the worker checks the page again.
-    assert_eq!(page.strokes_hash, "s1");
+    assert_eq!(page.state, PageOcrState::Truncated);
+    // The hashes the version was read from: the worker does not read the page again.
+    assert_eq!(page.strokes_hash, "s2");
+    assert_eq!(page.layers_hash, "l2");
+    // The stroke list is not in the log; the old one only makes the next region larger.
     assert_eq!(page.stroke_list, first_state().pages[0].stroke_list);
     assert_eq!(state.next_block, 5, "b4 is taken");
     assert_eq!(state.successors.get("b1"), Some(&vec!["b4".to_string()]));
@@ -555,4 +560,57 @@ fn a_failed_append_blocks_writes_until_a_repair() {
         vec![1, 2, 3],
         "complete lines are kept"
     );
+}
+
+#[test]
+fn a_crash_in_a_rekeyed_move_is_reconciled() {
+    const OLD: &str = "path:0123456789abcdef0123456789abcdef";
+    const NEW: &str = "path:fedcba9876543210fedcba9876543210";
+    let tmp = tempfile::tempdir().unwrap();
+    let w = WriterLock::take(tmp.path()).unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
+    let mut first = vec![page_line(
+        OLD,
+        "P1",
+        LineChange::New,
+        vec![block("b1", "hi")],
+    )];
+    store.append(&w, &mut first).unwrap();
+    let old = NoteState {
+        key: OLD.into(),
+        ..first_state()
+    };
+    store.save_note(&w, &old).unwrap();
+
+    // The move line is logged, then the process dies before the new state is saved.
+    let mut moved = LogLine::new(NEW, LineChange::NoteMoved);
+    moved.old_note = Some(OLD.into());
+    moved.path = Some("NOTE/Note/Moved.note".into());
+    moved.old_path = Some(old.path.clone());
+    store.append(&w, &mut [moved.clone()]).unwrap();
+    store.repair(&w).unwrap();
+    assert_eq!(store.note(OLD).unwrap(), None, "the old state goes");
+    let state = store.note(NEW).unwrap().unwrap();
+    assert_eq!(state.key, NEW);
+    assert_eq!(state.path, "NOTE/Note/Moved.note");
+    assert_eq!(state.title, "Moved");
+    assert_eq!(state.pages, old.pages, "same blocks and ids");
+    assert_eq!(state.next_block, old.next_block);
+
+    // A state saved under the old key after the move line is another note: it stays.
+    store.save_note(&w, &old).unwrap();
+    store.repair(&w).unwrap();
+    assert!(store.note(OLD).unwrap().is_some());
+
+    // Dies after the save of the new state, before the old one is removed: the old file was
+    // saved before the move line, so it goes.
+    let mut stale = old.clone();
+    stale.log_seq = 1;
+    let path = store
+        .dir()
+        .join("notes/path-0123456789abcdef0123456789abcdef.json");
+    std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
+    store.repair(&w).unwrap();
+    assert_eq!(store.note(OLD).unwrap(), None);
+    assert_eq!(store.note(NEW).unwrap().unwrap().pages, old.pages);
 }

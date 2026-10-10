@@ -4,8 +4,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use notedown_cloud::appdata::Digest;
 use notedown_cloud::pages::PageFingerprint;
-use notedown_note::{DigestRef, Notebook, VersionPolicy, decode_text_boxes};
+use notedown_note::{Notebook, VersionPolicy};
 
 use super::due::{AccountStore, DueNote, PageWork, note_waits, page_work};
 use super::{EngineSlot, Progress};
@@ -35,27 +36,10 @@ pub(super) struct NoteJob<'a> {
     pub store: AccountStore<'a>,
     /// The account's records, for the keys of link targets.
     pub records: &'a BTreeMap<String, Record>,
+    /// The account's live digests.
+    pub digests: &'a [Digest],
     pub now: &'a dyn Fn() -> u64,
     pub mode: Mode,
-}
-
-/// The digests registered in the note's text boxes.
-fn digests(nb: &Notebook) -> Vec<DigestRef> {
-    let mut out: Vec<DigestRef> = Vec::new();
-    for page in 0..nb.pages.len() {
-        let Ok(strokes) = nb.strokes(page) else {
-            continue;
-        };
-        let Ok(boxes) = decode_text_boxes(&strokes, page) else {
-            continue;
-        };
-        for d in boxes.into_iter().filter_map(|b| b.digest) {
-            if !out.iter().any(|o| o.id == d.id) {
-                out.push(d);
-            }
-        }
-    }
-    out
 }
 
 /// The index in `nb` of the page the record calls `page_id`: `<PAGEID>`, `<PAGEID>#<n>` for
@@ -143,7 +127,8 @@ pub(super) fn process(
     errors.clear(w, key, None)?;
 
     // Metadata.
-    state.meta = note_meta(&nb, &digests(&nb));
+    let digests = records::digests_of(job.digests, nb.file_id.as_deref(), &r.path);
+    state.meta = note_meta(&nb, &digests);
     for link in &mut state.meta.links {
         link.key = records::link_key(job.records, link.key.as_deref(), &link.target);
     }
@@ -296,6 +281,9 @@ pub(super) fn process(
             }
             line.blocks = composed.blocks.clone();
             line.path = Some(state.path.clone());
+            line.strokes_hash = Some(fp.strokes.clone());
+            line.layers_hash = Some(fp.layers_hash());
+            line.truncated = reading.truncated;
             let mut batch = [line];
             text.append(w, &mut batch)?;
             seq = Some(batch[0].seq);
@@ -321,11 +309,13 @@ pub(super) fn process(
         } else {
             PageOcrState::Done
         };
-        text.save_note(w, &state)?;
+        // Before the state save: the log line is written, so the page is not read again
+        // after a crash, and the count must not get lost.
         if composed.region_missed > 0 {
             text.add_region_missed(w, u64::from(composed.region_missed))?;
             progress.region_missed += u64::from(composed.region_missed);
         }
+        text.save_note(w, &state)?;
         report(progress);
     }
     Ok(())

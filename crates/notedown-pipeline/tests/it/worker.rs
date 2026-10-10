@@ -69,7 +69,8 @@ impl Data {
     }
 
     fn record_path(&self, key: &str) -> PathBuf {
-        self.pages_dir().join(format!("{key}.json"))
+        self.pages_dir()
+            .join(format!("{}.json", key.replace("path:", "path-")))
     }
 
     /// Changes the page record of `key` as the server would after a sync, without a journal
@@ -770,4 +771,174 @@ fn a_missing_model_waits_and_checks_every_ten_minutes() {
     // --once reports it as an error.
     let mut w = Worker::with_loader(&d.data, no_settle(), loader(loads.clone(), true));
     assert!(w.run_once(true).is_err());
+}
+
+#[test]
+fn a_text_box_edit_is_not_lost() {
+    let d = setup();
+    let key = d.put("test1", "NOTE/Note");
+    worker(&d, no_settle(), engine_reading("hello world"))
+        .run_once(true)
+        .unwrap();
+    // The page had a text box inside the paragraph; its text was edited, so its record (and
+    // the page's strokes hash) changed while the ink stayed. The old box is in the stored list.
+    let note_file = d
+        .data
+        .join("pipeline")
+        .join(SLUG)
+        .join("notes")
+        .join(format!("{key}.json"));
+    let mut state: NoteState = serde_json::from_slice(&std::fs::read(&note_file).unwrap()).unwrap();
+    state.pages[0]
+        .stroke_list
+        .push(notedown_pipeline::page::StrokeEntry {
+            hash: "0123456789abcdef".into(),
+            bbox: [300, 250, 600, 300],
+        });
+    std::fs::write(&note_file, serde_json::to_vec(&state).unwrap()).unwrap();
+    d.edit_record(&key, |r| {
+        r.pages[0] = with_parts(&r.pages[0], Some("0123456789abcdef"), None, None);
+    });
+    let p = worker(&d, no_settle(), engine_reading("hello world!"))
+        .run_once(true)
+        .unwrap();
+    assert_eq!(p.versions, 1);
+    let log = d.log();
+    assert_eq!(log.len(), 2, "{log:?}");
+    assert_eq!(log[1].change, LineChange::Edited);
+    assert_eq!(log[1].signal, ["strokes"]);
+    assert_eq!(texts(&log[1]), ["hello world!"]);
+}
+
+#[test]
+fn a_moved_note_without_a_file_id_keeps_its_text() {
+    let d = setup();
+    let original = d.put("test1", "NOTE/Note");
+    // A copy of an indexed note is keyed by its path.
+    let journal = Journal::open(&d.data).unwrap();
+    let src = root().join("tests/fixtures/notes/test1.note");
+    notedown_cloud::put::put(
+        &d.data,
+        SLUG,
+        &journal,
+        &src,
+        "NOTE/Note",
+        Some("copy.note"),
+    )
+    .unwrap();
+    let old = d
+        .records()
+        .into_iter()
+        .find(|r| r.path == "NOTE/Note/copy.note")
+        .unwrap()
+        .file_id;
+    assert!(old.starts_with("path:"), "{old}");
+    assert_ne!(old, original);
+    worker(&d, no_settle(), engine_reading("hello"))
+        .run_once(true)
+        .unwrap();
+    let before = d.state(&old).unwrap();
+
+    // The server moves the copy: the record is keyed by the new path now.
+    let new_path = "NOTE/Note/Moved.note";
+    let new = notedown_cloud::pages::path_key(
+        &notedown_cloud::store::WirePath::parse_named(new_path).unwrap(),
+    );
+    let files = d.data.join("accounts").join(SLUG).join("files/NOTE/Note");
+    std::fs::rename(files.join("copy.note"), files.join("Moved.note")).unwrap();
+    let mut rec: PageRecord =
+        serde_json::from_slice(&std::fs::read(d.record_path(&old)).unwrap()).unwrap();
+    std::fs::remove_file(d.record_path(&old)).unwrap();
+    rec.file_id = new.clone();
+    rec.path = new_path.into();
+    std::fs::write(d.record_path(&new), serde_json::to_vec(&rec).unwrap()).unwrap();
+
+    let engine = engine_reading("hello");
+    let calls = engine.calls_handle();
+    worker(&d, no_settle(), engine).run_once(true).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "a move is not read again");
+    let log = d.log();
+    assert!(
+        log.iter().all(|l| l.change != LineChange::NoteDeleted),
+        "{log:?}"
+    );
+    let moved = log.last().unwrap();
+    assert_eq!(moved.change, LineChange::NoteMoved);
+    assert_eq!(moved.note, new);
+    assert_eq!(moved.old_note.as_deref(), Some(old.as_str()));
+    assert_eq!(moved.path.as_deref(), Some(new_path));
+    assert_eq!(moved.old_path.as_deref(), Some("NOTE/Note/copy.note"));
+    assert!(d.state(&old).is_none(), "the old state is gone");
+    let state = d.state(&new).unwrap();
+    assert_eq!(state.path, new_path);
+    assert_eq!(state.title, "Moved");
+    assert_eq!(state.pages, before.pages, "same blocks and ids");
+    assert_eq!(state.next_block, before.next_block);
+
+    // Nothing more to do.
+    let engine = engine_reading("hello");
+    let calls = engine.calls_handle();
+    worker(&d, no_settle(), engine).run_once(true).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(d.log().len(), log.len());
+}
+
+#[test]
+fn an_unscoped_note_that_is_deleted_gives_note_deleted() {
+    let d = setup();
+    let key = d.put("test1", "NOTE/Note");
+    worker(&d, no_settle(), engine_reading("hello"))
+        .run_once(true)
+        .unwrap();
+    let narrow = PipelineConfig {
+        ingest_folders: vec!["DOCUMENT/**".into()],
+        ..no_settle()
+    };
+    worker(&d, narrow.clone(), engine_reading("hello"))
+        .run_once(true)
+        .unwrap();
+    std::fs::remove_file(d.record_path(&key)).unwrap();
+    for _ in 0..2 {
+        worker(&d, narrow.clone(), engine_reading("hello"))
+            .run_once(true)
+            .unwrap();
+    }
+    let changes: Vec<LineChange> = d.log().into_iter().map(|l| l.change).collect();
+    assert_eq!(
+        changes,
+        [
+            LineChange::New,
+            LineChange::NoteUnscoped,
+            LineChange::NoteDeleted
+        ]
+    );
+    assert!(d.state(&key).unwrap().deleted);
+}
+
+#[test]
+fn digests_of_the_note_are_in_its_metadata() {
+    let d = setup();
+    let key = d.put("test1", "NOTE/Note");
+    let items = d.data.join("accounts").join(SLUG).join("digests/items");
+    std::fs::create_dir_all(&items).unwrap();
+    let digest = |id: u64, meta: String, source: &str| {
+        serde_json::json!({
+            "id": id, "sourcePath": source, "sourceType": 2, "isDeleted": "N",
+            "isSummaryGroup": "N", "metadata": meta,
+        })
+    };
+    let by_id = digest(
+        7,
+        format!(r#"{{"note_fileId":"{key}","unique_identifier":"u7"}}"#),
+        "Note/elsewhere.note",
+    );
+    let by_path = digest(8, r#"{"unique_identifier":"u8"}"#.into(), "Note/test1.note");
+    let other = digest(9, r#"{"note_fileId":"F1"}"#.into(), "Note/other.note");
+    for (n, v) in [(7, by_id), (8, by_path), (9, other)] {
+        std::fs::write(items.join(format!("{n}.json")), v.to_string()).unwrap();
+    }
+    worker(&d, no_settle(), engine_reading("hello"))
+        .run_once(true)
+        .unwrap();
+    assert_eq!(d.state(&key).unwrap().meta.digests, ["u7", "u8"]);
 }

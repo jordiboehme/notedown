@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use notedown_cloud::appdata::Digest;
 use notedown_cloud::auth::Accounts;
 use notedown_cloud::journal::Journal;
 use notedown_ocr::{OcrEngine, OcrError};
@@ -238,6 +239,7 @@ impl Worker {
             // Note changes (moves, scope) first, so the states are current.
             due(&self.data, &slug, &store, &self.cfg, now)?;
             let recs = records::read(&self.data, &slug)?;
+            let digests = records::digests(&self.data, &slug)?;
             for (key, rec) in &recs.records {
                 let r = &rec.record;
                 if note.is_some_and(|n| n != key && n != r.path) {
@@ -265,6 +267,7 @@ impl Worker {
                     slug: &slug,
                     store,
                     records: &recs.records,
+                    digests: &digests,
                     now: &|| clock.now_ms(),
                     mode: Mode::Reocr,
                 };
@@ -379,7 +382,7 @@ impl Worker {
         let settle = self.cfg.ocr_settle.as_millis() as u64;
         let mut progress = Progress::default();
         let mut queue: Vec<(String, DueNote)> = Vec::new();
-        let mut recs: BTreeMap<String, records::Records> = BTreeMap::new();
+        let mut recs: BTreeMap<String, (records::Records, Vec<Digest>)> = BTreeMap::new();
         let mut next_due: Option<u64> = None;
         for slug in self.slugs()? {
             let found = (|| -> Result<Vec<DueNote>> {
@@ -393,7 +396,13 @@ impl Worker {
                 if let Some(t) = Errors::load(text.dir())?.next_try(now) {
                     next_due = Some(next_due.map_or(t, |n| n.min(t)));
                 }
-                recs.insert(slug.clone(), records::read(&self.data, &slug)?);
+                recs.insert(
+                    slug.clone(),
+                    (
+                        records::read(&self.data, &slug)?,
+                        records::digests(&self.data, &slug)?,
+                    ),
+                );
                 Ok(notes)
             })();
             let notes = match found {
@@ -445,7 +454,7 @@ impl Worker {
             if stop() {
                 break;
             }
-            let (Some(text), Some(r)) = (stores.get(slug), recs.get(slug)) else {
+            let (Some(text), Some((r, digests))) = (stores.get(slug), recs.get(slug)) else {
                 continue;
             };
             let job = NoteJob {
@@ -453,6 +462,7 @@ impl Worker {
                 slug,
                 store: AccountStore { text, lock },
                 records: &r.records,
+                digests,
                 now: &now_fn,
                 mode: Mode::Due,
             };

@@ -88,6 +88,27 @@ pub struct LogLine {
     pub path: Option<String>,
     #[serde(rename = "oldPath", default, skip_serializing_if = "Option::is_none")]
     pub old_path: Option<String>,
+    /// `note.moved` of a note whose key changed with the move (a note keyed by its path):
+    /// the old key. `note` is the new one.
+    #[serde(rename = "oldNote", default, skip_serializing_if = "Option::is_none")]
+    pub old_note: Option<String>,
+    /// A page version: the page index `strokes` and layers hashes it was read from, so a
+    /// crash repair does not read the page again.
+    #[serde(
+        rename = "strokesHash",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub strokes_hash: Option<String>,
+    #[serde(
+        rename = "layersHash",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub layers_hash: Option<String>,
+    /// A page version read to the engine's token limit (page state `truncated`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
     /// The 0-based page position.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<usize>,
@@ -109,6 +130,10 @@ impl LogLine {
             blocks: Vec::new(),
             path: None,
             old_path: None,
+            old_note: None,
+            strokes_hash: None,
+            layers_hash: None,
+            truncated: false,
             position: None,
         }
     }

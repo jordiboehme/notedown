@@ -13,7 +13,9 @@
 //! - for every bookmark younger than `keep_days`, the newest line of each page with
 //!   `seq <= bookmark.seq` stays: it is the base version of the consumer's next delta (also
 //!   the last text of a page that was deleted since);
-//! - the newest note-level line of a note stays, so its path and flags can be rebuilt;
+//! - the newest note-level line of a note stays, so its path and flags can be rebuilt, and for
+//!   every bookmark younger than `keep_days` the newest one with `seq <= bookmark.seq` (the
+//!   path the consumer saw, so `oldPath` names it);
 //! - a deleted note keeps the current text of its pages until its `note.deleted` line itself
 //!   may go, then both go.
 //!
@@ -125,6 +127,8 @@ fn removable(
     struct Note {
         deleted_seq: Option<u64>,
         last_note_line: Option<u64>,
+        /// All note-level lines of the note in `seq` order.
+        note_lines: Vec<u64>,
         /// The page lines to keep as current, per page: newest line, newest text line.
         pages: BTreeMap<String, PageLines>,
     }
@@ -139,6 +143,7 @@ fn removable(
         let note = notes.entry(group(&l.note, l.seq)).or_default();
         if l.change.is_note_change() {
             note.last_note_line = Some(l.seq);
+            note.note_lines.push(l.seq);
             if l.change == LineChange::NoteDeleted {
                 note.deleted_seq = Some(l.seq);
             }
@@ -178,6 +183,12 @@ fn removable(
         if let Some(seq) = note.deleted_seq {
             // A deleted note: the line itself stays while it may not go.
             protected.insert(seq);
+        }
+        // The base path and flags of each young bookmark.
+        for (_, b) in consumers {
+            if !old(b.updated_at) {
+                protected.extend(note.note_lines.iter().rev().find(|&&s| s <= b.seq).copied());
+            }
         }
         for page in note.pages.values() {
             protected.extend(page.seqs.last().copied());
@@ -370,6 +381,30 @@ mod tests {
         // "agent" has seen only line 1, so lines 2 and 3 are still to be read; line 1 is
         // its base version and line 3 the base of "other".
         assert_eq!(f.seqs(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_bookmark_holds_its_note_level_base_line() {
+        let f = fixture();
+        let moved = |path: &str| {
+            let mut l = note_line(KEY, LineChange::NoteMoved, OLD);
+            l.path = Some(path.into());
+            l
+        };
+        f.append(vec![
+            page(KEY, "P1", LineChange::New, OLD), // 1: current text
+            moved("NOTE/Note/b.note"),             // 2: the path "agent" has seen
+            moved("NOTE/Note/c.note"),             // 3: newest note-level line
+            page(KEY, "P2", LineChange::New, OLD), // 4
+        ]);
+        f.bookmark("agent", 2, YOUNG);
+        f.prune(NOW);
+        // Line 2 is the base path of the next delta of "agent", so its oldPath is right.
+        assert_eq!(f.seqs(), vec![1, 2, 3, 4]);
+        f.bookmark("agent", 2, OLD);
+        std::fs::remove_file(f.store.dir().join(STAMP_FILE)).unwrap();
+        f.prune(NOW);
+        assert_eq!(f.seqs(), vec![1, 3, 4], "an old bookmark holds nothing");
     }
 
     #[test]

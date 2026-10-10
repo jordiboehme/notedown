@@ -81,7 +81,7 @@ fn setup(accounts: &[&str]) -> Data {
             LineChange::Edited,
             vec![
                 block("b1", "Meeting with Anne on Friday", &[]),
-                block("b4", "Flow: A then B then C", &["b3"]),
+                block("b4", "Flow: A then B then C on Friday", &["b3"]),
             ],
         ),
         page(
@@ -202,6 +202,8 @@ async fn every_tool_answers() {
 
     let delta = ok(&client, "get_changes", json!({"consumer": "crystalline"})).await;
     assert!(delta.contains("more: false"), "{delta}");
+    assert!(delta.contains("\nfrom: 0\n"), "{delta}");
+    assert!(delta.contains("\nupTo: 4\n"), "{delta}");
     assert!(delta.contains("Meeting with Anne on Friday"), "{delta}");
     assert!(delta.contains("### textNow"), "{delta}");
 
@@ -372,8 +374,28 @@ async fn search_notes_finds_all_words_in_a_block() {
         assert!(!none.contains("notedown://"), "{q}: {none}");
     }
 
-    let limited = ok(&client, "search_notes", json!({"query": "a", "limit": 1})).await;
+    // Whole words only; punctuation does not count.
+    let meet = ok(&client, "search_notes", json!({"query": "meet"})).await;
+    assert!(!meet.contains("notedown://"), "{meet}");
+    let flow = ok(&client, "search_notes", json!({"query": "flow: c"})).await;
+    assert!(flow.contains(&anchor(A, "b4")), "{flow}");
+
+    let both = ok(&client, "search_notes", json!({"query": "friday"})).await;
+    assert!(both.contains("hits[2]{"), "{both}");
+    let limited = ok(
+        &client,
+        "search_notes",
+        json!({"query": "friday", "limit": 1}),
+    )
+    .await;
     assert!(limited.contains("hits[1]{"), "{limited}");
+    let zero = err(
+        &client,
+        "search_notes",
+        json!({"query": "friday", "limit": 0}),
+    )
+    .await;
+    assert!(zero.contains("limit"), "{zero}");
 
     let empty = err(&client, "search_notes", json!({"query": "  "})).await;
     assert!(empty.contains("query"), "{empty}");
@@ -449,4 +471,85 @@ async fn a_deleted_note_reads_as_deleted() {
     assert!(status.contains("notes: 1"), "{status}");
     let e = err(&client, "get_note", json!({"note": GARDEN})).await;
     assert!(e.contains("deleted"), "{e}");
+}
+
+#[tokio::test]
+async fn get_block_follows_a_re_keyed_note() {
+    const OLD: &str = "path:0123456789abcdef0123456789abcdef";
+    const NEW: &str = "path:fedcba9876543210fedcba9876543210";
+    let d = setup(&[SLUG]);
+    {
+        let w = WriterLock::take(&d.data).unwrap();
+        let store = TextStore::open_writer(&d.data, SLUG, &w).unwrap();
+        let mut moved = LogLine::new(NEW, LineChange::NoteMoved);
+        moved.old_note = Some(OLD.into());
+        moved.path = Some("Notes/Work/Budget.note".into());
+        moved.old_path = Some("Notes/Budget.note".into());
+        let mut lines = vec![
+            // seq 5
+            page(
+                OLD,
+                "Notes/Budget.note",
+                LineChange::New,
+                vec![
+                    block("b1", "Budget for Q3", &[]),
+                    block("b2", "an old idea", &[]),
+                ],
+            ),
+            // seq 6
+            moved,
+            // seq 7
+            page(
+                NEW,
+                "Notes/Work/Budget.note",
+                LineChange::Edited,
+                vec![block("b1", "Budget for Q3", &[])],
+            ),
+        ];
+        store.append(&w, &mut lines).unwrap();
+        store.repair(&w).unwrap();
+        assert!(store.note(OLD).unwrap().is_none());
+        assert!(store.note(NEW).unwrap().is_some());
+    }
+    let client = connect(&d.data, None).await;
+    let current = ok(&client, "get_block", json!({"anchor": anchor(OLD, "b1")})).await;
+    assert!(current.contains("the note moved"), "{current}");
+    assert!(current.contains(&anchor(NEW, "b1")), "{current}");
+    assert!(current.contains("Budget for Q3"), "{current}");
+
+    let gone = ok(&client, "get_block", json!({"anchor": anchor(OLD, "b2")})).await;
+    assert!(gone.contains(&anchor(NEW, "b2")), "{gone}");
+    assert!(gone.contains("deleted in version 7"), "{gone}");
+    assert!(gone.contains("an old idea"), "{gone}");
+
+    // The new key answers without the move note.
+    let new = ok(&client, "get_block", json!({"anchor": anchor(NEW, "b1")})).await;
+    assert!(
+        !new.contains("moved") && new.contains("Budget for Q3"),
+        "{new}"
+    );
+}
+
+#[tokio::test]
+async fn a_state_behind_the_log_is_an_error_not_a_deletion() {
+    let d = setup(&[SLUG]);
+    {
+        let w = WriterLock::take(&d.data).unwrap();
+        let store = TextStore::open_writer(&d.data, SLUG, &w).unwrap();
+        // A crash between the log line and the note state: no save, no repair.
+        let mut lines = [page(
+            B,
+            GARDEN,
+            LineChange::Edited,
+            vec![
+                block("b1", "Plant tomatoes in June\nand beans", &[]),
+                block("b9", "water daily", &[]),
+            ],
+        )];
+        store.append(&w, &mut lines).unwrap();
+    }
+    let client = connect(&d.data, None).await;
+    let e = err(&client, "get_block", json!({"anchor": anchor(B, "b9")})).await;
+    assert!(e.contains("seq 5") && e.contains("behind"), "{e}");
+    assert!(!e.contains("was deleted"), "{e}");
 }

@@ -11,7 +11,11 @@
 //!   the other notes. `summary` does not go with `notes`.
 //! - `get_block` of a block gone without successors names the version that dropped it: the
 //!   `seq` of the first line of its page (or the `note.deleted` line) after the newest line
-//!   that holds it. `textBefore` is the text of that newest line.
+//!   that holds it. `textBefore` is the text of that newest line. When no line dropped it,
+//!   the note state is behind the log: that is an error that says so.
+//! - `get_block` of an old key (a note keyed by its path that moved) follows the `note.moved`
+//!   lines with `oldNote` to the key now, answers for that key and names the new anchor. The
+//!   log lines under every old key count for the last text of a deleted block.
 //! - `list_notes` and `search_notes` leave deleted notes out. `folder` keeps the notes in that
 //!   folder and its subfolders; the folder of a note is its path up to the last `/`, as in the
 //!   manifest.
@@ -184,7 +188,7 @@ pub struct BlockParams {
 pub struct SearchParams {
     /// The words to find. Every word must occur in a block.
     pub query: String,
-    /// The most hits to give, 20 when left out.
+    /// The most hits to give, 1 or more, 20 when left out.
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -233,8 +237,8 @@ changed after a seq, a date, an RFC 3339 time or a duration like 3d.",
         description = "The changes of one range. Give one start: consumer (its bookmark), since \
 (a seq, date, time or duration) or from with upTo (a fixed range from a manifest). summary: true \
 gives only the manifest, without text. notes gives only these notes and needs from and upTo. The \
-range line of the answer says 'up to seq N', and that N is upTo. Ingest, call ack with upTo, and \
-repeat while more is true.",
+answer head has the fields from, upTo and more. Ingest, then call ack with the upTo field, and \
+repeat while more is true. With since, pass the previous upTo as since.",
         annotations(read_only_hint = true)
     )]
     async fn get_changes(
@@ -283,8 +287,8 @@ version that deleted it and its textBefore.",
 
     #[tool(
         description = "Word search over the current text of the notes. Every word of query must \
-occur in a block; case does not matter. Gives anchors with one line of context. limit is 20 when \
-left out.",
+occur as a whole word in a block; case and punctuation do not matter. Gives anchors with one \
+line of context. limit is 20 when left out.",
         annotations(read_only_hint = true)
     )]
     async fn search_notes(
@@ -578,6 +582,50 @@ impl NotesServer {
                 message: format!("{:?} is no note key", a.key),
             });
         }
+        // A note keyed by its path gets a new key when it moves: follow the moves to its key now.
+        let keys = self.key_chain(a.key)?;
+        let key = keys.last().map_or(a.key, String::as_str);
+        let answer = self.block_answer(key, &keys, a.page, a.block)?;
+        if key == a.key {
+            return Ok(answer);
+        }
+        Ok(format!(
+            "the note moved: {} is now {}.\n{answer}",
+            self.anchor(a.key, a.page, a.block),
+            self.anchor(key, a.page, a.block)
+        ))
+    }
+
+    /// `key` and every key it got by later moves (`note.moved` with `oldNote`), in log order.
+    fn key_chain(&self, key: &str) -> crate::Result<Vec<String>> {
+        let mut keys = vec![key.to_string()];
+        self.store.read_log(0, None, &mut |line| {
+            if line.change == LineChange::NoteMoved
+                && line.old_note.as_deref() == keys.last().map(String::as_str)
+                && line.old_note.as_deref() != Some(line.note.as_str())
+            {
+                keys.push(line.note);
+            }
+            Ok(())
+        })?;
+        Ok(keys)
+    }
+
+    /// The answer of `get_block` for block `block` of note `key` (its key now); `keys` holds
+    /// the keys the note had, whose log lines count too.
+    fn block_answer(
+        &self,
+        key: &str,
+        keys: &[String],
+        page_id: &str,
+        block: &str,
+    ) -> crate::Result<String> {
+        let a = Anchor {
+            slug: &self.slug,
+            key,
+            page: page_id,
+            block,
+        };
         let stored = self.store.note(a.key)?;
         // A deleted note keeps its last blocks in the state; they are not current.
         if let Some(state) = stored.as_ref().filter(|s| !s.deleted) {
@@ -628,17 +676,22 @@ impl NotesServer {
                 return Ok(out);
             }
         }
-        self.deleted_block(&a, stored.as_ref())
+        self.deleted_block(&a, keys, stored.as_ref())
     }
 
     /// A block that is not in the note now and has no successors: its last text from the log.
-    fn deleted_block(&self, a: &Anchor<'_>, state: Option<&NoteState>) -> crate::Result<String> {
+    fn deleted_block(
+        &self,
+        a: &Anchor<'_>,
+        keys: &[String],
+        state: Option<&NoteState>,
+    ) -> crate::Result<String> {
         // The newest line holding the block: (seq, page id, text); then the version that
         // dropped it.
         let mut held: Option<(u64, String, String)> = None;
         let mut dropped: Option<u64> = None;
         self.store.read_log(0, None, &mut |line| {
-            if line.note != a.key {
+            if !keys.contains(&line.note) {
                 return Ok(());
             }
             if let Some(b) = line.blocks.iter().find(|b| b.id == a.block) {
@@ -662,12 +715,19 @@ impl NotesServer {
             Ok(())
         })?;
         let here = self.anchor(a.key, a.page, a.block);
-        if let Some((_, _, text)) = held {
-            let when = dropped.map_or(String::new(), |seq| format!(" in version {seq}"));
-            return Ok(format!(
-                "{here} was deleted{when}.\ntextBefore:\n{}",
-                text.trim_end()
-            ));
+        if let Some((seq, _, text)) = held {
+            return match dropped {
+                Some(version) => Ok(format!(
+                    "{here} was deleted in version {version}.\ntextBefore:\n{}",
+                    text.trim_end()
+                )),
+                // The log holds the block in its newest page version, the note state does not:
+                // the state is behind the log until the pipeline repairs it.
+                None => Err(PipelineError::Read(format!(
+                    "{here} is not in the note state, but the newest version of its page (seq \
+{seq}) still holds it; the note state is behind the log, run notedown pipeline and ask again"
+                ))),
+            };
         }
         let number = a
             .block
@@ -684,7 +744,12 @@ impl NotesServer {
     }
 
     fn search_text(&self, query: &str, limit: Option<usize>) -> crate::Result<String> {
-        let hits = search::search(&self.store, query, limit.unwrap_or(search::DEFAULT_LIMIT))?;
+        let hits = search::search(
+            &self.store,
+            &self.slug,
+            query,
+            limit.unwrap_or(search::DEFAULT_LIMIT),
+        )?;
         let values: Vec<Value> = hits
             .iter()
             .map(|h| serde_json::to_value(h).unwrap_or(Value::Null))

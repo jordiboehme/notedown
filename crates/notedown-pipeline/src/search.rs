@@ -1,10 +1,13 @@
 //! The word search of `search_notes` (spec 6): over the current block texts of the notes that
 //! are not deleted.
 //!
-//! A query is split at white space into words. A block matches when every word occurs in its
-//! text, case-insensitive, also inside a longer word (`meet` finds `Meeting`). A hit is the
-//! anchor of the block plus one line of context: the first line of the block that holds a
-//! query word.
+//! A query and a block text are split into words at every character that is not a letter or
+//! a digit, so punctuation does not count, and compared case-insensitive. A block matches when
+//! every query word is one of its words (`meet` does not find `Meeting`, `flow` finds `Flow:`).
+//! A hit is the anchor of the block plus one line of context: the first line of the block that
+//! holds a query word.
+
+use std::collections::BTreeSet;
 
 use serde::Serialize;
 
@@ -31,23 +34,29 @@ pub struct Hit {
     pub context: String,
 }
 
-/// The blocks of `store` that hold every word of `query`, in note and page order, at most
-/// `limit` (at least one).
-pub fn search(store: &TextStore, query: &str, limit: usize) -> Result<Vec<Hit>> {
-    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-    if words.is_empty() {
+/// The lowercase words of `text`: the runs of letters and digits.
+fn words(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+}
+
+/// The blocks of `store` (account `slug`) that hold every word of `query`, in note and page
+/// order, at most `limit`.
+pub fn search(store: &TextStore, slug: &str, query: &str, limit: usize) -> Result<Vec<Hit>> {
+    let query: BTreeSet<String> = words(query).collect();
+    if query.is_empty() {
         return Err(Error::Invalid {
             what: "query",
             message: "give at least one word".into(),
         });
     }
-    let limit = limit.max(1);
-    let slug = store
-        .dir()
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_string();
+    if limit == 0 {
+        return Err(Error::Invalid {
+            what: "limit",
+            message: "give 1 or more".into(),
+        });
+    }
     let mut hits = Vec::new();
     for note in store.notes()? {
         if note.deleted {
@@ -55,8 +64,8 @@ pub fn search(store: &TextStore, query: &str, limit: usize) -> Result<Vec<Hit>> 
         }
         for (i, page) in note.pages.iter().enumerate() {
             for block in &page.blocks {
-                let lower = block.text.to_lowercase();
-                if !words.iter().all(|w| lower.contains(w.as_str())) {
+                let have: BTreeSet<String> = words(&block.text).collect();
+                if !query.is_subset(&have) {
                     continue;
                 }
                 hits.push(Hit {
@@ -66,7 +75,7 @@ pub fn search(store: &TextStore, query: &str, limit: usize) -> Result<Vec<Hit>> 
                     ),
                     note: note.title.clone(),
                     page: i + 1,
-                    context: context(&block.text, &words),
+                    context: context(&block.text, &query),
                 });
                 if hits.len() == limit {
                     return Ok(hits);
@@ -78,13 +87,10 @@ pub fn search(store: &TextStore, query: &str, limit: usize) -> Result<Vec<Hit>> 
 }
 
 /// The first line of `text` that holds one of `words`, trimmed and cut to [`CONTEXT_CHARS`].
-fn context(text: &str, words: &[String]) -> String {
+fn context(text: &str, query: &BTreeSet<String>) -> String {
     let line = text
         .lines()
-        .find(|l| {
-            let lower = l.to_lowercase();
-            words.iter().any(|w| lower.contains(w.as_str()))
-        })
+        .find(|l| words(l).any(|w| query.contains(&w)))
         .or_else(|| text.lines().next())
         .unwrap_or_default()
         .trim();
@@ -100,22 +106,32 @@ fn context(text: &str, words: &[String]) -> String {
 mod tests {
     use super::*;
 
-    fn words(q: &str) -> Vec<String> {
-        q.split_whitespace().map(str::to_lowercase).collect()
+    fn q(text: &str) -> BTreeSet<String> {
+        words(text).collect()
     }
 
     #[test]
     fn the_context_is_the_first_line_with_a_word() {
         let text = "Plant tomatoes\n  and BEANS in June  \nbeans again";
-        assert_eq!(context(text, &words("beans")), "and BEANS in June");
+        assert_eq!(context(text, &q("beans")), "and BEANS in June");
         // A word spread over two lines still gives the first line that holds one of them.
-        assert_eq!(context(text, &words("june plant")), "Plant tomatoes");
+        assert_eq!(context(text, &q("june plant")), "Plant tomatoes");
+    }
+
+    #[test]
+    fn words_drop_punctuation_and_case() {
+        assert_eq!(
+            words("Flow: A-then (B), Über!").collect::<Vec<_>>(),
+            ["flow", "a", "then", "b", "über"]
+        );
+        // A whole word only: `meet` is no word of this line.
+        assert!(!q("Meeting with Anne").contains("meet"));
     }
 
     #[test]
     fn a_long_line_is_cut() {
         let text = "word ".repeat(100);
-        let c = context(&text, &words("word"));
+        let c = context(&text, &q("word"));
         assert!(c.ends_with("..."), "{c}");
         assert!(c.chars().count() <= CONTEXT_CHARS + 3, "{c}");
     }

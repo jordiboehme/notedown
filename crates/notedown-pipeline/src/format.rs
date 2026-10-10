@@ -96,6 +96,10 @@ pub fn delta_text(delta: &Delta) -> String {
     let range = format!("{}: {}", delta.range_text, summary(delta));
     out.push_str(&line("range", range.into()));
     out.push('\n');
+    out.push_str(&line("from", delta.from.into()));
+    out.push('\n');
+    out.push_str(&line("upTo", delta.up_to.into()));
+    out.push('\n');
     out.push_str(&line("more", delta.more.into()));
     out.push('\n');
     out.push_str(&line("legend", LEGEND.into()));
@@ -393,6 +397,8 @@ mod tests {
     fn the_delta_text_matches_the_spec_example() {
         let want = "\
 range: \"since your last confirm on 2026-10-08 21:14 +02:00 (seq 412) up to seq 455: 1 page changed in 1 note\"
+from: 412
+upTo: 455
 more: false
 legend: \"textBefore is the text when you last confirmed (or at your since); wordDiff: [-...-] removed, [+...+] added\"
 notes[1]{key,title,path,change,pending,oldNote,oldPath,keywords,links}:

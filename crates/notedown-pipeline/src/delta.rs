@@ -29,6 +29,11 @@
 //!   `new` when no page has text yet, else `edited`) only in an answer that reaches the end of
 //!   the log (`more: false`), so a loop lists them once. A pending page never holds back
 //!   `up_to`.
+//! - A page whose OCR failed after every try (spec 4.4) is listed the same way, in an answer
+//!   that reaches the end of the log: a page entry with `failed: true`, no text, and the
+//!   device's recognition text of the page when the note has one. A page that also changed in
+//!   the range keeps its entry and gets the mark. It is listed in every such answer until the
+//!   page reads again.
 //! - Dates in `rangeText` and `beforeUnknown` are local times with their offset
 //!   (`2026-10-08 23:14 +02:00`); the caller passes the offset (ruling of fix round 1).
 //! - A note whose last text went with page deletions (its other pages still pending) is
@@ -149,6 +154,20 @@ pub struct PageDelta {
     /// The blocks in `text_now` that were not there before (they have no entry).
     #[serde(skip)]
     pub new_blocks: usize,
+    /// OCR failed on the page's newest ink after every try (spec 4.4): nothing of it is in
+    /// `text_now`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub failed: bool,
+    /// The device's own recognition text of a failed page, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_text: Option<String>,
+}
+
+impl PageDelta {
+    /// A page listed only because its OCR failed: no text change in the range.
+    pub fn only_failed(&self) -> bool {
+        self.failed && self.text_now.is_empty() && self.what_changed.is_empty()
+    }
 }
 
 /// The change of one block.
@@ -195,6 +214,8 @@ pub struct ManifestNote {
     /// Changed blocks: the `whatChanged` entries and the new blocks.
     pub blocks: usize,
     pub pending: bool,
+    /// A page of the note could not be read (spec 4.4).
+    pub failed: bool,
     /// The size of the note's delta: the characters of its texts.
     pub chars: usize,
 }
@@ -213,13 +234,14 @@ pub fn manifest(store: &TextStore, start: &Start, local: UtcOffset) -> Result<Ma
                 .rsplit_once('/')
                 .map_or(String::new(), |(f, _)| f.to_string()),
             change: n.change,
-            pages: n.pages.len(),
+            pages: n.pages.iter().filter(|p| !p.only_failed()).count(),
             blocks: n
                 .pages
                 .iter()
                 .map(|p| p.what_changed.len() + p.new_blocks)
                 .sum(),
             pending: n.pending,
+            failed: n.pages.iter().any(|p| p.failed),
             chars: note_chars(n),
         })
         .collect();
@@ -510,8 +532,25 @@ pub fn delta(
     }
     if !more {
         for state in store.notes()? {
-            let listed = out.iter().any(|n: &NoteDelta| n.key == state.key);
-            if listed || !wanted(&state.key) || !pending(&state) {
+            if !wanted(&state.key) || state.deleted || state.unscoped {
+                continue;
+            }
+            let failed = failed_pages(&state);
+            if let Some(n) = out.iter_mut().find(|n| n.key == state.key) {
+                for f in failed {
+                    match n.pages.iter_mut().find(|p| p.page_id == f.page_id) {
+                        Some(p) => {
+                            p.failed = true;
+                            p.device_text = f.device_text;
+                        }
+                        None => n.pages.push(f),
+                    }
+                }
+                n.pages.sort_by_key(|p| p.page);
+                continue;
+            }
+            let is_pending = pending(&state);
+            if !is_pending && failed.is_empty() {
                 continue;
             }
             let change = if state.pages.iter().any(|p| p.seq.is_some()) {
@@ -528,8 +567,8 @@ pub fn delta(
                 keywords: state.meta.keywords.clone(),
                 links: state.meta.links.clone(),
                 change,
-                pending: true,
-                pages: Vec::new(),
+                pending: is_pending,
+                pages: failed,
             });
         }
     }
@@ -548,6 +587,30 @@ fn pending(state: &NoteState) -> bool {
     !state.deleted
         && !state.unscoped
         && state.pages.iter().any(|p| p.state == PageOcrState::Pending)
+}
+
+/// The failed pages of a note (spec 4.4): no text, the device's recognition text if any.
+fn failed_pages(state: &NoteState) -> Vec<PageDelta> {
+    state
+        .pages
+        .iter()
+        .filter(|p| p.state == PageOcrState::Failed)
+        .map(|p| PageDelta {
+            page: p.position + 1,
+            page_id: p.page_id.clone(),
+            change: if p.seq.is_some() {
+                Change::Edited
+            } else {
+                Change::New
+            },
+            signal: Vec::new(),
+            text_now: Vec::new(),
+            what_changed: Vec::new(),
+            new_blocks: 0,
+            failed: true,
+            device_text: state.meta.recognition.get(&p.page_id).cloned(),
+        })
+        .collect()
 }
 
 /// The delta of the note `key` from its `lines` up to `up_to`; `None` when there is nothing
@@ -643,6 +706,8 @@ fn note_delta(
                     before_unknown: Some(format!("no versions before {}", stamp(ts, ctx.local))),
                 }],
                 new_blocks: 0,
+                failed: false,
+                device_text: None,
             });
             continue;
         }
@@ -654,6 +719,8 @@ fn note_delta(
             text_now,
             what_changed,
             new_blocks,
+            failed: false,
+            device_text: None,
         };
         match (b.text, n.text) {
             (None, None) => {}

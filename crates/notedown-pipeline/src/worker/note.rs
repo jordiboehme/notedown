@@ -1,7 +1,8 @@
 //! Reading one due note: metadata, page moves and deletions, then page by page OCR, each page
 //! written at once (spec 2.2, 3, 4.4).
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use notedown_cloud::appdata::Digest;
@@ -40,6 +41,21 @@ pub(super) struct NoteJob<'a> {
     pub digests: &'a [Digest],
     pub now: &'a dyn Fn() -> u64,
     pub mode: Mode,
+    /// The pages already reported as missing from their note file (see [`first_notice`]).
+    pub told_missing: &'a RefCell<BTreeSet<String>>,
+}
+
+/// Whether a page missing from its note file is told now: once per page and note record
+/// (`md5`), so a pass that finds it missing again stays quiet until the record changes.
+fn first_notice(
+    told: &RefCell<BTreeSet<String>>,
+    slug: &str,
+    key: &str,
+    page_id: &str,
+    md5: &str,
+) -> bool {
+    told.borrow_mut()
+        .insert(format!("{slug}/{key}/{page_id}/{md5}"))
 }
 
 /// The index in `nb` of the page the record calls `page_id`: `<PAGEID>`, `<PAGEID>#<n>` for
@@ -198,10 +214,12 @@ pub(super) fn process(
             Some(PageWork::Read) => {}
         }
         let Some(index) = page_index(&nb, &fp.page_id) else {
-            eprintln!(
-                "notedown pipeline: {}: page {} is not in the note file (yet)",
-                r.path, fp.page_id
-            );
+            if first_notice(job.told_missing, slug, key, &fp.page_id, &r.md5) {
+                eprintln!(
+                    "notedown pipeline: {}: page {} is not in the note file (yet)",
+                    r.path, fp.page_id
+                );
+            }
             continue;
         };
         if state.pages[i].state == PageOcrState::Failed {
@@ -334,6 +352,16 @@ fn mark_failed(page: &mut PageState, fp: &PageFingerprint) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_page_is_told_once_per_record() {
+        let told = RefCell::default();
+        assert!(first_notice(&told, "me", "F1", "P1", "aaa"));
+        assert!(!first_notice(&told, "me", "F1", "P1", "aaa"));
+        assert!(first_notice(&told, "me", "F1", "P2", "aaa"));
+        // A new record of the note: told again.
+        assert!(first_notice(&told, "me", "F1", "P1", "bbb"));
+    }
 
     #[test]
     fn record_page_ids_find_their_page() {

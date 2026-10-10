@@ -940,3 +940,65 @@ fn dates_show_the_local_offset() {
         Some("no versions before 2026-07-01 10:30 +02:00")
     );
 }
+
+#[test]
+fn a_failed_page_is_listed_as_unreadable_with_the_device_text() {
+    let f = fx();
+    f.add(vec![
+        page(A, "P1", LineChange::New, vec![b("b1", "read")]),
+        page(B, "P1", LineChange::New, vec![b("b1", "other")]),
+    ]);
+    f.state(
+        A,
+        vec![
+            ("P1", PageOcrState::Done, Some(1)),
+            ("P2", PageOcrState::Failed, None),
+        ],
+    );
+    let mut a = f.store.note(A).unwrap().unwrap();
+    a.meta
+        .recognition
+        .insert("P2".into(), "device words".into());
+    f.store.save_note(&f.w, &a).unwrap();
+    f.state(B, vec![("P1", PageOcrState::Done, Some(2))]);
+    // A note whose only page failed and that has no text in the log.
+    f.state(C, vec![("P1", PageOcrState::Failed, None)]);
+
+    let d = f.delta(&bookmark("c"));
+    assert_eq!((d.up_to, d.more), (2, false));
+    let a = note(&d, A);
+    assert!(!a.pending);
+    let pages: Vec<(&str, bool)> = a
+        .pages
+        .iter()
+        .map(|p| (p.page_id.as_str(), p.failed))
+        .collect();
+    assert_eq!(pages, [("P1", false), ("P2", true)]);
+    let p2 = &a.pages[1];
+    assert_eq!(p2.page, 2);
+    assert_eq!(p2.device_text.as_deref(), Some("device words"));
+    assert!(p2.text_now.is_empty() && p2.what_changed.is_empty());
+    assert!(note(&d, B).pages.iter().all(|p| !p.failed));
+    let c = note(&d, C);
+    assert_eq!(c.change, Change::New);
+    assert!(!c.pending);
+    assert_eq!(c.pages.len(), 1);
+    assert!(c.pages[0].failed);
+    assert_eq!(c.pages[0].device_text, None);
+    let json = serde_json::to_string(&d).unwrap();
+    assert!(json.contains(r#""failed":true"#), "{json}");
+    assert!(json.contains(r#""deviceText":"device words""#), "{json}");
+
+    // The manifest: `failed` per note; a failed page is no changed page.
+    let m = manifest(&f.store, &bookmark("c"), UtcOffset::UTC).unwrap();
+    let row = |key: &str| m.notes.iter().find(|n| n.key == key).unwrap();
+    assert_eq!((row(A).pages, row(A).failed), (1, true));
+    assert_eq!((row(B).pages, row(B).failed), (1, false));
+    assert_eq!((row(C).pages, row(C).blocks, row(C).failed), (0, 0, true));
+
+    // An answer that does not reach the end of the log lists no failed page.
+    let cut = delta(&f.store, &bookmark("c"), None, 1, UtcOffset::UTC).unwrap();
+    assert!(cut.more);
+    assert!(cut.notes.iter().all(|n| n.pages.iter().all(|p| !p.failed)));
+    assert!(cut.notes.iter().all(|n| n.key != C));
+}

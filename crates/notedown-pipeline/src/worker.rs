@@ -16,7 +16,8 @@
 mod due;
 mod note;
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -173,6 +174,9 @@ pub struct Worker {
     cfg: PipelineConfig,
     engine: EngineSlot,
     clock: Arc<dyn Clock>,
+    /// The pages already reported as missing from their note file, so each is told once
+    /// until its record changes.
+    told_missing: RefCell<BTreeSet<String>>,
 }
 
 impl Worker {
@@ -204,6 +208,7 @@ impl Worker {
                 last_used: 0,
             },
             clock: Arc::new(SystemClock),
+            told_missing: RefCell::default(),
         }
     }
 
@@ -273,6 +278,7 @@ impl Worker {
                     digests: &digests,
                     now: &|| clock.now_ms(),
                     mode: Mode::Reocr,
+                    told_missing: &self.told_missing,
                 };
                 note::process(
                     &job,
@@ -494,6 +500,7 @@ impl Worker {
                 digests,
                 now: &now_fn,
                 mode: Mode::Due,
+                told_missing: &self.told_missing,
             };
             match note::process(&job, &mut self.engine, d, &mut progress, &mut report, stop) {
                 Ok(()) => {}

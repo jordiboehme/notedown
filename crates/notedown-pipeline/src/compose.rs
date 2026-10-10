@@ -24,9 +24,11 @@
 //!   3, ownership or the net; below 0.8 it takes the new reading and counts a
 //!   `region_missed` (once). Three exceptions take the matched reading's
 //!   text instead of the old bytes, compared on words (markdown hard breaks,
-//!   punctuation and case stripped): the reading holds new ink (a line whose
-//!   similarity to every old line is below 0.5, or at least 3 more words
-//!   than the old text), because the old bytes would lose it; words of the
+//!   punctuation and case stripped, words read in pieces joined): the
+//!   reading holds new ink (a line more than half of whose words the old
+//!   text holds less often than the reading, or at least 3 more words than
+//!   the old text), because the old bytes would lose it; a line break at
+//!   another word or a misread word inside a line is no new ink; words of the
 //!   old text that the reading lacks turned up in another taken reading that
 //!   overlaps the block (at least 2 of them, or the word of a one-word old
 //!   line), because the old bytes would show that line twice; and a merge
@@ -36,7 +38,8 @@
 //!   nothing. Known limits, accepted: a re-read line whose words are misread
 //!   in the other reading can appear twice; a short common word in an
 //!   overlapping taken reading can count as moved, so the block takes its
-//!   close reading without need. Only an unmatched block is removed and goes
+//!   close reading without need; a misread one-word line counts as new ink.
+//!   Only an unmatched block is removed and goes
 //!   into `replaces`. Owning a taken reading also pulls in the paragraph
 //!   whose last line was re-read with new ink below it, so the word rule
 //!   above can see both readings and that line does not appear twice.
@@ -66,6 +69,8 @@
 //!   step from one version to the next; the note state keeps the history.
 //! - A matched block whose text is the same after normalization keeps its old
 //!   text bytes. When the whole page is unchanged, `blocks` are the old blocks.
+
+use std::collections::HashMap;
 
 use crate::model::Block;
 use crate::region::{Rect, Region, block_rect};
@@ -138,12 +143,12 @@ fn owner_of(new: &Rect, old: &[Rect]) -> Option<usize> {
     best.map(|(i, _, _)| i)
 }
 
-/// A reading line this far from every old line is new ink.
-const NEW_LINE: f32 = 0.5;
-/// This many more words than the old text is new ink too.
+/// This many more words than the old text (split words joined) is new ink.
 const NEW_WORDS: usize = 3;
 /// This many old words found in another reading mean a line moved there.
 const MOVED_WORDS: usize = 2;
+/// At most this many adjacent pieces are joined into one split word.
+const MAX_PIECES: usize = 3;
 
 /// The words of a line for the keep-old check: without the markdown hard
 /// break (a trailing `\`), punctuation and case.
@@ -169,26 +174,81 @@ fn take_word(pool: &mut Vec<String>, word: &str) -> bool {
         .is_some()
 }
 
+/// How often each word occurs.
+fn counts<'a>(words: impl Iterator<Item = &'a String>) -> HashMap<&'a str, usize> {
+    let mut out: HashMap<&str, usize> = HashMap::new();
+    for w in words {
+        *out.entry(w.as_str()).or_default() += 1;
+    }
+    out
+}
+
+/// The reading lines with split words joined: adjacent pieces (`an na`)
+/// whose concatenation is a word the old text holds more often than the
+/// reading become that word. Longer joins go first.
+fn join_splits(lines: Vec<Vec<String>>, old: &HashMap<&str, usize>) -> Vec<Vec<String>> {
+    let mut read: HashMap<String, usize> = HashMap::new();
+    for w in lines.iter().flatten() {
+        *read.entry(w.clone()).or_default() += 1;
+    }
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let mut joined_line = Vec::with_capacity(line.len());
+        let mut i = 0;
+        while i < line.len() {
+            let join = (2..=MAX_PIECES.min(line.len() - i)).rev().find_map(|k| {
+                let joined: String = line[i..i + k].concat();
+                let lacks = old.get(joined.as_str()).copied().unwrap_or(0)
+                    > read.get(&joined).copied().unwrap_or(0);
+                lacks.then_some((k, joined))
+            });
+            match join {
+                Some((k, joined)) => {
+                    for piece in &line[i..i + k] {
+                        if let Some(c) = read.get_mut(piece) {
+                            *c = c.saturating_sub(1);
+                        }
+                    }
+                    *read.entry(joined.clone()).or_default() += 1;
+                    joined_line.push(joined);
+                    i += k;
+                }
+                None => {
+                    joined_line.push(line[i].clone());
+                    i += 1;
+                }
+            }
+        }
+        out.push(joined_line);
+    }
+    out
+}
+
 /// Whether the matched reading of a block outside the region wins over the
-/// old bytes, compared on words: it holds new ink (a line unlike every old
-/// line, or `NEW_WORDS` more words), or words of the old text that it lacks
-/// turned up in `others`, the other taken readings over the block (at least
+/// old bytes, compared on words with split words joined (`join_splits`): it
+/// holds new ink, or words of the old text that it lacks turned up in
+/// `others`, the other taken readings over the block (at least
 /// `MOVED_WORDS` of them, or the word of a one-word old line).
+///
+/// New ink is a reading line most of whose words (more than half) the old
+/// text cannot explain, or `NEW_WORDS` more words than the old text. A word
+/// counts as unexplained when the reading holds it more often than the old
+/// text, wherever it stands, so a new line above the re-read lines is found
+/// like one below them. A line break at another word, a misread word inside
+/// a line and words read in pieces are no new ink.
 fn reading_wins(old: &str, reading: &str, others: &[&str]) -> bool {
     let old_lines = line_words(old);
-    let new_lines = line_words(reading);
     let old_words: Vec<&str> = old_lines.iter().flatten().map(String::as_str).collect();
+    let old_count = counts(old_lines.iter().flatten());
+    let new_lines = join_splits(line_words(reading), &old_count);
     let mut new_words: Vec<String> = new_lines.iter().flatten().cloned().collect();
     if new_words.len() >= old_words.len() + NEW_WORDS {
         return true;
     }
-    let unlike_every_old_line = |line: &Vec<String>| {
-        let line = line.join(" ");
-        old_lines
-            .iter()
-            .all(|o| similarity(&line, &o.join(" ")) < NEW_LINE)
-    };
-    if new_lines.iter().any(unlike_every_old_line) {
+    let new_count = counts(new_lines.iter().flatten());
+    let surplus = |w: &str| new_count[w] > old_count.get(w).copied().unwrap_or(0);
+    let new_line = |line: &Vec<String>| line.iter().filter(|w| surplus(w)).count() * 2 > line.len();
+    if new_lines.iter().any(new_line) {
         return true;
     }
     let mut elsewhere: Vec<String> = others
@@ -1496,5 +1556,82 @@ mod tests {
         assert!(!c.unchanged);
         assert_eq!(c.region_missed, 0);
         assert_eq!(next, 3);
+    }
+
+    /// b1 outside the region owns a grazing new line, so it joins the match
+    /// pool with its own `reading` (as in `a_new_line_grazing_a_block_keeps_its_bytes`).
+    fn grazed(first: &str, reading: &str) -> Composed {
+        assert!(
+            similarity(first, reading) >= SAFETY_NET,
+            "{first:?} / {reading:?}"
+        );
+        let olds = [old("b1", "Text", [100, 100, 900, 200], first)];
+        let news = [
+            new("Text", [100, 100, 900, 198], reading),
+            new("Text", [100, 195, 900, 260], "Call the bank"),
+        ];
+        let mut next = 2;
+        let c = compose(
+            &olds,
+            &news,
+            &region(&[[150, 210, 800, 250]]),
+            PAGE,
+            &mut next,
+        );
+        assert_eq!(c.blocks.len(), 2);
+        assert_eq!(c.blocks[0], olds[0]);
+        assert_eq!(texts(&c)[1], ("b2", "Call the bank"));
+        assert_eq!(c.region_missed, 0);
+        assert_eq!(next, 3);
+        c
+    }
+
+    #[test]
+    fn a_line_rebreak_of_a_close_reading_keeps_the_bytes() {
+        // The reading breaks the two lines at another word: no new ink.
+        grazed(
+            "Meeting with Anna on Friday about the budget.\\\nand the plan",
+            "Meeting with Anna on\\\nFriday about the budget and the plan",
+        );
+    }
+
+    #[test]
+    fn split_words_in_a_close_reading_keep_the_bytes() {
+        // Three words read in two pieces each: no new words.
+        grazed(
+            "Meeting with Anna on Friday about the budget.",
+            "Meet ing with An na on Fri day about the budget.",
+        );
+    }
+
+    #[test]
+    fn a_one_character_misread_keeps_the_bytes() {
+        // "A" read as "4" inside a line of several words.
+        grazed(
+            "Plan A for Monday with the whole team.\\\nCall Bob about it",
+            "Plan 4 for Monday with the whole team.\\\nCall Bob about it",
+        );
+    }
+
+    #[test]
+    fn a_new_line_above_the_reread_lines_is_not_lost() {
+        // Like x07, with the new line first: it shares "line" with the old
+        // text, which must not hide it.
+        let paragraph = "Line one.\nLine two.\nLine three.\nLine four.\nLine five.\nLine six.";
+        let with_new =
+            "New line.\nLine one.\nLine two.\nLine three.\nLine four.\nLine five.\nLine six.";
+        assert!(similarity(paragraph, with_new) >= SAFETY_NET);
+        let olds = [old("b1", "Text", [100, 100, 900, 700], paragraph)];
+        let news = [new("Text", [100, 20, 900, 700], with_new)];
+        let mut next = 2;
+        let c = compose(
+            &olds,
+            &news,
+            &region(&[[100, 20, 900, 90]]),
+            PAGE,
+            &mut next,
+        );
+        assert_eq!(texts(&c), [("b1", with_new)]);
+        assert_eq!(c.region_missed, 0);
     }
 }

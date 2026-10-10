@@ -25,15 +25,28 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-/// "4 pages changed in 2 notes, 1 note pending".
+/// The changed pages of a note: not those listed only because their OCR failed.
+fn changed_pages(n: &NoteDelta) -> usize {
+    n.pages.iter().filter(|p| !p.only_failed()).count()
+}
+
+/// "4 pages changed in 2 notes, 1 note pending, 1 page unreadable".
 fn summary(delta: &Delta) -> String {
-    let pages: usize = delta.notes.iter().map(|n| n.pages.len()).sum();
+    let pages: usize = delta.notes.iter().map(changed_pages).sum();
     let changed = delta
         .notes
         .iter()
-        .filter(|n| !(n.pending && n.pages.is_empty()))
+        .filter(|n| {
+            let listed_for_state = n.pending || n.pages.iter().any(|p| p.failed);
+            !(listed_for_state && changed_pages(n) == 0)
+        })
         .count();
     let pending = delta.notes.iter().filter(|n| n.pending).count();
+    let unreadable: usize = delta
+        .notes
+        .iter()
+        .map(|n| n.pages.iter().filter(|p| p.failed).count())
+        .sum();
     let mut out = if pages == 0 && changed == 0 {
         "no page changed".to_string()
     } else {
@@ -46,7 +59,19 @@ fn summary(delta: &Delta) -> String {
     if pending > 0 {
         let _ = write!(out, ", {} pending", plural(pending, "note", "notes"));
     }
+    if unreadable > 0 {
+        let _ = write!(out, ", {} unreadable", plural(unreadable, "page", "pages"));
+    }
     out
+}
+
+/// The name of a note in the body headings and the blocks table: its folder and title
+/// (`Work/Planview`), so two notes with one title are told apart.
+fn note_label(n: &NoteDelta) -> String {
+    match n.path.rsplit_once('/') {
+        Some((folder, _)) if !folder.is_empty() => format!("{folder}/{}", n.title),
+        _ => n.title.clone(),
+    }
 }
 
 fn line(key: &str, value: Value) -> String {
@@ -120,7 +145,7 @@ pub fn delta_text(delta: &Delta) -> String {
             for c in &p.what_changed {
                 let replaced = c.replaced_by.join(" ");
                 blocks.push(vec![
-                    json!(n.title),
+                    json!(note_label(n)),
                     json!(p.page),
                     json!(c.block),
                     json!(c.change),
@@ -146,7 +171,7 @@ fn note_body(out: &mut String, delta: &Delta, n: &NoteDelta) {
         if n.pending {
             what.push_str(", pending");
         }
-        let _ = writeln!(out, "\n## {} ({what})", n.title);
+        let _ = writeln!(out, "\n## {} ({what})", note_label(n));
         return;
     }
     for p in &n.pages {
@@ -156,10 +181,13 @@ fn note_body(out: &mut String, delta: &Delta, n: &NoteDelta) {
 
 fn page_body(out: &mut String, delta: &Delta, n: &NoteDelta, p: &PageDelta) {
     let mut what = change_word(p.change);
+    if p.failed {
+        what.push_str(", unreadable");
+    }
     if !p.signal.is_empty() {
         what.push_str(&format!("; {}", p.signal.join(", ")));
     }
-    let _ = writeln!(out, "\n## {}, page {} ({what})", n.title, p.page);
+    let _ = writeln!(out, "\n## {}, page {} ({what})", note_label(n), p.page);
     if !p.text_now.is_empty() {
         out.push_str("### textNow\n");
         let blocks: Vec<String> = p
@@ -180,6 +208,14 @@ fn page_body(out: &mut String, delta: &Delta, n: &NoteDelta, p: &PageDelta) {
     }
     for c in &p.what_changed {
         change_body(out, c);
+    }
+    if p.failed {
+        let device = p.device_text.as_deref().map(str::trim_end);
+        let _ = writeln!(
+            out,
+            "### unreadable\n{}",
+            device.filter(|t| !t.is_empty()).unwrap_or("no device text")
+        );
     }
 }
 
@@ -390,6 +426,8 @@ mod tests {
                     ],
                     what_changed: vec![edited, deleted, replaced],
                     new_blocks: 0,
+                    failed: false,
+                    device_text: None,
                 }],
             }],
         }
@@ -406,11 +444,11 @@ legend: \"textBefore is the text when you last confirmed (or at your since); wor
 notes[1]{key,title,path,change,pending,oldNote,oldPath,keywords,links}:
   F2024,Planview,NOTE/Note/Planview.note,edited,false,null,null,plan,null
 blocks[3]{note,page,block,change,replacedBy}:
-  Planview,3,\"notedown://jordi/F2024/P2024#b3\",edited,null
-  Planview,3,\"notedown://jordi/F2024/P2024#b5\",deleted,null
-  Planview,3,\"notedown://jordi/F2024/P2024#b4\",replaced,\"notedown://jordi/F2024/P2024#b7\"
+  NOTE/Note/Planview,3,\"notedown://jordi/F2024/P2024#b3\",edited,null
+  NOTE/Note/Planview,3,\"notedown://jordi/F2024/P2024#b5\",deleted,null
+  NOTE/Note/Planview,3,\"notedown://jordi/F2024/P2024#b4\",replaced,\"notedown://jordi/F2024/P2024#b7\"
 
-## Planview, page 3 (edited)
+## NOTE/Note/Planview, page 3 (edited)
 ### textNow
 <!-- notedown://jordi/F2024/P2024#b3 -->
 Meeting with Anne on Friday
@@ -460,6 +498,8 @@ Flow: A then B
             text_now: Vec::new(),
             what_changed: Vec::new(),
             new_blocks: 0,
+            failed: false,
+            device_text: None,
         });
         let text = delta_text(&d);
         assert!(
@@ -468,8 +508,71 @@ Flow: A then B
             ),
             "{text}"
         );
-        assert!(text.ends_with("## Planview, page 5 (moved)\n"), "{text}");
+        assert!(
+            text.ends_with("## NOTE/Note/Planview, page 5 (moved)\n"),
+            "{text}"
+        );
         assert!(text.contains("2 pages changed in 1 note"), "{text}");
+    }
+
+    #[test]
+    fn an_unreadable_page_shows_the_device_text() {
+        let mut d = planview();
+        let failed = |page: usize, id: &str, device: Option<&str>| PageDelta {
+            page,
+            page_id: id.into(),
+            change: Change::Edited,
+            signal: Vec::new(),
+            text_now: Vec::new(),
+            what_changed: Vec::new(),
+            new_blocks: 0,
+            failed: true,
+            device_text: device.map(str::to_string),
+        };
+        d.notes[0]
+            .pages
+            .push(failed(4, "P4", Some("call Bob\nabout March\n")));
+        d.notes[0].pages.push(failed(5, "P5", None));
+        let text = delta_text(&d);
+        assert!(
+            text.contains(
+                "## NOTE/Note/Planview, page 4 (edited, unreadable)\n### unreadable\ncall Bob\nabout March\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(
+                "## NOTE/Note/Planview, page 5 (edited, unreadable)\n### unreadable\nno device text\n"
+            ),
+            "{text}"
+        );
+        // Unreadable pages are no changed pages, and no block rows.
+        assert!(
+            text.contains("1 page changed in 1 note, 2 pages unreadable"),
+            "{text}"
+        );
+        assert!(text.contains("blocks[3]"), "{text}");
+        let head = text.split("\n\n## ").next().unwrap();
+        assert!(!head.contains("about March"), "{head}");
+    }
+
+    #[test]
+    fn two_notes_with_one_title_are_told_apart() {
+        let mut d = planview();
+        let mut other = d.notes[0].clone();
+        other.key = "F2025".into();
+        other.path = "NOTE/Work/Planview.note".into();
+        d.notes.push(other);
+        let text = delta_text(&d);
+        assert!(text.contains("## NOTE/Note/Planview, page 3"), "{text}");
+        assert!(text.contains("## NOTE/Work/Planview, page 3"), "{text}");
+        assert!(
+            text.contains("  NOTE/Work/Planview,3,\"notedown://jordi/F2024/P2024#b3\""),
+            "{text}"
+        );
+        let mut top = planview();
+        top.notes[0].path = "Planview.note".into();
+        assert!(delta_text(&top).contains("## Planview, page 3"));
     }
 
     fn note() -> NoteState {
@@ -552,6 +655,7 @@ Flow: A then B
                 pages: 2,
                 blocks: 5,
                 pending: false,
+                failed: false,
                 chars: 120,
             }],
         };
@@ -562,10 +666,11 @@ Flow: A then B
         assert!(toon.contains("more: true"), "{toon}");
         let n = &json["notes"][0];
         let row = format!(
-            "{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{}",
             n["blocks"],
             n["change"].as_str().unwrap(),
             n["chars"],
+            n["failed"],
             n["folder"].as_str().unwrap(),
             n["key"].as_str().unwrap(),
             n["pages"],

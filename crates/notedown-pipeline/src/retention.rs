@@ -5,12 +5,21 @@
 //! - the newest line of the log stays whatever it is (the next `seq` is read from the log
 //!   tail, so removing it would repeat numbers and make bookmarks skip lines);
 //! - the current text of every page stays: the newest text version of a page of a note, and
-//!   the newest line of the page of any kind. Page lines under the old key of a re-keyed note
-//!   (`note.moved` with `oldNote`) belong to the moved note, so they stay while they are the
-//!   current text of a page;
+//!   the newest line of the page of any kind (so a page `deleted` tombstone of a live note
+//!   stays, it is the page's newest line). Page lines under the old key of a re-keyed note
+//!   (`note.moved` with `oldNote`) belong to the moved note up to the move line's `seq`
+//!   (spec 2.2), so they stay while they are the current text of a page. A later note at the
+//!   old path reuses the old key and is another note;
+//! - for every bookmark younger than `keep_days`, the newest line of each page with
+//!   `seq <= bookmark.seq` stays: it is the base version of the consumer's next delta (also
+//!   the last text of a page that was deleted since);
 //! - the newest note-level line of a note stays, so its path and flags can be rebuilt;
 //! - a deleted note keeps the current text of its pages until its `note.deleted` line itself
 //!   may go, then both go.
+//!
+//! Property (the changes reader relies on it): per page, a prune removes only a prefix of the
+//! page's lines in `seq` order, counting the lines under the old key before a move. So when the
+//! first kept line of a page is not `new`, older versions were pruned.
 //!
 //! The rewrite is atomic under `.lock`, `seq` numbers are never changed, and the prune runs at
 //! most once a day (stamp file `.pruned`).
@@ -55,8 +64,9 @@ pub fn prune(
         });
     }
     let keep_ms = u64::from(keep_days) * DAY_MS;
-    let consumers = store.consumers()?;
+    // The bookmarks are read inside the lock of the rewrite.
     let (kept, removed) = store.rewrite_log(w, &mut |lines| {
+        let consumers = store.consumers()?;
         Ok(removable(lines, &consumers, keep_ms, now_ms))
     })?;
     notedown_cloud::fsutil::write_atomic(&stamp, format!("{now_ms}\n").as_bytes(), false)?;
@@ -91,20 +101,22 @@ fn removable(
         .map(|l| l.seq)
         .collect();
 
-    // A re-keyed note is one note: old key -> new key.
-    let mut rekey: BTreeMap<&str, &str> = BTreeMap::new();
-    for l in lines {
-        if let Some(old) = &l.old_note {
-            rekey.insert(old, &l.note);
-        }
-    }
-    let group = |key: &str| -> String {
-        let mut key = key;
-        for _ in 0..=rekey.len() {
-            match rekey.get(key) {
-                Some(next) => key = next,
-                None => break,
-            }
+    // A re-keyed note is one note, but only up to its move line: a line with a lower `seq`
+    // under the old key belongs to the new key; later lines under the old key (a new note at
+    // the old path) are another note. Each hop raises the `seq`, so a move back ends.
+    let moves: Vec<(&str, &str, u64)> = lines
+        .iter()
+        .filter_map(|l| {
+            l.old_note
+                .as_deref()
+                .map(|old| (old, l.note.as_str(), l.seq))
+        })
+        .collect();
+    let group = |key: &str, seq: u64| -> String {
+        let (mut key, mut seq) = (key, seq);
+        while let Some((_, new, at)) = moves.iter().find(|(old, _, at)| *old == key && *at > seq) {
+            key = new;
+            seq = *at;
         }
         key.to_string()
     };
@@ -114,11 +126,17 @@ fn removable(
         deleted_seq: Option<u64>,
         last_note_line: Option<u64>,
         /// The page lines to keep as current, per page: newest line, newest text line.
-        pages: BTreeMap<String, (u64, Option<u64>)>,
+        pages: BTreeMap<String, PageLines>,
+    }
+    #[derive(Default)]
+    struct PageLines {
+        /// All lines of the page in `seq` order.
+        seqs: Vec<u64>,
+        newest_text: Option<u64>,
     }
     let mut notes: BTreeMap<String, Note> = BTreeMap::new();
     for l in lines {
-        let note = notes.entry(group(&l.note)).or_default();
+        let note = notes.entry(group(&l.note, l.seq)).or_default();
         if l.change.is_note_change() {
             note.last_note_line = Some(l.seq);
             if l.change == LineChange::NoteDeleted {
@@ -127,18 +145,18 @@ fn removable(
             continue;
         }
         let Some(page) = &l.page_id else { continue };
-        let entry = note.pages.entry(page.clone()).or_insert((l.seq, None));
-        entry.0 = l.seq;
+        let entry = note.pages.entry(page.clone()).or_default();
+        entry.seqs.push(l.seq);
         match l.change {
             LineChange::New | LineChange::Edited => {
-                entry.1 = Some(l.seq);
+                entry.newest_text = Some(l.seq);
                 // Text again after a deletion: the note lives.
                 if note.last_note_line == note.deleted_seq {
                     note.last_note_line = None;
                 }
                 note.deleted_seq = None;
             }
-            LineChange::Deleted => entry.1 = None,
+            LineChange::Deleted => entry.newest_text = None,
             _ => {}
         }
     }
@@ -161,12 +179,29 @@ fn removable(
             // A deleted note: the line itself stays while it may not go.
             protected.insert(seq);
         }
-        for (newest, text) in note.pages.values() {
-            protected.insert(*newest);
-            protected.extend(*text);
+        for page in note.pages.values() {
+            protected.extend(page.seqs.last().copied());
+            protected.extend(page.newest_text);
+            // The base version of each young bookmark.
+            for (_, b) in consumers {
+                if !old(b.updated_at) {
+                    protected.extend(page.seqs.iter().rev().find(|&&s| s <= b.seq).copied());
+                }
+            }
         }
     }
-    aged.difference(&protected).copied().collect()
+    let mut remove: BTreeSet<u64> = aged.difference(&protected).copied().collect();
+    // Per page only a prefix goes: from the first kept line on, every line stays.
+    for note in notes.values() {
+        for page in note.pages.values() {
+            if let Some(first) = page.seqs.iter().position(|s| !remove.contains(s)) {
+                for s in &page.seqs[first..] {
+                    remove.remove(s);
+                }
+            }
+        }
+    }
+    remove
 }
 
 #[cfg(test)]
@@ -332,8 +367,9 @@ mod tests {
         f.bookmark("agent", 1, YOUNG);
         f.bookmark("other", 3, YOUNG);
         f.prune(NOW);
-        // "agent" has seen only line 1, so lines 2 and 3 are still to be read.
-        assert_eq!(f.seqs(), vec![2, 3, 4]);
+        // "agent" has seen only line 1, so lines 2 and 3 are still to be read; line 1 is
+        // its base version and line 3 the base of "other".
+        assert_eq!(f.seqs(), vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -456,5 +492,81 @@ mod tests {
         let third = f.prune(NOW + DAY_MS);
         assert_eq!((third.removed, third.skipped), (2, false));
         assert_eq!(f.seqs(), vec![4]);
+    }
+
+    #[test]
+    fn a_bookmark_keeps_the_base_version_of_each_page() {
+        let f = fixture();
+        f.append(vec![
+            page(KEY, "P1", LineChange::New, OLD),      // 1: base of P1
+            page(KEY, "P2", LineChange::New, OLD),      // 2: base of P2
+            page(KEY, "P1", LineChange::Edited, YOUNG), // 3
+        ]);
+        f.bookmark("agent", 2, YOUNG);
+        f.prune(NOW);
+        assert_eq!(f.seqs(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_bookmark_keeps_the_last_text_of_a_deleted_page() {
+        let f = fixture();
+        f.append(vec![
+            page(KEY, "P1", LineChange::New, OLD),     // 1: older
+            page(KEY, "P1", LineChange::Edited, OLD),  // 2: base of the bookmark
+            page(KEY, "P1", LineChange::Deleted, OLD), // 3
+            page(KEY, "P2", LineChange::New, YOUNG),   // 4
+        ]);
+        f.bookmark("agent", 2, YOUNG);
+        f.prune(NOW);
+        assert_eq!(f.seqs(), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn the_old_key_of_a_reused_path_is_another_note() {
+        let f = fixture();
+        let mut moved = note_line(NEW_KEY, LineChange::NoteMoved, OLD);
+        moved.old_note = Some(KEY.into());
+        f.append(vec![
+            page(KEY, "P1", LineChange::New, OLD), // 1: before the move, current text
+            moved,                                 // 2
+            page(NEW_KEY, "P1", LineChange::Edited, OLD), // 3
+            page(KEY, "Q1", LineChange::New, OLD), // 4: a new note at the old path
+            note_line(KEY, LineChange::NoteDeleted, OLD), // 5
+            page(NEW_KEY, "P9", LineChange::New, YOUNG), // 6
+        ]);
+        f.prune(NOW);
+        assert_eq!(f.seqs(), vec![2, 3, 6]);
+    }
+
+    #[test]
+    fn a_move_back_is_one_note() {
+        let f = fixture();
+        let mut there = note_line(NEW_KEY, LineChange::NoteMoved, OLD);
+        there.old_note = Some(KEY.into());
+        let mut back = note_line(KEY, LineChange::NoteMoved, OLD);
+        back.old_note = Some(NEW_KEY.into());
+        f.append(vec![
+            page(KEY, "P1", LineChange::New, OLD),     // 1: superseded by 4
+            there,                                     // 2
+            page(NEW_KEY, "P2", LineChange::New, OLD), // 3: current text
+            page(NEW_KEY, "P1", LineChange::Edited, OLD), // 4: current text
+            back,                                      // 5
+            page(KEY, "P3", LineChange::New, YOUNG),   // 6
+        ]);
+        f.prune(NOW);
+        assert_eq!(f.seqs(), vec![3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn a_page_loses_only_a_prefix_of_its_lines() {
+        let f = fixture();
+        f.append(vec![
+            page(KEY, "P1", LineChange::New, OLD),    // 1
+            page(KEY, "P1", LineChange::Edited, OLD), // 2: current text
+            page(KEY, "P1", LineChange::Moved, OLD),  // 3
+            page(KEY, "P1", LineChange::Moved, OLD),  // 4: newest
+        ]);
+        f.prune(NOW);
+        assert_eq!(f.seqs(), vec![2, 3, 4]);
     }
 }

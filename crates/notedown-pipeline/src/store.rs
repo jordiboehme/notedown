@@ -387,6 +387,8 @@ impl TextStore {
         if lines.is_empty() {
             return Ok(());
         }
+        // The account lock excludes a prune rewrite of the log (see `rewrite_log`).
+        let _lock = self.lock()?;
         let result = self.append_lines(lines);
         if result.is_err() {
             self.repaired.store(false, Ordering::SeqCst);

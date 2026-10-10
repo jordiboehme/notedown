@@ -614,3 +614,33 @@ fn a_crash_in_a_rekeyed_move_is_reconciled() {
     assert_eq!(store.note(OLD).unwrap(), None);
     assert_eq!(store.note(NEW).unwrap().unwrap().pages, old.pages);
 }
+
+#[test]
+fn append_and_rewrite_wait_for_the_account_lock() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let tmp = tempfile::tempdir().unwrap();
+    let w = WriterLock::take(tmp.path()).unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
+    appended(&store, &w, 2);
+    let guard = store.lock().unwrap();
+    let done = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let h = s.spawn(|| {
+            let mut lines = vec![page_line(KEY, "P9", LineChange::New, vec![])];
+            store.append(&w, &mut lines).unwrap();
+            store
+                .rewrite_log(&w, &mut |_| Ok(Default::default()))
+                .unwrap();
+            done.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "append and rewrite must wait for .lock"
+        );
+        assert_eq!(store.last_seq().unwrap(), 2, "nothing was appended yet");
+        drop(guard);
+        h.join().unwrap();
+    });
+    assert_eq!(store.last_seq().unwrap(), 3);
+}

@@ -99,7 +99,7 @@ impl Fx {
     }
 
     fn delta(&self, start: &Start) -> Delta {
-        delta(&self.store, start, None, MAX_CHARS).unwrap()
+        delta(&self.store, start, None, MAX_CHARS, UtcOffset::UTC).unwrap()
     }
 }
 
@@ -325,7 +325,7 @@ fn since_before_the_oldest_version_gives_before_unknown() {
     assert_eq!(p1.what_changed.len(), 1);
     assert_eq!(
         p1.what_changed[0].before_unknown.as_deref(),
-        Some("no versions before 2026-07-01 08:30 UTC")
+        Some("no versions before 2026-07-01 08:30 +00:00")
     );
     let p2 = n.pages.iter().find(|p| p.page_id == "P2").unwrap();
     assert_eq!(p2.change, Change::New);
@@ -410,14 +410,22 @@ fn a_fixed_range_ignores_newer_lines() {
         Some("one two three [-four-][+five+]")
     );
     // A tiny max_chars does not cut a fixed range.
-    let small = delta(&f.store, &Start::Range { from: 0, up_to: 3 }, None, 1).unwrap();
+    let small = delta(
+        &f.store,
+        &Start::Range { from: 0, up_to: 3 },
+        None,
+        1,
+        UtcOffset::UTC,
+    )
+    .unwrap();
     assert_eq!((small.up_to, small.more), (3, false));
     assert!(
         delta(
             &f.store,
             &Start::Range { from: 3, up_to: 2 },
             None,
-            MAX_CHARS
+            MAX_CHARS,
+            UtcOffset::UTC
         )
         .is_err()
     );
@@ -437,13 +445,14 @@ fn notes_filter() {
         &Start::Range { from: 0, up_to: 3 },
         Some(&only),
         MAX_CHARS,
+        UtcOffset::UTC,
     )
     .unwrap();
     let keys: Vec<&str> = d.notes.iter().map(|n| n.key.as_str()).collect();
     assert_eq!(keys, vec![B]);
     assert_eq!(d.up_to, 3);
     // The cut does not depend on the filter.
-    let cut = delta(&f.store, &bookmark("c"), Some(&only), 1).unwrap();
+    let cut = delta(&f.store, &bookmark("c"), Some(&only), 1, UtcOffset::UTC).unwrap();
     assert_eq!((cut.up_to, cut.more), (1, true));
     assert!(cut.notes.is_empty());
 }
@@ -466,7 +475,7 @@ fn the_manifest_holds_no_text() {
         page(A, "P2", LineChange::New, vec![b("b3", "secret page")]),
         LogLine::new(B, LineChange::NoteDeleted),
     ]);
-    let m = manifest(&f.store, &bookmark("c")).unwrap();
+    let m = manifest(&f.store, &bookmark("c"), UtcOffset::UTC).unwrap();
     assert_eq!((m.from, m.up_to, m.more), (2, 5, false));
     let json = serde_json::to_string(&m).unwrap();
     assert!(!json.contains("secret"), "{json}");
@@ -494,7 +503,7 @@ fn the_manifest_holds_no_text() {
             from: m.from,
             up_to: m.up_to,
         };
-        let d = delta(&f.store, &range, Some(&keys), MAX_CHARS).unwrap();
+        let d = delta(&f.store, &range, Some(&keys), MAX_CHARS, UtcOffset::UTC).unwrap();
         assert_eq!(d.notes.len(), 1);
         let nd = &d.notes[0];
         let blocks: usize = nd
@@ -569,7 +578,7 @@ fn looping_with_ack_shows_every_change_once() {
     let mut answers = Vec::new();
     let mut previous = 0;
     loop {
-        let d = delta(&f.store, &bookmark("agent"), None, 144).unwrap();
+        let d = delta(&f.store, &bookmark("agent"), None, 144, UtcOffset::UTC).unwrap();
         assert_eq!(d.from, previous, "answers are contiguous");
         assert!(d.up_to > d.from);
         for n in &d.notes {
@@ -655,4 +664,279 @@ fn since_parses_times_dates_and_seqs() {
     );
     assert!(parse_since("yesterday", now, two).is_err());
     assert!(parse_since("", now, two).is_err());
+}
+
+fn ack_to(f: &Fx, consumer: &str, d: &Delta) {
+    f.store.ack(consumer, d.up_to).unwrap();
+}
+
+#[test]
+fn a_page_deletion_of_a_textless_note_comes_once() {
+    let f = fx();
+    f.add(vec![page(
+        A,
+        "P1",
+        LineChange::New,
+        vec![b("b1", "first"), b("b2", "second")],
+    )]);
+    f.state(
+        A,
+        vec![
+            ("P1", PageOcrState::Done, Some(1)),
+            ("P2", PageOcrState::Pending, None),
+        ],
+    );
+    f.store.ack("c", 1).unwrap();
+    // P1 is removed while P2 still waits for OCR: no text is left, the note lives.
+    f.add(vec![page(A, "P1", LineChange::Deleted, vec![])]);
+    f.state(A, vec![("P2", PageOcrState::Pending, None)]);
+    let d = f.delta(&bookmark("c"));
+    let n = note(&d, A);
+    assert_eq!((n.change, n.pending), (Change::Edited, true));
+    assert_eq!(n.pages.len(), 1);
+    let p = &n.pages[0];
+    assert_eq!((p.page_id.as_str(), p.change), ("P1", Change::Deleted));
+    let gone: Vec<(String, Change, Option<String>)> = p
+        .what_changed
+        .iter()
+        .map(|c| (c.block.clone(), c.change, c.text_before.clone()))
+        .collect();
+    assert_eq!(
+        gone,
+        vec![
+            (anchor(A, "P1", "b1"), Change::Deleted, Some("first".into())),
+            (
+                anchor(A, "P1", "b2"),
+                Change::Deleted,
+                Some("second".into())
+            ),
+        ]
+    );
+    ack_to(&f, "c", &d);
+    // P2 gets its text: only P2 comes, as new.
+    f.add(vec![page(A, "P2", LineChange::New, vec![b("b3", "third")])]);
+    f.state(A, vec![("P2", PageOcrState::Done, Some(3))]);
+    let d = f.delta(&bookmark("c"));
+    let n = note(&d, A);
+    assert!(!n.pending);
+    assert_eq!(n.pages.len(), 1);
+    assert_eq!(
+        (n.pages[0].page_id.as_str(), n.pages[0].change),
+        ("P2", Change::New)
+    );
+    assert_eq!(n.pages[0].text_now, vec![b("b3", "third")]);
+}
+
+#[test]
+fn a_pending_note_whose_lines_cancel_out_is_still_listed() {
+    let f = fx();
+    f.add(vec![page(B, "P1", LineChange::New, vec![b("b1", "same")])]);
+    f.store.ack("c", 1).unwrap();
+    f.add(vec![
+        page(B, "P1", LineChange::Edited, vec![b("b1", "other")]),
+        page(B, "P1", LineChange::Edited, vec![b("b1", "same")]),
+    ]);
+    f.state(
+        B,
+        vec![
+            ("P1", PageOcrState::Done, Some(3)),
+            ("P2", PageOcrState::Pending, None),
+        ],
+    );
+    let d = f.delta(&bookmark("c"));
+    let n = note(&d, B);
+    assert!(n.pending && n.pages.is_empty());
+    assert_eq!(n.change, Change::Edited);
+}
+
+const OLD: &str = "path:0123456789abcdef0123456789abcdef";
+const NEW: &str = "path:fedcba9876543210fedcba9876543210";
+
+fn moved_to(note: &str, old_note: Option<&str>, path: &str, old_path: &str) -> LogLine {
+    let mut line = LogLine::new(note, LineChange::NoteMoved);
+    line.old_note = old_note.map(str::to_string);
+    line.path = Some(path.into());
+    line.old_path = Some(old_path.into());
+    line
+}
+
+#[test]
+fn a_re_keyed_note_keeps_its_lines() {
+    let f = fx();
+    f.add(vec![page(OLD, "P1", LineChange::New, vec![b("b1", "one")])]);
+    f.store.ack("c", 1).unwrap();
+    f.store.ack("cut", 1).unwrap();
+    f.add(vec![
+        page(OLD, "P1", LineChange::Edited, vec![b("b1", "one two")]),
+        page(B, "P1", LineChange::New, vec![b("b1", "b")]),
+        moved_to(NEW, Some(OLD), "Archive/Gamma.note", "Notes/Gamma.note"),
+        // Page lines carry the path of the note now.
+        LogLine {
+            path: Some("Archive/Gamma.note".into()),
+            ..page(
+                NEW,
+                "P1",
+                LineChange::Edited,
+                vec![b("b1", "one two three")],
+            )
+        },
+        // A new note at the old path reuses the old key: another note.
+        page(OLD, "P1", LineChange::New, vec![b("b1", "another note")]),
+    ]);
+
+    let d = f.delta(&bookmark("c"));
+    let moved = note(&d, NEW);
+    assert_eq!(moved.old_note.as_deref(), Some(OLD));
+    assert_eq!(moved.change, Change::Edited);
+    assert_eq!(
+        (moved.path.as_str(), moved.old_path.as_deref()),
+        ("Archive/Gamma.note", Some("Notes/Gamma.note"))
+    );
+    assert_eq!(moved.title, "Gamma");
+    let p = &moved.pages[0];
+    assert_eq!(p.text_now, vec![b("b1", "one two three")]);
+    assert_eq!(p.what_changed[0].block, anchor(NEW, "P1", "b1"));
+    // Two of three words are new: the texts in full, the base is the old key's text.
+    assert_eq!(
+        (
+            p.what_changed[0].text_before.as_deref(),
+            p.what_changed[0].text_full_now.as_deref()
+        ),
+        (Some("one"), Some("one two three"))
+    );
+    let reused = note(&d, OLD);
+    assert_eq!(
+        (reused.change, reused.old_note.as_deref()),
+        (Change::New, None)
+    );
+    assert_eq!(reused.pages[0].text_now, vec![b("b1", "another note")]);
+    assert!(serde_json::to_string(&d).unwrap().contains("\"oldNote\""));
+
+    // A cut before the move: the old key's lines show under the old key, then the rest under
+    // the new key, against the text of the first answer.
+    let first = delta(&f.store, &bookmark("cut"), None, 7, UtcOffset::UTC).unwrap();
+    assert_eq!((first.up_to, first.more), (2, true));
+    let old = note(&first, OLD);
+    assert_eq!(
+        (old.change, old.old_note.as_deref()),
+        (Change::Edited, None)
+    );
+    assert_eq!(old.pages[0].text_now, vec![b("b1", "one two")]);
+    ack_to(&f, "cut", &first);
+    let second = f.delta(&bookmark("cut"));
+    let moved = note(&second, NEW);
+    assert_eq!(moved.old_note.as_deref(), Some(OLD));
+    assert_eq!(
+        moved.pages[0].what_changed[0].word_diff.as_deref(),
+        Some("one two [+three+]")
+    );
+    assert_eq!(note(&second, OLD).change, Change::New);
+}
+
+#[test]
+fn unscoped_is_its_own_change() {
+    let f = fx();
+    f.add(vec![page(
+        A,
+        "P1",
+        LineChange::New,
+        vec![b("b1", "kept text")],
+    )]);
+    f.store.ack("c", 1).unwrap();
+    f.add(vec![LogLine::new(A, LineChange::NoteUnscoped)]);
+    let d = f.delta(&bookmark("c"));
+    let n = note(&d, A);
+    assert_eq!(n.change, Change::Unscoped);
+    assert!(n.pages.is_empty(), "no block reads as deleted: {n:#?}");
+    ack_to(&f, "c", &d);
+
+    // Back in scope: the worker writes `new` lines with the same text.
+    f.add(vec![
+        page(A, "P1", LineChange::New, vec![b("b1", "kept text")]),
+        // Created and unscoped inside the range: left out.
+        page(B, "P1", LineChange::New, vec![b("b1", "brief")]),
+        LogLine::new(B, LineChange::NoteUnscoped),
+    ]);
+    let d = f.delta(&bookmark("c"));
+    let keys: Vec<&str> = d.notes.iter().map(|n| n.key.as_str()).collect();
+    assert_eq!(keys, vec![A]);
+    assert_eq!(note(&d, A).change, Change::New);
+    assert!(note(&d, A).pages.is_empty());
+}
+
+#[test]
+fn a_moved_page_and_a_moved_note() {
+    let f = fx();
+    f.add(vec![
+        page(A, "P1", LineChange::New, vec![b("b1", "one")]),
+        page(A, "P2", LineChange::New, vec![b("b2", "two")]),
+        page(B, "P1", LineChange::New, vec![b("b1", "beta")]),
+    ]);
+    f.store.ack("c", 3).unwrap();
+    let mut p1 = page(A, "P1", LineChange::Moved, vec![]);
+    p1.position = Some(1);
+    let mut p2 = page(A, "P2", LineChange::Moved, vec![]);
+    p2.position = Some(0);
+    f.add(vec![
+        p1,
+        p2,
+        moved_to(B, None, "Archive/Beta.note", "Notes/Beta.note"),
+    ]);
+    let d = f.delta(&bookmark("c"));
+    let a = note(&d, A);
+    assert_eq!(a.change, Change::Edited);
+    let pages: Vec<(usize, &str, Change, bool)> = a
+        .pages
+        .iter()
+        .map(|p| {
+            (
+                p.page,
+                p.page_id.as_str(),
+                p.change,
+                p.text_now.is_empty() && p.what_changed.is_empty(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        pages,
+        vec![
+            (1, "P2", Change::Moved, true),
+            (2, "P1", Change::Moved, true)
+        ]
+    );
+    let bn = note(&d, B);
+    assert_eq!(bn.change, Change::Moved);
+    assert_eq!(
+        (bn.path.as_str(), bn.old_path.as_deref(), bn.title.as_str()),
+        ("Archive/Beta.note", Some("Notes/Beta.note"), "Beta")
+    );
+    assert!(bn.pages.is_empty());
+}
+
+#[test]
+fn dates_show_the_local_offset() {
+    let f = fx();
+    f.add(vec![at(
+        page(A, "P1", LineChange::Edited, vec![b("b1", "kept")]),
+        JULY,
+    )]);
+    let two = UtcOffset::from_hms(2, 0, 0).unwrap();
+    let d = delta(
+        &f.store,
+        &Start::Since(Since::Time(JULY)),
+        None,
+        MAX_CHARS,
+        two,
+    )
+    .unwrap();
+    assert_eq!(
+        d.range_text,
+        "since 2026-07-01 10:30 +02:00 (seq 0) up to seq 1"
+    );
+    assert_eq!(
+        note(&d, A).pages[0].what_changed[0]
+            .before_unknown
+            .as_deref(),
+        Some("no versions before 2026-07-01 10:30 +02:00")
+    );
 }

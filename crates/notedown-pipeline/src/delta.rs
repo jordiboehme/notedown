@@ -25,12 +25,14 @@
 //!   show the change against the text the consumer kept (it never retires on `unscoped`).
 //! - A note created and then unscoped inside the range is left out, like one created and
 //!   deleted (spec 5.1).
-//! - Notes with pending pages and no line in the range are listed (`pending: true`, no pages,
+//! - Notes with pending pages that the answer does not list otherwise are listed (`pending: true`, no pages,
 //!   `new` when no page has text yet, else `edited`) only in an answer that reaches the end of
 //!   the log (`more: false`), so a loop lists them once. A pending page never holds back
 //!   `up_to`.
-//! - Dates in `rangeText` and `beforeUnknown` are UTC (`2026-10-08 21:14 UTC`): a delta does not
-//!   know the reader's time zone.
+//! - Dates in `rangeText` and `beforeUnknown` are local times with their offset
+//!   (`2026-10-08 23:14 +02:00`); the caller passes the offset (ruling of fix round 1).
+//! - A note whose last text went with page deletions (its other pages still pending) is
+//!   `edited` with those deletions: the next base no longer holds the blocks.
 //! - A re-keyed note (`note.moved` with `oldNote`) is reported under its key at `up_to`; only
 //!   moves up to `up_to` count, and `oldNote` is the key the consumer knew at `from`. Keywords,
 //!   links and pending come from the current note state, found through every move in the log.
@@ -196,8 +198,8 @@ pub struct ManifestNote {
 }
 
 /// The manifest of `start`: the delta up to [`MANIFEST_MAX_CHARS`], summed up per note.
-pub fn manifest(store: &TextStore, start: &Start) -> Result<Manifest> {
-    let d = delta(store, start, None, MANIFEST_MAX_CHARS)?;
+pub fn manifest(store: &TextStore, start: &Start, local: UtcOffset) -> Result<Manifest> {
+    let d = delta(store, start, None, MANIFEST_MAX_CHARS, local)?;
     let notes = d
         .notes
         .iter()
@@ -252,13 +254,15 @@ fn line_chars(line: &LogLine) -> usize {
     line.blocks.iter().map(|b| b.text.chars().count()).sum()
 }
 
-/// `2026-10-08 21:14 UTC`.
-fn stamp(ms: u64) -> String {
-    let format = time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]");
+/// `2026-10-08 23:14 +02:00`: `ms` at the offset `local`.
+fn stamp(ms: u64, local: UtcOffset) -> String {
+    let format = time::macros::format_description!(
+        "[year]-[month]-[day] [hour]:[minute] [offset_hour sign:mandatory]:[offset_minute]"
+    );
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
         .ok()
-        .and_then(|t| t.format(&format).ok())
-        .map_or_else(|| format!("{ms} ms"), |s| format!("{s} UTC"))
+        .and_then(|t| t.to_offset(local).format(&format).ok())
+        .unwrap_or_else(|| format!("{ms} ms"))
 }
 
 /// A move that re-keyed a note: old key, new key, `seq` of the move line.
@@ -359,6 +363,8 @@ fn note_at(lines: &[&LogLine], seq: u64) -> NoteAt {
 /// What a delta builds a note from.
 struct Ctx<'a> {
     slug: &'a str,
+    /// The offset dates are shown at.
+    local: UtcOffset,
     from: u64,
     up_to: u64,
     /// The base at `from` is empty (a first import).
@@ -380,12 +386,14 @@ impl Ctx<'_> {
 }
 
 /// The delta of `start` (see the module doc). `notes` keeps only these note keys (the key at
-/// `up_to`); `max_chars` is the cut of a bookmark or `since` start.
+/// `up_to`); `max_chars` is the cut of a bookmark or `since` start. Dates in the texts are
+/// shown at the offset `local` (the CLI and the MCP server pass this computer's offset).
 pub fn delta(
     store: &TextStore,
     start: &Start,
     notes: Option<&[String]>,
     max_chars: usize,
+    local: UtcOffset,
 ) -> Result<Delta> {
     let slug = store
         .dir()
@@ -445,18 +453,19 @@ pub fn delta(
         Start::Bookmark(_) => match confirmed {
             Some(b) => format!(
                 "since your last confirm on {} (seq {from}) up to seq {up_to}",
-                stamp(b.updated_at)
+                stamp(b.updated_at, local)
             ),
             None => format!("since the start (no confirm yet) up to seq {up_to}"),
         },
         Start::Since(Since::Seq(n)) => format!("since seq {n} up to seq {up_to}"),
         Start::Since(Since::Time(t)) => {
-            format!("since {} (seq {from}) up to seq {up_to}", stamp(*t))
+            format!("since {} (seq {from}) up to seq {up_to}", stamp(*t, local))
         }
         Start::Range { .. } => format!("seq {from} to seq {up_to}"),
     };
     let ctx = Ctx {
         slug: &slug,
+        local,
         from,
         up_to,
         empty_base: from == 0 && !matches!(start, Start::Since(Since::Time(_))),
@@ -499,10 +508,7 @@ pub fn delta(
     }
     if !more {
         for state in store.notes()? {
-            let listed = out.iter().any(|n: &NoteDelta| n.key == state.key)
-                || by_note
-                    .get(state.key.as_str())
-                    .is_some_and(|l| l.iter().any(|l| ctx.in_range(l.seq)));
+            let listed = out.iter().any(|n: &NoteDelta| n.key == state.key);
             if listed || !wanted(&state.key) || !pending(&state) {
                 continue;
             }
@@ -631,7 +637,7 @@ fn note_delta(
                     text_before: None,
                     text_full_now: None,
                     replaced_by: Vec::new(),
-                    before_unknown: Some(format!("no versions before {}", stamp(ts))),
+                    before_unknown: Some(format!("no versions before {}", stamp(ts, ctx.local))),
                 }],
                 new_blocks: 0,
             });
@@ -713,7 +719,12 @@ fn note_delta(
         }
         Change::Unscoped
     } else if !now.visible() {
-        return None;
+        // No text left, but pages went: their deletions must come now, the next base has
+        // them gone.
+        if pages.is_empty() {
+            return None;
+        }
+        Change::Edited
     } else if !before.visible() && !unknown {
         Change::New
     } else if !pages.is_empty() {

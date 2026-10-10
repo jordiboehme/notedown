@@ -644,3 +644,35 @@ fn append_and_rewrite_wait_for_the_account_lock() {
     });
     assert_eq!(store.last_seq().unwrap(), 3);
 }
+
+#[test]
+fn reading_the_local_offset_never_holds_the_writer_lock() {
+    // The local offset is read while a writer releases and takes the lock again (the MCP
+    // server and the CLI do both in one process). Reading it must start no child process: a
+    // forked child holds every open lock until it execs, so the next take would be refused.
+    let tmp = tempfile::tempdir().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    notedown_cloud::localtime::local_utc_offset();
+                }
+            })
+        })
+        .collect();
+    let mut busy = 0;
+    for _ in 0..2000 {
+        match WriterLock::take(tmp.path()) {
+            Ok(w) => drop(w),
+            Err(crate::Error::WriterBusy) => busy += 1,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for r in readers {
+        r.join().unwrap();
+    }
+    assert_eq!(busy, 0, "takes refused while the offset was read");
+}

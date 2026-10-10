@@ -22,14 +22,12 @@ pub fn parse_utc_offset(text: &str) -> Option<UtcOffset> {
     UtcOffset::from_hms(sign * h, sign * m, 0).ok()
 }
 
-/// This computer's current offset from UTC, from `date +%z` (the time crate cannot read it
-/// safely once threads run).
+/// This computer's current offset from UTC. The time crate cannot read it safely once threads
+/// run; chrono reads `TZ` or the system zone data itself, without `localtime_r` and without a
+/// child process (a forked child would hold every open file lock of the process until it execs).
 pub fn local_utc_offset() -> Option<UtcOffset> {
-    let out = std::process::Command::new("date")
-        .arg("+%z")
-        .output()
-        .ok()?;
-    parse_utc_offset(std::str::from_utf8(&out.stdout).ok()?)
+    use chrono::Offset;
+    UtcOffset::from_whole_seconds(chrono::Local::now().offset().fix().local_minus_utc()).ok()
 }
 
 #[cfg(test)]

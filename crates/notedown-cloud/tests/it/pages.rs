@@ -782,6 +782,18 @@ impl Fixture {
         self.since(before)
     }
 
+    fn rm(&self, path: &str) -> Vec<Event> {
+        let before = self.journal.last_seq().unwrap();
+        let g = self.store.lock_recovered(&self.journal).unwrap();
+        let mut c = self
+            .store
+            .plan_delete(&g, &wp(path), 1_791_270_000_000, Origin::Device, None)
+            .unwrap();
+        pages::plan_page_delete(&self.store, &g, &mut c);
+        self.store.commit(&g, c, &self.journal).unwrap();
+        self.since(before)
+    }
+
     fn mkdir(&self, path: &str) {
         let g = self.store.lock_recovered(&self.journal).unwrap();
         let c = self
@@ -913,6 +925,26 @@ fn a_move_carries_the_record_along() {
     );
     let (_, ev) = f.put("NOTE/Note/E/x.note", &abc(None, ["s", "t", "s"]));
     assert_eq!(summary(&ev[1..]), ["modified PB@1 template"]);
+}
+
+#[test]
+fn a_delete_drops_the_records_of_its_notes() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/a.note", &abc(Some(FID), ["s", "s", "s"]));
+    f.put("NOTE/Note/k.note", &abc(Some(FID3), ["t", "s", "s"]));
+    let ev = f.rm("NOTE/Note/a.note");
+    assert_eq!(types(&ev), ["file.deleted"]);
+    assert!(f.record(FID).is_none());
+
+    // a folder delete drops the records of every note inside, keyed by FILE_ID or by path
+    f.mkdir("NOTE/Note/D");
+    f.mkdir("NOTE/Note/D/E");
+    f.put("NOTE/Note/D/x.note", &abc(None, ["s", "s", "s"]));
+    f.put("NOTE/Note/D/E/y.note", &abc(Some(FID2), ["s", "t", "s"]));
+    f.rm("NOTE/Note/D");
+    assert!(f.record(&path_key_file("NOTE/Note/D/x.note")).is_none());
+    assert!(f.record(FID2).is_none());
+    assert_eq!(f.record(FID3).unwrap().path, "NOTE/Note/k.note");
 }
 
 #[test]
@@ -1154,6 +1186,7 @@ fn a_snapshot_that_cannot_read_app_data_writes_no_page_records() {
 }
 
 const FID2: &str = "F20261006120000000001abcdefABCDEF";
+const FID3: &str = "F20261006120000000002abcdefABCDEF";
 
 /// The record files in `pages/`: name to (inode, mtime, bytes).
 fn record_files(f: &Fixture) -> BTreeMap<String, (u64, std::time::SystemTime, Vec<u8>)> {

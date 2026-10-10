@@ -1143,10 +1143,11 @@ async fn a_moved_note_carries_its_page_record() {
         .collect();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["path"], "INBOX/t.note");
-    // a delete leaves the record (it heals at the next write), and journals no page events
+    // a delete removes the record, and journals no page events
     let n = s.events().len();
     assert_ok(&s.delete(&t, &id).await);
     assert_eq!(types(&s.events_after(n)), ["file.deleted"]);
+    assert!(s.records().is_empty(), "{:?}", s.records());
 }
 
 // ------------------------------------------------------------------ copy_v3

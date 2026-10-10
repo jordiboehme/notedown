@@ -1693,7 +1693,8 @@ pub async fn delete_folder_v3(
         if crate::store::is_native_folder(&e.path) {
             return Outcome::native();
         }
-        let c = store.plan_delete(&guard, &e.path, now, Origin::Device, Some(serial.into()))?;
+        let mut c = store.plan_delete(&guard, &e.path, now, Origin::Device, Some(serial.into()))?;
+        crate::pages::plan_page_delete(&store, &guard, &mut c);
         store.commit(&guard, c, &st.journal)?;
         Ok(Outcome::Done(json!({"metadata": metadata_value(&e)})))
     })

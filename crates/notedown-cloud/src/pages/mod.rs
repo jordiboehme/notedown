@@ -55,13 +55,14 @@
 //! under the store lock ([`crate::store::SideWrite`]). They are not part of the intent in
 //! `pending.json`: a missing or stale record is harmless (see above). [`Store::snapshot`] writes
 //! the record of every note it journals, before its append. Moves carry the record along with
-//! [`plan_page_move`]. A record that already has the new bytes is not written again, and the
-//! `pages/` folder is synced once per commit, scan or snapshot.
+//! [`plan_page_move`], and deletes remove it with [`plan_page_delete`] (a crash between the
+//! delete and its record removal leaves the record to the cleanup below). A record that already
+//! has the new bytes is not written again, and the `pages/` folder is synced once per commit,
+//! scan or snapshot.
 //!
 //! A scan that finds a note deleted by hand removes its records, after its journal append like
 //! its other record writes. A whole-tree scan that applies also removes every record whose
-//! `path` is no file in the registry after it (a record left by an older version, or by a delete
-//! through the device API, which keeps the record).
+//! `path` is no file in the registry after it (a record left by an older version or a crash).
 
 pub mod fingerprint;
 
@@ -797,6 +798,32 @@ pub fn plan_page_move(store: &Store, _guard: &WriteGuard, commit: &mut Commit) {
     commit
         .side_writes
         .extend(move_records(store, &by_path, &notes));
+}
+
+/// Drop the page records along with a planned delete (`Store::plan_delete`): the record of the
+/// deleted note, or of every note below a deleted folder, under any key. No events. Call it
+/// after `plan_delete` and before `Store::commit`, under the same guard (the files must still be
+/// in place). Does nothing for other operations.
+pub fn plan_page_delete(store: &Store, _guard: &WriteGuard, commit: &mut Commit) {
+    let PendingOp::Delete { kind, path, .. } = &commit.op else {
+        return;
+    };
+    if *kind == Kind::File
+        && FileKind::of(path.rsplit('/').next().unwrap_or_default()) != FileKind::Note
+    {
+        return;
+    }
+    let below = format!("{path}/");
+    let by_path = records_by_path(store);
+    let gone = by_path
+        .iter()
+        .filter(|(p, _)| match kind {
+            Kind::File => *p == path,
+            Kind::Folder => p.starts_with(&below),
+        })
+        .flat_map(|(_, records)| records)
+        .filter_map(|(key, _)| record_write(store, key, None));
+    commit.side_writes.extend(gone);
 }
 
 /// The record changes for notes that moved from the first path to the second (see

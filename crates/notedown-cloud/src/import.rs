@@ -673,7 +673,8 @@ fn replace_all(store: &Store, guard: &WriteGuard, journal: &Journal) -> Result<u
                 queue.push(e.path);
                 continue;
             }
-            let commit = store.plan_delete(guard, &e.path, at, Origin::Cli, None)?;
+            let mut commit = store.plan_delete(guard, &e.path, at, Origin::Cli, None)?;
+            crate::pages::plan_page_delete(store, guard, &mut commit);
             moved += commit
                 .events
                 .iter()

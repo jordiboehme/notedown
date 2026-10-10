@@ -369,6 +369,36 @@ fn a_second_import_is_refused_without_replace() {
     assert!(folders.contains("EXPORT"));
 }
 
+#[test]
+fn a_replace_drops_the_page_records_of_the_old_notes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (backup, _, _) = backup_tree(tmp.path());
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let test1 = std::fs::read(root.join("tests/fixtures/notes/test1.note")).unwrap();
+    write(&backup.join("Note/t.note"), &test1);
+    let data = data_with_account();
+    run_import(data.path(), &backup, false).unwrap();
+    let pages = data.path().join("accounts/jordi/pages");
+    let paths = || -> Vec<String> {
+        std::fs::read_dir(&pages)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| {
+                        let v: Value =
+                            serde_json::from_slice(&std::fs::read(e.path()).unwrap()).unwrap();
+                        v["path"].as_str().unwrap().to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(paths(), ["NOTE/Note/t.note"]);
+
+    std::fs::remove_file(backup.join("Note/t.note")).unwrap();
+    run_import(data.path(), &backup, true).unwrap();
+    assert!(paths().is_empty(), "{:?}", paths());
+}
+
 /// An import without --replace on a held account refuses and leaves the hold and the journal
 /// as they are: it must not journal the held deletes and open the way for them.
 #[test]

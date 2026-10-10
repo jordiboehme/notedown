@@ -224,7 +224,7 @@ notedown pipeline --data ~/notedown-data
 
 Or start both with one command: `notedown serve --data ~/notedown-data --pipeline`. The pipeline stops when the server stops. It needs the OCR model (`notedown model pull`). It waits 10 minutes after the last change of a note before it reads it, so a note you are still writing is read once. `notedown pipeline --data ~/notedown-data --once` reads everything that is due now and stops.
 
-The first run reads every note in scope, newest note first, and prints its progress (`ocr: 12 of 380 pages`). One page takes up to about half a minute, so a few hundred pages take a few hours. You can stop it at any time: every finished page is kept. By default only notes in `NOTE/Note` are read. The `[pipeline]` section of `server.toml` changes that (`ingest_folders`, `ingest_exclude`, `ingest_keyword`). The pipeline writes only to `pipeline/` in the data folder, never to your files.
+The first run reads every note in scope, newest note first, and prints its progress (`ocr: 12 of 380 pages`). One page takes up to about half a minute, so a few hundred pages take a few hours. You can stop it at any time: every finished page is kept. By default only notes in `NOTE/Note` are read. The `[pipeline]` section of `server.toml` changes that (`ingest_folders`, `ingest_exclude`, `ingest_keyword`). The pipeline writes only its own files in the data folder: the `pipeline/` folder and its journal cursor `journal/consumers/pipeline.cursor`. It never writes your files.
 
 **Add the MCP server to Claude Code.**
 
@@ -242,7 +242,7 @@ cp -R skills/ingest-notes ~/.claude/skills/
 
 Then ask Claude to "ingest my notes".
 
-**Run it every night.** `scripts/ingest-notes.sh` does the same without a conversation: it reads the list of changed notes, runs `claude -p` per folder and confirms when every run succeeded. Questions and errors go to `~/Library/Logs/notedown-ingest.log`. The top of the script lists its settings. It needs `jq`. It reads the instructions for each run from `skills/ingest-notes/SKILL.md` in the same checkout, so run it from there. With more than one account in the data folder, set `NOTEDOWN_ACCOUNT`. To start it every night at 2:30 with launchd, save this as `~/Library/LaunchAgents/de.notedown.ingest.plist` (change the paths to yours):
+**Run it every night.** `scripts/ingest-notes.sh` does the same without a conversation: it reads the list of changed notes, runs `claude -p` per folder and confirms when every run succeeded. Questions and errors go to `~/Library/Logs/notedown-ingest.log`. The log also names notes with pages that OCR could not read after three tries. Such a page is read again when you change it on the device. The top of the script lists its settings. It needs `jq`. It finds the instructions for each run, `skills/ingest-notes/SKILL.md`, by its own location, so keep the script in the checkout (you can start it from any folder). With more than one account in the data folder, set `NOTEDOWN_ACCOUNT`. To start it every night at 2:30 with launchd, save this as `~/Library/LaunchAgents/de.notedown.ingest.plist` (change the paths to yours):
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>

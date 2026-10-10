@@ -175,16 +175,23 @@ while true; do
     from="$(jq -r '.from' <<<"$manifest")"
     up_to="$(jq -r '.upTo' <<<"$manifest")"
     more="$(jq -r '.more' <<<"$manifest")"
-    count="$(jq -r '.notes | length' <<<"$manifest")"
+    # A row with 0 pages and the change new or edited is listed only because pages wait for
+    # OCR (pending) or could not be read (failed): nothing to ingest, no run for it.
+    wanted='[.notes[] | select((.pages == 0 and (.change == "new" or .change == "edited")) | not)]'
+    count="$(jq -r "$wanted | length" <<<"$manifest")"
+    unreadable="$(jq -r '[.notes[] | select(.failed) | .path] | join(", ")' <<<"$manifest")"
+    if [[ -n "$unreadable" ]]; then
+        say "unreadable pages in: $unreadable"
+    fi
     if ((count == 0)) && [[ "$from" == "$up_to" ]]; then
         say "done: nothing changed"
         break
     fi
     say "range $from to $up_to: $count notes, more: $more"
 
-    # Groups by folder, split by size. A note without text yet (pending, 0 pages) waits.
-    groups="$(jq -c --argjson max "$group_chars" '
-        [.notes[] | select((.pending and .pages == 0) | not)]
+    # Groups by folder, split by size.
+    groups="$(jq -c --argjson max "$group_chars" "
+        $wanted"'
         | group_by(.folder)
         | map(reduce .[] as $n ([];
             if length > 0 and (.[length - 1].chars + $n.chars) <= $max

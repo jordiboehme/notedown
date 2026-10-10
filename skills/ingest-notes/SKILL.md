@@ -18,15 +18,18 @@ The consumer name is always `crystalline`.
 
 1. **Plan.** Call `status`. Its `account` is the account slug. Then call `get_changes` with
    `{"consumer": "crystalline", "summary": true}`. This is the manifest: `from`, `upTo`, `more`
-   and one row per changed note (key, path, folder, change, pages, blocks, pending, chars). No
-   text. When it lists no notes and `from` equals `upTo`, stop and say that nothing changed.
-   When it lists no notes but `from` is lower than `upTo`, go to step 4: the range holds lines
-   that change no note text, and the ack moves the bookmark past them.
+   and one row per changed note (key, path, folder, change, pages, blocks, pending, failed,
+   chars). No text. A row with 0 pages and the change `new` or `edited` has nothing to ingest:
+   it is listed only because pages wait for OCR (`pending: true`) or could not be read
+   (`failed: true`). Leave such rows out, and keep the notes with `failed: true` for the run
+   report. When no other row is left and `from` equals `upTo`, stop and say that nothing
+   changed (name the unreadable notes, if any). When no other row is left but `from` is lower
+   than `upTo`, go to step 4: the range holds lines that change no note text, and the ack
+   moves the bookmark past them.
 2. **Group.** Put the notes of one folder into one group. Split a folder when its notes add up
    to more than about 30,000 characters (the `chars` column). Keep related notes together: one
    sub-agent then decides about shared engrams, and two sub-agents never create the same engram
-   twice. Leave out a note with `pending: true` and 0 pages: it has no text yet, and its text comes
-   in a later run.
+   twice. The rows left out in step 1 get no sub-agent: their text comes in a later run.
 3. **Dispatch.** Start one sub-agent per group, at most 3 at the same time. Give each one:
    the account slug, the note keys of its group, the fixed range `from` and `upTo` of the
    manifest, and the sub-agent instructions below. Never give a sub-agent the consumer name:
@@ -36,7 +39,9 @@ The consumer name is always `crystalline`.
    The next run then repeats the whole range. This is safe, because ingestion is idempotent by
    anchor.
 5. **Repeat** from step 1 while `more` was true. Then give Jordi one short run report: notes
-   and engrams per group, and all open questions of the sub-agents.
+   and engrams per group, all open questions of the sub-agents, and the unreadable pages (the
+   notes with `failed: true`, and the pages the sub-agents reported). An unreadable page stays
+   in every run until it is written again on the device.
 
 ## Sub-agent instructions
 
@@ -67,6 +72,8 @@ Pass this section and the next one to every sub-agent, with its account slug, no
      Retire only when no source is left and `search_notes` finds the text in no other note.
      When unsure, keep the engram and list it as an open question.
    - A new block has no entry. It is in `textNow`.
+   - A page marked `unreadable` could not be read by OCR. Ingest nothing from it, also not from
+     its device text, and retire nothing because of it. Name it in your report (note and page).
    - To change `sources` of an engram: `edit_engram` with `set_frontmatter` may not accept the
      key `sources`. Then rewrite the engram with `write_engram` and `overwrite: true` (same title
      and folder, full metadata), or use `edit_engram` `find_replace` on its frontmatter.
@@ -82,15 +89,25 @@ Pass this section and the next one to every sub-agent, with its account slug, no
   `notes[N]{key,title,path,change,pending,oldNote,oldPath,keywords,links}:` and a table
   `blocks[N]{note,page,block,change,replacedBy}:` with one row per changed block. A table row
   holds one record, its cells split by commas.
-- The body: one `## <title>, page <n> (<change>)` section per page. `### textNow` holds the full
-  page text now, each block after an HTML comment with its anchor. Then one section per changed
-  block, named with its block id: `### wordDiff #b3`, `### textBefore #b5`, and
+- The `note` column of the blocks table and the body headings name a note by its folder and
+  title, for example `NOTE/Note/Planview`.
+- The body: one `## <folder>/<title>, page <n> (<change>)` section per page. `### textNow` holds
+  the full page text now, each block after an HTML comment with its anchor. Then one section
+  per changed block, named with its block id: `### wordDiff #b3`, `### textBefore #b5`, and
   `### textNow #b4` when more than half of the words changed.
+- A page whose heading ends in `unreadable` could not be read by OCR. Its `### unreadable`
+  section holds the device's own handwriting recognition, or `no device text`. That text is
+  only a hint for your report, never a source for engrams.
 - A note with `oldNote` got a new key by a move: search by the old key, then change `resource`
   and the anchors in `sources` of those engrams to the new key. A note with only `oldPath` keeps
   its key and its anchors.
 - The legend: `textBefore` is the text when you last confirmed (or at your `since`).
   `wordDiff`: `[-...-]` removed, `[+...+]` added.
-- `### beforeUnknown #b3` means the old versions were pruned. Search by the anchor and update
-  what you find; otherwise treat the block as new.
+- `### beforeUnknown` (without a block id) means the old versions of a page were pruned, so the
+  text before is unknown. Its row in the blocks table names the page anchor
+  (`notedown://<account>/<key>/<pageId>`), not a block. Search by `resource` (the note address
+  `notedown://<account>/<key>`), then compare the block anchors in the `sources` of the hits
+  with the anchors in `textNow`: update the engrams that cite them, and treat only the blocks
+  no hit cites as new. Never treat the page's blocks as new only because a `$contains` search
+  found nothing.
 - `get_block` with an anchor gives the current text of one block, or what replaced it.

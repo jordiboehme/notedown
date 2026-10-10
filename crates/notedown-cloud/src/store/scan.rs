@@ -22,7 +22,9 @@
 //! into a copy of the cache (for a scoped scan only the rows of the files it found), plans
 //! against the registry, reserves the new ids in the registry log (the next id only, no rows),
 //! appends the events to the journal (one batch, one `opId`, `origin: "scan"`), then the
-//! registry ops in one log append and the cache, then the page records. A crash after the
+//! registry ops in one log append and the cache, then the page records: those of new, changed
+//! and moved notes, the removal of those of deleted notes and, after a whole-tree scan, the
+//! removal of every record whose path is no file in the registry. A crash after the
 //! journal append journals the same changes again at the next scan (with new ids; the reserved
 //! ones stay unused); the registry is never ahead of the journal, and no id the journal used is
 //! handed out again.
@@ -381,6 +383,13 @@ impl Store {
                 eprintln!("warning: account {}: {e}", self.slug);
             }
         }
+        if whole {
+            for w in self.stale_records() {
+                if let Err(e) = self.write_side(&w, &mut batch) {
+                    eprintln!("warning: account {}: {e}", self.slug);
+                }
+            }
+        }
         self.sync_sides(batch);
         Ok((report, Some(walk)))
     }
@@ -530,8 +539,15 @@ impl Store {
         let mut writes = Vec::new();
         // The page records, read once, when a changed or moved note needs them.
         let is_note = |p: &WirePath| FileKind::of(p.name().unwrap_or_default()) == FileKind::Note;
+        let gone_notes: Vec<&WirePath> = plan
+            .gone_files
+            .iter()
+            .map(|g| &g.path)
+            .filter(|p| is_note(p))
+            .collect();
         let by_path = if plan.modified.iter().any(|(_, d)| is_note(&d.path))
             || plan.moved.iter().any(|(_, from, _)| is_note(from))
+            || !gone_notes.is_empty()
         {
             crate::pages::records_by_path(self)
         } else {
@@ -612,6 +628,19 @@ impl Store {
             });
         }
         writes.extend(crate::pages::move_records(self, &by_path, &moved_notes));
+        // The records of notes deleted by hand go first, and never one this scan writes anew (a
+        // new note that takes the free FILE_ID of a deleted one).
+        let rewritten: HashSet<std::path::PathBuf> = writes
+            .iter()
+            .filter(|w| w.bytes.is_some())
+            .map(|w| w.path.clone())
+            .collect();
+        let mut drops: Vec<SideWrite> = crate::pages::drop_records(self, &by_path, &gone_notes)
+            .into_iter()
+            .filter(|w| !rewritten.contains(&w.path))
+            .collect();
+        drops.append(&mut writes);
+        let writes = drops;
         for g in &plan.gone_files {
             bodies.push(EventBody::FileDeleted {
                 id: g.id,
@@ -631,6 +660,34 @@ impl Store {
             .map(|b| Event::new(&self.slug, Origin::Scan, None, &op_id, b))
             .collect();
         (events, writes)
+    }
+
+    /// The removals of the page records whose `path` is no file in the registry: notes gone
+    /// before the scan removed their records, or deleted through the device API. Called after
+    /// a whole-tree scan applied, so the registry knows every file on disk.
+    fn stale_records(&self) -> Vec<SideWrite> {
+        // Read without the state mutex; only the lookups hold it.
+        let records = crate::pages::record_paths(self);
+        let stale: Vec<String> = {
+            let state = self.state();
+            records
+                .into_iter()
+                .filter(|(_, path)| {
+                    WirePath::parse_named(path).is_ok_and(|p| {
+                        !state
+                            .ids
+                            .id_of(&p)
+                            .and_then(|id| state.ids.get(id))
+                            .is_some_and(|(k, _)| *k == Kind::File)
+                    })
+                })
+                .map(|(key, _)| key)
+                .collect()
+        };
+        stale
+            .iter()
+            .filter_map(|key| crate::pages::remove_record(self, key))
+            .collect()
     }
 
     /// After the journal append: the registry ops in one log append, then the cache. After a

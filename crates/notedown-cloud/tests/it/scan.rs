@@ -1613,6 +1613,62 @@ fn a_broken_tree_is_never_scanned() {
     assert!(fx.events().is_empty());
 }
 
+/// A page record for a note at `path` that is no file in the store, as a scan before it
+/// dropped records left them. Returns the record file.
+fn stale_record(fx: &Fx, path: &str) -> PathBuf {
+    let key = md5_hex(path.as_bytes());
+    let dir = fx.store.account_dir().join("pages");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join(format!("path-{key}.json"));
+    let record = serde_json::json!({
+        "fileId": format!("path:{key}"),
+        "path": path,
+        "size": 1,
+        "md5": md5_hex(b"gone"),
+        "pages": [],
+    });
+    std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+    file
+}
+
+#[test]
+fn stale_records_stay_until_a_whole_tree_scan_applies() {
+    let fx = Fx::imported();
+    let files = many(&fx, DOC, 3);
+    fx.seed();
+    let stale = stale_record(&fx, "NOTE/Note/nd-large-push/nd-large-a01.note");
+    // A dry run writes nothing.
+    let dry = ScanOptions {
+        dry_run: true,
+        ..ScanOptions::all(1)
+    };
+    fx.scan_with(&dry);
+    assert!(stale.exists());
+    // A broken tree is never scanned.
+    let doc = fx.fs("DOCUMENT");
+    let aside = doc.with_file_name(".DOCUMENT-aside");
+    let g = fx.store.lock_recovered(&fx.journal).unwrap();
+    std::fs::rename(&doc, &aside).unwrap();
+    let r = fx.store.scan(&g, &fx.journal, &ScanOptions::all(1), NOW);
+    assert!(matches!(r, Err(Error::StoreDamaged { .. })), "{r:?}");
+    drop(g);
+    std::fs::rename(&aside, &doc).unwrap();
+    assert!(stale.exists());
+    // A scan that holds applies nothing.
+    for f in &files {
+        fx.rm(f);
+    }
+    assert!(fx.scan_with(&ScanOptions::all(5)).held.is_some());
+    assert!(stale.exists());
+    // The scan that applies removes it.
+    let report = fx.scan_with(&ScanOptions {
+        accept: true,
+        ..ScanOptions::all(5)
+    });
+    assert_eq!(report.deleted.len(), 3);
+    assert!(!stale.exists());
+}
+
 // ---------------------------------------------------------------- the scan in the server
 
 /// The scan as the server runs it: at `synchronous/start`, before a device listing and on the

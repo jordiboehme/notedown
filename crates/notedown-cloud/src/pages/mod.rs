@@ -57,6 +57,11 @@
 //! the record of every note it journals, before its append. Moves carry the record along with
 //! [`plan_page_move`]. A record that already has the new bytes is not written again, and the
 //! `pages/` folder is synced once per commit, scan or snapshot.
+//!
+//! A scan that finds a note deleted by hand removes its records, after its journal append like
+//! its other record writes. A whole-tree scan that applies also removes every record whose
+//! `path` is no file in the registry after it (a record left by an older version, or by a delete
+//! through the device API, which keeps the record).
 
 pub mod fingerprint;
 
@@ -816,6 +821,60 @@ pub(crate) fn move_records(
         }
     }
     writes
+}
+
+/// The record removals for notes that are gone from these paths (a scan found them deleted by
+/// hand): every record whose `path` is one of them, under any key.
+pub(crate) fn drop_records(
+    store: &Store,
+    by_path: &RecordsByPath,
+    gone: &[&WirePath],
+) -> Vec<SideWrite> {
+    gone.iter()
+        .flat_map(|path| by_path.get(&path.display()).into_iter().flatten())
+        .filter_map(|(key, _)| record_write(store, key, None))
+        .collect()
+}
+
+/// The key and `path` of every record in `pages/` whose file name is a valid key and whose
+/// `fileId` is that key. Only these two fields are read; a file that is not such a record is
+/// left out.
+pub(crate) fn record_paths(store: &Store) -> Vec<(String, String)> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Head {
+        file_id: String,
+        path: String,
+    }
+    let Ok(entries) = std::fs::read_dir(store.account_dir().join(PAGES_DIR)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(stem) = name.strip_suffix(".json") else {
+            continue;
+        };
+        let key = match stem.strip_prefix("path-") {
+            Some(md5) => format!("path:{md5}"),
+            None => stem.to_string(),
+        };
+        if !valid_key(&key) {
+            continue;
+        }
+        let head = std::fs::read(entry.path())
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Head>(&b).ok());
+        if let Some(head) = head.filter(|h| h.file_id == key) {
+            out.push((key, head.path));
+        }
+    }
+    out
+}
+
+/// The removal of the record of `key`.
+pub(crate) fn remove_record(store: &Store, key: &str) -> Option<SideWrite> {
+    record_write(store, key, None)
 }
 
 /// The page index of a note the scan found new or changed on disk (store id `id`, `md5`,

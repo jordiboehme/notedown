@@ -1473,3 +1473,128 @@ fn a_scan_gives_a_free_file_id_to_a_copy() {
     keyed(&f, &ev, "NOTE/Note/a.note", FID);
     keyed(&f, &ev, "NOTE/Note/b.note", &path_key("NOTE/Note/b.note"));
 }
+
+// ------------------------------------------------------------ notes gone by hand
+
+#[test]
+fn a_note_deleted_by_hand_loses_its_record_in_the_scan() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/m.note", &abc(Some(FID), ["s", "s", "s"]));
+    f.place("NOTE/Note/n.note", &abc(None, ["s", "t", "s"]));
+    f.place("NOTE/Note/k.note", &abc(Some(FID2), ["t", "s", "s"]));
+    f.scan();
+    assert_eq!(f.records().len(), 3);
+    std::fs::remove_file(f.store.fs_path(&wp("NOTE/Note/m.note"))).unwrap();
+    std::fs::remove_file(f.store.fs_path(&wp("NOTE/Note/n.note"))).unwrap();
+    let ev = f.scan();
+    assert_eq!(types(&ev), ["file.deleted", "file.deleted"]);
+    let left: Vec<String> = f.records().into_keys().collect();
+    assert_eq!(left, [format!("{FID2}.json")]);
+    assert_eq!(f.record(FID2).unwrap().path, "NOTE/Note/k.note");
+}
+
+#[test]
+fn the_notes_of_a_folder_deleted_by_hand_lose_their_records() {
+    let f = Fixture::new();
+    f.place("NOTE/Note/push/a01.note", &abc(None, ["s", "s", "s"]));
+    f.place("NOTE/Note/push/a02.note", &abc(Some(FID2), ["s", "t", "s"]));
+    f.place("NOTE/Note/k.note", &abc(Some(FID), ["t", "s", "s"]));
+    f.scan();
+    assert_eq!(f.records().len(), 3);
+    std::fs::remove_dir_all(f.store.fs_path(&wp("NOTE/Note/push"))).unwrap();
+    let ev = f.scan();
+    assert_eq!(
+        types(&ev),
+        ["file.deleted", "file.deleted", "folder.deleted"]
+    );
+    let left: Vec<String> = f.records().into_keys().collect();
+    assert_eq!(left, [format!("{FID}.json")]);
+}
+
+#[test]
+fn a_new_note_keeps_the_file_id_record_of_a_note_deleted_in_the_same_scan() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/m.note", &abc(Some(FID), ["s", "s", "s"]));
+    std::fs::remove_file(f.store.fs_path(&wp("NOTE/Note/m.note"))).unwrap();
+    f.place("NOTE/Note/a.note", &abc(Some(FID), ["s", "t", "s"]));
+    let ev = f.scan();
+    keyed(&f, &ev, "NOTE/Note/a.note", FID);
+    assert_eq!(f.records().len(), 1);
+}
+
+#[test]
+fn a_path_keyed_note_moved_by_hand_keeps_its_record() {
+    let f = Fixture::new();
+    f.place("NOTE/Note/n.note", &abc(None, ["s", "t", "s"]));
+    f.place("NOTE/Note/k.note", &abc(Some(FID), ["t", "s", "s"]));
+    f.scan();
+    let before = f.record(&path_key_file("NOTE/Note/n.note")).unwrap();
+    std::fs::rename(
+        f.store.fs_path(&wp("NOTE/Note/n.note")),
+        f.store.fs_path(&wp("NOTE/Note/o.note")),
+    )
+    .unwrap();
+    std::fs::rename(
+        f.store.fs_path(&wp("NOTE/Note/k.note")),
+        f.store.fs_path(&wp("NOTE/Note/l.note")),
+    )
+    .unwrap();
+    let ev = f.scan();
+    assert_eq!(types(&ev), ["file.moved", "file.moved"]);
+    let moved = f.record(&path_key_file("NOTE/Note/o.note")).unwrap();
+    assert_eq!(moved.path, "NOTE/Note/o.note");
+    assert_eq!(moved.pages, before.pages);
+    assert_eq!(f.record(FID).unwrap().path, "NOTE/Note/l.note");
+    assert_eq!(f.records().len(), 2);
+}
+
+/// Write a record for a note at `path` that is no file of the store, as a scan before the fix
+/// left them.
+fn stale_record(f: &Fixture, path: &str) -> String {
+    let name = format!("{}.json", path_key_file(path));
+    let record = PageRecord {
+        file_id: path_key(path),
+        note_id: None,
+        path: path.to_string(),
+        size: 1,
+        md5: md5_hex(b"gone"),
+        pages: Vec::new(),
+    };
+    let dir = f.store.account_dir().join(PAGES_DIR);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(&name), serde_json::to_vec(&record).unwrap()).unwrap();
+    name
+}
+
+#[test]
+fn a_whole_tree_scan_removes_the_records_of_notes_that_are_no_files() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/m.note", &abc(Some(FID), ["s", "s", "s"]));
+    f.place("NOTE/Note/n.note", &abc(None, ["s", "t", "s"]));
+    let stale = stale_record(&f, "NOTE/Note/nd-large-push/nd-large-a01.note");
+    let ev = f.scan();
+    assert_eq!(types(&ev)[0], "file.created");
+    let names: Vec<String> = f.records().into_keys().collect();
+    assert!(!names.contains(&stale), "{names:?}");
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert_eq!(f.record(FID).unwrap().path, "NOTE/Note/m.note");
+}
+
+#[test]
+fn a_scoped_scan_leaves_stale_records_alone() {
+    use notedown_cloud::store::ScanOptions;
+    let f = Fixture::new();
+    let stale = stale_record(&f, "NOTE/Note/gone.note");
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    let opts = ScanOptions {
+        scope: wp("NOTE/Note"),
+        ..ScanOptions::all(1)
+    };
+    f.store
+        .scan(&g, &f.journal, &opts, 1_791_270_000_000)
+        .unwrap();
+    drop(g);
+    assert!(f.records().contains_key(&stale));
+    f.scan();
+    assert!(!f.records().contains_key(&stale));
+}

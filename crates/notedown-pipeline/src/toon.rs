@@ -40,6 +40,23 @@ pub fn render(value: &Value) -> String {
     lines.join("\n")
 }
 
+/// A table `name[N]{c1,c2}:` with the columns in the given order (`render` sorts them) and one
+/// row of scalar cells per record. Cells follow the same quoting rules as `render`.
+pub fn table(name: &str, columns: &[&str], rows: &[Vec<Value>]) -> String {
+    let header: Vec<String> = columns.iter().map(|c| string_token(c)).collect();
+    let mut lines = vec![format!(
+        "{}[{}]{{{}}}:",
+        string_token(name),
+        rows.len(),
+        header.join(",")
+    )];
+    for row in rows {
+        let cells: Vec<String> = row.iter().map(scalar_token).collect();
+        lines.push(format!("  {}", cells.join(",")));
+    }
+    lines.join("\n")
+}
+
 /// Emit every entry of an object as its own line (or block) at `indent`. Keys
 /// iterate in serde_json's Map order, which is alphabetical here since no crate
 /// enables `preserve_order`, matching the `json` mode's key order.

@@ -4,6 +4,7 @@ pub mod compose;
 pub mod config;
 pub mod delta;
 pub mod errors;
+pub mod format;
 pub mod meta;
 pub mod model;
 pub mod ocr;

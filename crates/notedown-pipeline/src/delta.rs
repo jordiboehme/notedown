@@ -100,6 +100,8 @@ pub fn parse_since(text: &str, now: OffsetDateTime, local: UtcOffset) -> Result<
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Delta {
+    /// The account slug of the anchors.
+    pub slug: String,
     /// Exclusive: the text before is the text at this `seq`.
     pub from: u64,
     pub up_to: u64,
@@ -532,6 +534,7 @@ pub fn delta(
         }
     }
     Ok(Delta {
+        slug,
         from,
         up_to,
         more,

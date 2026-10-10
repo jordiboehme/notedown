@@ -2,14 +2,18 @@
 
 pub mod compose;
 pub mod config;
+pub mod errors;
 pub mod meta;
 pub mod model;
 pub mod ocr;
 pub mod page;
+pub mod records;
 pub mod region;
+pub mod scope;
 pub mod store;
 pub mod text;
 pub mod toon;
+pub mod worker;
 
 pub use config::PipelineConfig;
 
@@ -38,6 +42,8 @@ pub enum Error {
     Cloud(#[from] notedown_cloud::Error),
     #[error("another notedown pipeline runs for this data folder")]
     WriterBusy,
+    #[error("the OCR model is missing, run `notedown model pull`")]
+    ModelMissing,
     #[error("the text store needs a repair before it is written")]
     NeedsRepair,
     #[error("invalid {what}: {message}")]

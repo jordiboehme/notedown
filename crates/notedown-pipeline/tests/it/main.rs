@@ -2,3 +2,4 @@
 
 mod fake_engine;
 mod reading;
+mod worker;

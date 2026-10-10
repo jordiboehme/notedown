@@ -215,6 +215,11 @@ pub struct NoteState {
     pub pages: Vec<PageState>,
     #[serde(default)]
     pub deleted: bool,
+    /// Set by a `note.unscoped` line: the note left the scope (spec 4.5). It is not deleted;
+    /// the flag keeps the worker from writing the line twice and is cleared when the note
+    /// enters the scope again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unscoped: bool,
     /// Per replaced block id the ids that replaced it.
     #[serde(default)]
     pub successors: BTreeMap<String, Vec<String>>,

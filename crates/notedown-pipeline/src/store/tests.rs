@@ -246,6 +246,10 @@ fn repair_applies_page_deletes_and_moves_and_never_reads_unscoped_as_deleted() {
     assert_eq!(state.pages.len(), 1);
     assert_eq!(state.pages[0].position, 3);
     assert!(!state.deleted);
+    assert!(
+        state.unscoped,
+        "a crash after the line still knows it was written"
+    );
 
     store
         .append(&w, &mut [LogLine::new(KEY, LineChange::NoteDeleted)])

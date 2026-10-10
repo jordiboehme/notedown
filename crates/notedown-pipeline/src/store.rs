@@ -550,10 +550,11 @@ fn apply_line(state: &mut NoteState, mut line: LogLine) {
         state.path = path;
     }
     if line.change.is_note_change() {
-        // `note.moved` set the path above. Leaving the scope is not a deletion (spec 4.5); the
-        // worker handles it.
-        if line.change == LineChange::NoteDeleted {
-            state.deleted = true;
+        // `note.moved` set the path above. Leaving the scope is not a deletion (spec 4.5).
+        match line.change {
+            LineChange::NoteDeleted => state.deleted = true,
+            LineChange::NoteUnscoped => state.unscoped = true,
+            _ => {}
         }
         return;
     }
@@ -606,6 +607,7 @@ fn apply_line(state: &mut NoteState, mut line: LogLine) {
                 page.position = pos;
             }
             state.deleted = false;
+            state.unscoped = false;
         }
     }
     state.pages.sort_by_key(|p| p.position);

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use notedown::pipeline::{NoteSource, PageSource};
+use notedown_convert::pipeline::{NoteSource, PageSource};
 use notedown_note::{DigestRef, Notebook, VersionPolicy};
 use notedown_pipeline::meta::note_meta;
 use notedown_pipeline::ocr::read_page;

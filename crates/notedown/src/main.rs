@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use notedown::inputs;
-use notedown::links::FileIndex;
-use notedown::pipeline::{Options, Outcome, convert_one};
+use notedown_convert::inputs;
+use notedown_convert::links::FileIndex;
+use notedown_convert::pipeline::{Options, Outcome, convert_one};
 use notedown_note::{Notebook, RenderOptions, VersionPolicy, encode_png};
 use notedown_ocr::model::{self, DEFAULT_MODEL};
 use notedown_ocr::{LlamaEngine, OcrEngine, OcrError, OcrOptions, PageOcr};

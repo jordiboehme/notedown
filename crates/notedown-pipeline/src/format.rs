@@ -7,7 +7,9 @@
 
 use std::fmt::Write as _;
 
-use notedown::document::{Frontmatter, FrontmatterLink, HeaderFormat, PageOut, render_document};
+use notedown_convert::document::{
+    Frontmatter, FrontmatterLink, HeaderFormat, PageOut, render_document,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 

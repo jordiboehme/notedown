@@ -1,6 +1,6 @@
 //! OCR of one page of a note (spec 3.2).
 
-use notedown::pipeline::{NoteSource, PageSource};
+use notedown_convert::pipeline::{NoteSource, PageSource};
 use notedown_note::Notebook;
 use notedown_ocr::OcrEngine;
 use notedown_ocr::convert::html_to_markdown;

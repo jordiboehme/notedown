@@ -1,5 +1,5 @@
-use notedown::links::FileIndex;
-use notedown::{
+use notedown_convert::links::FileIndex;
+use notedown_convert::{
     document::{Frontmatter, FrontmatterDigest, FrontmatterLink, HeaderFormat},
     inputs, pipeline,
 };
@@ -309,8 +309,8 @@ fn content_links_resolve_to_converted_bike() {
         let stem = name.strip_suffix(".note").unwrap_or(name);
         let expected = format!(
             "{} ({})",
-            notedown::links::escape_md(stem),
-            notedown::links::escape_md(path)
+            notedown_convert::links::escape_md(stem),
+            notedown_convert::links::escape_md(path)
         );
         assert!(md.contains(&expected), "{md}");
     }
@@ -363,7 +363,7 @@ fn link_placement_uses_bbox_overlap() {
         html: "<p>Alpha</p>".into(),
     };
     assert_eq!(
-        notedown::links::place(&[l], &[miss, hit], 1404, 1872),
+        notedown_convert::links::place(&[l], &[miss, hit], 1404, 1872),
         vec![Some(1)]
     );
 }
@@ -372,8 +372,8 @@ fn link_placement_uses_bbox_overlap() {
 /// and links applied to synthetic OCR pages.
 #[test]
 fn apply_links_resolves_by_file_id_without_private_files() {
-    use notedown::document::PageOut;
-    use notedown::pipeline::PageResult;
+    use notedown_convert::document::PageOut;
+    use notedown_convert::pipeline::PageResult;
     use notedown_note::LinkKind;
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out");
@@ -441,14 +441,14 @@ fn apply_links_resolves_by_file_id_without_private_files() {
     let mut l2 = link(LinkKind::File, [800, 1310, 281, 112]);
     l2.target = Some("/storage/emulated/0/Note/Beta.note".into());
     l2.target_file_id = Some("FUNKNOWN".into());
-    let ctx = notedown::links::LinkContext {
+    let ctx = notedown_convert::links::LinkContext {
         index: &index,
         from_md: &out.join("Content.md"),
         page_ids: &[None],
         width: 1404,
         height: 1872,
     };
-    let fm_links = notedown::links::apply(&[l1, l2], &mut pages, &ctx);
+    let fm_links = notedown_convert::links::apply(&[l1, l2], &mut pages, &ctx);
     let md = &pages[0].out.markdown;
     assert!(md.contains("[Bike](sub/My%20Bike.md)"), "{md}");
     assert!(!md.contains("Bike @"), "{md}");
@@ -570,7 +570,7 @@ fn block(bbox: [u32; 4], text: &str) -> notedown_ocr::convert::LayoutBlock {
 
 #[test]
 fn link_replaces_a_block_only_when_it_covers_half_of_it() {
-    use notedown::links::place;
+    use notedown_convert::links::place;
     use notedown_note::LinkKind;
     // A 1000 x 1000 page keeps bbox and pixel coordinates equal.
     let l = link(LinkKind::File, [0, 0, 100, 100]);
@@ -614,8 +614,8 @@ fn link_replaces_a_block_only_when_it_covers_half_of_it() {
 
 #[test]
 fn paragraph_with_a_small_link_keeps_its_text() {
-    use notedown::document::PageOut;
-    use notedown::pipeline::PageResult;
+    use notedown_convert::document::PageOut;
+    use notedown_convert::pipeline::PageResult;
     use notedown_note::LinkKind;
     let text = "A long paragraph that mentions Beta somewhere in the middle.";
     let blocks = vec![block([50, 100, 950, 700], text)];
@@ -638,14 +638,14 @@ fn paragraph_with_a_small_link_keeps_its_text() {
     l.target = Some("/storage/emulated/0/Note/Beta.note".into());
     l.target_file_id = Some("FBETA".into());
     let index = FileIndex::default();
-    let ctx = notedown::links::LinkContext {
+    let ctx = notedown_convert::links::LinkContext {
         index: &index,
         from_md: std::path::Path::new("Alpha.md"),
         page_ids: &[None],
         width: 1000,
         height: 1000,
     };
-    notedown::links::apply(&[l], &mut pages, &ctx);
+    notedown_convert::links::apply(&[l], &mut pages, &ctx);
     let md = &pages[0].out.markdown;
     assert!(md.starts_with(text), "{md}");
     assert!(
@@ -656,8 +656,8 @@ fn paragraph_with_a_small_link_keeps_its_text() {
 
 #[test]
 fn note_strings_in_the_body_are_escaped() {
-    use notedown::document::PageOut;
-    use notedown::pipeline::PageResult;
+    use notedown_convert::document::PageOut;
+    use notedown_convert::pipeline::PageResult;
     use notedown_note::LinkKind;
     let mut pages = vec![PageResult {
         out: PageOut {
@@ -677,14 +677,14 @@ fn note_strings_in_the_body_are_escaped() {
     l.target = Some("/storage/emulated/0/Note/a_b [x] (1) *`<i>.note".into());
     l.target_file_id = Some("FX".into());
     let index = FileIndex::default();
-    let ctx = notedown::links::LinkContext {
+    let ctx = notedown_convert::links::LinkContext {
         index: &index,
         from_md: std::path::Path::new("Alpha.md"),
         page_ids: &[None],
         width: 1000,
         height: 1000,
     };
-    notedown::links::apply(&[l], &mut pages, &ctx);
+    notedown_convert::links::apply(&[l], &mut pages, &ctx);
     let md = &pages[0].out.markdown;
     let stem = r"a\_b \[x\] \(1\) \*\`\<i>";
     assert!(
@@ -697,7 +697,7 @@ fn note_strings_in_the_body_are_escaped() {
 
 #[test]
 fn page_id_cannot_close_its_comment() {
-    use notedown::document::{PageOut, render_document};
+    use notedown_convert::document::{PageOut, render_document};
     let fm = Frontmatter {
         resource: "A.note".into(),
         file_id: None,
@@ -795,8 +795,8 @@ fn digests_are_listed_in_the_frontmatter_and_body_is_unchanged() {
     let mut engine = FakeEngine { calls: 0 };
     let results = pipeline::process_pages(&src, &mut engine, false, "x.assets").unwrap();
     let outs: Vec<_> = results.iter().map(|r| r.out.clone()).collect();
-    let with = notedown::document::render_document(&fm_with(digests), &outs);
-    let without = notedown::document::render_document(&fm_with(vec![]), &outs);
+    let with = notedown_convert::document::render_document(&fm_with(digests), &outs);
+    let without = notedown_convert::document::render_document(&fm_with(vec![]), &outs);
     assert!(
         with.contains("digests:\n  - { page: 1, digest_id: \"abc\","),
         "{with}"
@@ -1542,7 +1542,7 @@ fn stale_source_fields_get_a_header_update() {
     let md_path = out.join("Test 2.md");
     let body = |p: &std::path::Path| {
         let t = std::fs::read_to_string(p).unwrap();
-        notedown::document::body_of(&t).unwrap().to_string()
+        notedown_convert::document::body_of(&t).unwrap().to_string()
     };
     let first_body = body(&md_path);
     // only the time of the source changed
@@ -1852,7 +1852,7 @@ fn flow_map_shapes_that_only_look_like_notedown_are_foreign() {
         "generated: { by: !!str notedown/1 }\n",
     ] {
         let md = format!("---\ntype: note\n{header}---\nbody\n");
-        let h = notedown::document::Header::read(&md).expect("readable");
+        let h = notedown_convert::document::Header::read(&md).expect("readable");
         assert!(!h.is_notedown(), "{header:?}");
     }
 }
@@ -1909,7 +1909,7 @@ fn an_unknown_value_in_a_flow_generated_map_still_counts_as_notedowns() {
     assert!(text.contains("model: !!str fake-model, at: "), "{text}");
     std::fs::write(&md_path, &text).unwrap();
     assert!(
-        notedown::document::Header::read(&text)
+        notedown_convert::document::Header::read(&text)
             .unwrap()
             .is_notedown()
     );

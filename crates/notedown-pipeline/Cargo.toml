@@ -11,7 +11,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 const-hex.workspace = true
 notedown-cloud.workspace = true
-notedown = { path = "../notedown", version = "0.1.0" }
+notedown-convert.workspace = true
 notedown-note.workspace = true
 notedown-ocr.workspace = true
 rmcp.workspace = true

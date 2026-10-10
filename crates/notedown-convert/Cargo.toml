@@ -1,0 +1,23 @@
+[package]
+name = "notedown-convert"
+description = "Conversion library of notedown: inputs, documents and per-file conversion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+const-hex.workspace = true
+image.workspace = true
+time.workspace = true
+notedown-note.workspace = true
+notedown-ocr.workspace = true
+notedown-cloud.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+image.workspace = true

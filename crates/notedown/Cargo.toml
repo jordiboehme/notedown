@@ -15,19 +15,18 @@ path = "src/main.rs"
 clap.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-const-hex.workspace = true
-image.workspace = true
 zip.workspace = true
 time.workspace = true
 notedown-note.workspace = true
 notedown-ocr.workspace = true
 notedown-cloud.workspace = true
+notedown-convert.workspace = true
 rpassword.workspace = true
 if-addrs.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-image.workspace = true
 zip.workspace = true
+sha2.workspace = true
+const-hex.workspace = true

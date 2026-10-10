@@ -1645,8 +1645,8 @@ dependencies = [
  "clap",
  "const-hex",
  "if-addrs",
- "image",
  "notedown-cloud",
+ "notedown-convert",
  "notedown-note",
  "notedown-ocr",
  "rpassword",
@@ -1691,6 +1691,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "notedown-convert"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "const-hex",
+ "image",
+ "notedown-cloud",
+ "notedown-note",
+ "notedown-ocr",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "time",
+]
+
+[[package]]
 name = "notedown-note"
 version = "0.1.0"
 dependencies = [
@@ -1729,8 +1745,8 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "const-hex",
- "notedown",
  "notedown-cloud",
+ "notedown-convert",
  "notedown-note",
  "notedown-ocr",
  "rmcp",

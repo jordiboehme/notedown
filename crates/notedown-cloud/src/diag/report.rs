@@ -252,6 +252,18 @@ pub struct ReportInput<'a> {
     pub scans: &'a [(String, ScanResult)],
     /// Events of all accounts after the `render` cursor; `None` without a cursor.
     pub render_behind: Option<u64>,
+    /// The OCR pipeline of the data folder, numbers only.
+    pub pipeline: PipelineCounts,
+}
+
+/// The OCR pipeline in the report: its journal cursor and the pages of its note states that
+/// wait for OCR or failed. Read raw from `pipeline/<slug>/notes/*.json` (notedown-cloud does
+/// not link the pipeline); `pipeline/` itself never goes into the bundle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PipelineCounts {
+    pub cursor: Option<u64>,
+    pub pending: u64,
+    pub failed: u64,
 }
 
 /// The report text and every real-derived value written into it (for the final check).
@@ -480,6 +492,14 @@ pub fn render(stats: &Stats, input: &ReportInput, filter: &mut Filter) -> (Strin
             parts.join(", ")
         ));
     }
+    let p = &input.pipeline;
+    out.push(format!(
+        "Pipeline  cursor {}, {} pending, {} failed",
+        p.cursor
+            .map_or_else(|| "none".to_string(), |c| c.to_string()),
+        count(p.pending, "page"),
+        p.failed
+    ));
     (out.join("\n") + "\n", values)
 }
 
@@ -530,6 +550,7 @@ mod tests {
             accounts: &[],
             scans: &[],
             render_behind: None,
+            pipeline: PipelineCounts::default(),
         }
     }
 

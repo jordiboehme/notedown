@@ -1649,6 +1649,7 @@ dependencies = [
  "notedown-convert",
  "notedown-note",
  "notedown-ocr",
+ "notedown-pipeline",
  "rpassword",
  "serde_json",
  "sha2",

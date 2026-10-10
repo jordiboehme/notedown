@@ -695,6 +695,26 @@ fn the_journal_wakes_the_worker_and_moves_the_cursor() {
     );
 }
 
+#[test]
+fn the_continuous_worker_prunes_the_text_log() {
+    let d = setup();
+    d.put("test1", "NOTE/Note");
+    let clock = TestClock::at(now_ms());
+    let start = clock.now_ms();
+    let mut w =
+        worker(&d, no_settle(), engine_reading("hello")).with_clock(Arc::new(clock.clone()));
+    w.run(stop_at(&clock, start + 1)).unwrap();
+    assert_eq!(d.log().len(), 1);
+    // The daily stamp of the prune: the pass ran it for the account.
+    let stamp = d.data.join("pipeline").join(SLUG).join(".pruned");
+    let ms: u64 = std::fs::read_to_string(&stamp)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!((start..=clock.now_ms()).contains(&ms), "{ms}");
+}
+
 /// A loader that counts its loads and can report a missing model.
 fn loader(
     loads: Arc<AtomicUsize>,

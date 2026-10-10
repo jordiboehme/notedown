@@ -30,6 +30,7 @@ pub use due::{AccountStore, DueNote, due};
 
 use crate::errors::Errors;
 use crate::records;
+use crate::retention;
 use crate::scope::in_scope;
 use crate::store::{TextStore, WriterLock};
 use crate::{Error, PipelineConfig, Result};
@@ -296,7 +297,8 @@ impl Worker {
     /// The continuous worker: tails the journal with the cursor `pipeline`, looks at the
     /// records at start, after each journal batch, when a settle time or retry ends and every
     /// 10 minutes, and reads what is due. The model is unloaded after `model_idle` without
-    /// work. Returns when `stop` says so; it is asked between pages too.
+    /// work. After each pass it prunes the text log of every account (at most once a day,
+    /// spec 2.4). Returns when `stop` says so; it is asked between pages too.
     pub fn run(&mut self, stop: impl Fn() -> bool) -> Result<()> {
         let lock = WriterLock::take(&self.data)?;
         let journal = Journal::open_no_create(&self.data);
@@ -331,6 +333,14 @@ impl Worker {
                 next_wake = now + RESCAN_MS;
                 match result {
                     Ok(p) => {
+                        // Old page versions go once a day (the prune's own stamp limits it).
+                        for (slug, text) in stores.iter() {
+                            if let Err(e) =
+                                retention::prune(text, &lock, self.cfg.text_keep_days, now)
+                            {
+                                eprintln!("notedown pipeline: account {slug}: prune: {e}");
+                            }
+                        }
                         if let Some(t) = p.next_due {
                             next_wake = next_wake.min(t.max(now));
                         }

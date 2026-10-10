@@ -378,9 +378,28 @@ fn contains(hay: &[u8], needle: &str) -> bool {
 #[test]
 fn a_safe_bundle_holds_none_of_the_real_values() {
     let fx = fixture();
+    // The text store of the pipeline holds note text: it never goes into the bundle.
+    write(
+        &fx.data().join("pipeline").join(SLUG).join("notes/F1.json"),
+        br#"{"key":"F1","path":"NOTE/Note/Secret plans.note","title":"Secret plans","pages":[{"pageId":"P1","position":0,"state":"failed","blocks":[{"id":"b1","text":"Lunch with Anna"}]}]}"#,
+    );
+    write(
+        &fx.data().join("pipeline").join(SLUG).join("log.jsonl"),
+        b"{\"seq\":1,\"note\":\"F1\",\"path\":\"NOTE/Note/Secret plans.note\"}\n",
+    );
     let done = diagnose(&opts(&fx, "b.zip")).unwrap();
     let files = unzip(&done.zip);
     let names: Vec<_> = files.keys().cloned().collect();
+    assert!(
+        !names.iter().any(|n| n.starts_with("pipeline/")),
+        "{names:?}"
+    );
+    assert!(
+        done.report
+            .contains("Pipeline  cursor none, 0 pages pending, 1 failed"),
+        "{}",
+        done.report
+    );
     assert_eq!(
         names,
         [

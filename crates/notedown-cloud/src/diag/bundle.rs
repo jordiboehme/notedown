@@ -15,7 +15,7 @@ use time::format_description::well_known::Rfc3339;
 use super::check::{Leak, Needles, check_json, check_values};
 use super::collect::{Window, is_heartbeat, journal_ts, log_files, log_ts, read_lines};
 use super::filter::{Filter, Scrub};
-use super::report::{ReportInput, Stats, render};
+use super::report::{PipelineCounts, ReportInput, Stats, render};
 use super::standin::StandIns;
 use super::state::{AccountState, ScanResult, account_state, collect_needles, dry_run_scan};
 use crate::auth::{Accounts, Devices};
@@ -59,6 +59,7 @@ struct Facts {
     scans: Vec<(String, ScanResult)>,
     render_cursor: Option<u64>,
     render_behind: Option<u64>,
+    pipeline: PipelineCounts,
     needles: Needles,
     scrub: Scrub,
     /// Device serials bound to each account, for `--account` on log lines.
@@ -193,6 +194,7 @@ fn read_facts(opts: &DiagnoseOptions) -> Result<Facts> {
             dry_run_scan(data, slug, config.scan_min_files, opts.lock_wait),
         ));
     }
+    let pipeline = pipeline_counts(data, &selected, &journal);
     let probe_dir = if data.join("accounts").is_dir() {
         data.join("accounts")
     } else {
@@ -206,12 +208,58 @@ fn read_facts(opts: &DiagnoseOptions) -> Result<Facts> {
         scans,
         render_cursor,
         render_behind: render_cursor.map(|_| behind_all),
+        pipeline,
         needles,
         scrub,
         bound,
         fs: file_system(data),
         names_preserved: crate::store::probe_names_preserved(&probe_dir),
     })
+}
+
+/// The pipeline's journal cursor and the pages of the selected accounts' note states that are
+/// pending or failed. Only numbers leave this function. A missing folder counts nothing; a
+/// note state that cannot be read is skipped. A page without a state is pending (the
+/// pipeline's own default); the pages of a deleted note are no work and are not counted.
+fn pipeline_counts(data: &Path, selected: &[String], journal: &Journal) -> PipelineCounts {
+    let mut counts = PipelineCounts {
+        cursor: journal.cursor("pipeline").ok().flatten().map(|c| c.seq),
+        ..PipelineCounts::default()
+    };
+    for slug in selected {
+        let dir = data.join("pipeline").join(slug).join("notes");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(note) = std::fs::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            else {
+                continue;
+            };
+            if note.get("deleted").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+            let pages = note.get("pages").and_then(Value::as_array);
+            for page in pages.into_iter().flatten() {
+                match page
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("pending")
+                {
+                    "pending" => counts.pending += 1,
+                    "failed" => counts.failed += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    counts
 }
 
 fn device_in_log(data: &Path, window: &Window, serial: &str) -> Result<bool> {
@@ -460,6 +508,7 @@ fn write_bundle(
         accounts: &facts.states,
         scans: &facts.scans,
         render_behind: facts.render_behind,
+        pipeline: facts.pipeline,
     };
     let (report, values) = render(&stats, &input, &mut w.filter);
     w.check(check_values(

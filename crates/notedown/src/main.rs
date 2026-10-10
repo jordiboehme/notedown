@@ -41,6 +41,106 @@ enum Command {
         #[command(subcommand)]
         action: CloudAction,
     },
+    /// Read the pages of the notes in a data folder as text (OCR) and keep the text store for
+    /// agents. Runs until stopped (Ctrl-C). Loads the OCR model only when a page is due
+    Pipeline(PipelineArgs),
+    /// The MCP server over stdio: the note texts of one account for an agent. It only reads the
+    /// text store and writes bookmarks, it never runs OCR
+    Mcp(McpArgs),
+}
+
+#[derive(clap::Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+struct PipelineArgs {
+    #[command(subcommand)]
+    action: Option<PipelineAction>,
+    /// The data folder
+    #[arg(long, value_name = "DIR", required = true)]
+    data: Option<PathBuf>,
+    /// Read every page that is due now, without waiting for the settle time, then stop
+    #[arg(long)]
+    once: bool,
+    /// Read the notes in scope again (for example after a model upgrade), then stop. Changed
+    /// text gives new versions
+    #[arg(long, conflicts_with = "once")]
+    reocr: bool,
+    /// With --reocr: only this note, by key or path (NOTE/Note/Plan.note)
+    #[arg(long, value_name = "NOTE", requires = "reocr")]
+    note: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum PipelineAction {
+    /// List the bookmarks of the consumers per account as JSON, or remove one
+    Consumers {
+        /// The data folder
+        #[arg(long, value_name = "DIR")]
+        data: PathBuf,
+        /// Only this account (to remove a bookmark: needed when there are several accounts)
+        #[arg(long)]
+        account: Option<String>,
+        /// Remove the bookmark of this consumer
+        #[arg(long, value_name = "NAME")]
+        remove: Option<String>,
+    },
+    /// Print the changes of the text store as JSON: the same answers as get_changes of the MCP
+    /// server. A consumer's bookmark does not move, use ack for that
+    Changes(ChangesArgs),
+    /// Move the bookmark of a consumer to --up-to, never backwards, and print it as JSON
+    Ack {
+        /// The data folder
+        #[arg(long, value_name = "DIR")]
+        data: PathBuf,
+        /// The account slug (can be left out when the data folder has only one account)
+        #[arg(long)]
+        account: Option<String>,
+        /// The consumer name
+        #[arg(long, value_name = "NAME")]
+        consumer: String,
+        /// The upTo of the changes that were ingested
+        #[arg(long, value_name = "SEQ")]
+        up_to: u64,
+    },
+}
+
+#[derive(clap::Args)]
+#[command(group(clap::ArgGroup::new("start").required(true).args(["consumer", "since", "from"])))]
+struct ChangesArgs {
+    /// The data folder
+    #[arg(long, value_name = "DIR")]
+    data: PathBuf,
+    /// The account slug (can be left out when the data folder has only one account)
+    #[arg(long)]
+    account: Option<String>,
+    /// The changes after the bookmark of this consumer
+    #[arg(long, value_name = "NAME")]
+    consumer: Option<String>,
+    /// The changes since a seq (412), a date (2026-10-09), a time (2026-10-09T08:00:00Z) or a
+    /// duration back from now (3d). Needs no bookmark
+    #[arg(long, value_name = "X")]
+    since: Option<String>,
+    /// A fixed range: the changes after this seq (with --up-to)
+    #[arg(long, value_name = "SEQ", requires = "up_to")]
+    from: Option<u64>,
+    /// A fixed range: the changes up to this seq (with --from)
+    #[arg(long, value_name = "SEQ", requires = "from")]
+    up_to: Option<u64>,
+    /// Only the list of changed notes with their sizes, no text
+    #[arg(long, conflicts_with = "notes")]
+    summary: bool,
+    /// Only these notes, by key, comma separated (with --from and --up-to)
+    #[arg(long, value_name = "KEY,...", value_delimiter = ',', requires = "from")]
+    notes: Option<Vec<String>>,
+}
+
+#[derive(clap::Args)]
+struct McpArgs {
+    /// The data folder
+    #[arg(long, value_name = "DIR")]
+    data: PathBuf,
+    /// The account slug (can be left out when the data folder has only one account)
+    #[arg(long)]
+    account: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -55,6 +155,9 @@ struct ServeArgs {
     /// run only)
     #[arg(long)]
     refuse_sync: bool,
+    /// Also run `notedown pipeline` for the same data folder. It stops when the server stops
+    #[arg(long)]
+    pipeline: bool,
 }
 
 #[derive(Subcommand)]
@@ -1605,12 +1708,22 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
             1 => println!("scan hold: when the account would be left without files"),
             n => println!("scan hold: when fewer than {n} files would be left"),
         }
+        let child = if args.pipeline {
+            let child = start_pipeline(&args.data)?;
+            println!("pipeline: started notedown pipeline (pid {})", child.id());
+            Some(child)
+        } else {
+            None
+        };
+        let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+        if args.pipeline {
+            tokio::spawn(watch_pipeline(child.clone()));
+        }
         println!("press Ctrl-C to stop");
         std::io::stdout().flush()?;
-        serve_until(listeners, state.clone(), async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+        let served = serve_until(listeners, state.clone(), shutdown_signal()).await;
+        stop_pipeline(&child);
+        served?;
         println!("stopped");
         let (dropped, failed) = (state.log.dropped_lines(), state.log.capture_failures());
         if dropped > 0 {
@@ -1624,6 +1737,242 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Waits for Ctrl-C or, on Unix, SIGTERM.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let (Ok(mut int), Ok(mut term)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+        ) {
+            tokio::select! {
+                _ = int.recv() => {}
+                _ = term.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// `notedown pipeline --data <data>` as a child process of the server.
+fn start_pipeline(data: &Path) -> Result<std::process::Child> {
+    let exe = std::env::current_exe().context("cannot find the notedown program")?;
+    std::process::Command::new(exe)
+        .arg("pipeline")
+        .arg("--data")
+        .arg(data)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .context("cannot start notedown pipeline")
+}
+
+type PipelineChild = std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>;
+
+/// Says once when the pipeline child ends by itself; the server keeps running.
+async fn watch_pipeline(child: PipelineChild) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut guard = child.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(c) = guard.as_mut() else {
+            return;
+        };
+        match c.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => {
+                println!("pipeline: notedown pipeline ended ({status}), the server keeps running");
+                *guard = None;
+                return;
+            }
+            Err(e) => {
+                println!("pipeline: cannot watch notedown pipeline: {e}");
+                return;
+            }
+        }
+    }
+}
+
+/// Stops the pipeline child, if it still runs.
+fn stop_pipeline(child: &PipelineChild) {
+    let mut guard = child.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(mut c) = guard.take() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+}
+
+/// Sets the flag on Ctrl-C or SIGTERM. The handlers are in place when this returns.
+fn stop_flag() -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    #[cfg(unix)]
+    let signals = {
+        use tokio::signal::unix::{SignalKind, signal};
+        let _guard = runtime.enter();
+        (
+            signal(SignalKind::interrupt())?,
+            signal(SignalKind::terminate())?,
+        )
+    };
+    std::thread::spawn(move || {
+        runtime.block_on(async move {
+            #[cfg(unix)]
+            {
+                let (mut int, mut term) = signals;
+                tokio::select! {
+                    _ = int.recv() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = tokio::signal::ctrl_c().await;
+        });
+        flag.store(true, Ordering::SeqCst);
+    });
+    Ok(stop)
+}
+
+fn pipeline_command(args: PipelineArgs) -> Result<ExitCode> {
+    use notedown_pipeline::worker::{EngineLoader, Worker};
+    if let Some(action) = args.action {
+        return pipeline_action(action);
+    }
+    let data = args.data.context("--data is missing")?;
+    if !data.is_dir() {
+        return Err(anyhow!("data folder {} does not exist", data.display()));
+    }
+    let cfg = notedown_pipeline::PipelineConfig::load(&data)?;
+    // The model is loaded when a page is due, as `notedown convert` loads it.
+    let loader: EngineLoader = Box::new(|| {
+        let paths = model::resolve(&DEFAULT_MODEL, None, None)?;
+        eprintln!("loading model {} ...", paths.label);
+        let engine = LlamaEngine::load(&paths, OcrOptions::default())?;
+        Ok(Box::new(engine) as Box<dyn OcrEngine>)
+    });
+    let mut worker = Worker::with_loader(&data, cfg, loader);
+    if args.once || args.reocr {
+        let p = if args.reocr {
+            worker.reocr(args.note.as_deref())?
+        } else {
+            worker.run_once(true)?
+        };
+        println!(
+            "{} read, {} written, {} failed",
+            plural(p.pages_read, "page"),
+            plural(p.versions, "version"),
+            p.failed
+        );
+        return Ok(if p.failed > 0 {
+            ExitCode::from(1)
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
+    let stop = stop_flag()?;
+    eprintln!(
+        "notedown pipeline: running for {}, press Ctrl-C to stop",
+        data.display()
+    );
+    worker.run(|| stop.load(std::sync::atomic::Ordering::SeqCst))?;
+    eprintln!("notedown pipeline: stopped");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
+    use notedown_pipeline::delta::{self, MAX_CHARS, Start};
+    use notedown_pipeline::format::to_json;
+    use notedown_pipeline::mcp::resolve_account;
+    use notedown_pipeline::store::TextStore;
+    match action {
+        PipelineAction::Consumers {
+            data,
+            account,
+            remove,
+        } => {
+            if let Some(name) = remove {
+                let slug = resolve_account(&data, account.as_deref())?;
+                let store = TextStore::open(&data, &slug)?;
+                if !store.remove_consumer(&name)? {
+                    return Err(anyhow!("no bookmark {name} in account {slug}"));
+                }
+                println!("removed the bookmark of {name} in account {slug}");
+                return Ok(ExitCode::SUCCESS);
+            }
+            let slugs = match account {
+                Some(a) => vec![resolve_account(&data, Some(&a))?],
+                None => notedown_cloud::auth::Accounts::new(&data)
+                    .list()?
+                    .into_iter()
+                    .map(|a| a.slug)
+                    .collect(),
+            };
+            let mut out = serde_json::Map::new();
+            for slug in slugs {
+                // No text store yet: no bookmarks, and nothing is created for the listing.
+                let mut list = Vec::new();
+                let dir = data
+                    .join(notedown_pipeline::store::PIPELINE_DIR)
+                    .join(&slug);
+                if dir.is_dir() {
+                    for (name, b) in TextStore::open(&data, &slug)?.consumers()? {
+                        list.push(serde_json::json!({
+                            "consumer": name,
+                            "seq": b.seq,
+                            "updatedAt": b.updated_at,
+                        }));
+                    }
+                }
+                out.insert(slug, serde_json::Value::Array(list));
+            }
+            println!("{}", to_json(&out));
+        }
+        PipelineAction::Changes(a) => {
+            let slug = resolve_account(&a.data, a.account.as_deref())?;
+            let store = TextStore::open(&a.data, &slug)?;
+            let local =
+                notedown_cloud::localtime::local_utc_offset().unwrap_or(time::UtcOffset::UTC);
+            let start = match (a.consumer, a.since, a.from, a.up_to) {
+                (Some(c), _, _, _) => Start::Bookmark(c),
+                (_, Some(s), _, _) => Start::Since(delta::parse_since(
+                    &s,
+                    time::OffsetDateTime::now_utc(),
+                    local,
+                )?),
+                (_, _, Some(from), Some(up_to)) => Start::Range { from, up_to },
+                _ => return Err(anyhow!("give --consumer, --since, or --from with --up-to")),
+            };
+            if a.summary {
+                println!("{}", to_json(&delta::manifest(&store, &start, local)?));
+            } else {
+                let d = delta::delta(&store, &start, a.notes.as_deref(), MAX_CHARS, local)?;
+                println!("{}", to_json(&d));
+            }
+        }
+        PipelineAction::Ack {
+            data,
+            account,
+            consumer,
+            up_to,
+        } => {
+            let slug = resolve_account(&data, account.as_deref())?;
+            let store = TextStore::open(&data, &slug)?;
+            println!("{}", to_json(&store.ack(&consumer, up_to)?));
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn mcp_command(args: McpArgs) -> Result<ExitCode> {
+    // serve_stdio builds its own runtime; this is plain synchronous code.
+    notedown_pipeline::mcp::serve_stdio(&args.data, args.account.as_deref())?;
+    Ok(ExitCode::SUCCESS)
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -1632,6 +1981,8 @@ fn main() -> ExitCode {
         Command::Model { action } => model_command(action),
         Command::Serve(a) => serve_command(a),
         Command::Cloud { action } => cloud_command(action),
+        Command::Pipeline(a) => pipeline_command(a),
+        Command::Mcp(a) => mcp_command(a),
     };
     let _ = std::io::stdout().flush();
     match result {

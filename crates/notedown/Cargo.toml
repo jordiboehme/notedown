@@ -21,6 +21,7 @@ notedown-note.workspace = true
 notedown-ocr.workspace = true
 notedown-cloud.workspace = true
 notedown-convert.workspace = true
+notedown-pipeline.workspace = true
 rpassword.workspace = true
 if-addrs.workspace = true
 tokio.workspace = true

@@ -2,6 +2,7 @@
 
 pub mod compose;
 pub mod config;
+pub mod delta;
 pub mod errors;
 pub mod meta;
 pub mod model;

@@ -18,19 +18,19 @@ use notedown_pipeline::worker::{Clock, Worker};
 
 use crate::fake_engine::{FakeEngine, text_block};
 
-const SLUG: &str = "jordi";
+pub(crate) const SLUG: &str = "jordi";
 const HOUR: u64 = 3_600_000;
 
-struct Data {
+pub(crate) struct Data {
     _dir: tempfile::TempDir,
-    data: PathBuf,
+    pub(crate) data: PathBuf,
 }
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-fn setup() -> Data {
+pub(crate) fn setup() -> Data {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().to_path_buf();
     Accounts::new(&data)
@@ -45,7 +45,7 @@ impl Data {
     }
 
     /// Puts fixture `name` into `folder` with notedown-cloud; returns the note key.
-    fn put(&self, name: &str, folder: &str) -> String {
+    pub(crate) fn put(&self, name: &str, folder: &str) -> String {
         let journal = Journal::open(&self.data).unwrap();
         let src = root().join(format!("tests/fixtures/notes/{name}.note"));
         notedown_cloud::put::put(&self.data, SLUG, &journal, &src, folder, None).unwrap();
@@ -75,7 +75,7 @@ impl Data {
 
     /// Changes the page record of `key` as the server would after a sync, without a journal
     /// event.
-    fn edit_record(&self, key: &str, f: impl FnOnce(&mut PageRecord)) {
+    pub(crate) fn edit_record(&self, key: &str, f: impl FnOnce(&mut PageRecord)) {
         let path = self.record_path(key);
         let mut rec: PageRecord = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         f(&mut rec);
@@ -91,7 +91,7 @@ impl Data {
         f.set_modified(SystemTime::now() - ago).unwrap();
     }
 
-    fn store(&self) -> TextStore {
+    pub(crate) fn store(&self) -> TextStore {
         TextStore::open(&self.data, SLUG).unwrap()
     }
 
@@ -121,7 +121,7 @@ impl Data {
 }
 
 /// A fingerprint like `fp` with other part hashes; `total` is computed again.
-fn with_parts(
+pub(crate) fn with_parts(
     fp: &PageFingerprint,
     strokes: Option<&str>,
     layer: Option<&str>,
@@ -143,15 +143,15 @@ fn with_parts(
     )
 }
 
-fn engine_reading(text: &str) -> FakeEngine {
+pub(crate) fn engine_reading(text: &str) -> FakeEngine {
     FakeEngine::new(HashMap::new()).with_default(&text_block([100, 100, 900, 200], text))
 }
 
-fn worker(d: &Data, cfg: PipelineConfig, engine: FakeEngine) -> Worker {
+pub(crate) fn worker(d: &Data, cfg: PipelineConfig, engine: FakeEngine) -> Worker {
     Worker::new(&d.data, cfg, Box::new(engine))
 }
 
-fn no_settle() -> PipelineConfig {
+pub(crate) fn no_settle() -> PipelineConfig {
     PipelineConfig {
         ocr_settle: Duration::ZERO,
         ..PipelineConfig::default()

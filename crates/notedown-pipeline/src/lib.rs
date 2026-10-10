@@ -5,6 +5,7 @@ pub mod config;
 pub mod delta;
 pub mod errors;
 pub mod format;
+pub mod mcp;
 pub mod meta;
 pub mod model;
 pub mod ocr;
@@ -13,6 +14,7 @@ pub mod records;
 pub mod region;
 pub mod retention;
 pub mod scope;
+pub mod search;
 pub mod store;
 pub mod text;
 pub mod toon;
@@ -49,6 +51,11 @@ pub enum Error {
     ModelMissing,
     #[error("the text store needs a repair before it is written")]
     NeedsRepair,
+    /// The account of an MCP session cannot be chosen; the text says why.
+    #[error("{0}")]
+    Account(String),
+    #[error("mcp: {0}")]
+    Mcp(String),
     #[error("invalid {what}: {message}")]
     Invalid { what: &'static str, message: String },
     #[error("{path}: {message}")]

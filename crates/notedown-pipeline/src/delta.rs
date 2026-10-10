@@ -257,7 +257,7 @@ fn line_chars(line: &LogLine) -> usize {
 }
 
 /// `2026-10-08 23:14 +02:00`: `ms` at the offset `local`.
-fn stamp(ms: u64, local: UtcOffset) -> String {
+pub(crate) fn stamp(ms: u64, local: UtcOffset) -> String {
     let format = time::macros::format_description!(
         "[year]-[month]-[day] [hour]:[minute] [offset_hour sign:mandatory]:[offset_minute]"
     );
@@ -809,7 +809,11 @@ fn block_changes(
 
 /// The blocks of `new` that replaced `id`, through chains of replaced blocks (b3 became b7, b7
 /// became b9: b9).
-fn heirs(id: &str, new: &[Block], successors: &BTreeMap<String, Vec<String>>) -> Vec<String> {
+pub(crate) fn heirs(
+    id: &str,
+    new: &[Block],
+    successors: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut todo: Vec<String> = vec![id.to_string()];

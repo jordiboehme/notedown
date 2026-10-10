@@ -14,14 +14,19 @@ notedown-cloud.workspace = true
 notedown = { path = "../notedown", version = "0.1.0" }
 notedown-note.workspace = true
 notedown-ocr.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
 sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 similar.workspace = true
 thiserror.workspace = true
 time.workspace = true
+tokio.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+rmcp = { workspace = true, features = ["client"] }
+tokio = { workspace = true, features = ["macros"] }
 base64.workspace = true
 tempfile.workspace = true

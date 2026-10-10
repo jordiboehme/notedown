@@ -212,6 +212,69 @@ After `notedown cloud import --replace` every file gets a new id. The old versio
 
 The server keeps a PDF of every note in `share/` in the data folder, for example `~/notedown-data/share/me/`. You don't need to set anything for it. To use another folder, set `render_dir` in `server.toml`, for example `render_dir = "~/Documents/Supernote PDFs"`. `~` alone is your home folder. The folder must exist. The path must start with `/` or `~` and point outside the data folder, or the server doesn't start. To turn the PDFs off, set `render_dir = ""`. There is one subfolder per account, with the same folders as on the device. Two notes that would get the same PDF name (for example `a.note` and `a.NOTE`) get two PDFs. The note that had its PDF first keeps `a.pdf`. The other one gets its full name, as `a.NOTE.pdf`. When both notes are new, the one whose name sorts first gets `a.pdf`. A changed note is rendered again a few seconds after the sync. A moved or deleted note moves or deletes its PDF. Other files in that folder are never touched. To render everything again, run `notedown cloud render --data <data folder> --all`. For one note without the server, run `notedown render <file.note> --pdf`.
 
+## Your notes as text for an agent
+
+notedown can read the pages of your notes as text (OCR) and keep that text for an agent such as Claude Code. The agent then sees what changed since its last run, page by page, and can put it into Crystalline.
+
+**Read the pages.** Run the pipeline next to the server:
+
+```sh
+notedown pipeline --data ~/notedown-data
+```
+
+Or start both in one go with `notedown serve --data ~/notedown-data --pipeline`. The pipeline stops when the server stops. It needs the OCR model (`notedown model pull`). It waits 10 minutes after the last change of a note before it reads it, so a note you are still writing is read once. `notedown pipeline --data ~/notedown-data --once` reads everything that is due now and stops.
+
+The first run reads every note in scope, newest note first, and prints its progress (`ocr: 12 of 380 pages`). One page takes up to about half a minute, so a few hundred pages take a few hours. You can stop it at any time: every finished page is kept. By default only notes in `NOTE/Note` are read. The `[pipeline]` section of `server.toml` changes that (`ingest_folders`, `ingest_exclude`, `ingest_keyword`). The pipeline writes only to `pipeline/` in the data folder, never to your files.
+
+**Add the MCP server to Claude Code.**
+
+```sh
+claude mcp add notedown -- notedown mcp --data ~/notedown-data
+```
+
+With more than one account in the data folder, add `--account me`. The server only reads the text and the bookmarks of the agents. It never runs OCR. Ask Claude "what changed in my notes since yesterday?" to try it.
+
+**Install the ingest skill.** The skill tells the agent how to put the changes into Crystalline: it plans, gives the notes of one folder to one sub-agent, and confirms only when all of them succeeded. Copy it from a source checkout of notedown:
+
+```sh
+cp -R skills/ingest-notes ~/.claude/skills/
+```
+
+Then ask Claude to "ingest my notes".
+
+**Run it every night.** `scripts/ingest-notes.sh` does the same without a conversation: it reads the list of changed notes, runs `claude -p` per folder and confirms when every run succeeded. Questions and errors go to `~/Library/Logs/notedown-ingest.log`. The top of the script lists its settings. It needs `jq`. To start it every night at 2:30 with launchd, save this as `~/Library/LaunchAgents/de.notedown.ingest.plist` (change the paths to yours):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>de.notedown.ingest</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/me/notedown/scripts/ingest-notes.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/me/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>NOTEDOWN_DATA</key>
+    <string>/Users/me/notedown-data</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>2</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+</dict>
+</plist>
+```
+
+Load it with `launchctl load ~/Library/LaunchAgents/de.notedown.ingest.plist`. `PATH` must hold `notedown`, `claude` and `jq`, because launchd starts with a short one. Claude Code must know the Crystalline MCP server. If its name is not `crystalline`, set `CRYSTALLINE_MCP` (see the top of the script). When one run fails, the script confirms nothing. The next night repeats the same changes, which is safe.
+
 ## What to expect
 
 - Digests and to-dos sync with every sync of the device. Each change shows up in the journal (`digest.created`, `digest.updated`, `digest.deleted`, `task.created` and so on). The digests are in `accounts/me/digests/` and the to-dos in `accounts/me/tasks/`, as JSON files. A handwritten comment of a digest is a `.mark` file in `accounts/me/digests/marks/`.

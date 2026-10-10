@@ -1,0 +1,92 @@
+---
+name: ingest-notes
+description: Use when asked to ingest, import or sync handwritten Supernote notes from notedown into Crystalline, or to bring Crystalline up to date with new or changed notes. Reads the changes of the notedown MCP server and distills them into engrams with sub-agents.
+---
+
+# Ingest notes from notedown into Crystalline
+
+The notedown MCP server (`notedown mcp`, tools `mcp__notedown__*` when it was added as
+`notedown`) gives the text of handwritten notes and what changed since the last run. This skill
+turns those changes into Crystalline engrams.
+
+You are the main agent. You plan, dispatch and confirm. You never load note text yourself.
+Sub-agents read the text and write the engrams.
+
+The consumer name is always `crystalline`.
+
+## Main agent
+
+1. **Plan.** Call `status`. Then call `get_changes` with `{"consumer": "crystalline", "summary": true}`.
+   This is the manifest: `from`, `upTo`, `more` and one row per changed note (key, path, folder,
+   change, pages, blocks, pending, chars). No text. When it lists no notes, stop and say that
+   nothing changed.
+2. **Group.** Put the notes of one folder into one group. Split a folder when its notes add up
+   to more than about 30,000 characters (the `chars` column). Keep related notes together: one
+   sub-agent then decides about shared engrams, and two sub-agents never create the same engram
+   twice. Leave out a note with `pending: true` and 0 pages: it has no text yet, and its text comes
+   in a later run.
+3. **Dispatch.** Start one sub-agent per group, at most 3 at the same time. Give each one:
+   the account slug, the note keys of its group, the fixed range `from` and `upTo` of the
+   manifest, and the sub-agent instructions below. Never give a sub-agent the consumer name:
+   every sub-agent must see the same range as the manifest.
+4. **Confirm.** Only when every sub-agent reported success, call `ack` with
+   `{"consumer": "crystalline", "upTo": <upTo>}`. If one sub-agent failed, do not call `ack`.
+   The next run then repeats the whole range. This is safe, because ingestion is idempotent by
+   anchor.
+5. **Repeat** from step 1 while `more` was true. Then give Jordi one short run report: notes
+   and engrams per group, and all open questions of the sub-agents.
+
+## Sub-agent instructions
+
+Pass this section to every sub-agent, with its account, note keys, `from` and `upTo`.
+
+1. Fetch your delta: `get_changes` with `{"notes": [<keys>], "from": <from>, "upTo": <upTo>}`.
+   Do not use `consumer` or `since`. Do not call `ack`.
+2. Find the target domain: `list_domains` with `include_routing: true`, and follow the routing.
+   When you were given a domain, use that one.
+3. For each note, distill its text into engrams. One engram per topic, not one per block.
+   - Put the anchors of the blocks you used into the metadata key `sources` (a list), for
+     example `notedown://jordi/F2024.../P2024...#b3`.
+   - Put the note address `notedown://<account>/<key>` into the metadata key `resource`.
+4. Search before you write. A block that is already cited is updated, never ingested twice.
+   - With Crystalline 0.24.3 or later: `search_engrams` with
+     `metadata_filters: {"sources": {"$contains": "<anchor>"}}`.
+   - Before 0.24.3: `search_engrams` with `metadata_filters: {"resource": "notedown://<account>/<key>"}`,
+     then read the hits and check their `sources`.
+   - When you cannot tell the version, or the `$contains` filter gives an error, use the
+     `resource` search. An empty `$contains` result on an older server means nothing.
+5. Handle each entry of `whatChanged`:
+   - `edited`: update the engrams that cite the anchor to the new text.
+   - `replaced`: update the engrams that cite the anchor, and move the anchor in their `sources`
+     to the anchors in `replacedBy`. Do not retire them.
+   - `deleted`: check before you retire an engram. Tidying up the device does not make the
+     knowledge wrong. Remove the anchor from `sources`; retire only when the knowledge is gone.
+   - A note with `change: unscoped` only left the ingest scope. Never retire anything for it.
+   - A new block has no entry. It is in `textNow`.
+   - To change `sources` of an engram: `edit_engram` with `set_frontmatter` may not accept the
+     key `sources`. Then rewrite the engram with `write_engram` and `overwrite: true` (same title
+     and folder, full metadata), or use `edit_engram` `find_replace` on its frontmatter.
+6. Report back in a few lines: engrams created, updated and retired, and open questions (an
+   illegible word, a removal you were not sure about). End with one line `RESULT: ok`, or
+   `RESULT: failed` and the reason.
+
+## The format of a delta
+
+`get_changes` gives a TOON head and a Markdown body.
+
+- The head: `range` (the range in words), `from`, `upTo`, `more`, `legend`, a table
+  `notes[N]{key,title,path,change,pending,oldNote,oldPath,keywords,links}:` and a table
+  `blocks[N]{note,page,block,change,replacedBy}:` with one row per changed block. A table row
+  holds one record, its cells split by commas.
+- The body: one `## <title>, page <n> (<change>)` section per page. `### textNow` holds the full
+  page text now, each block after an HTML comment with its anchor. Then one section per changed
+  block, named with its block id: `### wordDiff #b3`, `### textBefore #b5`, and
+  `### textNow #b4` when more than half of the words changed.
+- A note with `oldNote` got a new key by a move: search by the old key, then change `resource`
+  and the anchors in `sources` of those engrams to the new key. A note with only `oldPath` keeps
+  its key and its anchors.
+- The legend: `textBefore` is the text when you last confirmed (or at your `since`).
+  `wordDiff`: `[-...-]` removed, `[+...+]` added.
+- `### beforeUnknown #b3` means the old versions were pruned. Search by the anchor and update
+  what you find; otherwise treat the block as new.
+- `get_block` with an anchor gives the current text of one block, or what replaced it.

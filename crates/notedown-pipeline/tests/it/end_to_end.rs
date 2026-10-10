@@ -1,6 +1,7 @@
-//! End to end (spec 9): notes put into a data folder as a device sync does, the worker, a
-//! delta for a consumer, `ack`, a second sync that changes one page, and a delta with only
-//! that change. Plus the one test with the real OCR model, which skips when it is missing.
+//! End to end (spec 9): notes put into a data folder with `notedown_cloud::put`, the worker, a
+//! delta for a consumer, `ack`, then one changed page and a delta with only that change. The
+//! change is made in the page record, not with new note bytes (see the test). Plus the one test
+//! with the real OCR model, which skips when it is missing.
 
 use std::path::Path;
 
@@ -58,9 +59,12 @@ fn a_sync_then_a_change_gives_only_that_change() {
     let empty = delta(&store, &bookmark(), None, MAX_CHARS, UtcOffset::UTC).unwrap();
     assert!(empty.notes.is_empty(), "{empty:?}");
 
-    // The second sync changes the one page of test2: a new layer hash in its page record, as
-    // the server writes it after a sync (the worker then reads the whole page, as in
-    // `worker::a_layer_change_reads_the_whole_page`). test1 comes again with the same bytes.
+    // The change of one page. There is no fixture with two versions of the same note, so no
+    // new note bytes go through `put` here: the test edits the page record of test2 directly
+    // and gives it a new layer hash. The worker then reads the whole page, as in
+    // `worker::a_layer_change_reads_the_whole_page`; the stroke region diff is not used (a new
+    // strokes hash over the same file finds no changed stroke, so nothing would be read).
+    // test1 is put again with the same bytes, which changes nothing.
     let again = d.put("test1", "NOTE/Note");
     assert_eq!(again, plan);
     d.edit_record(&work, |r| {

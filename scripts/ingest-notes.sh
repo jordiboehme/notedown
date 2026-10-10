@@ -8,7 +8,10 @@
 # The flow of skills/ingest-notes/SKILL.md as code: read the manifest of consumer
 # "crystalline", group the notes by folder (a group stays below about 30,000 characters), run
 # one `claude -p` per group with the fixed range from/upTo, and confirm with
-# `notedown pipeline ack` only when every run reported success. Repeat while the manifest says
+# `notedown pipeline ack` only when every run reported success. A manifest without notes is
+# confirmed too when its range is not empty, so the bookmark moves past lines that change no
+# note text. Each run gets the sections "Sub-agent instructions" and "The format of a delta" of
+# the skill file, plus the account, the note keys, the range and the domain. Repeat while the manifest says
 # `more`. One failed run stops the script without an ack; the next run repeats the whole range,
 # which is safe because ingestion is idempotent by anchor. Questions of the runs go to the log.
 #
@@ -17,7 +20,7 @@
 #
 # Settings (environment variables, with defaults):
 #   NOTEDOWN_DATA        data folder                        ~/notedown-data
-#   NOTEDOWN_ACCOUNT     account slug; empty when the data folder has only one account
+#   NOTEDOWN_ACCOUNT     account slug; empty: the only account of the data folder
 #   NOTEDOWN_CONSUMER    bookmark name                      crystalline
 #   NOTEDOWN_INGEST_LOG  run log                            ~/Library/Logs/notedown-ingest.log
 #   NOTEDOWN_BIN         the notedown command               notedown
@@ -29,6 +32,8 @@
 #   CRYSTALLINE_DOMAIN   the domain for the engrams; empty: the routing of list_domains decides
 #   GROUP_CHARS          the size limit of a group in characters  30000
 #   MAX_ROUNDS           stop after this many manifests (a guard against a loop)  50
+#   INGEST_SKILL         the skill file the run instructions come from
+#                        <this repo>/skills/ingest-notes/SKILL.md
 #
 # Needs jq to read the JSON of `notedown pipeline changes`. launchd starts with a short PATH,
 # so set PATH in the plist or give full paths in NOTEDOWN_BIN and CLAUDE_BIN.
@@ -44,6 +49,8 @@ crystalline="${CRYSTALLINE_MCP:-crystalline}"
 domain="${CRYSTALLINE_DOMAIN:-}"
 group_chars="${GROUP_CHARS:-30000}"
 max_rounds="${MAX_ROUNDS:-50}"
+skill="${INGEST_SKILL:-$(cd "$(dirname "$0")/.." && pwd)/skills/ingest-notes/SKILL.md}"
+server="notedown"
 
 mkdir -p "$(dirname "$log")"
 
@@ -65,54 +72,79 @@ need "$notedown"
 need "$claude"
 need jq
 
-account_args=()
-if [[ -n "$account" ]]; then
-    account_args=(--account "$account")
+fail() {
+    say "error: $*"
+    echo "ingest-notes: $*" >&2
+    exit 2
+}
+
+# The run instructions: the skill from "## Sub-agent instructions" to its end, without the
+# paragraph for the main agent.
+if [[ ! -f "$skill" ]]; then
+    fail "the skill file $skill is missing (set INGEST_SKILL)"
 fi
+instructions="$(awk '
+    /^## Sub-agent instructions/ { on = 1; skip = 1; print; print ""; next }
+    on && skip && /^1\. / { skip = 0 }
+    on && !skip' "$skill")"
+if [[ "$instructions" != *"## The format of a delta"* ]]; then
+    fail "no sections \"Sub-agent instructions\" and \"The format of a delta\" in $skill"
+fi
+
+# The account slug: the runs need it for the note addresses notedown://<account>/<key>.
+if [[ -z "$account" ]]; then
+    slugs="$("$notedown" pipeline consumers --data "$data" 2>>"$log" | jq -r 'keys[]')"
+    if [[ "$(grep -c . <<<"$slugs")" != "1" ]]; then
+        fail "set NOTEDOWN_ACCOUNT, the data folder has these accounts: $(tr '\n' ' ' <<<"$slugs")"
+    fi
+    account="$slugs"
+fi
+account_args=(--account "$account")
 
 # The notedown MCP server for the runs. The other MCP servers of Claude Code (Crystalline)
 # come from its own configuration.
-mcp_config="$(jq -cn --arg cmd "$notedown" --arg data "$data" --arg account "$account" '
-    {mcpServers: {notedown: {
-        command: $cmd,
-        args: (["mcp", "--data", $data] + (if $account == "" then [] else ["--account", $account] end))
-    }}}')"
+mcp_config="$(jq -cn --arg name "$server" --arg cmd "$notedown" --arg data "$data" \
+    --arg account "$account" '
+    {mcpServers: {($name): {command: $cmd, args: ["mcp", "--data", $data, "--account", $account]}}}')"
 
 # The runs may read notes and use Crystalline. They cannot ack: only this script confirms.
-allowed_tools="mcp__notedown__status mcp__notedown__get_changes mcp__notedown__get_block"
-allowed_tools+=" mcp__notedown__get_note mcp__notedown__search_notes mcp__notedown__list_notes"
+allowed_tools="mcp__${server}__status mcp__${server}__get_changes mcp__${server}__get_block"
+allowed_tools+=" mcp__${server}__get_note mcp__${server}__search_notes mcp__${server}__list_notes"
 allowed_tools+=" mcp__${crystalline}"
+disallowed_tools="mcp__${server}__ack"
 
 if [[ -n "$domain" ]]; then
-    domain_rule="Write the engrams into the Crystalline domain \"$domain\"."
+    domain_rule="Domain: write the engrams into the Crystalline domain \"$domain\"."
 else
-    domain_rule="Find the target domain with list_domains (include_routing: true) and follow its routing."
+    domain_rule="Domain: none given, follow the routing of list_domains (include_routing: true)."
 fi
 
-# The sub-agent instructions of skills/ingest-notes/SKILL.md, with the keys and the range.
+# One run's prompt: the skill sections with the account, the keys, the range and the domain.
 prompt_for() {
     local keys_json="$1" from="$2" up_to="$3"
     cat <<EOF
-You ingest handwritten notes from notedown into Crystalline. Work alone, nobody answers questions.
+You are a sub-agent of the ingest-notes skill: you ingest handwritten notes from notedown into
+Crystalline. Work alone, nobody answers questions. Write your report as plain text, no formatting.
 
-1. Fetch your delta: call the notedown tool get_changes with {"notes": $keys_json, "from": $from, "upTo": $up_to}. Use no consumer and no since. Never call ack.
-2. $domain_rule
-3. For each note, distill its text into engrams, one engram per topic. Put the anchors of the blocks you used into the metadata key "sources" (a list, for example notedown://jordi/F2024.../P2024...#b3). Put the note address notedown://<account>/<key> into the metadata key "resource".
-4. Search before you write. A block that is already cited is updated, never ingested twice. With Crystalline 0.24.3 or later: search_engrams with metadata_filters {"sources": {"\$contains": "<anchor>"}}. Before 0.24.3, or when you cannot tell the version, or when \$contains gives an error: search_engrams with metadata_filters {"resource": "notedown://<account>/<key>"}, then read the hits and check their sources.
-5. For each entry of whatChanged: edited: update the engrams that cite the anchor. replaced: update them and move the anchor in their sources to the anchors in replacedBy, do not retire them. deleted: check before you retire, because tidying up the device does not make the knowledge wrong; remove the anchor from sources and retire only when the knowledge is gone. A note with change unscoped only left the scope: never retire anything for it. A new block has no entry, it is in textNow. A note with oldNote got a new key: change resource and the anchors in sources to the new key. To change sources: set_frontmatter may not take the key sources; then rewrite the engram with write_engram and overwrite true (same title and folder, full metadata), or use edit_engram find_replace on its frontmatter.
-6. The delta has a TOON head (range, more, legend, tables notes[N]{...} and blocks[N]{...}, one record per row) and a Markdown body: per page "## <title>, page <n> (<change>)", then "### textNow" with each block after an HTML comment with its anchor, then "### wordDiff #b3" ([-...-] removed, [+...+] added), "### textBefore #b5" (the text at the start of the range) for the changed blocks.
-7. Report in a few lines: engrams created, updated and retired, and open questions (an illegible word, a removal you were not sure about). The last line is exactly "RESULT: ok", or "RESULT: failed" and the reason.
+Account: $account
+Note keys: $keys_json
+Range: from $from, upTo $up_to
+$domain_rule
+The notedown tools are named mcp__${server}__<tool>. Never call ack.
+
+$instructions
 EOF
 }
 
 # Runs one group. Returns 0 only when claude exits 0, reports no error, and the answer ends
 # with "RESULT: ok".
 run_group() {
-    local keys_json="$1" from="$2" up_to="$3" out result
+    local keys_json="$1" from="$2" up_to="$3" out result last
     if ! out="$("$claude" -p "$(prompt_for "$keys_json" "$from" "$up_to")" \
         --output-format json \
         --mcp-config "$mcp_config" \
         --allowedTools "$allowed_tools" \
+        --disallowedTools "$disallowed_tools" \
         --permission-mode dontAsk </dev/null 2>>"$log")"; then
         say "run failed: claude exited with an error"
         return 1
@@ -123,7 +155,8 @@ run_group() {
     fi
     result="$(jq -r '.result // ""' <<<"$out")"
     printf '%s\n' "$result" | sed 's/^/    /' >>"$log"
-    if [[ "$(printf '%s\n' "$result" | grep -v '^[[:space:]]*$' | tail -n 1)" != "RESULT: ok" ]]; then
+    last="$(printf '%s\n' "$result" | tr -d '*`' | grep -v '^[[:space:]]*$' | tail -n 1 | sed 's/[[:space:]]*$//')"
+    if [[ "$last" != "RESULT: ok" ]]; then
         say "run failed: no RESULT: ok"
         return 1
     fi

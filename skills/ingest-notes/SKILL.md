@@ -16,10 +16,12 @@ The consumer name is always `crystalline`.
 
 ## Main agent
 
-1. **Plan.** Call `status`. Then call `get_changes` with `{"consumer": "crystalline", "summary": true}`.
-   This is the manifest: `from`, `upTo`, `more` and one row per changed note (key, path, folder,
-   change, pages, blocks, pending, chars). No text. When it lists no notes, stop and say that
-   nothing changed.
+1. **Plan.** Call `status`. Its `account` is the account slug. Then call `get_changes` with
+   `{"consumer": "crystalline", "summary": true}`. This is the manifest: `from`, `upTo`, `more`
+   and one row per changed note (key, path, folder, change, pages, blocks, pending, chars). No
+   text. When it lists no notes and `from` equals `upTo`, stop and say that nothing changed.
+   When it lists no notes but `from` is lower than `upTo`, go to step 4: the range holds lines
+   that change no note text, and the ack moves the bookmark past them.
 2. **Group.** Put the notes of one folder into one group. Split a folder when its notes add up
    to more than about 30,000 characters (the `chars` column). Keep related notes together: one
    sub-agent then decides about shared engrams, and two sub-agents never create the same engram
@@ -38,7 +40,8 @@ The consumer name is always `crystalline`.
 
 ## Sub-agent instructions
 
-Pass this section to every sub-agent, with its account, note keys, `from` and `upTo`.
+Pass this section and the next one to every sub-agent, with its account slug, note keys,
+`from` and `upTo`. `scripts/ingest-notes.sh` reads both sections from this file.
 
 1. Fetch your delta: `get_changes` with `{"notes": [<keys>], "from": <from>, "upTo": <upTo>}`.
    Do not use `consumer` or `since`. Do not call `ack`.
@@ -46,7 +49,7 @@ Pass this section to every sub-agent, with its account, note keys, `from` and `u
    When you were given a domain, use that one.
 3. For each note, distill its text into engrams. One engram per topic, not one per block.
    - Put the anchors of the blocks you used into the metadata key `sources` (a list), for
-     example `notedown://jordi/F2024.../P2024...#b3`.
+     example `notedown://<account>/F2024.../P2024...#b3`.
    - Put the note address `notedown://<account>/<key>` into the metadata key `resource`.
 4. Search before you write. A block that is already cited is updated, never ingested twice.
    - With Crystalline 0.24.3 or later: `search_engrams` with
@@ -55,20 +58,21 @@ Pass this section to every sub-agent, with its account, note keys, `from` and `u
      then read the hits and check their `sources`.
    - When you cannot tell the version, or the `$contains` filter gives an error, use the
      `resource` search. An empty `$contains` result on an older server means nothing.
-5. Handle each entry of `whatChanged`:
+5. Check the `change` of each note first. On `unscoped`, stop there for that note and retire
+   nothing: the note only left the ingest scope. Then handle each entry of `whatChanged`:
    - `edited`: update the engrams that cite the anchor to the new text.
    - `replaced`: update the engrams that cite the anchor, and move the anchor in their `sources`
      to the anchors in `replacedBy`. Do not retire them.
-   - `deleted`: check before you retire an engram. Tidying up the device does not make the
-     knowledge wrong. Remove the anchor from `sources`; retire only when the knowledge is gone.
-   - A note with `change: unscoped` only left the ingest scope. Never retire anything for it.
+   - `deleted`: a deletion alone is never a reason to retire. Remove the anchor from `sources`.
+     Retire only when no source is left and `search_notes` finds the text in no other note.
+     When unsure, keep the engram and list it as an open question.
    - A new block has no entry. It is in `textNow`.
    - To change `sources` of an engram: `edit_engram` with `set_frontmatter` may not accept the
      key `sources`. Then rewrite the engram with `write_engram` and `overwrite: true` (same title
      and folder, full metadata), or use `edit_engram` `find_replace` on its frontmatter.
-6. Report back in a few lines: engrams created, updated and retired, and open questions (an
-   illegible word, a removal you were not sure about). End with one line `RESULT: ok`, or
-   `RESULT: failed` and the reason.
+6. Report back in a few lines of plain text, no formatting: engrams created, updated and
+   retired, and open questions (an illegible word, a removal you were not sure about). End with
+   one line `RESULT: ok`, or `RESULT: failed` and the reason.
 
 ## The format of a delta
 

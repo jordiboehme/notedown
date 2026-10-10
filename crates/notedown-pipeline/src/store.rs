@@ -475,6 +475,47 @@ impl TextStore {
         }
     }
 
+    /// Rewrites the log without the lines `plan` names, atomically and under `.lock`. A torn
+    /// last line is cut first. `plan` gets every complete line in order and returns the
+    /// `seq` numbers to drop; kept lines are copied byte for byte, so no `seq` changes.
+    /// Returns `(kept, removed)`. The log is left alone when `plan` names no line.
+    pub fn rewrite_log(
+        &self,
+        _w: &WriterLock,
+        plan: &mut dyn FnMut(&[LogLine]) -> Result<std::collections::BTreeSet<u64>>,
+    ) -> Result<(usize, usize)> {
+        self.writable()?;
+        let _lock = self.lock()?;
+        let (complete, _) = self.cut_torn()?;
+        let path = self.log_path();
+        let mut bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(io_err(&path)(e)),
+        };
+        bytes.truncate(complete as usize);
+        let mut raw: Vec<(LogLine, &[u8])> = Vec::new();
+        for chunk in bytes.split_inclusive(|&b| b == b'\n') {
+            let line: LogLine = serde_json::from_slice(&chunk[..chunk.len() - 1])
+                .map_err(|e| corrupt(&path, format!("log line cannot be read: {e}")))?;
+            raw.push((line, chunk));
+        }
+        let lines: Vec<LogLine> = raw.iter().map(|(l, _)| l.clone()).collect();
+        let drop = plan(&lines)?;
+        let removed = raw.iter().filter(|(l, _)| drop.contains(&l.seq)).count();
+        if removed == 0 {
+            return Ok((raw.len(), 0));
+        }
+        let mut out = Vec::with_capacity(bytes.len());
+        for (line, chunk) in &raw {
+            if !drop.contains(&line.seq) {
+                out.extend_from_slice(chunk);
+            }
+        }
+        notedown_cloud::fsutil::write_atomic(&path, &out, false)?;
+        Ok((raw.len() - removed, removed))
+    }
+
     /// The `seq` of the last complete log line, 0 for an empty log.
     pub fn last_seq(&self) -> Result<u64> {
         let path = self.log_path();

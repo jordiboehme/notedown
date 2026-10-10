@@ -9,6 +9,7 @@ pub mod ocr;
 pub mod page;
 pub mod records;
 pub mod region;
+pub mod retention;
 pub mod scope;
 pub mod store;
 pub mod text;

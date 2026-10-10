@@ -175,9 +175,10 @@ while true; do
     from="$(jq -r '.from' <<<"$manifest")"
     up_to="$(jq -r '.upTo' <<<"$manifest")"
     more="$(jq -r '.more' <<<"$manifest")"
-    # A row with 0 pages and the change new or edited is listed only because pages wait for
-    # OCR (pending) or could not be read (failed): nothing to ingest, no run for it.
-    wanted='[.notes[] | select((.pages == 0 and (.change == "new" or .change == "edited")) | not)]'
+    # A row with 0 pages that is pending or failed is listed only because pages wait for OCR
+    # or could not be read: nothing to ingest, no run for it. Other 0-page rows stay (a re-keyed
+    # note must still move its engrams).
+    wanted='[.notes[] | select((.pages == 0 and (.pending or .failed)) | not)]'
     count="$(jq -r "$wanted | length" <<<"$manifest")"
     unreadable="$(jq -r '[.notes[] | select(.failed) | .path] | join(", ")' <<<"$manifest")"
     if [[ -n "$unreadable" ]]; then

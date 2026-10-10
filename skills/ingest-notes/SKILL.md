@@ -19,9 +19,10 @@ The consumer name is always `crystalline`.
 1. **Plan.** Call `status`. Its `account` is the account slug. Then call `get_changes` with
    `{"consumer": "crystalline", "summary": true}`. This is the manifest: `from`, `upTo`, `more`
    and one row per changed note (key, path, folder, change, pages, blocks, pending, failed,
-   chars). No text. A row with 0 pages and the change `new` or `edited` has nothing to ingest:
-   it is listed only because pages wait for OCR (`pending: true`) or could not be read
-   (`failed: true`). Leave such rows out, and keep the notes with `failed: true` for the run
+   chars). No text. A row with 0 pages that is `pending: true` or `failed: true` has nothing to
+   ingest: it is listed only because pages wait for OCR or could not be read. Leave such rows
+   out. Keep a row with 0 pages and no such flag, for example a `new` row with `oldNote`: its
+   engrams still have to move to the new key. and keep the notes with `failed: true` for the run
    report. When no other row is left and `from` equals `upTo`, stop and say that nothing
    changed (name the unreadable notes, if any). When no other row is left but `from` is lower
    than `upTo`, go to step 4: the range holds lines that change no note text, and the ack
@@ -72,8 +73,10 @@ Pass this section and the next one to every sub-agent, with its account slug, no
      Retire only when no source is left and `search_notes` finds the text in no other note.
      When unsure, keep the engram and list it as an open question.
    - A new block has no entry. It is in `textNow`.
-   - A page marked `unreadable` could not be read by OCR. Ingest nothing from it, also not from
-     its device text, and retire nothing because of it. Name it in your report (note and page).
+   - A page marked `unreadable` could not be read by OCR. Ingest nothing from the device text and
+     nothing for the unread new ink. The `textNow` and `whatChanged` shown on that page are valid:
+     handle them as usual. Retire nothing because of the unreadable ink. Report the unreadable
+     page in the run report (note and page).
    - To change `sources` of an engram: `edit_engram` with `set_frontmatter` may not accept the
      key `sources`. Then rewrite the engram with `write_engram` and `overwrite: true` (same title
      and folder, full metadata), or use `edit_engram` `find_replace` on its frontmatter.

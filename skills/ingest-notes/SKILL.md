@@ -22,7 +22,7 @@ The consumer name is always `crystalline`.
    chars). No text. A row with 0 pages that is `pending: true` or `failed: true` has nothing to
    ingest: it is listed only because pages wait for OCR or could not be read. Leave such rows
    out. Keep a row with 0 pages and no such flag, for example a `new` row with `oldNote`: its
-   engrams still have to move to the new key. and keep the notes with `failed: true` for the run
+   engrams still have to move to the new key. Keep the notes with `failed: true` for the run
    report. When no other row is left and `from` equals `upTo`, stop and say that nothing
    changed (name the unreadable notes, if any). When no other row is left but `from` is lower
    than `upTo`, go to step 4: the range holds lines that change no note text, and the ack

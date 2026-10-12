@@ -87,9 +87,13 @@ Pass this section and the next one to every sub-agent, with its account slug, no
      nothing for the unread new ink. The `textNow` and `whatChanged` shown on that page are valid:
      handle them as usual. Retire nothing because of the unreadable ink. Report the unreadable
      page in the run report (note and page).
-   - To change `sources` of an engram: `edit_engram` with `set_frontmatter` may not accept the
-     key `sources`. Then rewrite the engram with `write_engram` and `overwrite: true` (same title
-     and folder, full metadata), or use `edit_engram` `find_replace` on its frontmatter.
+   - To change `sources` of an engram: `edit_engram` with `operation: "set_frontmatter"`,
+     `key: "sources"` and `values` (the whole new list), with the `expected_checksum` of your
+     `read_engram`. On a conflict, read again and retry. When the new list is the same as the
+     old one, make no call: every edit writes, so a run over unchanged notes writes nothing. To
+     change `resource`, use `set_frontmatter` with `key: "resource"` and `value`. Crystalline
+     before 0.25.1 refuses the key `sources`: then rewrite the engram with `write_engram` and
+     `overwrite: true` (same title and folder, full metadata).
 6. Report back in a few lines of plain text, no formatting: engrams created, updated and
    retired, and open questions (an illegible word, a removal you were not sure about). End with
    one line `RESULT: ok`, or `RESULT: failed` and the reason.

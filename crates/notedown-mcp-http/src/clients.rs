@@ -286,7 +286,14 @@ pub(crate) async fn register(State(o): State<Arc<Oauth>>, body: axum::body::Byte
         created_ms: now,
         used_ms: now,
     };
-    let stored = o.clients.create_capped(&client, now, &o.grants_in_use());
+    let stored = {
+        let (o, client) = (o.clone(), client.clone());
+        tokio::task::spawn_blocking(move || {
+            o.clients.create_capped(&client, now, &o.grants_in_use())
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("store task failed: {e}")))
+    };
     match stored {
         Ok(true) => (
             StatusCode::CREATED,
@@ -361,9 +368,9 @@ mod tests {
 
     fn fill(store: &ClientStore, n: usize, used: u64) {
         for i in 0..n {
-            store
-                .create(&client(format!("ndc_{i:032x}"), used))
-                .unwrap();
+            let c = client(format!("ndc_{i:032x}"), used);
+            std::fs::create_dir_all(&store.dir).unwrap();
+            std::fs::write(store.file(&c.id), serde_json::to_vec(&c).unwrap()).unwrap();
         }
     }
 

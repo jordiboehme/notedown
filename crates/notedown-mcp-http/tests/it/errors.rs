@@ -137,3 +137,33 @@ async fn a_corrupt_client_file_does_not_break_registration() {
     register(&s, REDIRECT).await;
     s.stop().await;
 }
+
+#[tokio::test]
+async fn a_full_client_store_answers_503() {
+    let s = start().await;
+    let dir = s.dir.path().join("oauth/clients");
+    std::fs::create_dir_all(&dir).unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    for i in 0..1000 {
+        let id = format!("ndc_{i:032x}");
+        let c = serde_json::json!({
+            "id": id, "name": "x", "redirect_uris": ["https://a.example/cb"],
+            "created_ms": now_ms, "used_ms": now_ms,
+        });
+        std::fs::write(dir.join(format!("{id}.json")), c.to_string()).unwrap();
+    }
+    let r = s
+        .client
+        .post(s.url("/oauth/register"))
+        .json(&serde_json::json!({"redirect_uris": [REDIRECT]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 503);
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["error"], "temporarily_unavailable");
+    s.stop().await;
+}

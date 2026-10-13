@@ -9,7 +9,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
-use crate::fsutil::{json_bytes, write_atomic};
+use crate::fsutil::{fsync_dir, json_bytes, write_atomic, write_atomic_in};
 use crate::{Error, Result, io_err};
 
 pub const KEY_FILE: &str = "token.key";
@@ -208,7 +208,9 @@ impl Devices {
     }
 
     /// Read, change and write one device record under the write lock; creates it when missing.
-    /// Returns the record before (`None` when new) and after the change.
+    /// Returns the record before (`None` when new) and after the change. [`Error::NoAccount`]
+    /// when the account has no `account.json` or is removed meanwhile: only `devices/` is
+    /// created, inside the existing account folder, so a removed account never comes back.
     pub fn update(
         &self,
         slug: &str,
@@ -217,13 +219,31 @@ impl Devices {
     ) -> Result<(Option<Device>, Device)> {
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let path = self.file(slug, serial)?;
+        let account_dir = self.data_dir.join("accounts").join(slug);
+        let no_account = || Error::NoAccount(slug.to_string());
+        if !account_dir.join(super::accounts::ACCOUNT_FILE).is_file() {
+            return Err(no_account());
+        }
         let before = self.get(slug, serial)?;
         let mut device = before.clone().unwrap_or_else(|| Device::new(serial));
         change(&mut device);
-        if before.as_ref() != Some(&device) {
-            write_atomic(&path, &json_bytes(&device), false)?;
+        if before.as_ref() == Some(&device) {
+            return Ok((before, device));
         }
-        Ok((before, device))
+        let dir = path.parent().unwrap_or(&account_dir);
+        match std::fs::create_dir(dir) {
+            Ok(()) => fsync_dir(&account_dir)?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(no_account()),
+            Err(e) => return Err(io_err(dir)(e)),
+        }
+        match write_atomic_in(&path, &json_bytes(&device), false) {
+            Ok(()) => Ok((before, device)),
+            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                Err(no_account())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// All devices of one account, sorted by serial.

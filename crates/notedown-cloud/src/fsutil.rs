@@ -8,6 +8,28 @@ use crate::{Result, io_err};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Create the missing folders of `dir` below `base`, one level at a time, with an fsync of
+/// each new folder's parent. `base` itself is never created: when it is gone (an account
+/// removed meanwhile), this fails with `NotFound` and creates nothing.
+pub fn create_dirs_below(base: &Path, dir: &Path) -> std::io::Result<()> {
+    let rest = dir.strip_prefix(base).map_err(|_| {
+        std::io::Error::other(format!("{} is not in {}", dir.display(), base.display()))
+    })?;
+    let mut cur = base.to_path_buf();
+    for part in rest.components() {
+        let parent = cur.clone();
+        cur.push(part);
+        match std::fs::create_dir(&cur) {
+            Ok(()) => {
+                std::fs::File::open(&parent)?.sync_all()?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && cur.is_dir() => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// `path` with symlinks resolved, also when its end does not exist yet: the longest existing
 /// ancestor is resolved and the rest is joined to it. `..` in the missing rest stays as written.
 pub fn real_path(path: &Path) -> PathBuf {
@@ -80,10 +102,17 @@ pub fn rename_durable(from: &Path, to: &Path) -> Result<()> {
 
 /// Write `bytes` to `path` atomically: a temp file `.<name>.<pid>.<counter>.tmp` in the same
 /// folder (unique, so concurrent writers never share one), fsync, rename, fsync of the folder.
-/// With `private` the file has mode 0600 from its creation on.
+/// With `private` the file has mode 0600 from its creation on. Missing folders are created.
 pub fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).map_err(io_err(dir))?;
+    write_atomic_in(path, bytes, private)
+}
+
+/// [`write_atomic`] into a folder that must exist: it creates no folder, so a write into a
+/// folder that was removed (or renamed away) fails with `NotFound` and never brings it back.
+pub fn write_atomic_in(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp = dir.join(format!(
         ".{name}.{}.{}.tmp",
@@ -121,4 +150,31 @@ pub(crate) fn json_bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
     let mut text = serde_json::to_string_pretty(value).expect("plain structs serialize");
     text.push('\n');
     text.into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_dirs_below_creates_the_missing_levels_but_never_the_base() {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path().join("accounts/anna");
+        let dir = base.join("digests/marks");
+        let err = create_dirs_below(&base, &dir).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(!base.exists());
+        std::fs::create_dir_all(&base).unwrap();
+        create_dirs_below(&base, &dir).unwrap();
+        assert!(dir.is_dir());
+        create_dirs_below(&base, &dir).unwrap();
+    }
+
+    #[test]
+    fn write_atomic_in_never_creates_its_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("gone/f.json");
+        assert!(write_atomic_in(&path, b"{}", false).is_err());
+        assert!(!d.path().join("gone").exists());
+    }
 }

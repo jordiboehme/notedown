@@ -37,6 +37,14 @@ fn internal(err: crate::Error) -> Reply {
     auth_error(&AuthError::Internal(err))
 }
 
+/// A failed device record write: an account removed meanwhile is `E0018`.
+fn device_error(err: crate::Error) -> Reply {
+    match err {
+        crate::Error::NoAccount(_) => auth_error(&AuthError::NoAccount),
+        e => internal(e),
+    }
+}
+
 fn serial(body: &Value) -> Result<String, Reply> {
     let s = field(body, "equipmentNo").ok_or_else(|| Reply::bad_params("equipmentNo"))?;
     if Devices::valid_serial(&s) {
@@ -74,6 +82,8 @@ pub async fn unlink(State(state): State<Arc<AppState>>, body: Bytes) -> Reply {
                     journal_device(&state, &slug, &serial, EventBody::DeviceUnbound).await;
                 }
             }
+            // Removed meanwhile: nothing is left to unbind.
+            Err(crate::Error::NoAccount(_)) => {}
             Err(e) => return internal(e).device(&serial),
         }
     }
@@ -160,7 +170,7 @@ pub async fn login_equipment(
         |_| {},
     ) {
         Ok(d) => d,
-        Err(e) => return internal(e).device(&serial),
+        Err(e) => return device_error(e).device(&serial),
     };
     let any_bound = match state.auth.devices().list(&slug) {
         Ok(list) => list.iter().any(|d| d.bound),
@@ -279,7 +289,7 @@ pub async fn bind_equipment(State(state): State<Arc<AppState>>, body: Bytes) -> 
             }
             Reply::ok(json!({})).device(&serial)
         }
-        Err(e) => internal(e).device(&serial),
+        Err(e) => device_error(e).device(&serial),
     }
 }
 

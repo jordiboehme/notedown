@@ -81,7 +81,8 @@ pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     };
     let serial = a.claims.equipment_no;
     match state.auth.logout(&a.account.slug, &serial) {
-        Ok(()) => Reply::ok(json!({})).device(&serial),
+        // Removed meanwhile: its tokens no longer work anyway.
+        Ok(()) | Err(crate::Error::NoAccount(_)) => Reply::ok(json!({})).device(&serial),
         Err(e) => {
             eprintln!("notedown cloud: {e}");
             Reply::internal().device(&serial)

@@ -847,7 +847,8 @@ pub async fn upload_summary(
     let dir = tokio::task::spawn_blocking(move || -> crate::Result<std::path::PathBuf> {
         let store = st.store(&slug)?;
         let dir = AppData::new(&store).marks_dir();
-        std::fs::create_dir_all(&dir).map_err(crate::io_err(&dir))?;
+        // Only below the account folder: a removed account is never brought back.
+        crate::fsutil::create_dirs_below(store.account_dir(), &dir).map_err(crate::io_err(&dir))?;
         Ok(dir)
     })
     .await;

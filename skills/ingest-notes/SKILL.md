@@ -12,7 +12,8 @@ turns those changes into Crystalline engrams.
 You are the main agent. You plan, dispatch and confirm. You never load note text yourself.
 Sub-agents read the text and write the engrams.
 
-The consumer name is always `crystalline`.
+The consumer name is always `crystalline`. The skill needs Crystalline 0.25.1 or later: it
+uses the `$contains_any` filter and `set_frontmatter` on `sources`.
 
 ## Main agent
 
@@ -70,10 +71,7 @@ Pass this section and the next one to every sub-agent, with its account slug, no
      already covers goes into that engram, not into a new one.
    - Page through a search while its `count` is below `total`. A hit shows only a snippet: read
      the engram with `read_engram` before you change it.
-   - Crystalline before 0.24.3 refuses the operators with an error such as
-     `unknown operator '$contains'`. Then use only the search by note, and compare the `sources`
-     of its hits with your anchors yourself. Where the operators work, an empty result is
-     reliable: no engram cites these anchors.
+   - An empty result is reliable: no engram cites these anchors.
 5. Check the `change` of each note first. On `unscoped`, stop there for that note and retire
    nothing: the note only left the ingest scope. Then handle each entry of `whatChanged`:
    - `edited`: update the engrams that cite the anchor to the new text.
@@ -91,9 +89,7 @@ Pass this section and the next one to every sub-agent, with its account slug, no
      `key: "sources"` and `values` (the whole new list), with the `expected_checksum` of your
      `read_engram`. On a conflict, read again and retry. When the new list is the same as the
      old one, make no call: every edit writes, so a run over unchanged notes writes nothing. To
-     change `resource`, use `set_frontmatter` with `key: "resource"` and `value`. Crystalline
-     before 0.25.1 refuses the key `sources`: then rewrite the engram with `write_engram` and
-     `overwrite: true` (same title and folder, full metadata).
+     change `resource`, use `set_frontmatter` with `key: "resource"` and `value`.
 6. Report back in a few lines of plain text, no formatting: engrams created, updated and
    retired, and open questions (an illegible word, a removal you were not sure about). End with
    one line `RESULT: ok`, or `RESULT: failed` and the reason.
@@ -125,7 +121,6 @@ Pass this section and the next one to every sub-agent, with its account slug, no
   text before is unknown. Its row in the blocks table names the page anchor
   (`notedown://<account>/<key>/<pageId>`), not a block. Search with `$contains_any` and all
   block anchors of the page's `textNow`: update the engrams that cite them to the text now, and
-  treat only the blocks no hit cites as new. Without the operators (before 0.24.3), search by
-  `resource` and compare the `sources` of the hits with the anchors yourself. Never treat the
-  page's blocks as new without one of these two searches.
+  treat only the blocks no hit cites as new. Never treat the page's blocks as new without this
+  search.
 - `get_block` with an anchor gives the current text of one block, or what replaced it.

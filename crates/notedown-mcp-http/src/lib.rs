@@ -18,8 +18,10 @@ use notedown_cloud::server::AppState;
 pub mod base;
 mod clients;
 mod discovery;
+mod login;
 mod redirect;
 mod secret;
+mod throttle;
 
 use base::Base;
 

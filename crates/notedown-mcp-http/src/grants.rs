@@ -189,15 +189,27 @@ pub fn list_grants(data: &Path, slug: &str) -> anyhow::Result<Vec<GrantSummary>>
         .collect())
 }
 
+/// Takes the account lock; `None` when the account is gone. [`Accounts::lock`] never creates
+/// the account folder and never hands out a lock of a removed account.
+fn lock_account(
+    accounts: &Accounts,
+    slug: &str,
+) -> anyhow::Result<Option<notedown_cloud::auth::AccountLock>> {
+    match accounts.lock(slug) {
+        Ok(l) => Ok(Some(l)),
+        Err(notedown_cloud::Error::NoAccount(_)) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Deletes the grant files of an account (`None`: all), by file name without parsing them, so a
 /// corrupt grant can be revoked too. Holds the account lock.
 pub fn revoke_grants(data: &Path, slug: &str, id: Option<&str>) -> anyhow::Result<usize> {
     validate_slug(slug)?;
     let accounts = Accounts::new(data);
-    if !accounts.account_dir(slug).is_dir() {
+    let Some(_lock) = lock_account(&accounts, slug)? else {
         return Ok(0);
-    }
-    let _lock = accounts.lock(slug)?;
+    };
     let mut n = 0;
     for gid in ids_of(&accounts, slug)? {
         if id.is_none_or(|want| want == gid) && delete(&accounts, slug, &gid)? {
@@ -266,17 +278,9 @@ impl GrantStore {
         Issued { access, refresh }
     }
 
-    /// Takes the account lock; `None` when the account folder is gone (nothing is created).
+    /// Takes the account lock; `None` when the account is gone (nothing is created).
     fn lock(&self, slug: &str) -> anyhow::Result<Option<notedown_cloud::auth::AccountLock>> {
-        if !self.accounts.account_dir(slug).is_dir() {
-            return Ok(None);
-        }
-        match self.accounts.lock(slug) {
-            Ok(l) => Ok(Some(l)),
-            // The folder can vanish between the check and the open.
-            Err(_) if !self.accounts.account_dir(slug).is_dir() => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        lock_account(&self.accounts, slug)
     }
 
     pub(crate) fn issue(

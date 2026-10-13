@@ -22,6 +22,8 @@ pub const MAX_FAILED_LOGINS: u32 = 6;
 /// A lock clears by itself after this time (ms); `cloud account passwd` clears it at once.
 pub const LOCK_COOLDOWN_MS: u64 = 15 * 60 * 1000;
 const NEXT_ID_FILE: &str = ".next_user_id";
+/// How often [`Accounts::lock`] takes the lock again when its `.lock` file was replaced.
+const LOCK_TRIES: usize = 5;
 const FIRST_USER_ID: u64 = 1_000_001;
 
 /// Field order is the file order.
@@ -135,6 +137,25 @@ fn validate_password(password: &str) -> Result<()> {
     Ok(())
 }
 
+/// `Some(true)` when the open `file` is the file at `path` (same device and inode), `None` when
+/// `path` is gone.
+#[cfg(unix)]
+fn is_same_file(file: &std::fs::File, path: &Path) -> std::io::Result<Option<bool>> {
+    use std::os::unix::fs::MetadataExt;
+    let open = file.metadata()?;
+    match std::fs::metadata(path) {
+        Ok(now) => Ok(Some(open.dev() == now.dev() && open.ino() == now.ino())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Elsewhere an open file cannot be deleted, so only a missing path is checked.
+#[cfg(not(unix))]
+fn is_same_file(_file: &std::fs::File, path: &Path) -> std::io::Result<Option<bool>> {
+    Ok(path.exists().then_some(true))
+}
+
 /// The held account lock; dropping it closes the file and releases the lock.
 #[derive(Debug)]
 pub struct AccountLock {
@@ -211,24 +232,78 @@ impl Accounts {
             failed_logins: 0,
             quota_bytes: None,
         };
+        let _lock = self.lock_for_create(slug)?;
+        if self.get(slug)?.is_some() {
+            return Err(Error::AccountExists(slug.to_string()));
+        }
+        // A folder without `account.json` is reused. OAuth grants left in it belong to a
+        // removed account: delete them, so its tokens never work for the new one.
+        let oauth = self.account_dir(slug).join(OAUTH_DIR);
+        match std::fs::remove_dir_all(&oauth) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err(&oauth)(e)),
+        }
         self.save(&account)?;
         Ok(account)
     }
 
     /// Take the account lock (`accounts/<slug>/.lock`, exclusive, blocking). It is held until
     /// the guard is dropped. Every read-modify-write of `account.json` runs under it, in the CLI
-    /// and in the server.
+    /// and in the server. [`Error::NoAccount`] when the account has no `account.json` or was
+    /// removed while this call waited; nothing is created then.
     pub fn lock(&self, slug: &str) -> Result<AccountLock> {
+        self.lock_with(slug, false)
+    }
+
+    /// [`Accounts::lock`] for [`Accounts::create`]: it creates the account folder and does not
+    /// need an `account.json`.
+    fn lock_for_create(&self, slug: &str) -> Result<AccountLock> {
+        self.lock_with(slug, true)
+    }
+
+    fn lock_with(&self, slug: &str, create: bool) -> Result<AccountLock> {
         validate_slug(slug)?;
-        let path = self.account_dir(slug).join(LOCK_FILE);
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .map_err(io_err(&path))?;
-        file.lock().map_err(io_err(&path))?;
-        Ok(AccountLock { _file: file })
+        let dir = self.account_dir(slug);
+        let path = dir.join(LOCK_FILE);
+        let no_account = || Error::NoAccount(slug.to_string());
+        for _ in 0..LOCK_TRIES {
+            if create {
+                std::fs::create_dir_all(&dir).map_err(io_err(&dir))?;
+            } else if !self.file(slug).is_file() {
+                return Err(no_account());
+            }
+            let file = match std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+            {
+                Ok(f) => f,
+                // The folder is gone: removed before or while we got here.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !create => {
+                    return Err(no_account());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(io_err(&path)(e)),
+            };
+            file.lock().map_err(io_err(&path))?;
+            // `remove` deletes the folder, `.lock` too, while it holds the lock. A waiter then
+            // holds a lock on an unlinked file that excludes nobody: drop it and look again.
+            match is_same_file(&file, &path).map_err(io_err(&path))? {
+                Some(true) => {}
+                Some(false) => continue,
+                None if create => continue,
+                None => return Err(no_account()),
+            }
+            if !create && !self.file(slug).is_file() {
+                return Err(no_account());
+            }
+            return Ok(AccountLock { _file: file });
+        }
+        Err(io_err(&path)(std::io::Error::other(
+            "the lock file keeps changing, try again",
+        )))
     }
 
     /// Atomic write with mode 0600.
@@ -325,6 +400,97 @@ impl Accounts {
         // global lock order says. The raw lock works on a damaged store too.
         let _store = crate::store::take_store_lock(&dir, Some(slug))?;
         let _lock = self.lock(slug)?;
+        // `account.json` goes first: `remove_dir_all` deletes in no fixed order, and a caller
+        // that opens `.lock` after it is gone checks `account.json` after its lock. Without it
+        // first, such a caller could hold a lock while `account.json` is still there.
+        let file = self.file(slug);
+        std::fs::remove_file(&file).map_err(io_err(&file))?;
         std::fs::remove_dir_all(&dir).map_err(io_err(&dir))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn accounts() -> (tempfile::TempDir, Accounts) {
+        let dir = tempfile::tempdir().unwrap();
+        let accounts = Accounts::new(dir.path());
+        accounts.create("anna", "anna@example.org", "pw").unwrap();
+        (dir, accounts)
+    }
+
+    #[test]
+    fn lock_on_a_removed_account_is_no_account_and_creates_nothing() {
+        let (_dir, accounts) = accounts();
+        accounts.remove("anna").unwrap();
+        assert!(matches!(accounts.lock("anna"), Err(Error::NoAccount(s)) if s == "anna"));
+        assert!(!accounts.account_dir("anna").exists());
+    }
+
+    #[test]
+    fn lock_on_a_folder_without_account_json_is_no_account_and_creates_no_lock_file() {
+        let (_dir, accounts) = accounts();
+        let dir = accounts.account_dir("anna");
+        std::fs::remove_file(dir.join(LOCK_FILE)).ok();
+        std::fs::remove_file(dir.join(ACCOUNT_FILE)).unwrap();
+        assert!(matches!(accounts.lock("anna"), Err(Error::NoAccount(_))));
+        assert!(!dir.join(LOCK_FILE).exists());
+    }
+
+    #[test]
+    fn a_waiter_on_an_account_removed_meanwhile_gets_no_account() {
+        let (_dir, accounts) = accounts();
+        let held = accounts.lock("anna").unwrap();
+        let waiter = {
+            let accounts = accounts.clone();
+            std::thread::spawn(move || accounts.lock("anna").map(|_| ()))
+        };
+        // Let the waiter open the lock file and block on it.
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::remove_dir_all(accounts.account_dir("anna")).unwrap();
+        drop(held);
+        let got = waiter.join().unwrap();
+        assert!(matches!(got, Err(Error::NoAccount(_))), "{got:?}");
+        assert!(!accounts.account_dir("anna").exists());
+    }
+
+    #[test]
+    fn a_waiter_never_holds_a_lock_file_that_was_replaced() {
+        let (_dir, accounts) = accounts();
+        let path = accounts.account_dir("anna").join(LOCK_FILE);
+        let held = accounts.lock("anna").unwrap();
+        let waiter = {
+            let accounts = accounts.clone();
+            std::thread::spawn(move || accounts.lock("anna"))
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        // The waiter blocks on the old inode; a new `.lock` takes its place.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::File::create(&path).unwrap();
+        drop(held);
+        let got = waiter.join().unwrap().unwrap();
+        let other = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        assert!(
+            matches!(other.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "the waiter holds a lock on an unlinked file"
+        );
+        drop(got);
+        other.try_lock().unwrap();
+    }
+
+    #[test]
+    fn create_over_a_leftover_folder_drops_its_oauth_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let accounts = Accounts::new(dir.path());
+        let oauth = accounts.account_dir("anna").join(OAUTH_DIR);
+        std::fs::create_dir_all(&oauth).unwrap();
+        std::fs::write(oauth.join("0123.json"), "{}").unwrap();
+        accounts.create("anna", "anna@example.org", "pw").unwrap();
+        assert!(!oauth.exists());
+        assert!(accounts.get("anna").unwrap().is_some());
+        // The account lock works for the new account.
+        drop(accounts.lock("anna").unwrap());
     }
 }

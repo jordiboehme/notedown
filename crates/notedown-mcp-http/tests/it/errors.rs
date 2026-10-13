@@ -245,6 +245,35 @@ async fn at_the_cap_a_client_with_a_pending_login_is_not_pruned() {
     s.stop().await;
 }
 
+/// At the cap, a never-used client whose code is not yet exchanged is kept.
+#[tokio::test]
+async fn at_the_cap_a_client_with_an_unexchanged_code_is_not_pruned() {
+    let s = start().await;
+    add_account(&s, "anna", "anna@example.org", "pw");
+    fill_clients(&s, 11 * 60 * 1000);
+    let file = s
+        .dir
+        .path()
+        .join(format!("oauth/clients/ndc_{:032x}.json", 0));
+    let mut c: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    c["redirect_uris"] = serde_json::json!([REDIRECT]);
+    std::fs::write(&file, c.to_string()).unwrap();
+    let id = c["id"].as_str().unwrap().to_string();
+    let code = sign_in(&s, &id, "anna@example.org", "pw").await;
+    let r = s
+        .client
+        .post(s.url("/oauth/register"))
+        .json(&serde_json::json!({"redirect_uris": [REDIRECT]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    assert!(file.exists(), "the client with a code was pruned");
+    let tokens = exchange(&s, &id, &code).await;
+    assert!(tokens["access_token"].is_string());
+    s.stop().await;
+}
+
 #[tokio::test]
 async fn authorize_refuses_without_redirecting_for_an_unknown_client_or_redirect() {
     let s = start().await;

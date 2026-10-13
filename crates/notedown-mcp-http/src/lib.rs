@@ -60,10 +60,19 @@ pub(crate) struct Oauth {
 impl Oauth {
     /// The client ids that pruning keeps: those with a grant, a live pending login or a code
     /// not yet exchanged.
+    ///
+    /// The three sets are snapshots taken one after the other, before the prune holds the
+    /// client write lock. They are read in the order of a sign-in (pending login, code, grant),
+    /// so a sign-in that moves on between two reads is found in the later set. Two short
+    /// windows stay open: a sign-in that starts after the snapshot (an authorize page opened
+    /// while the prune runs), and the moment inside one step when the entry has left one set
+    /// but is not in the next yet (a login between taking its pending entry and issuing the
+    /// code, a code exchange between taking the code and indexing its grant). A client lost
+    /// there fails its sign-in as an unknown client and registers again.
     pub(crate) fn clients_in_use(&self, now_ms: u64) -> std::collections::HashSet<String> {
-        let mut ids = self.grants.client_ids();
-        ids.extend(self.pending.client_ids(now_ms));
+        let mut ids = self.pending.client_ids(now_ms);
         ids.extend(self.codes.client_ids(now_ms));
+        ids.extend(self.grants.client_ids());
         ids
     }
 

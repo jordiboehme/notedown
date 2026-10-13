@@ -310,6 +310,7 @@ pub(crate) async fn submit(
     };
     let code = o.codes.issue(Code {
         slug: account.slug,
+        password_md5: account.password_md5,
         client_id: p.client_id,
         redirect_uri: p.redirect_uri.clone(),
         challenge: p.challenge,

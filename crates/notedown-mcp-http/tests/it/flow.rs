@@ -293,3 +293,30 @@ async fn passwd_ends_the_grants_of_a_running_server() {
     assert_eq!(r.status(), 401);
     s.stop().await;
 }
+
+#[tokio::test]
+async fn a_code_issued_before_passwd_is_not_exchanged_after_it() {
+    let s = start().await;
+    add_account(&s, "anna", "anna@example.com", "right");
+    let id = register(&s, REDIRECT).await;
+    let code = sign_in(&s, &id, "anna@example.com", "right").await;
+    notedown_cloud::auth::Accounts::new(s.dir.path())
+        .set_password("anna", "new")
+        .unwrap();
+    let r = s
+        .client
+        .post(s.url("/oauth/token"))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", REDIRECT),
+            ("client_id", id.as_str()),
+            ("code_verifier", VERIFIER),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let (status, error) = error_of(r).await;
+    assert_eq!((status, error.as_str()), (400, "invalid_grant"));
+    s.stop().await;
+}

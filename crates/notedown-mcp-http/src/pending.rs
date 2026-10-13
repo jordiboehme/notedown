@@ -69,14 +69,30 @@ impl PendingStore {
 }
 
 /// A pending authorization code.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct Code {
     pub slug: String,
+    /// The account's `password_md5` when the code was issued: a password change ends the code.
+    /// Never logged or returned.
+    pub password_md5: String,
     pub client_id: String,
     pub redirect_uri: String,
     pub challenge: String,
     pub resource: String,
     pub expires_ms: u64,
+}
+
+impl std::fmt::Debug for Code {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Code")
+            .field("slug", &self.slug)
+            .field("password_md5", &"<redacted>")
+            .field("client_id", &self.client_id)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("resource", &self.resource)
+            .field("expires_ms", &self.expires_ms)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Codes by their SHA-256 hash.
@@ -139,6 +155,7 @@ mod tests {
         let s = CodeStore::default();
         let c = |exp| Code {
             slug: "a".into(),
+            password_md5: "m".into(),
             client_id: "c".into(),
             redirect_uri: "r".into(),
             challenge: "x".into(),

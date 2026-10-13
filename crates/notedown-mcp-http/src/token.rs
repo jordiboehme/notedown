@@ -9,6 +9,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::json;
+use subtle::ConstantTimeEq;
 
 use crate::grants::{ACCESS_TTL_MS, Issued, Refused};
 use crate::{Oauth, oauth_error, secret};
@@ -127,6 +128,13 @@ pub(crate) async fn token(
                 return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", BAD_CODE);
             }
             let result = blocking(&o, move |o| {
+                // A password change since the code was issued ends the code.
+                let same_password = o.accounts.get(&c.slug)?.is_some_and(|a| {
+                    bool::from(a.password_md5.as_bytes().ct_eq(c.password_md5.as_bytes()))
+                });
+                if !same_password {
+                    return Ok(None);
+                }
                 let Some(cl) = o.clients.get(&client_id)? else {
                     return Ok(None);
                 };
@@ -138,7 +146,7 @@ pub(crate) async fn token(
             .await;
             match result {
                 Ok(Some(Some(i))) => granted(i),
-                // The client or the account is gone.
+                // The client or the account is gone, or the password changed.
                 Ok(None | Some(None)) => {
                     oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", BAD_CODE)
                 }

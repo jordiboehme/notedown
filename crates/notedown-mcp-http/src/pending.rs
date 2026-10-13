@@ -68,9 +68,8 @@ impl PendingStore {
     }
 }
 
-/// Read by the token route (Task 7).
+/// A pending authorization code.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields are read by the token route of Task 7
 pub(crate) struct Code {
     pub slug: String,
     pub client_id: String,
@@ -96,7 +95,6 @@ impl CodeStore {
         code
     }
 
-    #[allow(dead_code)] // used by the token route of Task 7
     pub(crate) fn take(&self, code: &str, now_ms: u64) -> Option<Code> {
         let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
         map.remove(&secret::sha256_hex(code))

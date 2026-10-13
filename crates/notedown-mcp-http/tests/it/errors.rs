@@ -502,3 +502,70 @@ async fn the_eighth_attempt_is_refused_with_retry_after() {
     assert!(html.contains("Too many wrong passwords. Wait 15 minutes."));
     s.stop().await;
 }
+
+#[tokio::test]
+async fn every_bad_code_exchange_is_the_same_invalid_grant() {
+    let s = start().await;
+    add_account(&s, "anna", "anna@example.com", "right");
+    let id = register(&s, REDIRECT).await;
+    let other = register(&s, REDIRECT).await;
+    // (client, redirect_uri, verifier); None leaves redirect_uri out.
+    for (client, redirect, verifier) in [
+        (other.as_str(), Some(REDIRECT), VERIFIER),
+        (id.as_str(), Some("https://claude.ai/other"), VERIFIER),
+        (id.as_str(), None, VERIFIER),
+        (
+            id.as_str(),
+            Some(REDIRECT),
+            "dBjftJeZ4CVP-mJ92K28uhbUJU1p1r_wW1gFWFOEjXX",
+        ),
+    ] {
+        let code = sign_in(&s, &id, "anna@example.com", "right").await;
+        let mut form = vec![
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("client_id", client),
+            ("code_verifier", verifier),
+        ];
+        if let Some(r) = redirect {
+            form.push(("redirect_uri", r));
+        }
+        let r = s
+            .client
+            .post(s.url("/oauth/token"))
+            .form(&form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400);
+        let v: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(v["error"], "invalid_grant");
+    }
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn a_wrong_resource_at_the_token_endpoint_is_invalid_target() {
+    let s = start().await;
+    add_account(&s, "anna", "anna@example.com", "right");
+    let id = register(&s, REDIRECT).await;
+    let code = sign_in(&s, &id, "anna@example.com", "right").await;
+    let r = s
+        .client
+        .post(s.url("/oauth/token"))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", REDIRECT),
+            ("client_id", id.as_str()),
+            ("code_verifier", VERIFIER),
+            ("resource", "https://x.example/mcp"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["error"], "invalid_target");
+    s.stop().await;
+}

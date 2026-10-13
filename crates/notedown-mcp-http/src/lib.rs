@@ -19,13 +19,16 @@ mod authorize;
 pub mod base;
 mod clients;
 mod discovery;
+mod grants;
 mod login;
 mod pending;
 mod redirect;
 mod secret;
 mod throttle;
+mod token;
 
 use base::Base;
+pub use grants::{GrantSummary, list_grants, revoke_grants};
 
 /// The one scope: read the notes and move the bookmarks.
 pub const SCOPE: &str = "notes";
@@ -47,12 +50,34 @@ pub(crate) struct Oauth {
     pub(crate) throttle: throttle::Throttle,
     pub(crate) login_limiter: notedown_cloud::api::limit::RateLimiter,
     pub(crate) accounts: notedown_cloud::auth::Accounts,
+    pub(crate) grants: grants::GrantStore,
+    last_sweep: std::sync::atomic::AtomicU64,
 }
 
 impl Oauth {
-    /// The client ids that hold a grant (pruning keeps them). Task 7 fills it from the grants.
+    /// The client ids that hold a grant (pruning keeps them).
     pub(crate) fn grants_in_use(&self) -> std::collections::HashSet<String> {
-        std::collections::HashSet::new()
+        self.grants.client_ids()
+    }
+
+    /// At most once an hour: delete expired grants and old unused clients.
+    pub(crate) fn maybe_sweep(&self, now_ms: u64) {
+        use std::sync::atomic::Ordering;
+        let last = self.last_sweep.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < 3_600_000
+            || self
+                .last_sweep
+                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        if let Err(e) = self.grants.sweep(now_ms) {
+            eprintln!("notedown mcp: grant sweep failed: {e}");
+        }
+        if let Err(e) = self.clients.prune(now_ms, &self.grants_in_use()) {
+            eprintln!("notedown mcp: client prune failed: {e}");
+        }
     }
 
     pub(crate) fn now_ms(&self) -> u64 {
@@ -83,6 +108,8 @@ pub fn router(state: &Arc<AppState>) -> anyhow::Result<Option<Router>> {
         throttle: Default::default(),
         login_limiter: Default::default(),
         accounts: notedown_cloud::auth::Accounts::new(&state.data_dir),
+        grants: grants::GrantStore::open(&state.data_dir)?,
+        last_sweep: Default::default(),
     });
     let routes = Router::new()
         .route(
@@ -106,6 +133,16 @@ pub fn router(state: &Arc<AppState>) -> anyhow::Result<Option<Router>> {
             "/oauth/authorize",
             get(authorize::show)
                 .post(authorize::submit)
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_FORM_BYTES)),
+        )
+        .route(
+            "/oauth/token",
+            axum::routing::post(token::token)
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_FORM_BYTES)),
+        )
+        .route(
+            "/oauth/revoke",
+            axum::routing::post(token::revoke)
                 .layer(axum::extract::DefaultBodyLimit::max(MAX_FORM_BYTES)),
         )
         .with_state(oauth.clone())

@@ -97,7 +97,6 @@ pub async fn register(s: &Server, redirect: &str) -> String {
     v["client_id"].as_str().unwrap().to_string()
 }
 
-#[allow(dead_code)] // used by the token tests of Task 7
 pub const VERIFIER: &str = "dBjftJeZ4CVP-mJ92K28uhbUJU1p1r_wW1gFWFOEjXk";
 pub const CHALLENGE: &str = "jDBroimTx0Ag-gB-3YHpo5TS8niR-0pvTfRtAXTl1p8";
 
@@ -182,4 +181,37 @@ pub async fn sign_in(s: &Server, client_id: &str, email: &str, password: &str) -
     assert_eq!(p["state"], "st-1");
     assert_eq!(p["iss"], BASE);
     p["code"].clone()
+}
+
+pub async fn exchange(s: &Server, client_id: &str, code: &str) -> serde_json::Value {
+    let r = s
+        .client
+        .post(s.url("/oauth/token"))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", REDIRECT),
+            ("client_id", client_id),
+            ("code_verifier", VERIFIER),
+            ("resource", "https://notedown.example/mcp"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["cache-control"], "no-store");
+    r.json().await.unwrap()
+}
+
+pub async fn refresh(s: &Server, client_id: &str, token: &str) -> reqwest::Response {
+    s.client
+        .post(s.url("/oauth/token"))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", token),
+            ("client_id", client_id),
+        ])
+        .send()
+        .await
+        .unwrap()
 }

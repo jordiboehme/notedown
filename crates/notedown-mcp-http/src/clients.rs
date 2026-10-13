@@ -83,7 +83,6 @@ impl ClientStore {
     }
 
     /// Records a use; a failure only loses the stamp.
-    #[allow(dead_code)] // used by the authorize route of the tasks that follow
     pub(crate) fn touch(&self, id: &str, now_ms: u64) {
         if let Ok(Some(mut c)) = self.get(id) {
             c.used_ms = now_ms;
@@ -119,7 +118,6 @@ impl ClientStore {
     }
 
     /// Deletes the clients without a grant (`in_use`) not used for 30 days.
-    #[allow(dead_code)] // the cap prunes through create_capped; later tasks may prune on their own
     pub(crate) fn prune(&self, now_ms: u64, in_use: &HashSet<String>) -> anyhow::Result<usize> {
         let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
         self.prune_locked(now_ms, in_use)

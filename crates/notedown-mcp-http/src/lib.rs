@@ -60,18 +60,19 @@ impl Oauth {
         self.grants.client_ids()
     }
 
-    /// At most once an hour: delete expired grants and old unused clients.
-    pub(crate) fn maybe_sweep(&self, now_ms: u64) {
+    /// True at most once an hour: a sweep of expired grants and old unused clients is due.
+    pub(crate) fn sweep_due(&self, now_ms: u64) -> bool {
         use std::sync::atomic::Ordering;
         let last = self.last_sweep.load(Ordering::Relaxed);
-        if now_ms.saturating_sub(last) < 3_600_000
-            || self
+        now_ms.saturating_sub(last) >= 3_600_000
+            && self
                 .last_sweep
                 .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
-                .is_err()
-        {
-            return;
-        }
+                .is_ok()
+    }
+
+    /// Deletes expired grants and old unused clients (blocking file work).
+    pub(crate) fn sweep(&self, now_ms: u64) {
         if let Err(e) = self.grants.sweep(now_ms) {
             eprintln!("notedown mcp: grant sweep failed: {e}");
         }

@@ -35,6 +35,8 @@ async fn code_exchange_refresh_replay_and_revoke() {
         .await
         .unwrap();
     assert_eq!(r.status(), 400);
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["error"], "invalid_grant");
 
     // Rotation.
     let r = refresh(&s, &id, &refresh1).await;
@@ -71,5 +73,129 @@ async fn code_exchange_refresh_replay_and_revoke() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200, "revoke of an unknown token is 200 too");
+    s.stop().await;
+}
+
+async fn error_of(r: reqwest::Response) -> (u16, String) {
+    let status = r.status().as_u16();
+    let v: serde_json::Value = r.json().await.unwrap();
+    (status, v["error"].as_str().unwrap_or("").to_string())
+}
+
+#[tokio::test]
+async fn revoke_by_access_token_ends_the_grant() {
+    let s = start().await;
+    add_account(&s, "anna", "anna@example.com", "right");
+    let id = register(&s, REDIRECT).await;
+    let code = sign_in(&s, &id, "anna@example.com", "right").await;
+    let t = exchange(&s, &id, &code).await;
+    let r = s
+        .client
+        .post(s.url("/oauth/revoke"))
+        .form(&[("token", t["access_token"].as_str().unwrap())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = refresh(&s, &id, t["refresh_token"].as_str().unwrap()).await;
+    assert_eq!(r.status(), 400);
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn refresh_with_the_wrong_client_or_resource_and_unknown_codes() {
+    let s = start().await;
+    add_account(&s, "anna", "anna@example.com", "right");
+    let id = register(&s, REDIRECT).await;
+    let other = register(&s, REDIRECT).await;
+    let code = sign_in(&s, &id, "anna@example.com", "right").await;
+    let t = exchange(&s, &id, &code).await;
+    let rt = t["refresh_token"].as_str().unwrap();
+
+    let r = refresh(&s, &other, rt).await;
+    assert_eq!(error_of(r).await, (400, "invalid_grant".to_string()));
+
+    // The grant is for this server's resource; a field naming another one is invalid_target.
+    let r = s
+        .client
+        .post(s.url("/oauth/token"))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", rt),
+            ("client_id", id.as_str()),
+            ("resource", "https://x.example/mcp"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(error_of(r).await, (400, "invalid_target".to_string()));
+    // The token survived both refusals.
+    assert_eq!(refresh(&s, &id, rt).await.status(), 200);
+
+    let r = s
+        .client
+        .post(s.url("/oauth/token"))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", "no-such-code"),
+            ("redirect_uri", REDIRECT),
+            ("client_id", id.as_str()),
+            ("code_verifier", VERIFIER),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(error_of(r).await, (400, "invalid_grant".to_string()));
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn a_wrong_resource_still_spends_the_code() {
+    let s = start().await;
+    add_account(&s, "anna", "anna@example.com", "right");
+    let id = register(&s, REDIRECT).await;
+    let code = sign_in(&s, &id, "anna@example.com", "right").await;
+    let post = |resource: Option<&'static str>| {
+        let mut form = vec![
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", REDIRECT),
+            ("client_id", id.as_str()),
+            ("code_verifier", VERIFIER),
+        ];
+        if let Some(r) = resource {
+            form.push(("resource", r));
+        }
+        s.client.post(s.url("/oauth/token")).form(&form).send()
+    };
+    let r = post(Some("https://x.example/mcp")).await.unwrap();
+    assert_eq!(error_of(r).await, (400, "invalid_target".to_string()));
+    let r = post(None).await.unwrap();
+    assert_eq!(error_of(r).await, (400, "invalid_grant".to_string()));
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn a_body_that_is_no_form_is_rejected_cleanly() {
+    let s = start().await;
+    let r = s
+        .client
+        .post(s.url("/oauth/token"))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.headers()["cache-control"], "no-store");
+    assert_eq!(error_of(r).await, (400, "invalid_request".to_string()));
+    let r = s
+        .client
+        .post(s.url("/oauth/revoke"))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
     s.stop().await;
 }

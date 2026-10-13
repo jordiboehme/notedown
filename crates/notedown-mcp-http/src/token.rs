@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use axum::Form;
 use axum::extract::State;
+use axum::extract::rejection::FormRejection;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -64,14 +65,30 @@ fn unavailable(e: anyhow::Error) -> Response {
     )
 }
 
-pub(crate) async fn token(State(o): State<Arc<Oauth>>, Form(f): Form<TokenForm>) -> Response {
+pub(crate) async fn token(
+    State(o): State<Arc<Oauth>>,
+    form: Result<Form<TokenForm>, FormRejection>,
+) -> Response {
+    let Ok(Form(f)) = form else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "the request body must be a form",
+        );
+    };
     let now = o.now_ms();
-    let _ = blocking(&o, move |o| {
-        o.maybe_sweep(now);
-        Ok(())
-    })
-    .await;
+    if o.sweep_due(now) {
+        let o = o.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || o.sweep(now)).await {
+            eprintln!("notedown mcp: sweep task failed: {e}");
+        }
+    }
     let resource = o.base.resource();
+    // A code is spent by its first use, so it is taken before any check that can fail.
+    let taken = match (f.grant_type.as_deref(), f.code.as_deref()) {
+        (Some("authorization_code"), Some(code)) => Some(o.codes.take(code, now)),
+        _ => None,
+    };
     if f.resource.as_deref().is_some_and(|r| r != resource) {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -88,16 +105,14 @@ pub(crate) async fn token(State(o): State<Arc<Oauth>>, Form(f): Form<TokenForm>)
     };
     match f.grant_type.as_deref() {
         Some("authorization_code") => {
-            let (Some(code), Some(verifier)) = (f.code.as_deref(), f.code_verifier.as_deref())
-            else {
+            let (Some(taken), Some(verifier)) = (taken, f.code_verifier.as_deref()) else {
                 return oauth_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_request",
                     "code and code_verifier are required",
                 );
             };
-            // Taken before any check: a code is spent by its first use, right or wrong.
-            let Some(c) = o.codes.take(code, now) else {
+            let Some(c) = taken else {
                 return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", BAD_CODE);
             };
             let ok = c.client_id == client_id
@@ -166,8 +181,13 @@ pub(crate) struct RevokeForm {
     token: Option<String>,
 }
 
-pub(crate) async fn revoke(State(o): State<Arc<Oauth>>, Form(f): Form<RevokeForm>) -> Response {
-    if let Some(t) = f.token
+pub(crate) async fn revoke(
+    State(o): State<Arc<Oauth>>,
+    form: Result<Form<RevokeForm>, FormRejection>,
+) -> Response {
+    // RFC 7009: the answer is 200 whatever the request held.
+    let token = form.ok().and_then(|Form(f)| f.token);
+    if let Some(t) = token
         && let Err(e) = blocking(&o, move |o| o.grants.revoke(&t)).await
     {
         return unavailable(e);

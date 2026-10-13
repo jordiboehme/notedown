@@ -57,7 +57,20 @@ fn redirect_error(
     found(redirect::with_params(uri, &params))
 }
 
-pub(crate) async fn show(State(o): State<Arc<Oauth>>, Query(q): Query<AuthorizeQuery>) -> Response {
+pub(crate) async fn show(
+    State(o): State<Arc<Oauth>>,
+    Extension(ClientAddr(ip)): Extension<ClientAddr>,
+    Query(q): Query<AuthorizeQuery>,
+) -> Response {
+    if !o.login_limiter.allow(ip, "oauth-authorize", o.now_ms()) {
+        let mut r = login::error_page(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many sign-in requests. Wait a minute.",
+        );
+        r.headers_mut()
+            .insert(header::RETRY_AFTER, "60".parse().unwrap());
+        return r;
+    }
     // Errors about the client or the redirect URI are never redirected.
     let Some(client_id) = q.client_id.as_deref() else {
         return login::error_page(StatusCode::BAD_REQUEST, "The request names no client.");
@@ -80,8 +93,13 @@ pub(crate) async fn show(State(o): State<Arc<Oauth>>, Query(q): Query<AuthorizeQ
     };
     let redirect_uri = match q.redirect_uri.as_deref() {
         Some(u) if client.redirect_uris.iter().any(|r| r == u) => u.to_string(),
-        None if client.redirect_uris.len() == 1 => client.redirect_uris[0].clone(),
-        _ => {
+        None => {
+            return login::error_page(
+                StatusCode::BAD_REQUEST,
+                "The request names no redirect URI.",
+            );
+        }
+        Some(_) => {
             return login::error_page(
                 StatusCode::BAD_REQUEST,
                 "The redirect URI is not registered for this client.",
@@ -173,11 +191,14 @@ fn origin_of(uri: &str) -> String {
     let Some((scheme, _)) = uri.split_once("://") else {
         return String::new();
     };
-    let origin = format!(
-        "{}://{}",
-        scheme.to_ascii_lowercase(),
-        redirect::host_of(uri)
-    );
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = redirect::host_of(uri);
+    // A CSP host-source cannot hold an IPv6 literal: allow the whole scheme.
+    let origin = if authority.starts_with('[') {
+        format!("{scheme}:")
+    } else {
+        format!("{scheme}://{authority}")
+    };
     if origin
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || ":/.-[]".contains(c))
@@ -235,7 +256,12 @@ pub(crate) async fn submit(
         );
     };
     if f.action == "cancel" {
-        o.pending.take(&f.pending, now);
+        if o.pending.take(&f.pending, now).is_none() {
+            return login::error_page(
+                StatusCode::BAD_REQUEST,
+                "This sign-in request is unknown or expired. Start the sign-in again in your client.",
+            );
+        }
         return redirect_error(
             &o,
             &p.redirect_uri,
@@ -265,16 +291,12 @@ pub(crate) async fn submit(
     let (email, password) = (f.email.clone(), f.password.clone());
     let checked =
         tokio::task::spawn_blocking(move || login::check_password(&accounts, &email, &password))
-            .await;
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r);
+    let now = o.now_ms();
     let account = match checked {
-        Ok(Ok(a)) => a,
-        Ok(Err(e)) => {
-            eprintln!("notedown mcp: password check failed: {e}");
-            return login::error_page(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "The server cannot read its accounts right now.",
-            );
-        }
+        Ok(a) => a,
         Err(e) => {
             eprintln!("notedown mcp: password check failed: {e}");
             return login::error_page(
@@ -321,7 +343,7 @@ mod tests {
             origin_of("HTTPS://claude.ai/api/mcp/auth_callback"),
             "https://claude.ai"
         );
-        assert_eq!(origin_of("http://[::1]:8080/cb"), "http://[::1]:8080");
+        assert_eq!(origin_of("http://[::1]:8080/cb"), "http:");
         assert_eq!(origin_of("https://a.example;b/cb"), "");
         assert_eq!(origin_of("nonsense"), "");
     }

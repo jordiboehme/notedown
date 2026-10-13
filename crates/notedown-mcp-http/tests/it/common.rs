@@ -149,7 +149,6 @@ pub fn location_params(r: &reqwest::Response) -> std::collections::HashMap<Strin
 }
 
 /// Opens the login page and signs in; returns the code.
-#[allow(dead_code)] // used by the token tests of Task 7
 pub async fn sign_in(s: &Server, client_id: &str, email: &str, password: &str) -> String {
     let r = s
         .client

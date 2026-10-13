@@ -327,8 +327,7 @@ async fn the_web_throttle_never_touches_the_device_lockout() {
 #[tokio::test]
 async fn login_posts_are_limited_per_ip() {
     let s = start().await;
-    let mut last = 0;
-    for _ in 0..11 {
+    for i in 1..=11 {
         let r = s
             .client
             .post(s.url("/oauth/authorize"))
@@ -341,8 +340,165 @@ async fn login_posts_are_limited_per_ip() {
             .send()
             .await
             .unwrap();
-        last = r.status().as_u16();
+        if i <= 10 {
+            assert_ne!(r.status(), 429, "post {i}");
+        } else {
+            assert_eq!(r.status(), 429);
+        }
     }
-    assert_eq!(last, 429);
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn authorize_pages_are_limited_per_ip() {
+    let s = start().await;
+    let id = register(&s, REDIRECT).await;
+    for i in 1..=11 {
+        let r = s
+            .client
+            .get(s.url("/oauth/authorize"))
+            .query(&authorize_query(&id, &[]))
+            .send()
+            .await
+            .unwrap();
+        if i <= 10 {
+            assert_eq!(r.status(), 200, "get {i}");
+        } else {
+            assert_eq!(r.status(), 429);
+            assert_eq!(r.headers()["retry-after"], "60");
+            assert!(
+                r.text()
+                    .await
+                    .unwrap()
+                    .contains("Too many sign-in requests. Wait a minute.")
+            );
+        }
+    }
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn authorize_requires_the_redirect_uri() {
+    let s = start().await;
+    let id = register(&s, REDIRECT).await;
+    let r = s
+        .client
+        .get(s.url("/oauth/authorize"))
+        .query(&authorize_query(&id, &[("redirect_uri", "")]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert!(r.headers().get("location").is_none());
+    assert!(r.text().await.unwrap().contains("names no redirect URI"));
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn the_right_password_redirects_with_a_code_once() {
+    let s = start().await;
+    add_account(&s, "anna", "anna@example.com", "right");
+    let id = register(&s, REDIRECT).await;
+    let r = s
+        .client
+        .get(s.url("/oauth/authorize"))
+        .query(&authorize_query(&id, &[]))
+        .send()
+        .await
+        .unwrap();
+    let pending = pending_id_of(&r.text().await.unwrap());
+    let form = [
+        ("pending", pending.as_str()),
+        ("email", "anna@example.com"),
+        ("password", "right"),
+        ("action", "login"),
+    ];
+    let r = s
+        .client
+        .post(s.url("/oauth/authorize"))
+        .form(&form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 302);
+    assert!(
+        r.headers()["location"]
+            .to_str()
+            .unwrap()
+            .starts_with(REDIRECT)
+    );
+    let p = location_params(&r);
+    assert!(!p["code"].is_empty());
+    assert_eq!(p["state"], "st-1");
+    assert_eq!(p["iss"], BASE);
+    let r = s
+        .client
+        .post(s.url("/oauth/authorize"))
+        .form(&form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    // The helper walks the same path.
+    assert!(
+        !sign_in(&s, &id, "anna@example.com", "right")
+            .await
+            .is_empty()
+    );
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn the_eighth_attempt_is_refused_with_retry_after() {
+    let s = start().await;
+    add_account(&s, "anna", "anna@example.com", "right");
+    let id = register(&s, REDIRECT).await;
+    let r = s
+        .client
+        .get(s.url("/oauth/authorize"))
+        .query(&authorize_query(&id, &[]))
+        .send()
+        .await
+        .unwrap();
+    let pending = pending_id_of(&r.text().await.unwrap());
+    // 3 free, then waits of 1, 2, 4, 8 s: about 15 s in all.
+    let mut statuses = Vec::new();
+    for _ in 0..7 {
+        let r = s
+            .client
+            .post(s.url("/oauth/authorize"))
+            .form(&[
+                ("pending", pending.as_str()),
+                ("email", "anna@example.com"),
+                ("password", "wrong"),
+                ("action", "login"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        statuses.push(r.status().as_u16());
+    }
+    assert_eq!(statuses, [401; 7]);
+    let r = s
+        .client
+        .post(s.url("/oauth/authorize"))
+        .form(&[
+            ("pending", pending.as_str()),
+            ("email", "anna@example.com"),
+            ("password", "right"),
+            ("action", "login"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 429);
+    let secs: u64 = r.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(secs > 0 && secs <= 900);
+    let html = r.text().await.unwrap();
+    assert!(html.contains("Too many wrong passwords. Wait 15 minutes."));
     s.stop().await;
 }

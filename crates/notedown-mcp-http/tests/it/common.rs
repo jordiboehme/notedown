@@ -74,3 +74,25 @@ impl Server {
         self.handle.await.unwrap().unwrap();
     }
 }
+
+pub const REDIRECT: &str = "https://claude.ai/api/mcp/auth_callback";
+
+pub async fn register(s: &Server, redirect: &str) -> String {
+    let r = s
+        .client
+        .post(s.url("/oauth/register"))
+        .json(&serde_json::json!({
+            "client_name": "Claude",
+            "client_uri": "https://claude.ai",
+            "redirect_uris": [redirect],
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let v: serde_json::Value = r.json().await.unwrap();
+    v["client_id"].as_str().unwrap().to_string()
+}

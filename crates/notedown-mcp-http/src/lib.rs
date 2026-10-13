@@ -16,6 +16,7 @@ use notedown_cloud::Clock;
 use notedown_cloud::server::AppState;
 
 pub mod base;
+mod clients;
 mod discovery;
 mod redirect;
 mod secret;
@@ -25,6 +26,10 @@ use base::Base;
 /// The one scope: read the notes and move the bookmarks.
 pub const SCOPE: &str = "notes";
 
+pub(crate) const MAX_REGISTER_BYTES: usize = 64 * 1024;
+#[allow(dead_code)] // used by the token and authorize routes of the tasks that follow
+pub(crate) const MAX_FORM_BYTES: usize = 8 * 1024;
+
 /// What the OAuth handlers and the gate share.
 #[allow(dead_code)] // `data` is used by the tasks that follow
 pub(crate) struct Oauth {
@@ -32,10 +37,16 @@ pub(crate) struct Oauth {
     pub(crate) data: PathBuf,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) trusted: Vec<IpAddr>,
+    pub(crate) clients: clients::ClientStore,
+    pub(crate) registrations: clients::RegistrationLimiter,
 }
 
 impl Oauth {
-    #[allow(dead_code)] // used by the tasks that follow
+    /// The client ids that hold a grant (pruning keeps them). Task 7 fills it from the grants.
+    pub(crate) fn grants_in_use(&self) -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
     pub(crate) fn now_ms(&self) -> u64 {
         let ns = self.clock.now().unix_timestamp_nanos();
         u64::try_from(ns / 1_000_000).unwrap_or(0)
@@ -57,6 +68,8 @@ pub fn router(state: &Arc<AppState>) -> anyhow::Result<Option<Router>> {
         data: state.data_dir.clone(),
         clock: state.clock.clone(),
         trusted: config.trusted_proxies.clone(),
+        clients: clients::ClientStore::new(&state.data_dir),
+        registrations: Default::default(),
     });
     let routes = Router::new()
         .route(
@@ -70,6 +83,11 @@ pub fn router(state: &Arc<AppState>) -> anyhow::Result<Option<Router>> {
         .route(
             "/.well-known/oauth-authorization-server",
             get(discovery::authorization_server),
+        )
+        .route(
+            "/oauth/register",
+            axum::routing::post(clients::register)
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_REGISTER_BYTES)),
         )
         .with_state(oauth.clone())
         .layer(middleware::from_fn_with_state(oauth, check_host));
@@ -86,4 +104,14 @@ async fn check_host(State(o): State<Arc<Oauth>>, request: Request, next: Next) -
             .into_response();
     }
     next.run(request).await
+}
+
+/// An OAuth error answer (RFC 6749 5.2): JSON `error` and `error_description`, never cached.
+pub(crate) fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
+    (
+        status,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        axum::Json(serde_json::json!({"error": error, "error_description": description})),
+    )
+        .into_response()
 }

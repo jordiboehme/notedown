@@ -197,6 +197,17 @@ fn answer(result: crate::Result<String>) -> std::result::Result<String, String> 
     result.map_err(|e| e.to_string())
 }
 
+/// Runs the blocking file work of a tool off the async workers (the HTTP server shares them
+/// with the device sync).
+async fn blocking(
+    work: impl FnOnce() -> crate::Result<String> + Send + 'static,
+) -> std::result::Result<String, String> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(result) => answer(result),
+        Err(e) => Err(format!("the tool stopped: {e}")),
+    }
+}
+
 #[tool_router]
 impl NotesServer {
     /// The server of `account` (see [`resolve_account`]) in `data`.
@@ -217,7 +228,8 @@ pages, the region_missed count, the oldest kept version and the bookmarks of the
         annotations(read_only_hint = true)
     )]
     async fn status(&self) -> std::result::Result<String, String> {
-        answer(self.status_text())
+        let this = self.clone();
+        blocking(move || this.status_text()).await
     }
 
     #[tool(
@@ -230,7 +242,8 @@ changed after a seq, a date, an RFC 3339 time or a duration like 3d.",
         &self,
         Parameters(p): Parameters<ListNotesParams>,
     ) -> std::result::Result<String, String> {
-        answer(self.list_text(p))
+        let this = self.clone();
+        blocking(move || this.list_text(p)).await
     }
 
     #[tool(
@@ -245,7 +258,8 @@ repeat while more is true. With since, pass the previous upTo as since.",
         &self,
         Parameters(p): Parameters<ChangesParams>,
     ) -> std::result::Result<String, String> {
-        answer(self.changes_text(p))
+        let this = self.clone();
+        blocking(move || this.changes_text(p)).await
     }
 
     #[tool(
@@ -257,7 +271,8 @@ the changes up to upTo are ingested.",
         &self,
         Parameters(p): Parameters<AckParams>,
     ) -> std::result::Result<String, String> {
-        answer(self.ack_text(p))
+        let this = self.clone();
+        blocking(move || this.ack_text(p)).await
     }
 
     #[tool(
@@ -269,7 +284,8 @@ its anchor as an HTML comment.",
         &self,
         Parameters(p): Parameters<NoteParams>,
     ) -> std::result::Result<String, String> {
-        answer(self.note_text(&p.note))
+        let this = self.clone();
+        blocking(move || this.note_text(&p.note)).await
     }
 
     #[tool(
@@ -282,7 +298,8 @@ version that deleted it and its textBefore.",
         &self,
         Parameters(p): Parameters<BlockParams>,
     ) -> std::result::Result<String, String> {
-        answer(self.block_text(&p.anchor))
+        let this = self.clone();
+        blocking(move || this.block_text(&p.anchor)).await
     }
 
     #[tool(
@@ -295,7 +312,8 @@ line of context. limit is 20 when left out.",
         &self,
         Parameters(p): Parameters<SearchParams>,
     ) -> std::result::Result<String, String> {
-        answer(self.search_text(&p.query, p.limit))
+        let this = self.clone();
+        blocking(move || this.search_text(&p.query, p.limit)).await
     }
 }
 

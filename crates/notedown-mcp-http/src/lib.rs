@@ -19,15 +19,18 @@ mod authorize;
 pub mod base;
 mod clients;
 mod discovery;
+mod gate;
 mod grants;
 mod login;
 mod pending;
 mod redirect;
 mod secret;
+mod session;
 mod throttle;
 mod token;
 
 use base::Base;
+pub use gate::McpAccount;
 pub use grants::{GrantSummary, list_grants, revoke_grants};
 
 /// The one scope: read the notes and move the bookmarks.
@@ -37,7 +40,6 @@ pub(crate) const MAX_REGISTER_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_FORM_BYTES: usize = 8 * 1024;
 
 /// What the OAuth handlers and the gate share.
-#[allow(dead_code)] // `data` is used by the tasks that follow
 pub(crate) struct Oauth {
     pub(crate) base: Base,
     pub(crate) data: PathBuf,
@@ -112,6 +114,7 @@ pub fn router(state: &Arc<AppState>) -> anyhow::Result<Option<Router>> {
         grants: grants::GrantStore::open(&state.data_dir)?,
         last_sweep: Default::default(),
     });
+    let mcp_routes = mcp_routes(&oauth);
     let routes = Router::new()
         .route(
             "/.well-known/oauth-protected-resource",
@@ -147,8 +150,40 @@ pub fn router(state: &Arc<AppState>) -> anyhow::Result<Option<Router>> {
                 .layer(axum::extract::DefaultBodyLimit::max(MAX_FORM_BYTES)),
         )
         .with_state(oauth.clone())
+        .merge(mcp_routes)
         .layer(middleware::from_fn_with_state(oauth, check_host));
     Ok(Some(routes))
+}
+
+/// `/mcp`: rmcp's streamable HTTP service behind the bearer gate.
+fn mcp_routes(oauth: &Arc<Oauth>) -> Router {
+    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+    use rmcp::transport::streamable_http_server::tower::{
+        StreamableHttpServerConfig, StreamableHttpService,
+    };
+    let mut manager = LocalSessionManager::default();
+    // No SSE priming frame (strict SSE parsers refuse it).
+    manager.session_config.sse_retry = None;
+    let manager = Arc::new(manager);
+    let data = oauth.data.clone();
+    let servers = session::Servers::default();
+    let mcp = StreamableHttpService::new(
+        move || Ok(session::AccountSession::new(data.clone(), servers.clone())),
+        manager.clone(),
+        StreamableHttpServerConfig::default()
+            .with_sse_retry(None)
+            .with_legacy_session_mode(true)
+            // The Host check of this router replaces rmcp's loopback-only default.
+            .disable_allowed_hosts(),
+    );
+    let gate = Arc::new(gate::Gate {
+        oauth: oauth.clone(),
+        owners: Default::default(),
+        sessions: manager,
+    });
+    Router::new()
+        .route_service("/mcp", mcp)
+        .layer(middleware::from_fn_with_state(gate, gate::gate))
 }
 
 /// 421 for a request not addressed to the base (a wrong `Host`).

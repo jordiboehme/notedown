@@ -199,3 +199,75 @@ async fn a_body_that_is_no_form_is_rejected_cleanly() {
     assert_eq!(r.status(), 200);
     s.stop().await;
 }
+
+#[tokio::test]
+async fn an_mcp_client_sees_only_its_own_account() {
+    let s = start().await;
+    let (_, anna) = signed_in(&s, "anna").await;
+    add_account(&s, "ben", "ben@example.com", "right");
+    // The rmcp client speaks ProtocolVersion::LATEST (2026-07-28): the stateless path.
+    let client = mcp_client(&s, &anna).await.unwrap();
+    let tools = client.list_all_tools().await.unwrap();
+    assert_eq!(tools.len(), 7);
+    let r = client
+        .call_tool(rmcp::model::CallToolRequestParams::new("status"))
+        .await
+        .unwrap();
+    assert_ne!(r.is_error, Some(true));
+    let text = format!("{:?}", r.content);
+    assert!(text.contains("anna") && !text.contains("ben"), "{text}");
+    let r = client
+        .call_tool(
+            rmcp::model::CallToolRequestParams::new("get_changes").with_arguments(
+                serde_json::json!({"consumer": "crystalline", "summary": true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_ne!(r.is_error, Some(true), "{r:?}");
+    client.cancel().await.unwrap();
+    s.stop().await;
+}
+
+/// The log must hold no secret of the sign-in: not the password, tokens, code or verifier,
+/// also not from the `Location` of the 302.
+#[tokio::test]
+async fn the_request_log_holds_no_secret_of_the_sign_in() {
+    let s = start().await;
+    add_account(&s, "anna", "anna@example.com", "secret-pw-1");
+    let id = register(&s, REDIRECT).await;
+    let code = sign_in(&s, &id, "anna@example.com", "secret-pw-1").await;
+    let t = exchange(&s, &id, &code).await;
+    let access = t["access_token"].as_str().unwrap().to_string();
+    let refresh_token = t["refresh_token"].as_str().unwrap().to_string();
+    let client = mcp_client(&s, &access).await.unwrap();
+    client.cancel().await.unwrap();
+    let r = refresh(&s, &id, &refresh_token).await;
+    assert_eq!(r.status(), 200);
+    // Read before `stop`: it drops the temporary data folder. Every line is flushed when written.
+    let mut text = String::new();
+    for entry in walk(s.state.log.logs_dir()) {
+        text.push_str(&String::from_utf8_lossy(&std::fs::read(entry).unwrap()));
+    }
+    s.stop().await;
+    assert!(!text.is_empty(), "the requests were logged");
+    for secret in ["secret-pw-1", &access, &refresh_token, &code, VERIFIER] {
+        assert!(!text.contains(secret), "the log holds {secret}");
+    }
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}

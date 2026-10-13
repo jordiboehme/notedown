@@ -569,3 +569,113 @@ async fn a_wrong_resource_at_the_token_endpoint_is_invalid_target() {
     assert_eq!(v["error"], "invalid_target");
     s.stop().await;
 }
+
+#[tokio::test]
+async fn mcp_without_a_good_token_is_401_with_resource_metadata() {
+    let s = start().await;
+    for auth in [None, Some("Bearer nda_nope"), Some("Basic abc")] {
+        let mut r = s
+            .client
+            .post(s.url("/mcp"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+        if let Some(a) = auth {
+            r = r.header("authorization", a);
+        }
+        let r = r.send().await.unwrap();
+        assert_eq!(r.status(), 401);
+        assert_eq!(
+            r.headers()["www-authenticate"],
+            "Bearer resource_metadata=\"https://notedown.example/.well-known/oauth-protected-resource/mcp\""
+        );
+    }
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn stateless_requests_run_on_the_account_of_each_token() {
+    let s = start().await;
+    let (_, anna) = signed_in(&s, "anna").await;
+    let (_, ben) = signed_in(&s, "ben").await;
+    for (token, me, other) in [(&anna, "anna", "ben"), (&ben, "ben", "anna")] {
+        let r = s
+            .client
+            .post(s.url("/mcp"))
+            .header("authorization", format!("Bearer {token}"))
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "status")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            // A stateless request carries its method and name as headers (SEP-2243), and its
+            // protocol version and client capabilities in `_meta`.
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"status","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#)
+            .send()
+            .await
+            .unwrap();
+        let status = r.status();
+        let body = r.text().await.unwrap();
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains(me) && !body.contains(other), "{body}");
+    }
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn a_legacy_session_works_for_its_account_and_is_403_for_another() {
+    let s = start().await;
+    let (_, anna) = signed_in(&s, "anna").await;
+    let (_, ben) = signed_in(&s, "ben").await;
+    // Open a session as anna with a raw initialize to read the session id.
+    let r = s
+        .client
+        .post(s.url("/mcp"))
+        .header("authorization", format!("Bearer {anna}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let session = r.headers()["mcp-session-id"].to_str().unwrap().to_string();
+    let post = |token: &str, body: &'static str| {
+        s.client
+            .post(s.url("/mcp"))
+            .header("authorization", format!("Bearer {token}"))
+            .header("mcp-session-id", &session)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(body)
+    };
+    // Anna's own legacy session works.
+    let r = post(
+        &anna,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(r.status().is_success(), "{}", r.status());
+    let r = post(
+        &anna,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"status","arguments":{}}}"#,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(r.status(), 200);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("anna"), "{body}");
+    // Ben's token on Anna's session is refused.
+    let r = post(
+        &ben,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(r.status(), 403);
+    s.stop().await;
+}

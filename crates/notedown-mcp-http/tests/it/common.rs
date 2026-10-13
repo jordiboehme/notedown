@@ -10,7 +10,6 @@ use notedown_cloud::{Config, SyncMode};
 pub const BASE: &str = "https://notedown.example";
 pub const HOST: &str = "notedown.example";
 
-#[allow(dead_code)] // `dir` and `state` are used by the tasks that follow
 pub struct Server {
     pub addr: SocketAddr,
     pub dir: tempfile::TempDir,
@@ -214,4 +213,34 @@ pub async fn refresh(s: &Server, client_id: &str, token: &str) -> reqwest::Respo
         .send()
         .await
         .unwrap()
+}
+
+/// An rmcp client on `/mcp` with the bearer `access`.
+pub async fn mcp_client(
+    s: &Server,
+    access: &str,
+) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, String> {
+    use rmcp::ServiceExt;
+    use rmcp::transport::StreamableHttpClientTransport;
+    use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+    let mut headers = std::collections::HashMap::new();
+    headers.insert(
+        reqwest::header::HeaderName::from_static("x-forwarded-host"),
+        reqwest::header::HeaderValue::from_static(HOST),
+    );
+    let config = StreamableHttpClientTransportConfig::with_uri(s.url("/mcp"))
+        .auth_header(access.to_string())
+        .custom_headers(headers);
+    let transport = StreamableHttpClientTransport::from_config(config);
+    ().serve(transport).await.map_err(|e| e.to_string())
+}
+
+/// Adds account `slug` and signs it in; returns the client id and the access token.
+pub async fn signed_in(s: &Server, slug: &str) -> (String, String) {
+    let email = format!("{slug}@example.com");
+    add_account(s, slug, &email, "right");
+    let id = register(s, REDIRECT).await;
+    let code = sign_in(s, &id, &email, "right").await;
+    let t = exchange(s, &id, &code).await;
+    (id, t["access_token"].as_str().unwrap().to_string())
 }

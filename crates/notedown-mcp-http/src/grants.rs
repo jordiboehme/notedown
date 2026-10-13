@@ -315,7 +315,6 @@ impl GrantStore {
     }
 
     /// The account of a valid access token for `resource`, else `None`.
-    #[allow(dead_code)] // used by the MCP gate of the tasks that follow
     pub(crate) fn access(
         &self,
         token: &str,

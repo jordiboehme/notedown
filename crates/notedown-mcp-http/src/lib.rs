@@ -15,10 +15,12 @@ use axum::routing::get;
 use notedown_cloud::Clock;
 use notedown_cloud::server::AppState;
 
+mod authorize;
 pub mod base;
 mod clients;
 mod discovery;
 mod login;
+mod pending;
 mod redirect;
 mod secret;
 mod throttle;
@@ -29,7 +31,6 @@ use base::Base;
 pub const SCOPE: &str = "notes";
 
 pub(crate) const MAX_REGISTER_BYTES: usize = 64 * 1024;
-#[allow(dead_code)] // used by the token and authorize routes of the tasks that follow
 pub(crate) const MAX_FORM_BYTES: usize = 8 * 1024;
 
 /// What the OAuth handlers and the gate share.
@@ -41,6 +42,11 @@ pub(crate) struct Oauth {
     pub(crate) trusted: Vec<IpAddr>,
     pub(crate) clients: clients::ClientStore,
     pub(crate) registrations: clients::RegistrationLimiter,
+    pub(crate) pending: pending::PendingStore,
+    pub(crate) codes: pending::CodeStore,
+    pub(crate) throttle: throttle::Throttle,
+    pub(crate) login_limiter: notedown_cloud::api::limit::RateLimiter,
+    pub(crate) accounts: notedown_cloud::auth::Accounts,
 }
 
 impl Oauth {
@@ -72,6 +78,11 @@ pub fn router(state: &Arc<AppState>) -> anyhow::Result<Option<Router>> {
         trusted: config.trusted_proxies.clone(),
         clients: clients::ClientStore::new(&state.data_dir),
         registrations: Default::default(),
+        pending: Default::default(),
+        codes: Default::default(),
+        throttle: Default::default(),
+        login_limiter: Default::default(),
+        accounts: notedown_cloud::auth::Accounts::new(&state.data_dir),
     });
     let routes = Router::new()
         .route(
@@ -90,6 +101,12 @@ pub fn router(state: &Arc<AppState>) -> anyhow::Result<Option<Router>> {
             "/oauth/register",
             axum::routing::post(clients::register)
                 .layer(axum::extract::DefaultBodyLimit::max(MAX_REGISTER_BYTES)),
+        )
+        .route(
+            "/oauth/authorize",
+            get(authorize::show)
+                .post(authorize::submit)
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_FORM_BYTES)),
         )
         .with_state(oauth.clone())
         .layer(middleware::from_fn_with_state(oauth, check_host));

@@ -167,3 +167,182 @@ async fn a_full_client_store_answers_503() {
     assert_eq!(v["error"], "temporarily_unavailable");
     s.stop().await;
 }
+
+#[tokio::test]
+async fn authorize_refuses_without_redirecting_for_an_unknown_client_or_redirect() {
+    let s = start().await;
+    let id = register(&s, REDIRECT).await;
+    for q in [
+        authorize_query("ndc_00000000000000000000000000000000", &[]),
+        authorize_query(
+            &id,
+            &[("redirect_uri", "https://claude.ai/api/mcp/auth_callback/")],
+        ),
+        authorize_query(&id, &[("redirect_uri", "https://evil.example/cb")]),
+    ] {
+        let r = s
+            .client
+            .get(s.url("/oauth/authorize"))
+            .query(&q)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400);
+        assert!(r.headers().get("location").is_none());
+    }
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn authorize_redirects_other_errors_with_state_and_iss() {
+    let s = start().await;
+    let id = register(&s, REDIRECT).await;
+    for (extra, error) in [
+        (
+            vec![("response_type", "token")],
+            "unsupported_response_type",
+        ),
+        (vec![("code_challenge", "")], "invalid_request"),
+        (vec![("code_challenge_method", "plain")], "invalid_request"),
+        (
+            vec![("resource", "https://other.example/mcp")],
+            "invalid_target",
+        ),
+    ] {
+        let r = s
+            .client
+            .get(s.url("/oauth/authorize"))
+            .query(&authorize_query(&id, &extra))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 302, "{error}");
+        let p = location_params(&r);
+        assert_eq!(p["error"], error);
+        assert_eq!(p["state"], "st-1");
+        assert_eq!(p["iss"], BASE);
+    }
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn a_wrong_password_shows_the_form_again_and_cancel_denies() {
+    let s = start().await;
+    add_account(&s, "anna", "anna@example.com", "right");
+    let id = register(&s, REDIRECT).await;
+    let r = s
+        .client
+        .get(s.url("/oauth/authorize"))
+        .query(&authorize_query(&id, &[]))
+        .send()
+        .await
+        .unwrap();
+    let pending = pending_id_of(&r.text().await.unwrap());
+    let r = s
+        .client
+        .post(s.url("/oauth/authorize"))
+        .form(&[
+            ("pending", pending.as_str()),
+            ("email", "anna@example.com"),
+            ("password", "wrong"),
+            ("action", "login"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    let html = r.text().await.unwrap();
+    assert!(html.contains("email or password wrong"));
+    assert_eq!(
+        pending_id_of(&html),
+        pending,
+        "the same pending login stays"
+    );
+    let r = s
+        .client
+        .post(s.url("/oauth/authorize"))
+        .form(&[("pending", pending.as_str()), ("action", "cancel")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 302);
+    assert_eq!(location_params(&r)["error"], "access_denied");
+    // Used once: the pending id is gone.
+    let r = s
+        .client
+        .post(s.url("/oauth/authorize"))
+        .form(&[
+            ("pending", pending.as_str()),
+            ("email", "anna@example.com"),
+            ("password", "right"),
+            ("action", "login"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn the_web_throttle_never_touches_the_device_lockout() {
+    let s = start().await;
+    add_account(&s, "anna", "anna@example.com", "right");
+    let id = register(&s, REDIRECT).await;
+    let r = s
+        .client
+        .get(s.url("/oauth/authorize"))
+        .query(&authorize_query(&id, &[]))
+        .send()
+        .await
+        .unwrap();
+    let pending = pending_id_of(&r.text().await.unwrap());
+    let mut statuses = Vec::new();
+    // 3 free failures, then the first delayed one (1 s) is enough to see the counter untouched.
+    for _ in 0..4 {
+        let r = s
+            .client
+            .post(s.url("/oauth/authorize"))
+            .form(&[
+                ("pending", pending.as_str()),
+                ("email", "anna@example.com"),
+                ("password", "wrong"),
+                ("action", "login"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        statuses.push(r.status().as_u16());
+    }
+    assert_eq!(statuses, [401, 401, 401, 401]);
+    let a = notedown_cloud::auth::Accounts::new(s.dir.path())
+        .get("anna")
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.failed_logins, 0);
+    assert!(!a.locked);
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn login_posts_are_limited_per_ip() {
+    let s = start().await;
+    let mut last = 0;
+    for _ in 0..11 {
+        let r = s
+            .client
+            .post(s.url("/oauth/authorize"))
+            .form(&[
+                ("pending", "nope"),
+                ("email", "x@example.com"),
+                ("password", "p"),
+                ("action", "login"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        last = r.status().as_u16();
+    }
+    assert_eq!(last, 429);
+    s.stop().await;
+}

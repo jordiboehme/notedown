@@ -96,3 +96,91 @@ pub async fn register(s: &Server, redirect: &str) -> String {
     let v: serde_json::Value = r.json().await.unwrap();
     v["client_id"].as_str().unwrap().to_string()
 }
+
+#[allow(dead_code)] // used by the token tests of Task 7
+pub const VERIFIER: &str = "dBjftJeZ4CVP-mJ92K28uhbUJU1p1r_wW1gFWFOEjXk";
+pub const CHALLENGE: &str = "jDBroimTx0Ag-gB-3YHpo5TS8niR-0pvTfRtAXTl1p8";
+
+pub fn add_account(s: &Server, slug: &str, email: &str, password: &str) {
+    notedown_cloud::auth::Accounts::new(s.dir.path())
+        .create(slug, email, password)
+        .unwrap();
+}
+
+pub fn authorize_query(client_id: &str, extra: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut q: Vec<(String, String)> = [
+        ("response_type", "code"),
+        ("client_id", client_id),
+        ("redirect_uri", REDIRECT),
+        ("code_challenge", CHALLENGE),
+        ("code_challenge_method", "S256"),
+        ("state", "st-1"),
+        ("resource", "https://notedown.example/mcp"),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    for (k, v) in extra {
+        q.retain(|(qk, _)| qk != k);
+        if !v.is_empty() {
+            q.push((k.to_string(), v.to_string()));
+        }
+    }
+    q
+}
+
+pub fn pending_id_of(html: &str) -> String {
+    let at = html
+        .find("name=\"pending\" value=\"")
+        .expect("a login form")
+        + 22;
+    html[at..].split('"').next().unwrap().to_string()
+}
+
+/// Query parameters of a `Location` header.
+pub fn location_params(r: &reqwest::Response) -> std::collections::HashMap<String, String> {
+    let loc = r.headers()["location"].to_str().unwrap();
+    let query = loc.split_once('?').map_or("", |(_, q)| q);
+    reqwest::Url::parse(&format!("http://x/?{query}"))
+        .unwrap()
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect()
+}
+
+/// Opens the login page and signs in; returns the code.
+#[allow(dead_code)] // used by the token tests of Task 7
+pub async fn sign_in(s: &Server, client_id: &str, email: &str, password: &str) -> String {
+    let r = s
+        .client
+        .get(s.url("/oauth/authorize"))
+        .query(&authorize_query(client_id, &[]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let pending = pending_id_of(&r.text().await.unwrap());
+    let r = s
+        .client
+        .post(s.url("/oauth/authorize"))
+        .form(&[
+            ("pending", pending.as_str()),
+            ("email", email),
+            ("password", password),
+            ("action", "login"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 302, "sign-in redirects");
+    let p = location_params(&r);
+    assert!(
+        r.headers()["location"]
+            .to_str()
+            .unwrap()
+            .starts_with(REDIRECT)
+    );
+    assert_eq!(p["state"], "st-1");
+    assert_eq!(p["iss"], BASE);
+    p["code"].clone()
+}

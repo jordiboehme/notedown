@@ -1,7 +1,5 @@
 //! The web login throttle per email. It is separate from the device lockout: it never touches
 //! `failed_logins` of an account.
-// Used from Task 6 on; removed in Task 10.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::Mutex;

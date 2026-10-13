@@ -1,6 +1,4 @@
 //! The password check and the login page.
-// Used from Task 6 on; removed in Task 10.
-#![allow(dead_code)]
 
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};

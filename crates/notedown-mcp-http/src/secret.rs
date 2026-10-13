@@ -62,6 +62,8 @@ mod tests {
             verifier,
             "jDBroimTx0Ag-gB-3YHpo5TS8niR-0pvTfRtAXTl1p9"
         ));
+        assert!(!pkce_matches(verifier, ""));
+        assert!(!pkce_matches(verifier, &format!("{challenge}x")));
         assert!(pkce_text_ok(verifier));
         assert!(!pkce_text_ok("short"));
         assert!(!pkce_text_ok(&"a".repeat(129)));

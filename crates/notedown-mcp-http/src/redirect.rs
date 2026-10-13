@@ -33,6 +33,37 @@ pub(crate) fn is_loopback(uri: &str) -> bool {
     LOOPBACK.contains(&host.as_str())
 }
 
+/// A port of 1 to 5 ASCII digits with a value from 1 to 65535.
+fn valid_port(port: &str) -> bool {
+    (1..=5).contains(&port.len())
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u32>().is_ok_and(|n| (1..=65535).contains(&n))
+}
+
+/// `authority` is a bracketed IPv6 host, or a plain host of ASCII letters, digits, `-` and `.`,
+/// each optionally followed by `:<port>`. Nothing else (no `\`, `%`, `_`) is allowed, so the host
+/// shown to the user is the host the browser connects to.
+fn valid_authority(authority: &str) -> bool {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some((inner, after)) = rest.split_once(']') else {
+            return false;
+        };
+        let inner_ok = !inner.is_empty()
+            && inner
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.');
+        return inner_ok && (after.is_empty() || after.strip_prefix(':').is_some_and(valid_port));
+    }
+    let (host, port) = authority
+        .split_once(':')
+        .map_or((authority, None), |(h, p)| (h, Some(p)));
+    let host_ok = !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
+    host_ok && port.is_none_or(valid_port)
+}
+
 /// Why `uri` cannot be a redirect URI, or `None` when it can.
 pub(crate) fn problem(uri: &str) -> Option<&'static str> {
     if uri.len() > MAX_URI_LEN {
@@ -52,6 +83,9 @@ pub(crate) fn problem(uri: &str) -> Option<&'static str> {
     }
     if authority.contains('@') {
         return Some("has user info");
+    }
+    if !valid_authority(authority) {
+        return Some("has an invalid host or port");
     }
     match scheme.to_ascii_lowercase().as_str() {
         "https" => None,
@@ -95,6 +129,45 @@ mod tests {
         assert!(problem("javascript:alert(1)").is_some());
         assert!(problem(&format!("https://a.example/{}", "x".repeat(2048))).is_some());
         assert!(problem("https://a.example/ cb").is_some());
+    }
+
+    #[test]
+    fn authority_must_be_a_plain_host_or_ipv6_with_a_valid_port() {
+        // Refused: the host a user sees must be the host the browser uses.
+        assert!(
+            problem("https://evil.com\\.claude.ai/cb").is_some(),
+            "backslash"
+        );
+        assert!(
+            problem("https://evil.com%2F.claude.ai/cb").is_some(),
+            "percent"
+        );
+        assert!(problem("https://a%41.example/cb").is_some(), "percent");
+        assert!(
+            problem("https://claude_ai.example/cb").is_some(),
+            "underscore"
+        );
+        assert!(problem("http://[::1]evil.com/cb").is_some(), "text after ]");
+        assert!(
+            problem("http://localhost:evil.com/cb").is_some(),
+            "port not a number"
+        );
+        assert!(
+            problem("http://localhost:99999999/").is_some(),
+            "port too large"
+        );
+        assert!(problem("https://claude.ai:0/cb").is_some(), "port zero");
+        assert!(problem("https://claude.ai:/cb").is_some(), "empty port");
+        assert!(
+            problem("https://claude.ai:+443/cb").is_some(),
+            "signed port"
+        );
+        assert!(problem("https://[]/cb").is_some(), "empty IPv6");
+        assert!(problem("https://[g::1]/cb").is_some(), "non-hex IPv6");
+        // Accepted.
+        assert_eq!(problem("https://claude.ai:443/cb"), None);
+        assert_eq!(problem("http://[::1]:8080/cb"), None);
+        assert_eq!(problem("https://claude.ai:65535/cb"), None);
     }
 
     #[test]

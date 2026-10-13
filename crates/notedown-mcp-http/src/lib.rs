@@ -58,9 +58,13 @@ pub(crate) struct Oauth {
 }
 
 impl Oauth {
-    /// The client ids that hold a grant (pruning keeps them).
-    pub(crate) fn grants_in_use(&self) -> std::collections::HashSet<String> {
-        self.grants.client_ids()
+    /// The client ids that pruning keeps: those with a grant, a live pending login or a code
+    /// not yet exchanged.
+    pub(crate) fn clients_in_use(&self, now_ms: u64) -> std::collections::HashSet<String> {
+        let mut ids = self.grants.client_ids();
+        ids.extend(self.pending.client_ids(now_ms));
+        ids.extend(self.codes.client_ids(now_ms));
+        ids
     }
 
     /// True at most once an hour: a sweep of expired grants and old unused clients is due.
@@ -79,7 +83,7 @@ impl Oauth {
         if let Err(e) = self.grants.sweep(now_ms) {
             eprintln!("notedown mcp: grant sweep failed: {e}");
         }
-        if let Err(e) = self.clients.prune(now_ms, &self.grants_in_use()) {
+        if let Err(e) = self.clients.prune(now_ms, &self.clients_in_use(now_ms)) {
             eprintln!("notedown mcp: client prune failed: {e}");
         }
     }

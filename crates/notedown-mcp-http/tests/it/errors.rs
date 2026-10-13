@@ -211,6 +211,40 @@ async fn a_full_store_of_never_used_clients_older_than_10_minutes_takes_a_new_on
     s.stop().await;
 }
 
+/// At the cap, a never-used client in the middle of a sign-in (a pending login) is kept.
+#[tokio::test]
+async fn at_the_cap_a_client_with_a_pending_login_is_not_pruned() {
+    let s = start().await;
+    fill_clients(&s, 11 * 60 * 1000);
+    let file = s
+        .dir
+        .path()
+        .join(format!("oauth/clients/ndc_{:032x}.json", 0));
+    let mut c: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    c["redirect_uris"] = serde_json::json!([REDIRECT]);
+    std::fs::write(&file, c.to_string()).unwrap();
+    let id = c["id"].as_str().unwrap();
+    let r = s
+        .client
+        .get(s.url("/oauth/authorize"))
+        .query(&authorize_query(id, &[]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    pending_id_of(&r.text().await.unwrap());
+    let r = s
+        .client
+        .post(s.url("/oauth/register"))
+        .json(&serde_json::json!({"redirect_uris": [REDIRECT]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    assert!(file.exists(), "the client in a sign-in was pruned");
+    s.stop().await;
+}
+
 #[tokio::test]
 async fn authorize_refuses_without_redirecting_for_an_unknown_client_or_redirect() {
     let s = start().await;

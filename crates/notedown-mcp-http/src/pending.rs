@@ -1,7 +1,7 @@
 //! Pending logins and authorization codes. In memory only: a restart forgets them and the
 //! client starts the sign-in again.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use crate::secret;
@@ -66,6 +66,15 @@ impl PendingStore {
         map.remove(id)
             .filter(|v| now_ms.saturating_sub(v.created_ms) < PENDING_TTL_MS)
     }
+
+    /// The clients of the live pending logins (a sign-in in progress keeps its client).
+    pub(crate) fn client_ids(&self, now_ms: u64) -> HashSet<String> {
+        let map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        map.values()
+            .filter(|v| now_ms.saturating_sub(v.created_ms) < PENDING_TTL_MS)
+            .map(|v| v.client_id.clone())
+            .collect()
+    }
 }
 
 /// A pending authorization code.
@@ -116,6 +125,15 @@ impl CodeStore {
         map.remove(&secret::sha256_hex(code))
             .filter(|c| now_ms < c.expires_ms)
     }
+
+    /// The clients of the live codes (a code not yet exchanged keeps its client).
+    pub(crate) fn client_ids(&self, now_ms: u64) -> HashSet<String> {
+        let map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        map.values()
+            .filter(|c| now_ms < c.expires_ms)
+            .map(|c| c.client_id.clone())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -148,6 +166,32 @@ mod tests {
         let id = s.insert(p("c2", 0), 0).unwrap();
         assert!(s.take(&id, 1).is_some());
         assert!(s.take(&id, 1).is_none());
+    }
+
+    #[test]
+    fn client_ids_are_those_of_live_pending_logins() {
+        let s = PendingStore::default();
+        s.insert(p("c1", 0), 0).unwrap();
+        s.insert(p("c2", 5), 5).unwrap();
+        let ids = s.client_ids(PENDING_TTL_MS + 1);
+        assert_eq!(ids, ["c2".to_string()].into());
+    }
+
+    #[test]
+    fn client_ids_are_those_of_live_codes() {
+        let s = CodeStore::default();
+        let c = |client: &str, exp| Code {
+            slug: "a".into(),
+            password_md5: "m".into(),
+            client_id: client.into(),
+            redirect_uri: "r".into(),
+            challenge: "x".into(),
+            resource: "res".into(),
+            expires_ms: exp,
+        };
+        s.issue(c("c1", 10));
+        s.issue(c("c2", 20));
+        assert_eq!(s.client_ids(15), ["c2".to_string()].into());
     }
 
     #[test]

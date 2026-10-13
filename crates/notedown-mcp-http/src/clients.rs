@@ -332,7 +332,8 @@ pub(crate) async fn register(
     let stored = {
         let (o, client) = (o.clone(), client.clone());
         tokio::task::spawn_blocking(move || {
-            o.clients.create_capped(&client, now, &o.grants_in_use())
+            o.clients
+                .create_capped(&client, now, &o.clients_in_use(now))
         })
         .await
         .unwrap_or_else(|e| Err(anyhow::anyhow!("store task failed: {e}")))

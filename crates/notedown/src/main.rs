@@ -413,7 +413,7 @@ enum AccountAction {
         #[arg(long, value_name = "ID")]
         revoke: Option<String>,
     },
-    /// Delete an account with all its files (also ends its OAuth sign-ins)
+    /// Delete an account with all its files and its note text (also ends its OAuth sign-ins)
     Remove {
         slug: String,
         /// Confirm the deletion
@@ -1608,7 +1608,7 @@ fn account_command(data: &Path, action: AccountAction) -> Result<ExitCode> {
         AccountAction::Remove { slug, yes } => {
             if !yes {
                 return Err(anyhow!(
-                    "this deletes account {slug} with all its files; add --yes to confirm"
+                    "this deletes account {slug} with all its files and its note text; add --yes to confirm"
                 ));
             }
             accounts.remove(&slug)?;

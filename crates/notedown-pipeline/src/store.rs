@@ -24,7 +24,7 @@ use crate::model::{LineChange, LogLine, NoteState, PageOcrState, PageState, titl
 use crate::{Error, Result};
 
 /// `<data>/pipeline`.
-pub const PIPELINE_DIR: &str = "pipeline";
+pub use notedown_cloud::auth::PIPELINE_DIR;
 /// `<data>/pipeline/.writer.lock`.
 pub const WRITER_LOCK_FILE: &str = ".writer.lock";
 /// `<data>/pipeline/<slug>/.lock`: the prune and bookmark writes.

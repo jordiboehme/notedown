@@ -7,11 +7,14 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::fsutil::{is_same_file, json_bytes, rename_durable, write_atomic};
+use crate::fsutil::{fsync_dir, is_same_file, json_bytes, write_atomic};
 use crate::{Error, Result, io_err};
 
 /// The folder of an account's OAuth grants (`notedown-mcp-http`). A new password deletes it.
 pub const OAUTH_DIR: &str = "oauth";
+/// `<data>/pipeline/<slug>`: the note text of an account (`notedown-pipeline`). It belongs to
+/// the account: `remove` deletes it and `create` drops one that was left.
+pub const PIPELINE_DIR: &str = "pipeline";
 
 pub const ACCOUNT_FILE: &str = "account.json";
 /// `accounts/<slug>/.lock`: an advisory lock that the CLI and the server take around every
@@ -149,6 +152,8 @@ pub struct AccountLock {
 #[derive(Debug, Clone)]
 pub struct Accounts {
     root: PathBuf,
+    /// `<data>/pipeline`.
+    pipeline: PathBuf,
 }
 
 impl Accounts {
@@ -156,6 +161,7 @@ impl Accounts {
     pub fn new(data_dir: &Path) -> Accounts {
         Accounts {
             root: data_dir.join("accounts"),
+            pipeline: data_dir.join(PIPELINE_DIR),
         }
     }
 
@@ -219,13 +225,18 @@ impl Accounts {
         if self.get(slug)?.is_some() {
             return Err(Error::AccountExists(slug.to_string()));
         }
-        // A folder without `account.json` is reused. OAuth grants left in it belong to a
-        // removed account: delete them, so its tokens never work for the new one.
-        let oauth = self.account_dir(slug).join(OAUTH_DIR);
-        match std::fs::remove_dir_all(&oauth) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io_err(&oauth)(e)),
+        // A folder without `account.json` is reused. OAuth grants left in it, and a note text
+        // store of the same slug, belong to a removed account: delete them, so its tokens never
+        // work for the new one and its notes never show up in it.
+        for left in [
+            self.account_dir(slug).join(OAUTH_DIR),
+            self.pipeline.join(slug),
+        ] {
+            match std::fs::remove_dir_all(&left) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_err(&left)(e)),
+            }
         }
         self.save(&account)?;
         Ok(account)
@@ -371,7 +382,7 @@ impl Accounts {
     }
 
     /// Delete the account folder with everything in it (files, digests, devices), under the
-    /// store lock and the account lock.
+    /// store lock and the account lock, and then the account's note text (`pipeline/<slug>`).
     pub fn remove(&self, slug: &str) -> Result<()> {
         validate_slug(slug)?;
         self.sweep_tombstones();
@@ -394,25 +405,51 @@ impl Accounts {
     /// crash or a failed delete is swept by the next `remove` and at server start.
     fn remove_locked(&self, slug: &str) -> Result<()> {
         let dir = self.account_dir(slug);
-        let mut raw = [0u8; 8];
-        rand::fill(&mut raw[..]);
-        let tomb = self.root.join(format!(
-            "{TOMBSTONE_PREFIX}{slug}-{}",
-            const_hex::encode(raw)
-        ));
-        rename_durable(&dir, &tomb)?;
-        if let Err(e) = std::fs::remove_dir_all(&tomb) {
-            eprintln!(
-                "notedown cloud: account {slug} is removed, but {} could not be deleted: {e}; \
-                 it is deleted at the next start",
-                tomb.display()
-            );
+        let tomb = self.tombstone(slug, "");
+        std::fs::rename(&dir, &tomb).map_err(io_err(&dir))?;
+        fsync_dir(&self.root)?;
+        Self::delete_tombstone(slug, &tomb);
+        // The note text goes the same way. A failure here is only logged: the account is gone,
+        // and `create` drops the text if the slug is used again.
+        let text = self.pipeline.join(slug);
+        let text_tomb = self.tombstone(slug, "-pipeline");
+        match std::fs::rename(&text, &text_tomb) {
+            Ok(()) => Self::delete_tombstone(slug, &text_tomb),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!(
+                "notedown cloud: account {slug} is removed, but its note text {} could not be \
+                 deleted: {e}",
+                text.display()
+            ),
         }
         Ok(())
     }
 
-    /// Delete the tombstones of removed accounts (`accounts/.removed-*`) that a crash or a
-    /// failed delete left. Errors are only logged. Returns how many were deleted.
+    /// A new tombstone path in `accounts/`: `.removed-<slug>-<hex><suffix>`.
+    fn tombstone(&self, slug: &str, suffix: &str) -> PathBuf {
+        let mut raw = [0u8; 8];
+        rand::fill(&mut raw[..]);
+        self.root.join(format!(
+            "{TOMBSTONE_PREFIX}{slug}-{}{suffix}",
+            const_hex::encode(raw)
+        ))
+    }
+
+    /// Delete a tombstone; a failure is logged, and the next sweep tries again.
+    fn delete_tombstone(slug: &str, tomb: &Path) {
+        match std::fs::remove_dir_all(tomb) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!(
+                "notedown cloud: account {slug} is removed, but {} could not be deleted: {e}; \
+                 it is deleted at the next start",
+                tomb.display()
+            ),
+        }
+    }
+
+    /// Delete the tombstones of removed accounts and of their note text (`accounts/.removed-*`)
+    /// that a crash or a failed delete left. Errors are only logged. Returns how many were deleted.
     pub fn sweep_tombstones(&self) -> usize {
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return 0;

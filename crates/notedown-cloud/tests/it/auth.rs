@@ -694,3 +694,46 @@ fn set_password_deletes_the_oauth_grants() {
     accounts.set_password("anna", "pw2").unwrap();
     assert!(!oauth.exists());
 }
+
+#[test]
+fn a_device_record_of_a_removed_account_is_no_account_and_creates_nothing() {
+    let d = data();
+    let accounts = Accounts::new(d.path());
+    accounts.create("jordi", "jordi@example.org", "pw").unwrap();
+    let devices = Devices::new(d.path());
+    assert_eq!(devices.bump("jordi", "SN1", NOW).unwrap(), 1);
+    accounts.remove("jordi").unwrap();
+    assert!(matches!(
+        devices.invalidate("jordi", "SN1"),
+        Err(Error::NoAccount(_))
+    ));
+    assert!(matches!(
+        devices.bump("jordi", "SN2", NOW),
+        Err(Error::NoAccount(_))
+    ));
+    assert!(!d.path().join("accounts/jordi").exists());
+}
+
+#[test]
+fn account_remove_deletes_the_pipeline_text_and_create_drops_a_leftover() {
+    use notedown_cloud::auth::PIPELINE_DIR;
+    let d = data();
+    let accounts = Accounts::new(d.path());
+    accounts.create("jordi", "jordi@example.org", "pw").unwrap();
+    let text = d.path().join(PIPELINE_DIR).join("jordi");
+    std::fs::create_dir_all(text.join("notes")).unwrap();
+    std::fs::write(text.join("notes/n.json"), "{}").unwrap();
+    std::fs::create_dir_all(d.path().join(PIPELINE_DIR).join("anna")).unwrap();
+    accounts.remove("jordi").unwrap();
+    assert!(!text.exists());
+    // Nothing else of the pipeline is touched, and no tombstone is left.
+    let left: Vec<_> = std::fs::read_dir(d.path().join(PIPELINE_DIR))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(left, ["anna"]);
+    // A text store left by a crash, or recreated by a running writer, is dropped on create.
+    std::fs::create_dir_all(text.join("notes")).unwrap();
+    accounts.create("jordi", "jordi@example.org", "pw").unwrap();
+    assert!(!text.exists());
+}

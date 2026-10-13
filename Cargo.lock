@@ -1658,6 +1658,7 @@ dependencies = [
  "if-addrs",
  "notedown-cloud",
  "notedown-convert",
+ "notedown-mcp-http",
  "notedown-note",
  "notedown-ocr",
  "notedown-pipeline",

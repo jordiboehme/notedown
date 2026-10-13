@@ -271,3 +271,25 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+#[tokio::test]
+async fn passwd_ends_the_grants_of_a_running_server() {
+    let s = start().await;
+    let (_, anna) = signed_in(&s, "anna").await;
+    assert!(mcp_client(&s, &anna).await.is_ok());
+    notedown_cloud::auth::Accounts::new(s.dir.path())
+        .set_password("anna", "new")
+        .unwrap();
+    let r = s
+        .client
+        .post(s.url("/mcp"))
+        .header("authorization", format!("Bearer {anna}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    s.stop().await;
+}

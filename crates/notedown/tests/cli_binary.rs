@@ -232,6 +232,110 @@ fn serve_startup_with_stderr(data: &std::path::Path, extra: &[&str]) -> (String,
 }
 
 #[test]
+fn serve_mounts_the_mcp_endpoint_and_names_it() {
+    use std::io::{BufRead, Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("server.toml"),
+        "listen = [\"127.0.0.1:0\"]\nexternal_base_url = \"https://notedown.example\"\n\
+         trusted_proxies = [\"127.0.0.1\"]\nsync = \"refuse\"\nwatch = false\n\
+         scan_interval = 0\nrender_dir = \"\"\n",
+    )
+    .unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["serve", "--data"])
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut lines = String::new();
+    let mut port = None;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        if let Some(addr) = line.strip_prefix("listening on: ") {
+            port = addr.trim().rsplit(':').next().map(str::to_string);
+        }
+        lines.push_str(&line);
+        if line.starts_with("press Ctrl-C") {
+            break;
+        }
+    }
+    let reply = port.map(|port| {
+        let mut tcp = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        tcp.write_all(
+            b"GET /.well-known/oauth-authorization-server HTTP/1.1\r\nHost: notedown.example\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        let mut reply = String::new();
+        tcp.read_to_string(&mut reply).unwrap();
+        reply
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        lines.contains("\nmcp: https://notedown.example/mcp\n"),
+        "{lines}"
+    );
+    let reply = reply.expect("no listening line");
+    assert!(
+        reply.contains("\"issuer\":\"https://notedown.example\""),
+        "{reply}"
+    );
+}
+
+#[test]
+fn serve_says_why_the_mcp_endpoint_is_off() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("server.toml"),
+        "listen = [\"127.0.0.1:0\"]\n",
+    )
+    .unwrap();
+    let out = serve_startup(dir.path(), &[]);
+    assert!(
+        out.contains("\nmcp: off (needs an https external_base_url)\n"),
+        "{out}"
+    );
+    std::fs::write(
+        dir.path().join("server.toml"),
+        "listen = [\"127.0.0.1:0\"]\n[mcp]\nenabled = false\n",
+    )
+    .unwrap();
+    let out = serve_startup(dir.path(), &[]);
+    assert!(
+        out.contains("\nmcp: off ([mcp] enabled = false)\n"),
+        "{out}"
+    );
+}
+
+#[test]
+fn cloud_account_oauth_lists_and_revokes() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let out = cloud(
+        d,
+        &["add", "anna", "--email", "a@x", "--password-stdin"],
+        Some("pw\n"),
+    );
+    assert!(out.status.success());
+    let out = cloud(d, &["oauth", "anna"], None);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("no OAuth sign-ins"));
+    let out = cloud(d, &["oauth", "anna", "--revoke", "all"], None);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("revoked 0 OAuth sign-ins"));
+    let out = cloud(d, &["oauth", "anna", "--revoke", "nope"], None);
+    assert!(!out.status.success());
+    let out = cloud(d, &["oauth", "ghost"], None);
+    assert!(!out.status.success());
+}
+
+#[test]
 fn serve_reads_the_old_push_reconnect_as_detail_and_warns() {
     let dir = tempfile::tempdir().unwrap();
     let toml = dir.path().join("server.toml");

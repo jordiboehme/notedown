@@ -17,6 +17,8 @@ use notedown_cloud::server::AppState;
 
 pub mod base;
 mod discovery;
+mod redirect;
+mod secret;
 
 use base::Base;
 

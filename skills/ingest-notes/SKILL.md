@@ -57,6 +57,8 @@ Pass this section and the next one to every sub-agent, with its account slug, no
      that already holds the topic, also when its name differs a little. Start a new folder only
      when none fits.
 3. For each note, distill its text into engrams. One engram per topic, not one per block.
+   - Keep the facts complete. Numbers, names and contact data the note holds go into the engram
+     as written. Leave out only text without lasting content, such as tests and scribbles.
    - Put the anchors of the blocks you used into the metadata key `sources` (a list), for
      example `notedown://<account>/F2024.../P2024...#b3`.
    - Put the note address `notedown://<account>/<key>` into the metadata key `resource`.

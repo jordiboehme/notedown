@@ -1,8 +1,5 @@
 //! Random ids and tokens, hashes and the PKCE check.
 
-// Used from Task 4 on; removed in Task 10.
-#![allow(dead_code)]
-
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};

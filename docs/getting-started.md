@@ -275,6 +275,56 @@ Then ask Claude to "ingest my notes".
 
 Load it with `launchctl load ~/Library/LaunchAgents/de.notedown.ingest.plist`. `PATH` must hold `notedown`, `claude` and `jq`, because launchd starts with a short one. Claude Code must know the Crystalline MCP server. If its name is not `crystalline`, set `CRYSTALLINE_MCP` (see the top of the script). When one run fails, the script confirms nothing. The next night repeats the same changes, which is safe.
 
+## Use your notes in claude.ai
+
+`notedown serve` can serve the MCP tools on the internet at `https://<your name>/mcp`. claude.ai then reads your notes like Claude Code does. It signs in with the email and password of a notedown account.
+
+You need:
+
+- a reverse proxy with TLS in front of `notedown serve`;
+- a public DNS name for the proxy;
+- split DNS, so the device reaches the same name on the LAN.
+
+**Set up `server.toml`.** Restart the server after you change it.
+
+```toml
+external_base_url = "https://notedown.example.net"
+trusted_proxies = ["192.168.1.2"]   # the proxy
+
+[mcp]
+enabled = true                       # the default
+```
+
+The MCP endpoint is served only when `external_base_url` starts with `https://`. `notedown serve` prints one of these lines at start:
+
+- `mcp: https://notedown.example.net/mcp`
+- `mcp: off (needs an https external_base_url)`
+- `mcp: off ([mcp] enabled = false)`
+
+**Set up the proxy.** From the internet, forward only these paths: `/mcp`, `/oauth/` and `/.well-known/`. The device API stays on the LAN. This is an example for Caddy:
+
+```
+notedown.example.net {
+    @public path /mcp /mcp/* /oauth/* /.well-known/*
+    @lan remote_ip 192.168.0.0/16 10.0.0.0/8
+    handle @public {
+        reverse_proxy 192.168.1.10:19072
+    }
+    handle @lan {
+        reverse_proxy 192.168.1.10:19072
+    }
+    respond 404
+}
+```
+
+Caddy sends `X-Forwarded-Host` and `X-Forwarded-For`. List the proxy in `trusted_proxies`. The proxy must pass on the original host. Behind a trusted proxy, notedown reads it from `X-Forwarded-Host`. It must be one value. A list or a repeated header is refused with 421.
+
+**Add the connector.** In claude.ai open Settings, Connectors, Add custom connector. Enter the URL `https://notedown.example.net/mcp`. Sign in on the notedown page with the email and password of the account.
+
+**Security.** The device password is now also the sign-in of a page on the internet. Use a strong one. Set it with `notedown cloud account --data ~/notedown-data passwd me`. A new password ends every OAuth sign-in. `notedown cloud account --data ~/notedown-data oauth me` lists the sign-ins. `--revoke <id>` ends one and `--revoke all` ends all of them. Wrong passwords on the web page get longer delays, then a pause of 15 minutes for that email. They never lock the device.
+
+Before you move the device to the https name, check by hand that it syncs through that name.
+
 ## What to expect
 
 - Digests and to-dos sync with every sync of the device. Each change shows up in the journal (`digest.created`, `digest.updated`, `digest.deleted`, `task.created` and so on). The digests are in `accounts/me/digests/` and the to-dos in `accounts/me/tasks/`, as JSON files. A handwritten comment of a digest is a `.mark` file in `accounts/me/digests/marks/`.

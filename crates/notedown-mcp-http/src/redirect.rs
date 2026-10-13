@@ -1,8 +1,5 @@
 //! Redirect URI rules: https, or http on a loopback host; no fragment, no user info.
 
-// Used from Task 4 on; removed in Task 10.
-#![allow(dead_code)]
-
 use crate::secret::percent_encode;
 
 pub(crate) const MAX_URI_LEN: usize = 2048;

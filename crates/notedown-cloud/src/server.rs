@@ -558,14 +558,25 @@ impl Drop for AbortOnDrop {
 /// How long open connections (a device keeps its socket open) get to finish after `shutdown`.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Serve until `shutdown` completes, then stop accepting, give open requests a short grace and
-/// return. Every log line is flushed when it is written, so nothing is pending afterwards.
+/// Serve until `shutdown` completes (see [`serve_until_with`]), without extra routes.
 pub async fn serve_until(
     listeners: Vec<TcpListener>,
     state: Arc<AppState>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
-    let app = router(state.clone());
+    serve_until_with(listeners, state, axum::Router::new(), shutdown).await
+}
+
+/// Serve until `shutdown` completes, then stop accepting, give open requests a short grace and
+/// return. `extra` routes are served in front of the device routes (the MCP endpoint). Every log
+/// line is flushed when it is written, so nothing is pending afterwards.
+pub async fn serve_until_with(
+    listeners: Vec<TcpListener>,
+    state: Arc<AppState>,
+    extra: axum::Router,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    let app = crate::api::router_with(state.clone(), extra);
     // The journal follower and the push tick (D8, D11); stopped when this returns. Its start
     // position is taken before the listeners serve.
     let follower = crate::push::Follower::start(state.clone()).await;

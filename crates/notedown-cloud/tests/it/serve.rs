@@ -141,3 +141,51 @@ async fn capture_writes_masked_dumps() {
     }
     assert!(saw_login);
 }
+
+#[tokio::test]
+async fn extra_routes_answer_and_a_streamed_response_is_not_buffered() {
+    use axum::response::IntoResponse;
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(false);
+    let listeners = bind(&config).await.unwrap();
+    let addr = listeners[0].local_addr().unwrap();
+    let state = AppState::open(config, dir.path()).unwrap();
+    // A body that never ends: a buffering log would never send the headers.
+    let extra = axum::Router::new().route(
+        "/x/stream",
+        axum::routing::get(|| async {
+            let body = axum::body::Body::from_stream(futures_util::stream::pending::<
+                Result<axum::body::Bytes, std::io::Error>,
+            >());
+            let mut r = (axum::http::StatusCode::OK, body).into_response();
+            r.extensions_mut()
+                .insert(notedown_cloud::api::envelope::Streamed);
+            r
+        }),
+    );
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(notedown_cloud::server::serve_until_with(
+        listeners,
+        state,
+        extra,
+        async {
+            let _ = rx.await;
+        },
+    ));
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(b"GET /x/stream HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(5), s.read(&mut buf))
+        .await
+        .expect("headers of a streamed extra route arrive")
+        .unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+    // The device routes still answer.
+    let reply = http(addr, "GET", "/api/file/query/server", "").await;
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    drop(s);
+    tx.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}

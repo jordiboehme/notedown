@@ -10,6 +10,9 @@ use time::format_description::well_known::Rfc3339;
 use crate::fsutil::{json_bytes, write_atomic};
 use crate::{Error, Result, io_err};
 
+/// The folder of an account's OAuth grants (`notedown-mcp-http`). A new password deletes it.
+pub const OAUTH_DIR: &str = "oauth";
+
 pub const ACCOUNT_FILE: &str = "account.json";
 /// `accounts/<slug>/.lock`: an advisory lock that the CLI and the server take around every
 /// read-modify-write of `account.json`, so neither can overwrite a change of the other.
@@ -263,7 +266,14 @@ impl Accounts {
         account.locked = false;
         account.locked_at_ms = None;
         account.failed_logins = 0;
-        self.save(&account)
+        self.save(&account)?;
+        // A new password ends every OAuth sign-in of the account.
+        let oauth = self.account_dir(slug).join(OAUTH_DIR);
+        match std::fs::remove_dir_all(&oauth) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io_err(&oauth)(e)),
+        }
     }
 
     /// All accounts, sorted by slug. Folders without an `account.json` are skipped.

@@ -11,7 +11,7 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_FIELD_BYTES: usize = 4 * 1024;
 
 /// A key is sensitive when its lowercase name contains one of these ...
-const SENSITIVE_PARTS: [&str; 9] = [
+const SENSITIVE_PARTS: [&str; 10] = [
     "password",
     "token",
     "secret",
@@ -21,13 +21,14 @@ const SENSITIVE_PARTS: [&str; 9] = [
     "signature",
     "randomcode",
     "validcode",
+    "verifier",
 ];
 
 const PREFIX: &str = "<masked:";
 const SUFFIX: &str = " chars>";
 
 /// Whether a JSON key, query key or form key carries a secret (case-insensitive): the name
-/// contains password, token, secret, authorization, cookie, sign, randomcode or validcode, or is
+/// contains password, token, secret, authorization, cookie, sign, randomcode, validcode or verifier (the OAuth `code_verifier`), or is
 /// exactly `code`.
 pub fn is_sensitive_key(key: &str) -> bool {
     is_sensitive_key_from(key, Origin::Client)
@@ -734,6 +735,14 @@ mod tests {
             // to the same key.
             json!({"a": 1, JWT: "first", "b": [1, 2], "eyJhbGciOiJIUzI1NiJ9.eyJ1c2VySWQiOjJ9.c2lnbmF0dXJl": "second"}),
         ]
+    }
+
+    #[test]
+    fn a_code_verifier_is_masked_in_a_form() {
+        let masked =
+            mask_form("grant_type=authorization_code&code_verifier=abcdef&client_id=ndc_1");
+        assert!(!masked.contains("abcdef"), "{masked}");
+        assert!(masked.contains("client_id=ndc_1"), "{masked}");
     }
 
     #[test]

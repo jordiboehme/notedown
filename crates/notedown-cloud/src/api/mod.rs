@@ -164,6 +164,12 @@ pub struct ClientAddr(pub IpAddr);
 
 /// The router with all routes, the catch-all, panic protection and the request log.
 pub fn router(state: Arc<AppState>) -> Router {
+    router_with(state, Router::new())
+}
+
+/// [`router`] with `extra` routes in front of the catch-all. They pass the request log and the
+/// panic guard like every route; a response with [`envelope::Streamed`] is not buffered.
+pub fn router_with(state: Arc<AppState>, extra: Router) -> Router {
     let base = Router::new()
         .route("/api/terminal/equipment/unlink", post(login::unlink))
         .route(
@@ -206,9 +212,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/oss/{*rest}", any(refuse::refuse))
         .fallback(catchall::catch_all)
         .method_not_allowed_fallback(catchall::catch_all)
+        .with_state(state.clone())
+        .merge(extra)
         .layer(CatchPanicLayer::custom(panic_reply))
-        .layer(middleware::from_fn_with_state(state.clone(), log_request))
-        .with_state(state)
+        .layer(middleware::from_fn_with_state(state, log_request))
 }
 
 /// The file sync, digest and to-do routes of accept mode. Another method on one of these paths is

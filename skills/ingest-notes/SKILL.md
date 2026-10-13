@@ -12,8 +12,7 @@ turns those changes into Crystalline engrams.
 You are the main agent. You plan, dispatch and confirm. You never load note text yourself.
 Sub-agents read the text and write the engrams.
 
-The consumer name is always `crystalline`. The skill needs Crystalline 0.25.1 or later: it
-uses the `$contains_any` filter and `set_frontmatter` on `sources`.
+The consumer name is always `crystalline`.
 
 ## Main agent
 

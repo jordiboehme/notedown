@@ -36,7 +36,16 @@ fn escape(text: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// The CSP of a page without a form.
 const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
+/// The CSP of the login page. Chrome checks the redirect after a form post against `form-action`,
+/// so the origin of the redirect URI is listed.
+fn login_csp(redirect_origin: &str) -> String {
+    format!(
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' {redirect_origin}; frame-ancestors 'none'; base-uri 'none'"
+    )
+}
 
 const STYLE: &str = "body{font-family:system-ui,sans-serif;max-width:28rem;margin:3rem auto;padding:0 1rem;color:#222;background:#fafafa}\
 h1{font-size:1.4rem}label{display:block;margin-top:1rem}input{width:100%;padding:.5rem;font-size:1rem;box-sizing:border-box}\
@@ -44,7 +53,7 @@ h1{font-size:1.4rem}label{display:block;margin-top:1rem}input{width:100%;padding
 .warn{background:#fff3cd;padding:.6rem;border-radius:4px}.err{background:#f8d7da;padding:.6rem;border-radius:4px}\
 small{color:#555}";
 
-fn page(status: StatusCode, title: &str, body: &str) -> Response {
+fn page(status: StatusCode, csp: &str, title: &str, body: &str) -> Response {
     let html = format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
@@ -53,7 +62,7 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
     (
         status,
         [
-            (header::CONTENT_SECURITY_POLICY, CSP),
+            (header::CONTENT_SECURITY_POLICY, csp),
             (header::CACHE_CONTROL, "no-store"),
             (header::REFERRER_POLICY, "no-referrer"),
             (header::X_FRAME_OPTIONS, "DENY"),
@@ -67,6 +76,8 @@ pub(crate) struct Page {
     pub client_name: String,
     pub client_uri: Option<String>,
     pub redirect_host: String,
+    /// Scheme and authority of the redirect URI, for example `https://claude.ai`.
+    pub redirect_origin: String,
     pub loopback: bool,
     pub pending_id: String,
     pub minutes_left: u64,
@@ -109,12 +120,18 @@ minutes.</small></p>",
         escape(&p.email),
         p.minutes_left
     ));
-    page(StatusCode::OK, "Sign in to notedown", &body)
+    page(
+        StatusCode::OK,
+        &login_csp(&p.redirect_origin),
+        "Sign in to notedown",
+        &body,
+    )
 }
 
 pub(crate) fn error_page(status: StatusCode, message: &str) -> Response {
     page(
         status,
+        CSP,
         "notedown sign-in",
         &format!(
             "<h1>Sign-in not possible</h1><p class=\"err\">{}</p>",
@@ -165,23 +182,26 @@ mod tests {
             client_name: "<script>x</script>".into(),
             client_uri: Some("https://claude.ai".into()),
             redirect_host: "127.0.0.1:9".into(),
+            redirect_origin: "https://claude.ai".into(),
             loopback: true,
             pending_id: "p1".into(),
             minutes_left: 10,
             error: None,
-            email: String::new(),
+            email: "a\"><b>".into(),
         });
         let csp = r.headers()["content-security-policy"]
             .to_str()
             .unwrap()
             .to_string();
         assert!(csp.contains("frame-ancestors 'none'") && csp.contains("default-src 'none'"));
+        assert!(csp.contains("form-action 'self' https://claude.ai;"));
         assert_eq!(r.headers()["cache-control"], "no-store");
         let body = axum::body::to_bytes(r.into_body(), usize::MAX)
             .await
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(!html.contains("<script>"));
+        assert!(html.contains("a&quot;&gt;&lt;b&gt;") && !html.contains("a\"><b>"));
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains("name=\"pending\" value=\"p1\""));
         assert!(html.contains("this computer"), "loopback warning");

@@ -285,23 +285,9 @@ You need:
 - a public DNS name for the proxy;
 - split DNS, so the device reaches the same name on the LAN.
 
-**Set up `server.toml`.** Restart the server after you change it.
+Do the steps in this order. The last step also moves the device to the https name.
 
-```toml
-external_base_url = "https://notedown.example.net"
-trusted_proxies = ["192.168.1.2"]   # the proxy
-
-[mcp]
-enabled = true                       # the default
-```
-
-The MCP endpoint is served only when `external_base_url` starts with `https://`. `notedown serve` prints one of these lines at start:
-
-- `mcp: https://notedown.example.net/mcp`
-- `mcp: off (needs an https external_base_url)`
-- `mcp: off ([mcp] enabled = false)`
-
-**Set up the proxy.** From the internet, forward only these paths: `/mcp`, `/oauth/` and `/.well-known/`. The device API stays on the LAN. This is an example for Caddy:
+**1. Set up the proxy.** From the internet, forward only these paths: `/mcp`, `/oauth/` and `/.well-known/`. The device API stays on the LAN. Set up split DNS, so the name points to the proxy on the LAN too. This is an example for Caddy:
 
 ```
 notedown.example.net {
@@ -313,17 +299,40 @@ notedown.example.net {
     handle @lan {
         reverse_proxy 192.168.1.10:19072
     }
-    respond 404
+    handle {
+        respond 404
+    }
 }
 ```
 
-Caddy sends `X-Forwarded-Host` and `X-Forwarded-For`. List the proxy in `trusted_proxies`. The proxy must pass on the original host. Behind a trusted proxy, notedown reads it from `X-Forwarded-Host`. It must be one value. A list or a repeated header is refused with 421.
+The `@lan` rule must hold the address range of your LAN. Add your own range if it is a different one, for example `172.16.0.0/12`.
 
-**Add the connector.** In claude.ai open Settings, Connectors, Add custom connector. Enter the URL `https://notedown.example.net/mcp`. Sign in on the notedown page with the email and password of the account.
+Caddy sends `X-Forwarded-Host` and `X-Forwarded-For`. List the proxy in `trusted_proxies`. The proxy must pass on the original host. notedown reads `X-Forwarded-Host` only from addresses in `trusted_proxies`. From any other address it ignores that header and uses `Host`. It must be one value. A list or a repeated header is refused with 421.
 
-**Security.** The device password is now also the sign-in of a page on the internet. Use a strong one. Set it with `notedown cloud account --data ~/notedown-data passwd me`. A new password ends every OAuth sign-in. `notedown cloud account --data ~/notedown-data oauth me` lists the sign-ins. `--revoke <id>` ends one and `--revoke all` ends all of them. Wrong passwords on the web page get longer delays, then a pause of 15 minutes for that email. They never lock the device.
+**2. Check the name from the LAN.** On a computer in the LAN, run `curl https://notedown.example.net/api/file/query/server`. The answer must hold `"success":true`. From the internet the same URL must get 404. If it does not work, fix the proxy, the DNS or the `@lan` rule first.
 
-Before you move the device to the https name, check by hand that it syncs through that name.
+**3. Set up `server.toml`.** Only now add `external_base_url`. Restart the server after you change it.
+
+```toml
+external_base_url = "https://notedown.example.net"
+trusted_proxies = ["192.168.1.2"]   # the proxy
+
+[mcp]
+enabled = true                       # the default
+```
+
+`external_base_url` is also the base of the URLs that the device uses for its uploads and downloads. After the restart the device sends its files through `https://notedown.example.net` and the proxy. So the device must reach that name on the LAN, as checked in step 2. If the device cannot sync any more, remove `external_base_url` and restart the server. That is the way back: the device then uses the address it logged in with again.
+
+The MCP endpoint is served only when `external_base_url` starts with `https://` and has no path. `notedown serve` prints one of these lines at start:
+
+- `mcp: https://notedown.example.net/mcp`
+- `mcp: off (needs an https external_base_url)`
+- `mcp: off (external_base_url must have no path)`
+- `mcp: off ([mcp] enabled = false)`
+
+**4. Add the connector.** In claude.ai open Settings, Connectors, Add custom connector. Enter the URL `https://notedown.example.net/mcp`. Sign in on the notedown page with the email and password of the account.
+
+**Security.** The device password is now also the sign-in of a page on the internet. Use a strong one. Set it with `notedown cloud account --data ~/notedown-data passwd me`. A new password ends every OAuth sign-in. `notedown cloud account --data ~/notedown-data oauth me` lists the sign-ins. `--revoke <id>` ends one and `--revoke all` ends all of them. Wrong passwords on the web page get longer delays, then a pause of 15 minutes for that email. They never lock the device. Someone who knows the email of an account can start this pause on purpose. Sign-ins that exist already and the device keep working.
 
 ## What to expect
 

@@ -38,7 +38,11 @@ pub(crate) struct ClientStore {
 }
 
 fn valid_id(id: &str) -> bool {
-    id.len() == 36 && id.starts_with("ndc_") && id[4..].bytes().all(|b| b.is_ascii_hexdigit())
+    id.len() == 36
+        && id.starts_with("ndc_")
+        && id[4..]
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 impl ClientStore {
@@ -66,6 +70,10 @@ impl ClientStore {
 
     pub(crate) fn create(&self, c: &Client) -> anyhow::Result<()> {
         let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        self.write_file(c)
+    }
+
+    fn write_file(&self, c: &Client) -> anyhow::Result<()> {
         notedown_cloud::fsutil::write_atomic(
             &self.file(&c.id),
             &serde_json::to_vec_pretty(c)?,
@@ -91,34 +99,65 @@ impl ClientStore {
         };
         let mut out = Vec::new();
         for entry in entries {
-            let name = entry?.file_name();
+            let Ok(entry) = entry else { continue };
+            let name = entry.file_name();
             let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
                 continue;
             };
-            if let Some(c) = self.get(id)? {
-                out.push(c);
+            match self.get(id) {
+                Ok(Some(c)) => out.push(c),
+                Ok(None) => {}
+                Err(_) => eprintln!("notedown mcp: skipping unreadable client file {name:?}"),
             }
         }
         Ok(out)
     }
 
+    #[cfg(test)]
     pub(crate) fn count(&self) -> anyhow::Result<usize> {
         Ok(self.all()?.len())
     }
 
     /// Deletes the clients without a grant (`in_use`) not used for 30 days.
+    #[allow(dead_code)] // the cap prunes through create_capped; later tasks may prune on their own
     pub(crate) fn prune(&self, now_ms: u64, in_use: &HashSet<String>) -> anyhow::Result<usize> {
+        let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        self.prune_locked(now_ms, in_use)
+    }
+
+    fn prune_locked(&self, now_ms: u64, in_use: &HashSet<String>) -> anyhow::Result<usize> {
         let mut n = 0;
         for c in self.all()? {
             if !in_use.contains(&c.id)
                 && now_ms.saturating_sub(c.used_ms.max(c.created_ms)) > UNUSED_MS
             {
-                let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
-                std::fs::remove_file(self.file(&c.id))?;
-                n += 1;
+                match std::fs::remove_file(self.file(&c.id)) {
+                    Ok(()) => n += 1,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
         Ok(n)
+    }
+
+    /// Stores `c` unless the store holds [`MAX_CLIENTS`] after pruning; `Ok(false)` at the cap.
+    /// Count, prune and write happen under one hold of the write lock.
+    pub(crate) fn create_capped(
+        &self,
+        c: &Client,
+        now_ms: u64,
+        in_use: &HashSet<String>,
+    ) -> anyhow::Result<bool> {
+        let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        if self.all()?.len() >= MAX_CLIENTS {
+            self.prune_locked(now_ms, in_use)?;
+            if self.all()?.len() >= MAX_CLIENTS {
+                return Ok(false);
+            }
+        }
+        self.write_file(c)?;
+        Ok(true)
     }
 }
 
@@ -153,6 +192,11 @@ pub(crate) struct RegisterBody {
     token_endpoint_auth_method: Option<String>,
     grant_types: Option<Vec<String>>,
     response_types: Option<Vec<String>>,
+}
+
+/// Characters that are invisible or reorder text, which could spoof the login page.
+fn is_invisible(c: char) -> bool {
+    matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2028}' | '\u{2029}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}')
 }
 
 fn metadata_error(description: &str) -> Response {
@@ -206,17 +250,20 @@ pub(crate) async fn register(State(o): State<Arc<Oauth>>, body: axum::body::Byte
     }
     if b.client_uri
         .as_deref()
-        .is_some_and(|u| !u.starts_with("https://") || u.len() > redirect::MAX_URI_LEN)
+        .is_some_and(|u| !u.starts_with("https://") || redirect::problem(u).is_some())
     {
         return metadata_error("client_uri must be an https URL");
     }
     let now = o.now_ms();
     if !o.registrations.allow(now) {
-        return oauth_error(
+        let mut r = oauth_error(
             StatusCode::TOO_MANY_REQUESTS,
             "invalid_client_metadata",
             "too many registrations, try again in 10 minutes",
         );
+        r.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, "600".parse().unwrap());
+        return r;
     }
     let name: String = b
         .client_name
@@ -224,7 +271,7 @@ pub(crate) async fn register(State(o): State<Arc<Oauth>>, body: axum::body::Byte
         .unwrap_or("an MCP client")
         .trim()
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !is_invisible(*c))
         .take(MAX_NAME_CHARS)
         .collect();
     let client = Client {
@@ -239,16 +286,7 @@ pub(crate) async fn register(State(o): State<Arc<Oauth>>, body: axum::body::Byte
         created_ms: now,
         used_ms: now,
     };
-    let stored = (|| -> anyhow::Result<bool> {
-        if o.clients.count()? >= MAX_CLIENTS {
-            o.clients.prune(now, &o.grants_in_use())?;
-            if o.clients.count()? >= MAX_CLIENTS {
-                return Ok(false);
-            }
-        }
-        o.clients.create(&client)?;
-        Ok(true)
-    })();
+    let stored = o.clients.create_capped(&client, now, &o.grants_in_use());
     match stored {
         Ok(true) => (
             StatusCode::CREATED,
@@ -308,5 +346,66 @@ mod tests {
         assert!(store.get(&old).unwrap().is_none());
         assert!(store.get(&kept).unwrap().is_some());
         assert!(store.get(&new).unwrap().is_some());
+    }
+
+    fn client(id: String, used: u64) -> Client {
+        Client {
+            id,
+            name: "x".into(),
+            uri: None,
+            redirect_uris: vec!["https://a.example/cb".into()],
+            created_ms: used,
+            used_ms: used,
+        }
+    }
+
+    fn fill(store: &ClientStore, n: usize, used: u64) {
+        for i in 0..n {
+            store
+                .create(&client(format!("ndc_{i:032x}"), used))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn the_cap_refuses_when_nothing_is_prunable_and_prunes_when_it_can() {
+        let day = 24 * 3600 * 1000;
+        let none = HashSet::new();
+        let new = client(format!("ndc_{}", "f".repeat(32)), 100 * day);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ClientStore::new(dir.path());
+        fill(&store, MAX_CLIENTS, 100 * day);
+        assert!(!store.create_capped(&new, 100 * day, &none).unwrap());
+        assert_eq!(store.count().unwrap(), MAX_CLIENTS);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ClientStore::new(dir.path());
+        fill(&store, MAX_CLIENTS, 0);
+        assert!(store.create_capped(&new, 100 * day, &none).unwrap());
+        assert_eq!(store.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn corrupt_files_are_skipped_and_odd_ids_are_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ClientStore::new(dir.path());
+        fill(&store, 1, 0);
+        std::fs::write(
+            dir.path()
+                .join("oauth/clients")
+                .join(format!("ndc_{}.json", "e".repeat(32))),
+            b"{not json",
+        )
+        .unwrap();
+        assert_eq!(store.count().unwrap(), 1);
+        assert!(store.get("../x").unwrap().is_none());
+        assert!(store.get("ndc_../../..").unwrap().is_none());
+        assert!(
+            store
+                .get(&format!("ndc_{}", "A".repeat(32)))
+                .unwrap()
+                .is_none()
+        );
     }
 }

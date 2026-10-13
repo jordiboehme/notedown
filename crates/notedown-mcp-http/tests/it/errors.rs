@@ -65,19 +65,41 @@ async fn register_ignores_unknown_fields() {
     s.stop().await;
 }
 
-#[tokio::test]
-async fn register_is_limited_to_30_per_10_minutes() {
-    let s = start().await;
-    for _ in 0..30 {
-        register(&s, REDIRECT).await;
-    }
-    let r = s
-        .client
+async fn register_from(s: &Server, ip: &str) -> reqwest::Response {
+    s.client
         .post(s.url("/oauth/register"))
+        .header("x-forwarded-for", ip)
         .json(&serde_json::json!({"redirect_uris": [REDIRECT]}))
         .send()
         .await
-        .unwrap();
+        .unwrap()
+}
+
+#[tokio::test]
+async fn register_is_limited_to_10_per_minute_per_ip() {
+    let s = start().await;
+    for _ in 0..10 {
+        register(&s, REDIRECT).await;
+    }
+    let r = register_from(&s, "127.0.0.1").await;
+    assert_eq!(r.status(), 429);
+    assert_eq!(r.headers()["retry-after"], "60");
+    // Another address is still served.
+    assert_eq!(register_from(&s, "192.0.2.9").await.status(), 201);
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn register_is_limited_to_30_per_10_minutes() {
+    let s = start().await;
+    // 127.0.0.1 is a trusted proxy here, so X-Forwarded-For names the caller: three addresses
+    // stay under the per-address limit and fill the global one.
+    for ip in ["192.0.2.1", "192.0.2.2", "192.0.2.3"] {
+        for _ in 0..10 {
+            assert_eq!(register_from(&s, ip).await.status(), 201);
+        }
+    }
+    let r = register_from(&s, "192.0.2.4").await;
     assert_eq!(r.status(), 429);
     assert_eq!(r.headers()["retry-after"], "600");
     s.stop().await;
@@ -138,23 +160,29 @@ async fn a_corrupt_client_file_does_not_break_registration() {
     s.stop().await;
 }
 
-#[tokio::test]
-async fn a_full_client_store_answers_503() {
-    let s = start().await;
+fn fill_clients(s: &Server, age_ms: u64) {
     let dir = s.dir.path().join("oauth/clients");
     std::fs::create_dir_all(&dir).unwrap();
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
+    let at = now_ms - age_ms;
     for i in 0..1000 {
         let id = format!("ndc_{i:032x}");
         let c = serde_json::json!({
             "id": id, "name": "x", "redirect_uris": ["https://a.example/cb"],
-            "created_ms": now_ms, "used_ms": now_ms,
+            "created_ms": at, "used_ms": at,
         });
         std::fs::write(dir.join(format!("{id}.json")), c.to_string()).unwrap();
     }
+}
+
+/// A full store of fresh clients that never got a grant: nothing can be pruned.
+#[tokio::test]
+async fn a_full_client_store_answers_503() {
+    let s = start().await;
+    fill_clients(&s, 0);
     let r = s
         .client
         .post(s.url("/oauth/register"))
@@ -165,6 +193,21 @@ async fn a_full_client_store_answers_503() {
     assert_eq!(r.status(), 503);
     let v: serde_json::Value = r.json().await.unwrap();
     assert_eq!(v["error"], "temporarily_unavailable");
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn a_full_store_of_never_used_clients_older_than_10_minutes_takes_a_new_one() {
+    let s = start().await;
+    fill_clients(&s, 11 * 60 * 1000);
+    let r = s
+        .client
+        .post(s.url("/oauth/register"))
+        .json(&serde_json::json!({"redirect_uris": [REDIRECT]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
     s.stop().await;
 }
 

@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use notedown_cloud::api::ClientAddr;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -18,6 +19,8 @@ pub(crate) const MAX_CLIENTS: usize = 1000;
 const MAX_REDIRECT_URIS: usize = 10;
 const MAX_NAME_CHARS: usize = 100;
 const UNUSED_MS: u64 = 30 * 24 * 3600 * 1000;
+/// At the cap, a client that never got a grant is pruned once it is this old.
+const NEVER_USED_MS: u64 = 10 * 60 * 1000;
 pub(crate) const REGISTRATION_BURST: usize = 30;
 pub(crate) const REGISTRATION_WINDOW_MS: u64 = 10 * 60 * 1000;
 
@@ -124,11 +127,32 @@ impl ClientStore {
     }
 
     fn prune_locked(&self, now_ms: u64, in_use: &HashSet<String>) -> anyhow::Result<usize> {
+        self.remove_where(in_use, |c| {
+            now_ms.saturating_sub(c.used_ms.max(c.created_ms)) > UNUSED_MS
+        })
+    }
+
+    /// Deletes the clients that never got a grant (`used_ms == created_ms`, not in `in_use`) and
+    /// are older than [`NEVER_USED_MS`].
+    fn prune_never_used_locked(
+        &self,
+        now_ms: u64,
+        in_use: &HashSet<String>,
+    ) -> anyhow::Result<usize> {
+        self.remove_where(in_use, |c| {
+            c.used_ms == c.created_ms && now_ms.saturating_sub(c.created_ms) > NEVER_USED_MS
+        })
+    }
+
+    /// Deletes the clients not in `in_use` for which `old` holds.
+    fn remove_where(
+        &self,
+        in_use: &HashSet<String>,
+        old: impl Fn(&Client) -> bool,
+    ) -> anyhow::Result<usize> {
         let mut n = 0;
         for c in self.all()? {
-            if !in_use.contains(&c.id)
-                && now_ms.saturating_sub(c.used_ms.max(c.created_ms)) > UNUSED_MS
-            {
+            if !in_use.contains(&c.id) && old(&c) {
                 match std::fs::remove_file(self.file(&c.id)) {
                     Ok(()) => n += 1,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -140,7 +164,9 @@ impl ClientStore {
     }
 
     /// Stores `c` unless the store holds [`MAX_CLIENTS`] after pruning; `Ok(false)` at the cap.
-    /// Count, prune and write happen under one hold of the write lock.
+    /// At the cap it first prunes the clients that never got a grant and are older than
+    /// [`NEVER_USED_MS`], then the ones unused for 30 days. Count, prune and write happen under
+    /// one hold of the write lock.
     pub(crate) fn create_capped(
         &self,
         c: &Client,
@@ -148,6 +174,9 @@ impl ClientStore {
         in_use: &HashSet<String>,
     ) -> anyhow::Result<bool> {
         let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        if self.all()?.len() >= MAX_CLIENTS {
+            self.prune_never_used_locked(now_ms, in_use)?;
+        }
         if self.all()?.len() >= MAX_CLIENTS {
             self.prune_locked(now_ms, in_use)?;
             if self.all()?.len() >= MAX_CLIENTS {
@@ -205,7 +234,11 @@ fn metadata_error(description: &str) -> Response {
     )
 }
 
-pub(crate) async fn register(State(o): State<Arc<Oauth>>, body: axum::body::Bytes) -> Response {
+pub(crate) async fn register(
+    State(o): State<Arc<Oauth>>,
+    Extension(ClientAddr(ip)): Extension<ClientAddr>,
+    body: axum::body::Bytes,
+) -> Response {
     if body.len() > crate::MAX_REGISTER_BYTES {
         return metadata_error("the registration is larger than 64 KiB");
     }
@@ -253,6 +286,18 @@ pub(crate) async fn register(State(o): State<Arc<Oauth>>, body: axum::body::Byte
         return metadata_error("client_uri must be an https URL");
     }
     let now = o.now_ms();
+    // Per address first: the global limiter counts only what it allows, so one address that
+    // is over its own limit never uses up the global slots.
+    if !o.login_limiter.allow(ip, "oauth-register", now) {
+        let mut r = oauth_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "invalid_client_metadata",
+            "too many registrations from this address, try again in a minute",
+        );
+        r.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, "60".parse().unwrap());
+        return r;
+    }
     if !o.registrations.allow(now) {
         let mut r = oauth_error(
             StatusCode::TOO_MANY_REQUESTS,
@@ -384,11 +429,48 @@ mod tests {
         assert!(!store.create_capped(&new, 100 * day, &none).unwrap());
         assert_eq!(store.count().unwrap(), MAX_CLIENTS);
 
+        // Used once, then not for 30 days.
         let dir = tempfile::tempdir().unwrap();
         let store = ClientStore::new(dir.path());
         fill(&store, MAX_CLIENTS, 0);
+        for i in 0..MAX_CLIENTS {
+            store.touch(&format!("ndc_{i:032x}"), 1);
+        }
         assert!(store.create_capped(&new, 100 * day, &none).unwrap());
         assert_eq!(store.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn at_the_cap_never_used_clients_older_than_10_minutes_go_first() {
+        let min = 60 * 1000;
+        let none = HashSet::new();
+        let new = client(format!("ndc_{}", "f".repeat(32)), 11 * min);
+
+        // Never used and 11 minutes old: pruned.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ClientStore::new(dir.path());
+        fill(&store, MAX_CLIENTS, 0);
+        assert!(store.create_capped(&new, 11 * min, &none).unwrap());
+        assert_eq!(store.count().unwrap(), 1);
+
+        // Never used but only 9 minutes old: kept.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ClientStore::new(dir.path());
+        fill(&store, MAX_CLIENTS, 2 * min);
+        assert!(!store.create_capped(&new, 11 * min, &none).unwrap());
+
+        // Used once (a code was exchanged), or holding a grant: kept.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ClientStore::new(dir.path());
+        fill(&store, MAX_CLIENTS - 1, 0);
+        for i in 0..MAX_CLIENTS - 1 {
+            store.touch(&format!("ndc_{i:032x}"), 1);
+        }
+        let granted = format!("ndc_{}", "e".repeat(32));
+        store.create(&client(granted.clone(), 0)).unwrap();
+        let in_use: HashSet<String> = [granted].into();
+        assert!(!store.create_capped(&new, 11 * min, &in_use).unwrap());
+        assert_eq!(store.count().unwrap(), MAX_CLIENTS);
     }
 
     #[test]

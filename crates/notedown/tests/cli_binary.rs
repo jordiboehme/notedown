@@ -311,6 +311,16 @@ fn serve_says_why_the_mcp_endpoint_is_off() {
         out.contains("\nmcp: off ([mcp] enabled = false)\n"),
         "{out}"
     );
+    std::fs::write(
+        dir.path().join("server.toml"),
+        "listen = [\"127.0.0.1:0\"]\nexternal_base_url = \"https://notedown.example/notes\"\n",
+    )
+    .unwrap();
+    let out = serve_startup(dir.path(), &[]);
+    assert!(
+        out.contains("\nmcp: off (external_base_url must have no path)\n"),
+        "{out}"
+    );
 }
 
 #[test]

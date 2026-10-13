@@ -1726,6 +1726,9 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
         match (&mcp, config.mcp.enabled, config.external_base_url.as_deref()) {
             (Some(_), _, Some(url)) => println!("mcp: {}/mcp", url.trim_end_matches('/')),
             (None, false, _) => println!("mcp: off ([mcp] enabled = false)"),
+            (None, true, Some(url)) if has_path(url) => {
+                println!("mcp: off (external_base_url must have no path)")
+            }
             _ => println!("mcp: off (needs an https external_base_url)"),
         }
         println!("watch: {}", if config.watch { "on" } else { "off" });
@@ -2109,6 +2112,12 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Whether an `https://` base URL has a path (one trailing `/` is no path).
+fn has_path(url: &str) -> bool {
+    url.strip_prefix("https://")
+        .is_some_and(|rest| rest.strip_suffix('/').unwrap_or(rest).contains('/'))
 }
 
 #[cfg(test)]

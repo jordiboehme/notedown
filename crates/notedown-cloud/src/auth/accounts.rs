@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::fsutil::{json_bytes, write_atomic};
+use crate::fsutil::{is_same_file, json_bytes, rename_durable, write_atomic};
 use crate::{Error, Result, io_err};
 
 /// The folder of an account's OAuth grants (`notedown-mcp-http`). A new password deletes it.
@@ -22,6 +22,8 @@ pub const MAX_FAILED_LOGINS: u32 = 6;
 /// A lock clears by itself after this time (ms); `cloud account passwd` clears it at once.
 pub const LOCK_COOLDOWN_MS: u64 = 15 * 60 * 1000;
 const NEXT_ID_FILE: &str = ".next_user_id";
+/// The name start of a removed account folder before it is deleted (`.removed-<slug>-<hex>`).
+const TOMBSTONE_PREFIX: &str = ".removed-";
 /// How often [`Accounts::lock`] takes the lock again when its `.lock` file was replaced.
 const LOCK_TRIES: usize = 5;
 const FIRST_USER_ID: u64 = 1_000_001;
@@ -135,25 +137,6 @@ fn validate_password(password: &str) -> Result<()> {
         });
     }
     Ok(())
-}
-
-/// `Some(true)` when the open `file` is the file at `path` (same device and inode), `None` when
-/// `path` is gone.
-#[cfg(unix)]
-fn is_same_file(file: &std::fs::File, path: &Path) -> std::io::Result<Option<bool>> {
-    use std::os::unix::fs::MetadataExt;
-    let open = file.metadata()?;
-    match std::fs::metadata(path) {
-        Ok(now) => Ok(Some(open.dev() == now.dev() && open.ino() == now.ino())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-/// Elsewhere an open file cannot be deleted, so only a missing path is checked.
-#[cfg(not(unix))]
-fn is_same_file(_file: &std::fs::File, path: &Path) -> std::io::Result<Option<bool>> {
-    Ok(path.exists().then_some(true))
 }
 
 /// The held account lock; dropping it closes the file and releases the lock.
@@ -391,6 +374,7 @@ impl Accounts {
     /// store lock and the account lock.
     pub fn remove(&self, slug: &str) -> Result<()> {
         validate_slug(slug)?;
+        self.sweep_tombstones();
         if self.get(slug)?.is_none() {
             return Err(Error::NoAccount(slug.to_string()));
         }
@@ -400,12 +384,58 @@ impl Accounts {
         // global lock order says. The raw lock works on a damaged store too.
         let _store = crate::store::take_store_lock(&dir, Some(slug))?;
         let _lock = self.lock(slug)?;
-        // `account.json` goes first: `remove_dir_all` deletes in no fixed order, and a caller
-        // that opens `.lock` after it is gone checks `account.json` after its lock. Without it
-        // first, such a caller could hold a lock while `account.json` is still there.
-        let file = self.file(slug);
-        std::fs::remove_file(&file).map_err(io_err(&file))?;
-        std::fs::remove_dir_all(&dir).map_err(io_err(&dir))
+        self.remove_locked(slug)
+    }
+
+    /// The part of [`Accounts::remove`] under both locks. The folder is first renamed to a
+    /// tombstone (`.removed-<slug>-<hex>`), so the account is gone at once and as a whole:
+    /// every waiter on a lock of it finds its path gone and gets [`Error::NoAccount`], and
+    /// nothing can recreate a part of it. Then the tombstone is deleted. A tombstone left by a
+    /// crash or a failed delete is swept by the next `remove` and at server start.
+    fn remove_locked(&self, slug: &str) -> Result<()> {
+        let dir = self.account_dir(slug);
+        let mut raw = [0u8; 8];
+        rand::fill(&mut raw[..]);
+        let tomb = self.root.join(format!(
+            "{TOMBSTONE_PREFIX}{slug}-{}",
+            const_hex::encode(raw)
+        ));
+        rename_durable(&dir, &tomb)?;
+        if let Err(e) = std::fs::remove_dir_all(&tomb) {
+            eprintln!(
+                "notedown cloud: account {slug} is removed, but {} could not be deleted: {e}; \
+                 it is deleted at the next start",
+                tomb.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Delete the tombstones of removed accounts (`accounts/.removed-*`) that a crash or a
+    /// failed delete left. Errors are only logged. Returns how many were deleted.
+    pub fn sweep_tombstones(&self) -> usize {
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return 0;
+        };
+        let mut n = 0;
+        for entry in entries.flatten() {
+            if !entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(TOMBSTONE_PREFIX))
+            {
+                continue;
+            }
+            let path = entry.path();
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => n += 1,
+                Err(e) => eprintln!(
+                    "notedown cloud: cannot delete the removed account folder {}: {e}",
+                    path.display()
+                ),
+            }
+        }
+        n
     }
 }
 
@@ -449,6 +479,7 @@ mod tests {
         };
         // Let the waiter open the lock file and block on it.
         std::thread::sleep(Duration::from_millis(200));
+        assert!(!waiter.is_finished());
         std::fs::remove_dir_all(accounts.account_dir("anna")).unwrap();
         drop(held);
         let got = waiter.join().unwrap();
@@ -466,6 +497,7 @@ mod tests {
             std::thread::spawn(move || accounts.lock("anna"))
         };
         std::thread::sleep(Duration::from_millis(200));
+        assert!(!waiter.is_finished());
         // The waiter blocks on the old inode; a new `.lock` takes its place.
         std::fs::remove_file(&path).unwrap();
         std::fs::File::create(&path).unwrap();
@@ -492,5 +524,99 @@ mod tests {
         assert!(accounts.get("anna").unwrap().is_some());
         // The account lock works for the new account.
         drop(accounts.lock("anna").unwrap());
+    }
+
+    fn tombstones(accounts: &Accounts) -> Vec<String> {
+        std::fs::read_dir(&accounts.root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(TOMBSTONE_PREFIX))
+            .collect()
+    }
+
+    #[test]
+    fn remove_with_a_waiter_in_lock_gives_no_account_and_leaves_no_folder() {
+        let (_dir, accounts) = accounts();
+        let dir = accounts.account_dir("anna");
+        let _store = crate::store::take_store_lock(&dir, None).unwrap();
+        let held = accounts.lock("anna").unwrap();
+        let waiter = {
+            let accounts = accounts.clone();
+            std::thread::spawn(move || accounts.lock("anna").map(|_| ()))
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!waiter.is_finished());
+        accounts.remove_locked("anna").unwrap();
+        drop(held);
+        let got = waiter.join().unwrap();
+        assert!(matches!(got, Err(Error::NoAccount(_))), "{got:?}");
+        assert!(!dir.exists());
+        assert!(tombstones(&accounts).is_empty());
+        assert!(accounts.get("anna").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_store_lock_waiter_never_recreates_a_removed_account() {
+        let (_dir, accounts) = accounts();
+        let data = accounts.root.parent().unwrap().to_path_buf();
+        let dir = accounts.account_dir("anna");
+        let store = crate::store::Store::open(&data, "anna").unwrap();
+        let held = crate::store::take_store_lock(&dir, None).unwrap();
+        let waiter = std::thread::spawn(move || store.lock().map(|_| ()));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!waiter.is_finished());
+        let tomb = accounts.root.join(format!("{TOMBSTONE_PREFIX}anna-test"));
+        std::fs::rename(&dir, &tomb).unwrap();
+        std::fs::remove_dir_all(&tomb).unwrap();
+        drop(held);
+        let got = waiter.join().unwrap();
+        assert!(matches!(got, Err(Error::NoAccount(_))), "{got:?}");
+        assert!(!dir.exists(), "the waiter recreated the account folder");
+    }
+
+    #[test]
+    fn a_leftover_tombstone_is_swept_by_remove_and_by_the_sweep() {
+        let (_dir, accounts) = accounts();
+        accounts.create("bert", "bert@example.org", "pw").unwrap();
+        let tomb = accounts.root.join(format!("{TOMBSTONE_PREFIX}carl-0123"));
+        std::fs::create_dir_all(tomb.join("devices")).unwrap();
+        std::fs::write(tomb.join("devices/SN1.json"), "{}").unwrap();
+        accounts.remove("bert").unwrap();
+        assert!(tombstones(&accounts).is_empty());
+
+        std::fs::create_dir_all(tomb.join("files")).unwrap();
+        assert_eq!(accounts.sweep_tombstones(), 1);
+        assert!(!tomb.exists());
+        assert_eq!(accounts.sweep_tombstones(), 0);
+        assert!(accounts.get("anna").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_tombstone_never_counts_as_an_owner_or_for_the_staging_sweep() {
+        let (dir, accounts) = accounts();
+        let tomb = accounts.root.join(format!("{TOMBSTONE_PREFIX}carl-0123"));
+        std::fs::create_dir_all(tomb.join("devices")).unwrap();
+        std::fs::write(tomb.join("devices/SN1.json"), "{}").unwrap();
+        let devices = crate::auth::Devices::new(dir.path());
+        assert!(devices.owners("SN1").unwrap().is_empty());
+        let staged = tomb.join(crate::sync::staging::STAGING_DIR).join("u1");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("part"), "x").unwrap();
+        assert_eq!(
+            crate::sync::staging::sweep(dir.path(), u64::MAX / 2).unwrap(),
+            0
+        );
+        assert!(staged.exists());
+    }
+
+    #[test]
+    fn the_server_start_sweeps_tombstones() {
+        let (dir, accounts) = accounts();
+        let tomb = accounts.root.join(format!("{TOMBSTONE_PREFIX}carl-0123"));
+        std::fs::create_dir_all(tomb.join("files")).unwrap();
+        crate::server::AppState::open(crate::Config::default(), dir.path()).unwrap();
+        assert!(!tomb.exists());
+        assert!(accounts.get("anna").unwrap().is_some());
     }
 }

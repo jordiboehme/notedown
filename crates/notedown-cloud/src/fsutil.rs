@@ -41,6 +41,27 @@ pub fn fsync_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `Some(true)` when the open `file` is the file at `path` (same device and inode), `None` when
+/// `path` is gone. A lock taken on a file that was deleted or replaced meanwhile excludes
+/// nobody; the lock functions check with this after the lock is held.
+#[cfg(unix)]
+pub(crate) fn is_same_file(file: &std::fs::File, path: &Path) -> std::io::Result<Option<bool>> {
+    use std::os::unix::fs::MetadataExt;
+    let open = file.metadata()?;
+    match std::fs::metadata(path) {
+        Ok(now) => Ok(Some(open.dev() == now.dev() && open.ino() == now.ino())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The server runs on unix only. Here the check is weaker: it sees a missing path, not a file
+/// that was replaced.
+#[cfg(not(unix))]
+pub(crate) fn is_same_file(_file: &std::fs::File, path: &Path) -> std::io::Result<Option<bool>> {
+    Ok(path.exists().then_some(true))
+}
+
 /// Rename `from` to `to`, then fsync the folder of `to` and, when it is another one, the folder
 /// of `from`.
 pub fn rename_durable(from: &Path, to: &Path) -> Result<()> {

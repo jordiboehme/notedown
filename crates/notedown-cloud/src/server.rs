@@ -104,6 +104,11 @@ impl AppState {
                 ..JournalOptions::default()
             },
         )?;
+        // Tombstones of removed accounts that a crash left (errors are logged).
+        match crate::auth::Accounts::new(data_dir).sweep_tombstones() {
+            0 => {}
+            n => eprintln!("notedown cloud: deleted {n} folders of removed accounts"),
+        }
         // The stores recovery opened are kept: the start loads each registry once.
         let (recovered, opened) = crate::store::recover_all_keeping(data_dir, &journal)?;
         for (slug, r) in recovered {

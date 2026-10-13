@@ -635,6 +635,14 @@ pub fn sweep(data_dir: &Path, now_ms: u64) -> Result<usize> {
     };
     let mut removed = 0;
     for account in list.flatten() {
+        // Only account folders: never the tombstone of a removed account.
+        if !account
+            .file_name()
+            .to_str()
+            .is_some_and(|name| crate::auth::validate_slug(name).is_ok())
+        {
+            continue;
+        }
         let staging = account.path().join(STAGING_DIR);
         let Ok(entries) = std::fs::read_dir(&staging) else {
             continue;

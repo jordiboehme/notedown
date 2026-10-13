@@ -270,24 +270,26 @@ type HashHook = Arc<dyn Fn(&WirePath) + Send + Sync>;
 /// for the store lock of account <slug>" on stderr, then blocks. No state is read and the tree
 /// is not checked, so a damaged account can still be removed.
 pub fn take_store_lock(account_dir: &Path, announce: Option<&str>) -> Result<std::fs::File> {
-    let path = account_dir.join(STORE_LOCK_FILE);
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .map_err(io_err(&path))?;
-    match file.try_lock() {
-        Ok(()) => return Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => {
-            if let Some(slug) = announce {
-                eprintln!("waiting for the store lock of account {slug}");
+    for _ in 0..STORE_LOCK_TRIES {
+        let file = open_store_lock(account_dir)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if let Some(slug) = announce {
+                    eprintln!("waiting for the store lock of account {slug}");
+                }
+                file.lock()
+                    .map_err(io_err(&account_dir.join(STORE_LOCK_FILE)))?;
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(io_err(&account_dir.join(STORE_LOCK_FILE))(e));
             }
         }
-        Err(std::fs::TryLockError::Error(e)) => return Err(io_err(&path)(e)),
+        if let Some(file) = still_there(account_dir, file)? {
+            return Ok(file);
+        }
     }
-    file.lock().map_err(io_err(&path))?;
-    Ok(file)
+    Err(lock_keeps_changing(account_dir))
 }
 
 /// [`take_store_lock`] that gives up: it tries, then tries again every 50 ms until `wait` is
@@ -297,25 +299,74 @@ pub fn take_store_lock_within(
     wait: std::time::Duration,
 ) -> Result<Option<std::fs::File>> {
     let path = account_dir.join(STORE_LOCK_FILE);
-    let file = std::fs::OpenOptions::new()
+    let deadline = std::time::Instant::now() + wait;
+    for _ in 0..STORE_LOCK_TRIES {
+        let file = open_store_lock(account_dir)?;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(e)) => return Err(io_err(&path)(e)),
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(50)));
+        }
+        if let Some(file) = still_there(account_dir, file)? {
+            return Ok(Some(file));
+        }
+    }
+    Err(lock_keeps_changing(account_dir))
+}
+
+/// How often the store lock is taken again when its file was replaced.
+const STORE_LOCK_TRIES: usize = 5;
+
+/// The account of `account_dir`, for [`Error::NoAccount`].
+fn slug_of(account_dir: &Path) -> String {
+    account_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Opens (creates) `.store.lock` in an existing account folder; [`Error::NoAccount`] when the
+/// folder is gone. The folder itself is never created.
+fn open_store_lock(account_dir: &Path) -> Result<std::fs::File> {
+    let path = account_dir.join(STORE_LOCK_FILE);
+    match std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(&path)
-        .map_err(io_err(&path))?;
-    let deadline = std::time::Instant::now() + wait;
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(Some(file)),
-            Err(std::fs::TryLockError::WouldBlock) => {}
-            Err(std::fs::TryLockError::Error(e)) => return Err(io_err(&path)(e)),
+    {
+        Ok(f) => Ok(f),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(Error::NoAccount(slug_of(account_dir)))
         }
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            return Ok(None);
-        }
-        std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(50)));
+        Err(e) => Err(io_err(&path)(e)),
     }
+}
+
+/// The held lock `file` when it is still the `.store.lock` of `account_dir`. `remove` renames
+/// the account folder away while it holds the lock: a waiter then holds a lock that excludes
+/// nobody, and its tree check would recreate `files/` at the old path. Gone:
+/// [`Error::NoAccount`]; replaced by another file: `None` (take it again).
+fn still_there(account_dir: &Path, file: std::fs::File) -> Result<Option<std::fs::File>> {
+    let path = account_dir.join(STORE_LOCK_FILE);
+    match crate::fsutil::is_same_file(&file, &path).map_err(io_err(&path))? {
+        Some(true) => Ok(Some(file)),
+        Some(false) => Ok(None),
+        None => Err(Error::NoAccount(slug_of(account_dir))),
+    }
+}
+
+fn lock_keeps_changing(account_dir: &Path) -> Error {
+    io_err(&account_dir.join(STORE_LOCK_FILE))(std::io::Error::other(
+        "the lock file keeps changing, try again",
+    ))
 }
 
 /// The name of the normalization probe: `é` as one code point (NFC). A file system that

@@ -151,7 +151,7 @@ impl Auth {
             .slug;
         // Read the account again under the account lock: a `cloud account passwd` of the CLI
         // in between is not overwritten by the counter update below.
-        let _account_lock = self.accounts.lock(&slug)?;
+        let _account_lock = lock_account(&self.accounts, &slug)?;
         let mut account = self.accounts.get(&slug)?.ok_or(AuthError::NoAccount)?;
         if account.locked {
             match account.locked_at_ms {
@@ -219,5 +219,30 @@ impl Auth {
     /// Logout or unbinding: older tokens of this device stop working.
     pub fn logout(&self, slug: &str, equipment_no: &str) -> crate::Result<()> {
         self.devices.invalidate(slug, equipment_no).map(|_| ())
+    }
+}
+
+/// [`Accounts::lock`] for a login: an account removed since it was looked up is
+/// [`AuthError::NoAccount`] (E0018), not an internal error.
+fn lock_account(accounts: &Accounts, slug: &str) -> Result<AccountLock, AuthError> {
+    match accounts.lock(slug) {
+        Ok(lock) => Ok(lock),
+        Err(Error::NoAccount(_)) => Err(AuthError::NoAccount),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_vanished_account_at_the_lock_is_no_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let accounts = Accounts::new(dir.path());
+        assert!(matches!(
+            lock_account(&accounts, "anna"),
+            Err(AuthError::NoAccount)
+        ));
     }
 }

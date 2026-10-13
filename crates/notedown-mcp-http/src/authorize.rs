@@ -61,7 +61,7 @@ pub(crate) async fn show(
     Extension(ClientAddr(ip)): Extension<ClientAddr>,
     Query(q): Query<AuthorizeQuery>,
 ) -> Response {
-    if !o.login_limiter.allow(ip, "oauth-authorize", o.now_ms()) {
+    if !o.limiter.allow(ip, "oauth-authorize", o.now_ms()) {
         let mut r = login::error_page(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many sign-in requests. Wait a minute.",
@@ -232,7 +232,7 @@ pub(crate) async fn submit(
     Form(f): Form<LoginForm>,
 ) -> Response {
     let now = o.now_ms();
-    if !o.login_limiter.allow(ip, "oauth-login", now) {
+    if !o.limiter.allow(ip, "oauth-login", now) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [(header::RETRY_AFTER, "60")],

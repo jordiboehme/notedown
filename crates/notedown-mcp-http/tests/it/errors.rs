@@ -765,7 +765,12 @@ async fn mcp_with_a_trailing_slash_is_the_same_gate() {
 #[tokio::test]
 async fn unknown_oauth_and_well_known_paths_are_404() {
     let s = start().await;
-    for path in ["/.well-known/openid-configuration", "/oauth/x"] {
+    for path in [
+        "/.well-known/openid-configuration",
+        "/oauth/x",
+        "/mcp/x",
+        "/mcp/a/b",
+    ] {
         for post in [false, true] {
             let r = if post {
                 s.client.post(s.url(path))
@@ -781,14 +786,16 @@ async fn unknown_oauth_and_well_known_paths_are_404() {
         }
     }
     // Still behind the Host check.
-    let r = s
-        .client
-        .get(s.url("/oauth/x"))
-        .header("x-forwarded-host", "other.example")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 421);
+    for path in ["/oauth/x", "/mcp/x"] {
+        let r = s
+            .client
+            .get(s.url(path))
+            .header("x-forwarded-host", "other.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 421, "{path}");
+    }
     s.stop().await;
 }
 

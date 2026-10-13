@@ -50,7 +50,8 @@ pub(crate) struct Oauth {
     pub(crate) pending: pending::PendingStore,
     pub(crate) codes: pending::CodeStore,
     pub(crate) throttle: throttle::Throttle,
-    pub(crate) login_limiter: notedown_cloud::api::limit::RateLimiter,
+    /// Per-address limits of the sign-in pages and of registration.
+    pub(crate) limiter: notedown_cloud::api::limit::RateLimiter,
     pub(crate) accounts: notedown_cloud::auth::Accounts,
     pub(crate) grants: grants::GrantStore,
     last_sweep: std::sync::atomic::AtomicU64,
@@ -109,7 +110,7 @@ pub fn router(state: &Arc<AppState>) -> anyhow::Result<Option<Router>> {
         pending: Default::default(),
         codes: Default::default(),
         throttle: Default::default(),
-        login_limiter: Default::default(),
+        limiter: Default::default(),
         accounts: notedown_cloud::auth::Accounts::new(&state.data_dir),
         grants: grants::GrantStore::open(&state.data_dir)?,
         last_sweep: Default::default(),
@@ -152,6 +153,8 @@ pub fn router(state: &Arc<AppState>) -> anyhow::Result<Option<Router>> {
         // Nothing else under these prefixes falls through to the device routes.
         .route("/oauth/{*rest}", axum::routing::any(not_found))
         .route("/.well-known/{*rest}", axum::routing::any(not_found))
+        // `/mcp` and `/mcp/` go through the gate; anything below is unknown.
+        .route("/mcp/{*rest}", axum::routing::any(not_found))
         .with_state(oauth.clone())
         .merge(mcp_routes)
         .layer(middleware::from_fn_with_state(oauth, check_host));
@@ -190,7 +193,7 @@ fn mcp_routes(oauth: &Arc<Oauth>) -> Router {
         .layer(middleware::from_fn_with_state(gate, gate::gate))
 }
 
-/// A plain 404 for an unknown path under `/oauth/` or `/.well-known/`.
+/// A plain 404 for an unknown path under `/oauth/`, `/.well-known/` or `/mcp/`.
 async fn not_found() -> Response {
     (
         StatusCode::NOT_FOUND,

@@ -288,7 +288,7 @@ pub(crate) async fn register(
     let now = o.now_ms();
     // Per address first: the global limiter counts only what it allows, so one address that
     // is over its own limit never uses up the global slots.
-    if !o.login_limiter.allow(ip, "oauth-register", now) {
+    if !o.limiter.allow(ip, "oauth-register", now) {
         let mut r = oauth_error(
             StatusCode::TOO_MANY_REQUESTS,
             "invalid_client_metadata",

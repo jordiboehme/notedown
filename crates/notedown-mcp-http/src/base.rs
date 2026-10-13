@@ -42,6 +42,12 @@ impl Base {
         self.url("/mcp")
     }
 
+    /// Whether a client's `resource` names the MCP endpoint: exactly, or with one trailing `/`.
+    pub fn is_resource(&self, r: &str) -> bool {
+        let resource = self.resource();
+        r == resource || r.strip_suffix('/') == Some(resource.as_str())
+    }
+
     pub fn metadata_url(&self) -> String {
         self.url("/.well-known/oauth-protected-resource/mcp")
     }

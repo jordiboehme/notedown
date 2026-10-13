@@ -149,6 +149,9 @@ pub fn router(state: &Arc<AppState>) -> anyhow::Result<Option<Router>> {
             axum::routing::post(token::revoke)
                 .layer(axum::extract::DefaultBodyLimit::max(MAX_FORM_BYTES)),
         )
+        // Nothing else under these prefixes falls through to the device routes.
+        .route("/oauth/{*rest}", axum::routing::any(not_found))
+        .route("/.well-known/{*rest}", axum::routing::any(not_found))
         .with_state(oauth.clone())
         .merge(mcp_routes)
         .layer(middleware::from_fn_with_state(oauth, check_host));
@@ -182,8 +185,19 @@ fn mcp_routes(oauth: &Arc<Oauth>) -> Router {
         sessions: manager,
     });
     Router::new()
-        .route_service("/mcp", mcp)
+        .route_service("/mcp", mcp.clone())
+        .route_service("/mcp/", mcp)
         .layer(middleware::from_fn_with_state(gate, gate::gate))
+}
+
+/// A plain 404 for an unknown path under `/oauth/` or `/.well-known/`.
+async fn not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        "not found\n",
+    )
+        .into_response()
 }
 
 /// 421 for a request not addressed to the base (a wrong `Host`).

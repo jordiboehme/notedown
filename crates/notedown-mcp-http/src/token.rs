@@ -89,7 +89,10 @@ pub(crate) async fn token(
         (Some("authorization_code"), Some(code)) => Some(o.codes.take(code, now)),
         _ => None,
     };
-    if f.resource.as_deref().is_some_and(|r| r != resource) {
+    if f.resource
+        .as_deref()
+        .is_some_and(|r| !o.base.is_resource(r))
+    {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_target",

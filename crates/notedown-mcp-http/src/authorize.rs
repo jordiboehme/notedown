@@ -27,7 +27,6 @@ pub(crate) struct AuthorizeQuery {
     code_challenge_method: Option<String>,
     state: Option<String>,
     resource: Option<String>,
-    scope: Option<String>,
 }
 
 fn found(location: String) -> Response {
@@ -144,7 +143,10 @@ pub(crate) async fn show(
         );
     }
     let resource = o.base.resource();
-    if q.resource.as_deref().is_some_and(|r| r != resource) {
+    if q.resource
+        .as_deref()
+        .is_some_and(|r| !o.base.is_resource(r))
+    {
         return redirect_error(
             &o,
             &redirect_uri,
@@ -153,18 +155,7 @@ pub(crate) async fn show(
             "the resource is not this server's MCP endpoint",
         );
     }
-    if q.scope
-        .as_deref()
-        .is_some_and(|s| s.split(' ').any(|s| !s.is_empty() && s != crate::SCOPE))
-    {
-        return redirect_error(
-            &o,
-            &redirect_uri,
-            state,
-            "invalid_scope",
-            "the only scope is notes",
-        );
-    }
+    // `scope` is ignored: a grant is always the one scope `notes`.
     let now = o.now_ms();
     let pending = Pending {
         client_id: client.id.clone(),

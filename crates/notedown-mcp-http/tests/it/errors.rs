@@ -679,3 +679,132 @@ async fn a_legacy_session_works_for_its_account_and_is_403_for_another() {
     assert_eq!(r.status(), 403);
     s.stop().await;
 }
+
+#[tokio::test]
+async fn any_scope_is_ignored_at_authorize() {
+    let s = start().await;
+    let id = register(&s, REDIRECT).await;
+    let r = s
+        .client
+        .get(s.url("/oauth/authorize"))
+        .query(&authorize_query(
+            &id,
+            &[("scope", "claudeai offline_access")],
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().contains("name=\"pending\""));
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn mcp_with_a_trailing_slash_is_the_same_gate() {
+    let s = start().await;
+    let r = s
+        .client
+        .post(s.url("/mcp/"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    assert_eq!(
+        r.headers()["www-authenticate"],
+        "Bearer resource_metadata=\"https://notedown.example/.well-known/oauth-protected-resource/mcp\""
+    );
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn unknown_oauth_and_well_known_paths_are_404() {
+    let s = start().await;
+    for path in ["/.well-known/openid-configuration", "/oauth/x"] {
+        for post in [false, true] {
+            let r = if post {
+                s.client.post(s.url(path))
+            } else {
+                s.client.get(s.url(path))
+            }
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(r.status(), 404, "{path}");
+            assert_eq!(r.headers()["cache-control"], "no-store", "{path}");
+            assert_eq!(r.text().await.unwrap(), "not found\n", "{path}");
+        }
+    }
+    // Still behind the Host check.
+    let r = s
+        .client
+        .get(s.url("/oauth/x"))
+        .header("x-forwarded-host", "other.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 421);
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn a_resource_with_one_trailing_slash_is_the_endpoint() {
+    let s = start().await;
+    add_account(&s, "anna", "anna@example.com", "right");
+    let id = register(&s, REDIRECT).await;
+    let slash = "https://notedown.example/mcp/";
+    let r = s
+        .client
+        .get(s.url("/oauth/authorize"))
+        .query(&authorize_query(&id, &[("resource", slash)]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = s
+        .client
+        .get(s.url("/oauth/authorize"))
+        .query(&authorize_query(
+            &id,
+            &[("resource", "https://notedown.example/mcp//")],
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 302);
+    assert_eq!(location_params(&r)["error"], "invalid_target");
+    let code = sign_in(&s, &id, "anna@example.com", "right").await;
+    let r = s
+        .client
+        .post(s.url("/oauth/token"))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", REDIRECT),
+            ("client_id", id.as_str()),
+            ("code_verifier", VERIFIER),
+            ("resource", slash),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = r.json().await.unwrap();
+    let refresh_token = v["refresh_token"].as_str().unwrap();
+    let r = s
+        .client
+        .post(s.url("/oauth/token"))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", id.as_str()),
+            ("resource", slash),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    s.stop().await;
+}

@@ -125,12 +125,17 @@ fn delete(accounts: &Accounts, slug: &str, id: &str) -> anyhow::Result<bool> {
     }
 }
 
-/// Every grant of every account: (slug, grant). Unreadable accounts or files are skipped.
+/// Every grant of every account: (slug, grant). An account whose grant folder cannot be listed
+/// is skipped with a log line, and so is a bad grant file; only a failing account listing fails.
 fn all(accounts: &Accounts) -> anyhow::Result<Vec<(String, Grant)>> {
     let mut out = Vec::new();
     for a in accounts.list()? {
-        for (_, g) in of_account(accounts, &a.slug)? {
-            out.push((a.slug.clone(), g));
+        match of_account(accounts, &a.slug) {
+            Ok(grants) => out.extend(grants.into_iter().map(|(_, g)| (a.slug.clone(), g))),
+            Err(e) => eprintln!(
+                "notedown mcp: skipping the grants of account {}: {e}",
+                a.slug
+            ),
         }
     }
     Ok(out)
@@ -202,6 +207,20 @@ pub fn revoke_grants(data: &Path, slug: &str, id: Option<&str>) -> anyhow::Resul
     Ok(n)
 }
 
+/// Drops the expired replaced tokens, remembers the current refresh token as replaced and keeps
+/// at most `cap` entries (the oldest go first).
+fn remember_replaced(g: &mut Grant, now_ms: u64, cap: usize) {
+    g.replaced.retain(|r| r.expires_ms > now_ms);
+    g.replaced.push(Replaced {
+        hash: g.refresh_hash.clone(),
+        expires_ms: g.refresh_expires_ms,
+    });
+    if g.replaced.len() > cap {
+        let excess = g.replaced.len() - cap;
+        g.replaced.drain(..excess);
+    }
+}
+
 impl GrantStore {
     pub(crate) fn open(data: &Path) -> anyhow::Result<GrantStore> {
         let accounts = Accounts::new(data);
@@ -267,7 +286,7 @@ impl GrantStore {
         client_name: &str,
         resource: &str,
         now_ms: u64,
-    ) -> anyhow::Result<Issued> {
+    ) -> anyhow::Result<Option<Issued>> {
         let mut g = Grant {
             id: secret::random_hex_32(),
             client_id: client_id.into(),
@@ -283,15 +302,16 @@ impl GrantStore {
             replaced: Vec::new(),
         };
         let issued = Self::new_tokens(&mut g, now_ms);
+        // `None`: the account is gone, nothing is written.
         let Some(_lock) = self.lock(slug)? else {
-            anyhow::bail!("the account {slug} is gone");
+            return Ok(None);
         };
         if self.accounts.get(slug)?.is_none() {
-            anyhow::bail!("the account {slug} is gone");
+            return Ok(None);
         }
         write(&self.accounts, slug, &g)?;
         Self::index_grant(&mut self.index_lock(), slug, &g);
-        Ok(issued)
+        Ok(Some(issued))
     }
 
     /// The account of a valid access token for `resource`, else `None`.
@@ -336,35 +356,49 @@ impl GrantStore {
         if entry.kind != Kind::Refresh {
             return Ok(Err(Refused::Grant));
         }
+        self.refresh_locked(&entry, &hash, client_id, resource, now_ms)
+    }
+
+    /// The part of `refresh` after the index lookup: under the account lock, against the file.
+    fn refresh_locked(
+        &self,
+        entry: &Entry,
+        hash: &str,
+        client_id: &str,
+        resource: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<Result<Issued, Refused>> {
         // The account lock, never waited for under the index mutex.
         let Some(_lock) = self.lock(&entry.slug)? else {
             Self::unindex(&mut self.index_lock(), &entry.grant);
             return Ok(Err(Refused::Grant));
         };
+        if self.accounts.get(&entry.slug)?.is_none() {
+            Self::unindex(&mut self.index_lock(), &entry.grant);
+            return Ok(Err(Refused::Grant));
+        }
         let Some(mut g) = read(&self.accounts, &entry.slug, &entry.grant)? else {
             Self::unindex(&mut self.index_lock(), &entry.grant);
             return Ok(Err(Refused::Grant));
         };
+        if g.replaced.iter().any(|r| r.hash == hash) {
+            // A replay that raced a rotation: end the whole grant.
+            delete(&self.accounts, &entry.slug, &g.id)?;
+            Self::unindex(&mut self.index_lock(), &g.id);
+            return Ok(Err(Refused::Grant));
+        }
         if g.refresh_hash != hash || g.client_id != client_id || now_ms >= g.refresh_expires_ms {
             return Ok(Err(Refused::Grant));
         }
         if g.resource != resource {
             return Ok(Err(Refused::Target));
         }
-        g.replaced.retain(|r| r.expires_ms > now_ms);
-        g.replaced.push(Replaced {
-            hash: g.refresh_hash.clone(),
-            expires_ms: g.refresh_expires_ms,
-        });
-        if g.replaced.len() > KEEP_REPLACED {
-            let excess = g.replaced.len() - KEEP_REPLACED;
-            g.replaced.drain(..excess);
-        }
+        remember_replaced(&mut g, now_ms, KEEP_REPLACED);
         let issued = Self::new_tokens(&mut g, now_ms);
         write(&self.accounts, &entry.slug, &g)?;
         let mut index = self.index_lock();
         let still = index
-            .get(&hash)
+            .get(hash)
             .is_some_and(|e| e.grant == g.id && e.kind == Kind::Refresh);
         if !still {
             // Revoked or replayed while we rotated: do not leave the grant behind.
@@ -453,6 +487,7 @@ mod tests {
         let store = GrantStore::open(dir.path()).unwrap();
         let t = store
             .issue("anna", "ndc_1", "Claude", "https://n/mcp", 0)
+            .unwrap()
             .unwrap();
         let store = GrantStore::open(dir.path()).unwrap();
         assert_eq!(
@@ -489,7 +524,10 @@ mod tests {
             .create("anna", "a@x", "p")
             .unwrap();
         let store = GrantStore::open(dir.path()).unwrap();
-        store.issue("anna", "ndc_1", "Claude", "r", 0).unwrap();
+        store
+            .issue("anna", "ndc_1", "Claude", "r", 0)
+            .unwrap()
+            .unwrap();
         assert_eq!(store.sweep(REFRESH_TTL_MS - 1).unwrap(), 0);
         assert_eq!(store.sweep(REFRESH_TTL_MS).unwrap(), 1);
         assert!(store.client_ids().is_empty());
@@ -502,7 +540,10 @@ mod tests {
             .create("anna", "a@x", "p")
             .unwrap();
         let store = GrantStore::open(dir.path()).unwrap();
-        let t = store.issue("anna", "ndc_1", "Claude", "r", 0).unwrap();
+        let t = store
+            .issue("anna", "ndc_1", "Claude", "r", 0)
+            .unwrap()
+            .unwrap();
         let oauth = dir.path().join("accounts/anna/oauth");
         for f in std::fs::read_dir(&oauth).unwrap() {
             std::fs::remove_file(f.unwrap().path()).unwrap();
@@ -518,13 +559,21 @@ mod tests {
         let accounts = notedown_cloud::auth::Accounts::new(dir.path());
         accounts.create("anna", "a@x", "p").unwrap();
         let store = GrantStore::open(dir.path()).unwrap();
-        let t = store.issue("anna", "ndc_1", "Claude", "r", 0).unwrap();
+        let t = store
+            .issue("anna", "ndc_1", "Claude", "r", 0)
+            .unwrap()
+            .unwrap();
         accounts.remove("anna").unwrap();
         assert_eq!(
             store.refresh(&t.refresh, "ndc_1", "r", 1).unwrap().err(),
             Some(Refused::Grant)
         );
-        assert!(store.issue("anna", "ndc_1", "Claude", "r", 1).is_err());
+        assert!(
+            store
+                .issue("anna", "ndc_1", "Claude", "r", 1)
+                .unwrap()
+                .is_none()
+        );
         assert!(!dir.path().join("accounts/anna").exists());
     }
 
@@ -534,7 +583,10 @@ mod tests {
         let accounts = notedown_cloud::auth::Accounts::new(dir.path());
         accounts.create("anna", "a@x", "p").unwrap();
         let store = GrantStore::open(dir.path()).unwrap();
-        let t = store.issue("anna", "ndc_1", "Claude", "r", 0).unwrap();
+        let t = store
+            .issue("anna", "ndc_1", "Claude", "r", 0)
+            .unwrap()
+            .unwrap();
         assert!(store.access(&t.access, "r", 1).unwrap().is_some());
         accounts.set_password("anna", "a-new-password").unwrap();
         assert_eq!(store.access(&t.access, "r", 1).unwrap(), None);
@@ -547,7 +599,10 @@ mod tests {
             .create("anna", "a@x", "p")
             .unwrap();
         let store = GrantStore::open(dir.path()).unwrap();
-        store.issue("anna", "ndc_1", "Claude", "r", 0).unwrap();
+        store
+            .issue("anna", "ndc_1", "Claude", "r", 0)
+            .unwrap()
+            .unwrap();
         let oauth = dir.path().join("accounts/anna/oauth");
         std::fs::write(oauth.join(format!("{}.json", "a".repeat(32))), "{ not json").unwrap();
         let store = GrantStore::open(dir.path()).unwrap();
@@ -565,7 +620,10 @@ mod tests {
             .create("anna", "a@x", "p")
             .unwrap();
         let store = GrantStore::open(dir.path()).unwrap();
-        store.issue("anna", "ndc_1", "Claude", "r", 0).unwrap();
+        store
+            .issue("anna", "ndc_1", "Claude", "r", 0)
+            .unwrap()
+            .unwrap();
         let oauth = dir.path().join("accounts/anna/oauth");
         let f = std::fs::read_dir(&oauth)
             .unwrap()
@@ -584,7 +642,10 @@ mod tests {
             .create("anna", "a@x", "p")
             .unwrap();
         let store = GrantStore::open(dir.path()).unwrap();
-        let t1 = store.issue("anna", "ndc_1", "Claude", "r", 0).unwrap();
+        let t1 = store
+            .issue("anna", "ndc_1", "Claude", "r", 0)
+            .unwrap()
+            .unwrap();
         let mut last = t1.refresh.clone();
         for i in 1..=60u64 {
             let t = store.refresh(&last, "ndc_1", "r", i).unwrap().ok().unwrap();
@@ -613,8 +674,8 @@ mod tests {
             .create("anna", "a@x", "p")
             .unwrap();
         let store = GrantStore::open(dir.path()).unwrap();
-        store.issue("anna", "ndc_1", "A", "r", 0).unwrap();
-        store.issue("anna", "ndc_2", "B", "r", 1).unwrap();
+        store.issue("anna", "ndc_1", "A", "r", 0).unwrap().unwrap();
+        store.issue("anna", "ndc_2", "B", "r", 1).unwrap().unwrap();
         let list = list_grants(dir.path(), "anna").unwrap();
         assert_eq!(
             revoke_grants(dir.path(), "anna", Some(&list[0].id)).unwrap(),
@@ -632,7 +693,7 @@ mod tests {
             .create("anna", "a@x", "p")
             .unwrap();
         let store = GrantStore::open(dir.path()).unwrap();
-        let t = store.issue("anna", "ndc_1", "A", "r", 0).unwrap();
+        let t = store.issue("anna", "ndc_1", "A", "r", 0).unwrap().unwrap();
         assert_eq!(
             store.refresh(&t.refresh, "ndc_2", "r", 1).unwrap().err(),
             Some(Refused::Grant)
@@ -645,5 +706,70 @@ mod tests {
             Some(Refused::Target)
         );
         assert!(store.refresh(&t.refresh, "ndc_1", "r", 1).unwrap().is_ok());
+    }
+
+    #[test]
+    fn a_replay_that_raced_a_rotation_ends_the_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        notedown_cloud::auth::Accounts::new(dir.path())
+            .create("anna", "a@x", "p")
+            .unwrap();
+        let store = GrantStore::open(dir.path()).unwrap();
+        let t = store
+            .issue("anna", "ndc_1", "Claude", "r", 0)
+            .unwrap()
+            .unwrap();
+        // Both requests did their index lookup before the rotation.
+        let hash = secret::sha256_hex(&t.refresh);
+        let entry = store.index_lock().get(&hash).cloned().unwrap();
+        assert!(store.refresh(&t.refresh, "ndc_1", "r", 1).unwrap().is_ok());
+        // The second one continues after the lookup with the old token.
+        let r = store
+            .refresh_locked(&entry, &hash, "ndc_1", "r", 2)
+            .unwrap();
+        assert_eq!(r.err(), Some(Refused::Grant));
+        assert_eq!(
+            list_grants(dir.path(), "anna").unwrap().len(),
+            0,
+            "grant ended"
+        );
+        assert!(store.index_lock().is_empty());
+    }
+
+    #[test]
+    fn replaced_entries_expire_and_are_capped() {
+        let mut g = Grant {
+            id: "x".into(),
+            client_id: String::new(),
+            client_name: String::new(),
+            resource: String::new(),
+            scope: String::new(),
+            created_ms: 0,
+            used_ms: 0,
+            access_hash: String::new(),
+            access_expires_ms: 0,
+            refresh_hash: "cur".into(),
+            refresh_expires_ms: 500,
+            replaced: vec![
+                Replaced {
+                    hash: "old".into(),
+                    expires_ms: 10,
+                },
+                Replaced {
+                    hash: "live".into(),
+                    expires_ms: 100,
+                },
+            ],
+        };
+        remember_replaced(&mut g, 50, 3);
+        let hashes: Vec<_> = g.replaced.iter().map(|r| r.hash.as_str()).collect();
+        assert_eq!(hashes, ["live", "cur"], "the expired entry is dropped");
+        g.refresh_hash = "n1".into();
+        remember_replaced(&mut g, 50, 3);
+        g.refresh_hash = "n2".into();
+        remember_replaced(&mut g, 50, 3);
+        let hashes: Vec<_> = g.replaced.iter().map(|r| r.hash.as_str()).collect();
+        assert_eq!(hashes, ["cur", "n1", "n2"], "the oldest goes at the cap");
+        assert_eq!(KEEP_REPLACED, 1000);
     }
 }

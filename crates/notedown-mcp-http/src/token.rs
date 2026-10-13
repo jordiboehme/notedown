@@ -134,8 +134,11 @@ pub(crate) async fn token(
             })
             .await;
             match result {
-                Ok(Some(i)) => granted(i),
-                Ok(None) => oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", BAD_CODE),
+                Ok(Some(Some(i))) => granted(i),
+                // The client or the account is gone.
+                Ok(None | Some(None)) => {
+                    oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", BAD_CODE)
+                }
                 Err(e) => unavailable(e),
             }
         }

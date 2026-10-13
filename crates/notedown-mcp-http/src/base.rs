@@ -64,24 +64,30 @@ pub fn peer_of(request: &Request) -> Option<IpAddr> {
 /// Whether the request is addressed to `base`: its `Host`, or `X-Forwarded-Host` when the peer
 /// is a trusted proxy. A `:443` port is the same as none.
 pub fn host_ok(base: &Base, request: &Request, trusted: &[IpAddr]) -> bool {
-    let header = |name: &str| {
-        request
-            .headers()
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| {
-                v.split(',')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_ascii_lowercase()
-            })
+    // One header line, readable ASCII, no list: anything else is refused, never guessed at.
+    let single = |name: &str| -> Option<Option<String>> {
+        let mut lines = request.headers().get_all(name).iter();
+        let Some(first) = lines.next() else {
+            return Some(None);
+        };
+        if lines.next().is_some() {
+            return None;
+        }
+        let v = first.to_str().ok()?.trim();
+        if v.contains(',') {
+            return None;
+        }
+        Some(Some(v.to_ascii_lowercase()))
     };
     let from_proxy = peer_of(request).is_some_and(|p| trusted.contains(&p));
     let host = if from_proxy {
-        header("x-forwarded-host").or_else(|| header("host"))
+        match single("x-forwarded-host") {
+            None => return false,
+            Some(Some(h)) => Some(h),
+            Some(None) => single("host").flatten(),
+        }
     } else {
-        header("host")
+        single("host").flatten()
     };
     host.is_some_and(|h| h.strip_suffix(":443").unwrap_or(&h) == base.authority)
 }
@@ -143,5 +149,64 @@ mod tests {
             &req("10.0.0.2:19072", Some("n.example"), "1.2.3.4"),
             &[proxy]
         ));
+    }
+
+    #[test]
+    fn lists_repeated_lines_and_unreadable_values_are_refused() {
+        let b = Base::parse("https://n.example").unwrap();
+        let proxy: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let build = |headers: &[(&str, &[u8])], peer: &str| {
+            let mut r = axum::http::Request::builder().uri("/mcp");
+            for (k, v) in headers {
+                r = r.header(*k, axum::http::HeaderValue::from_bytes(v).unwrap());
+            }
+            let mut r = r.body(axum::body::Body::empty()).unwrap();
+            r.extensions_mut().insert(axum::extract::ConnectInfo(
+                format!("{peer}:1234")
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap(),
+            ));
+            r
+        };
+        let t = [proxy];
+        assert!(host_ok(
+            &b,
+            &build(&[("x-forwarded-host", b"n.example")], "10.0.0.1"),
+            &t
+        ));
+        let list = build(
+            &[
+                ("host", b"x"),
+                ("x-forwarded-host", b"n.example, evil.example"),
+            ],
+            "10.0.0.1",
+        );
+        assert!(!host_ok(&b, &list, &t));
+        assert!(!host_ok(
+            &b,
+            &build(&[("host", b"n.example, evil.example")], "1.2.3.4"),
+            &[]
+        ));
+        let two = build(
+            &[
+                ("x-forwarded-host", b"n.example"),
+                ("x-forwarded-host", b"evil.example"),
+            ],
+            "10.0.0.1",
+        );
+        assert!(!host_ok(&b, &two, &t));
+        assert!(!host_ok(
+            &b,
+            &build(&[("host", b"n.example.")], "1.2.3.4"),
+            &[]
+        ));
+        let bad = build(
+            &[
+                ("host", b"n.example"),
+                ("x-forwarded-host", b"n.exampl\xe9"),
+            ],
+            "10.0.0.1",
+        );
+        assert!(!host_ok(&b, &bad, &t));
     }
 }

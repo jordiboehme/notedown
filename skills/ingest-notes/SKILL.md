@@ -53,6 +53,9 @@ Pass this section and the next one to every sub-agent, with its account slug, no
    Do not use `consumer` or `since`. Do not call `ack`.
 2. Find the target domain: `list_domains` with `include_routing: true`, and follow the routing.
    When you were given a domain, use that one.
+   - Find the folder: look at the domain's folders with `browse_domain` and reuse the folder
+     that already holds the topic, also when its name differs a little. Start a new folder only
+     when none fits.
 3. For each note, distill its text into engrams. One engram per topic, not one per block.
    - Put the anchors of the blocks you used into the metadata key `sources` (a list), for
      example `notedown://<account>/F2024.../P2024...#b3`.

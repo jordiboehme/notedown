@@ -223,11 +223,11 @@ Build it on the Pi (64-bit Raspberry Pi OS, arm64) without the OCR part:
 cargo build --release --no-default-features -p notedown
 ```
 
-This build has `serve`, `cloud` and `render`. It has no OCR, so there is no `pipeline`, `convert`, `model` or `mcp`, and `serve` has no `--pipeline`. The build needs no `cmake` and no C++ compiler. There are no release binaries yet.
+This build has `serve`, `cloud` and `render`. It has no OCR, so there is no `pipeline`, `convert`, `model` or `mcp`, and `serve` has no `--pipeline`. The build needs a C compiler (on Raspberry Pi OS: `sudo apt install build-essential`). It does not need the C++ toolchain for llama.cpp that the OCR build needs. There are no release binaries yet.
 
 Set up the account, the import and the server as in part 2, with the binary from `target/release/`. Two things to know:
 
-- The Pi needs the right time. Run NTP (Raspberry Pi OS does this by default). The server signs the transfer URLs and the journal and the logs carry time stamps, so a wrong clock causes trouble.
+- The Pi has no clock that runs while it is off, so it needs NTP after every start (Raspberry Pi OS does this by default). The server signs the upload and download URLs with the time. It refuses a URL that is more than 5 minutes in the future or older than its time limit (30 minutes for uploads and 24 hours for downloads).
 - The device keeps the address of its Private Cloud. If the address of the Pi changes, you have to log out of the cloud on the device and set it up again. Give the Pi a fixed address: a fixed lease in your router or a static address.
 
 Note text for an agent does not work on the Pi alone yet. A pipeline on a second machine that reads the Pi over the network is planned, but it is not there. Until then, run `notedown serve --pipeline` on one machine with the OCR build (for example a Mac) to get note text, as described below.

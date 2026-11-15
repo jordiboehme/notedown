@@ -8,16 +8,20 @@ use notedown_cloud::auth::{Accounts, validate_slug};
 use serde::Deserialize;
 
 use crate::config::{PipelineConfig, Raw};
+use crate::rest::RestSource;
 use crate::source::{FolderSource, ServerAccount, ServerData};
 use crate::store::{OWNER_FILE, PIPELINE_DIR};
 use crate::{Error, Result};
 
 /// The file name in the local folder.
 pub const FILE: &str = "pipeline.toml";
+/// The folder of the token files (`<slug>.token`) in the local folder.
+pub const TOKENS_FOLDER: &str = "tokens";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawServer {
+    url: Option<String>,
     folder: Option<PathBuf>,
     accounts: Option<Vec<String>>,
 }
@@ -29,11 +33,19 @@ struct RawFile {
     pipeline: Option<Raw>,
 }
 
+/// Where the server's data is read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerAt {
+    /// The server's REST API (`http://host:port`, stored without a trailing slash).
+    Url(String),
+    /// The server's data folder, best mounted read-only. For tests; not documented.
+    Folder(PathBuf),
+}
+
 /// `<local>/pipeline.toml`. Its existence means two machines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalConfig {
-    /// The server's data folder, best mounted read-only.
-    pub server_folder: PathBuf,
+    pub server: ServerAt,
     /// The accounts to serve; `None`: every account the server lists.
     pub accounts: Option<Vec<String>>,
     pub pipeline: PipelineConfig,
@@ -54,11 +66,29 @@ impl LocalConfig {
         };
         let file: RawFile = toml::from_str(&text).map_err(|e| bad(e.to_string()))?;
         let server = file.server.ok_or_else(|| {
-            bad("the [server] table with a folder is missing; add [server] folder = \"...\"".into())
+            bad("the [server] table is missing; add [server] url = \"http://host:port\"".into())
         })?;
-        let server_folder = match server.folder {
-            Some(f) if !f.as_os_str().is_empty() => f,
-            _ => return Err(bad("[server] folder is missing".into())),
+        let at = match (server.url, server.folder) {
+            (Some(_), Some(_)) => {
+                return Err(bad(
+                    "[server] url and [server] folder are both set; keep only one".into(),
+                ));
+            }
+            (Some(url), None) => {
+                let url = url.trim().trim_end_matches('/').to_string();
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    return Err(bad(format!(
+                        "[server] url {url:?} must start with http:// or https://"
+                    )));
+                }
+                ServerAt::Url(url)
+            }
+            (None, Some(f)) if !f.as_os_str().is_empty() => ServerAt::Folder(f),
+            (None, _) => {
+                return Err(bad(
+                    "[server] url is missing (or [server] folder, for a mounted folder)".into(),
+                ));
+            }
         };
         if let Some(list) = &server.accounts {
             for slug in list {
@@ -70,7 +100,7 @@ impl LocalConfig {
             None => PipelineConfig::default(),
         };
         Ok(Some(LocalConfig {
-            server_folder,
+            server: at,
             accounts: server.accounts,
             pipeline,
         }))
@@ -94,13 +124,21 @@ impl Setup {
     /// settings come from `server.toml` `[pipeline]`. Reads only; nothing is created.
     pub fn load(data: &Path) -> Result<Setup> {
         match LocalConfig::load(data)? {
-            Some(c) => Ok(Setup {
-                local: data.to_path_buf(),
-                source: Arc::new(FolderSource::shared(&c.server_folder)),
-                cfg: c.pipeline,
-                two_machines: true,
-                accounts: c.accounts,
-            }),
+            Some(c) => {
+                let source: Arc<dyn ServerData> = match &c.server {
+                    ServerAt::Folder(f) => Arc::new(FolderSource::shared(f)),
+                    ServerAt::Url(url) => {
+                        Arc::new(RestSource::new(url, &data.join(TOKENS_FOLDER), data)?)
+                    }
+                };
+                Ok(Setup {
+                    local: data.to_path_buf(),
+                    source,
+                    cfg: c.pipeline,
+                    two_machines: true,
+                    accounts: c.accounts,
+                })
+            }
             None => Ok(Setup {
                 local: data.to_path_buf(),
                 source: Arc::new(FolderSource::new(data)),
@@ -112,7 +150,7 @@ impl Setup {
     }
 
     /// The accounts the worker serves: the configured list, else every account the server
-    /// lists. The only place this filter lives.
+    /// lists (with a URL: every account that has a token file). The only place this filter lives.
     pub fn served(&self) -> Result<Vec<ServerAccount>> {
         Ok(self.serve(&self.source.accounts()?))
     }
@@ -209,12 +247,12 @@ mod tests {
         write(d.path(), FILE, "[server]\naccounts = [\"a\"]\n");
         let m = message(LocalConfig::load(d.path()));
         assert!(
-            m.contains("pipeline.toml") && m.contains("[server] folder"),
+            m.contains("pipeline.toml") && m.contains("[server] url"),
             "{m}"
         );
         write(d.path(), FILE, "[pipeline]\nocr_settle = \"1m\"\n");
         let m = message(LocalConfig::load(d.path()));
-        assert!(m.contains("[server]") && m.contains("folder"), "{m}");
+        assert!(m.contains("[server]") && m.contains("url"), "{m}");
     }
 
     #[test]
@@ -226,7 +264,7 @@ mod tests {
             "[server]\nfolder = \"/mnt/n\"\naccounts = [\"jordi\"]\n[pipeline]\nocr_settle = \"3m\"\n",
         );
         let c = LocalConfig::load(d.path()).unwrap().unwrap();
-        assert_eq!(c.server_folder, PathBuf::from("/mnt/n"));
+        assert_eq!(c.server, ServerAt::Folder(PathBuf::from("/mnt/n")));
         assert_eq!(c.accounts, Some(vec!["jordi".to_string()]));
         assert_eq!(c.pipeline.ocr_settle, std::time::Duration::from_secs(180));
         assert!(LocalConfig::load(&d.path().join("none")).unwrap().is_none());
@@ -268,6 +306,106 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn local_config_takes_a_url() {
+        let d = tempfile::tempdir().unwrap();
+        write(
+            d.path(),
+            FILE,
+            "[server]\nurl = \"http://pi.local:19072\"\n",
+        );
+        let c = LocalConfig::load(d.path()).unwrap().unwrap();
+        assert_eq!(c.server, ServerAt::Url("http://pi.local:19072".into()));
+        assert_eq!(c.accounts, None);
+    }
+
+    #[test]
+    fn local_config_refuses_url_and_folder_together() {
+        let d = tempfile::tempdir().unwrap();
+        write(
+            d.path(),
+            FILE,
+            "[server]\nurl = \"http://pi:1\"\nfolder = \"/x\"\n",
+        );
+        let m = message(LocalConfig::load(d.path()));
+        assert!(
+            m.contains("pipeline.toml") && m.contains("url") && m.contains("folder"),
+            "{m}"
+        );
+    }
+
+    #[test]
+    fn local_config_refuses_a_url_without_a_scheme() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), FILE, "[server]\nurl = \"pi.local:19072\"\n");
+        let m = message(LocalConfig::load(d.path()));
+        assert!(
+            m.contains("pipeline.toml") && m.contains("http://") && m.contains("https://"),
+            "{m}"
+        );
+    }
+
+    #[test]
+    fn a_trailing_slash_is_the_same_url() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), FILE, "[server]\nurl = \"http://pi:1///\"\n");
+        let c = LocalConfig::load(d.path()).unwrap().unwrap();
+        assert_eq!(c.server, ServerAt::Url("http://pi:1".into()));
+    }
+
+    /// A server that answers every request as the account `slug` and stops with the test.
+    fn fake_server(slug: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let body = format!("{{\"slug\":\"{slug}\",\"userId\":1000001}}");
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn served_accounts_come_from_the_token_files() {
+        use base64::Engine;
+        let d = tempfile::tempdir().unwrap();
+        let url = fake_server("jordi");
+        write(d.path(), FILE, &format!("[server]\nurl = \"{url}\"\n"));
+        let s = Setup::load(d.path()).unwrap();
+        assert!(s.two_machines);
+        // No tokens folder yet: nothing is known, and nothing is created.
+        assert!(
+            s.served()
+                .unwrap_err()
+                .to_string()
+                .contains("notedown connect")
+        );
+        assert!(!d.path().join(TOKENS_FOLDER).exists());
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"slug":"jordi","userId":1000001,"id":"0123abcd","nonce":"n"}"#);
+        let tokens = d.path().join(TOKENS_FOLDER);
+        std::fs::create_dir(&tokens).unwrap();
+        write(&tokens, "jordi.token", &format!("ndt1.{payload}.sig\n"));
+        let served: Vec<String> = s.served().unwrap().into_iter().map(|a| a.slug).collect();
+        assert_eq!(served, vec!["jordi"]);
+        // A configured list narrows it.
+        write(
+            d.path(),
+            FILE,
+            &format!("[server]\nurl = \"{url}\"\naccounts = [\"other\"]\n"),
+        );
+        assert!(Setup::load(d.path()).unwrap().served().unwrap().is_empty());
     }
 
     fn account(data: &Path, slug: &str) {

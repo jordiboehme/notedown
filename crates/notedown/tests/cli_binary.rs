@@ -2309,3 +2309,195 @@ fn revoke_refuses_a_bad_id() {
         2
     );
 }
+
+/// A running `notedown serve` on a random loopback port; it is killed on drop.
+struct Server {
+    child: std::process::Child,
+    url: String,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn running_server(data: &std::path::Path) -> Server {
+    use std::io::BufRead;
+    std::fs::write(data.join("server.toml"), "listen = [\"127.0.0.1:0\"]\n").unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["serve", "--data"])
+        .arg(data)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut url = None;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        if let Some(r) = line.strip_prefix("REST API: ") {
+            url = r.split("/rest/v1").next().map(str::to_string);
+        }
+        if line.starts_with("press Ctrl-C") {
+            break;
+        }
+    }
+    // Keep reading so the server never blocks on a full pipe.
+    std::thread::spawn(move || std::io::copy(&mut reader, &mut std::io::sink()).map(|_| ()));
+    Server {
+        child,
+        url: url.expect("no REST line"),
+    }
+}
+
+fn connect_cmd(url: &str, local: &std::path::Path, password: &str) -> std::process::Output {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["connect", url, "--data"])
+        .arg(local)
+        .args(["--email", "j@example.org", "--password-stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut pipe = child.stdin.take().unwrap();
+    pipe.write_all(format!("{password}\n").as_bytes()).unwrap();
+    drop(pipe);
+    child.wait_with_output().unwrap()
+}
+
+fn server_with_account() -> (tempfile::TempDir, Server) {
+    let dir = tempfile::tempdir().unwrap();
+    let out = cloud(
+        dir.path(),
+        &[
+            "add",
+            "jordi",
+            "--email",
+            "j@example.org",
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(out.status.success());
+    let server = running_server(dir.path());
+    (dir, server)
+}
+
+#[test]
+fn connect_logs_in_and_writes_pipeline_toml() {
+    let (_data, server) = server_with_account();
+    let local = tempfile::tempdir().unwrap();
+    let out = connect_cmd(&server.url, local.path(), "secret");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    let file = local.path().join("tokens/jordi.token");
+    let first = text.lines().next().unwrap();
+    assert!(
+        first.starts_with(&format!("connected to {} as jordi (user id ", server.url))
+            && first.contains("), token ")
+            && first.ends_with(&format!(" stored in {}", file.display())),
+        "{text}"
+    );
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert_eq!(
+        std::fs::read_to_string(local.path().join("pipeline.toml")).unwrap(),
+        format!("[server]\nurl = \"{}\"\n", server.url)
+    );
+    let token = std::fs::read_to_string(&file).unwrap();
+    assert!(token.trim().starts_with("ndt1."));
+    // The same URL with a trailing slash reconnects and names the older token.
+    let out = connect_cmd(&format!("{}/", server.url), local.path(), "secret");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("an older token ") && text.contains(" still works"),
+        "{text}"
+    );
+    assert_ne!(std::fs::read_to_string(&file).unwrap(), token);
+}
+
+#[cfg(unix)]
+#[test]
+fn connect_stores_the_token_privately() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_data, server) = server_with_account();
+    let local = tempfile::tempdir().unwrap();
+    let out = connect_cmd(&server.url, local.path(), "secret");
+    assert!(out.status.success());
+    let file = local.path().join("tokens/jordi.token");
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&file), 0o600);
+    assert_eq!(mode(&local.path().join("tokens")), 0o700);
+    let token = std::fs::read_to_string(&file).unwrap();
+    let token = token.trim();
+    assert!(!token.is_empty());
+    for text in [
+        stdout(&out),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ] {
+        assert!(!text.contains(token), "the token is printed: {text}");
+        assert!(!text.contains("secret"), "{text}");
+    }
+}
+
+#[test]
+fn connect_with_a_wrong_password_says_so() {
+    let (_data, server) = server_with_account();
+    let local = tempfile::tempdir().unwrap();
+    let out = connect_cmd(&server.url, local.path(), "wrong");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("the server refused the email or the password"),
+        "{err}"
+    );
+    assert!(!local.path().join("tokens").exists());
+    assert!(!local.path().join("pipeline.toml").exists());
+}
+
+#[test]
+fn connect_refuses_another_url_in_pipeline_toml() {
+    let (_data, server) = server_with_account();
+    let local = tempfile::tempdir().unwrap();
+    std::fs::write(
+        local.path().join("pipeline.toml"),
+        "[server]\nurl = \"http://other.example:1\"\n",
+    )
+    .unwrap();
+    let out = connect_cmd(&server.url, local.path(), "secret");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(
+            "pipeline.toml points at http://other.example:1; change it or use another --data folder"
+        ),
+        "{err}"
+    );
+    assert!(!local.path().join("tokens").exists());
+}
+
+#[test]
+fn connect_refuses_a_server_data_folder() {
+    let (data, server) = server_with_account();
+    let out = connect_cmd(&server.url, data.path(), "secret");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("holds a server's data"), "{err}");
+    assert!(!data.path().join("pipeline.toml").exists());
+    assert!(!data.path().join("tokens").exists());
+}

@@ -58,6 +58,10 @@ enum Command {
     /// text store and writes bookmarks, it never runs OCR
     #[cfg(feature = "ocr")]
     Mcp(McpArgs),
+    /// Log in to a Supernote Private Cloud server over REST, keep the account's token and write
+    /// pipeline.toml, so the pipeline on this machine reads the server over the network
+    #[cfg(feature = "ocr")]
+    Connect(ConnectArgs),
 }
 
 #[cfg(feature = "ocr")]
@@ -2152,6 +2156,46 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
 }
 
 #[cfg(feature = "ocr")]
+#[derive(clap::Args)]
+struct ConnectArgs {
+    /// The server, for example http://pi.local:19072
+    url: String,
+    /// The pipeline's own data folder (it gets pipeline.toml and tokens/)
+    #[arg(long)]
+    data: PathBuf,
+    /// The email of the account
+    #[arg(long)]
+    email: String,
+    /// Read the password from the first line of stdin instead of asking for it
+    #[arg(long)]
+    password_stdin: bool,
+    /// The name the token gets on the server
+    #[arg(long, default_value = "pipeline")]
+    name: String,
+}
+
+#[cfg(feature = "ocr")]
+fn connect_command(a: ConnectArgs) -> Result<ExitCode> {
+    let password = read_password(a.password_stdin, false)?;
+    let c = notedown_pipeline::connect::connect(&a.url, &a.data, &a.email, &password, &a.name)?;
+    let url = a.url.trim().trim_end_matches('/');
+    println!(
+        "connected to {url} as {} (user id {}), token {} stored in {}",
+        c.slug,
+        c.user_id,
+        c.token_id,
+        c.token_file.display()
+    );
+    if let Some(old) = c.replaced_token_id {
+        println!(
+            "an older token {old} still works; revoke it on the server with notedown cloud \
+             account tokens revoke"
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(feature = "ocr")]
 fn mcp_command(args: McpArgs) -> Result<ExitCode> {
     // serve_stdio builds its own runtime; this is plain synchronous code.
     notedown_pipeline::mcp::serve_stdio(&args.data, args.account.as_deref())?;
@@ -2172,6 +2216,8 @@ fn main() -> ExitCode {
         Command::Pipeline(a) => pipeline_command(a),
         #[cfg(feature = "ocr")]
         Command::Mcp(a) => mcp_command(a),
+        #[cfg(feature = "ocr")]
+        Command::Connect(a) => connect_command(a),
     };
     let _ = std::io::stdout().flush();
     match result {

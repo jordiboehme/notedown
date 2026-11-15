@@ -503,6 +503,15 @@ fn sha256_hex(token: &str) -> String {
 /// token of this form. It says nothing about the token's worth (only the server can check the
 /// MAC); a client uses it to see whether a token file holds the token of the right account.
 pub fn token_slug(token: &str) -> Option<String> {
+    token_payload(token).map(|p| p.slug)
+}
+
+/// The id a token names in its payload, read without the key (see [`token_slug`]).
+pub fn token_id(token: &str) -> Option<String> {
+    token_payload(token).map(|p| p.id).filter(|id| valid_id(id))
+}
+
+fn token_payload(token: &str) -> Option<Payload> {
     if token.len() > MAX_TOKEN_LEN {
         return None;
     }
@@ -514,7 +523,7 @@ pub fn token_slug(token: &str) -> Option<String> {
     };
     let json = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let payload: Payload = serde_json::from_slice(&json).ok()?;
-    validate_slug(&payload.slug).is_ok().then_some(payload.slug)
+    validate_slug(&payload.slug).is_ok().then_some(payload)
 }
 
 /// 8 lowercase hex characters.

@@ -306,17 +306,23 @@ impl RestSource {
         request
             .header(AUTHORIZATION, auth)
             .send()
-            .map_err(|e| Error::Read(format!("{url}: {}", chain(&e.without_url()))))
+            .map_err(|_| self.no_answer(path))
+    }
+
+    /// A transport error (no connection, a timeout, a broken answer) in one steady text per
+    /// route, so a network that comes and goes gives one message, not one per poll.
+    fn no_answer(&self, path: &str) -> Error {
+        let route = path.split('?').next().unwrap_or(path);
+        Error::Read(format!(
+            "{}{PREFIX}{route}: no answer from the server",
+            self.url
+        ))
     }
 
     fn body(&self, path: &str, resp: Response) -> Result<Vec<u8>> {
-        resp.bytes().map(|b| b.to_vec()).map_err(|e| {
-            Error::Read(format!(
-                "{}{PREFIX}{path}: {}",
-                self.url,
-                chain(&e.without_url())
-            ))
-        })
+        resp.bytes()
+            .map(|b| b.to_vec())
+            .map_err(|_| self.no_answer(path))
     }
 
     fn parse<T: DeserializeOwned>(&self, path: &str, body: &[u8]) -> Result<T> {

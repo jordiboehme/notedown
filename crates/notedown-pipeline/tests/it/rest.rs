@@ -820,3 +820,34 @@ fn the_worker_says_a_refusal_once() {
     w.run(stop_at(&clock, clock.now_ms() + 3_000)).unwrap();
     assert_eq!(said.count(&message), 2, "{:?}", said.lines());
 }
+
+#[test]
+fn a_flapping_network_is_said_once() {
+    // Every other request is closed after its head, the others get an answer that is no HTTP:
+    // two kinds of transport error, one after the other.
+    let turn = Arc::new(AtomicUsize::new(0));
+    let t = turn.clone();
+    let fake = Fake::start(move |_| {
+        if t.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
+            Vec::new()
+        } else {
+            b"nonsense\r\n\r\n".to_vec()
+        }
+    });
+    let (src, local) = fake_source(&fake, &[(SLUG, &fake_token(SLUG, "a"))]);
+    std::fs::write(
+        local.path().join("pipeline.toml"),
+        format!("[server]\nurl = {:?}\n", fake.url()),
+    )
+    .unwrap();
+    let clock = TestClock::at(now_ms());
+    let mut s = Setup::load(local.path()).unwrap();
+    s.cfg = no_settle();
+    s.source = Arc::new(src.with_clock(Arc::new(clock.clone())));
+    let said = Said::default();
+    worker(&s, &clock, &said)
+        .run(stop_at(&clock, clock.now_ms() + 120_000))
+        .unwrap();
+    assert!(fake.requests() > 10, "{}", fake.requests());
+    assert_eq!(said.count(&fake.url()), 1, "{:?}", said.lines());
+}

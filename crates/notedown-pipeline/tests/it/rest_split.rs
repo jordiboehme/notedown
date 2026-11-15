@@ -445,6 +445,12 @@ fn a_refused_token_keeps_the_text() {
     assert_eq!(owner_of(local.path(), SLUG), Some(FIRST_ID));
     let message = refused(&h, local.path(), SLUG);
     assert_eq!(said.count(&message), 1, "{:?}", said.lines());
+    assert_eq!(
+        said.count(&refused_message(&h.url(), local.path(), SLUG)),
+        1,
+        "said once, not again for the journal: {:?}",
+        said.lines()
+    );
 
     // A new connect resumes, without a restart.
     connect_as(&h, local.path(), SLUG, "secret2");

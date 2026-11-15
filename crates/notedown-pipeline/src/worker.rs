@@ -835,7 +835,11 @@ impl Worker {
                     follows.insert(slug.to_string(), f);
                 }
                 Err(e) => {
-                    self.say_once(&topic, format!("notedown pipeline: account {slug}: {e}"));
+                    self.say_journal(
+                        slug,
+                        &topic,
+                        format!("notedown pipeline: account {slug}: {e}"),
+                    );
                     return (false, removed);
                 }
             }
@@ -846,7 +850,8 @@ impl Worker {
             let batch = match self.setup.source.journal(slug, f.read + 1, JOURNAL_PAGE) {
                 Ok(b) => b,
                 Err(e) => {
-                    self.say_once(
+                    self.say_journal(
+                        slug,
                         &topic,
                         format!("notedown pipeline: account {slug}: journal: {e}"),
                     );
@@ -872,6 +877,15 @@ impl Worker {
                 return (changed, removed);
             }
         }
+    }
+
+    /// Says a journal failure of account `slug` once, unless the refusal of its token is said:
+    /// a refused token fails every journal read, and the refusal already tells what to do.
+    fn say_journal(&self, slug: &str, topic: &str, message: String) {
+        if self.said.borrow().contains_key(&format!("token:{slug}")) {
+            return;
+        }
+        self.say_once(topic, message);
     }
 
     /// Writes the cursor of account `slug` after a good pass, when it moved or has no file.

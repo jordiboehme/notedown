@@ -397,7 +397,7 @@ enum AccountAction {
         #[arg(long)]
         password_stdin: bool,
     },
-    /// Set a new password (also unlocks the account and ends its OAuth sign-ins)
+    /// Set a new password (also unlocks the account)
     Passwd {
         slug: String,
         /// Read the password from the first line of stdin instead of asking for it
@@ -406,14 +406,7 @@ enum AccountAction {
     },
     /// List the accounts
     List,
-    /// List the OAuth sign-ins of an account (MCP clients such as claude.ai), or end them
-    Oauth {
-        slug: String,
-        /// End one sign-in by its id, or all with "all"
-        #[arg(long, value_name = "ID")]
-        revoke: Option<String>,
-    },
-    /// Delete an account with all its files and its note text (also ends its OAuth sign-ins)
+    /// Delete an account with all its files and its note text
     Remove {
         slug: String,
         /// Confirm the deletion
@@ -1573,38 +1566,6 @@ fn account_command(data: &Path, action: AccountAction) -> Result<ExitCode> {
                 );
             }
         }
-        AccountAction::Oauth { slug, revoke } => {
-            if accounts.get(&slug)?.is_none() {
-                return Err(anyhow!("account {slug} does not exist"));
-            }
-            match revoke.as_deref() {
-                Some(id) => {
-                    let n =
-                        notedown_mcp_http::revoke_grants(data, &slug, (id != "all").then_some(id))?;
-                    if n == 0 && id != "all" {
-                        return Err(anyhow!("account {slug} has no OAuth sign-in {id}"));
-                    }
-                    println!("revoked {n} OAuth sign-ins");
-                }
-                None => {
-                    let grants = notedown_mcp_http::list_grants(data, &slug)?;
-                    if grants.is_empty() {
-                        println!("no OAuth sign-ins");
-                    }
-                    let offset = notedown_cloud::localtime::local_utc_offset()
-                        .unwrap_or(time::UtcOffset::UTC);
-                    for g in grants {
-                        println!(
-                            "{}\t{}\tsigned in {}\tlast used {}",
-                            g.id,
-                            g.client_name,
-                            local_time(g.created_ms, offset),
-                            local_time(g.used_ms, offset)
-                        );
-                    }
-                }
-            }
-        }
         AccountAction::Remove { slug, yes } => {
             if !yes {
                 return Err(anyhow!(
@@ -1653,7 +1614,7 @@ fn host_ipv4s() -> Vec<std::net::Ipv4Addr> {
 
 fn serve_command(args: ServeArgs) -> Result<ExitCode> {
     use notedown_cloud::Config;
-    use notedown_cloud::server::{AppState, bind, serve_until_with};
+    use notedown_cloud::server::{AppState, bind, serve_until};
     let (mut config, config_warnings) = Config::load_with_warnings(&args.data)?;
     // The flag counts for this run only; server.toml is not rewritten.
     let capture_from_file = config.capture && !args.capture;
@@ -1722,14 +1683,10 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
             Some(root) => println!("render: {}", root.display()),
             None => println!("render: off"),
         }
-        let mcp = notedown_mcp_http::router(&state)?;
-        match (&mcp, config.mcp.enabled, config.external_base_url.as_deref()) {
-            (Some(_), _, Some(url)) => println!("mcp: {}/mcp", url.trim_end_matches('/')),
-            (None, false, _) => println!("mcp: off ([mcp] enabled = false)"),
-            (None, true, Some(url)) if has_path(url) => {
-                println!("mcp: off (external_base_url must have no path)")
-            }
-            _ => println!("mcp: off (needs an https external_base_url)"),
+        if config.mcp.is_some() {
+            println!(
+                "mcp: [mcp] in server.toml is ignored; MCP runs on the pipeline machine over stdio (notedown mcp)"
+            );
         }
         println!("watch: {}", if config.watch { "on" } else { "off" });
         if config.recycle_prune {
@@ -1769,13 +1726,7 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
         }
         println!("press Ctrl-C to stop");
         std::io::stdout().flush()?;
-        let served = serve_until_with(
-            listeners,
-            state.clone(),
-            mcp.unwrap_or_default(),
-            shutdown.wait(),
-        )
-        .await;
+        let served = serve_until(listeners, state.clone(), shutdown.wait()).await;
         drop(guard);
         served?;
         println!("stopped");
@@ -2112,12 +2063,6 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
-}
-
-/// Whether an `https://` base URL has a path (one trailing `/` is no path).
-fn has_path(url: &str) -> bool {
-    url.strip_prefix("https://")
-        .is_some_and(|rest| rest.strip_suffix('/').unwrap_or(rest).contains('/'))
 }
 
 #[cfg(test)]

@@ -682,20 +682,6 @@ fn account_remove_waits_for_the_store_lock_first() {
 }
 
 #[test]
-fn set_password_deletes_the_oauth_grants() {
-    let dir = tempfile::tempdir().unwrap();
-    let accounts = notedown_cloud::auth::Accounts::new(dir.path());
-    accounts.create("anna", "anna@example.com", "pw1").unwrap();
-    let oauth = accounts
-        .account_dir("anna")
-        .join(notedown_cloud::auth::OAUTH_DIR);
-    std::fs::create_dir_all(&oauth).unwrap();
-    std::fs::write(oauth.join("g.json"), "{}").unwrap();
-    accounts.set_password("anna", "pw2").unwrap();
-    assert!(!oauth.exists());
-}
-
-#[test]
 fn a_device_record_of_a_removed_account_is_no_account_and_creates_nothing() {
     let d = data();
     let accounts = Accounts::new(d.path());

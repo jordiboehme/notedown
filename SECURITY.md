@@ -19,9 +19,9 @@ Only the latest release gets security fixes. Please check that the problem still
 `notedown serve` is the Private Cloud of a Supernote device. It speaks plain HTTP and is made for the home network:
 
 - Don't expose it to the internet directly. Use a VPN, or a reverse proxy with TLS, to reach it from outside.
-- The MCP endpoint for claude.ai is the one part that is made for the internet. notedown serves it only when `external_base_url` is an `https://` address. Put it behind a reverse proxy with TLS that forwards only `/mcp`, `/oauth/` and `/.well-known/` from the internet. The device API stays on the home network. [Getting started](docs/getting-started.md) shows the setup.
+- MCP is local over stdio only (`notedown mcp`). The server has no MCP endpoint and no sign-in page.
 
-A way to read or change the files of an account without its password, to get past a sign-in, or to reach the device API through the MCP setup above is a security problem.
+A way to read or change the files of an account without its password, or to get past a sign-in, is a security problem.
 
 ## How notedown treats .note files
 

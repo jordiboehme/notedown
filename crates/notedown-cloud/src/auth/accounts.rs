@@ -10,8 +10,6 @@ use time::format_description::well_known::Rfc3339;
 use crate::fsutil::{fsync_dir, is_same_file, json_bytes, write_atomic};
 use crate::{Error, Result, io_err};
 
-/// The folder of an account's OAuth grants (`notedown-mcp-http`). A new password deletes it.
-pub const OAUTH_DIR: &str = "oauth";
 /// `<data>/pipeline/<slug>`: the note text of an account (`notedown-pipeline`). It belongs to
 /// the account: `remove` deletes it and `create` drops one that was left.
 pub const PIPELINE_DIR: &str = "pipeline";
@@ -225,18 +223,13 @@ impl Accounts {
         if self.get(slug)?.is_some() {
             return Err(Error::AccountExists(slug.to_string()));
         }
-        // A folder without `account.json` is reused. OAuth grants left in it, and a note text
-        // store of the same slug, belong to a removed account: delete them, so its tokens never
-        // work for the new one and its notes never show up in it.
-        for left in [
-            self.account_dir(slug).join(OAUTH_DIR),
-            self.pipeline.join(slug),
-        ] {
-            match std::fs::remove_dir_all(&left) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(io_err(&left)(e)),
-            }
+        // A folder without `account.json` is reused. A note text store of the same slug
+        // belongs to a removed account: delete it, so its notes never show up in the new one.
+        let left = self.pipeline.join(slug);
+        match std::fs::remove_dir_all(&left) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err(&left)(e)),
         }
         self.save(&account)?;
         Ok(account)
@@ -335,14 +328,7 @@ impl Accounts {
         account.locked = false;
         account.locked_at_ms = None;
         account.failed_logins = 0;
-        self.save(&account)?;
-        // A new password ends every OAuth sign-in of the account.
-        let oauth = self.account_dir(slug).join(OAUTH_DIR);
-        match std::fs::remove_dir_all(&oauth) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(io_err(&oauth)(e)),
-        }
+        self.save(&account)
     }
 
     /// All accounts, sorted by slug. Folders without an `account.json` are skipped.
@@ -547,20 +533,6 @@ mod tests {
         );
         drop(got);
         other.try_lock().unwrap();
-    }
-
-    #[test]
-    fn create_over_a_leftover_folder_drops_its_oauth_grants() {
-        let dir = tempfile::tempdir().unwrap();
-        let accounts = Accounts::new(dir.path());
-        let oauth = accounts.account_dir("anna").join(OAUTH_DIR);
-        std::fs::create_dir_all(&oauth).unwrap();
-        std::fs::write(oauth.join("0123.json"), "{}").unwrap();
-        accounts.create("anna", "anna@example.org", "pw").unwrap();
-        assert!(!oauth.exists());
-        assert!(accounts.get("anna").unwrap().is_some());
-        // The account lock works for the new account.
-        drop(accounts.lock("anna").unwrap());
     }
 
     fn tombstones(accounts: &Accounts) -> Vec<String> {

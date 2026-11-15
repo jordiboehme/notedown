@@ -11,8 +11,7 @@ use subtle::ConstantTimeEq;
 
 pub use accounts::{
     ACCOUNT_FILE, Account, AccountLock, Accounts, AppDataImported, DEFAULT_QUOTA_BYTES, Imported,
-    LOCK_COOLDOWN_MS, LOCK_FILE, MAX_FAILED_LOGINS, OAUTH_DIR, PIPELINE_DIR, md5_hex,
-    validate_slug,
+    LOCK_COOLDOWN_MS, LOCK_FILE, MAX_FAILED_LOGINS, PIPELINE_DIR, md5_hex, validate_slug,
 };
 pub use codes::{CODE_LEN, CODE_TTL_MS, LoginCodes, MAX_PENDING_CODES};
 pub use token::{Claims, Device, Devices, KEY_FILE, TokenKey};

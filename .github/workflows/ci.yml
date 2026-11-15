@@ -23,7 +23,7 @@ jobs:
   # Decides whether the Rust jobs run. They are skipped (reported as skipped,
   # not failed) when the change touches documentation only: root-level *.md,
   # docs/**, release-notes/**, LICENSE, NOTICE, .github/*.md,
-  # .github/ISSUE_TEMPLATE/** and .github/FUNDING.yml.
+  # .github/badges/**, .github/ISSUE_TEMPLATE/** and .github/FUNDING.yml.
   #
   # Everything else counts as code, including .github/workflows/** (a
   # workflow change has to exercise itself) and markdown deeper in the tree.
@@ -110,7 +110,7 @@ jobs:
               .github/workflows/*) verdict=code ;;
               docs/*|release-notes/*) verdict=docs ;;
               LICENSE|LICENSE.md|LICENSE.txt|NOTICE) verdict=docs ;;
-              .github/ISSUE_TEMPLATE/*|.github/FUNDING.yml|.github/*.md) verdict=docs ;;
+              .github/badges/*|.github/ISSUE_TEMPLATE/*|.github/FUNDING.yml|.github/*.md) verdict=docs ;;
               */*)                 verdict=code ;;
               *.md)                verdict=docs ;;
               *)                   verdict=code ;;

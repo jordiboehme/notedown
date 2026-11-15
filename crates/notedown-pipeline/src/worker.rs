@@ -8,6 +8,12 @@
 //! - This file holds the queue (order, settle time), the model (loaded when a page is due,
 //!   unloaded after `model_idle`) and the loop over the journal.
 //!
+//! Two roots: the server's data is read only through [`ServerData`] (`setup.source`), and the
+//! worker's own data (text stores, the writer lock, one journal cursor per account) is in the
+//! local folder (`setup.local`). On one machine both are the same folder. Every error of the
+//! source means "nothing known": the account is skipped and looked at again, its cursor stays,
+//! and no note counts as deleted.
+//!
 //! Settle time: the time of a note's last page change is the mtime of its page record. The
 //! server writes the record only when the note's bytes change (or the note moves), right
 //! before the journal append of that change, so it is there for every note, also without
@@ -16,29 +22,32 @@
 mod due;
 mod note;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use notedown_cloud::appdata::Digest;
-use notedown_cloud::auth::Accounts;
-use notedown_cloud::journal::Journal;
 use notedown_ocr::{OcrEngine, OcrError};
 
 pub use due::{AccountStore, DueNote, KeywordCache, due};
 
+use crate::cursor;
 use crate::errors::Errors;
 use crate::records;
 use crate::retention;
 use crate::scope::in_scope;
+use crate::setup::Setup;
+use crate::source::{ServerAccount, ServerData};
 use crate::store::{TextStore, WriterLock};
-use crate::{Error, PipelineConfig, Result};
+use crate::{Error, Result};
 use note::{Mode, NoteJob};
 
-/// The journal consumer name of the worker: `journal/consumers/pipeline.cursor`.
+/// The consumer name of the one cursor that one machine kept before the per-account cursors
+/// (`journal/consumers/pipeline.cursor`). It is only read, to take its place over.
 pub const CONSUMER: &str = "pipeline";
+/// The most journal lines read in one go; more are read before the worker sleeps.
+const JOURNAL_PAGE: usize = 10_000;
 /// How often a missing model is looked for again.
 pub const MODEL_RETRY: Duration = Duration::from_secs(10 * 60);
 /// How often the continuous worker looks at the journal.
@@ -167,11 +176,21 @@ pub struct Progress {
     pub next_due: Option<u64>,
 }
 
-/// The OCR worker of one data folder. Every call that writes takes the writer lock
-/// (`<data>/pipeline/.writer.lock`) for its duration.
+/// Where the worker is in the journal of one account.
+struct Follow {
+    /// The last `seq` read, taken before each pass.
+    read: u64,
+    /// The cursor in the local folder; `None` when there is no cursor file yet.
+    saved: Option<u64>,
+}
+
+/// Where the worker's own messages go.
+pub type Messages = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// The OCR worker of one pipeline. Every call that writes takes the writer lock
+/// (`<local>/pipeline/.writer.lock`) for its duration.
 pub struct Worker {
-    data: PathBuf,
-    cfg: PipelineConfig,
+    setup: Setup,
     engine: EngineSlot,
     clock: Arc<dyn Clock>,
     /// The pages already reported as missing from their note file, so each is told once
@@ -179,20 +198,22 @@ pub struct Worker {
     told_missing: RefCell<BTreeSet<String>>,
     /// The keywords of notes out of scope, so the keyword scope parses each note once.
     keywords: RefCell<KeywordCache>,
+    say: Messages,
+    /// The last message said per topic, so a failure that repeats is said once.
+    said: RefCell<BTreeMap<String, String>>,
 }
 
 impl Worker {
     /// A worker with a loaded `engine`.
-    pub fn new(data: &Path, cfg: PipelineConfig, engine: Box<dyn OcrEngine>) -> Worker {
-        Worker::with_engine(data, cfg, Engine::Fixed(engine))
+    pub fn new(setup: &Setup, engine: Box<dyn OcrEngine>) -> Worker {
+        Worker::with_engine(setup, Engine::Fixed(engine))
     }
 
     /// A worker that loads the model with `loader` when a page is due and unloads it after
     /// `model_idle` without work.
-    pub fn with_loader(data: &Path, cfg: PipelineConfig, loader: EngineLoader) -> Worker {
+    pub fn with_loader(setup: &Setup, loader: EngineLoader) -> Worker {
         Worker::with_engine(
-            data,
-            cfg,
+            setup,
             Engine::Lazy {
                 loader,
                 loaded: None,
@@ -200,10 +221,9 @@ impl Worker {
         )
     }
 
-    fn with_engine(data: &Path, cfg: PipelineConfig, engine: Engine) -> Worker {
+    fn with_engine(setup: &Setup, engine: Engine) -> Worker {
         Worker {
-            data: data.to_path_buf(),
-            cfg,
+            setup: setup.clone(),
             engine: EngineSlot {
                 engine,
                 retry_at: 0,
@@ -212,6 +232,8 @@ impl Worker {
             clock: Arc::new(SystemClock),
             told_missing: RefCell::default(),
             keywords: RefCell::default(),
+            say: Arc::new(|m: &str| eprintln!("{m}")),
+            said: RefCell::default(),
         }
     }
 
@@ -221,27 +243,60 @@ impl Worker {
         self
     }
 
+    /// Sends the worker's own messages (accounts, journals, cursors, failed passes) to `say`
+    /// instead of stderr. The messages of single pages stay on stderr.
+    pub fn with_messages(mut self, say: Messages) -> Worker {
+        self.say = say;
+        self
+    }
+
     /// Whether the model is loaded now.
     pub fn model_loaded(&self) -> bool {
         self.engine.loaded()
     }
 
+    fn say(&self, message: &str) {
+        (self.say)(message);
+    }
+
+    /// Says `message` unless it is the last one said on `topic`.
+    fn say_once(&self, topic: &str, message: String) {
+        let mut said = self.said.borrow_mut();
+        if said.get(topic) != Some(&message) {
+            (self.say)(&message);
+            said.insert(topic.to_string(), message);
+        }
+    }
+
+    /// `topic` is fine again: its next failure is said.
+    fn settled(&self, topic: &str) {
+        self.said.borrow_mut().remove(topic);
+    }
+
+    /// The accounts the worker follows. The one place this set is made.
+    fn followed(&self) -> Result<Vec<ServerAccount>> {
+        self.setup.served()
+    }
+
     /// One pass over all accounts: the due notes whose settle time is over (all of them with
     /// `ignore_settle`), page by page, each page written at once.
     pub fn run_once(&mut self, ignore_settle: bool) -> Result<Progress> {
-        let lock = WriterLock::take(&self.data)?;
+        let lock = WriterLock::take(&self.setup.local)?;
+        let accounts = self.followed()?;
         let mut stores = BTreeMap::new();
-        self.pass(&lock, &mut stores, ignore_settle, &|| false)
+        let (progress, _) = self.pass(&lock, &mut stores, &accounts, ignore_settle, &|| false)?;
+        Ok(progress)
     }
 
     /// Reads note `note` (a key or a wire path) or, with `None`, every note in scope again,
     /// with the whole page as the change region. Changed text gives normal versions.
     pub fn reocr(&mut self, note: Option<&str>) -> Result<Progress> {
-        let lock = WriterLock::take(&self.data)?;
+        let lock = WriterLock::take(&self.setup.local)?;
+        let source = self.setup.source.clone();
         let mut progress = Progress::default();
         let mut found = false;
-        for slug in self.slugs()? {
-            let text = TextStore::open_writer(&self.data, &slug, &lock)?;
+        for slug in self.followed()?.into_iter().map(|a| a.slug) {
+            let text = TextStore::open_writer(&self.setup.local, &slug, &lock)?;
             let store = AccountStore {
                 text: &text,
                 lock: &lock,
@@ -249,15 +304,15 @@ impl Worker {
             let now = self.clock.now_ms();
             // Note changes (moves, scope) first, so the states are current.
             due(
-                &self.data,
+                &*source,
                 &slug,
                 &store,
-                &self.cfg,
+                &self.setup.cfg,
                 &mut self.keywords.borrow_mut(),
                 now,
             )?;
-            let recs = records::read(&self.data, &slug)?;
-            let digests = records::digests(&self.data, &slug)?;
+            let recs = source.records(&slug)?;
+            let digests = source.digests(&slug)?;
             for (key, rec) in &recs.records {
                 let r = &rec.record;
                 if note.is_some_and(|n| n != key && n != r.path) {
@@ -268,7 +323,7 @@ impl Worker {
                     .as_ref()
                     .map(|s| s.meta.keywords.clone())
                     .unwrap_or_default();
-                if !in_scope(&self.cfg, &r.path, &words) {
+                if !in_scope(&self.setup.cfg, &r.path, &words) {
                     continue;
                 }
                 found = true;
@@ -281,7 +336,7 @@ impl Worker {
                 };
                 let clock = self.clock.clone();
                 let job = NoteJob {
-                    data: &self.data,
+                    source: &*source,
                     slug: &slug,
                     store,
                     records: &recs.records,
@@ -289,6 +344,7 @@ impl Worker {
                     now: &|| clock.now_ms(),
                     mode: Mode::Reocr,
                     told_missing: &self.told_missing,
+                    unsure: &Cell::new(false),
                 };
                 note::process(
                     &job,
@@ -312,11 +368,12 @@ impl Worker {
         Ok(progress)
     }
 
-    /// The continuous worker: tails the journal with the cursor `pipeline`, looks at the
-    /// records at start, after each journal batch, when a settle time or retry ends and every
-    /// 10 minutes, and reads what is due. The model is unloaded after `model_idle` without
-    /// work. After each pass it prunes the text log of every account (at most once a day,
-    /// spec 2.4). Returns when `stop` says so; it is asked between pages too.
+    /// The continuous worker: follows the journal of every followed account, each with its
+    /// own cursor in the local folder; looks at the records at start, after new journal lines,
+    /// when a settle time or retry ends and every 10 minutes, and reads what is due. The model
+    /// is unloaded after `model_idle` without work. After each pass it prunes the text log of
+    /// every account (at most once a day, spec 2.4). Returns when `stop` says so; it is asked
+    /// between pages too.
     pub fn run(&mut self, stop: impl Fn() -> bool) -> Result<()> {
         self.run_with_start(|| {}, stop)
     }
@@ -328,75 +385,66 @@ impl Worker {
         started: impl FnOnce(),
         stop: impl Fn() -> bool,
     ) -> Result<()> {
-        let lock = WriterLock::take(&self.data)?;
+        let lock = WriterLock::take(&self.setup.local)?;
         started();
         // A failing prune is said at most once a day per account.
         let mut prune_warned: BTreeMap<String, u64> = BTreeMap::new();
-        let journal = Journal::open_no_create(&self.data);
-        let mut done = journal.cursor(CONSUMER)?.map_or(0, |c| c.seq);
-        let mut tail = journal.tail(done + 1);
+        let mut follows: BTreeMap<String, Follow> = BTreeMap::new();
         let mut stores = BTreeMap::new();
         let mut look = true;
         let mut next_wake = 0u64;
-        let mut warned: Option<String> = None;
         loop {
-            if journal.dir().is_dir() {
-                match tail.next_batch() {
-                    Ok(batch) => {
-                        look |= !batch.is_empty();
-                        warned = None;
+            match self.followed() {
+                // Nothing known: no pass, no cursor moves; asked again at the next poll.
+                Err(e) => self.say_once(
+                    "accounts",
+                    format!("notedown pipeline: {}: {e}", self.setup.source.describe()),
+                ),
+                Ok(accounts) => {
+                    self.settled("accounts");
+                    for a in &accounts {
+                        look |= self.follow(&a.slug, &mut follows);
                     }
-                    Err(e) => {
-                        let message = e.to_string();
-                        if warned.as_ref() != Some(&message) {
-                            eprintln!("notedown pipeline: journal: {message}");
-                            warned = Some(message);
-                        }
-                    }
-                }
-            }
-            let now = self.clock.now_ms();
-            if look || now >= next_wake {
-                look = false;
-                let seen = tail.next_seq().saturating_sub(1);
-                let result = self.pass(&lock, &mut stores, false, &stop);
-                let now = self.clock.now_ms();
-                next_wake = now + RESCAN_MS;
-                match result {
-                    Ok(p) => {
-                        // Old page versions go once a day (the prune's own stamp limits it).
-                        for (slug, text) in stores.iter() {
-                            if let Err(e) =
-                                retention::prune(text, &lock, self.cfg.text_keep_days, now)
-                                && prune_warned
-                                    .get(slug)
-                                    .is_none_or(|&at| now.saturating_sub(at) >= DAY_MS)
-                            {
-                                eprintln!("notedown pipeline: account {slug}: prune: {e}");
-                                prune_warned.insert(slug.clone(), now);
+                    let now = self.clock.now_ms();
+                    if look || now >= next_wake {
+                        look = false;
+                        // Taken before the pass, so an event that comes during a long pass is
+                        // read next time and not skipped.
+                        let seen: Vec<(String, u64)> = accounts
+                            .iter()
+                            .filter_map(|a| follows.get(&a.slug).map(|f| (a.slug.clone(), f.read)))
+                            .collect();
+                        let result = self.pass(&lock, &mut stores, &accounts, false, &stop);
+                        let now = self.clock.now_ms();
+                        next_wake = now + RESCAN_MS;
+                        match result {
+                            Ok((p, unsure)) => {
+                                self.prune(&lock, &stores, &mut prune_warned, now);
+                                if let Some(t) = p.next_due {
+                                    next_wake = next_wake.min(t.max(now));
+                                }
+                                if !unsure.is_empty() {
+                                    next_wake = next_wake.min(now + ERROR_WAIT_MS);
+                                }
+                                for (slug, seq) in seen {
+                                    if !unsure.contains(&slug) {
+                                        self.save_cursor(&slug, seq, &mut follows);
+                                    }
+                                }
+                            }
+                            Err(Error::ModelMissing) => {
+                                next_wake = next_wake.min(self.engine.retry_at.max(now));
+                            }
+                            Err(e) => {
+                                self.say(&format!("notedown pipeline: {e}"));
+                                next_wake = now + ERROR_WAIT_MS;
                             }
                         }
-                        if let Some(t) = p.next_due {
-                            next_wake = next_wake.min(t.max(now));
-                        }
-                        if seen > done {
-                            match journal.set_cursor(CONSUMER, seen) {
-                                Ok(_) => done = seen,
-                                Err(e) => eprintln!("notedown pipeline: journal cursor: {e}"),
-                            }
-                        }
-                    }
-                    Err(Error::ModelMissing) => {
-                        next_wake = next_wake.min(self.engine.retry_at.max(now));
-                    }
-                    Err(e) => {
-                        eprintln!("notedown pipeline: {e}");
-                        next_wake = now + ERROR_WAIT_MS;
                     }
                 }
             }
             self.engine
-                .unload_if_idle(self.clock.now_ms(), self.cfg.model_idle);
+                .unload_if_idle(self.clock.now_ms(), self.setup.cfg.model_idle);
             if stop() {
                 return Ok(());
             }
@@ -404,44 +452,147 @@ impl Worker {
         }
     }
 
-    fn slugs(&self) -> Result<Vec<String>> {
-        Ok(Accounts::new(&self.data)
-            .list()?
-            .into_iter()
-            .map(|a| a.slug)
-            .collect())
+    /// Old page versions go once a day (the prune's own stamp limits it).
+    fn prune(
+        &self,
+        lock: &WriterLock,
+        stores: &BTreeMap<String, TextStore>,
+        warned: &mut BTreeMap<String, u64>,
+        now: u64,
+    ) {
+        for (slug, text) in stores.iter() {
+            if let Err(e) = retention::prune(text, lock, self.setup.cfg.text_keep_days, now)
+                && warned
+                    .get(slug)
+                    .is_none_or(|&at| now.saturating_sub(at) >= DAY_MS)
+            {
+                self.say(&format!("notedown pipeline: account {slug}: prune: {e}"));
+                warned.insert(slug.clone(), now);
+            }
+        }
+    }
+
+    /// Where account `slug` starts in its journal: its cursor; else, on one machine, the old
+    /// cursor of all accounts (only read, so an update does not read the whole journal again);
+    /// else the start.
+    fn start(&self, slug: &str) -> Result<Follow> {
+        let saved = cursor::load(&self.setup.local, slug)?;
+        let read = match saved {
+            Some(seq) => seq,
+            // An old cursor that cannot be read only costs a full read of the journal.
+            None if !self.setup.two_machines => {
+                cursor::old(&self.setup.local).ok().flatten().unwrap_or(0)
+            }
+            None => 0,
+        };
+        Ok(Follow { read, saved })
+    }
+
+    /// Reads the new journal lines of account `slug`, page by page to the end, and tells
+    /// whether any of them is about the account. A source without an answer leaves the
+    /// position as it is. A journal that ends before the position (the server's journal was
+    /// started again) is read again from the start.
+    fn follow(&self, slug: &str, follows: &mut BTreeMap<String, Follow>) -> bool {
+        let topic = format!("journal:{slug}");
+        if !follows.contains_key(slug) {
+            match self.start(slug) {
+                Ok(f) => {
+                    follows.insert(slug.to_string(), f);
+                }
+                Err(e) => {
+                    self.say_once(&topic, format!("notedown pipeline: account {slug}: {e}"));
+                    return false;
+                }
+            }
+        }
+        let f = follows.get_mut(slug).expect("inserted above");
+        let mut changed = false;
+        loop {
+            let batch = match self.setup.source.journal(slug, f.read + 1, JOURNAL_PAGE) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.say_once(
+                        &topic,
+                        format!("notedown pipeline: account {slug}: journal: {e}"),
+                    );
+                    return changed;
+                }
+            };
+            self.settled(&topic);
+            // An end of 0 is "nothing known" (no journal, or a share that is not mounted).
+            if batch.end > 0 && batch.end < f.read {
+                self.say(&format!(
+                    "notedown pipeline: the journal of {slug} ends at {}, before this \
+                     pipeline's position {}; reading it again from the start",
+                    batch.end, f.read
+                ));
+                f.read = 0;
+                changed = true;
+                continue;
+            }
+            changed |= batch.changed;
+            f.read = f.read.max(batch.next.saturating_sub(1));
+            if !batch.more {
+                return changed;
+            }
+        }
+    }
+
+    /// Writes the cursor of account `slug` after a good pass, when it moved or has no file.
+    fn save_cursor(&self, slug: &str, seq: u64, follows: &mut BTreeMap<String, Follow>) {
+        let Some(f) = follows.get_mut(slug) else {
+            return;
+        };
+        if f.saved == Some(seq) {
+            return;
+        }
+        let topic = format!("cursor:{slug}");
+        match cursor::write(&self.setup.local, slug, seq) {
+            Ok(()) => {
+                f.saved = Some(seq);
+                self.settled(&topic);
+            }
+            Err(e) => self.say_once(
+                &topic,
+                format!("notedown pipeline: account {slug}: journal cursor: {e}"),
+            ),
+        }
     }
 
     /// One pass: the due notes of every account in one queue. Notes with text go first, the
     /// one whose settle time ended first at the front; then notes without any text yet (the
     /// first run), newest first, with progress on stderr. An account that fails is reported
-    /// and skipped; a missing model ends the pass.
+    /// (once while it keeps failing) and skipped; a missing model ends the pass. Also gives
+    /// the accounts that were not looked at fully, whose cursors must stay.
     fn pass(
         &mut self,
         lock: &WriterLock,
         stores: &mut BTreeMap<String, TextStore>,
+        accounts: &[ServerAccount],
         ignore_settle: bool,
         stop: &dyn Fn() -> bool,
-    ) -> Result<Progress> {
+    ) -> Result<(Progress, BTreeSet<String>)> {
         let now = self.clock.now_ms();
-        let settle = self.cfg.ocr_settle.as_millis() as u64;
+        let settle = self.setup.cfg.ocr_settle.as_millis() as u64;
+        let source: Arc<dyn ServerData> = self.setup.source.clone();
         let mut progress = Progress::default();
         let mut queue: Vec<(String, DueNote)> = Vec::new();
         let mut recs: BTreeMap<String, (records::Records, Vec<Digest>)> = BTreeMap::new();
         let mut next_due: Option<u64> = None;
-        for slug in self.slugs()? {
+        let mut unsure: BTreeSet<String> = BTreeSet::new();
+        for slug in accounts.iter().map(|a| a.slug.clone()) {
             let found = (|| -> Result<Vec<DueNote>> {
                 if !stores.contains_key(&slug) {
-                    let text = TextStore::open_writer(&self.data, &slug, lock)?;
+                    let text = TextStore::open_writer(&self.setup.local, &slug, lock)?;
                     stores.insert(slug.clone(), text);
                 }
                 let text = &stores[&slug];
                 let store = AccountStore { text, lock };
                 let notes = due(
-                    &self.data,
+                    &*source,
                     &slug,
                     &store,
-                    &self.cfg,
+                    &self.setup.cfg,
                     &mut self.keywords.borrow_mut(),
                     now,
                 )?;
@@ -450,19 +601,21 @@ impl Worker {
                 }
                 recs.insert(
                     slug.clone(),
-                    (
-                        records::read(&self.data, &slug)?,
-                        records::digests(&self.data, &slug)?,
-                    ),
+                    (source.records(&slug)?, source.digests(&slug)?),
                 );
                 Ok(notes)
             })();
+            let topic = format!("account:{slug}");
             let notes = match found {
-                Ok(n) => n,
+                Ok(n) => {
+                    self.settled(&topic);
+                    n
+                }
                 Err(e) => {
-                    eprintln!("notedown pipeline: account {slug}: {e}");
+                    self.say_once(&topic, format!("notedown pipeline: account {slug}: {e}"));
                     // A failed write blocks the store until a repair: open it again next time.
                     stores.remove(&slug);
+                    unsure.insert(slug);
                     continue;
                 }
             };
@@ -509,8 +662,9 @@ impl Worker {
             let (Some(text), Some((r, digests))) = (stores.get(slug), recs.get(slug)) else {
                 continue;
             };
+            let note_unsure = Cell::new(false);
             let job = NoteJob {
-                data: &self.data,
+                source: &*source,
                 slug,
                 store: AccountStore { text, lock },
                 records: &r.records,
@@ -518,25 +672,40 @@ impl Worker {
                 now: &now_fn,
                 mode: Mode::Due,
                 told_missing: &self.told_missing,
+                unsure: &note_unsure,
             };
-            match note::process(&job, &mut self.engine, d, &mut progress, &mut report, stop) {
+            let done = note::process(&job, &mut self.engine, d, &mut progress, &mut report, stop);
+            if note_unsure.get() {
+                unsure.insert(slug.clone());
+            }
+            match done {
                 Ok(()) => {}
                 Err(Error::ModelMissing) => return Err(Error::ModelMissing),
                 Err(e) => {
-                    eprintln!("notedown pipeline: {}: {e}", d.path);
+                    self.say_once(
+                        &format!("note:{slug}"),
+                        format!("notedown pipeline: {}: {e}", d.path),
+                    );
                     broken.push(slug.clone());
                 }
             }
         }
-        // A failed write blocks the store until a repair: open it again next pass.
+        for a in accounts {
+            if !broken.contains(&a.slug) {
+                self.settled(&format!("note:{}", a.slug));
+            }
+        }
+        // A failed write blocks the store until a repair: open it again next pass. Such an
+        // account (or one whose record the source could not give) keeps its cursor.
         for slug in broken {
             stores.remove(&slug);
+            unsure.insert(slug);
         }
         let end = self.clock.now_ms();
         for text in stores.values() {
             text.set_last_run(lock, end)?;
         }
         progress.next_due = next_due;
-        Ok(progress)
+        Ok((progress, unsure))
     }
 }

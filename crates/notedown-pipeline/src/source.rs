@@ -201,7 +201,11 @@ impl ServerData for FolderSource {
                 });
             }
         }
-        batch.end = batch.end.max(batch.next.saturating_sub(1));
+        // Only a `seq` that was read raises the end, never the position asked for: a cursor
+        // ahead of the journal must be seen as such.
+        if read > 0 {
+            batch.end = batch.end.max(batch.next.saturating_sub(1));
+        }
         Ok(batch)
     }
 }

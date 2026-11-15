@@ -1,5 +1,6 @@
 //! The page records of an account (`accounts/<slug>/pages/<key>.json`) and its note files,
-//! read straight from disk.
+//! read straight from disk. Only [`crate::source::FolderSource`] reads them this way; the worker
+//! goes through [`crate::source::ServerData`].
 //!
 //! The pipeline never writes below `accounts/`, so it does not open a `notedown_cloud` `Store`
 //! (opening one probes the folder with a temp file and compacts `ids.jsonl`). The checks are
@@ -49,7 +50,7 @@ impl Records {
 }
 
 /// `accounts/<slug>`.
-pub fn account_dir(data: &Path, slug: &str) -> PathBuf {
+pub(crate) fn account_dir(data: &Path, slug: &str) -> PathBuf {
     Accounts::new(data).account_dir(slug)
 }
 
@@ -71,7 +72,7 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
 }
 
 /// Reads every page record of account `slug`.
-pub fn read(data: &Path, slug: &str) -> Result<Records> {
+pub(crate) fn read(data: &Path, slug: &str) -> Result<Records> {
     let dir = account_dir(data, slug).join(PAGES_DIR);
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
@@ -100,7 +101,7 @@ pub fn read(data: &Path, slug: &str) -> Result<Records> {
 }
 
 /// The record of `key`, `None` when it is missing or cannot be used.
-pub fn read_key(data: &Path, slug: &str, key: &str) -> Option<Record> {
+pub(crate) fn read_key(data: &Path, slug: &str, key: &str) -> Option<Record> {
     if !valid_key(key) {
         return None;
     }
@@ -143,7 +144,7 @@ fn read_one(path: &Path, key: &str) -> Option<Record> {
 
 /// The live digest items of account `slug`, read from `accounts/<slug>/digests/items/*.json`
 /// (spec 2.1). A file that cannot be read is left out with a warning.
-pub fn digests(data: &Path, slug: &str) -> Result<Vec<Digest>> {
+pub(crate) fn digests(data: &Path, slug: &str) -> Result<Vec<Digest>> {
     let dir = account_dir(data, slug).join(DIGESTS_DIR).join("items");
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
@@ -210,7 +211,7 @@ pub fn digests_of(digests: &[Digest], file_id: Option<&str>, path: &str) -> Vec<
 }
 
 /// The file of the note at wire `path`: `accounts/<slug>/files/<path>`.
-pub fn note_file(data: &Path, slug: &str, path: &str) -> Result<PathBuf> {
+pub(crate) fn note_file(data: &Path, slug: &str, path: &str) -> Result<PathBuf> {
     let wire = WirePath::parse(path)?;
     Ok(wire.to_fs(&account_dir(data, slug).join("files")))
 }
@@ -218,7 +219,7 @@ pub fn note_file(data: &Path, slug: &str, path: &str) -> Result<PathBuf> {
 /// Whether the note file at wire `path` is missing: it is not there, and the account's
 /// `files/` folder is. Any other error (a folder in its place, no access) is no answer, and
 /// without `files/` nothing is known, so neither counts as missing.
-pub fn note_missing(data: &Path, slug: &str, path: &str) -> bool {
+pub(crate) fn note_missing(data: &Path, slug: &str, path: &str) -> bool {
     let Ok(file) = note_file(data, slug, path) else {
         return false;
     };

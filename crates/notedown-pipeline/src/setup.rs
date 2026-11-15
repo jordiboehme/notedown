@@ -81,6 +81,7 @@ impl LocalConfig {
 }
 
 /// The pipeline's view of both machines.
+#[derive(Clone)]
 pub struct Setup {
     /// The folder of the pipeline's own data: `pipeline/`, the cursors and the lock.
     pub local: PathBuf,

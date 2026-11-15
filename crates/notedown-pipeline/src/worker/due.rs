@@ -2,15 +2,15 @@
 //! `note.unscoped` (spec 2.2, 4.5).
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use notedown_cloud::pages::{PageFingerprint, PageRecord};
 use notedown_note::{Notebook, VersionPolicy};
 
 use crate::errors::{ErrorEntry, Errors};
 use crate::model::{LineChange, LogLine, NoteState, PageOcrState, PageState, title_of};
-use crate::records::{self, Record};
+use crate::records::Record;
 use crate::scope::in_scope;
+use crate::source::{NoteBytes, ServerData};
 use crate::store::{TextStore, WriterLock};
 use crate::{PipelineConfig, Result};
 
@@ -105,6 +105,14 @@ struct Known {
 }
 
 impl KeywordCache {
+    /// The keywords of note `key` of account `slug` when they are known for `md5`.
+    fn known(&self, slug: &str, key: &str, md5: &str) -> Option<Option<Vec<String>>> {
+        self.0
+            .get(&(slug.to_string(), key.to_string()))
+            .filter(|k| k.md5 == md5)
+            .map(|k| k.words.clone())
+    }
+
     /// The keywords of note `key` of account `slug` at `md5`, from `read` only when they are
     /// not known for these bytes.
     fn get_or(
@@ -135,9 +143,10 @@ impl KeywordCache {
 
 /// The device keywords of a note for the scope check: from the state while its bytes are the
 /// ones it was read from, else from the note file (only when `ingest_keyword` is set), read
-/// once per note bytes through `cache`.
+/// once per note bytes through `cache`. A note the source cannot give now keeps the scope it
+/// had and is not remembered, so it is read again next time.
 fn keywords(
-    data: &Path,
+    source: &dyn ServerData,
     slug: &str,
     cfg: &PipelineConfig,
     cache: &mut KeywordCache,
@@ -148,9 +157,16 @@ fn keywords(
     if cfg.ingest_keyword.is_none() || state.is_some_and(|s| s.md5 == rec.md5) {
         return from_state();
     }
+    if let Some(words) = cache.known(slug, key, &rec.md5) {
+        return words.unwrap_or_else(from_state);
+    }
+    let bytes = match source.note(slug, &rec.path) {
+        Ok(NoteBytes::Found(b)) => Some(b),
+        Ok(NoteBytes::Missing) => None,
+        Err(_) => return from_state(),
+    };
     let parsed = cache.get_or(slug, key, &rec.md5, || {
-        let file = records::note_file(data, slug, &rec.path).ok()?;
-        let nb = Notebook::open(&file, VersionPolicy::AllowUnknown).ok()?;
+        let nb = Notebook::from_bytes(bytes?, VersionPolicy::AllowUnknown).ok()?;
         Some(
             nb.keywords
                 .iter()
@@ -176,14 +192,14 @@ fn keywords(
 /// a `new` line per page with text, with its last text, so a consumer that dropped it sees
 /// it again. Notes out of scope without a state get nothing.
 pub fn due(
-    data: &Path,
+    source: &dyn ServerData,
     slug: &str,
     store: &AccountStore,
     cfg: &PipelineConfig,
     cache: &mut KeywordCache,
     now: u64,
 ) -> Result<Vec<DueNote>> {
-    let recs = records::read(data, slug)?;
+    let recs = source.records(slug)?;
     let mut errors = Errors::load(store.text.dir())?;
     let mut states: BTreeMap<String, NoteState> = store
         .text
@@ -210,7 +226,7 @@ pub fn due(
         if let Some((new, rec)) = target {
             let mut state = states.remove(&old).expect("listed above");
             // Same bytes, so the keywords of the state hold.
-            let words = keywords(data, slug, cfg, cache, (&new, &rec), Some(&state));
+            let words = keywords(source, slug, cfg, cache, (&new, &rec), Some(&state));
             let listed = !state.unscoped && in_scope(cfg, &rec.path, &words);
             rekey(store, &mut state, &new, &rec.path, listed)?;
             // The tries of the old key are of no note any more.
@@ -245,7 +261,7 @@ pub fn due(
     for (key, rec) in &recs.records {
         let r = &rec.record;
         let state = states.get_mut(key);
-        let words = keywords(data, slug, cfg, cache, (key, r), state.as_deref());
+        let words = keywords(source, slug, cfg, cache, (key, r), state.as_deref());
         if !in_scope(cfg, &r.path, &words) {
             if let Some(state) = state {
                 leave_scope(store, state)?;
@@ -257,10 +273,13 @@ pub fn due(
         // A note file moved or deleted by hand before the server's scan moved or dropped its
         // record: the note waits for the scan, untouched. A dropped record then gives
         // `note.deleted` above. Looked at only for a note with work, errors, or to bring back,
-        // so an idle note costs no file check.
+        // so an idle note costs no file check. Only a certain "not there" counts; a check that
+        // gives no answer lets the read find out.
         let reviving = state.as_ref().is_some_and(|s| s.deleted || s.unscoped);
         let failing = errors.entries().iter().any(|e| e.note == *key);
-        if (work.is_some() || failing || reviving) && records::note_missing(data, slug, &r.path) {
+        if (work.is_some() || failing || reviving)
+            && matches!(source.note_exists(slug, &r.path), Ok(Some(false)))
+        {
             continue;
         }
         if let Some(s) = state {

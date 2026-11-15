@@ -108,6 +108,11 @@ pub(crate) fn journal_from_a_position(src: &dyn ServerData, d: &Data) {
     assert!(one.changed);
     assert_eq!(one.next, 2);
     assert_eq!(one.end, all.end);
+    // A position past the journal does not raise its end: the caller must see it is ahead.
+    let ahead = src.journal(SLUG, all.end + 100, 10_000).unwrap();
+    assert_eq!(ahead.end, all.end);
+    assert_eq!(ahead.next, all.end + 100);
+    assert!(!ahead.changed);
 }
 
 pub(crate) fn journal_is_per_account(src: &dyn ServerData, d: &Data) {

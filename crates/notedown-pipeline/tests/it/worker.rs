@@ -12,7 +12,9 @@ use notedown_cloud::journal::Journal;
 use notedown_cloud::pages::{PageFingerprint, PageRecord};
 use notedown_ocr::{OcrEngine, OcrError};
 use notedown_pipeline::PipelineConfig;
+use notedown_pipeline::cursor;
 use notedown_pipeline::model::{LineChange, LogLine, NoteState, PageOcrState};
+use notedown_pipeline::setup::Setup;
 use notedown_pipeline::store::TextStore;
 use notedown_pipeline::worker::{Clock, Worker};
 
@@ -147,8 +149,15 @@ pub(crate) fn engine_reading(text: &str) -> FakeEngine {
     FakeEngine::new(HashMap::new()).with_default(&text_block([100, 100, 900, 200], text))
 }
 
+/// One machine: the server's folder is the pipeline's own, with `cfg`.
+pub(crate) fn one_machine(d: &Data, cfg: PipelineConfig) -> Setup {
+    let mut s = Setup::load(&d.data).unwrap();
+    s.cfg = cfg;
+    s
+}
+
 pub(crate) fn worker(d: &Data, cfg: PipelineConfig, engine: FakeEngine) -> Worker {
-    Worker::new(&d.data, cfg, Box::new(engine))
+    Worker::new(&one_machine(d, cfg), Box::new(engine))
 }
 
 pub(crate) fn no_settle() -> PipelineConfig {
@@ -160,10 +169,10 @@ pub(crate) fn no_settle() -> PipelineConfig {
 
 /// A clock the test sets; `sleep` moves it on.
 #[derive(Clone)]
-struct TestClock(Arc<AtomicU64>);
+pub(crate) struct TestClock(Arc<AtomicU64>);
 
 impl TestClock {
-    fn at(ms: u64) -> TestClock {
+    pub(crate) fn at(ms: u64) -> TestClock {
         TestClock(Arc::new(AtomicU64::new(ms)))
     }
     fn set(&self, ms: u64) {
@@ -180,7 +189,7 @@ impl Clock for TestClock {
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
@@ -188,7 +197,7 @@ fn now_ms() -> u64 {
 }
 
 /// Every entry below `dir` with its size and mtime.
-fn tree(dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
+pub(crate) fn tree(dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
     let mut out = Vec::new();
     for e in std::fs::read_dir(dir).unwrap() {
         let e = e.unwrap();
@@ -896,7 +905,7 @@ fn a_missed_journal_event_leaves_no_gap() {
     let last = journal.last_seq().unwrap();
     assert!(last > 0);
     // As if the events of the put were seen already, but never acted on.
-    journal.set_cursor("pipeline", last).unwrap();
+    cursor::write(&d.data, SLUG, last).unwrap();
     let clock = TestClock::at(now_ms());
     let mut w =
         worker(&d, no_settle(), engine_reading("hello")).with_clock(Arc::new(clock.clone()));
@@ -914,7 +923,7 @@ fn a_missed_journal_event_leaves_no_gap() {
     let log = d.log();
     assert_eq!(log.len(), 2);
     assert_eq!(log[1].change, LineChange::Edited);
-    assert_eq!(journal.cursor("pipeline").unwrap().unwrap().seq, last);
+    assert_eq!(cursor::read(&d.data, SLUG).unwrap(), last);
 }
 
 #[test]
@@ -928,7 +937,7 @@ fn the_journal_wakes_the_worker_and_moves_the_cursor() {
     w.run(stop_at(&clock, clock.now_ms() + 1)).unwrap();
     assert_eq!(d.log().len(), 1);
     assert_eq!(
-        journal.cursor("pipeline").unwrap().unwrap().seq,
+        cursor::read(&d.data, SLUG).unwrap(),
         journal.last_seq().unwrap()
     );
 }
@@ -972,7 +981,7 @@ fn loader(
 
 /// A stop that says yes once `clock` reaches `ms`. The test clock stands still during a
 /// pass, so a pass that starts before `ms` runs to its end.
-fn stop_at(clock: &TestClock, ms: u64) -> impl Fn() -> bool + use<> {
+pub(crate) fn stop_at(clock: &TestClock, ms: u64) -> impl Fn() -> bool + use<> {
     let c = clock.clone();
     move || c.now_ms() >= ms
 }
@@ -988,13 +997,13 @@ fn the_model_loads_when_work_is_due_and_unloads_when_idle() {
     let clock = TestClock::at(now_ms());
 
     // No work: no model.
-    let mut w = Worker::with_loader(&d.data, cfg.clone(), loader(loads.clone(), false))
+    let mut w = Worker::with_loader(&one_machine(&d, cfg.clone()), loader(loads.clone(), false))
         .with_clock(Arc::new(clock.clone()));
     w.run(stop_at(&clock, clock.now_ms() + 3000)).unwrap();
     assert_eq!(loads.load(Ordering::SeqCst), 0);
 
     d.put("test1", "NOTE/Note");
-    let mut w = Worker::with_loader(&d.data, cfg.clone(), loader(loads.clone(), false))
+    let mut w = Worker::with_loader(&one_machine(&d, cfg.clone()), loader(loads.clone(), false))
         .with_clock(Arc::new(clock.clone()));
     w.run(stop_at(&clock, clock.now_ms() + 3000)).unwrap();
     assert_eq!(loads.load(Ordering::SeqCst), 1);
@@ -1013,7 +1022,7 @@ fn a_missing_model_waits_and_checks_every_ten_minutes() {
     let key = d.put("test1", "NOTE/Note");
     let loads = Arc::new(AtomicUsize::new(0));
     let clock = TestClock::at(now_ms());
-    let mut w = Worker::with_loader(&d.data, no_settle(), loader(loads.clone(), true))
+    let mut w = Worker::with_loader(&one_machine(&d, no_settle()), loader(loads.clone(), true))
         .with_clock(Arc::new(clock.clone()));
     // 25 minutes of one-second polls: the first try and two more.
     w.run(stop_at(&clock, clock.now_ms() + 25 * 60_000))
@@ -1027,7 +1036,7 @@ fn a_missing_model_waits_and_checks_every_ten_minutes() {
     let state = d.state(&key);
     assert!(state.is_none_or(|s| s.pages.iter().all(|p| p.state == PageOcrState::Pending)));
     // --once reports it as an error.
-    let mut w = Worker::with_loader(&d.data, no_settle(), loader(loads.clone(), true));
+    let mut w = Worker::with_loader(&one_machine(&d, no_settle()), loader(loads.clone(), true));
     assert!(w.run_once(true).is_err());
 }
 

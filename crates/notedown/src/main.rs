@@ -1925,7 +1925,9 @@ fn pipeline_command(args: PipelineArgs) -> Result<ExitCode> {
     if !data.is_dir() {
         return Err(anyhow!("data folder {} does not exist", data.display()));
     }
-    let cfg = notedown_pipeline::PipelineConfig::load(&data)?;
+    // Without <data>/pipeline.toml the server's data is this folder; with it, the folder named
+    // there, and this one keeps only the pipeline's own data.
+    let setup = notedown_pipeline::setup::Setup::load(&data)?;
     // The model is loaded when a page is due, as `notedown convert` loads it.
     let loader: EngineLoader = Box::new(|| {
         let paths = model::resolve(&DEFAULT_MODEL, None, None)?;
@@ -1933,7 +1935,7 @@ fn pipeline_command(args: PipelineArgs) -> Result<ExitCode> {
         let engine = LlamaEngine::load(&paths, OcrOptions::default())?;
         Ok(Box::new(engine) as Box<dyn OcrEngine>)
     });
-    let mut worker = Worker::with_loader(&data, cfg, loader);
+    let mut worker = Worker::with_loader(&setup, loader);
     if args.once || args.reocr {
         let done = if args.reocr {
             worker.reocr(args.note.as_deref())

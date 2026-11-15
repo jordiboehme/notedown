@@ -5,4 +5,5 @@ mod fake_engine;
 mod mcp;
 mod reading;
 mod source;
+mod split;
 mod worker;

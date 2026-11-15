@@ -38,6 +38,8 @@ pub struct AppState {
     pub journal: Journal,
     pub(crate) limiter: RateLimiter,
     pub(crate) retries: RetryTracker,
+    /// When the request log last wrote a REST token refusal, per token id and path.
+    pub(crate) rest_refusals: crate::rest::RefusalLog,
     /// The sync session of each account (`synchronous/start|end`).
     pub sync_locks: SyncLocks,
     /// The live auto-sync socket sessions (pushes are handed to them).
@@ -159,6 +161,7 @@ impl AppState {
             config,
             limiter: RateLimiter::default(),
             retries: RetryTracker::default(),
+            rest_refusals: crate::rest::RefusalLog::default(),
         }))
     }
 

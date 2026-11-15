@@ -217,6 +217,12 @@ impl RestTokens {
         )
     }
 
+    /// The slug and the id a token carries, when its MAC is good; `None` for anything else.
+    /// Touches no file. It says nothing about the token's worth, see [`RestTokens::check`].
+    pub(crate) fn slug_and_id(&self, token: &str) -> Option<(String, String)> {
+        self.key.open(token).map(|p| (p.slug, p.id))
+    }
+
     /// The highest `seq` of an `account.removed` of `slug` with `user_id`, cached: a found one
     /// forever, none for [`NO_REMOVAL_TTL_MS`].
     fn removal(&self, slug: &str, user_id: u64, now_ms: u64) -> Result<Option<u64>> {

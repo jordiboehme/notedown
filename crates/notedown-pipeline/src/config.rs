@@ -39,7 +39,7 @@ impl Default for PipelineConfig {
 
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
-struct Raw {
+pub(crate) struct Raw {
     ocr_settle: Option<String>,
     model_idle: Option<String>,
     text_keep_days: Option<u32>,
@@ -72,8 +72,13 @@ impl PipelineConfig {
         let Some(raw) = file.pipeline else {
             return Ok(PipelineConfig::default());
         };
+        PipelineConfig::from_raw(raw, &path)
+    }
+
+    /// The settings of a `[pipeline]` table; `path` is the file named in an error.
+    pub(crate) fn from_raw(raw: Raw, path: &Path) -> Result<PipelineConfig> {
         let bad = |message: String| Error::Config {
-            path: path.clone(),
+            path: path.to_path_buf(),
             message,
         };
         let mut c = PipelineConfig::default();

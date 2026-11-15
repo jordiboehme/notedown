@@ -1994,11 +1994,7 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
             }
             let slugs = match account {
                 Some(a) => vec![resolve_account(&data, Some(&a))?],
-                None => notedown_cloud::auth::Accounts::new(&data)
-                    .list()?
-                    .into_iter()
-                    .map(|a| a.slug)
-                    .collect(),
+                None => notedown_pipeline::setup::local_accounts(&data)?,
             };
             let local =
                 notedown_cloud::localtime::local_utc_offset().unwrap_or(time::UtcOffset::UTC);

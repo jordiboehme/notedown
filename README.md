@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-reduced-motion: reduce)" srcset="docs/assets/banner-static.svg">
+  <img src="docs/assets/banner.svg" alt="notedown" width="100%">
+</picture>
+
 # notedown
 
 **Your handwriting, readable by machines.**

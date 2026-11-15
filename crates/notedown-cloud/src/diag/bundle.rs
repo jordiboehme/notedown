@@ -231,6 +231,9 @@ fn pipeline_counts(data: &Path, selected: &[String]) -> PipelineCounts {
             .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
             .and_then(|v| v.get("seq")?.as_u64());
         counts.cursors.push((slug.clone(), cursor));
+        if data.join("pipeline").join(slug).is_dir() {
+            counts.stores += 1;
+        }
     }
     for slug in selected {
         let dir = data.join("pipeline").join(slug).join("notes");

@@ -601,6 +601,19 @@ fn diagnose_reads_the_pipeline_cursor_per_account() {
         "{}",
         done.report
     );
+    // A text store without a cursor (a pipeline that has not finished a pass since the
+    // update): the counts stay.
+    write(
+        &fx.data().join("pipeline").join(SLUG).join("notes/F1.json"),
+        br#"{"key":"F1","pages":[{"pageId":"P1","position":0,"state":"failed"},{"pageId":"P2","position":1}]}"#,
+    );
+    let done = diagnose(&opts(&fx, "c.zip")).unwrap();
+    assert!(
+        done.report
+            .contains("Pipeline  cursor none, 1 page pending, 1 failed"),
+        "{}",
+        done.report
+    );
     write(
         &fx.data().join("pipeline").join(format!("{SLUG}.cursor")),
         br#"{"seq":12,"updatedAt":1}"#,
@@ -608,7 +621,7 @@ fn diagnose_reads_the_pipeline_cursor_per_account() {
     let done = diagnose(&opts(&fx, "b.zip")).unwrap();
     assert!(
         done.report
-            .contains("Pipeline  cursor acct-1 12, 0 pages pending, 0 failed"),
+            .contains("Pipeline  cursor acct-1 12, 1 page pending, 1 failed"),
         "{}",
         done.report
     );

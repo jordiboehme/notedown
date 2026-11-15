@@ -45,7 +45,7 @@ subtle = "=2.6.1"
 rpassword = "=7.5.4"
 if-addrs = "=0.15.0"
 axum = { version = "=0.8.9", features = ["ws", "multipart"] }
-tokio = { version = "=1.53.2", features = ["net", "rt-multi-thread", "sync", "time", "signal"] }
+tokio = { version = "=1.53.3", features = ["net", "rt-multi-thread", "sync", "time", "signal"] }
 tower-http = { version = "=0.7.1", features = ["catch-panic"] }
 tower = { version = "=0.5.3", features = ["util"] }
 tokio-tungstenite = "=0.30.0"
@@ -53,7 +53,7 @@ futures-util = { version = "=0.3.34", default-features = false, features = ["std
 unicode-normalization = "=0.1.25"
 unicase = "=2.10.0"
 notify = { version = "=8.2.0", default-features = false, features = ["macos_fsevent"] }
-rmcp = { version = "=3.5.1", default-features = false, features = ["server", "transport-io", "macros"] }
+rmcp = { version = "=3.10.0", default-features = false, features = ["server", "transport-io", "macros"] }
 schemars = "=1.2.2"
 
 # Lean debug builds: our own code keeps line tables (readable backtraces), dependencies carry no

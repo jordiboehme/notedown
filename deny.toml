@@ -33,12 +33,4 @@ ignore = [
     { id = "RUSTSEC-2026-0368", reason = "zip extract only, not called; remove when zip moves to 9" },
     { id = "RUSTSEC-2026-0369", reason = "zip extract only, not called; remove when zip moves to 9" },
     { id = "RUSTSEC-2026-0429", reason = "zip extract only, not called; remove when zip moves to 9" },
-    # tokio =1.53.2. AsyncFd::new is unsound. notedown does not call it.
-    { id = "RUSTSEC-2026-0386", reason = "AsyncFd not used; remove when tokio moves to 1.53.3" },
-    # rmcp =3.5.1. notedown does not use the OAuth client, and the HTTP client only in tests.
-    { id = "RUSTSEC-2026-0457", reason = "rmcp OAuth client not used; remove when rmcp moves to 3.7" },
-    { id = "RUSTSEC-2026-0462", reason = "rmcp HTTP client only in tests; remove when rmcp moves to 3.9" },
-    # This one does apply: notedown-mcp-http serves the streamable HTTP transport, and
-    # `notedown serve` can put it on the internet behind a proxy. Move rmcp to 3.6 or later soon.
-    { id = "RUSTSEC-2026-0461", reason = "applies to the MCP endpoint; remove when rmcp moves to 3.6" },
 ]

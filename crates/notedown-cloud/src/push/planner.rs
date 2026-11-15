@@ -380,6 +380,22 @@ mod tests {
     }
 
     #[test]
+    fn an_account_removed_event_plans_nothing() {
+        let mut p = planner();
+        p.observe(
+            &ev(
+                Origin::Cli,
+                None,
+                1,
+                EventBody::AccountRemoved { user_id: 1_000_001 },
+            ),
+            &targets(),
+            0,
+        );
+        assert!(!is_pending(&p, "A") && !is_pending(&p, "B"));
+    }
+
+    #[test]
     fn a_sync_start_covers_older_events() {
         let mut p = planner();
         p.covered("acc", "B", 10);

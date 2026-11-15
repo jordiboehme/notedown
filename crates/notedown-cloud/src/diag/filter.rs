@@ -928,6 +928,16 @@ mod tests {
     }
 
     #[test]
+    fn an_account_removed_line_keeps_its_user_id() {
+        let mut f = filter();
+        let out = f.journal_line(&json!({"seq": 7, "ts": 2, "account": "jordi",
+            "origin": "cli", "type": "account.removed", "userId": 1000001, "opId": "x"}));
+        assert_eq!(out["userId"], 1000001);
+        assert_eq!(out["type"], "account.removed");
+        assert_eq!(out["account"], "acct-1");
+    }
+
+    #[test]
     fn journal_lines_replace_names_accounts_and_devices() {
         let mut f = filter();
         let line = json!({"seq": 1, "ts": 2, "account": "jordi", "origin": "device", "device": "SN1",

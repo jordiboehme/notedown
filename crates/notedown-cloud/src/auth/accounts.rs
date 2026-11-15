@@ -8,6 +8,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::fsutil::{fsync_dir, is_same_file, json_bytes, write_atomic};
+use crate::journal::{Event, EventBody, Journal, Origin, new_op_id};
 use crate::{Error, Result, io_err};
 
 /// `<data>/pipeline/<slug>`: the note text of an account (`notedown-pipeline`). It belongs to
@@ -369,7 +370,9 @@ impl Accounts {
 
     /// Delete the account folder with everything in it (files, digests, devices), under the
     /// store lock and the account lock, and then the account's note text (`pipeline/<slug>`).
-    pub fn remove(&self, slug: &str) -> Result<()> {
+    /// The `account.removed` event, with the user id, is appended to `journal` first; if that
+    /// fails, nothing is removed.
+    pub fn remove(&self, slug: &str, journal: &Journal) -> Result<()> {
         validate_slug(slug)?;
         self.sweep_tombstones();
         if self.get(slug)?.is_none() {
@@ -381,7 +384,7 @@ impl Accounts {
         // global lock order says. The raw lock works on a damaged store too.
         let _store = crate::store::take_store_lock(&dir, Some(slug))?;
         let _lock = self.lock(slug)?;
-        self.remove_locked(slug)
+        self.remove_locked(slug, journal)
     }
 
     /// The part of [`Accounts::remove`] under both locks. The folder is first renamed to a
@@ -389,8 +392,23 @@ impl Accounts {
     /// every waiter on a lock of it finds its path gone and gets [`Error::NoAccount`], and
     /// nothing can recreate a part of it. Then the tombstone is deleted. A tombstone left by a
     /// crash or a failed delete is swept by the next `remove` and at server start.
-    fn remove_locked(&self, slug: &str) -> Result<()> {
+    fn remove_locked(&self, slug: &str, journal: &Journal) -> Result<()> {
         let dir = self.account_dir(slug);
+        let account = self
+            .get(slug)?
+            .ok_or_else(|| Error::NoAccount(slug.to_string()))?;
+        // The record comes before the removal: a crash in between leaves a live account with
+        // an `account.removed` record, and a reader treats that account as alive.
+        let mut event = [Event::new(
+            slug,
+            Origin::Cli,
+            None,
+            &new_op_id(),
+            EventBody::AccountRemoved {
+                user_id: account.user_id,
+            },
+        )];
+        journal.append(&mut event)?;
         let tomb = self.tombstone(slug, "");
         std::fs::rename(&dir, &tomb).map_err(io_err(&dir))?;
         fsync_dir(&self.root)?;
@@ -474,10 +492,14 @@ mod tests {
         (dir, accounts)
     }
 
+    fn journal_of(dir: &tempfile::TempDir) -> Journal {
+        Journal::open(dir.path()).unwrap()
+    }
+
     #[test]
     fn lock_on_a_removed_account_is_no_account_and_creates_nothing() {
         let (_dir, accounts) = accounts();
-        accounts.remove("anna").unwrap();
+        accounts.remove("anna", &journal_of(&_dir)).unwrap();
         assert!(matches!(accounts.lock("anna"), Err(Error::NoAccount(s)) if s == "anna"));
         assert!(!accounts.account_dir("anna").exists());
     }
@@ -546,7 +568,8 @@ mod tests {
 
     #[test]
     fn remove_with_a_waiter_in_lock_gives_no_account_and_leaves_no_folder() {
-        let (_dir, accounts) = accounts();
+        let (data, accounts) = accounts();
+        let journal = journal_of(&data);
         let dir = accounts.account_dir("anna");
         let _store = crate::store::take_store_lock(&dir, None).unwrap();
         let held = accounts.lock("anna").unwrap();
@@ -556,7 +579,7 @@ mod tests {
         };
         std::thread::sleep(Duration::from_millis(200));
         assert!(!waiter.is_finished());
-        accounts.remove_locked("anna").unwrap();
+        accounts.remove_locked("anna", &journal).unwrap();
         drop(held);
         let got = waiter.join().unwrap();
         assert!(matches!(got, Err(Error::NoAccount(_))), "{got:?}");
@@ -591,7 +614,7 @@ mod tests {
         let tomb = accounts.root.join(format!("{TOMBSTONE_PREFIX}carl-0123"));
         std::fs::create_dir_all(tomb.join("devices")).unwrap();
         std::fs::write(tomb.join("devices/SN1.json"), "{}").unwrap();
-        accounts.remove("bert").unwrap();
+        accounts.remove("bert", &journal_of(&_dir)).unwrap();
         assert!(tombstones(&accounts).is_empty());
 
         std::fs::create_dir_all(tomb.join("files")).unwrap();

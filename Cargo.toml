@@ -20,16 +20,16 @@ thiserror = "=2.0.21"
 anyhow = "=1.0.104"
 base64 = "=0.23.1"
 serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.151"
+serde_json = "=1.0.154"
 image = { version = "=0.25.10", default-features = false, features = ["png"] }
-sha2 = "=0.11.0"
+sha2 = "=0.11.1"
 const-hex = "=1.19.3"
-similar = "=3.2.0"
+similar = "=3.2.1"
 insta = "=1.49.0"
-zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "=9.6.0", default-features = false, features = ["deflate"] }
 pdf-writer = "=0.15.0"
 miniz_oxide = "=0.9.1"
-scraper = "=0.27.0"
+scraper = "=0.29.0"
 dirs = "=7.0.0"
 reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "rustls"] }
 tempfile = "=3.27.0"
@@ -37,24 +37,24 @@ clap = { version = "=4.6.7", features = ["derive"] }
 time = { version = "=0.3.55", features = ["formatting", "parsing", "macros"] }
 # Only for the local UTC offset: it reads the zone data itself, no localtime_r, no child process.
 chrono = { version = "=0.4.45", default-features = false, features = ["clock"] }
-toml = "=1.1.6"
+toml = "=1.2.1"
 hmac = "=0.13.0"
 md-5 = "=0.11.0"
 rand = "=0.10.3"
 subtle = "=2.6.1"
-rpassword = "=7.5.4"
+rpassword = "=7.5.5"
 if-addrs = "=0.15.0"
 axum = { version = "=0.8.9", features = ["ws", "multipart"] }
-tokio = { version = "=1.53.3", features = ["net", "rt-multi-thread", "sync", "time", "signal"] }
+tokio = { version = "=1.54.1", features = ["net", "rt-multi-thread", "sync", "time", "signal"] }
 tower-http = { version = "=0.7.1", features = ["catch-panic"] }
 tower = { version = "=0.5.3", features = ["util"] }
 tokio-tungstenite = "=0.30.0"
 futures-util = { version = "=0.3.34", default-features = false, features = ["std", "sink"] }
-unicode-normalization = "=0.1.25"
+unicode-normalization = "=0.1.26"
 unicase = "=2.10.0"
-notify = { version = "=8.2.0", default-features = false, features = ["macos_fsevent"] }
+notify = { version = "=8.2.2", default-features = false, features = ["macos_fsevent"] }
 rmcp = { version = "=3.10.0", default-features = false, features = ["server", "transport-io", "macros"] }
-schemars = "=1.2.2"
+schemars = "=1.2.3"
 
 # Lean debug builds: our own code keeps line tables (readable backtraces), dependencies carry no
 # debug info. This keeps target/ small and links faster.

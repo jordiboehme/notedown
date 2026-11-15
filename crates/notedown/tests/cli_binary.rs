@@ -2114,7 +2114,7 @@ fn diagnose_reports_the_pipeline_line_and_leaves_its_texts_out() {
     let mut zip = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
     for i in 0..zip.len() {
         let mut f = zip.by_index(i).unwrap();
-        let name = f.name().to_string();
+        let name = f.name().unwrap().into_owned();
         assert!(!name.starts_with("pipeline/"), "{name}");
         let mut body = Vec::new();
         std::io::Read::read_to_end(&mut f, &mut body).unwrap();

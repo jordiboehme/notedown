@@ -230,7 +230,50 @@ Set up the account, the import and the server as in part 2, with the installed `
 - Most Pis have no clock that runs while they are off, so they need NTP after every start (Raspberry Pi OS does this by default). The server signs the upload and download URLs with the time. It refuses a URL that is more than 5 minutes in the future or older than its time limit (30 minutes for uploads and 24 hours for downloads).
 - The device keeps the address of its Private Cloud. If the address of the Pi changes, you have to log out of the cloud on the device and set it up again. Give the Pi a fixed address: a fixed lease in your router or a static address.
 
-Note text for an agent does not work on the Pi alone yet. A pipeline on a second machine that reads the Pi over the network is planned, but it is not there. Until then, run `notedown serve --pipeline` on one machine with the OCR build (for example a Mac) to get note text, as described below.
+Note text for an agent needs the OCR build, so it does not run on the Pi. Read the Pi from a Mac instead, as described in the next section.
+
+### A pipeline on a Mac
+
+The pipeline can run on a second machine (for example a Mac) and read the Pi over the network. The Pi keeps your files. The Mac keeps the note text.
+
+**On the Pi.** Nothing to set up. `notedown serve` prints a line like this next to the device URL:
+
+```
+REST API: http://192.168.1.10:19072/rest/v1 (connect a pipeline with notedown connect http://192.168.1.10:19072)
+```
+
+**On the Mac.** Build notedown with the OCR part and get the model, as in part 1. Then log in once:
+
+```sh
+notedown connect http://192.168.1.10:19072 --data ~/notedown-mac --email you@example.org
+```
+
+It asks for the password. With `--password-stdin` it reads the password from the first line of stdin instead. It sends a login to the server and keeps a token in `~/notedown-mac/tokens/`. It also writes the `pipeline.toml` of that folder, so you don't have to. With `--name` you choose the name the token gets on the server (it is `pipeline` by default).
+
+Then start the pipeline and add the MCP server, as in the next section, with the new folder:
+
+```sh
+notedown pipeline --data ~/notedown-mac
+claude mcp add notedown -- notedown mcp --data ~/notedown-mac
+```
+
+For a second account, run `notedown connect` again with its email. The running pipeline picks it up. You don't need to restart it.
+
+**The token is like a password.** It lets whoever has it read the notes of the account. The file in `~/notedown-mac/tokens/` has mode 0600 and the folder has mode 0700. On the Pi you can see the tokens of an account and revoke them:
+
+```sh
+notedown cloud account --data ~/notedown-data tokens list me
+notedown cloud account --data ~/notedown-data tokens revoke me <id>
+notedown cloud account --data ~/notedown-data tokens revoke me --all
+```
+
+`tokens list` shows the id, the name and the creation time of each token, never the token itself. A password change (`cloud account passwd`) revokes every token. A new `connect` leaves the old token valid until you revoke it. A restore of an old backup of the Pi brings back the tokens that you had revoked since. Revoke them again.
+
+**When the Mac deletes note text.** Only when the account is gone on the Pi, or when its name now belongs to a new account. A refused token, a locked account or a Pi that can't be reached only stop the reading. The Mac keeps the text it has.
+
+**Both machines need the right time (NTP).** The Mac waits until a page has been quiet for a while. It measures that by the time the Pi wrote the page. If the clocks differ a lot, the Mac reads too early or too late.
+
+**The API is plain HTTP**, like the sync of the device, and made for the home network. The login does not send the password itself. The token goes over the network as it is, so a reverse proxy with HTTPS is the way to reach the API from outside.
 
 ## Your notes as text for an agent
 

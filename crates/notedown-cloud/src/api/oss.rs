@@ -567,25 +567,38 @@ fn recv_refused(why: Recv, serial: &str) -> Response {
     }
 }
 
-/// The staging entry of an upload target, created if needed (blocking).
-async fn open_entry(state: &AppState, target: &SignedTarget) -> crate::Result<std::path::PathBuf> {
+/// The staging entry of an upload target. `upload/apply` creates it; an entry that is gone
+/// (removed by `upload/finish`, or never applied for) is `None`, and the upload is refused.
+async fn open_entry(
+    state: &AppState,
+    target: &SignedTarget,
+) -> crate::Result<Option<std::path::PathBuf>> {
     let account_dir = crate::auth::Accounts::new(&state.data_dir).account_dir(&target.account);
     let entry = staging::entry_dir(&account_dir, target.inner.as_deref().unwrap_or(""))?;
     let e = entry.clone();
-    tokio::task::spawn_blocking(move || staging::create_entry(&e))
+    let gone = tokio::task::spawn_blocking(move || staging::entry_gone(&e))
         .await
         .map_err(|e| crate::Error::Invalid {
             what: "upload",
             message: e.to_string(),
-        })??;
-    Ok(entry)
+        })?;
+    Ok((!gone).then_some(entry))
+}
+
+/// [`recv_refused`], but a failure in an entry that is gone meanwhile (an `upload/finish`
+/// removed it while the bytes arrived) is the refusal of an upload to a used URL.
+fn failed_in(entry: &std::path::Path, why: Recv, serial: &str) -> Response {
+    if matches!(why, Recv::Failed(_)) && staging::entry_gone(entry) {
+        return upload_refused(FLAG_PART_MISMATCH, serial);
+    }
+    recv_refused(why, serial)
 }
 
 /// `POST /api/oss/upload?path&signature&timestamp&nonce` (multipart field `file`): the bytes
 /// of a whole file into `staging/<innerName>/data`, at most 1 GiB (`E0324`). An upload URL
 /// takes one set of bytes: a retry with the same bytes (a lost answer) is answered again, but
-/// other bytes (also during `upload/finish`) or bytes after parts are refused (`E0324`,
-/// `part_mismatch`), so the bytes a finish verifies cannot change. Answers
+/// other bytes (also during and after `upload/finish`) or bytes after parts are refused
+/// (`E0324`, `part_mismatch`), so the bytes a finish verifies cannot change. Answers
 /// `{innerName, md5}`.
 pub async fn upload(
     State(state): State<Arc<AppState>>,
@@ -602,7 +615,8 @@ pub async fn upload(
         return upload_refused(FLAG_UPLOAD_BROKEN, &serial);
     };
     let entry = match open_entry(&state, &target).await {
-        Ok(e) => e,
+        Ok(Some(e)) => e,
+        Ok(None) => return upload_refused(FLAG_PART_MISMATCH, &serial),
         Err(e) => return recv_refused(Recv::Failed(e), &serial),
     };
     let file = match receive_file(
@@ -615,11 +629,11 @@ pub async fn upload(
     .await
     {
         Ok(f) => f,
-        Err(why) => return recv_refused(why, &serial),
+        Err(why) => return failed_in(&entry, why, &serial),
     };
     let (tmp, _, md5) = match file.close().await {
         Ok(c) => c,
-        Err(e) => return recv_refused(Recv::Failed(e), &serial),
+        Err(e) => return failed_in(&entry, Recv::Failed(e), &serial),
     };
     let (st, e, parent, m) = (
         state.clone(),
@@ -645,7 +659,7 @@ pub async fn upload(
         Ok(Ok(SingleOutcome::Refused)) => upload_refused(FLAG_PART_MISMATCH, &serial),
         Ok(Err(e)) => {
             let _ = std::fs::remove_file(&tmp);
-            recv_refused(Recv::Failed(e), &serial)
+            failed_in(&entry, Recv::Failed(e), &serial)
         }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
@@ -691,7 +705,8 @@ pub async fn upload_part(
         return upload_refused(FLAG_UPLOAD_BROKEN, &serial);
     };
     let entry = match open_entry(&state, &target).await {
-        Ok(e) => e,
+        Ok(Some(e)) => e,
+        Ok(None) => return upload_refused(FLAG_PART_MISMATCH, &serial),
         Err(e) => return recv_refused(Recv::Failed(e), &serial),
     };
     let file = match receive_file(
@@ -704,11 +719,11 @@ pub async fn upload_part(
     .await
     {
         Ok(f) => f,
-        Err(why) => return recv_refused(why, &serial),
+        Err(why) => return failed_in(&entry, why, &serial),
     };
     let (tmp, _, chunk_md5) = match file.close().await {
         Ok(c) => c,
-        Err(e) => return recv_refused(Recv::Failed(e), &serial),
+        Err(e) => return failed_in(&entry, Recv::Failed(e), &serial),
     };
     let meta = UploadMeta {
         parent: target.path.clone(),
@@ -734,7 +749,7 @@ pub async fn upload_part(
         Ok(Ok(PartOutcome::TooLarge)) => return upload_refused(FLAG_UPLOAD_TOO_LARGE, &serial),
         Ok(Err(e)) => {
             let _ = std::fs::remove_file(&tmp);
-            return recv_refused(Recv::Failed(e), &serial);
+            return failed_in(&entry, Recv::Failed(e), &serial);
         }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);

@@ -2286,6 +2286,91 @@ async fn posts_during_finish_are_refused_and_the_journal_matches_the_bytes() {
     }
 }
 
+/// A POST body that the test sends piece by piece.
+fn streamed_body() -> (tokio::sync::mpsc::UnboundedSender<Vec<u8>>, Body) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let stream = futures_util::stream::poll_fn(move |cx| {
+        rx.poll_recv(cx)
+            .map(|c| c.map(Ok::<_, std::convert::Infallible>))
+    });
+    (tx, Body::from_stream(stream))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_post_still_streaming_when_finish_commits_is_refused() {
+    let s = Arc::new(Server::new());
+    let t = s.session().await;
+    let good = b"good bytes".to_vec();
+    let a = s
+        .apply(&t, "/INBOX/late.pdf", "late.pdf", good.len() as u64)
+        .await;
+    let url = a["fullUploadUrl"].as_str().unwrap().to_string();
+    let inner = internal_id(&a);
+    assert_ok(&s.send(&url, "", "late.pdf", &good).await.json());
+    let entry = s.account().join("staging").join(&inner);
+    // POSTs with other bytes: one has its temp file in the entry already, one has sent no
+    // body yet (it may or may not have looked at the entry), and two come after the finish.
+    let (ct, body) = multipart("late.pdf", b"evil bytes");
+    let split = body.len() - 8;
+    let start = |body: Body| {
+        let (s, uri, ct) = (s.clone(), path_and_query(&url), ct.clone());
+        tokio::spawn(async move {
+            s.raw("POST", &uri, &[("content-type", &ct)], body)
+                .await
+                .json()
+        })
+    };
+    let (writing_tx, writing_body) = streamed_body();
+    let writing = start(writing_body);
+    writing_tx.send(body[..split].to_vec()).unwrap();
+    let (waiting_tx, waiting_body) = streamed_body();
+    let waiting = start(waiting_body);
+    let has_temp = || {
+        std::fs::read_dir(&entry).is_ok_and(|d| {
+            d.flatten()
+                .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !has_temp() {
+        assert!(std::time::Instant::now() < deadline, "no temp file");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    // finish commits and removes the staging entry while both POSTs are open.
+    assert_ok(&s.finish(&t, "/INBOX/", "late.pdf", &inner, &good).await);
+    writing_tx.send(body[split..].to_vec()).unwrap();
+    drop(writing_tx);
+    waiting_tx.send(body.clone()).unwrap();
+    drop(waiting_tx);
+    assert_err(&writing.await.unwrap(), "E0324");
+    assert_err(&waiting.await.unwrap(), "E0324");
+    assert_err(
+        &s.send(&url, "", "late.pdf", b"after").await.json(),
+        "E0324",
+    );
+    let part = s
+        .send(
+            a["partUploadUrl"].as_str().unwrap(),
+            "&uploadId=u&partNumber=1&totalChunks=1",
+            "late.pdf",
+            b"after",
+        )
+        .await;
+    assert_err(&part.json(), "E0324");
+    // The committed bytes and their event stay, and no staging entry is made again.
+    assert_eq!(
+        std::fs::read(s.files().join("INBOX/late.pdf")).unwrap(),
+        good
+    );
+    let created = s
+        .events()
+        .into_iter()
+        .rfind(|e| e["type"] == "file.created" && e["path"] == "INBOX/late.pdf")
+        .unwrap();
+    assert_eq!(created["md5"], md5_of(&good));
+    assert!(!entry.exists());
+}
+
 #[tokio::test]
 async fn other_multipart_fields_are_capped_together() {
     let s = Server::new();
@@ -2351,7 +2436,8 @@ fn the_staging_lock_answers_retries_of_claimed_bytes_and_cleans_up_failures() {
     use notedown_cloud::sync::staging::{Claim, SingleOutcome, StagingLocks};
     let dir = tempfile::tempdir().unwrap();
     let entry = dir.path().join("55555555-5555-4555-8555-555555555555");
-    std::fs::create_dir_all(&entry).unwrap();
+    // As `upload/apply` leaves it: an entry without the apply record is gone.
+    staging::record_apply(&entry, SERIAL, "INBOX", "a.pdf", 0).unwrap();
     let locks = StagingLocks::default();
     let tmp = |bytes: &[u8]| {
         let p = entry.join(format!(".nd-test-{}.tmp", md5_of(bytes)));

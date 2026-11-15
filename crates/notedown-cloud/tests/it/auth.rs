@@ -1098,3 +1098,32 @@ fn listing_tokens_creates_no_key() {
         Err(Error::NoAccount(_))
     ));
 }
+
+#[test]
+fn a_restored_and_removed_again_account_gives_the_new_seq() {
+    let (d, auth, tokens) = rest();
+    let (token, info, _) = rest_login(&auth, "one");
+    let dir = d.path().join("accounts/jordi");
+    let token_file = format!("tokens/{}.json", info.id);
+    let account_json = std::fs::read(dir.join("account.json")).unwrap();
+    let token_json = std::fs::read(dir.join(&token_file)).unwrap();
+    let journal = journal(&d);
+    auth.accounts().remove("jordi", &journal).unwrap();
+    let first = match tokens.check(&token, NOW).unwrap() {
+        TokenCheck::Removed { seq, .. } => seq,
+        other => panic!("{other:?}"),
+    };
+    // A backup brings the account back by hand.
+    std::fs::create_dir_all(dir.join("tokens")).unwrap();
+    std::fs::write(dir.join("account.json"), &account_json).unwrap();
+    std::fs::write(dir.join(&token_file), &token_json).unwrap();
+    assert!(matches!(
+        tokens.check(&token, NOW).unwrap(),
+        TokenCheck::Valid(_)
+    ));
+    auth.accounts().remove("jordi", &journal).unwrap();
+    match tokens.check(&token, NOW).unwrap() {
+        TokenCheck::Removed { seq, .. } => assert!(seq > first, "{seq} > {first}"),
+        other => panic!("{other:?}"),
+    }
+}

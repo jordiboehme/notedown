@@ -186,6 +186,12 @@ impl RestTokens {
         if let Some(account) = self.accounts.get(&payload.slug)?
             && account.user_id == payload.user_id
         {
+            // A live account: a removal found before (the account came back from a backup)
+            // is stale, so the next removal is looked up again.
+            self.removals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(payload.slug.clone(), payload.user_id));
             let path = token_file(&self.accounts.account_dir(&payload.slug), &payload.id);
             let Some(stored) = read_token_file(&path)? else {
                 return Ok(TokenCheck::Refused);
@@ -239,7 +245,8 @@ impl RestTokens {
     }
 }
 
-/// Reads the whole journal of `slug`, page by page.
+/// Reads the whole journal of `slug`, page by page. A page that asks for more but does not
+/// move on is an error: a partial answer must never count (or be cached) as "no removal".
 fn find_removal(data: &Path, slug: &str, user_id: u64) -> Result<Option<u64>> {
     let mut from = 0;
     let mut found: Option<u64> = None;
@@ -248,8 +255,14 @@ fn find_removal(data: &Path, slug: &str, user_id: u64) -> Result<Option<u64>> {
         for r in batch.removed.iter().filter(|r| r.user_id == user_id) {
             found = Some(found.map_or(r.seq, |f| f.max(r.seq)));
         }
-        if !batch.more || batch.next <= from {
+        if !batch.more {
             return Ok(found);
+        }
+        if batch.next <= from {
+            return Err(Error::Io {
+                path: data.join(crate::journal::JOURNAL_DIR),
+                source: std::io::Error::other("the journal read does not move on"),
+            });
         }
         from = batch.next;
     }
@@ -420,7 +433,8 @@ fn read_token_file(path: &Path) -> Result<Option<TokenFile>> {
     }
 }
 
-/// Creates `dir` (one level below `parent`, which must exist) with mode 0700.
+/// Creates `dir` (one level below `parent`, which must exist) with mode 0700; an existing
+/// `dir` gets mode 0700 too.
 fn make_private_dir(parent: &Path, dir: &Path) -> Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
@@ -428,19 +442,21 @@ fn make_private_dir(parent: &Path, dir: &Path) -> Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    match builder.create(dir) {
-        Ok(()) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                    .map_err(io_err(dir))?;
-            }
-            fsync_dir(parent)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(()),
-        Err(e) => Err(io_err(dir)(e)),
+    let created = match builder.create(dir) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => false,
+        Err(e) => return Err(io_err(dir)(e)),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(io_err(dir))?;
     }
+    if created {
+        fsync_dir(parent)?;
+    }
+    Ok(())
 }
 
 /// Writes a new file with mode 0600 (`create_new`) and syncs it; `false` when it exists.

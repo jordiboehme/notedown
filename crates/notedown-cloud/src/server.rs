@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 use crate::api::limit::{RateLimiter, RetryTracker};
-use crate::auth::{Auth, RestKey, RestTokens};
+use crate::auth::{Auth, RestTokens};
 use crate::diag::{Capture, Clock, LogEntry, LogKind, ProtocolLog, SystemClock};
 use crate::journal::{Journal, JournalOptions};
 use crate::push::{PushPlanner, PushTiming};
@@ -139,9 +139,10 @@ impl AppState {
                 (store.slug().to_string(), Arc::new(store))
             })
             .collect();
+        let auth = Auth::open(data_dir)?;
         Ok(Arc::new(AppState {
-            auth: Auth::open(data_dir)?,
-            rest_tokens: RestTokens::new(data_dir, RestKey::load_or_create(data_dir)?),
+            rest_tokens: RestTokens::new(data_dir, auth.rest_key().clone()),
+            auth,
             url_signer: UrlSigner::load_or_create(data_dir)?,
             sync_locks: SyncLocks::new(),
             sockets: crate::socket::SocketRegistry::new(),

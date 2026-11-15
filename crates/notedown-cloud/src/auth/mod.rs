@@ -126,6 +126,11 @@ impl Auth {
         &self.devices
     }
 
+    /// The key of the REST tokens, for the [`RestTokens`] that checks them.
+    pub fn rest_key(&self) -> &RestKey {
+        &self.rest_key
+    }
+
     /// The server instance id the device sees as `uniqueMachineId`: stable across restarts.
     pub fn machine_id(&self) -> String {
         self.key.derive_id("unique-machine-id")

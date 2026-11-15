@@ -68,7 +68,7 @@ impl Data {
         out
     }
 
-    fn record_path(&self, key: &str) -> PathBuf {
+    pub(crate) fn record_path(&self, key: &str) -> PathBuf {
         self.pages_dir()
             .join(format!("{}.json", key.replace("path:", "path-")))
     }

@@ -15,6 +15,7 @@ pub mod region;
 pub mod retention;
 pub mod scope;
 pub mod search;
+pub mod source;
 pub mod store;
 pub mod text;
 pub mod toon;

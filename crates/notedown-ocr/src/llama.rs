@@ -164,7 +164,7 @@ impl OcrEngine for LlamaEngine {
         }
         #[allow(clippy::cast_possible_wrap)] // N_BATCH is a small constant
         let mut n_past = chunks
-            .eval_chunks(&self.mtmd, &ctx, 0, 0, N_BATCH as i32, true)
+            .eval_chunks(&mut self.mtmd, &mut ctx, 0, 0, N_BATCH as i32, true)
             .map_err(|e| engine_err("evaluating prompt", e))?;
         let encode_ms = millis(encode_start);
 

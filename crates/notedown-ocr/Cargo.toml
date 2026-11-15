@@ -22,10 +22,10 @@ tempfile.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-llama-cpp-2 = { version = "=0.1.158", default-features = false, features = ["mtmd", "metal"] }
+llama-cpp-2 = { version = "=0.1.161", default-features = false, features = ["mtmd", "metal"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-llama-cpp-2 = { version = "=0.1.158", default-features = false, features = ["mtmd", "openmp"] }
+llama-cpp-2 = { version = "=0.1.161", default-features = false, features = ["mtmd", "openmp"] }
 
 [features]
 vulkan = ["llama-cpp-2/vulkan"]

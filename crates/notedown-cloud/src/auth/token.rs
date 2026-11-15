@@ -14,6 +14,35 @@ use crate::{Error, Result, io_err};
 
 pub const KEY_FILE: &str = "token.key";
 
+/// Load the key `<data>/keys/<name>` (hex, at least 32 bytes); generate 32 random bytes with
+/// mode 0600 when it is missing.
+pub(crate) fn load_or_create_key(data_dir: &Path, name: &str) -> Result<Vec<u8>> {
+    let path = data_dir.join("keys").join(name);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let secret = const_hex::decode(text.trim()).map_err(|_| Error::Config {
+                path: path.clone(),
+                message: "not a hex key".into(),
+            })?;
+            if secret.len() < 32 {
+                return Err(Error::Config {
+                    path,
+                    message: "key shorter than 32 bytes".into(),
+                });
+            }
+            Ok(secret)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut secret = vec![0u8; 32];
+            rand::fill(&mut secret[..]);
+            let text = format!("{}\n", const_hex::encode(&secret));
+            write_atomic(&path, text.as_bytes(), true)?;
+            Ok(secret)
+        }
+        Err(e) => Err(io_err(&path)(e)),
+    }
+}
+
 /// The header of every issued token, base64url of `{"alg":"HS256","typ":"JWT"}`.
 const HEADER: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
 
@@ -55,30 +84,7 @@ impl TokenKey {
 
     /// Load `<data>/keys/token.key` (64 hex characters); generate it with mode 0600 when missing.
     pub fn load_or_create(data_dir: &Path) -> Result<TokenKey> {
-        let path = data_dir.join("keys").join(KEY_FILE);
-        match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                let secret = const_hex::decode(text.trim()).map_err(|_| Error::Config {
-                    path: path.clone(),
-                    message: "not a hex key".into(),
-                })?;
-                if secret.len() < 32 {
-                    return Err(Error::Config {
-                        path,
-                        message: "key shorter than 32 bytes".into(),
-                    });
-                }
-                Ok(TokenKey { secret })
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let mut secret = vec![0u8; 32];
-                rand::fill(&mut secret[..]);
-                let text = format!("{}\n", const_hex::encode(&secret));
-                write_atomic(&path, text.as_bytes(), true)?;
-                Ok(TokenKey { secret })
-            }
-            Err(e) => Err(io_err(&path)(e)),
-        }
+        load_or_create_key(data_dir, KEY_FILE).map(|secret| TokenKey { secret })
     }
 
     /// A stable public id derived from the key (domain-separated hash, the key cannot be

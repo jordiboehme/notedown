@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 use crate::api::limit::{RateLimiter, RetryTracker};
-use crate::auth::Auth;
+use crate::auth::{Auth, RestKey, RestTokens};
 use crate::diag::{Capture, Clock, LogEntry, LogKind, ProtocolLog, SystemClock};
 use crate::journal::{Journal, JournalOptions};
 use crate::push::{PushPlanner, PushTiming};
@@ -30,6 +30,8 @@ pub struct AppState {
     pub config: Config,
     pub data_dir: PathBuf,
     pub auth: Auth,
+    /// Checks the tokens of the REST read API (`keys/rest.key`).
+    pub rest_tokens: RestTokens,
     pub log: ProtocolLog,
     pub clock: Arc<dyn Clock>,
     /// The change journal (server-wide).
@@ -139,6 +141,7 @@ impl AppState {
             .collect();
         Ok(Arc::new(AppState {
             auth: Auth::open(data_dir)?,
+            rest_tokens: RestTokens::new(data_dir, RestKey::load_or_create(data_dir)?),
             url_signer: UrlSigner::load_or_create(data_dir)?,
             sync_locks: SyncLocks::new(),
             sockets: crate::socket::SocketRegistry::new(),

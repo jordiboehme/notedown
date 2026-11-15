@@ -2,6 +2,7 @@
 
 mod accounts;
 mod codes;
+mod rest_tokens;
 mod token;
 
 use std::sync::Mutex;
@@ -14,6 +15,10 @@ pub use accounts::{
     LOCK_COOLDOWN_MS, LOCK_FILE, MAX_FAILED_LOGINS, PIPELINE_DIR, md5_hex, validate_slug,
 };
 pub use codes::{CODE_LEN, CODE_TTL_MS, LoginCodes, MAX_PENDING_CODES};
+pub use rest_tokens::{
+    REST_KEY_FILE, RestKey, RestTokens, TOKENS_DIR, TokenCheck, TokenInfo, list_tokens,
+    revoke_all_tokens, revoke_token,
+};
 pub use token::{Claims, Device, Devices, KEY_FILE, TokenKey};
 
 use crate::Error;
@@ -92,19 +97,23 @@ pub struct Auth {
     devices: Devices,
     codes: LoginCodes,
     key: TokenKey,
+    /// Signs the REST tokens that [`Auth::rest_login`] issues.
+    rest_key: RestKey,
     /// Serializes logins in this process (codes and counter); the account lock file serializes
     /// them with the CLI.
     login_lock: Mutex<()>,
 }
 
 impl Auth {
-    /// Opens the data folder's accounts and creates `keys/token.key` on the first start.
+    /// Opens the data folder's accounts and creates `keys/token.key` and `keys/rest.key` on the
+    /// first start.
     pub fn open(data_dir: &std::path::Path) -> crate::Result<Auth> {
         Ok(Auth {
             accounts: Accounts::new(data_dir),
             devices: Devices::new(data_dir),
             codes: LoginCodes::new(),
             key: TokenKey::load_or_create(data_dir)?,
+            rest_key: RestKey::load_or_create(data_dir)?,
             login_lock: Mutex::new(()),
         })
     }
@@ -128,13 +137,8 @@ impl Auth {
         self.codes.issue(email, now_ms)
     }
 
-    /// `login/equipment`. A lock older than [`LOCK_COOLDOWN_MS`] is cleared first (counter back
-    /// to zero); a lock without a stored time (older file) gets the current time and stays.
-    /// Order: unknown account `E0018`, locked `E0045`, then the code is
-    /// consumed (single use). A missing, used or expired code gives `E0019` without counting
-    /// (no password guess was possible); a wrong hash gives `E0019` and counts, the sixth failure
-    /// locks the account. Success resets the counter, raises the device's token generation and
-    /// returns a token for it.
+    /// `login/equipment`: the checks of `check_login`. Success raises the device's
+    /// token generation and returns a token for it.
     pub fn login(
         &self,
         email: &str,
@@ -142,6 +146,62 @@ impl Auth {
         equipment_no: &str,
         now_ms: u64,
     ) -> Result<LoginOk, AuthError> {
+        let (token, account, failed_logins_before) =
+            self.check_login(email, password_hash, now_ms, |account| {
+                let generation = self.devices.bump(&account.slug, equipment_no, now_ms)?;
+                Ok(self.key.issue(&Claims {
+                    user_id: account.user_id,
+                    equipment_no: equipment_no.to_string(),
+                    generation,
+                    create_time: now_ms / 1000,
+                })?)
+            })?;
+        Ok(LoginOk {
+            token,
+            account,
+            failed_logins_before,
+        })
+    }
+
+    /// The REST login: checks the hash against a random code and issues a token, all under one
+    /// account lock, with the checks and the failure counting of the device login
+    /// (`check_login`). Returns the token (shown once, never stored), its stored info
+    /// and the account.
+    pub fn rest_login(
+        &self,
+        email: &str,
+        password_hash: &str,
+        name: &str,
+        now_ms: u64,
+    ) -> Result<(String, TokenInfo, Account), AuthError> {
+        let ((token, info), account, _) =
+            self.check_login(email, password_hash, now_ms, |account| {
+                Ok(rest_tokens::issue(
+                    &self.accounts,
+                    &self.rest_key,
+                    account,
+                    name,
+                    now_ms,
+                )?)
+            })?;
+        Ok((token, info, account))
+    }
+
+    /// The password check of every login; `issue` runs on success, still under the login lock
+    /// and the account lock. A lock older than [`LOCK_COOLDOWN_MS`] is cleared first (counter
+    /// back to zero); a lock without a stored time (older file) gets the current time and
+    /// stays. Order: unknown account `E0018`, locked `E0045`, then the code is consumed (single
+    /// use). A missing, used or expired code gives `E0019` without counting (no password guess
+    /// was possible); a wrong hash gives `E0019` and counts, the sixth failure locks the
+    /// account. Success resets the counter. Returns what `issue` made, the account and the
+    /// counter before the reset.
+    fn check_login<T>(
+        &self,
+        email: &str,
+        password_hash: &str,
+        now_ms: u64,
+        issue: impl FnOnce(&Account) -> Result<T, AuthError>,
+    ) -> Result<(T, Account, u32), AuthError> {
         let _guard = self.login_lock.lock().unwrap_or_else(|e| e.into_inner());
         let code = self.codes.consume(email, now_ms);
         let slug = self
@@ -188,18 +248,8 @@ impl Auth {
             account.failed_logins = 0;
             self.accounts.save(&account)?;
         }
-        let generation = self.devices.bump(&account.slug, equipment_no, now_ms)?;
-        let token = self.key.issue(&Claims {
-            user_id: account.user_id,
-            equipment_no: equipment_no.to_string(),
-            generation,
-            create_time: now_ms / 1000,
-        })?;
-        Ok(LoginOk {
-            token,
-            account,
-            failed_logins_before,
-        })
+        let made = issue(&account)?;
+        Ok((made, account, failed_logins_before))
     }
 
     /// Signature, account and generation. Every failure is `NotLoggedIn` (`E0712`).

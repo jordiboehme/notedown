@@ -175,7 +175,7 @@ impl TestClock {
     pub(crate) fn at(ms: u64) -> TestClock {
         TestClock(Arc::new(AtomicU64::new(ms)))
     }
-    fn set(&self, ms: u64) {
+    pub(crate) fn set(&self, ms: u64) {
         self.0.store(ms, Ordering::SeqCst);
     }
 }

@@ -155,8 +155,19 @@ pub(crate) fn note_bytes(src: &dyn ServerData, d: &Data) {
     let want = std::fs::read(fixture("test1")).unwrap();
     match src.note(SLUG, "NOTE/Note/test1.note").unwrap() {
         NoteBytes::Found(b) => assert_eq!(b, want),
-        NoteBytes::Missing => panic!("the note is there"),
+        other => panic!("the note is there: {other:?}"),
     }
+    // Something in the note's place that is not a file: a certain answer, not "nothing known".
+    let folder = d
+        .data
+        .join("accounts")
+        .join(SLUG)
+        .join("files/NOTE/Note/folder.note");
+    std::fs::create_dir_all(&folder).unwrap();
+    assert_eq!(
+        src.note(SLUG, "NOTE/Note/folder.note").unwrap(),
+        NoteBytes::NotAFile
+    );
     assert!(matches!(
         src.note(SLUG, "NOTE/Note/nothing.note").unwrap(),
         NoteBytes::Missing

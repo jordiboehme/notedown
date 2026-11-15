@@ -1,7 +1,7 @@
 //! Reading one due note: metadata, page moves and deletions, then page by page OCR, each page
 //! written at once (spec 2.2, 3, 4.4).
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use notedown_cloud::appdata::Digest;
@@ -44,8 +44,6 @@ pub(super) struct NoteJob<'a> {
     pub mode: Mode,
     /// The pages already reported as missing from their note file (see [`first_notice`]).
     pub told_missing: &'a RefCell<BTreeSet<String>>,
-    /// Set when the source gave no answer for the note's bytes, so the account's cursor stays.
-    pub unsure: &'a Cell<bool>,
 }
 
 /// Whether a page missing from its note file is told now: once per page and note record
@@ -88,8 +86,9 @@ fn page_line(key: &str, change: LineChange, page_id: &str, position: usize) -> L
 
 /// Reads the due note `due`. The note's state is saved after the page structure is brought up
 /// to date, and again after every page. Stops early (state saved) when `stop` says so, and
-/// returns [`Error::ModelMissing`] when the model cannot be had. A record the source cannot
-/// give now is an error: the note is skipped and looked at again.
+/// returns [`Error::ModelMissing`] when the model cannot be had. A record or note bytes the
+/// source cannot give now are an error before anything is written: the note is skipped with no
+/// try counted, and looked at again.
 pub(super) fn process(
     job: &NoteJob,
     engine: &mut EngineSlot,
@@ -122,17 +121,15 @@ pub(super) fn process(
         return Ok(());
     }
     // Moved or deleted by hand since `due` looked: skipped for this pass, untouched, until the
-    // server's scan moves or drops the record. A read that fails otherwise is a failure of the
-    // note with its tries, as a note that does not parse.
-    let nb = match source.note(slug, &r.path) {
-        Ok(NoteBytes::Found(bytes)) => {
+    // server's scan moves or drops the record. Something that is not a file in its place is a
+    // failure of the note with its tries, as a note that does not parse. A source without an
+    // answer is no failure of the note: skipped, untouched, no try.
+    let nb = match source.note(slug, &r.path)? {
+        NoteBytes::Found(bytes) => {
             Notebook::from_bytes(bytes, VersionPolicy::AllowUnknown).map_err(Error::from)
         }
-        Ok(NoteBytes::Missing) => return Ok(()),
-        Err(e) => {
-            job.unsure.set(true);
-            Err(e)
-        }
+        NoteBytes::Missing => return Ok(()),
+        NoteBytes::NotAFile => Err(Error::Read(format!("{} is not a file", r.path))),
     };
     if state.md5 != r.md5 || state.size != r.size {
         // New bytes: a note that did not parse starts again with fresh tries.

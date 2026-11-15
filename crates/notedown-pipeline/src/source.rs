@@ -20,11 +20,14 @@ pub struct ServerAccount {
     pub user_id: u64,
 }
 
-/// The bytes of a note, or the certain news that it is not there.
+/// The bytes of a note, or the certain news that it is not there or not a note file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoteBytes {
     Found(Vec<u8>),
     Missing,
+    /// Something is at the note's path, but it is not a file (a folder, say). It stays so
+    /// until someone changes it, so the worker counts it as a failure of the note.
+    NotAFile,
 }
 
 /// An `account.removed` event.
@@ -57,8 +60,9 @@ pub trait ServerData: Send + Sync {
     fn records(&self, slug: &str) -> Result<Records>;
     /// `Ok(None)`: no such record. The caller skips the note in both `Err` and `None`.
     fn record(&self, slug: &str, key: &str) -> Result<Option<Record>>;
-    /// `Missing` only when the account's `files/` exists and the note does not; a missing
-    /// account is `Err`.
+    /// `Missing` only when the account's `files/` exists and the note does not; `NotAFile` when
+    /// something that is not a file is at its path; a missing account is `Err`. Any `Err` is
+    /// "nothing known": the worker skips the note and counts no try.
     fn note(&self, slug: &str, path: &str) -> Result<NoteBytes>;
     /// A cheap check without the bytes: `Some(false)` as for `Missing`, `None` when nothing is
     /// known.
@@ -114,6 +118,9 @@ impl ServerData for FolderSource {
 
     fn note(&self, slug: &str, path: &str) -> Result<NoteBytes> {
         let file = records::note_file(&self.root, slug, path)?;
+        if std::fs::metadata(&file).is_ok_and(|m| !m.is_file()) {
+            return Ok(NoteBytes::NotAFile);
+        }
         match std::fs::read(&file) {
             Ok(b) => Ok(NoteBytes::Found(b)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

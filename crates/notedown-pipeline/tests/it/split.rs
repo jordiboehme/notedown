@@ -343,3 +343,148 @@ fn one_machine_takes_over_the_old_cursor() {
     // The old file stays as it was.
     assert_eq!(journal.cursor("pipeline").unwrap().unwrap().seq, n - 1);
 }
+
+/// A folder source whose `records` or `note` fail while the flag is set; the rest works, so
+/// the account is listed and its journal is read.
+struct Partial {
+    inner: FolderSource,
+    records: Arc<AtomicBool>,
+    note: Arc<AtomicBool>,
+}
+
+fn away(flag: &AtomicBool) -> Result<()> {
+    if flag.load(Ordering::SeqCst) {
+        Err(notedown_pipeline::Error::Read("the share is away".into()))
+    } else {
+        Ok(())
+    }
+}
+
+impl ServerData for Partial {
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+    fn accounts(&self) -> Result<Vec<ServerAccount>> {
+        self.inner.accounts()
+    }
+    fn records(&self, slug: &str) -> Result<Records> {
+        away(&self.records)?;
+        self.inner.records(slug)
+    }
+    fn record(&self, slug: &str, key: &str) -> Result<Option<Record>> {
+        self.inner.record(slug, key)
+    }
+    fn note(&self, slug: &str, path: &str) -> Result<NoteBytes> {
+        away(&self.note)?;
+        self.inner.note(slug, path)
+    }
+    fn note_exists(&self, slug: &str, path: &str) -> Result<Option<bool>> {
+        self.inner.note_exists(slug, path)
+    }
+    fn digests(&self, slug: &str) -> Result<Vec<notedown_cloud::appdata::Digest>> {
+        self.inner.digests(slug)
+    }
+    fn journal(&self, slug: &str, from: u64, limit: usize) -> Result<JournalBatch> {
+        self.inner.journal(slug, from, limit)
+    }
+}
+
+fn errors_file(local: &Path) -> String {
+    std::fs::read_to_string(local.join("pipeline").join(SLUG).join("errors.jsonl"))
+        .unwrap_or_default()
+}
+
+/// One part of the source fails for the account while the account itself is listed: the
+/// cursor stays, nothing is deleted, no try is counted; after it is back, all is read.
+fn a_failing_part_keeps_the_cursor(fail_records: bool) {
+    let (d, local) = two_folders();
+    let key1 = d.put("test1", "NOTE/Note");
+    let records = Arc::new(AtomicBool::new(false));
+    let note = Arc::new(AtomicBool::new(false));
+    let mut s = load(local.path());
+    s.source = Arc::new(Partial {
+        inner: FolderSource::new(&d.data),
+        records: records.clone(),
+        note: note.clone(),
+    });
+    let said = Said::default();
+    let clock = TestClock::at(now_ms());
+    let mut w = Worker::new(&s, Box::new(engine_reading("hello")))
+        .with_clock(Arc::new(clock.clone()))
+        .with_messages(said.sink());
+    w.run(stop_at(&clock, clock.now_ms() + 1)).unwrap();
+    assert_eq!(log(local.path()).len(), 1);
+    let first = cursor::read(local.path(), SLUG).unwrap();
+    assert_eq!(first, last_seq(&d.data));
+
+    let key2 = d.put("test2", "NOTE/Note");
+    // The clock past the record's mtime, so test2 is due and not settling.
+    clock.set(now_ms());
+    let flag = if fail_records { &records } else { &note };
+    flag.store(true, Ordering::SeqCst);
+    let state = TextStore::open(local.path(), SLUG)
+        .unwrap()
+        .note(&key1)
+        .unwrap();
+    w.run(stop_at(&clock, clock.now_ms() + 25 * 60_000))
+        .unwrap();
+    let lines = log(local.path());
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines.iter().all(|l| l.change != LineChange::NoteDeleted));
+    let store = TextStore::open(local.path(), SLUG).unwrap();
+    assert_eq!(store.note(&key1).unwrap(), state, "the store is unchanged");
+    assert!(store.note(&key2).unwrap().is_none(), "no state, no try");
+    assert_eq!(errors_file(local.path()), "", "no try is counted");
+    assert_eq!(
+        cursor::read(local.path(), SLUG).unwrap(),
+        first,
+        "{:?}",
+        said.lines()
+    );
+    assert_eq!(said.count("the share is away"), 1, "{:?}", said.lines());
+
+    flag.store(false, Ordering::SeqCst);
+    w.run(stop_at(&clock, clock.now_ms() + 1)).unwrap();
+    let store = TextStore::open(local.path(), SLUG).unwrap();
+    assert!(store.note(&key2).unwrap().is_some(), "test2 is read");
+    assert_eq!(log(local.path()).len(), 2);
+    assert_eq!(errors_file(local.path()), "");
+    assert_eq!(cursor::read(local.path(), SLUG).unwrap(), last_seq(&d.data));
+}
+
+#[test]
+fn failing_records_keep_the_cursor_and_count_no_try() {
+    a_failing_part_keeps_the_cursor(true);
+}
+
+#[test]
+fn a_failing_note_read_keeps_the_cursor_and_counts_no_try() {
+    a_failing_part_keeps_the_cursor(false);
+}
+
+#[test]
+fn a_corrupt_cursor_is_read_again_from_the_start() {
+    let (d, local) = two_folders();
+    d.put("test1", "NOTE/Note");
+    let file = cursor::path(local.path(), SLUG);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "{").unwrap();
+    let said = Said::default();
+    let clock = TestClock::at(now_ms());
+    let mut w = Worker::new(&load(local.path()), Box::new(engine_reading("hello")))
+        .with_clock(Arc::new(clock.clone()))
+        .with_messages(said.sink());
+    w.run(stop_at(&clock, clock.now_ms() + 5_000)).unwrap();
+    assert_eq!(
+        said.count(&format!("{SLUG}.cursor")),
+        1,
+        "{:?}",
+        said.lines()
+    );
+    assert_eq!(log(local.path()).len(), 1);
+    assert_eq!(
+        cursor::read(local.path(), SLUG).unwrap(),
+        last_seq(&d.data),
+        "the cursor is written again"
+    );
+}

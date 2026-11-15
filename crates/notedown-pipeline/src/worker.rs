@@ -22,7 +22,7 @@
 mod due;
 mod note;
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -344,7 +344,6 @@ impl Worker {
                     now: &|| clock.now_ms(),
                     mode: Mode::Reocr,
                     told_missing: &self.told_missing,
-                    unsure: &Cell::new(false),
                 };
                 note::process(
                     &job,
@@ -475,8 +474,22 @@ impl Worker {
     /// Where account `slug` starts in its journal: its cursor; else, on one machine, the old
     /// cursor of all accounts (only read, so an update does not read the whole journal again);
     /// else the start.
+    /// A cursor file that does not parse counts as missing; it is written again after the
+    /// next good pass.
     fn start(&self, slug: &str) -> Result<Follow> {
-        let saved = cursor::load(&self.setup.local, slug)?;
+        let saved = match cursor::load(&self.setup.local, slug) {
+            Err(e @ Error::Corrupt { .. }) => {
+                self.say_once(
+                    &format!("cursor:{slug}"),
+                    format!(
+                        "notedown pipeline: account {slug}: the journal cursor cannot be read \
+                         ({e}); it is written again after the next pass"
+                    ),
+                );
+                None
+            }
+            other => other?,
+        };
         let read = match saved {
             Some(seq) => seq,
             // An old cursor that cannot be read only costs a full read of the journal.
@@ -563,7 +576,8 @@ impl Worker {
     /// one whose settle time ended first at the front; then notes without any text yet (the
     /// first run), newest first, with progress on stderr. An account that fails is reported
     /// (once while it keeps failing) and skipped; a missing model ends the pass. Also gives
-    /// the accounts that were not looked at fully, whose cursors must stay.
+    /// the accounts that were not looked at fully (a source error, a broken store, or notes
+    /// left by a stop), whose cursors must stay.
     fn pass(
         &mut self,
         lock: &WriterLock,
@@ -652,17 +666,21 @@ impl Worker {
         let clock = self.clock.clone();
         let now_fn = || clock.now_ms();
         let mut broken: Vec<String> = Vec::new();
-        for (slug, d) in &queue {
+        for (i, (slug, d)) in queue.iter().enumerate() {
             if broken.contains(slug) {
                 continue;
             }
             if stop() {
+                // The notes not read, and the one before (a stop between its pages leaves it
+                // half read): their accounts keep their cursors.
+                for (s, _) in &queue[i.saturating_sub(1)..] {
+                    unsure.insert(s.clone());
+                }
                 break;
             }
             let (Some(text), Some((r, digests))) = (stores.get(slug), recs.get(slug)) else {
                 continue;
             };
-            let note_unsure = Cell::new(false);
             let job = NoteJob {
                 source: &*source,
                 slug,
@@ -672,13 +690,8 @@ impl Worker {
                 now: &now_fn,
                 mode: Mode::Due,
                 told_missing: &self.told_missing,
-                unsure: &note_unsure,
             };
-            let done = note::process(&job, &mut self.engine, d, &mut progress, &mut report, stop);
-            if note_unsure.get() {
-                unsure.insert(slug.clone());
-            }
-            match done {
+            match note::process(&job, &mut self.engine, d, &mut progress, &mut report, stop) {
                 Ok(()) => {}
                 Err(Error::ModelMissing) => return Err(Error::ModelMissing),
                 Err(e) => {
@@ -696,7 +709,8 @@ impl Worker {
             }
         }
         // A failed write blocks the store until a repair: open it again next pass. Such an
-        // account (or one whose record the source could not give) keeps its cursor.
+        // account (or one whose record or note bytes the source could not give) keeps its
+        // cursor.
         for slug in broken {
             stores.remove(&slug);
             unsure.insert(slug);

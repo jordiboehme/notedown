@@ -162,7 +162,7 @@ fn keywords(
     }
     let bytes = match source.note(slug, &rec.path) {
         Ok(NoteBytes::Found(b)) => Some(b),
-        Ok(NoteBytes::Missing) => None,
+        Ok(NoteBytes::Missing | NoteBytes::NotAFile) => None,
         Err(_) => return from_state(),
     };
     let parsed = cache.get_or(slug, key, &rec.md5, || {

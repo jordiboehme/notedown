@@ -64,6 +64,9 @@ pub enum Error {
     Account(String),
     #[error("mcp: {0}")]
     Mcp(String),
+    /// `notedown connect` failed; the text says why.
+    #[error("{0}")]
+    Connect(String),
     #[error("invalid {what}: {message}")]
     Invalid { what: &'static str, message: String },
     #[error("{path}: {message}")]

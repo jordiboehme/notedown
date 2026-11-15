@@ -48,10 +48,7 @@ struct Login {
 }
 
 fn invalid(message: String) -> Error {
-    Error::Invalid {
-        what: "connect",
-        message,
-    }
+    Error::Connect(message)
 }
 
 fn chain(e: &dyn std::error::Error) -> String {
@@ -68,21 +65,25 @@ fn chain(e: &dyn std::error::Error) -> String {
     text
 }
 
-/// Logs in to the server at `url` as `email` and stores the token in
-/// `<local>/tokens/<slug>.token`. Writes `<local>/pipeline.toml` when it is missing. The
-/// password and the token appear in no error.
-pub fn connect(
-    url: &str,
-    local: &Path,
-    email: &str,
-    password: &str,
-    name: &str,
-) -> Result<Connected> {
+/// The checks of [`connect`] that need no password: the URL, and a `local` folder that is no
+/// server's data and whose `pipeline.toml` points at no other server. Run them before the
+/// password is asked for. Gives the URL without a trailing slash and the `pipeline.toml`.
+pub fn check(url: &str, local: &Path) -> Result<(String, Option<LocalConfig>)> {
     let url = url.trim().trim_end_matches('/').to_string();
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(invalid(format!(
             "{url:?} does not start with http:// or https://"
         )));
+    }
+    // The URL is not repeated here: it may hold a password.
+    let parsed = reqwest::Url::parse(&url)
+        .map_err(|e| invalid(format!("the server url cannot be read: {e}")))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(invalid(
+            "the server url must not hold a user name or a password; connect asks for the \
+             password"
+                .into(),
+        ));
     }
     if local.join("accounts").exists() || local.join("server.toml").exists() {
         return Err(invalid(format!(
@@ -105,6 +106,20 @@ pub fn connect(
             )));
         }
     }
+    Ok((url, existing))
+}
+
+/// Logs in to the server at `url` as `email` and stores the token in
+/// `<local>/tokens/<slug>.token`. Writes `<local>/pipeline.toml` when it is missing. The
+/// password and the token appear in no error.
+pub fn connect(
+    url: &str,
+    local: &Path,
+    email: &str,
+    password: &str,
+    name: &str,
+) -> Result<Connected> {
+    let (url, existing) = check(url, local)?;
 
     let client = Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)

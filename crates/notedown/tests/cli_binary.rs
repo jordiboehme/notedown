@@ -2463,9 +2463,56 @@ fn connect_with_a_wrong_password_says_so() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("the server refused the email or the password"),
+        err.lines()
+            .any(|l| l == "error: the server refused the email or the password"),
         "{err}"
     );
+    assert!(!local.path().join("tokens").exists());
+    assert!(!local.path().join("pipeline.toml").exists());
+}
+
+#[test]
+fn connect_checks_the_folder_before_the_password() {
+    let (data, server) = server_with_account();
+    // An empty password is refused, but only after the folder is checked.
+    let out = connect_cmd(&server.url, data.path(), "");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("holds a server's data"), "{err}");
+
+    let local = tempfile::tempdir().unwrap();
+    std::fs::write(
+        local.path().join("pipeline.toml"),
+        "[server]\nfolder = \"/srv/notedown\"\n",
+    )
+    .unwrap();
+    let out = connect_cmd(&server.url, local.path(), "");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.lines().any(|l| l
+            == "error: pipeline.toml points at the folder /srv/notedown; change it or use \
+                another --data folder"),
+        "{err}"
+    );
+    assert!(!local.path().join("tokens").exists());
+}
+
+#[test]
+fn connect_refuses_a_url_with_a_user_name_or_a_password() {
+    let (_data, server) = server_with_account();
+    let local = tempfile::tempdir().unwrap();
+    let url = server.url.replace("http://", "http://jordi:hidden@");
+    let out = connect_cmd(&url, local.path(), "secret");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.lines().any(|l| l
+            == "error: the server url must not hold a user name or a password; connect asks \
+                for the password"),
+        "{err}"
+    );
+    assert!(!err.contains("hidden"), "{err}");
     assert!(!local.path().join("tokens").exists());
     assert!(!local.path().join("pipeline.toml").exists());
 }

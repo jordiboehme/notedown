@@ -2176,6 +2176,8 @@ struct ConnectArgs {
 
 #[cfg(feature = "ocr")]
 fn connect_command(a: ConnectArgs) -> Result<ExitCode> {
+    // A wrong folder or URL is said before the password is asked for.
+    notedown_pipeline::connect::check(&a.url, &a.data)?;
     let password = read_password(a.password_stdin, false)?;
     let c = notedown_pipeline::connect::connect(&a.url, &a.data, &a.email, &password, &a.name)?;
     let url = a.url.trim().trim_end_matches('/');

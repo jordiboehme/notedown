@@ -29,7 +29,9 @@ Early. What works today:
 - The Private Cloud (experimental): device sync, digests, to-dos, a recycle bin and a journal.
 - The pipeline: keeps the note text up to date and serves it to agents over MCP (stdio).
 
-What comes next: the sync server on a Raspberry Pi with the OCR on a Mac, and a new vision engine
+The sync server also builds for a Raspberry Pi without the OCR part (see the getting started guide).
+
+What comes next: a pipeline on a Mac that reads the server on the Pi, and a new vision engine
 that reads layout and content in two steps. There is no release yet, so you build it from source.
 Star the repo if you want to see where this goes.
 

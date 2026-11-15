@@ -147,6 +147,8 @@ notedown serve --data ~/notedown-data --capture
 
 The first start writes `server.toml` with the defaults. Leave `protect = true` and `sync = "accept"`. `--capture` writes every request into `~/notedown-data/capture/` for this run. It helps if something goes wrong. Drop it once you trust the setup.
 
+If the device reaches the server through a reverse proxy, set `external_base_url` in `server.toml`, for example `external_base_url = "https://notes.example.org"`. The device gets the upload and download URLs from this base, so it must be an address the device can reach. Without it, notedown uses the host of the request. Restart the server after you change it.
+
 The output shows one or more lines like `device URL: http://192.168.1.10:19072`. Use the one of your home network. macOS may ask if notedown may accept incoming connections. Allow it.
 
 ### 6. Log out of Ratta's cloud
@@ -210,6 +212,25 @@ After `notedown cloud import --replace` every file gets a new id. The old versio
 ## PDFs of your notes
 
 The server keeps a PDF of every note in `share/` in the data folder, for example `~/notedown-data/share/me/`. You don't need to set anything for it. To use another folder, set `render_dir` in `server.toml`, for example `render_dir = "~/Documents/Supernote PDFs"`. `~` alone is your home folder. The folder must exist. The path must start with `/` or `~` and point outside the data folder, or the server doesn't start. To turn the PDFs off, set `render_dir = ""`. There is one subfolder per account, with the same folders as on the device. Two notes that would get the same PDF name (for example `a.note` and `a.NOTE`) get two PDFs. The note that had its PDF first keeps `a.pdf`. The other one gets its full name, as `a.NOTE.pdf`. When both notes are new, the one whose name sorts first gets `a.pdf`. A changed note is rendered again a few seconds after the sync. A moved or deleted note moves or deletes its PDF. Other files in that folder are never touched. To render everything again, run `notedown cloud render --data <data folder> --all`. For one note without the server, run `notedown render <file.note> --pdf`.
+
+## The server on a Raspberry Pi
+
+The sync server is small. It can run on a Raspberry Pi that stays on all day, so your computer doesn't have to.
+
+Build it on the Pi (64-bit Raspberry Pi OS, arm64) without the OCR part:
+
+```sh
+cargo build --release --no-default-features -p notedown
+```
+
+This build has `serve`, `cloud` and `render`. It has no OCR, so there is no `pipeline`, `convert`, `model` or `mcp`, and `serve` has no `--pipeline`. The build needs no `cmake` and no C++ compiler. There are no release binaries yet.
+
+Set up the account, the import and the server as in part 2, with the binary from `target/release/`. Two things to know:
+
+- The Pi needs the right time. Run NTP (Raspberry Pi OS does this by default). The server signs the transfer URLs and the journal and the logs carry time stamps, so a wrong clock causes trouble.
+- The device keeps the address of its Private Cloud. If the address of the Pi changes, you have to log out of the cloud on the device and set it up again. Give the Pi a fixed address: a fixed lease in your router or a static address.
+
+Note text for an agent does not work on the Pi alone yet. A pipeline on a second machine that reads the Pi over the network is planned, but it is not there. Until then, run `notedown serve --pipeline` on one machine with the OCR build (for example a Mac) to get note text, as described below.
 
 ## Your notes as text for an agent
 

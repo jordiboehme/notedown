@@ -30,7 +30,7 @@ fn two_folders() -> (Data, TempDir) {
     (d, local)
 }
 
-fn point_at(local: &Path, server: &Path) {
+pub(crate) fn point_at(local: &Path, server: &Path) {
     std::fs::write(
         local.join("pipeline.toml"),
         format!("[server]\nfolder = {:?}\n", server.to_str().unwrap()),
@@ -38,7 +38,7 @@ fn point_at(local: &Path, server: &Path) {
     .unwrap();
 }
 
-fn load(local: &Path) -> Setup {
+pub(crate) fn load(local: &Path) -> Setup {
     let mut s = Setup::load(local).unwrap();
     s.cfg = no_settle();
     s
@@ -46,22 +46,22 @@ fn load(local: &Path) -> Setup {
 
 /// What the worker said, line by line.
 #[derive(Clone, Default)]
-struct Said(Arc<Mutex<Vec<String>>>);
+pub(crate) struct Said(Arc<Mutex<Vec<String>>>);
 
 impl Said {
-    fn sink(&self) -> Arc<dyn Fn(&str) + Send + Sync> {
+    pub(crate) fn sink(&self) -> Arc<dyn Fn(&str) + Send + Sync> {
         let lines = self.0.clone();
         Arc::new(move |s: &str| lines.lock().unwrap().push(s.to_string()))
     }
-    fn lines(&self) -> Vec<String> {
+    pub(crate) fn lines(&self) -> Vec<String> {
         self.0.lock().unwrap().clone()
     }
-    fn count(&self, part: &str) -> usize {
+    pub(crate) fn count(&self, part: &str) -> usize {
         self.lines().iter().filter(|l| l.contains(part)).count()
     }
 }
 
-fn log(local: &Path) -> Vec<LogLine> {
+pub(crate) fn log(local: &Path) -> Vec<LogLine> {
     let mut out = Vec::new();
     let Ok(store) = TextStore::open(local, SLUG) else {
         return out;
@@ -75,7 +75,7 @@ fn log(local: &Path) -> Vec<LogLine> {
     out
 }
 
-fn last_seq(data: &Path) -> u64 {
+pub(crate) fn last_seq(data: &Path) -> u64 {
     Journal::open(data).unwrap().last_seq().unwrap()
 }
 
@@ -493,34 +493,34 @@ fn a_corrupt_cursor_is_read_again_from_the_start() {
 // Owners, slug reuse and `account.removed` (the note text on the Mac is deleted only for a
 // removed or replaced account).
 
-const FIRST_ID: u64 = 1_000_001;
-const SECOND_ID: u64 = 1_000_002;
+pub(crate) const FIRST_ID: u64 = 1_000_001;
+pub(crate) const SECOND_ID: u64 = 1_000_002;
 
-fn store_dir(local: &Path, slug: &str) -> PathBuf {
+pub(crate) fn store_dir(local: &Path, slug: &str) -> PathBuf {
     local.join("pipeline").join(slug)
 }
 
 /// The user id in `<local>/pipeline/<slug>/owner.json`, `None` without one. Creates nothing.
-fn owner_of(local: &Path, slug: &str) -> Option<u64> {
+pub(crate) fn owner_of(local: &Path, slug: &str) -> Option<u64> {
     let bytes = std::fs::read(store_dir(local, slug).join("owner.json")).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     Some(v["userId"].as_u64().unwrap())
 }
 
-fn create_account(data: &Path, slug: &str) {
+pub(crate) fn create_account(data: &Path, slug: &str) {
     Accounts::new(data)
         .create(slug, &format!("{slug}@example.org"), "secret")
         .unwrap();
 }
 
-fn remove_account(data: &Path, slug: &str) {
+pub(crate) fn remove_account(data: &Path, slug: &str) {
     Accounts::new(data)
         .remove(slug, &Journal::open(data).unwrap())
         .unwrap();
 }
 
 /// Puts fixture `name` into `folder` of account `slug`; returns the note key.
-fn put_into(data: &Path, slug: &str, name: &str, folder: &str) -> String {
+pub(crate) fn put_into(data: &Path, slug: &str, name: &str, folder: &str) -> String {
     let journal = Journal::open(data).unwrap();
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/notes")
@@ -537,7 +537,7 @@ fn put_into(data: &Path, slug: &str, name: &str, folder: &str) -> String {
         .0
 }
 
-fn tombstones(local: &Path) -> Vec<String> {
+pub(crate) fn tombstones(local: &Path) -> Vec<String> {
     std::fs::read_dir(local.join("pipeline"))
         .map(|e| {
             e.flatten()
@@ -548,12 +548,12 @@ fn tombstones(local: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn removed_message(slug: &str) -> String {
+pub(crate) fn removed_message(slug: &str) -> String {
     format!("notedown pipeline: account {slug} was removed on the server; its note text is deleted")
 }
 
 /// A continuous worker on `s` with a test clock and the messages in `said`.
-fn continuous(s: &Setup, said: &Said) -> (Worker, TestClock) {
+pub(crate) fn continuous(s: &Setup, said: &Said) -> (Worker, TestClock) {
     let clock = TestClock::at(now_ms());
     let w = Worker::new(s, Box::new(engine_reading("hello")))
         .with_clock(Arc::new(clock.clone()))
@@ -937,9 +937,9 @@ fn removing_an_account_on_one_machine_leaves_the_worker_running() {
 }
 
 /// Per account: the live note keys, and per note the block texts of each page in order.
-type Texts = Vec<(String, Vec<Vec<String>>)>;
+pub(crate) type Texts = Vec<(String, Vec<Vec<String>>)>;
 
-fn texts_of(local: &Path, slug: &str) -> Texts {
+pub(crate) fn texts_of(local: &Path, slug: &str) -> Texts {
     let store = TextStore::open(local, slug).unwrap();
     store
         .notes()

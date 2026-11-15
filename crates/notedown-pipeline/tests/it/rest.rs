@@ -26,14 +26,14 @@ use crate::source::contract;
 use crate::worker::{Data, SLUG, TestClock, engine_reading, no_settle, now_ms, setup, stop_at};
 
 /// A notedown server over a data folder, on a runtime of its own thread.
-struct Server {
+pub(crate) struct Server {
     addr: SocketAddr,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Server {
-    fn start(data: &Path) -> Server {
+    pub(crate) fn start(data: &Path) -> Server {
         let data = data.to_path_buf();
         let (addr_tx, addr_rx) = std::sync::mpsc::channel();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -75,7 +75,7 @@ impl Server {
         }
     }
 
-    fn url(&self) -> String {
+    pub(crate) fn url(&self) -> String {
         format!("http://{}", self.addr)
     }
 
@@ -447,7 +447,7 @@ fn a_note_path_with_a_plus_and_a_space_is_sent_as_it_is() {
     );
 }
 
-fn refused_message(url: &str, local: &Path, slug: &str) -> String {
+pub(crate) fn refused_message(url: &str, local: &Path, slug: &str) -> String {
     format!(
         "the server refused the token of {slug}; run notedown connect {url} --data {} again",
         local.display()

@@ -112,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine: "chandra-ocr-2",
         fingerprint: Fingerprint {
             krate: format!("notedown-ocr {}", env!("CARGO_PKG_VERSION")),
-            llama_cpp_2: "0.1.158",
+            llama_cpp_2: "0.1.161",
             model_sha256: [
                 model::DEFAULT_MODEL.model.sha256,
                 model::DEFAULT_MODEL.mmproj.sha256,

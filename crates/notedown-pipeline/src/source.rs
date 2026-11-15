@@ -151,8 +151,11 @@ impl ServerData for FolderSource {
             end: 0,
             more: false,
         };
-        if !journal.dir().is_dir() {
-            return Ok(batch);
+        // Only a folder that is certainly not there is "no journal"; any other error is no answer.
+        match std::fs::metadata(journal.dir()) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(batch),
+            Err(e) => return Err(io(journal.dir())(e)),
         }
         batch.end = last_seq(&journal)?;
         let files = journal.files()?;
@@ -166,18 +169,23 @@ impl ServerData for FolderSource {
             current: None,
             last: 0,
         };
+        let limit = limit.max(1);
         let mut read = 0usize;
         while let Some(line) = lines.next_line()? {
-            if line.seq < from {
+            if line.est < from {
                 continue;
             }
-            // The line after the limit is only looked at, not taken.
-            if read >= limit {
+            // The line after the limit is only looked at, not taken. Only lines with a real
+            // `seq` count toward the limit and move `next`: a line without one is not a place
+            // to put the cursor behind, since the event that follows may still be unread.
+            if line.seq.is_some() && read >= limit {
                 batch.more = true;
                 break;
             }
-            read += 1;
-            batch.next = batch.next.max(line.seq + 1);
+            if let Some(seq) = line.seq {
+                read += 1;
+                batch.next = batch.next.max(seq + 1);
+            }
             if line.account.as_deref().is_none_or(|a| a == slug) {
                 batch.changed = true;
             }
@@ -188,7 +196,7 @@ impl ServerData for FolderSource {
                 }) = line.event
             {
                 batch.removed.push(Removal {
-                    seq: line.seq,
+                    seq: line.est,
                     user_id,
                 });
             }
@@ -201,9 +209,12 @@ impl ServerData for FolderSource {
 /// A complete journal line. A line that does not parse as an event has `event: None`. Its
 /// `account` is read from the line when it is still JSON with one, else it is `None`, and the
 /// line counts for every account (the safe side). Its `seq` is read the same way, else it is
-/// taken to follow the line before it.
+/// taken to follow the last real one, and it never moves a cursor.
 struct Line {
-    seq: u64,
+    /// The `seq` the line carries, `None` when none can be read.
+    seq: Option<u64>,
+    /// The `seq`, else the one after the last real one: only for placing the line before `from`.
+    est: u64,
     account: Option<String>,
     event: Option<Event>,
 }
@@ -246,15 +257,18 @@ impl Lines {
             let seq = event
                 .as_ref()
                 .map(|e| e.seq)
-                .or_else(|| value.as_ref()?.get("seq")?.as_u64())
-                .unwrap_or(self.last + 1);
+                .or_else(|| value.as_ref()?.get("seq")?.as_u64());
             let account = event
                 .as_ref()
                 .map(|e| e.account.clone())
                 .or_else(|| value.as_ref()?.get("account")?.as_str().map(str::to_string));
-            self.last = seq;
+            let est = seq.unwrap_or(self.last + 1);
+            if let Some(seq) = seq {
+                self.last = seq;
+            }
             return Ok(Some(Line {
                 seq,
+                est,
                 account,
                 event,
             }));

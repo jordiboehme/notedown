@@ -10,7 +10,9 @@ use notedown_cloud::auth::Accounts;
 use notedown_cloud::journal::Journal;
 use notedown_pipeline::Error;
 use notedown_pipeline::records::{Record, Records};
-use notedown_pipeline::source::{FolderSource, JournalBatch, NoteBytes, ServerAccount, ServerData};
+use notedown_pipeline::source::{
+    FolderSource, JournalBatch, NoteBytes, Removal, ServerAccount, ServerData,
+};
 
 use crate::worker::{Data, SLUG, setup};
 
@@ -190,6 +192,35 @@ pub(crate) fn a_missing_account(src: &dyn ServerData, d: &Data) {
     }
 }
 
+pub(crate) fn removed_accounts(src: &dyn ServerData, d: &Data) {
+    let accounts = Accounts::new(&d.data);
+    let bob = accounts.create("bob", "bob@example.org", "secret").unwrap();
+    let journal = Journal::open(&d.data).unwrap();
+    notedown_cloud::put::put(
+        &d.data,
+        "bob",
+        &journal,
+        &fixture("test2"),
+        "NOTE/Note",
+        None,
+    )
+    .unwrap();
+    let from = src.journal("bob", 1, 10_000).unwrap().next;
+    let other_from = src.journal(SLUG, 1, 10_000).unwrap().next;
+    accounts.remove("bob", &journal).unwrap();
+    let b = src.journal("bob", from, 10_000).unwrap();
+    assert!(b.changed);
+    assert_eq!(
+        b.removed,
+        [Removal {
+            seq: b.end,
+            user_id: bob.user_id
+        }]
+    );
+    let other = src.journal(SLUG, other_from, 10_000).unwrap();
+    assert!(other.removed.is_empty());
+}
+
 fn contract(src: &dyn ServerData, d: &Data) {
     journal_from_a_position(src, d);
     journal_is_per_account(src, d);
@@ -197,6 +228,7 @@ fn contract(src: &dyn ServerData, d: &Data) {
     note_bytes(src, d);
     digests_keep_only_live_ones(src, d);
     a_missing_account(src, d);
+    removed_accounts(src, d);
 }
 
 #[test]
@@ -317,4 +349,74 @@ fn a_line_that_does_not_parse_counts_as_changed() {
     let only_anna = src.journal(SLUG, end + 2, 10_000).unwrap();
     assert!(!only_anna.changed);
     assert!(src.journal("anna", end + 2, 10_000).unwrap().changed);
+}
+
+fn event_line(seq: u64, account: &str, user_id: u64) -> String {
+    use notedown_cloud::journal::{Event, EventBody, Origin};
+    let mut e = Event::new(
+        account,
+        Origin::Cli,
+        None,
+        "op",
+        EventBody::AccountRemoved { user_id },
+    );
+    e.seq = seq;
+    e.to_line()
+}
+
+fn write_journal(root: &Path, lines: &[String]) {
+    let dir = root.join("journal");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut text = lines.join("\n");
+    text.push('\n');
+    std::fs::write(dir.join("journal-000000000001.jsonl"), text).unwrap();
+}
+
+#[test]
+fn a_garbage_line_at_the_page_boundary_takes_no_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    write_journal(
+        dir.path(),
+        &[
+            event_line(1, "a", 1),
+            "garbage".into(),
+            event_line(2, "a", 2),
+        ],
+    );
+    let src = FolderSource::new(dir.path());
+    let b = src.journal("a", 2, 1).unwrap();
+    assert!(b.changed);
+    assert_eq!(b.next, 3);
+    assert_eq!(b.removed, [Removal { seq: 2, user_id: 2 }]);
+}
+
+#[test]
+fn a_trailing_garbage_line_does_not_skip_the_next_event() {
+    let dir = tempfile::tempdir().unwrap();
+    write_journal(dir.path(), &[event_line(1, "a", 1), "garbage".into()]);
+    let src = FolderSource::new(dir.path());
+    let b = src.journal("a", 2, 10).unwrap();
+    assert!(b.changed);
+    assert_eq!(b.next, 2);
+    write_journal(dir.path(), &[event_line(1, "a", 1), event_line(2, "a", 2)]);
+    let b = src.journal("a", b.next, 10).unwrap();
+    assert_eq!(b.removed, [Removal { seq: 2, user_id: 2 }]);
+}
+
+#[test]
+fn a_journal_folder_that_cannot_be_looked_at_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("file");
+    std::fs::write(&file, "x").unwrap();
+    // `file/journal` fails with "not a directory", not "not found".
+    assert!(FolderSource::new(&file).journal("a", 1, 10).is_err());
+}
+
+#[test]
+fn a_limit_of_zero_still_makes_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    write_journal(dir.path(), &[event_line(1, "a", 1), event_line(2, "a", 2)]);
+    let b = FolderSource::new(dir.path()).journal("a", 1, 0).unwrap();
+    assert_eq!(b.next, 2);
+    assert!(b.more);
 }

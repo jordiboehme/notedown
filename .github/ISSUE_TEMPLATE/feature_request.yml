@@ -1,0 +1,16 @@
+name: Feature request
+description: An idea for notedown.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What do you want to do
+      description: What do you want to do, and what stops you today?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+      description: How could notedown help? Leave it empty if you are not sure.

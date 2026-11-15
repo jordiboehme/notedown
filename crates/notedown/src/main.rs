@@ -1694,6 +1694,19 @@ fn device_urls(listen: &[std::net::SocketAddr], host_ips: &[std::net::Ipv4Addr])
     urls
 }
 
+/// The base URLs of the REST API: the device URLs, else (loopback only) the bound addresses
+/// that a client can use. An unspecified address (`0.0.0.0`, `[::]`) is never one.
+fn rest_bases(bound: &[std::net::SocketAddr], device_urls: &[String]) -> Vec<String> {
+    if !device_urls.is_empty() {
+        return device_urls.to_vec();
+    }
+    bound
+        .iter()
+        .filter(|a| !a.ip().is_unspecified())
+        .map(|a| format!("http://{a}"))
+        .collect()
+}
+
 fn host_ipv4s() -> Vec<std::net::Ipv4Addr> {
     if_addrs::get_if_addrs()
         .unwrap_or_default()
@@ -1734,12 +1747,10 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
         for url in &urls {
             println!("device URL: {url}");
         }
-        // Without a device URL (loopback only) the bound addresses are the base.
-        let bases = if urls.is_empty() {
-            bound.iter().map(|a| format!("http://{a}")).collect()
-        } else {
-            urls
-        };
+        let bases = rest_bases(&bound, &urls);
+        if bases.is_empty() {
+            println!("REST API: none found, use the IP address of this host");
+        }
         for base in &bases {
             println!(
                 "REST API: {base}{} (connect a pipeline with notedown connect {base})",
@@ -2251,6 +2262,19 @@ mod tests {
             device_urls(&listen, &ips),
             ["http://192.168.1.20:19072", "http://10.0.0.5:19072"]
         );
+    }
+
+    #[test]
+    fn the_rest_base_is_never_an_unspecified_address() {
+        let bound: Vec<std::net::SocketAddr> = vec![
+            "0.0.0.0:19072".parse().unwrap(),
+            "[::]:19072".parse().unwrap(),
+        ];
+        assert!(rest_bases(&bound, &[]).is_empty());
+        let local = ["127.0.0.1:19072".parse().unwrap()];
+        assert_eq!(rest_bases(&local, &[]), ["http://127.0.0.1:19072"]);
+        let lan = ["http://192.168.1.20:19072".to_string()];
+        assert_eq!(rest_bases(&bound, &lan), lan);
     }
 
     #[test]

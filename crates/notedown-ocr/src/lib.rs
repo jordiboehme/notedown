@@ -5,6 +5,6 @@ mod llama;
 pub mod model;
 pub mod prompt;
 
-pub use engine::{OcrEngine, OcrOptions, PageOcr};
+pub use engine::{OcrBlock, OcrEngine, OcrOptions, PageOcr};
 pub use error::OcrError;
 pub use llama::LlamaEngine;

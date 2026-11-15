@@ -4,8 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use notedown_note::{Notebook, RenderOptions, TextBox, VersionPolicy, encode_png};
-use notedown_ocr::convert::{LayoutBlock, html_to_markdown};
-use notedown_ocr::{OcrEngine, PageOcr};
+use notedown_ocr::{OcrBlock, OcrEngine, PageOcr};
 use sha2::{Digest, Sha256};
 
 use crate::document::{
@@ -202,7 +201,7 @@ pub struct PageResult {
     pub out: PageOut,
     pub png: Option<Vec<u8>>,
     pub ocr: Option<PageOcr>,
-    pub blocks: Vec<LayoutBlock>,
+    pub blocks: Vec<OcrBlock>,
     /// Markdown of each block, aligned with `blocks`.
     pub parts: Vec<String>,
 }
@@ -250,20 +249,22 @@ pub fn process_pages(
         let ocr = engine
             .ocr_png(&png)
             .map_err(|e| anyhow!("OCR failed on page {number}: {e}"))?;
-        let converted = html_to_markdown(&ocr.html);
+        let parts = ocr.blocks.iter().map(|b| b.markdown.clone()).collect();
+        let blocks = ocr.blocks.clone();
+        let markdown = ocr.markdown.clone();
         results.push(PageResult {
             out: PageOut {
                 number,
                 page_id,
                 image_rel,
-                markdown: converted.markdown,
+                markdown,
                 truncated: ocr.truncated,
                 empty: false,
             },
             png: images.then_some(png),
             ocr: Some(ocr),
-            blocks: converted.blocks,
-            parts: converted.parts,
+            blocks,
+            parts,
         });
     }
     Ok(results)
@@ -678,18 +679,16 @@ pub fn convert_one(
 mod tests {
     use super::*;
     use notedown_ocr::OcrError;
+    use notedown_ocr::convert::chandra_page;
 
     struct Counting(usize);
     impl OcrEngine for Counting {
         fn ocr_png(&mut self, _png: &[u8]) -> Result<PageOcr, OcrError> {
             self.0 += 1;
             Ok(PageOcr {
-                html: "<div data-label=\"Text\"><p>Hi</p></div>".into(),
                 prompt_tokens: 1,
                 output_tokens: 1,
-                truncated: false,
-                encode_ms: 0,
-                decode_ms: 0,
+                ..chandra_page("<div data-label=\"Text\"><p>Hi</p></div>")
             })
         }
         fn label(&self) -> &str {

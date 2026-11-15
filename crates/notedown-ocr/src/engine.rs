@@ -18,11 +18,27 @@ impl Default for OcrOptions {
     }
 }
 
+/// One block of the OCR result, independent of the model that produced it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct OcrBlock {
+    /// Layout label in Chandra's vocabulary ("Text", "Section-Header", "List-Group", "Diagram",
+    /// "Figure", "Image", "Table", ...). The pipeline stores and compares these strings.
+    pub label: String,
+    /// Box on the 0..=1000 grid, if the engine gave one.
+    pub bbox: Option<[u32; 4]>,
+    /// The block as Markdown; empty for a block that renders nothing (kept for index alignment).
+    pub markdown: String,
+}
+
 /// The OCR result for one page.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PageOcr {
-    /// Chandra layout HTML, without the leading think block.
-    pub html: String,
+    pub blocks: Vec<OcrBlock>,
+    /// The page as Markdown (what `convert::assemble` gives for the blocks' Markdown).
+    pub markdown: String,
+    pub mermaid_blocks: usize,
+    /// The engine's raw answer (Chandra HTML today), for debug output only.
+    pub raw: String,
     pub prompt_tokens: u32,
     pub output_tokens: u32,
     /// True when generation stopped at `max_tokens`.
@@ -31,7 +47,7 @@ pub struct PageOcr {
     pub decode_ms: u64,
 }
 
-/// A backend that turns a page image into Chandra layout HTML.
+/// A backend that turns a page image into blocks of Markdown.
 pub trait OcrEngine {
     fn ocr_png(&mut self, png: &[u8]) -> Result<PageOcr, OcrError>;
     fn label(&self) -> &str;

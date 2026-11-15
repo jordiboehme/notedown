@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
+use notedown_ocr::convert::chandra_page;
 use notedown_ocr::{OcrEngine, OcrError, PageOcr};
 use sha2::{Digest, Sha256};
 
@@ -107,12 +108,8 @@ impl OcrEngine for FakeEngine {
             .unwrap_or(&self.default_html)
             .clone();
         Ok(PageOcr {
-            html,
-            prompt_tokens: 0,
-            output_tokens: 0,
             truncated: self.truncated,
-            encode_ms: 0,
-            decode_ms: 0,
+            ..chandra_page(&html)
         })
     }
 

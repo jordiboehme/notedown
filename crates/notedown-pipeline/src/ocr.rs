@@ -3,7 +3,6 @@
 use notedown_convert::pipeline::{NoteSource, PageSource};
 use notedown_note::Notebook;
 use notedown_ocr::OcrEngine;
-use notedown_ocr::convert::html_to_markdown;
 
 use crate::compose::NewBlock;
 use crate::{Error, Result};
@@ -49,15 +48,14 @@ pub fn read_page(nb: &Notebook, index: usize, engine: &mut dyn OcrEngine) -> Res
     let png = source.png(index).map_err(read)?;
     let ocr = engine.ocr_png(&png)?;
     reading.truncated = ocr.truncated;
-    let converted = html_to_markdown(&ocr.html);
-    for (block, part) in converted.blocks.into_iter().zip(converted.parts) {
-        if part.trim().is_empty() {
+    for block in ocr.blocks {
+        if block.markdown.trim().is_empty() {
             continue;
         }
         reading.blocks.push(NewBlock {
             label: block.label,
             bbox: block.bbox.unwrap_or(WHOLE_PAGE),
-            text: part,
+            text: block.markdown,
         });
     }
     Ok(reading)

@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 use notedown_note::{Link, LinkKind, Notebook, VersionPolicy};
-use notedown_ocr::convert::{LayoutBlock, assemble};
+use notedown_ocr::OcrBlock;
+use notedown_ocr::convert::assemble;
 
 use crate::document::{Frontmatter, FrontmatterLink};
 use crate::inputs::{Input, InputKind};
@@ -249,12 +250,7 @@ fn decode_url(s: &str) -> String {
 /// where that overlap also covers at least half of the block's area. A small link inside
 /// a large paragraph therefore labels no block: the paragraph keeps its text and the link
 /// is only listed in the `Links:` line.
-pub fn place(
-    links: &[Link],
-    blocks: &[LayoutBlock],
-    page_w: u32,
-    page_h: u32,
-) -> Vec<Option<usize>> {
+pub fn place(links: &[Link], blocks: &[OcrBlock], page_w: u32, page_h: u32) -> Vec<Option<usize>> {
     let (w, h) = (f64::from(page_w), f64::from(page_h));
     links
         .iter()

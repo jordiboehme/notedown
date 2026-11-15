@@ -15,12 +15,10 @@ fn ocr_test2_page_finds_text_and_diagram() {
     let out = engine.ocr_png(&png).unwrap();
     eprintln!(
         "load {load_ms} ms, encode {} ms, decode {} ms, prompt {} tokens, output {} tokens\n{}",
-        out.encode_ms, out.decode_ms, out.prompt_tokens, out.output_tokens, out.html
+        out.encode_ms, out.decode_ms, out.prompt_tokens, out.output_tokens, out.raw
     );
     assert!(!out.truncated);
-    let md = notedown_ocr::convert::html_to_markdown(&out.html)
-        .markdown
-        .to_lowercase();
+    let md = out.markdown.to_lowercase();
     assert!(md.contains("recognition"), "{md}");
     assert!(md.contains("```mermaid"), "{md}");
 
@@ -43,7 +41,7 @@ fn ocr_test2_page_finds_text_and_diagram() {
 fn edge_check_sees_wrong_arrows() {
     // Chandra 2 output for test2 from a newer llama.cpp: the right nodes, mostly wrong arrows.
     let html = r#"<div data-bbox="96 291 658 567" data-label="Diagram"><pre>graph TD; search((search)) --&gt; teach((teach)); teach --&gt; learn((learn)); learn --&gt; search;</pre></div><div data-bbox="195 652 829 786" data-label="Diagram"><pre>graph LR; App((App)) --&gt; DB[(DB)]; DB --&gt; MCP[MCP];</pre></div>"#;
-    let md = notedown_ocr::convert::html_to_markdown(html)
+    let md = notedown_ocr::convert::chandra_page(html)
         .markdown
         .to_lowercase();
     let mut edges = mermaid_edges(&md);

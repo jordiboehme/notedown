@@ -12,9 +12,16 @@ struct FakeEngine {
 impl OcrEngine for FakeEngine {
     fn ocr_png(&mut self, _png: &[u8]) -> Result<PageOcr, OcrError> {
         self.calls += 1;
-        Ok(PageOcr { html: r#"<div data-label="Text"><p>Hello page</p></div><div data-label="Diagram"><pre>graph LR
-A --> B</pre></div>"#.into(),
-            prompt_tokens: 10, output_tokens: 5, truncated: false, encode_ms: 1, decode_ms: 1 })
+        Ok(PageOcr {
+            prompt_tokens: 10,
+            output_tokens: 5,
+            encode_ms: 1,
+            decode_ms: 1,
+            ..notedown_ocr::convert::chandra_page(
+                r#"<div data-label="Text"><p>Hello page</p></div><div data-label="Diagram"><pre>graph LR
+A --> B</pre></div>"#,
+            )
+        })
     }
     fn label(&self) -> &str {
         "fake-model"
@@ -349,18 +356,18 @@ fn link(kind: notedown_note::LinkKind, rect: [u32; 4]) -> notedown_note::Link {
 #[test]
 fn link_placement_uses_bbox_overlap() {
     use notedown_note::LinkKind;
-    use notedown_ocr::convert::LayoutBlock;
+    use notedown_ocr::OcrBlock;
     let l = link(LinkKind::File, [788, 426, 275, 111]);
     // Same area in 0-1000 coordinates of a 1404x1872 page.
-    let hit = LayoutBlock {
+    let hit = OcrBlock {
         label: "Text".into(),
         bbox: Some([561, 227, 757, 287]),
-        html: "<p>Bike</p>".into(),
+        markdown: "Bike".into(),
     };
-    let miss = LayoutBlock {
+    let miss = OcrBlock {
         label: "Text".into(),
         bbox: Some([100, 600, 300, 650]),
-        html: "<p>Alpha</p>".into(),
+        markdown: "Alpha".into(),
     };
     assert_eq!(
         notedown_convert::links::place(&[l], &[miss, hit], 1404, 1872),
@@ -400,20 +407,20 @@ fn apply_links_resolves_by_file_id_without_private_files() {
     assert_eq!(index.resolve("FNOPE", &out.join("Content.md")), None);
 
     let blocks = vec![
-        notedown_ocr::convert::LayoutBlock {
+        notedown_ocr::OcrBlock {
             label: "Text".into(),
             bbox: Some([561, 227, 757, 287]),
-            html: "<p><u>Bike @</u></p>".into(),
+            markdown: "Bike @".into(),
         },
-        notedown_ocr::convert::LayoutBlock {
+        notedown_ocr::OcrBlock {
             label: "Text".into(),
             bbox: Some([570, 700, 770, 760]),
-            html: "<p><u>Bata @</u></p>".into(),
+            markdown: "Bata @".into(),
         },
-        notedown_ocr::convert::LayoutBlock {
+        notedown_ocr::OcrBlock {
             label: "Text".into(),
             bbox: Some([100, 600, 300, 650]),
-            html: "<p>Alpha</p>".into(),
+            markdown: "Alpha".into(),
         },
     ];
     let parts: Vec<String> = ["Bike @", "Bata @", "Alpha"]
@@ -560,11 +567,11 @@ fn folder_walk_does_not_follow_symlink_loops() {
     assert!(warnings.iter().any(|w| w.contains("loop")), "{warnings:?}");
 }
 
-fn block(bbox: [u32; 4], text: &str) -> notedown_ocr::convert::LayoutBlock {
-    notedown_ocr::convert::LayoutBlock {
+fn block(bbox: [u32; 4], text: &str) -> notedown_ocr::OcrBlock {
+    notedown_ocr::OcrBlock {
         label: "Text".into(),
         bbox: Some(bbox),
-        html: format!("<p>{text}</p>"),
+        markdown: text.to_string(),
     }
 }
 
@@ -1238,12 +1245,10 @@ struct TruncatingEngine;
 impl OcrEngine for TruncatingEngine {
     fn ocr_png(&mut self, _png: &[u8]) -> Result<PageOcr, OcrError> {
         Ok(PageOcr {
-            html: "<div data-label=\"Text\"><p>Cut</p></div>".into(),
             prompt_tokens: 1,
             output_tokens: 1,
             truncated: true,
-            encode_ms: 0,
-            decode_ms: 0,
+            ..notedown_ocr::convert::chandra_page("<div data-label=\"Text\"><p>Cut</p></div>")
         })
     }
     fn label(&self) -> &str {

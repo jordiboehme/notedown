@@ -14,6 +14,7 @@ use llama_cpp_2::mtmd::{
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{LogOptions, send_logs_to_tracing};
 
+use crate::convert::chandra_page;
 use crate::engine::{OcrEngine, OcrOptions, PageOcr};
 use crate::model::ModelPaths;
 use crate::{OcrError, prompt};
@@ -202,12 +203,12 @@ impl OcrEngine for LlamaEngine {
 
         let text = String::from_utf8_lossy(&bytes);
         Ok(PageOcr {
-            html: prompt::strip_think(&text).to_string(),
             prompt_tokens,
             output_tokens,
             truncated,
             encode_ms,
             decode_ms,
+            ..chandra_page(prompt::strip_think(&text))
         })
     }
 

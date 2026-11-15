@@ -243,7 +243,10 @@ pub fn decode_recogn_file(data: &[u8]) -> Result<RecognArchive, NoteError> {
         let mut file = zip
             .by_index(i)
             .map_err(|e| err(format!("entry {i}: {e}")))?;
-        let name = file.name().to_owned();
+        let name = file
+            .name()
+            .map_err(|e| err(format!("entry {i}: name: {e}")))?
+            .into_owned();
         let size = file.size();
         let compressed_size = file.compressed_size();
         let limit = budget.min(MAX_ENTRY_BYTES);

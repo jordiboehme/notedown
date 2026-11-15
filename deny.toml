@@ -23,14 +23,5 @@ allow = [
 multiple-versions = "warn"
 
 [advisories]
-# Advisories for crates that Cargo.toml pins exactly. The fix needs a new pin, which is a change
-# of its own (Dependabot proposes it). cargo-deny warns when an id here no longer matches, so
-# remove each entry when its pin moves.
-ignore = [
-    # zip =8.6.0. All four are in ZipArchive::extract and ZipStreamReader::extract. notedown
-    # never calls them: it reads single entries and never unpacks an archive to disk.
-    { id = "RUSTSEC-2026-0367", reason = "zip extract only, not called; remove when zip moves to 9" },
-    { id = "RUSTSEC-2026-0368", reason = "zip extract only, not called; remove when zip moves to 9" },
-    { id = "RUSTSEC-2026-0369", reason = "zip extract only, not called; remove when zip moves to 9" },
-    { id = "RUSTSEC-2026-0429", reason = "zip extract only, not called; remove when zip moves to 9" },
-]
+# No advisory is ignored. When one has to be, list it here with the reason and when it goes.
+ignore = []

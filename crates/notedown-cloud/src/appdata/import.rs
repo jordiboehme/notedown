@@ -310,7 +310,12 @@ fn read_backup(path: &Path) -> Result<Backup> {
         )));
     }
     let mut skipped = Vec::new();
-    for name in zip.file_names().map(String::from).collect::<Vec<_>>() {
+    // A name zip cannot decode is left out of this list of skipped files.
+    for name in zip
+        .file_names()
+        .filter_map(|n| n.ok().map(|n| n.into_owned()))
+        .collect::<Vec<_>>()
+    {
         if let Some(rest) = name.strip_prefix(HANDWRITE_DIR)
             && !rest.is_empty()
             && !rest.ends_with('/')

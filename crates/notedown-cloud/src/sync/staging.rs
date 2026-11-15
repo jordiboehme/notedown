@@ -207,13 +207,21 @@ pub fn create_entry(entry: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Remove an entry and everything in it (a missing one is fine).
+/// Remove an entry and everything in it (a missing one is fine). The entry is first renamed
+/// to `.gone-<id>` in `staging/`, so it vanishes at once: an upload request that is still
+/// receiving bytes finds no entry (and is refused) instead of a half removed one, and a temp
+/// file it creates meanwhile goes away with the rest. A leftover `.gone-` folder is never an
+/// upload ([`valid_inner_name`]) and [`sweep`] removes it.
 pub fn remove_entry(entry: &Path) {
-    match std::fs::remove_dir_all(entry) {
+    let parent = entry.parent().unwrap_or(entry);
+    let gone = parent.join(format!(".gone-{}", crate::journal::new_op_id()));
+    let removed = std::fs::rename(entry, &gone).and_then(|()| {
+        let _ = crate::fsutil::fsync_dir(parent);
+        std::fs::remove_dir_all(&gone)
+    });
+    match removed {
         Ok(()) => {
-            if let Some(parent) = entry.parent() {
-                let _ = crate::fsutil::fsync_dir(parent);
-            }
+            let _ = crate::fsutil::fsync_dir(parent);
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => eprintln!(
@@ -221,6 +229,12 @@ pub fn remove_entry(entry: &Path) {
             entry.display()
         ),
     }
+}
+
+/// Whether the entry is gone (removed by `upload/finish` or never applied for): an upload
+/// request for it is refused, never answered with an error.
+pub fn entry_gone(entry: &Path) -> bool {
+    !entry.join(APPLY_FILE).is_file()
 }
 
 /// Bytes streamed into a temp file of a staging entry: buffered in memory up to 256 KiB, then
@@ -435,8 +449,8 @@ impl StagingLocks {
     ///   that fails, `upload.json` is removed again, so the URL stays usable.
     /// - An entry with a single upload of the same MD5 (still `data`, or claimed by a finish):
     ///   [`SingleOutcome::Same`], the retry of a lost answer.
-    /// - Anything else (other bytes, parts): [`SingleOutcome::Refused`]. Bytes a finish
-    ///   verifies can never change.
+    /// - Anything else (other bytes, parts, an entry that is gone): [`SingleOutcome::Refused`].
+    ///   Bytes a finish verifies can never change.
     pub fn store_single(
         &self,
         entry: &Path,
@@ -448,6 +462,9 @@ impl StagingLocks {
             let _ = std::fs::remove_file(tmp);
         };
         let r = self.with(entry, || {
+            if entry_gone(entry) {
+                return Ok(SingleOutcome::Refused);
+            }
             if let Some(meta) = read_meta(entry)? {
                 let same = meta.upload_id.is_none()
                     && meta.md5.as_deref() == Some(md5)
@@ -515,6 +532,10 @@ impl StagingLocks {
                 let _ = std::fs::remove_file(tmp);
             };
             let total_chunks = meta.total_chunks.unwrap_or(0);
+            if entry_gone(entry) {
+                drop_tmp();
+                return Ok(PartOutcome::Mismatch);
+            }
             match read_meta(entry)? {
                 Some(m) if m == *meta => {}
                 Some(_) => {

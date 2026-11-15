@@ -73,6 +73,9 @@ impl ServerData for Flaky {
         self.check()?;
         self.inner.journal(slug, from, limit)
     }
+    fn knows_gone(&self, slug: &str) -> bool {
+        self.inner.knows_gone(slug)
+    }
 }
 
 fn mtime_ms(path: PathBuf) -> u64 {

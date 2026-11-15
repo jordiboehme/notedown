@@ -37,6 +37,14 @@ pub trait ServerData: Send + Sync {
     fn refusals(&self) -> Vec<(String, String)> {
         Vec::new()
     }
+    /// Whether the source knows for sure that account `slug`, left out of the last
+    /// [`ServerData::accounts`], is gone. Only then may a removal delete its note text; a
+    /// slug that is only missing from the list (a refused token, a failed request) waits.
+    /// The default is `false`: a source that cannot tell never deletes.
+    fn knows_gone(&self, slug: &str) -> bool {
+        let _ = slug;
+        false
+    }
 }
 
 /// The server data in a folder on this machine.
@@ -141,5 +149,10 @@ impl ServerData for FolderSource {
 
     fn journal(&self, slug: &str, from: u64, limit: usize) -> Result<JournalBatch> {
         read::journal(&self.root, slug, from, limit).map_err(from_cloud)
+    }
+
+    /// The folder lists every account it holds: a slug it leaves out is gone.
+    fn knows_gone(&self, _slug: &str) -> bool {
+        true
     }
 }

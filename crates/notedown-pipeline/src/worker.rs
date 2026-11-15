@@ -221,6 +221,9 @@ enum Outcome {
     Done,
     /// The server lists the account as alive.
     Alive,
+    /// The server leaves the account out but does not know it is gone (a refused token, a
+    /// failed request): the removal stays and nothing is deleted.
+    Wait,
 }
 
 /// Where the worker's own messages go.
@@ -446,7 +449,8 @@ impl Worker {
     /// Carries out the pending removals of every account in `seq` order; a removal that fails
     /// stays (said once while its message stays the same) and so do the later ones of its
     /// account. A removal whose account looks alive is dropped only when a list read after the
-    /// removal still shows it; a fresh one waits one turn. Gives whether any removal was done.
+    /// removal still shows it; a fresh one waits one turn. A removal whose account the source
+    /// leaves out without knowing it is gone waits too. Gives whether any removal was done.
     fn removals(
         &self,
         lock: &WriterLock,
@@ -470,7 +474,11 @@ impl Worker {
                         }
                         break;
                     }
-                    Ok(_) => {
+                    Ok(Outcome::Wait) => {
+                        self.settled(&topic);
+                        break;
+                    }
+                    Ok(Outcome::Alive | Outcome::Done) => {
                         list.pop_first();
                         self.settled(&topic);
                         done = true;
@@ -494,9 +502,11 @@ impl Worker {
 
     /// One `account.removed` event of account `slug`: deletes the store when it is of the
     /// removed user id and the server does not list the slug with that id (a crash between
-    /// the server's record and its removal leaves the account alive). A store without owner
-    /// counts as the removed one only on one machine, and only when the server lists no
-    /// account of that slug. A missing store is not created.
+    /// the server's record and its removal leaves the account alive). A slug left out of the
+    /// list counts as gone only when the source knows it ([`ServerData::knows_gone`]); else
+    /// the removal waits. A store without owner counts as the removed one only on one
+    /// machine, and only when the server lists no account of that slug. A missing store is not
+    /// created.
     fn remove(
         &self,
         lock: &WriterLock,
@@ -529,6 +539,9 @@ impl Worker {
         }
         if alive {
             return Ok(Outcome::Alive);
+        }
+        if listed.is_none() && !self.setup.source.knows_gone(slug) {
+            return Ok(Outcome::Wait);
         }
         stores.remove(slug);
         let destroyed = TextStore::destroy(&self.setup.local, slug, lock)?;

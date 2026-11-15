@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use notedown_cloud::auth::Accounts;
 use notedown_cloud::journal::{Event, EventBody, Journal, Origin, new_op_id};
+use notedown_cloud::rest::PREFIX;
 use notedown_pipeline::connect::connect;
 use notedown_pipeline::cursor;
 use notedown_pipeline::model::LineChange;
@@ -28,11 +29,12 @@ use crate::worker::{Data, SLUG, TestClock, engine_reading, no_settle, now_ms, se
 
 /// A proxy in front of the server on a port that never changes. Switched off, it closes every
 /// open connection and every new one after its request head, like a server that is not
-/// running.
+/// running. With a token in `fail`, it answers 500 to `GET /account` with that token.
 struct Proxy {
     addr: SocketAddr,
     on: Arc<AtomicBool>,
     open: Arc<Mutex<Vec<TcpStream>>>,
+    fail: Arc<Mutex<Option<String>>>,
 }
 
 impl Proxy {
@@ -41,7 +43,8 @@ impl Proxy {
         let addr = listener.local_addr().unwrap();
         let on = Arc::new(AtomicBool::new(true));
         let open: Arc<Mutex<Vec<TcpStream>>> = Arc::default();
-        let (on2, open2) = (on.clone(), open.clone());
+        let fail: Arc<Mutex<Option<String>>> = Arc::default();
+        let (on2, open2, fail2) = (on.clone(), open.clone(), fail.clone());
         std::thread::spawn(move || {
             for client in listener.incoming() {
                 let Ok(client) = client else { return };
@@ -58,11 +61,20 @@ impl Proxy {
                 };
                 held.push(client.try_clone().unwrap());
                 held.push(server.try_clone().unwrap());
-                pipe(client.try_clone().unwrap(), server.try_clone().unwrap());
+                requests(
+                    client.try_clone().unwrap(),
+                    server.try_clone().unwrap(),
+                    fail2.clone(),
+                );
                 pipe(server, client);
             }
         });
-        Proxy { addr, on, open }
+        Proxy {
+            addr,
+            on,
+            open,
+            fail,
+        }
     }
 
     fn url(&self) -> String {
@@ -80,6 +92,70 @@ impl Proxy {
     fn on(&self) {
         self.on.store(true, Ordering::SeqCst);
     }
+
+    /// Answers 500 to every `GET /account` with `token`, or with `None` to none.
+    fn fail_account(&self, token: Option<String>) {
+        *self.fail.lock().unwrap() = token;
+    }
+}
+
+/// The request head from `from`, up to and with the empty line; `None` at the end.
+fn head(from: &mut TcpStream) -> Option<Vec<u8>> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match from.read(&mut byte) {
+            Ok(1) => head.push(byte[0]),
+            _ => return None,
+        }
+    }
+    Some(head)
+}
+
+/// Copies the requests from `from` to `to` one by one, each head and its body, on a thread of
+/// its own. A `GET /account` with the token in `fail` gets a 500 and the connection is closed.
+fn requests(mut from: TcpStream, mut to: TcpStream, fail: Arc<Mutex<Option<String>>>) {
+    use std::io::Write;
+    std::thread::spawn(move || {
+        while let Some(head) = head(&mut from) {
+            let text = String::from_utf8_lossy(&head).into_owned();
+            let failing = fail.lock().unwrap().clone().is_some_and(|token| {
+                text.starts_with(&format!("GET {PREFIX}/account "))
+                    && text
+                        .lines()
+                        .any(|l| l.eq_ignore_ascii_case(&format!("authorization: Bearer {token}")))
+            });
+            if failing {
+                let body = br#"{"error":"internal"}"#;
+                let mut answer = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
+                     Connection: close\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                answer.extend_from_slice(body);
+                let _ = from.write_all(&answer);
+                break;
+            }
+            let length: u64 = text
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse().ok())?
+                })
+                .unwrap_or(0);
+            if to.write_all(&head).is_err() {
+                break;
+            }
+            let copied = std::io::copy(&mut (&mut from).take(length), &mut to);
+            if !copied.is_ok_and(|n| n == length) {
+                break;
+            }
+        }
+        let _ = to.shutdown(Shutdown::Both);
+        let _ = from.shutdown(Shutdown::Both);
+    });
 }
 
 /// Reads the request head, then closes the connection. Closing before the request is read
@@ -391,16 +467,7 @@ fn a_stale_removal_record_and_a_password_change_keep_the_text() {
     // A crash between the record and the removal leaves the account alive with a record; then
     // the password changes, so the token is refused. The Mac has not read the record yet: a
     // removed token would make it read the record while the server lists no such account.
-    Journal::open(&d.data)
-        .unwrap()
-        .append(&mut [Event::new(
-            SLUG,
-            Origin::Cli,
-            None,
-            &new_op_id(),
-            EventBody::AccountRemoved { user_id: FIRST_ID },
-        )])
-        .unwrap();
+    stale_removal(&d.data);
     Accounts::new(&d.data)
         .set_password(SLUG, "secret2")
         .unwrap();
@@ -420,6 +487,125 @@ fn a_stale_removal_record_and_a_password_change_keep_the_text() {
     assert_eq!(owner_of(local.path(), SLUG), Some(FIRST_ID));
     assert_eq!(said.count(&removed_message(SLUG)), 0, "{:?}", said.lines());
     assert_eq!(cursor::read(local.path(), SLUG).unwrap(), last_seq(&d.data));
+}
+
+/// The `account.removed` record of the account `jordi` a crash between the record and the
+/// removal leaves behind: the account stays alive.
+fn stale_removal(data: &Path) -> u64 {
+    let journal = Journal::open(data).unwrap();
+    journal
+        .append(&mut [Event::new(
+            SLUG,
+            Origin::Cli,
+            None,
+            &new_op_id(),
+            EventBody::AccountRemoved { user_id: FIRST_ID },
+        )])
+        .unwrap();
+    journal.last_seq().unwrap()
+}
+
+#[test]
+fn a_stale_removal_read_before_a_password_change_keeps_the_text() {
+    let (d, local, h) = over_rest();
+    let key = d.put("test1", "NOTE/Note");
+    let said = Said::default();
+    let (mut w, clock) = mac_worker(local.path(), &h, &said);
+    run_for(&mut w, &clock, 1);
+    let first = cursor::read(local.path(), SLUG).unwrap();
+
+    // One turn reads the record while the account is listed alive; then the password
+    // changes, so the next list leaves the account out without knowing it is gone.
+    let record = stale_removal(&d.data);
+    clock.set(clock.now_ms().max(now_ms()));
+    let end = clock.now_ms() + 25 * 60_000;
+    let turns = std::cell::Cell::new(0);
+    w.run(|| {
+        turns.set(turns.get() + 1);
+        if turns.get() == 1 {
+            Accounts::new(&d.data)
+                .set_password(SLUG, "secret2")
+                .unwrap();
+        }
+        clock.now_ms() >= end
+    })
+    .unwrap();
+    assert!(turns.get() > 1);
+    assert!(has_note(local.path(), &key), "{:?}", said.lines());
+    assert!(store_dir(local.path(), SLUG).join("notes").is_dir());
+    assert!(nothing_deleted(local.path()));
+    assert_eq!(owner_of(local.path(), SLUG), Some(FIRST_ID));
+    assert_eq!(said.count(&removed_message(SLUG)), 0, "{:?}", said.lines());
+    let held = cursor::read(local.path(), SLUG).unwrap();
+    assert!(
+        held < record,
+        "the cursor {held} stays before the record {record}"
+    );
+    assert!(held >= first);
+
+    // A new connect: the account is listed alive, the record is dropped, the text stays.
+    connect_as(&h, local.path(), SLUG, "secret2");
+    run_for(&mut w, &clock, 5_000);
+    assert!(has_note(local.path(), &key), "{:?}", said.lines());
+    assert_eq!(said.count(&removed_message(SLUG)), 0, "{:?}", said.lines());
+    assert_eq!(cursor::read(local.path(), SLUG).unwrap(), last_seq(&d.data));
+}
+
+#[test]
+fn a_stale_removal_read_while_its_account_fails_keeps_the_text() {
+    let (d, local, h) = over_rest();
+    create_account(&d.data, "anna");
+    connect_as(&h, local.path(), "anna", "secret");
+    let key = d.put("test1", "NOTE/Note");
+    put_into(&d.data, "anna", "test1", "NOTE/Note");
+    let said = Said::default();
+    let (mut w, clock) = mac_worker(local.path(), &h, &said);
+    run_for(&mut w, &clock, 1);
+    assert!(has_note(local.path(), &key), "{:?}", said.lines());
+
+    // The turn that first reads the record gets a 500 for jordi's account only; anna answers.
+    let record = stale_removal(&d.data);
+    let token = std::fs::read_to_string(local.path().join("tokens/jordi.token")).unwrap();
+    h.proxy.fail_account(Some(token.trim().to_string()));
+    run_for(&mut w, &clock, 1);
+    assert!(has_note(local.path(), &key), "{:?}", said.lines());
+    assert!(store_dir(local.path(), SLUG).join("notes").is_dir());
+    assert!(nothing_deleted(local.path()));
+    assert_eq!(owner_of(local.path(), SLUG), Some(FIRST_ID));
+    assert_eq!(said.count(&removed_message(SLUG)), 0, "{:?}", said.lines());
+    assert!(cursor::read(local.path(), SLUG).unwrap() < record);
+
+    // The account answers again: it is alive, the record is dropped, the cursor moves on.
+    h.proxy.fail_account(None);
+    run_for(&mut w, &clock, 5_000);
+    assert!(has_note(local.path(), &key), "{:?}", said.lines());
+    assert_eq!(said.count(&removed_message(SLUG)), 0, "{:?}", said.lines());
+    assert_eq!(cursor::read(local.path(), SLUG).unwrap(), last_seq(&d.data));
+}
+
+#[test]
+fn a_removal_after_a_refused_token_deletes_the_text() {
+    let (d, local, h) = over_rest();
+    d.put("test1", "NOTE/Note");
+    let said = Said::default();
+    let (mut w, clock) = mac_worker(local.path(), &h, &said);
+    run_for(&mut w, &clock, 1);
+    let dir = store_dir(local.path(), SLUG);
+    assert!(dir.join("notes").is_dir());
+
+    Accounts::new(&d.data)
+        .set_password(SLUG, "secret2")
+        .unwrap();
+    run_for(&mut w, &clock, 5 * 60_000);
+    assert!(dir.join("notes").is_dir(), "{:?}", said.lines());
+    assert_eq!(said.count(&refused(&h, local.path(), SLUG)), 1);
+
+    // The account is removed while its token is refused: the next probe gets a 410.
+    remove_account(&d.data, SLUG);
+    run_for(&mut w, &clock, 5 * 60_000);
+    assert!(!dir.exists(), "{:?}", said.lines());
+    assert_eq!(said.count(&removed_message(SLUG)), 1, "{:?}", said.lines());
+    assert!(tombstones(local.path()).is_empty());
 }
 
 #[test]

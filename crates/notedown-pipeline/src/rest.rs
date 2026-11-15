@@ -562,6 +562,14 @@ impl ServerData for RestSource {
             .filter_map(|(slug, e)| Some((slug.clone(), self.refusal(slug, &e.state)?)))
             .collect()
     }
+
+    /// Only a 410 for the token of `slug` says the account is gone. A refused token, a token
+    /// of another account, a failed request and a missing token file know nothing.
+    fn knows_gone(&self, slug: &str) -> bool {
+        self.entries()
+            .get(slug)
+            .is_some_and(|e| e.state == State::Removed)
+    }
 }
 
 #[cfg(test)]

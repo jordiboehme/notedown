@@ -314,6 +314,9 @@ impl ServerData for Recording {
         self.froms.lock().unwrap().push(from);
         self.inner.journal(slug, from, limit)
     }
+    fn knows_gone(&self, slug: &str) -> bool {
+        self.inner.knows_gone(slug)
+    }
 }
 
 #[test]
@@ -387,6 +390,9 @@ impl ServerData for Partial {
     }
     fn journal(&self, slug: &str, from: u64, limit: usize) -> Result<JournalBatch> {
         self.inner.journal(slug, from, limit)
+    }
+    fn knows_gone(&self, slug: &str) -> bool {
+        self.inner.knows_gone(slug)
     }
 }
 
@@ -1044,6 +1050,9 @@ impl ServerData for Stale {
     }
     fn journal(&self, slug: &str, from: u64, limit: usize) -> Result<JournalBatch> {
         self.inner.journal(slug, from, limit)
+    }
+    fn knows_gone(&self, slug: &str) -> bool {
+        self.inner.knows_gone(slug)
     }
 }
 

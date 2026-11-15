@@ -69,10 +69,28 @@ fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The text of a `<pre>` or `<code>` element. A `<br/>` inside a quoted label stays a Mermaid
+/// line break (`<br/>`); anywhere else it ends the line. Plain `text()` drops it and glues the
+/// words together ("UI<br/>mac OS" became "UImac OS").
+fn code_text(e: ElementRef) -> String {
+    let mut out = String::new();
+    for node in e.descendants() {
+        match node.value() {
+            Node::Text(t) => out.push_str(t),
+            Node::Element(el) if el.name() == "br" => {
+                let in_quotes = out.matches('"').count() % 2 == 1;
+                out.push_str(if in_quotes { "<br/>" } else { "\n" });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn render_diagram(root: ElementRef) -> Rendered {
     let code = descendants_named(root, &["pre", "code"])
         .first()
-        .map(|e| e.text().collect::<String>());
+        .map(|e| code_text(*e));
     let all_text: String = root.text().collect();
     let source = [code.as_deref(), Some(all_text.as_str())]
         .into_iter()

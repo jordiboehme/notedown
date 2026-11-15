@@ -116,6 +116,18 @@ mod tests {
     }
 
     #[test]
+    fn line_breaks_in_diagram_labels_are_kept() {
+        let html = r#"<div data-label="Diagram" data-bbox="0 0 500 500"><pre>graph TD; A["UI<br/>mac OS menu bar item"] --&gt; B["notedown CLI"];</pre></div>"#;
+        let page = chandra_page(html);
+        assert!(
+            page.markdown
+                .contains(r#"A["UI<br/>mac OS menu bar item"] --> B["notedown CLI"]"#),
+            "{}",
+            page.markdown
+        );
+    }
+
+    #[test]
     fn chandra_page_keeps_empty_blocks() {
         let html = r#"<div data-label="Text" data-bbox="0 0 500 100"><p>Hi</p></div><div data-label="Blank-Page" data-bbox="0 0 1000 1000"></div>"#;
         let page = chandra_page(html);

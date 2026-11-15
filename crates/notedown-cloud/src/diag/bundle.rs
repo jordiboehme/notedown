@@ -194,7 +194,7 @@ fn read_facts(opts: &DiagnoseOptions) -> Result<Facts> {
             dry_run_scan(data, slug, config.scan_min_files, opts.lock_wait),
         ));
     }
-    let pipeline = pipeline_counts(data, &selected, &journal);
+    let pipeline = pipeline_counts(data, &selected);
     let probe_dir = if data.join("accounts").is_dir() {
         data.join("accounts")
     } else {
@@ -217,15 +217,21 @@ fn read_facts(opts: &DiagnoseOptions) -> Result<Facts> {
     })
 }
 
-/// The pipeline's journal cursor and the pages of the selected accounts' note states that are
-/// pending or failed. Only numbers leave this function. A missing folder counts nothing; a
-/// note state that cannot be read is skipped. A page without a state is pending (the
-/// pipeline's own default); the pages of a deleted note are no work and are not counted.
-fn pipeline_counts(data: &Path, selected: &[String], journal: &Journal) -> PipelineCounts {
-    let mut counts = PipelineCounts {
-        cursor: journal.cursor("pipeline").ok().flatten().map(|c| c.seq),
-        ..PipelineCounts::default()
-    };
+/// The pipeline's journal cursor of each selected account (`pipeline/<slug>.cursor`; a cursor
+/// that cannot be read counts as none) and the pages of their note states that are pending or
+/// failed. Only the slugs and numbers leave this function, and the report filters the slugs.
+/// A missing folder counts nothing; a note state that cannot be read is skipped. A page
+/// without a state is pending (the pipeline's own default); the pages of a deleted note are
+/// no work and are not counted.
+fn pipeline_counts(data: &Path, selected: &[String]) -> PipelineCounts {
+    let mut counts = PipelineCounts::default();
+    for slug in selected {
+        let cursor = std::fs::read(data.join("pipeline").join(format!("{slug}.cursor")))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|v| v.get("seq")?.as_u64());
+        counts.cursors.push((slug.clone(), cursor));
+    }
     for slug in selected {
         let dir = data.join("pipeline").join(slug).join("notes");
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -508,7 +514,7 @@ fn write_bundle(
         accounts: &facts.states,
         scans: &facts.scans,
         render_behind: facts.render_behind,
-        pipeline: facts.pipeline,
+        pipeline: facts.pipeline.clone(),
     };
     let (report, values) = render(&stats, &input, &mut w.filter);
     w.check(check_values(

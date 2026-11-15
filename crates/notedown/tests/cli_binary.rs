@@ -2000,10 +2000,7 @@ mod pipeline_and_mcp {
         }
         // A note state that cannot be read counts nothing and stops nothing.
         std::fs::write(d.join("pipeline/jordi/notes/broken.json"), "{").unwrap();
-        notedown_cloud::journal::Journal::open(d)
-            .unwrap()
-            .set_cursor("pipeline", 7)
-            .unwrap();
+        notedown_pipeline::cursor::write(d, "jordi", 7).unwrap();
         let zip_path = dir.path().join("b.zip");
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
             .args(["cloud", "diagnose", "--data"])
@@ -2019,7 +2016,7 @@ mod pipeline_and_mcp {
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(
-            text.contains("\nPipeline  cursor 7, 2 pages pending, 1 failed\n"),
+            text.contains("\nPipeline  cursor acct-1 7, 2 pages pending, 1 failed\n"),
             "{text}"
         );
         let mut zip = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
@@ -2048,7 +2045,7 @@ mod pipeline_and_mcp {
             .output()
             .unwrap();
         assert!(
-            stdout(&out).contains("\nPipeline  cursor none, 0 pages pending, 0 failed\n"),
+            stdout(&out).contains("\nPipeline  not on this machine\n"),
             "{}",
             stdout(&out)
         );

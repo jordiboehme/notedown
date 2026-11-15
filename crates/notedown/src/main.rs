@@ -429,6 +429,27 @@ enum AccountAction {
         #[arg(long)]
         yes: bool,
     },
+    /// List or revoke the REST tokens of an account
+    Tokens {
+        #[command(subcommand)]
+        action: TokensAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokensAction {
+    /// List the tokens (id, name and creation time, never the token itself)
+    List { slug: String },
+    /// Revoke one token by its id, or all of them
+    Revoke {
+        slug: String,
+        /// The token id from `tokens list`
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        id: Option<String>,
+        /// Revoke every token of the account
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[cfg(feature = "ocr")]
@@ -1575,8 +1596,11 @@ fn account_command(data: &Path, action: AccountAction) -> Result<ExitCode> {
                 return Err(anyhow!("account {slug} does not exist"));
             }
             let password = read_password(password_stdin, true)?;
-            accounts.set_password(&slug, &password)?;
+            let revoked = accounts.set_password(&slug, &password)?;
             println!("password of {slug} changed");
+            if revoked > 0 {
+                println!("revoked {revoked} REST tokens");
+            }
         }
         AccountAction::List => {
             for a in accounts.list()? {
@@ -1602,8 +1626,46 @@ fn account_command(data: &Path, action: AccountAction) -> Result<ExitCode> {
             accounts.remove(&slug, &journal)?;
             println!("removed account {slug}");
         }
+        AccountAction::Tokens { action } => tokens_command(data, action)?,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn tokens_command(data: &Path, action: TokensAction) -> Result<()> {
+    use notedown_cloud::auth::{list_tokens, revoke_all_tokens, revoke_token};
+    match action {
+        TokensAction::List { slug } => {
+            let tokens = list_tokens(data, &slug)?;
+            if tokens.is_empty() {
+                println!("no tokens");
+            }
+            for t in tokens {
+                println!("{}  {}  created {}", t.id, t.name, rfc3339_ms(t.created_ms));
+            }
+        }
+        TokensAction::Revoke {
+            slug, id: Some(id), ..
+        } => {
+            if !revoke_token(data, &slug, &id)? {
+                return Err(anyhow!("no token {id} for {slug}"));
+            }
+            println!("revoked {id}");
+        }
+        TokensAction::Revoke { slug, id: None, .. } => {
+            let n = revoke_all_tokens(data, &slug)?;
+            println!("revoked {n} tokens");
+        }
+    }
+    Ok(())
+}
+
+fn rfc3339_ms(ms: u64) -> String {
+    use time::format_description::well_known::Rfc3339;
+    i64::try_from(ms / 1000)
+        .ok()
+        .and_then(|s| time::OffsetDateTime::from_unix_timestamp(s).ok())
+        .and_then(|t| t.format(&Rfc3339).ok())
+        .unwrap_or_else(|| ms.to_string())
 }
 
 /// The URLs a device can use: `http://<ip>:<port>` for each listen address. A wildcard address
@@ -1641,7 +1703,7 @@ fn host_ipv4s() -> Vec<std::net::Ipv4Addr> {
 
 fn serve_command(args: ServeArgs) -> Result<ExitCode> {
     use notedown_cloud::Config;
-    use notedown_cloud::server::{AppState, bind, serve_until};
+    use notedown_cloud::server::{AppState, bind, serve_until_with};
     let (mut config, config_warnings) = Config::load_with_warnings(&args.data)?;
     // The flag counts for this run only; server.toml is not rewritten.
     let capture_from_file = config.capture && !args.capture;
@@ -1665,8 +1727,20 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
         if urls.is_empty() {
             println!("device URL: none found, use the IP address of this host");
         }
-        for url in urls {
+        for url in &urls {
             println!("device URL: {url}");
+        }
+        // Without a device URL (loopback only) the bound addresses are the base.
+        let bases = if urls.is_empty() {
+            bound.iter().map(|a| format!("http://{a}")).collect()
+        } else {
+            urls
+        };
+        for base in &bases {
+            println!(
+                "REST API: {base}{} (connect a pipeline with notedown connect {base})",
+                notedown_cloud::rest::PREFIX
+            );
         }
         if let Some(url) = &config.external_base_url {
             println!("external base URL: {url}");
@@ -1756,7 +1830,13 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
         }
         println!("press Ctrl-C to stop");
         std::io::stdout().flush()?;
-        let served = serve_until(listeners, state.clone(), shutdown.wait()).await;
+        let served = serve_until_with(
+            listeners,
+            state.clone(),
+            notedown_cloud::rest::router(state.clone()),
+            shutdown.wait(),
+        )
+        .await;
         #[cfg(feature = "ocr")]
         drop(guard);
         served?;

@@ -2166,3 +2166,143 @@ fn the_pi_build_has_no_pipeline() {
         assert!(!commands.contains(&gone), "{gone} is in the Pi build");
     }
 }
+
+#[test]
+fn serve_prints_the_rest_api_line() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("server.toml"),
+        "listen = [\"127.0.0.1:0\"]\n",
+    )
+    .unwrap();
+    let out = serve_startup(dir.path(), &[]);
+    let rest = out
+        .lines()
+        .find(|l| l.starts_with("REST API: "))
+        .unwrap_or_else(|| panic!("no REST line: {out}"));
+    let base = rest
+        .strip_prefix("REST API: ")
+        .and_then(|r| r.split("/rest/v1").next())
+        .unwrap();
+    assert!(base.starts_with("http://127.0.0.1:"), "{rest}");
+    assert_eq!(
+        rest,
+        format!("REST API: {base}/rest/v1 (connect a pipeline with notedown connect {base})")
+    );
+    let at = |prefix: &str| out.lines().position(|l| l.starts_with(prefix));
+    assert!(at("REST API: ") > at("listening on: "), "{out}");
+}
+
+/// Issues a REST token the way a login does: a code, then the hash of the password with it.
+fn issue_token(data: &std::path::Path, email: &str, password: &str, name: &str) -> String {
+    use notedown_cloud::auth::{Auth, expected_login_hash, md5_hex};
+    let auth = Auth::open(data).unwrap();
+    let (code, _) = auth.challenge(email, 1_000).unwrap();
+    let hash = expected_login_hash(&md5_hex(password), &code);
+    let (_, info, _) = auth.rest_login(email, &hash, name, 2_000).unwrap();
+    info.id
+}
+
+fn account_with_tokens() -> (tempfile::TempDir, String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let out = cloud(
+        d,
+        &[
+            "add",
+            "jordi",
+            "--email",
+            "j@example.org",
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(out.status.success());
+    let first = issue_token(d, "j@example.org", "secret", "laptop");
+    let second = issue_token(d, "j@example.org", "secret", "studio");
+    (dir, first, second)
+}
+
+#[test]
+fn tokens_list_and_revoke() {
+    let (dir, first, second) = account_with_tokens();
+    let d = dir.path();
+    let out = cloud(d, &["tokens", "list", "jordi"], None);
+    assert!(out.status.success());
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    for (line, (id, name)) in lines.iter().zip([(&first, "laptop"), (&second, "studio")]) {
+        let rest = line
+            .strip_prefix(&format!("{id}  {name}  created "))
+            .unwrap();
+        assert!(rest.starts_with("1970-01-01T00:00:02"), "{line}");
+    }
+    let out = cloud(d, &["tokens", "revoke", "jordi", &first], None);
+    assert_eq!(stdout(&out), format!("revoked {first}\n"));
+    let out = cloud(d, &["tokens", "revoke", "jordi", &first], None);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(&format!("no token {first} for jordi")),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let issued = issue_token(d, "j@example.org", "secret", "third");
+    assert_ne!(issued, second);
+    let out = cloud(d, &["tokens", "revoke", "jordi", "--all"], None);
+    assert_eq!(stdout(&out), "revoked 2 tokens\n");
+    let out = cloud(d, &["tokens", "list", "jordi"], None);
+    assert_eq!(stdout(&out), "no tokens\n");
+}
+
+#[test]
+fn passwd_revokes_the_tokens() {
+    let (dir, _, _) = account_with_tokens();
+    let d = dir.path();
+    let out = cloud(
+        d,
+        &["passwd", "jordi", "--password-stdin"],
+        Some("other1\n"),
+    );
+    assert!(out.status.success());
+    assert_eq!(
+        stdout(&out),
+        "password of jordi changed\nrevoked 2 REST tokens\n"
+    );
+    assert_eq!(
+        stdout(&cloud(d, &["tokens", "list", "jordi"], None)),
+        "no tokens\n"
+    );
+    let out = cloud(
+        d,
+        &["passwd", "jordi", "--password-stdin"],
+        Some("other2\n"),
+    );
+    assert_eq!(stdout(&out), "password of jordi changed\n");
+}
+
+#[test]
+fn revoke_refuses_a_bad_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let out = cloud(d, &["tokens", "revoke", "jordi", "../account"], None);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("token id"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (dir, _, _) = account_with_tokens();
+    let out = cloud(
+        dir.path(),
+        &["tokens", "revoke", "jordi", "../account"],
+        None,
+    );
+    assert!(!out.status.success());
+    assert_eq!(
+        stdout(&cloud(dir.path(), &["tokens", "list", "jordi"], None))
+            .lines()
+            .count(),
+        2
+    );
+}

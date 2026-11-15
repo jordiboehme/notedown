@@ -1009,3 +1009,183 @@ fn catch_up_gives_the_same_text_as_always_on() {
         "no trace of the old account's note"
     );
 }
+
+/// A folder source whose `accounts()` gives an old list once when one is set: the list a Mac
+/// read just before the server removed an account.
+struct Stale {
+    inner: FolderSource,
+    old: Arc<Mutex<Option<Vec<ServerAccount>>>>,
+}
+
+impl ServerData for Stale {
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+    fn accounts(&self) -> Result<Vec<ServerAccount>> {
+        match self.old.lock().unwrap().take() {
+            Some(old) => Ok(old),
+            None => self.inner.accounts(),
+        }
+    }
+    fn records(&self, slug: &str) -> Result<Records> {
+        self.inner.records(slug)
+    }
+    fn record(&self, slug: &str, key: &str) -> Result<Option<Record>> {
+        self.inner.record(slug, key)
+    }
+    fn note(&self, slug: &str, path: &str) -> Result<NoteBytes> {
+        self.inner.note(slug, path)
+    }
+    fn note_exists(&self, slug: &str, path: &str) -> Result<Option<bool>> {
+        self.inner.note_exists(slug, path)
+    }
+    fn digests(&self, slug: &str) -> Result<Vec<notedown_cloud::appdata::Digest>> {
+        self.inner.digests(slug)
+    }
+    fn journal(&self, slug: &str, from: u64, limit: usize) -> Result<JournalBatch> {
+        self.inner.journal(slug, from, limit)
+    }
+}
+
+#[test]
+fn a_removal_read_after_an_old_account_list_still_deletes() {
+    let (d, local) = two_folders();
+    d.put("test1", "NOTE/Note");
+    let old = Arc::new(Mutex::new(None));
+    let mut s = load(local.path());
+    s.source = Arc::new(Stale {
+        inner: FolderSource::new(&d.data),
+        old: old.clone(),
+    });
+    let said = Said::default();
+    let (mut w, clock) = continuous(&s, &said);
+    w.run(stop_at(&clock, clock.now_ms() + 1)).unwrap();
+    // The Mac lists the accounts, then the server removes one, then the Mac reads the journal.
+    let before = FolderSource::new(&d.data).accounts().unwrap();
+    remove_account(&d.data, SLUG);
+    *old.lock().unwrap() = Some(before);
+    w.run(stop_at(&clock, clock.now_ms() + 5_000)).unwrap();
+    assert!(old.lock().unwrap().is_none(), "the old list was given");
+    assert!(
+        !store_dir(local.path(), SLUG).exists(),
+        "{:?}",
+        said.lines()
+    );
+    assert_eq!(said.count(&removed_message(SLUG)), 1, "{:?}", said.lines());
+    assert_eq!(cursor::read(local.path(), SLUG).unwrap(), last_seq(&d.data));
+}
+
+/// Moves `<server>/accounts` away while `f` runs, like a share that is only half there.
+fn without_accounts(data: &Path, f: impl FnOnce()) {
+    let accounts = data.join("accounts");
+    let away = data.join("accounts.away");
+    std::fs::rename(&accounts, &away).unwrap();
+    f();
+    std::fs::rename(&away, &accounts).unwrap();
+}
+
+#[test]
+fn a_removal_read_while_the_accounts_are_missing_waits() {
+    let (d, local) = two_folders();
+    d.put("test1", "NOTE/Note");
+    let said = Said::default();
+    let (mut w, clock) = continuous(&load(local.path()), &said);
+    w.run(stop_at(&clock, clock.now_ms() + 1)).unwrap();
+    let before = cursor::read(local.path(), SLUG).unwrap();
+    remove_account(&d.data, SLUG);
+    let dir = store_dir(local.path(), SLUG);
+    without_accounts(&d.data, || {
+        w.run(stop_at(&clock, clock.now_ms() + 25 * 60_000))
+            .unwrap();
+        assert!(dir.join("notes").is_dir(), "{:?}", said.lines());
+        assert_eq!(cursor::read(local.path(), SLUG).unwrap(), before);
+    });
+    let away = said.count(&d.data.join("accounts").display().to_string());
+    assert_eq!(away, 1, "said once: {:?}", said.lines());
+    assert_eq!(said.count(&removed_message(SLUG)), 0);
+    // Back: the removal is carried out as usual.
+    w.run(stop_at(&clock, clock.now_ms() + 5_000)).unwrap();
+    assert!(!dir.exists(), "{:?}", said.lines());
+    assert_eq!(said.count(&removed_message(SLUG)), 1);
+    assert_eq!(cursor::read(local.path(), SLUG).unwrap(), last_seq(&d.data));
+}
+
+#[test]
+fn a_removal_record_of_a_live_account_read_while_the_accounts_are_missing_deletes_nothing() {
+    use notedown_cloud::journal::{Event, EventBody, Origin, new_op_id};
+    let (d, local) = two_folders();
+    let key = d.put("test1", "NOTE/Note");
+    let said = Said::default();
+    let (mut w, clock) = continuous(&load(local.path()), &said);
+    w.run(stop_at(&clock, clock.now_ms() + 1)).unwrap();
+    Journal::open(&d.data)
+        .unwrap()
+        .append(&mut [Event::new(
+            SLUG,
+            Origin::Cli,
+            None,
+            &new_op_id(),
+            EventBody::AccountRemoved { user_id: FIRST_ID },
+        )])
+        .unwrap();
+    without_accounts(&d.data, || {
+        w.run(stop_at(&clock, clock.now_ms() + 5_000)).unwrap();
+    });
+    w.run(stop_at(&clock, clock.now_ms() + 5_000)).unwrap();
+    let store = TextStore::open(local.path(), SLUG).unwrap();
+    assert!(store.note(&key).unwrap().is_some(), "{:?}", said.lines());
+    assert_eq!(owner_of(local.path(), SLUG), Some(FIRST_ID));
+    assert_eq!(said.count(&removed_message(SLUG)), 0);
+    assert_eq!(cursor::read(local.path(), SLUG).unwrap(), last_seq(&d.data));
+}
+
+#[test]
+fn a_fresh_one_machine_folder_starts_and_waits_for_accounts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().to_path_buf();
+    let said = Said::default();
+    let (mut w, clock) = continuous(&load(&data), &said);
+    let start = clock.now_ms();
+    let c = clock.clone();
+    let d = data.clone();
+    let made = AtomicBool::new(false);
+    w.run(move || {
+        let now = c.now_ms();
+        if now >= start + 5_000 && !made.swap(true, Ordering::SeqCst) {
+            create_account(&d, SLUG);
+            put_into(&d, SLUG, "test1", "NOTE/Note");
+        }
+        now >= start + 10_000
+    })
+    .unwrap();
+    assert_eq!(said.lines().len(), 1, "said once: {:?}", said.lines());
+    assert_eq!(log(&data).len(), 1, "read once the account is there");
+}
+
+#[test]
+fn a_tombstone_that_cannot_be_deleted_is_said_once() {
+    let (d, local) = two_folders();
+    d.put("test1", "NOTE/Note");
+    let tomb = local.path().join("pipeline").join(".removed-x-1");
+    let locked = tomb.join("notes");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::write(locked.join("a.json"), "{}").unwrap();
+    set_mode(&locked, 0o555);
+    if std::fs::write(locked.join("probe"), "").is_ok() {
+        set_mode(&locked, 0o755);
+        eprintln!("skipped: running as root, a read-only folder can be written");
+        return;
+    }
+    let said = Said::default();
+    let (mut w, clock) = continuous(&load(local.path()), &said);
+    w.run(stop_at(&clock, clock.now_ms() + 5_000)).unwrap();
+    w.run(stop_at(&clock, clock.now_ms() + 5_000)).unwrap();
+    let still = tomb.exists();
+    set_mode(&locked, 0o755);
+    assert!(still);
+    let n = said.count(&tomb.display().to_string());
+    assert_eq!(n, 1, "said once: {:?}", said.lines());
+    // Once it can be deleted, the next start does it.
+    w.run(|| true).unwrap();
+    assert!(!tomb.exists());
+}

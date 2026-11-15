@@ -203,8 +203,25 @@ struct Followed {
     journals: Vec<String>,
 }
 
-/// The removals of each account not carried out yet: `seq` to the removed user id.
-type Pending = BTreeMap<String, BTreeMap<u64, u64>>;
+/// The removals of each account not carried out yet, by `seq`.
+type Pending = BTreeMap<String, BTreeMap<u64, Waiting>>;
+
+/// A removal not carried out yet.
+#[derive(Debug, Clone, Copy)]
+struct Waiting {
+    user_id: u64,
+    /// Read in this turn, after its account list: a list that still shows the account alive
+    /// may be from before the removal, so "alive" is only believed from a later list.
+    fresh: bool,
+}
+
+/// What a removal came to.
+enum Outcome {
+    /// Done: the store is deleted, or there is none, or it is another account's.
+    Done,
+    /// The server lists the account as alive.
+    Alive,
+}
 
 /// Where the worker's own messages go.
 pub type Messages = Arc<dyn Fn(&str) + Send + Sync>;
@@ -322,8 +339,30 @@ impl Worker {
     /// Takes the writer lock and sweeps the tombstones a crash or a failed delete left.
     fn take_lock(&self) -> Result<WriterLock> {
         let lock = WriterLock::take(&self.setup.local)?;
-        TextStore::sweep(&self.setup.local, &lock);
+        self.sweep(&lock);
         Ok(lock)
+    }
+
+    /// Deletes the tombstones under `<local>/pipeline`; the ones that stay are said once.
+    fn sweep(&self, lock: &WriterLock) {
+        let swept = TextStore::sweep_all(&self.setup.local, lock);
+        if swept.failed.is_empty() {
+            self.settled("sweep");
+            return;
+        }
+        let list: Vec<String> = swept
+            .failed
+            .iter()
+            .map(|(path, e)| format!("{}: {e}", path.display()))
+            .collect();
+        self.say_once(
+            "sweep",
+            format!(
+                "notedown pipeline: deleted note text cannot be removed from the disk ({}); it is \
+                 tried again at the next start or removal",
+                list.join("; ")
+            ),
+        );
     }
 
     /// The owner check of a served account before its pass (`stores` holds its store). Gives
@@ -348,6 +387,7 @@ impl Worker {
             Some(old) => {
                 stores.remove(slug);
                 TextStore::destroy(&self.setup.local, slug, lock)?;
+                self.sweep(lock);
                 self.say(&format!(
                     "notedown pipeline: account {slug} belongs to a new user id ({}, was \
                      {old}); its old note text is deleted",
@@ -380,7 +420,8 @@ impl Worker {
 
     /// Carries out the pending removals of every account in `seq` order; a removal that fails
     /// stays (said once while its message stays the same) and so do the later ones of its
-    /// account. Gives whether any removal was done.
+    /// account. A removal whose account looks alive is dropped only when a list read after the
+    /// removal still shows it; a fresh one waits one turn. Gives whether any removal was done.
     fn removals(
         &self,
         lock: &WriterLock,
@@ -391,9 +432,20 @@ impl Worker {
         let mut done = false;
         pending.retain(|slug, list| {
             let topic = format!("removal:{slug}");
-            while let Some((&seq, &user_id)) = list.first_key_value() {
-                match self.remove(lock, stores, slug, Removal { seq, user_id }, all) {
-                    Ok(()) => {
+            while let Some((&seq, &waiting)) = list.first_key_value() {
+                let removal = Removal {
+                    seq,
+                    user_id: waiting.user_id,
+                };
+                match self.remove(lock, stores, slug, removal, all) {
+                    Ok(Outcome::Alive) if waiting.fresh => {
+                        self.settled(&topic);
+                        if let Some(w) = list.get_mut(&seq) {
+                            w.fresh = false;
+                        }
+                        break;
+                    }
+                    Ok(_) => {
                         list.pop_first();
                         self.settled(&topic);
                         done = true;
@@ -427,11 +479,11 @@ impl Worker {
         slug: &str,
         removal: Removal,
         all: &[ServerAccount],
-    ) -> Result<()> {
+    ) -> Result<Outcome> {
         let dir = self.setup.local.join(crate::store::PIPELINE_DIR).join(slug);
         match std::fs::symlink_metadata(&dir) {
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Outcome::Done),
             Err(source) => return Err(Error::Io { path: dir, source }),
         }
         let owner = match stores.get(slug) {
@@ -439,21 +491,30 @@ impl Worker {
             None => TextStore::open(&self.setup.local, slug)?.owner()?,
         };
         let listed = all.iter().find(|a| a.slug == slug);
-        let removed = match owner {
-            Some(id) => id == removal.user_id && listed.is_none_or(|a| a.user_id != id),
-            None => !self.setup.two_machines && listed.is_none(),
+        // Whether the store is of the removed account, and whether the list says it lives.
+        let (of_removed, alive) = match owner {
+            Some(id) => (
+                id == removal.user_id,
+                listed.is_some_and(|a| a.user_id == id),
+            ),
+            None => (!self.setup.two_machines, listed.is_some()),
         };
-        if !removed {
-            return Ok(());
+        if !of_removed {
+            return Ok(Outcome::Done);
+        }
+        if alive {
+            return Ok(Outcome::Alive);
         }
         stores.remove(slug);
-        if TextStore::destroy(&self.setup.local, slug, lock)? {
+        let destroyed = TextStore::destroy(&self.setup.local, slug, lock)?;
+        self.sweep(lock);
+        if destroyed {
             self.say(&format!(
                 "notedown pipeline: account {slug} was removed on the server; its note text is \
                  deleted"
             ));
         }
-        Ok(())
+        Ok(Outcome::Done)
     }
 
     /// One pass over all accounts: the due notes whose settle time is over (all of them with
@@ -593,7 +654,11 @@ impl Worker {
                             pending
                                 .entry(slug.clone())
                                 .or_default()
-                                .insert(r.seq, r.user_id);
+                                .entry(r.seq)
+                                .or_insert(Waiting {
+                                    user_id: r.user_id,
+                                    fresh: true,
+                                });
                         }
                     }
                     look |= self.removals(&lock, &mut stores, &mut pending, &followed.all);

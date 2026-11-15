@@ -261,7 +261,10 @@ fn folder_source_meets_the_contract() {
 fn a_missing_server_folder_is_nothing_known() {
     let dir = tempfile::tempdir().unwrap();
     let src = FolderSource::new(&dir.path().join("missing"));
-    assert!(src.accounts().map(|a| a.is_empty()).unwrap_or(true));
+    assert!(
+        src.accounts().is_err(),
+        "no account folder is nothing known"
+    );
     assert!(src.records(SLUG).map(|r| !r.complete).unwrap_or(true));
     let b = src.journal(SLUG, 1, 10_000).unwrap();
     assert!(!b.changed);
@@ -435,4 +438,20 @@ fn a_limit_of_zero_still_makes_progress() {
     let b = FolderSource::new(dir.path()).journal("a", 1, 0).unwrap();
     assert_eq!(b.next, 2);
     assert!(b.more);
+}
+
+#[test]
+fn only_an_account_folder_that_is_there_lists_accounts() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = FolderSource::new(dir.path());
+    assert!(src.accounts().is_err(), "a server folder without accounts/");
+    std::fs::write(dir.path().join("accounts"), "").unwrap();
+    assert!(src.accounts().is_err(), "accounts is a file");
+    std::fs::remove_file(dir.path().join("accounts")).unwrap();
+    std::fs::create_dir(dir.path().join("accounts")).unwrap();
+    assert_eq!(
+        src.accounts().unwrap(),
+        vec![],
+        "an empty folder has no accounts"
+    );
 }

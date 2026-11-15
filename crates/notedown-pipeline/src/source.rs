@@ -97,7 +97,27 @@ impl ServerData for FolderSource {
         format!("server folder {}", self.root.display())
     }
 
+    /// A server folder without `accounts/` (a share that is not or only half mounted) is no
+    /// answer, never "no accounts": a server whose last account was removed still has the
+    /// folder (it holds `.next_user_id`).
     fn accounts(&self) -> Result<Vec<ServerAccount>> {
+        let dir = self.root.join("accounts");
+        match std::fs::metadata(&dir) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => {
+                return Err(Error::Read(format!(
+                    "{} is not a folder; is the server folder mounted?",
+                    dir.display()
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::Read(format!(
+                    "{} is missing; is the server folder mounted?",
+                    dir.display()
+                )));
+            }
+            Err(e) => return Err(io(&dir)(e)),
+        }
         Ok(Accounts::new(&self.root)
             .list()?
             .into_iter()

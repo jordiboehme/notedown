@@ -250,6 +250,7 @@ mod tests {
             FILE,
             &format!("[server]\nfolder = {:?}\naccounts = [\"a\"]\n", srv.path()),
         );
+        std::fs::create_dir(srv.path().join("accounts")).unwrap();
         let s = Setup::load(d.path()).unwrap();
         assert!(s.two_machines);
         assert_eq!(
@@ -258,7 +259,15 @@ mod tests {
         );
         assert!(s.served().unwrap().is_empty());
         assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1);
-        assert_eq!(std::fs::read_dir(srv.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(srv.path()).unwrap().count(), 1);
+        assert!(
+            srv.path()
+                .join("accounts")
+                .read_dir()
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 
     fn account(data: &Path, slug: &str) {

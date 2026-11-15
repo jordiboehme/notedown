@@ -210,6 +210,15 @@ pub struct TextStore {
     repaired: AtomicBool,
 }
 
+/// What a sweep did.
+#[derive(Debug, Default)]
+pub struct Swept {
+    /// Tombstones deleted.
+    pub deleted: usize,
+    /// Tombstones still there, with the error of their delete.
+    pub failed: Vec<(PathBuf, std::io::Error)>,
+}
+
 /// `owner.json`.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -308,19 +317,30 @@ impl TextStore {
 
     /// Deletes every tombstone (`.removed-*`) under `<local>/pipeline` that a crash or a failed
     /// delete left. Errors only leave a tombstone for the next sweep. Returns how many went.
-    pub fn sweep(local: &Path, _w: &WriterLock) -> usize {
+    pub fn sweep(local: &Path, w: &WriterLock) -> usize {
+        TextStore::sweep_all(local, w).deleted
+    }
+
+    /// [`sweep`](Self::sweep), with the tombstones that could not be deleted and why.
+    pub fn sweep_all(local: &Path, _w: &WriterLock) -> Swept {
+        let mut swept = Swept::default();
         let Ok(entries) = std::fs::read_dir(local.join(PIPELINE_DIR)) else {
-            return 0;
+            return swept;
         };
-        entries
-            .flatten()
-            .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .is_some_and(|n| n.starts_with(TOMBSTONE_PREFIX))
-            })
-            .filter(|e| remove_tombstone(&e.path()).is_ok())
-            .count()
+        for e in entries.flatten() {
+            if !e
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(TOMBSTONE_PREFIX))
+            {
+                continue;
+            }
+            match remove_tombstone(&e.path()) {
+                Ok(()) => swept.deleted += 1,
+                Err(err) => swept.failed.push((e.path(), err)),
+            }
+        }
+        swept
     }
 
     /// `<data>/pipeline/<slug>`.

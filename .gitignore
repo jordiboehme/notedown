@@ -3,3 +3,5 @@
 .DS_Store
 /tests/fixtures/local/
 .superpowers/
+# Internal design notes and plans stay local
+/docs/superpowers/

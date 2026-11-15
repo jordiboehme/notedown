@@ -9,14 +9,11 @@ use serde::Deserialize;
 
 use crate::config::{PipelineConfig, Raw};
 use crate::source::{FolderSource, ServerAccount, ServerData};
-use crate::store::PIPELINE_DIR;
+use crate::store::{OWNER_FILE, PIPELINE_DIR};
 use crate::{Error, Result};
 
 /// The file name in the local folder.
 pub const FILE: &str = "pipeline.toml";
-
-/// The owner file of an account store; a store without it is not listed offline.
-const OWNER_FILE: &str = "owner.json";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -117,11 +114,19 @@ impl Setup {
     /// The accounts the worker serves: the configured list, else every account the server
     /// lists. The only place this filter lives.
     pub fn served(&self) -> Result<Vec<ServerAccount>> {
-        let all = self.source.accounts()?;
-        Ok(match &self.accounts {
-            Some(list) => all.into_iter().filter(|a| list.contains(&a.slug)).collect(),
-            None => all,
-        })
+        Ok(self.serve(&self.source.accounts()?))
+    }
+
+    /// The accounts of `all` (the server's list) that the worker serves.
+    pub fn serve(&self, all: &[ServerAccount]) -> Vec<ServerAccount> {
+        match &self.accounts {
+            Some(list) => all
+                .iter()
+                .filter(|a| list.contains(&a.slug))
+                .cloned()
+                .collect(),
+            None => all.to_vec(),
+        }
     }
 }
 
@@ -141,6 +146,14 @@ pub fn local_accounts(local: &Path) -> Result<Vec<String>> {
     if let Some(list) = cfg.accounts {
         return Ok(list);
     }
+    local_stores(local, true)
+}
+
+/// The account stores under `<local>/pipeline`, sorted; with `owned`, only those that have an
+/// `owner.json` (or one whose presence cannot be told: such a store is never left out). Every
+/// name that is not a valid slug (`.writer.lock`, `*.cursor`, `.removed-*`) is skipped.
+/// Creates nothing.
+pub fn local_stores(local: &Path, owned: bool) -> Result<Vec<String>> {
     let dir = local.join(PIPELINE_DIR);
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
@@ -156,10 +169,13 @@ pub fn local_accounts(local: &Path) -> Result<Vec<String>> {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if validate_slug(&name).is_ok()
-            && entry.path().is_dir()
-            && entry.path().join(OWNER_FILE).is_file()
-        {
+        let has_owner = || {
+            !matches!(
+                std::fs::symlink_metadata(entry.path().join(OWNER_FILE)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            )
+        };
+        if validate_slug(&name).is_ok() && entry.path().is_dir() && (!owned || has_owner()) {
             slugs.push(name);
         }
     }

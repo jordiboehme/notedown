@@ -14,6 +14,13 @@
 //! source means "nothing known": the account is skipped and looked at again, its cursor stays,
 //! and no note counts as deleted.
 //!
+//! Note text is deleted only for an account that is gone for sure: its `account.removed` event
+//! names the user id of the store's owner (`owner.json`) and the server does not list the slug
+//! with that id any more, or the server lists the slug with another user id (a new account).
+//! Nothing else deletes a store: not a source error, not an empty or missing server folder,
+//! not an account the server no longer lists. A removal that fails is tried again every loop
+//! turn, and the account's cursor stays before it.
+//!
 //! Settle time: the time of a note's last page change is the mtime of its page record. The
 //! server writes the record only when the note's bytes change (or the note moves), right
 //! before the journal append of that change, so it is there for every note, also without
@@ -38,7 +45,7 @@ use crate::records;
 use crate::retention;
 use crate::scope::in_scope;
 use crate::setup::Setup;
-use crate::source::{ServerAccount, ServerData};
+use crate::source::{Removal, ServerAccount, ServerData};
 use crate::store::{TextStore, WriterLock};
 use crate::{Error, Result};
 use note::{Mode, NoteJob};
@@ -184,6 +191,21 @@ struct Follow {
     saved: Option<u64>,
 }
 
+/// The accounts of one loop turn.
+struct Followed {
+    /// Every account the server lists, unfiltered: tells a live account from a removed one.
+    all: Vec<ServerAccount>,
+    /// The accounts the worker reads ([`Setup::served`]): the owner check and the passes.
+    served: Vec<ServerAccount>,
+    /// The accounts whose journals the worker reads: the served ones and the local stores
+    /// (on two machines only those with an owner), so a removal is seen after the server
+    /// stopped listing the account.
+    journals: Vec<String>,
+}
+
+/// The removals of each account not carried out yet: `seq` to the removed user id.
+type Pending = BTreeMap<String, BTreeMap<u64, u64>>;
+
 /// Where the worker's own messages go.
 pub type Messages = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -273,16 +295,172 @@ impl Worker {
         self.said.borrow_mut().remove(topic);
     }
 
-    /// The accounts the worker follows. The one place this set is made.
-    fn followed(&self) -> Result<Vec<ServerAccount>> {
-        self.setup.served()
+    /// The accounts the worker follows. The one place this set is made. A local folder that
+    /// cannot be listed is said and left out for this turn (its cursors stay).
+    fn followed(&self) -> Result<Followed> {
+        let all = self.setup.source.accounts()?;
+        let served = self.setup.serve(&all);
+        let mut journals: Vec<String> = served.iter().map(|a| a.slug.clone()).collect();
+        match crate::setup::local_stores(&self.setup.local, self.setup.two_machines) {
+            Ok(local) => {
+                self.settled("stores");
+                for slug in local {
+                    if !journals.contains(&slug) {
+                        journals.push(slug);
+                    }
+                }
+            }
+            Err(e) => self.say_once("stores", format!("notedown pipeline: {e}")),
+        }
+        Ok(Followed {
+            all,
+            served,
+            journals,
+        })
+    }
+
+    /// Takes the writer lock and sweeps the tombstones a crash or a failed delete left.
+    fn take_lock(&self) -> Result<WriterLock> {
+        let lock = WriterLock::take(&self.setup.local)?;
+        TextStore::sweep(&self.setup.local, &lock);
+        Ok(lock)
+    }
+
+    /// The owner check of a served account before its pass (`stores` holds its store). Gives
+    /// whether the account may be read now.
+    /// - No owner and no text: the store is new; the owner is its first write.
+    /// - No owner but text: on one machine it is the account's own (creating and removing an
+    ///   account there delete the text); on two machines nobody can tell, so the account is
+    ///   skipped until the owner file is copied or the store is deleted.
+    /// - Another owner: the slug belongs to a new account. The old text is deleted.
+    fn owner_check(
+        &self,
+        lock: &WriterLock,
+        stores: &mut BTreeMap<String, TextStore>,
+        account: &ServerAccount,
+    ) -> Result<bool> {
+        let slug = &account.slug;
+        let text = &stores[slug];
+        let owner = text.owner()?;
+        let topic = format!("owner:{slug}");
+        match owner {
+            Some(id) if id == account.user_id => {}
+            Some(old) => {
+                stores.remove(slug);
+                TextStore::destroy(&self.setup.local, slug, lock)?;
+                self.say(&format!(
+                    "notedown pipeline: account {slug} belongs to a new user id ({}, was \
+                     {old}); its old note text is deleted",
+                    account.user_id
+                ));
+                let text = TextStore::open_writer(&self.setup.local, slug, lock)?;
+                text.set_owner(account.user_id, lock)?;
+                stores.insert(slug.clone(), text);
+            }
+            None => {
+                let empty = text.notes()?.is_empty() && text.last_seq()? == 0;
+                if !empty && self.setup.two_machines {
+                    self.say_once(
+                        &topic,
+                        format!(
+                            "notedown pipeline: {} has note text but no owner; copy it from a \
+                             pipeline that ran this version, or delete it to read everything \
+                             again",
+                            text.dir().display()
+                        ),
+                    );
+                    return Ok(false);
+                }
+                text.set_owner(account.user_id, lock)?;
+            }
+        }
+        self.settled(&topic);
+        Ok(true)
+    }
+
+    /// Carries out the pending removals of every account in `seq` order; a removal that fails
+    /// stays (said once while its message stays the same) and so do the later ones of its
+    /// account. Gives whether any removal was done.
+    fn removals(
+        &self,
+        lock: &WriterLock,
+        stores: &mut BTreeMap<String, TextStore>,
+        pending: &mut Pending,
+        all: &[ServerAccount],
+    ) -> bool {
+        let mut done = false;
+        pending.retain(|slug, list| {
+            let topic = format!("removal:{slug}");
+            while let Some((&seq, &user_id)) = list.first_key_value() {
+                match self.remove(lock, stores, slug, Removal { seq, user_id }, all) {
+                    Ok(()) => {
+                        list.pop_first();
+                        self.settled(&topic);
+                        done = true;
+                    }
+                    Err(e) => {
+                        self.say_once(
+                            &topic,
+                            format!(
+                                "notedown pipeline: account {slug} was removed on the server, \
+                                 but its note text cannot be deleted yet: {e}"
+                            ),
+                        );
+                        break;
+                    }
+                }
+            }
+            !list.is_empty()
+        });
+        done
+    }
+
+    /// One `account.removed` event of account `slug`: deletes the store when it is of the
+    /// removed user id and the server does not list the slug with that id (a crash between
+    /// the server's record and its removal leaves the account alive). A store without owner
+    /// counts as the removed one only on one machine, and only when the server lists no
+    /// account of that slug. A missing store is not created.
+    fn remove(
+        &self,
+        lock: &WriterLock,
+        stores: &mut BTreeMap<String, TextStore>,
+        slug: &str,
+        removal: Removal,
+        all: &[ServerAccount],
+    ) -> Result<()> {
+        let dir = self.setup.local.join(crate::store::PIPELINE_DIR).join(slug);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(Error::Io { path: dir, source }),
+        }
+        let owner = match stores.get(slug) {
+            Some(text) => text.owner()?,
+            None => TextStore::open(&self.setup.local, slug)?.owner()?,
+        };
+        let listed = all.iter().find(|a| a.slug == slug);
+        let removed = match owner {
+            Some(id) => id == removal.user_id && listed.is_none_or(|a| a.user_id != id),
+            None => !self.setup.two_machines && listed.is_none(),
+        };
+        if !removed {
+            return Ok(());
+        }
+        stores.remove(slug);
+        if TextStore::destroy(&self.setup.local, slug, lock)? {
+            self.say(&format!(
+                "notedown pipeline: account {slug} was removed on the server; its note text is \
+                 deleted"
+            ));
+        }
+        Ok(())
     }
 
     /// One pass over all accounts: the due notes whose settle time is over (all of them with
     /// `ignore_settle`), page by page, each page written at once.
     pub fn run_once(&mut self, ignore_settle: bool) -> Result<Progress> {
-        let lock = WriterLock::take(&self.setup.local)?;
-        let accounts = self.followed()?;
+        let lock = self.take_lock()?;
+        let accounts = self.followed()?.served;
         let mut stores = BTreeMap::new();
         let (progress, _) = self.pass(&lock, &mut stores, &accounts, ignore_settle, &|| false)?;
         Ok(progress)
@@ -291,16 +469,22 @@ impl Worker {
     /// Reads note `note` (a key or a wire path) or, with `None`, every note in scope again,
     /// with the whole page as the change region. Changed text gives normal versions.
     pub fn reocr(&mut self, note: Option<&str>) -> Result<Progress> {
-        let lock = WriterLock::take(&self.setup.local)?;
+        let lock = self.take_lock()?;
         let source = self.setup.source.clone();
         let mut progress = Progress::default();
         let mut found = false;
-        for slug in self.followed()?.into_iter().map(|a| a.slug) {
-            let text = TextStore::open_writer(&self.setup.local, &slug, &lock)?;
-            let store = AccountStore {
-                text: &text,
-                lock: &lock,
-            };
+        let mut stores = BTreeMap::new();
+        for account in self.followed()?.served {
+            let slug = account.slug.clone();
+            stores.insert(
+                slug.clone(),
+                TextStore::open_writer(&self.setup.local, &slug, &lock)?,
+            );
+            if !self.owner_check(&lock, &mut stores, &account)? {
+                continue;
+            }
+            let text = &stores[&slug];
+            let store = AccountStore { text, lock: &lock };
             let now = self.clock.now_ms();
             // Note changes (moves, scope) first, so the states are current.
             due(
@@ -384,11 +568,12 @@ impl Worker {
         started: impl FnOnce(),
         stop: impl Fn() -> bool,
     ) -> Result<()> {
-        let lock = WriterLock::take(&self.setup.local)?;
+        let lock = self.take_lock()?;
         started();
         // A failing prune is said at most once a day per account.
         let mut prune_warned: BTreeMap<String, u64> = BTreeMap::new();
         let mut follows: BTreeMap<String, Follow> = BTreeMap::new();
+        let mut pending: Pending = BTreeMap::new();
         let mut stores = BTreeMap::new();
         let mut look = true;
         let mut next_wake = 0u64;
@@ -399,19 +584,42 @@ impl Worker {
                     "accounts",
                     format!("notedown pipeline: {}: {e}", self.setup.source.describe()),
                 ),
-                Ok(accounts) => {
+                Ok(followed) => {
                     self.settled("accounts");
-                    for a in &accounts {
-                        look |= self.follow(&a.slug, &mut follows);
+                    for slug in &followed.journals {
+                        let (changed, removed) = self.follow(slug, &mut follows);
+                        look |= changed;
+                        for r in removed {
+                            pending
+                                .entry(slug.clone())
+                                .or_default()
+                                .insert(r.seq, r.user_id);
+                        }
                     }
+                    look |= self.removals(&lock, &mut stores, &mut pending, &followed.all);
+                    // An account with a removal not done yet is not read.
+                    let accounts: Vec<ServerAccount> = followed
+                        .served
+                        .into_iter()
+                        .filter(|a| !pending.contains_key(&a.slug))
+                        .collect();
                     let now = self.clock.now_ms();
                     if look || now >= next_wake {
                         look = false;
                         // Taken before the pass, so an event that comes during a long pass is
-                        // read next time and not skipped.
-                        let seen: Vec<(String, u64)> = accounts
+                        // read next time and not skipped. The cursor never passes a removal
+                        // not done yet: a restart reads it again.
+                        let seen: Vec<(String, u64)> = followed
+                            .journals
                             .iter()
-                            .filter_map(|a| follows.get(&a.slug).map(|f| (a.slug.clone(), f.read)))
+                            .filter_map(|slug| {
+                                let read = follows.get(slug)?.read;
+                                let held = pending
+                                    .get(slug)
+                                    .and_then(|p| p.keys().next())
+                                    .map_or(read, |first| read.min(first.saturating_sub(1)));
+                                Some((slug.clone(), held))
+                            })
                             .collect();
                         let result = self.pass(&lock, &mut stores, &accounts, false, &stop);
                         let now = self.clock.now_ms();
@@ -502,11 +710,12 @@ impl Worker {
     }
 
     /// Reads the new journal lines of account `slug`, page by page to the end, and tells
-    /// whether any of them is about the account. A source without an answer leaves the
-    /// position as it is. A journal that ends before the position (the server's journal was
-    /// started again) is read again from the start.
-    fn follow(&self, slug: &str, follows: &mut BTreeMap<String, Follow>) -> bool {
+    /// whether any of them is about the account; gives the `account.removed` events read too.
+    /// A source without an answer leaves the position as it is. A journal that ends before the
+    /// position (the server's journal was started again) is read again from the start.
+    fn follow(&self, slug: &str, follows: &mut BTreeMap<String, Follow>) -> (bool, Vec<Removal>) {
         let topic = format!("journal:{slug}");
+        let mut removed = Vec::new();
         if !follows.contains_key(slug) {
             match self.start(slug) {
                 Ok(f) => {
@@ -514,7 +723,7 @@ impl Worker {
                 }
                 Err(e) => {
                     self.say_once(&topic, format!("notedown pipeline: account {slug}: {e}"));
-                    return false;
+                    return (false, removed);
                 }
             }
         }
@@ -528,7 +737,7 @@ impl Worker {
                         &topic,
                         format!("notedown pipeline: account {slug}: journal: {e}"),
                     );
-                    return changed;
+                    return (changed, removed);
                 }
             };
             self.settled(&topic);
@@ -544,9 +753,10 @@ impl Worker {
                 continue;
             }
             changed |= batch.changed;
+            removed.extend(batch.removed);
             f.read = f.read.max(batch.next.saturating_sub(1));
             if !batch.more {
-                return changed;
+                return (changed, removed);
             }
         }
     }
@@ -594,11 +804,18 @@ impl Worker {
         let mut recs: BTreeMap<String, (records::Records, Vec<Digest>)> = BTreeMap::new();
         let mut next_due: Option<u64> = None;
         let mut unsure: BTreeSet<String> = BTreeSet::new();
-        for slug in accounts.iter().map(|a| a.slug.clone()) {
-            let found = (|| -> Result<Vec<DueNote>> {
+        // Only the stores of this pass stay open: no stamp or prune touches another one, and a
+        // removed account's folder is never made again.
+        stores.retain(|slug, _| accounts.iter().any(|a| &a.slug == slug));
+        for account in accounts {
+            let slug = account.slug.clone();
+            let found = (|| -> Result<Option<Vec<DueNote>>> {
                 if !stores.contains_key(&slug) {
                     let text = TextStore::open_writer(&self.setup.local, &slug, lock)?;
                     stores.insert(slug.clone(), text);
+                }
+                if !self.owner_check(lock, stores, account)? {
+                    return Ok(None);
                 }
                 let text = &stores[&slug];
                 let store = AccountStore { text, lock };
@@ -617,13 +834,20 @@ impl Worker {
                     slug.clone(),
                     (source.records(&slug)?, source.digests(&slug)?),
                 );
-                Ok(notes)
+                Ok(Some(notes))
             })();
             let topic = format!("account:{slug}");
             let notes = match found {
-                Ok(n) => {
+                Ok(Some(n)) => {
                     self.settled(&topic);
                     n
+                }
+                // Skipped by the owner check (said there): its cursor stays.
+                Ok(None) => {
+                    self.settled(&topic);
+                    stores.remove(&slug);
+                    unsure.insert(slug);
+                    continue;
                 }
                 Err(e) => {
                     self.say_once(&topic, format!("notedown pipeline: account {slug}: {e}"));

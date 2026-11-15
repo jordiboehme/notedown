@@ -2232,7 +2232,10 @@ fn tokens_list_and_revoke() {
     let text = stdout(&out);
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 2, "{text}");
-    for (line, (id, name)) in lines.iter().zip([(&first, "laptop"), (&second, "studio")]) {
+    // Both tokens have the same creation time (the test clock), so the list is in id order.
+    let mut want = [(&first, "laptop"), (&second, "studio")];
+    want.sort();
+    for (line, (id, name)) in lines.iter().zip(want) {
         let rest = line
             .strip_prefix(&format!("{id}  {name}  created "))
             .unwrap();

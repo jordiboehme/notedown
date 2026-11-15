@@ -14,6 +14,7 @@ notedown-cloud.workspace = true
 notedown-convert.workspace = true
 notedown-note.workspace = true
 notedown-ocr.workspace = true
+reqwest.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
 sha2.workspace = true

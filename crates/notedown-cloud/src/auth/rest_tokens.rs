@@ -499,6 +499,24 @@ fn sha256_hex(token: &str) -> String {
     const_hex::encode(Sha256::digest(token.as_bytes()))
 }
 
+/// The slug a token names in its payload, read without the key: `None` when the text is no
+/// token of this form. It says nothing about the token's worth (only the server can check the
+/// MAC); a client uses it to see whether a token file holds the token of the right account.
+pub fn token_slug(token: &str) -> Option<String> {
+    if token.len() > MAX_TOKEN_LEN {
+        return None;
+    }
+    let mut parts = token.split('.');
+    let (Some(PREFIX), Some(payload), Some(_), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    let json = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let payload: Payload = serde_json::from_slice(&json).ok()?;
+    validate_slug(&payload.slug).is_ok().then_some(payload.slug)
+}
+
 /// 8 lowercase hex characters.
 fn valid_id(id: &str) -> bool {
     id.len() == 8 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
@@ -520,6 +538,25 @@ mod tests {
     }
 
     const GOOD: &str = r#"{"slug":"jordi","userId":1000001,"id":"0123abcd","nonce":"n"}"#;
+
+    #[test]
+    fn the_slug_of_a_token_is_read_without_the_key() {
+        let token = signed(&key(), GOOD);
+        assert_eq!(token_slug(&token).as_deref(), Some("jordi"));
+        // Another key: the slug is still read, the worth is the server's to judge.
+        let other = RestKey {
+            secret: vec![9u8; 32],
+        };
+        assert_eq!(token_slug(&signed(&other, GOOD)).as_deref(), Some("jordi"));
+        assert_eq!(token_slug("ndt1.x.y"), None);
+        assert_eq!(token_slug(&token.replacen("ndt1", "ndt2", 1)), None);
+        assert_eq!(token_slug(&format!("{token}.z")), None);
+        let bad = signed(
+            &key(),
+            r#"{"slug":"../x","userId":1,"id":"0123abcd","nonce":"n"}"#,
+        );
+        assert_eq!(token_slug(&bad), None);
+    }
 
     #[test]
     fn a_token_with_a_changed_mac_is_refused() {

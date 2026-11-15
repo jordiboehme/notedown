@@ -17,7 +17,7 @@ pub use accounts::{
 pub use codes::{CODE_LEN, CODE_TTL_MS, LoginCodes, MAX_PENDING_CODES};
 pub use rest_tokens::{
     REST_KEY_FILE, RestKey, RestTokens, TOKENS_DIR, TokenCheck, TokenInfo, list_tokens,
-    revoke_all_tokens, revoke_token,
+    revoke_all_tokens, revoke_token, token_slug,
 };
 pub use token::{Claims, Device, Devices, KEY_FILE, TokenKey};
 

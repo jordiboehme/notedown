@@ -13,6 +13,7 @@ pub mod ocr;
 pub mod page;
 pub mod records;
 pub mod region;
+pub mod rest;
 pub mod retention;
 pub mod scope;
 pub mod search;

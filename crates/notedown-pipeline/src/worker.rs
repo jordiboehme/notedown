@@ -315,7 +315,9 @@ impl Worker {
     /// The accounts the worker follows. The one place this set is made. A local folder that
     /// cannot be listed is said and left out for this turn (its cursors stay).
     fn followed(&self) -> Result<Followed> {
-        let all = self.setup.source.accounts()?;
+        let all = self.setup.source.accounts();
+        self.say_refusals();
+        let all = all?;
         let served = self.setup.serve(&all);
         let mut journals: Vec<String> = served.iter().map(|a| a.slug.clone()).collect();
         match crate::setup::local_stores(&self.setup.local, self.setup.two_machines) {
@@ -334,6 +336,29 @@ impl Worker {
             served,
             journals,
         })
+    }
+
+    /// Says each refused token of the source once (topic `token:<slug>`); a refusal that is
+    /// gone is settled, so it is said again when it comes back.
+    fn say_refusals(&self) {
+        let refusals = self.setup.source.refusals();
+        let topics: Vec<String> = refusals
+            .iter()
+            .map(|(slug, _)| format!("token:{slug}"))
+            .collect();
+        let gone: Vec<String> = self
+            .said
+            .borrow()
+            .keys()
+            .filter(|t| t.starts_with("token:") && !topics.contains(t))
+            .cloned()
+            .collect();
+        for topic in gone {
+            self.settled(&topic);
+        }
+        for (topic, (_, message)) in topics.iter().zip(refusals) {
+            self.say_once(topic, format!("notedown pipeline: {message}"));
+        }
     }
 
     /// Takes the writer lock and sweeps the tombstones a crash or a failed delete left.

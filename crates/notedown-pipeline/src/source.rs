@@ -31,6 +31,12 @@ pub trait ServerData: Send + Sync {
     fn digests(&self, slug: &str) -> Result<Vec<Digest>>;
     /// The account's events with `seq >= from`, at most `limit` lines. Never creates anything.
     fn journal(&self, slug: &str, from: u64, limit: usize) -> Result<JournalBatch>;
+    /// The accounts whose token the server refused or that hold another account's token, as
+    /// (slug, message for the user), as of the last calls. They are left out of
+    /// [`ServerData::accounts`]. A source prints nothing itself; the worker says these.
+    fn refusals(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 /// The server data in a folder on this machine.

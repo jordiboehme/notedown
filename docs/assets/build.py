@@ -1,351 +1,350 @@
 #!/usr/bin/env python3
-"""Build the notedown banner and icon SVGs ("Vector Party" design).
+"""Build the notedown banner and icons ("Paper Vector" design).
 
-The text is outlined from Orbitron (SIL Open Font License 1.1), so the SVGs
-need no web fonts. The font is not part of the repository. Fetch it first:
+Paper and ink, the look of an e-ink panel, with a C64 font for the small text.
 
-    mkdir -p /tmp/orbitron
-    curl -sSLo /tmp/orbitron/Orbitron.ttf \
-      "https://github.com/google/fonts/raw/main/ofl/orbitron/Orbitron%5Bwght%5D.ttf"
+Run it from anywhere:
 
-Then run (needs fontTools: pip install fonttools):
+    python3 docs/assets/build.py
 
-    python3 docs/assets/build.py /tmp/orbitron/Orbitron.ttf
+It needs Pillow 11 and fontTools (pip install pillow fonttools), plus
+rsvg-convert (brew install librsvg) and iconutil (part of macOS) for the
+icon PNGs and the .icns file.
 
-It writes banner.svg, banner-static.svg, icon.svg and icon-menubar.svg next to
-this file. The PNGs and the .icns come from icon.svg:
+The fonts are not part of the repository. The script downloads them from the
+google/fonts repository on GitHub into a temporary folder:
 
-    cd docs/assets && mkdir -p icon.iconset
-    for s in 16 32 128 256 512; do
-      rsvg-convert -w $s -h $s icon.svg -o icon.iconset/icon_${s}x${s}.png
-      rsvg-convert -w $((s*2)) -h $((s*2)) icon.svg -o icon.iconset/icon_${s}x${s}@2x.png
-    done
-    rsvg-convert -w 1024 -h 1024 icon.svg -o icon-1024.png
-    iconutil -c icns icon.iconset -o notedown.icns
+    Orbitron (variable, used at weight 900)
+      https://github.com/google/fonts/raw/main/ofl/orbitron/Orbitron%5Bwght%5D.ttf
+    Press Start 2P
+      https://github.com/google/fonts/raw/main/ofl/pressstart2p/PressStart2P-Regular.ttf
+
+Both are under the SIL Open Font License 1.1. To use fonts you already have,
+pass their folder (with Orbitron.ttf and PressStart2P.ttf in it):
+
+    python3 docs/assets/build.py /path/to/fonts
+
+It writes next to this file:
+
+    banner.gif          animated banner, 1280x320, 2 colours, 9 s loop
+    banner-static.png   first frame of the banner (for reduced motion)
+    icon.svg            app icon source, all text as paths
+    icon-menubar.svg    menu bar template icon
+    icon.iconset/       all 10 macOS icon sizes
+    icon-1024.png
+    notedown.icns
+
+How the banner is drawn: every frame is painted in greys at 640x160 (4x
+oversampled, then reduced, which gives the anti-aliasing of a canvas),
+then an 8x8 Bayer matrix turns the greys into paper or ink. The result is
+scaled up 2x with nearest neighbour. The loop is 9 s at 15 frames per
+second: the tablet makes one whole turn, the grid moves by 8 lines and the
+cursor blinks 9 times, so the last frame leads straight into the first.
 """
 
 import math
+import shutil
+import subprocess
 import sys
+import tempfile
+import urllib.request
 from pathlib import Path
 
 from fontTools.pens.svgPathPen import SVGPathPen
 from fontTools.pens.transformPen import TransformPen
 from fontTools.ttLib import TTFont
-from fontTools.varLib.instancer import instantiateVariableFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 OUT = Path(__file__).resolve().parent
 
-BG = "#05040c"
-GRID = "#ff2fd1"
-LINE = "#47f3ff"
-TAG = "#ff9df0"
+FONTS = {
+    "Orbitron.ttf": "https://github.com/google/fonts/raw/main/ofl/orbitron/Orbitron%5Bwght%5D.ttf",
+    "PressStart2P.ttf": "https://github.com/google/fonts/raw/main/ofl/pressstart2p/PressStart2P-Regular.ttf",
+}
+
+PAPER = "#e9e6dc"
+INK = "#1d1c1a"
+PAPER_RGB = (0xE9, 0xE6, 0xDC)
+INK_RGB = (0x1D, 0x1C, 0x1A)
+
+# Banner geometry (canvas pixels before the 2x scale).
+W, H = 640, 160
+HZ = 106            # horizon
+SS = 4              # oversampling factor
+LOOP = 9            # seconds
+FPS = 15
+FRAMES = LOOP * FPS
+START = 18          # first frame is t = 18 / 15 = 1.2 s
+OMEGA = 2 * math.pi / LOOP      # one turn per loop (about 0.7 rad/s)
+GRID_LINES_PER_LOOP = 8         # grid speed 8/9 lines per second
+
+B8 = [
+    0, 32, 8, 40, 2, 34, 10, 42,
+    48, 16, 56, 24, 50, 18, 58, 26,
+    12, 44, 4, 36, 14, 46, 6, 38,
+    60, 28, 52, 20, 62, 30, 54, 22,
+    3, 35, 11, 43, 1, 33, 9, 41,
+    51, 19, 59, 27, 49, 17, 57, 25,
+    15, 47, 7, 39, 13, 45, 5, 37,
+    63, 31, 55, 23, 61, 29, 53, 21,
+]
+
+BOX = [(-1, -1.4, -.1), (1, -1.4, -.1), (1, 1.4, -.1), (-1, 1.4, -.1),
+       (-1, -1.4, .1), (1, -1.4, .1), (1, 1.4, .1), (-1, 1.4, .1)]
+EDGES = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4),
+         (0, 4), (1, 5), (2, 6), (3, 7)]
 
 
-def num(v):
-    s = f"{v:.1f}"
-    if s.endswith(".0"):
-        s = s[:-2]
-    return "0" if s == "-0" else s
+def fetch_fonts(folder):
+    folder = Path(folder)
+    for name, url in FONTS.items():
+        target = folder / name
+        if not target.exists():
+            print(f"downloading {name}")
+            with urllib.request.urlopen(url) as r, open(target, "wb") as f:
+                shutil.copyfileobj(r, f)
+    return folder
 
 
-# ---------------------------------------------------------------- text
-
-class Font:
-    def __init__(self, path, weight):
-        self.font = instantiateVariableFont(TTFont(path), {"wght": weight})
-        self.glyphs = self.font.getGlyphSet()
-        self.cmap = self.font.getBestCmap()
-        self.upm = self.font["head"].unitsPerEm
-
-    def advance(self, ch):
-        return self.font["hmtx"][self.cmap[ord(ch)]][0]
-
-    def width(self, text, size, tracking=0.0):
-        w = sum(self.advance(c) for c in text) * size / self.upm
-        return w + tracking * (len(text) - 1)
-
-    def path(self, text, x, y, size, tracking=0.0, mapper=None):
-        """Outline `text` with its baseline at (x, y). `mapper` can bend each
-        point afterwards (used to put the "#" on the tilted tablet screen)."""
-        pen = SVGPathPen(self.glyphs, ntos=num)
-        s = size / self.upm
-        for ch in text:
-            name = self.cmap[ord(ch)]
-            if mapper is None:
-                tp = TransformPen(pen, (s, 0, 0, -s, x, y))
-            else:
-                tp = MapPen(pen, lambda px, py, x=x: mapper(x + px * s, y - py * s))
-            self.glyphs[name].draw(tp)
-            x += self.advance(ch) * s + tracking
-        return pen.getCommands()
+def g(v):
+    """Grey level like the canvas g(): 0 is ink, 1 is paper."""
+    return round(max(0.0, min(1.0, v)) * 255)
 
 
-class MapPen:
-    """A pen that sends every point through a function."""
+# ---------------------------------------------------------------- banner
 
-    def __init__(self, out, fn):
-        self.out, self.fn = out, fn
-
-    def moveTo(self, p):
-        self.out.moveTo(self.fn(*p))
-
-    def lineTo(self, p):
-        self.out.lineTo(self.fn(*p))
-
-    def qCurveTo(self, *pts):
-        self.out.qCurveTo(*[None if p is None else self.fn(*p) for p in pts])
-
-    def curveTo(self, *pts):
-        self.out.curveTo(*[self.fn(*p) for p in pts])
-
-    def closePath(self):
-        self.out.closePath()
-
-    def endPath(self):
-        self.out.endPath()
-
-    def addComponent(self, name, transform):
-        raise NotImplementedError
-
-
-# ---------------------------------------------------------------- 3D tablet
-
-BOX = [(-1, -1.4, -.08), (1, -1.4, -.08), (1, 1.4, -.08), (-1, 1.4, -.08),
-       (-1, -1.4, .08), (1, -1.4, .08), (1, 1.4, .08), (-1, 1.4, .08)]
-SCREEN = [(-.82, -1.15, -.09), (.82, -1.15, -.09), (.82, 1.2, -.09), (-.82, 1.2, -.09)]
-
-
-def proj(p, a, b, cx, cy, s):
+def rot(p, a, b):
     x, y, z = p
     x1 = x * math.cos(a) + z * math.sin(a)
     z1 = -x * math.sin(a) + z * math.cos(a)
     y1 = y * math.cos(b) - z1 * math.sin(b)
     z2 = y * math.sin(b) + z1 * math.cos(b)
-    f = s / (z2 + 4.5)
-    return cx + x1 * f, cy + y1 * f
+    return (x1, y1, z2)
 
 
-def poly(points, close=True):
-    d = "M" + " ".join(f"{num(x)} {num(y)}" for x, y in points[:1])
-    d += "".join(f"L{num(x)} {num(y)}" for x, y in points[1:])
-    return d + ("Z" if close else "")
+def pj(r, cx=520, cy=70, s=160):
+    f = s / (r[2] + 4.5)
+    return (cx + r[0] * f, cy + r[1] * f)
 
 
-def body_path(a, b, cx, cy, s):
-    """Front face, back face and the four side edges. The command structure
-    is the same for every angle, so SMIL can interpolate between frames."""
-    P = [proj(p, a, b, cx, cy, s) for p in BOX]
-    d = poly(P[0:4]) + poly(P[4:8])
-    for i in range(4):
-        d += poly([P[i], P[i + 4]], close=False)
-    return d
+def S(p):
+    """Canvas point to oversampled pixel space."""
+    return (p[0] * SS, p[1] * SS)
 
 
-def screen_path(a, b, cx, cy, s):
-    """Screen frame and five lines of "handwriting"."""
-    d = poly([proj(p, a, b, cx, cy, s) for p in SCREEN])
-    for r in range(5):
-        yy = -0.8 + r * 0.4
-        right = .6 - (r % 2) * .3
-        d += poly([proj((-.6, yy, -.09), a, b, cx, cy, s),
-                   proj((right, yy, -.09), a, b, cx, cy, s)], close=False)
-    return d
+class Banner:
+    def __init__(self, fonts):
+        self.logo = ImageFont.truetype(str(fonts / "Orbitron.ttf"), 46 * SS)
+        self.logo.set_variation_by_axes([900])
+        self.c64 = ImageFont.truetype(str(fonts / "PressStart2P.ttf"), 8 * SS)
+        self.base = self._base()
+        self.threshold = self._threshold()
+
+    def _base(self):
+        """Paper, horizon haze and the fan of floor lines: the same in every frame."""
+        w, h = W * SS, H * SS
+        img = Image.new("L", (w, h), 255)
+        d = ImageDraw.Draw(img)
+        top = HZ - 29
+        for yy in range(top * SS, HZ * SS):
+            y = (yy + 0.5) / SS
+            d.line([(0, yy), (w, yy)], fill=g(1 + (0.55 - 1) * (y - top) / 29))
+        # floor lines toward the vanishing point, stroked with a vertical gradient
+        grad = Image.new("L", (w, h), 0)
+        gd = ImageDraw.Draw(grad)
+        for yy in range(HZ * SS - SS, h):
+            y = (yy + 0.5) / SS
+            q = max(0.0, min(1.0, (y - HZ) / (H - HZ)))
+            gd.line([(0, yy), (w, yy)], fill=round(g(0.6) * (1 - q)))
+        mask = Image.new("L", (w, h), 0)
+        md = ImageDraw.Draw(mask)
+        for i in range(-26, 27):
+            md.line([S((W / 2 + i * 7, HZ)), S((W / 2 + i * 61, H))], fill=255, width=SS)
+        img.paste(grad, (0, 0), mask)
+        return img
+
+    def _threshold(self):
+        """Paper where grey > (B8 + 0.5) * 255 / 64, the same test as the canvas."""
+        cell = Image.new("L", (8, 8))
+        cell.putdata([math.floor((v + 0.5) * 255 / 64) for v in B8])
+        t = Image.new("L", (W, H))
+        for y in range(0, H, 8):
+            for x in range(0, W, 8):
+                t.paste(cell, (x, y))
+        return t
+
+    def grey(self, k):
+        """Frame k of the loop in greys at SS x size. t = (START + k) / FPS."""
+        n = START + k
+        t = n / FPS
+        img = self.base.copy()
+        d = ImageDraw.Draw(img)
+        # grid lines across, moving toward the viewer
+        sh = (n * GRID_LINES_PER_LOOP % FRAMES) / FRAMES
+        for i in range(9):
+            q = (i + sh) / 9
+            y = HZ + (H - HZ) * q * q
+            d.line([S((0, y)), S((W, y))], fill=g(0.6 * (1 - q)), width=SS)
+        d.line([S((0, HZ)), S((W, HZ))], fill=0, width=SS)
+        # the turning wireframe tablet
+        a = OMEGA * t
+        b = 0.35 + math.sin(OMEGA * t) * 0.18
+        P = [pj(rot(p, a, b)) for p in BOX]
+        for i, j in EDGES:
+            d.line([S(P[i]), S(P[j])], fill=0, width=round(1.5 * SS))
+        zf = -.11 if rot((0, 0, -1), a, b)[2] < 0 else .11
+        for r in range(5):
+            yy = -0.8 + r * 0.4
+            A = pj(rot((-.6, yy, zf), a, b))
+            B = pj(rot((.6 - (r % 2) * .3, yy, zf), a, b))
+            d.line([S(A), S(B)], fill=0, width=SS)
+        # the logo block
+        d.rectangle([28 * SS, 26 * SS, (28 + 318) * SS - 1, (26 + 74) * SS - 1], fill=255)
+        org = (36 * SS, 70 * SS)
+        # canvas: fill at 72% grey, then a 1.6 px ink stroke centred on the outline
+        fill = Image.new("L", img.size, 0)
+        ImageDraw.Draw(fill).text(org, "NOTEDOWN", font=self.logo, fill=255, anchor="ls")
+        outer = Image.new("L", img.size, 0)
+        ImageDraw.Draw(outer).text(org, "NOTEDOWN", font=self.logo, fill=255, anchor="ls",
+                                   stroke_width=3, stroke_fill=255)
+        inner = fill.filter(ImageFilter.MinFilter(7))
+        img.paste(0, (0, 0), outer)
+        img.paste(g(0.72), (0, 0), inner)
+        d.text((38 * SS, 86 * SS), "YOUR HANDWRITING, READABLE BY MACHINES.",
+               font=self.c64, fill=0, anchor="ls")
+        d.text((38 * SS, 98 * SS), "READY.", font=self.c64, fill=0, anchor="ls")
+        if (2 * n // FPS) % 2 == 0:
+            d.rectangle([38 * SS, 100 * SS, 46 * SS - 1, 108 * SS - 1], fill=0)
+        return img.reduce(SS)
+
+    def frame(self, k):
+        """Frame k dithered to paper (index 0) and ink (index 1), scaled 2x."""
+        diff = ImageChops.subtract(self.grey(k), self.threshold)
+        idx = diff.point(lambda v: 0 if v > 0 else 1)
+        p = Image.frombytes("P", (W, H), idx.tobytes())
+        p.putpalette(list(PAPER_RGB) + list(INK_RGB))
+        return p.resize((W * 2, H * 2), Image.NEAREST)
 
 
-# ---------------------------------------------------------------- banner
-
-W, H = 1280, 320
-HZ = 212                      # horizon
-TAB = (1040, 150, 330)        # tablet centre and scale
-PERIOD = 9                    # seconds for one turn
-FRAMES = 72                   # keyframes per turn
-A0 = 0.55                     # start angle, also the still frame
-GRID_PERIOD = 0.9             # seconds per grid line
-GRID_FRAMES = 16
-
-
-def angles(i, n):
-    t = i / n
-    return A0 + 2 * math.pi * t, 0.35 + 0.2 * math.sin(2 * math.pi * t)
-
-
-def grid_vertical():
-    d = ""
-    for i in range(-24, 25):
-        d += f"M{num(640 + i * 14)} {HZ}L{num(640 + i * 120)} {H}"
-    return d
-
-
-def grid_horizontal(shift):
-    d = ""
-    for k in range(10):
-        q = (k + shift) / 9
-        y = HZ + (H - HZ) * q * q
-        d += f"M0 {num(y)}H{W}"
-    return d
-
-
-def anim(attr, values, dur):
-    keys = ";".join(values)
-    return (f'<animate attributeName="{attr}" dur="{dur}s" repeatCount="indefinite" '
-            f'calcMode="linear" values="{keys}"/>')
-
-
-def banner(logo_font, tag_font, animated):
-    logo_size = 104
-    logo_x, logo_y = 72, 160
-    logo_w = logo_font.width("NOTEDOWN", logo_size)
-    tagline = "YOUR HANDWRITING, READABLE BY MACHINES."
-    tag_size = 20
-    tracking = (logo_w - tag_font.width(tagline, tag_size)) / (len(tagline) - 1)
-    logo = logo_font.path("NOTEDOWN", logo_x, logo_y, logo_size)
-    tag = tag_font.path(tagline, logo_x + 3, 202, tag_size, tracking)
-
-    a, b = angles(0, 1)
-    body = body_path(a, b, *TAB)
-    scr = screen_path(a, b, *TAB)
-    hlines = grid_horizontal(0)
-    body_anim = scr_anim = h_anim = ""
-    if animated:
-        frames = [angles(i, FRAMES) for i in range(FRAMES + 1)]
-        body_anim = anim("d", [body_path(a, b, *TAB) for a, b in frames], PERIOD)
-        scr_anim = anim("d", [screen_path(a, b, *TAB) for a, b in frames], PERIOD)
-        h_anim = anim("d", [grid_horizontal(i / GRID_FRAMES) for i in range(GRID_FRAMES + 1)],
-                      GRID_PERIOD)
-
-    return f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img" aria-label="notedown: your handwriting, readable by machines">
-<title>notedown</title>
-<defs>
-<filter id="glow" filterUnits="userSpaceOnUse" x="0" y="0" width="{W}" height="{H}">
-<feGaussianBlur in="SourceGraphic" stdDeviation="5" result="wide"/>
-<feGaussianBlur in="SourceGraphic" stdDeviation="1.6" result="near"/>
-<feMerge><feMergeNode in="wide"/><feMergeNode in="near"/><feMergeNode in="SourceGraphic"/></feMerge>
-</filter>
-<filter id="soft" filterUnits="userSpaceOnUse" x="0" y="0" width="{W}" height="{H}">
-<feGaussianBlur in="SourceGraphic" stdDeviation="3" result="b"/>
-<feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
-</filter>
-<linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
-<stop offset="0" stop-color="{GRID}" stop-opacity="0"/>
-<stop offset="1" stop-color="{GRID}" stop-opacity=".35"/>
-</linearGradient>
-<linearGradient id="fade" x1="0" y1="{HZ}" x2="0" y2="{H}" gradientUnits="userSpaceOnUse">
-<stop offset="0" stop-color="#fff" stop-opacity=".25"/>
-<stop offset=".35" stop-color="#fff" stop-opacity=".8"/>
-<stop offset="1" stop-color="#fff"/>
-</linearGradient>
-<mask id="floor"><rect y="{HZ}" width="{W}" height="{H - HZ}" fill="url(#fade)"/></mask>
-</defs>
-<rect width="{W}" height="{H}" fill="{BG}"/>
-<rect y="150" width="{W}" height="{HZ - 150}" fill="url(#sky)"/>
-<g fill="none" stroke="{GRID}" stroke-width="1.5" stroke-opacity=".8" mask="url(#floor)">
-<path d="{grid_vertical()}"/>
-<path d="{hlines}">{h_anim}</path>
-</g>
-<path d="M0 {HZ}H{W}" stroke="{GRID}" stroke-width="2" filter="url(#soft)"/>
-<g fill="none" stroke="{LINE}" stroke-linejoin="round" stroke-linecap="round" filter="url(#glow)">
-<path stroke-width="2.5" d="{body}">{body_anim}</path>
-<path stroke-width="1.4" d="{scr}">{scr_anim}</path>
-</g>
-<path d="{logo}" fill="{LINE}" fill-opacity=".08" stroke="{LINE}" stroke-width="2.5" stroke-linejoin="round" filter="url(#glow)"/>
-<path d="{tag}" fill="{TAG}" filter="url(#soft)"/>
-</svg>
-'''
+def build_banner(fonts):
+    banner = Banner(fonts)
+    frames = [banner.frame(k) for k in range(FRAMES)]
+    # GIF delays are in 1/100 s: 70, 60, 70 ms make exactly 15 frames per second
+    durations = [(70, 60, 70)[k % 3] for k in range(FRAMES)]
+    frames[0].save(OUT / "banner.gif", save_all=True, append_images=frames[1:],
+                   duration=durations, loop=0, optimize=True)
+    frames[0].save(OUT / "banner-static.png", optimize=True)
+    # the frame after the last one must be the first one again
+    seam = ImageChops.difference(banner.frame(FRAMES).convert("L"), frames[0].convert("L"))
+    if seam.getbbox() is not None:
+        sys.exit("banner loop has a seam")
 
 
 # ---------------------------------------------------------------- icon
 
-def icon(hash_font):
-    # Apple icon grid: 824 x 824 body with a ~185 px corner radius in 1024.
-    x0, size, r = 100, 824, 185
-    hz = 690
-    cx, cy, s = 512, 480, 840
-    a, b = -0.42, 0.28
+def glyph_path(font_path, ch, x, y, size):
+    font = TTFont(str(font_path))
+    gs = font.getGlyphSet()
+    name = font.getBestCmap()[ord(ch)]
+    scale = size / font["head"].unitsPerEm
+    pen = SVGPathPen(gs, ntos=lambda v: ("%.2f" % v).rstrip("0").rstrip("."))
+    gs[name].draw(TransformPen(pen, (scale, 0, 0, -scale, x, y)))
+    return pen.getCommands()
 
-    body = body_path(a, b, cx, cy, s)
-    scr = poly([proj(p, a, b, cx, cy, s) for p in SCREEN])
 
-    # "#" drawn in screen coordinates (units of the tablet), then projected.
-    hs = 1.25
-    hw = hash_font.advance("#") / hash_font.upm * hs
+def icon_svg(hash_d, small=False):
+    """App icon "READY.": a frontal tablet with a hash and a solid block cursor.
 
-    def on_screen(px, py):
-        return proj((px, py, -.09), a, b, cx, cy, s)
-
-    hash_d = hash_font.path("#", -hw / 2, 0.05 + 0.72 * hs / 2, hs, mapper=on_screen)
-
-    vp = 512
+    small=True is the variant for 16 and 32 px: no dither (it turns into a grey
+    smear there), thicker lines, two solid text lines and the floor as two plain lines.
+    """
+    hz = 790
     grid = ""
     for i in range(-9, 10):
-        grid += f"M{num(vp + i * 30)} {hz}L{num(vp + i * 150)} {x0 + size}"
-    for k in range(1, 6):
-        q = k / 5
-        y = hz + (x0 + size - hz) * q * q
-        grid += f"M{x0} {num(y)}H{x0 + size}"
-
+        grid += f"M{512 + i * 40} {hz} L{512 + i * 170} 1024 "
+    if small:
+        grid = ""
+    for q in ((0.4,) if small else (0.18, 0.45, 0.8)):
+        grid += f"M0 {round(hz + (1024 - hz) * q)} H1024 "
+    grid = grid.strip()
+    if small:
+        floor = ""
+        grid_paths = f'<path d="{grid}" stroke="{INK}" stroke-width="24" fill="none"/>\n'
+        bar = 32
+        edge = 40
+        screen = ""
+        lines = (f'<rect x="372" y="548" width="250" height="36" fill="{INK}"/>'
+                 f'<rect x="372" y="636" width="190" height="36" fill="{INK}"/>\n')
+    else:
+        floor = (f'<rect x="0" y="{hz}" width="1024" height="60" fill="url(#a)"/>'
+                 f'<rect x="0" y="{hz + 60}" width="1024" height="180" fill="url(#b)"/>\n')
+        grid_paths = (f'<path d="{grid}" stroke="{PAPER}" stroke-width="10" fill="none"/>\n'
+                      f'<path d="{grid}" stroke="{INK}" stroke-width="5" fill="none"/>\n')
+        bar = 12
+        edge = 24
+        screen = (f'<rect x="342" y="232" width="360" height="520" rx="10" fill="none" '
+                  f'stroke="{INK}" stroke-width="10"/>\n')
+        lines = ('<rect x="372" y="540" width="250" height="16" fill="url(#b)"/>'
+                 '<rect x="372" y="590" width="190" height="16" fill="url(#b)"/>'
+                 '<rect x="372" y="640" width="230" height="16" fill="url(#b)"/>\n')
     return f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
-<title>notedown</title>
 <defs>
-<clipPath id="squircle"><rect x="{x0}" y="{x0}" width="{size}" height="{size}" rx="{r}"/></clipPath>
-<filter id="glow" filterUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024">
-<feGaussianBlur in="SourceGraphic" stdDeviation="16" result="wide"/>
-<feGaussianBlur in="SourceGraphic" stdDeviation="5" result="near"/>
-<feMerge><feMergeNode in="wide"/><feMergeNode in="near"/><feMergeNode in="SourceGraphic"/></feMerge>
-</filter>
-<filter id="soft" filterUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024">
-<feGaussianBlur in="SourceGraphic" stdDeviation="8" result="b"/>
-<feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
-</filter>
-<linearGradient id="sky" x1="0" y1="{x0}" x2="0" y2="{hz}" gradientUnits="userSpaceOnUse">
-<stop offset="0" stop-color="#0b0820"/>
-<stop offset=".6" stop-color="{BG}"/>
-<stop offset="1" stop-color="{GRID}" stop-opacity=".45"/>
-</linearGradient>
-<linearGradient id="fade" x1="0" y1="{hz}" x2="0" y2="{x0 + size}" gradientUnits="userSpaceOnUse">
-<stop offset="0" stop-color="#fff" stop-opacity=".3"/>
-<stop offset=".4" stop-color="#fff" stop-opacity=".85"/>
-<stop offset="1" stop-color="#fff"/>
-</linearGradient>
-<mask id="floor"><rect x="{x0}" y="{hz}" width="{size}" height="{x0 + size - hz}" fill="url(#fade)"/></mask>
+<clipPath id="k"><rect x="100" y="100" width="824" height="824" rx="185"/></clipPath>
+<pattern id="a" width="16" height="16" patternUnits="userSpaceOnUse"><rect width="8" height="8" fill="{INK}"/></pattern>
+<pattern id="b" width="16" height="16" patternUnits="userSpaceOnUse"><rect width="8" height="8" fill="{INK}"/><rect x="8" y="8" width="8" height="8" fill="{INK}"/></pattern>
 </defs>
-<g clip-path="url(#squircle)">
-<rect x="{x0}" y="{x0}" width="{size}" height="{size}" fill="{BG}"/>
-<rect x="{x0}" y="{x0}" width="{size}" height="{hz - x0}" fill="url(#sky)"/>
-<path d="{grid}" fill="none" stroke="{GRID}" stroke-width="7" stroke-opacity=".85" mask="url(#floor)"/>
-<path d="M{x0} {hz}H{x0 + size}" stroke="{GRID}" stroke-width="8" filter="url(#soft)"/>
-<g fill="none" stroke="{LINE}" stroke-linejoin="round" stroke-linecap="round" filter="url(#glow)">
-<path stroke-width="22" d="{body}"/>
-<path stroke-width="9" d="{scr}"/>
-</g>
-<path d="{hash_d}" fill="{LINE}" filter="url(#glow)"/>
-</g>
-<rect x="{x0 + 1.5}" y="{x0 + 1.5}" width="{size - 3}" height="{size - 3}" rx="{r - 1.5}" fill="none" stroke="#fff" stroke-opacity=".12" stroke-width="3"/>
+<g clip-path="url(#k)">
+<rect width="1024" height="1024" fill="{PAPER}"/>
+{floor}{grid_paths}<rect x="0" y="{hz - bar // 2}" width="1024" height="{bar}" fill="{INK}"/>
+<path d="M300 188 L752 188 L772 208 L772 822 L320 822 L300 802 Z" fill="{INK}"/>
+<rect x="292" y="176" width="460" height="634" rx="34" fill="{PAPER}" stroke="{INK}" stroke-width="{edge}"/>
+{screen}<path d="{hash_d}" fill="{INK}"/>
+<rect x="520" y="356" width="108" height="114" fill="{INK}"/>
+{lines}</g>
+<rect x="100" y="100" width="824" height="824" rx="185" fill="none" stroke="#c9c5b8" stroke-width="3"/>
 </svg>
 '''
 
 
-def menubar():
-    # 18 x 18 pt template: black on transparent, strokes only, no text.
-    return '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18" width="18" height="18">
-<g fill="none" stroke="#000" stroke-linecap="round" stroke-linejoin="round">
-<path stroke-width="1.5" d="M5.25 1.75H12.75Q14.25 1.75 14.25 3.25V14.75Q14.25 16.25 12.75 16.25H5.25Q3.75 16.25 3.75 14.75V3.25Q3.75 1.75 5.25 1.75Z"/>
-<path stroke-width="1.4" d="M7.6 5.5L7.2 12.5M10.8 5.5L10.4 12.5M6 7.4H12.3M5.7 10.6H12"/>
-</g>
+MENUBAR = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18" width="18" height="18">
+<rect x="3.2" y="1.6" width="11.6" height="14.8" rx="2" fill="none" stroke="#000" stroke-width="1.6"/>
+<path d="M7.4 5.2L6.6 12.8M11.2 5.2L10.4 12.8M5.4 7.6H12.6M5.2 10.4H12.4" fill="none" stroke="#000" stroke-width="1.3" stroke-linecap="round"/>
 </svg>
 '''
+
+
+def rsvg(svg, size, out):
+    subprocess.run(["rsvg-convert", "-w", str(size), "-h", str(size), str(svg), "-o", str(out)],
+                   check=True)
+
+
+def build_icons(fonts, tmp):
+    hash_d = glyph_path(fonts / "PressStart2P.ttf", "#", 372, 470, 120)
+    (OUT / "icon.svg").write_text(icon_svg(hash_d))
+    small = Path(tmp) / "icon-small.svg"
+    small.write_text(icon_svg(hash_d, small=True))
+    (OUT / "icon-menubar.svg").write_text(MENUBAR)
+    iconset = OUT / "icon.iconset"
+    if iconset.exists():
+        shutil.rmtree(iconset)
+    iconset.mkdir()
+    for s in (16, 32, 128, 256, 512):
+        for scale, suffix in ((1, ""), (2, "@2x")):
+            px = s * scale
+            src = small if px <= 32 else OUT / "icon.svg"
+            rsvg(src, px, iconset / f"icon_{s}x{s}{suffix}.png")
+    rsvg(OUT / "icon.svg", 1024, OUT / "icon-1024.png")
+    subprocess.run(["iconutil", "-c", "icns", str(iconset), "-o", str(OUT / "notedown.icns")],
+                   check=True)
 
 
 def main():
-    if len(sys.argv) != 2:
-        sys.exit("usage: build.py path/to/Orbitron[wght].ttf")
-    font_path = sys.argv[1]
-    black = Font(font_path, 900)
-    bold = Font(font_path, 800)
-    (OUT / "banner.svg").write_text(banner(black, bold, animated=True))
-    (OUT / "banner-static.svg").write_text(banner(black, bold, animated=False))
-    (OUT / "icon.svg").write_text(icon(black))
-    (OUT / "icon-menubar.svg").write_text(menubar())
-    for name in ("banner.svg", "banner-static.svg", "icon.svg", "icon-menubar.svg"):
+    with tempfile.TemporaryDirectory() as tmp:
+        fonts = Path(sys.argv[1]) if len(sys.argv) > 1 else fetch_fonts(tmp)
+        build_banner(fonts)
+        build_icons(fonts, tmp)
+    for name in ("banner.gif", "banner-static.png", "icon.svg", "icon-menubar.svg",
+                 "icon-1024.png", "notedown.icns"):
         print(f"{name}: {(OUT / name).stat().st_size} bytes")
 
 

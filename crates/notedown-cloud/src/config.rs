@@ -28,27 +28,6 @@ pub enum SyncMode {
     Refuse,
 }
 
-/// The `[mcp]` table: the MCP endpoint with OAuth at `<external_base_url>/mcp`. It is served
-/// only when `external_base_url` starts with `https://`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct McpConfig {
-    /// false turns the MCP endpoint and its OAuth routes off.
-    pub enabled: bool,
-}
-
-impl Default for McpConfig {
-    fn default() -> Self {
-        McpConfig { enabled: true }
-    }
-}
-
-impl McpConfig {
-    fn is_default(&self) -> bool {
-        *self == McpConfig::default()
-    }
-}
-
 /// What the server pushes to connected devices after a server-side change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -130,9 +109,10 @@ pub struct Config {
     /// subfolders.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_dir: Option<String>,
-    /// The `[mcp]` table ([`McpConfig`]).
-    #[serde(default, skip_serializing_if = "McpConfig::is_default")]
-    pub mcp: McpConfig,
+    /// The `[mcp]` table of older versions (MCP over HTTP). It is accepted with any content,
+    /// never written back and never read, except for one line at `notedown serve` start.
+    #[serde(default, skip_serializing)]
+    pub mcp: Option<toml::Table>,
     /// The `[pipeline]` table of `notedown pipeline`. The server ignores it and keeps it as
     /// written, so [`Config::save`] writes it back unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -160,7 +140,7 @@ impl Default for Config {
             scan_min_files: 1,
             watch: true,
             render_dir: None,
-            mcp: McpConfig::default(),
+            mcp: None,
             pipeline: None,
         }
     }
@@ -451,14 +431,9 @@ mod tests {
     }
 
     #[test]
-    fn mcp_table_defaults_to_enabled_and_reads_false() {
-        let c: Config = toml::from_str("").unwrap();
-        assert!(c.mcp.enabled);
-        let c: Config = toml::from_str("[mcp]\nenabled = false\n").unwrap();
-        assert!(!c.mcp.enabled);
-        // The default is not written back.
-        let text = toml::to_string(&Config::default()).unwrap();
-        assert!(!text.contains("[mcp]"), "{text}");
+    fn an_old_mcp_table_with_any_key_still_loads() {
+        let cfg: Config = toml::from_str("[mcp]\nfoo = 1\n").unwrap();
+        assert!(!toml::to_string(&cfg).unwrap().contains("[mcp]"));
     }
 
     #[test]

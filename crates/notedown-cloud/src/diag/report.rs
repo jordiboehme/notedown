@@ -256,12 +256,16 @@ pub struct ReportInput<'a> {
     pub pipeline: PipelineCounts,
 }
 
-/// The OCR pipeline in the report: its journal cursor and the pages of its note states that
-/// wait for OCR or failed. Read raw from `pipeline/<slug>/notes/*.json` (notedown-cloud does
-/// not link the pipeline); `pipeline/` itself never goes into the bundle.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// The OCR pipeline in the report: its journal cursor per account and the pages of its note
+/// states that wait for OCR or failed. Read raw from `pipeline/<slug>.cursor` and
+/// `pipeline/<slug>/notes/*.json` (notedown-cloud does not link the pipeline); `pipeline/`
+/// itself never goes into the bundle.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PipelineCounts {
-    pub cursor: Option<u64>,
+    /// By account slug: the cursor, `None` without one.
+    pub cursors: Vec<(String, Option<u64>)>,
+    /// The accounts with a text store (`pipeline/<slug>/`).
+    pub stores: u64,
     pub pending: u64,
     pub failed: u64,
 }
@@ -493,13 +497,30 @@ pub fn render(stats: &Stats, input: &ReportInput, filter: &mut Filter) -> (Strin
         ));
     }
     let p = &input.pipeline;
-    out.push(format!(
-        "Pipeline  cursor {}, {} pending, {} failed",
-        p.cursor
-            .map_or_else(|| "none".to_string(), |c| c.to_string()),
-        count(p.pending, "page"),
-        p.failed
-    ));
+    let no_cursor = p.cursors.iter().all(|(_, c)| c.is_none());
+    if no_cursor && p.stores == 0 {
+        // No cursor and no text store: the pipeline runs on another machine, or not at all.
+        out.push("Pipeline  not on this machine".into());
+    } else {
+        let cursors = if no_cursor {
+            // Text stores, but no pass has written a cursor yet (as right after an update).
+            "none".to_string()
+        } else {
+            let mut cursors = Vec::new();
+            for (slug, c) in &p.cursors {
+                let acct = filter.account(slug);
+                values.push(acct.clone());
+                let at = c.map_or_else(|| "none".to_string(), |c| c.to_string());
+                cursors.push(format!("{acct} {at}"));
+            }
+            cursors.join(", ")
+        };
+        out.push(format!(
+            "Pipeline  cursor {cursors}, {} pending, {} failed",
+            count(p.pending, "page"),
+            p.failed
+        ));
+    }
     (out.join("\n") + "\n", values)
 }
 

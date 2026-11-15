@@ -1,15 +1,22 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "ocr")]
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
+#[cfg(feature = "ocr")]
 use notedown_convert::inputs;
+#[cfg(feature = "ocr")]
 use notedown_convert::links::FileIndex;
+#[cfg(feature = "ocr")]
 use notedown_convert::pipeline::{Options, Outcome, convert_one};
 use notedown_note::{Notebook, RenderOptions, VersionPolicy, encode_png};
+#[cfg(feature = "ocr")]
 use notedown_ocr::model::{self, DEFAULT_MODEL};
+#[cfg(feature = "ocr")]
 use notedown_ocr::{LlamaEngine, OcrEngine, OcrError, OcrOptions, PageOcr};
 
 #[derive(Parser)]
@@ -26,10 +33,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Convert .note and .png files (or folders of them) to Markdown
+    #[cfg(feature = "ocr")]
     Convert(ConvertArgs),
     /// Render the pages of a .note file as PNG images, or as one PDF with --pdf
     Render(RenderArgs),
     /// Manage the OCR model files
+    #[cfg(feature = "ocr")]
     Model {
         #[command(subcommand)]
         action: ModelAction,
@@ -43,12 +52,15 @@ enum Command {
     },
     /// Read the pages of the notes in a data folder as text (OCR) and keep the text store for
     /// agents. Runs until stopped (Ctrl-C). Loads the OCR model only when a page is due
+    #[cfg(feature = "ocr")]
     Pipeline(PipelineArgs),
     /// The MCP server over stdio: the note texts of one account for an agent. It only reads the
     /// text store and writes bookmarks, it never runs OCR
+    #[cfg(feature = "ocr")]
     Mcp(McpArgs),
 }
 
+#[cfg(feature = "ocr")]
 #[derive(clap::Args)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 struct PipelineArgs {
@@ -69,6 +81,7 @@ struct PipelineArgs {
     note: Option<String>,
 }
 
+#[cfg(feature = "ocr")]
 #[derive(Subcommand)]
 enum PipelineAction {
     /// List the bookmarks of the consumers per account as JSON, or remove one
@@ -103,6 +116,7 @@ enum PipelineAction {
     },
 }
 
+#[cfg(feature = "ocr")]
 #[derive(clap::Args)]
 #[command(group(clap::ArgGroup::new("start").required(true).args(["consumer", "since", "from"])))]
 struct ChangesArgs {
@@ -133,6 +147,7 @@ struct ChangesArgs {
     notes: Option<Vec<String>>,
 }
 
+#[cfg(feature = "ocr")]
 #[derive(clap::Args)]
 struct McpArgs {
     /// The data folder
@@ -157,6 +172,7 @@ struct ServeArgs {
     refuse_sync: bool,
     /// Also run `notedown pipeline` for the same data folder. It stops when the server stops
     #[arg(long)]
+    #[cfg(feature = "ocr")]
     pipeline: bool,
 }
 
@@ -397,7 +413,7 @@ enum AccountAction {
         #[arg(long)]
         password_stdin: bool,
     },
-    /// Set a new password (also unlocks the account and ends its OAuth sign-ins)
+    /// Set a new password (also unlocks the account)
     Passwd {
         slug: String,
         /// Read the password from the first line of stdin instead of asking for it
@@ -406,14 +422,7 @@ enum AccountAction {
     },
     /// List the accounts
     List,
-    /// List the OAuth sign-ins of an account (MCP clients such as claude.ai), or end them
-    Oauth {
-        slug: String,
-        /// End one sign-in by its id, or all with "all"
-        #[arg(long, value_name = "ID")]
-        revoke: Option<String>,
-    },
-    /// Delete an account with all its files and its note text (also ends its OAuth sign-ins)
+    /// Delete an account with all its files and its note text
     Remove {
         slug: String,
         /// Confirm the deletion
@@ -422,6 +431,7 @@ enum AccountAction {
     },
 }
 
+#[cfg(feature = "ocr")]
 #[derive(clap::Args)]
 struct ConvertArgs {
     /// Files or folders to convert (folders are searched recursively)
@@ -474,6 +484,7 @@ struct RenderArgs {
     pdf: bool,
 }
 
+#[cfg(feature = "ocr")]
 #[derive(Subcommand)]
 enum ModelAction {
     /// Download the model files into the cache
@@ -484,6 +495,7 @@ enum ModelAction {
     Verify,
 }
 
+#[cfg(feature = "ocr")]
 /// Loads the model on the first page that needs OCR, so an up-to-date folder never loads it.
 struct LazyEngine {
     label: String,
@@ -495,6 +507,7 @@ struct LazyEngine {
     loaded_in: Option<Duration>,
 }
 
+#[cfg(feature = "ocr")]
 impl OcrEngine for LazyEngine {
     fn ocr_png(&mut self, png: &[u8]) -> Result<PageOcr, OcrError> {
         if self.engine.is_none() {
@@ -537,10 +550,12 @@ fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
+#[cfg(feature = "ocr")]
 fn display_name(rel: &Path) -> String {
     rel.to_string_lossy().into_owned()
 }
 
+#[cfg(feature = "ocr")]
 fn convert(args: ConvertArgs) -> Result<ExitCode> {
     let (found, warnings) = inputs::collect(&args.paths, args.out.as_deref());
     for w in &warnings {
@@ -686,6 +701,7 @@ fn render(args: RenderArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+#[cfg(feature = "ocr")]
 fn model_command(action: ModelAction) -> Result<ExitCode> {
     match action {
         ModelAction::Pull => {
@@ -1573,45 +1589,17 @@ fn account_command(data: &Path, action: AccountAction) -> Result<ExitCode> {
                 );
             }
         }
-        AccountAction::Oauth { slug, revoke } => {
-            if accounts.get(&slug)?.is_none() {
-                return Err(anyhow!("account {slug} does not exist"));
-            }
-            match revoke.as_deref() {
-                Some(id) => {
-                    let n =
-                        notedown_mcp_http::revoke_grants(data, &slug, (id != "all").then_some(id))?;
-                    if n == 0 && id != "all" {
-                        return Err(anyhow!("account {slug} has no OAuth sign-in {id}"));
-                    }
-                    println!("revoked {n} OAuth sign-ins");
-                }
-                None => {
-                    let grants = notedown_mcp_http::list_grants(data, &slug)?;
-                    if grants.is_empty() {
-                        println!("no OAuth sign-ins");
-                    }
-                    let offset = notedown_cloud::localtime::local_utc_offset()
-                        .unwrap_or(time::UtcOffset::UTC);
-                    for g in grants {
-                        println!(
-                            "{}\t{}\tsigned in {}\tlast used {}",
-                            g.id,
-                            g.client_name,
-                            local_time(g.created_ms, offset),
-                            local_time(g.used_ms, offset)
-                        );
-                    }
-                }
-            }
-        }
         AccountAction::Remove { slug, yes } => {
             if !yes {
                 return Err(anyhow!(
                     "this deletes account {slug} with all its files and its note text; add --yes to confirm"
                 ));
             }
-            accounts.remove(&slug)?;
+            if accounts.get(&slug)?.is_none() {
+                return Err(anyhow!("account {slug} does not exist"));
+            }
+            let journal = notedown_cloud::journal::Journal::open(data)?;
+            accounts.remove(&slug, &journal)?;
             println!("removed account {slug}");
         }
     }
@@ -1653,7 +1641,7 @@ fn host_ipv4s() -> Vec<std::net::Ipv4Addr> {
 
 fn serve_command(args: ServeArgs) -> Result<ExitCode> {
     use notedown_cloud::Config;
-    use notedown_cloud::server::{AppState, bind, serve_until_with};
+    use notedown_cloud::server::{AppState, bind, serve_until};
     let (mut config, config_warnings) = Config::load_with_warnings(&args.data)?;
     // The flag counts for this run only; server.toml is not rewritten.
     let capture_from_file = config.capture && !args.capture;
@@ -1722,14 +1710,10 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
             Some(root) => println!("render: {}", root.display()),
             None => println!("render: off"),
         }
-        let mcp = notedown_mcp_http::router(&state)?;
-        match (&mcp, config.mcp.enabled, config.external_base_url.as_deref()) {
-            (Some(_), _, Some(url)) => println!("mcp: {}/mcp", url.trim_end_matches('/')),
-            (None, false, _) => println!("mcp: off ([mcp] enabled = false)"),
-            (None, true, Some(url)) if has_path(url) => {
-                println!("mcp: off (external_base_url must have no path)")
-            }
-            _ => println!("mcp: off (needs an https external_base_url)"),
+        if config.mcp.is_some() {
+            println!(
+                "mcp: [mcp] in server.toml is ignored; MCP runs on the pipeline machine over stdio (notedown mcp)"
+            );
         }
         println!("watch: {}", if config.watch { "on" } else { "off" });
         if config.recycle_prune {
@@ -1759,8 +1743,11 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
         // The handlers are in place before the child starts, so a stop signal always ends
         // the server and with it the child.
         let shutdown = Shutdown::new()?;
+        #[cfg(feature = "ocr")]
         let child: PipelineChild = std::sync::Arc::new(std::sync::Mutex::new(None));
+        #[cfg(feature = "ocr")]
         let guard = PipelineGuard(child.clone());
+        #[cfg(feature = "ocr")]
         if args.pipeline {
             let started = start_pipeline(&args.data)?;
             println!("pipeline: started notedown pipeline (pid {})", started.id());
@@ -1769,13 +1756,8 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
         }
         println!("press Ctrl-C to stop");
         std::io::stdout().flush()?;
-        let served = serve_until_with(
-            listeners,
-            state.clone(),
-            mcp.unwrap_or_default(),
-            shutdown.wait(),
-        )
-        .await;
+        let served = serve_until(listeners, state.clone(), shutdown.wait()).await;
+        #[cfg(feature = "ocr")]
         drop(guard);
         served?;
         println!("stopped");
@@ -1828,6 +1810,7 @@ impl Shutdown {
     }
 }
 
+#[cfg(feature = "ocr")]
 /// `notedown pipeline --data <data>` as a child process of the server.
 fn start_pipeline(data: &Path) -> Result<std::process::Child> {
     let exe = std::env::current_exe().context("cannot find the notedown program")?;
@@ -1840,8 +1823,10 @@ fn start_pipeline(data: &Path) -> Result<std::process::Child> {
         .context("cannot start notedown pipeline")
 }
 
+#[cfg(feature = "ocr")]
 type PipelineChild = std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>;
 
+#[cfg(feature = "ocr")]
 /// Says once when the pipeline child ends by itself; the server keeps running.
 async fn watch_pipeline(child: PipelineChild) {
     loop {
@@ -1865,19 +1850,23 @@ async fn watch_pipeline(child: PipelineChild) {
     }
 }
 
+#[cfg(feature = "ocr")]
 /// How long the pipeline child gets to stop after SIGTERM before it is killed.
 const PIPELINE_STOP_WAIT: Duration = Duration::from_secs(5);
 
+#[cfg(feature = "ocr")]
 /// The pipeline child of `serve --pipeline`. Dropping the guard stops the child, also on an
 /// error or a panic of the server.
 struct PipelineGuard(PipelineChild);
 
+#[cfg(feature = "ocr")]
 impl Drop for PipelineGuard {
     fn drop(&mut self) {
         stop_pipeline(&self.0);
     }
 }
 
+#[cfg(feature = "ocr")]
 /// Stops the pipeline child, if it still runs: SIGTERM (it ends between two pages), then a
 /// kill after [`PIPELINE_STOP_WAIT`].
 fn stop_pipeline(child: &PipelineChild) {
@@ -1909,6 +1898,7 @@ fn stop_pipeline(child: &PipelineChild) {
     let _ = c.wait();
 }
 
+#[cfg(feature = "ocr")]
 /// Sets the flag on Ctrl-C or SIGTERM. The handlers are in place when this returns.
 fn stop_flag() -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>> {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1928,6 +1918,7 @@ fn stop_flag() -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>> {
     Ok(stop)
 }
 
+#[cfg(feature = "ocr")]
 fn pipeline_command(args: PipelineArgs) -> Result<ExitCode> {
     use notedown_pipeline::worker::{EngineLoader, Worker};
     if let Some(action) = args.action {
@@ -1937,7 +1928,9 @@ fn pipeline_command(args: PipelineArgs) -> Result<ExitCode> {
     if !data.is_dir() {
         return Err(anyhow!("data folder {} does not exist", data.display()));
     }
-    let cfg = notedown_pipeline::PipelineConfig::load(&data)?;
+    // Without <data>/pipeline.toml the server's data is this folder; with it, the folder named
+    // there, and this one keeps only the pipeline's own data.
+    let setup = notedown_pipeline::setup::Setup::load(&data)?;
     // The model is loaded when a page is due, as `notedown convert` loads it.
     let loader: EngineLoader = Box::new(|| {
         let paths = model::resolve(&DEFAULT_MODEL, None, None)?;
@@ -1945,7 +1938,7 @@ fn pipeline_command(args: PipelineArgs) -> Result<ExitCode> {
         let engine = LlamaEngine::load(&paths, OcrOptions::default())?;
         Ok(Box::new(engine) as Box<dyn OcrEngine>)
     });
-    let mut worker = Worker::with_loader(&data, cfg, loader);
+    let mut worker = Worker::with_loader(&setup, loader);
     if args.once || args.reocr {
         let done = if args.reocr {
             worker.reocr(args.note.as_deref())
@@ -1983,6 +1976,7 @@ fn pipeline_command(args: PipelineArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+#[cfg(feature = "ocr")]
 fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
     use notedown_pipeline::delta::{self, MAX_CHARS, Start};
     use notedown_pipeline::format::to_json;
@@ -2005,11 +1999,7 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
             }
             let slugs = match account {
                 Some(a) => vec![resolve_account(&data, Some(&a))?],
-                None => notedown_cloud::auth::Accounts::new(&data)
-                    .list()?
-                    .into_iter()
-                    .map(|a| a.slug)
-                    .collect(),
+                None => notedown_pipeline::setup::local_accounts(&data)?,
             };
             let local =
                 notedown_cloud::localtime::local_utc_offset().unwrap_or(time::UtcOffset::UTC);
@@ -2081,6 +2071,7 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+#[cfg(feature = "ocr")]
 fn mcp_command(args: McpArgs) -> Result<ExitCode> {
     // serve_stdio builds its own runtime; this is plain synchronous code.
     notedown_pipeline::mcp::serve_stdio(&args.data, args.account.as_deref())?;
@@ -2090,12 +2081,16 @@ fn mcp_command(args: McpArgs) -> Result<ExitCode> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
+        #[cfg(feature = "ocr")]
         Command::Convert(a) => convert(a),
         Command::Render(a) => render(a),
+        #[cfg(feature = "ocr")]
         Command::Model { action } => model_command(action),
         Command::Serve(a) => serve_command(a),
         Command::Cloud { action } => cloud_command(action),
+        #[cfg(feature = "ocr")]
         Command::Pipeline(a) => pipeline_command(a),
+        #[cfg(feature = "ocr")]
         Command::Mcp(a) => mcp_command(a),
     };
     let _ = std::io::stdout().flush();
@@ -2103,6 +2098,7 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e:#}");
+            #[cfg(feature = "ocr")]
             if matches!(
                 e.downcast_ref::<OcrError>(),
                 Some(OcrError::ModelMissing { .. })
@@ -2112,12 +2108,6 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
-}
-
-/// Whether an `https://` base URL has a path (one trailing `/` is no path).
-fn has_path(url: &str) -> bool {
-    url.strip_prefix("https://")
-        .is_some_and(|rest| rest.strip_suffix('/').unwrap_or(rest).contains('/'))
 }
 
 #[cfg(test)]

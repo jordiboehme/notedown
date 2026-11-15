@@ -54,13 +54,10 @@ The texts of a delta follow as Markdown under headings that name the block."
     )
 }
 
-/// The account of a session: `account` when it exists, else the only account of `data`.
+/// The account of a session: `account` when it exists, else the only account of `data` (see
+/// [`crate::setup::local_accounts`]). The name is checked before any store is opened.
 pub fn resolve_account(data: &Path, account: Option<&str>) -> crate::Result<String> {
-    let slugs: Vec<String> = notedown_cloud::auth::Accounts::new(data)
-        .list()?
-        .into_iter()
-        .map(|a| a.slug)
-        .collect();
+    let slugs = crate::setup::local_accounts(data)?;
     match account {
         Some(slug) if slugs.iter().any(|s| s == slug) => Ok(slug.to_string()),
         Some(slug) => Err(PipelineError::Account(if slugs.is_empty() {

@@ -33,6 +33,10 @@ const LOG_FILE: &str = "log.jsonl";
 const NOTES_DIR: &str = "notes";
 const CONSUMERS_DIR: &str = "consumers";
 const STATS_FILE: &str = "stats.json";
+/// `<local>/pipeline/<slug>/owner.json`: `{"userId":N}`, the server account the text is of.
+pub const OWNER_FILE: &str = "owner.json";
+/// The name start of a store on its way out: `<local>/pipeline/.removed-<slug>-<hex>`.
+pub const TOMBSTONE_PREFIX: &str = ".removed-";
 
 fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
     move |source| Error::Io {
@@ -206,6 +210,50 @@ pub struct TextStore {
     repaired: AtomicBool,
 }
 
+/// What a sweep did.
+#[derive(Debug, Default)]
+pub struct Swept {
+    /// Tombstones deleted.
+    pub deleted: usize,
+    /// Tombstones still there, with the error of their delete.
+    pub failed: Vec<(PathBuf, std::io::Error)>,
+}
+
+/// `owner.json`.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Owner {
+    user_id: u64,
+}
+
+/// A name part no other tombstone of this process has: the time and the process id, and a
+/// count for two in the same nanosecond.
+fn tomb_hex() -> String {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    let mut raw = [0u8; 16];
+    raw[..8].copy_from_slice(&(nanos ^ n.rotate_left(48)).to_be_bytes());
+    raw[8..12].copy_from_slice(&std::process::id().to_be_bytes());
+    raw[12..].copy_from_slice(&(n as u32).to_be_bytes());
+    const_hex::encode(raw)
+}
+
+/// Deletes a tombstone, a folder or a file.
+fn remove_tombstone(path: &Path) -> std::io::Result<()> {
+    let r = match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(e) => Err(e),
+    };
+    match r {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        r => r,
+    }
+}
+
 /// Only the `seq` of a log line.
 #[derive(Deserialize)]
 struct SeqOnly {
@@ -230,6 +278,69 @@ impl TextStore {
         let store = TextStore::open(data, slug)?;
         store.repair(w)?;
         Ok(store)
+    }
+
+    /// The user id of the server account this text is of (`owner.json`), `None` when the store
+    /// has no owner file. A file that cannot be read or parsed is an error, never `None`.
+    pub fn owner(&self) -> Result<Option<u64>> {
+        Ok(read_json::<Owner>(&self.dir.join(OWNER_FILE))?.map(|o| o.user_id))
+    }
+
+    /// Writes `owner.json`. For a new store it is the first write.
+    pub fn set_owner(&self, user_id: u64, _w: &WriterLock) -> Result<()> {
+        let path = self.dir.join(OWNER_FILE);
+        notedown_cloud::fsutil::write_atomic(&path, &json_bytes(&Owner { user_id })?, false)?;
+        Ok(())
+    }
+
+    /// Deletes the store of account `slug` in `local` as a whole: renames it to a tombstone
+    /// (`pipeline/.removed-<slug>-<hex>`), fsyncs `pipeline/` and deletes the tombstone. Earlier
+    /// tombstones are swept first. Returns whether a store was there; a missing store is not
+    /// created. Only a failed rename is an error: once renamed, the store is gone, and a
+    /// tombstone that cannot be deleted now is left to the next [`sweep`](Self::sweep). Works
+    /// only below `<local>/pipeline`.
+    pub fn destroy(local: &Path, slug: &str, w: &WriterLock) -> Result<bool> {
+        notedown_cloud::auth::validate_slug(slug)?;
+        TextStore::sweep(local, w);
+        let pipeline = local.join(PIPELINE_DIR);
+        let dir = pipeline.join(slug);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(io_err(&dir)(e)),
+        }
+        let tomb = pipeline.join(format!("{TOMBSTONE_PREFIX}{slug}-{}", tomb_hex()));
+        notedown_cloud::fsutil::rename_durable(&dir, &tomb)?;
+        let _ = remove_tombstone(&tomb);
+        Ok(true)
+    }
+
+    /// Deletes every tombstone (`.removed-*`) under `<local>/pipeline` that a crash or a failed
+    /// delete left. Errors only leave a tombstone for the next sweep. Returns how many went.
+    pub fn sweep(local: &Path, w: &WriterLock) -> usize {
+        TextStore::sweep_all(local, w).deleted
+    }
+
+    /// [`sweep`](Self::sweep), with the tombstones that could not be deleted and why.
+    pub fn sweep_all(local: &Path, _w: &WriterLock) -> Swept {
+        let mut swept = Swept::default();
+        let Ok(entries) = std::fs::read_dir(local.join(PIPELINE_DIR)) else {
+            return swept;
+        };
+        for e in entries.flatten() {
+            if !e
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(TOMBSTONE_PREFIX))
+            {
+                continue;
+            }
+            match remove_tombstone(&e.path()) {
+                Ok(()) => swept.deleted += 1,
+                Err(err) => swept.failed.push((e.path(), err)),
+            }
+        }
+        swept
     }
 
     /// `<data>/pipeline/<slug>`.

@@ -11,6 +11,12 @@ rust-version.workspace = true
 name = "notedown"
 path = "src/main.rs"
 
+[features]
+# The OCR side: convert, model, pipeline and mcp. Without it the binary is the sync server
+# and the other tools, with no llama.cpp (the Raspberry Pi build).
+default = ["ocr"]
+ocr = ["dep:notedown-ocr", "dep:notedown-pipeline", "dep:notedown-convert"]
+
 [dependencies]
 clap.workspace = true
 anyhow.workspace = true
@@ -18,11 +24,10 @@ serde_json.workspace = true
 zip.workspace = true
 time.workspace = true
 notedown-note.workspace = true
-notedown-ocr.workspace = true
+notedown-ocr = { workspace = true, optional = true }
 notedown-cloud.workspace = true
-notedown-mcp-http.workspace = true
-notedown-convert.workspace = true
-notedown-pipeline.workspace = true
+notedown-convert = { workspace = true, optional = true }
+notedown-pipeline = { workspace = true, optional = true }
 rpassword.workspace = true
 if-addrs.workspace = true
 tokio.workspace = true

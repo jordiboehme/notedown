@@ -3,11 +3,16 @@ use notedown_cloud::auth::{
     Accounts, Auth, AuthError, Claims, Devices, LoginCodes, TokenKey, check_login_hash,
     expected_login_hash, md5_hex,
 };
+use notedown_cloud::journal::{Journal, Origin};
 
 const NOW: u64 = 1_791_270_000_000;
 
 fn data() -> tempfile::TempDir {
     tempfile::tempdir().unwrap()
+}
+
+fn journal(d: &tempfile::TempDir) -> Journal {
+    Journal::open(d.path()).unwrap()
 }
 
 // accounts
@@ -51,9 +56,12 @@ fn create_list_find_remove() {
         accounts.create("other", "anna@example.org", "pw"),
         Err(Error::EmailInUse { .. })
     ));
-    accounts.remove("anna").unwrap();
+    accounts.remove("anna", &journal(&d)).unwrap();
     assert!(!d.path().join("accounts/anna").exists());
-    assert!(matches!(accounts.remove("anna"), Err(Error::NoAccount(_))));
+    assert!(matches!(
+        accounts.remove("anna", &journal(&d)),
+        Err(Error::NoAccount(_))
+    ));
     // ids are never reused
     let c = accounts.create("carl", "carl@example.org", "pw").unwrap();
     assert!(c.user_id > b.user_id);
@@ -467,7 +475,7 @@ fn token_of_removed_account_is_refused() {
     let ok = auth
         .login("jordi@example.org", &hash_for(&code, "secret"), "SN1", NOW)
         .unwrap();
-    auth.accounts().remove("jordi").unwrap();
+    auth.accounts().remove("jordi", &journal(&_d)).unwrap();
     assert!(auth.authenticate(&ok.token).is_err());
 }
 
@@ -665,7 +673,8 @@ fn account_remove_waits_for_the_store_lock_first() {
     let (tx, rx) = std::sync::mpsc::channel();
     let data = dir.path().to_path_buf();
     let remover = std::thread::spawn(move || {
-        let r = notedown_cloud::auth::Accounts::new(&data).remove("jordi");
+        let r = notedown_cloud::auth::Accounts::new(&data)
+            .remove("jordi", &Journal::open(&data).unwrap());
         tx.send(()).unwrap();
         r
     });
@@ -682,27 +691,13 @@ fn account_remove_waits_for_the_store_lock_first() {
 }
 
 #[test]
-fn set_password_deletes_the_oauth_grants() {
-    let dir = tempfile::tempdir().unwrap();
-    let accounts = notedown_cloud::auth::Accounts::new(dir.path());
-    accounts.create("anna", "anna@example.com", "pw1").unwrap();
-    let oauth = accounts
-        .account_dir("anna")
-        .join(notedown_cloud::auth::OAUTH_DIR);
-    std::fs::create_dir_all(&oauth).unwrap();
-    std::fs::write(oauth.join("g.json"), "{}").unwrap();
-    accounts.set_password("anna", "pw2").unwrap();
-    assert!(!oauth.exists());
-}
-
-#[test]
 fn a_device_record_of_a_removed_account_is_no_account_and_creates_nothing() {
     let d = data();
     let accounts = Accounts::new(d.path());
     accounts.create("jordi", "jordi@example.org", "pw").unwrap();
     let devices = Devices::new(d.path());
     assert_eq!(devices.bump("jordi", "SN1", NOW).unwrap(), 1);
-    accounts.remove("jordi").unwrap();
+    accounts.remove("jordi", &journal(&d)).unwrap();
     assert!(matches!(
         devices.invalidate("jordi", "SN1"),
         Err(Error::NoAccount(_))
@@ -724,7 +719,7 @@ fn account_remove_deletes_the_pipeline_text_and_create_drops_a_leftover() {
     std::fs::create_dir_all(text.join("notes")).unwrap();
     std::fs::write(text.join("notes/n.json"), "{}").unwrap();
     std::fs::create_dir_all(d.path().join(PIPELINE_DIR).join("anna")).unwrap();
-    accounts.remove("jordi").unwrap();
+    accounts.remove("jordi", &journal(&d)).unwrap();
     assert!(!text.exists());
     // Nothing else of the pipeline is touched, and no tombstone is left.
     let left: Vec<_> = std::fs::read_dir(d.path().join(PIPELINE_DIR))
@@ -736,4 +731,36 @@ fn account_remove_deletes_the_pipeline_text_and_create_drops_a_leftover() {
     std::fs::create_dir_all(text.join("notes")).unwrap();
     accounts.create("jordi", "jordi@example.org", "pw").unwrap();
     assert!(!text.exists());
+}
+
+#[test]
+fn removing_an_account_journals_its_user_id() {
+    let d = data();
+    let accounts = Accounts::new(d.path());
+    let a = accounts.create("jordi", "jordi@example.org", "pw").unwrap();
+    assert_eq!(a.user_id, 1_000_001);
+    let journal = journal(&d);
+    accounts.remove("jordi", &journal).unwrap();
+    let events: Vec<_> = journal.read_from(0).unwrap().map(|e| e.unwrap()).collect();
+    let last = events.last().expect("an event");
+    assert_eq!(last.body.type_name(), "account.removed");
+    assert_eq!(last.account, "jordi");
+    assert_eq!(last.origin, Origin::Cli);
+    assert_eq!(last.device, None);
+    let line: serde_json::Value = serde_json::from_str(&last.to_line()).unwrap();
+    assert_eq!(line["type"], "account.removed");
+    assert_eq!(line["userId"], 1_000_001);
+    assert!(!d.path().join("accounts/jordi").exists());
+}
+
+#[test]
+fn a_failed_journal_append_removes_nothing() {
+    let d = data();
+    let accounts = Accounts::new(d.path());
+    accounts.create("jordi", "jordi@example.org", "pw").unwrap();
+    // No journal/ folder: an append through open_no_create fails.
+    let journal = Journal::open_no_create(d.path());
+    assert!(accounts.remove("jordi", &journal).is_err());
+    assert!(accounts.get("jordi").unwrap().is_some());
+    assert!(d.path().join("accounts/jordi").is_dir());
 }

@@ -676,3 +676,69 @@ fn reading_the_local_offset_never_holds_the_writer_lock() {
     }
     assert_eq!(busy, 0, "takes refused while the offset was read");
 }
+
+#[test]
+fn the_owner_is_written_and_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let w = WriterLock::take(tmp.path()).unwrap();
+    let store = TextStore::open_writer(tmp.path(), "a", &w).unwrap();
+    assert_eq!(store.owner().unwrap(), None);
+    store.set_owner(1_000_001, &w).unwrap();
+    assert_eq!(store.owner().unwrap(), Some(1_000_001));
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store.dir().join(OWNER_FILE)).unwrap()).unwrap();
+    assert_eq!(v, serde_json::json!({"userId": 1_000_001}));
+    std::fs::write(store.dir().join(OWNER_FILE), "{").unwrap();
+    assert!(store.owner().is_err(), "a broken owner is not None");
+}
+
+#[test]
+fn destroy_removes_only_the_store_of_the_slug() {
+    let tmp = tempfile::tempdir().unwrap();
+    let w = WriterLock::take(tmp.path()).unwrap();
+    let a = TextStore::open_writer(tmp.path(), "a", &w).unwrap();
+    a.set_owner(1, &w).unwrap();
+    std::fs::create_dir_all(a.dir().join("notes")).unwrap();
+    std::fs::write(a.dir().join("notes").join("x.json"), "{}").unwrap();
+    let b = TextStore::open_writer(tmp.path(), "a-b", &w).unwrap();
+    b.set_owner(2, &w).unwrap();
+    let pipeline = tmp.path().join(PIPELINE_DIR);
+    std::fs::write(pipeline.join("a.cursor"), "{}").unwrap();
+    assert!(TextStore::destroy(tmp.path(), "a", &w).unwrap());
+    assert!(!a.dir().exists());
+    assert!(b.dir().join(OWNER_FILE).is_file());
+    assert!(pipeline.join("a.cursor").is_file());
+    assert!(pipeline.join(WRITER_LOCK_FILE).is_file());
+    assert!(!TextStore::destroy(tmp.path(), "a", &w).unwrap());
+    assert!(!a.dir().exists(), "a missing store is not created");
+    let names: Vec<String> = std::fs::read_dir(&pipeline)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names.iter().all(|n| !n.starts_with(".removed-")),
+        "{names:?}"
+    );
+    assert!(TextStore::destroy(tmp.path(), "../x", &w).is_err());
+}
+
+#[test]
+fn sweep_deletes_only_tombstones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let w = WriterLock::take(tmp.path()).unwrap();
+    assert_eq!(TextStore::sweep(tmp.path(), &w), 0);
+    let pipeline = tmp.path().join(PIPELINE_DIR);
+    std::fs::create_dir_all(pipeline.join(".removed-a-1").join("notes")).unwrap();
+    std::fs::write(pipeline.join(".removed-a-1/notes/x.json"), "{}").unwrap();
+    std::fs::write(pipeline.join(".removed-b-2"), "").unwrap();
+    std::fs::create_dir_all(pipeline.join("c")).unwrap();
+    assert_eq!(TextStore::sweep(tmp.path(), &w), 2);
+    let mut names: Vec<String> = std::fs::read_dir(&pipeline)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, [WRITER_LOCK_FILE, "c"]);
+}

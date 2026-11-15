@@ -3,7 +3,6 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 use notedown_cloud::appdata::Digest;
 use notedown_cloud::pages::PageFingerprint;
@@ -19,6 +18,7 @@ use crate::ocr::read_page;
 use crate::page::stroke_list;
 use crate::records::{self, Record};
 use crate::region::{Region, change_region};
+use crate::source::{NoteBytes, ServerData};
 use crate::{Error, Result};
 
 /// How the pages of a note are read.
@@ -32,7 +32,8 @@ pub(super) enum Mode {
 
 /// Everything one note needs besides the engine.
 pub(super) struct NoteJob<'a> {
-    pub data: &'a Path,
+    /// Where the server's data is read; the text store is in `store`, in the local folder.
+    pub source: &'a dyn ServerData,
     pub slug: &'a str,
     pub store: AccountStore<'a>,
     /// The account's records, for the keys of link targets.
@@ -85,7 +86,9 @@ fn page_line(key: &str, change: LineChange, page_id: &str, position: usize) -> L
 
 /// Reads the due note `due`. The note's state is saved after the page structure is brought up
 /// to date, and again after every page. Stops early (state saved) when `stop` says so, and
-/// returns [`Error::ModelMissing`] when the model cannot be had.
+/// returns [`Error::ModelMissing`] when the model cannot be had. A record or note bytes the
+/// source cannot give now are an error before anything is written: the note is skipped with no
+/// try counted, and looked at again.
 pub(super) fn process(
     job: &NoteJob,
     engine: &mut EngineSlot,
@@ -94,10 +97,10 @@ pub(super) fn process(
     report: &mut dyn FnMut(&Progress),
     stop: &dyn Fn() -> bool,
 ) -> Result<()> {
-    let NoteJob { data, slug, .. } = *job;
+    let NoteJob { source, slug, .. } = *job;
     let (text, w) = (job.store.text, job.store.lock);
     let key = due.key.as_str();
-    let Some(rec) = records::read_key(data, slug, key) else {
+    let Some(rec) = source.record(slug, key)? else {
         return Ok(());
     };
     let r = &rec.record;
@@ -117,15 +120,17 @@ pub(super) fn process(
     if job.mode == Mode::Due && note_waits(errors.get(key, None), Some(&state), r, now) {
         return Ok(());
     }
-    let nb = records::note_file(data, slug, &r.path).and_then(|file| {
-        let bytes = std::fs::read(&file).map_err(|source| Error::Io { path: file, source })?;
-        Ok(Notebook::from_bytes(bytes, VersionPolicy::AllowUnknown)?)
-    });
     // Moved or deleted by hand since `due` looked: skipped for this pass, untouched, until the
-    // server's scan moves or drops the record.
-    if nb.is_err() && records::note_missing(data, slug, &r.path) {
-        return Ok(());
-    }
+    // server's scan moves or drops the record. Something that is not a file in its place is a
+    // failure of the note with its tries, as a note that does not parse. A source without an
+    // answer is no failure of the note: skipped, untouched, no try.
+    let nb = match source.note(slug, &r.path)? {
+        NoteBytes::Found(bytes) => {
+            Notebook::from_bytes(bytes, VersionPolicy::AllowUnknown).map_err(Error::from)
+        }
+        NoteBytes::Missing => return Ok(()),
+        NoteBytes::NotAFile => Err(Error::Read(format!("{} is not a file", r.path))),
+    };
     if state.md5 != r.md5 || state.size != r.size {
         // New bytes: a note that did not parse starts again with fresh tries.
         errors.clear(w, key, None)?;
@@ -356,6 +361,7 @@ fn mark_failed(page: &mut PageState, fp: &PageFingerprint) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn a_missing_page_is_told_once_per_record() {

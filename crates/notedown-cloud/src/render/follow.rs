@@ -333,6 +333,11 @@ mod tests {
     use crate::journal::{EventBody, FileKind};
 
     #[test]
+    fn an_account_removed_event_does_not_wake() {
+        assert!(!wakes(&EventBody::AccountRemoved { user_id: 1_000_001 }));
+    }
+
+    #[test]
     fn note_and_folder_changes_wake_others_dont() {
         let note = |p: &str| EventBody::FileDeleted {
             id: 1,

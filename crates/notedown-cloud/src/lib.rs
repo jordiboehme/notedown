@@ -27,7 +27,7 @@ pub mod store;
 pub mod sync;
 pub mod watch;
 
-pub use config::{Config, McpConfig, PushMode, SyncMode};
+pub use config::{Config, PushMode, SyncMode};
 pub use diag::{Clock, LogEntry, LogKind, ProtocolLog, SystemClock};
 
 /// Errors of the cloud crate.

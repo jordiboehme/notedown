@@ -202,6 +202,11 @@ pub enum EventBody {
         deleted_at: u64,
         reason: RecycleReason,
     },
+    /// The account was removed (`cloud account remove`). The slug is in the event's `account`
+    /// field. The event is appended before the account folder goes away, so a crash in between
+    /// leaves a live account with this record: a reader must find the account missing too.
+    #[serde(rename = "account.removed", rename_all = "camelCase")]
+    AccountRemoved { user_id: u64 },
 }
 
 /// The fields of `digest.*` events. `uniqueIdentifier` is the digest's identity,
@@ -287,6 +292,7 @@ impl EventBody {
             EventBody::TaskGroupUpdated(_) => "task_group.updated",
             EventBody::TaskGroupDeleted(_) => "task_group.deleted",
             EventBody::RecyclePruned { .. } => "recycle.pruned",
+            EventBody::AccountRemoved { .. } => "account.removed",
         }
     }
 }

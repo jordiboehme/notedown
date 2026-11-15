@@ -573,7 +573,7 @@ pub async fn serve_until(
 }
 
 /// Serve until `shutdown` completes, then stop accepting, give open requests a short grace and
-/// return. `extra` routes are served in front of the device routes (the MCP endpoint). Every log
+/// return. `extra` routes are served in front of the device routes (extra routes mounted next to the device API). Every log
 /// line is flushed when it is written, so nothing is pending afterwards.
 pub async fn serve_until_with(
     listeners: Vec<TcpListener>,

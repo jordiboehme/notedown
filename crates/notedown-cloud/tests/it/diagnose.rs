@@ -387,6 +387,10 @@ fn a_safe_bundle_holds_none_of_the_real_values() {
         &fx.data().join("pipeline").join(SLUG).join("log.jsonl"),
         b"{\"seq\":1,\"note\":\"F1\",\"path\":\"NOTE/Note/Secret plans.note\"}\n",
     );
+    write(
+        &fx.data().join("pipeline").join(format!("{SLUG}.cursor")),
+        br#"{"seq":7,"updatedAt":1}"#,
+    );
     let done = diagnose(&opts(&fx, "b.zip")).unwrap();
     let files = unzip(&done.zip);
     let names: Vec<_> = files.keys().cloned().collect();
@@ -396,7 +400,7 @@ fn a_safe_bundle_holds_none_of_the_real_values() {
     );
     assert!(
         done.report
-            .contains("Pipeline  cursor none, 0 pages pending, 1 failed"),
+            .contains("Pipeline  cursor acct-1 7, 0 pages pending, 1 failed"),
         "{}",
         done.report
     );
@@ -581,4 +585,45 @@ fn an_account_filter_keeps_its_devices_and_neutral_markers() {
     let protocol = String::from_utf8_lossy(&unzip(&done.zip)["protocol.jsonl"]).into_owned();
     assert!(protocol.contains("recovery_failed"), "{protocol}");
     assert!(protocol.contains("dev-2"), "{protocol}");
+}
+
+#[test]
+fn diagnose_reads_the_pipeline_cursor_per_account() {
+    let fx = fixture();
+    // The old cursor of one machine is not the pipeline's position any more.
+    write(
+        &fx.data().join("journal/consumers/pipeline.cursor"),
+        br#"{"seq":99,"updatedAt":1}"#,
+    );
+    let done = diagnose(&opts(&fx, "a.zip")).unwrap();
+    assert!(
+        done.report.contains("Pipeline  not on this machine"),
+        "{}",
+        done.report
+    );
+    // A text store without a cursor (a pipeline that has not finished a pass since the
+    // update): the counts stay.
+    write(
+        &fx.data().join("pipeline").join(SLUG).join("notes/F1.json"),
+        br#"{"key":"F1","pages":[{"pageId":"P1","position":0,"state":"failed"},{"pageId":"P2","position":1}]}"#,
+    );
+    let done = diagnose(&opts(&fx, "c.zip")).unwrap();
+    assert!(
+        done.report
+            .contains("Pipeline  cursor none, 1 page pending, 1 failed"),
+        "{}",
+        done.report
+    );
+    write(
+        &fx.data().join("pipeline").join(format!("{SLUG}.cursor")),
+        br#"{"seq":12,"updatedAt":1}"#,
+    );
+    let done = diagnose(&opts(&fx, "b.zip")).unwrap();
+    assert!(
+        done.report
+            .contains("Pipeline  cursor acct-1 12, 1 page pending, 1 failed"),
+        "{}",
+        done.report
+    );
+    assert!(!done.report.contains(SLUG), "{}", done.report);
 }

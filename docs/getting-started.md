@@ -53,7 +53,7 @@ The README has all options and the output format.
 
 The device can sync with a "Private Cloud" instead of Ratta's cloud. notedown can be that cloud. Your files then live as real files in a folder on your computer, and every change is written to a journal.
 
-Status: experimental. Notes, documents and the other device folders sync. Digests and to-dos sync too (see "What to expect").
+Notes, documents and the other device folders sync. Digests and to-dos sync too (see "What to expect").
 
 Before you start:
 

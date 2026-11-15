@@ -9,7 +9,6 @@
 
 [![CI](https://github.com/jordiboehme/notedown/actions/workflows/ci.yml/badge.svg)](https://github.com/jordiboehme/notedown/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/github/license/jordiboehme/notedown)](LICENSE)
-[![Status: early](https://img.shields.io/badge/status-early-orange)](#status)
 [![Works best with Crystalline](.github/badges/works-best-with-crystalline.svg)](https://github.com/jordiboehme/crystalline)
 
 You write on a Supernote. Your AI agent reads Markdown. notedown sits in between.
@@ -28,10 +27,10 @@ notedown is for Supernote devices and is not affiliated with Ratta.
 
 ## Status
 
-Early. What works today:
+What works today:
 
 - `convert` and `render`: `.note` files to Markdown and PNG.
-- The Private Cloud (experimental): device sync, digests, to-dos, a recycle bin and a journal.
+- The Private Cloud: device sync, digests, to-dos, a recycle bin and a journal.
 - The pipeline: keeps the note text up to date and serves it to agents over MCP (stdio).
 
 The sync server also builds for a Raspberry Pi without the OCR part (see the [getting started guide](docs/getting-started.md#the-server-on-a-raspberry-pi)).
@@ -240,7 +239,7 @@ part of the page text from the OCR, so the Markdown body does not change. The an
 itself is stored outside the `.note` file and is not available to notedown. The key is left out when
 a note has no digests.
 
-## Private Cloud (experimental)
+## Private Cloud
 
 notedown can run a small server that the Supernote Nomad accepts as its Private Cloud. It stores your
 files as real files in a data folder and writes every change to a journal.

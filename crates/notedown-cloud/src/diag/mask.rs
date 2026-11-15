@@ -28,8 +28,8 @@ const PREFIX: &str = "<masked:";
 const SUFFIX: &str = " chars>";
 
 /// Whether a JSON key, query key or form key carries a secret (case-insensitive): the name
-/// contains password, token, secret, authorization, cookie, sign, randomcode, validcode or verifier (the OAuth `code_verifier`), or is
-/// exactly `code`.
+/// contains password, token, secret, authorization, cookie, sign, randomcode, validcode or
+/// verifier, or is exactly `code`.
 pub fn is_sensitive_key(key: &str) -> bool {
     is_sensitive_key_from(key, Origin::Client)
 }

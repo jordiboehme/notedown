@@ -96,7 +96,7 @@ impl Setup {
         match LocalConfig::load(data)? {
             Some(c) => Ok(Setup {
                 local: data.to_path_buf(),
-                source: Arc::new(FolderSource::new(&c.server_folder)),
+                source: Arc::new(FolderSource::shared(&c.server_folder)),
                 cfg: c.pipeline,
                 two_machines: true,
                 accounts: c.accounts,

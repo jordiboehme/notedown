@@ -1189,3 +1189,28 @@ fn a_tombstone_that_cannot_be_deleted_is_said_once() {
     w.run(|| true).unwrap();
     assert!(!tomb.exists());
 }
+
+#[test]
+fn one_machine_without_accounts_does_nothing_and_leaves_no_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let said = Said::default();
+    let mut w = Worker::new(&load(dir.path()), Box::new(engine_reading("hello")))
+        .with_messages(said.sink());
+    let p = w.run_once(true).unwrap();
+    assert_eq!(p.pages_read, 0);
+    assert_eq!(said.count("no accounts in"), 1, "{:?}", said.lines());
+    assert_eq!(said.count("notedown cloud account add"), 1);
+    assert_eq!(said.count("mounted"), 0);
+    assert!(!dir.path().join("pipeline").exists(), "no lock, no folder");
+}
+
+#[test]
+fn two_machines_without_accounts_keep_the_mount_wording_and_no_lock() {
+    let server = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    point_at(local.path(), server.path());
+    let mut w = Worker::new(&load(local.path()), Box::new(engine_reading("hello")));
+    let e = w.run_once(true).unwrap_err().to_string();
+    assert!(e.contains("is the server folder mounted?"), "{e}");
+    assert!(!local.path().join("pipeline").exists(), "no lock left");
+}

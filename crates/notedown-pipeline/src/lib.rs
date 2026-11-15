@@ -46,6 +46,9 @@ pub enum Error {
     Ocr(#[from] notedown_ocr::OcrError),
     #[error("{0}")]
     Read(String),
+    /// A data folder that is the server's own and has no `accounts/` yet.
+    #[error("no accounts in {} yet; create one with `notedown cloud account add`", .0.display())]
+    NoAccounts(std::path::PathBuf),
     #[error(transparent)]
     Cloud(#[from] notedown_cloud::Error),
     #[error("another notedown pipeline runs for this data folder")]

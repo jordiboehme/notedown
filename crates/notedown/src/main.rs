@@ -1595,6 +1595,9 @@ fn account_command(data: &Path, action: AccountAction) -> Result<ExitCode> {
                     "this deletes account {slug} with all its files and its note text; add --yes to confirm"
                 ));
             }
+            if accounts.get(&slug)?.is_none() {
+                return Err(anyhow!("account {slug} does not exist"));
+            }
             let journal = notedown_cloud::journal::Journal::open(data)?;
             accounts.remove(&slug, &journal)?;
             println!("removed account {slug}");

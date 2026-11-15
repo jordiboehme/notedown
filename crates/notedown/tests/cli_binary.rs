@@ -118,6 +118,16 @@ fn cloud(data: &std::path::Path, args: &[&str], stdin: Option<&str>) -> std::pro
 }
 
 #[test]
+fn cloud_account_remove_of_a_typo_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let typo = dir.path().join("typo");
+    let out = cloud(&typo, &["remove", "jordi", "--yes"], None);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("does not exist"));
+    assert!(!typo.join("journal").exists());
+}
+
+#[test]
 fn cloud_account_add_list_passwd_remove() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
@@ -1767,6 +1777,17 @@ mod pipeline_and_mcp {
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap()
+    }
+
+    #[test]
+    fn pipeline_once_on_a_fresh_data_folder_says_so_and_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = pipeline_cmd(dir.path(), &["--once"]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        assert!(err.contains("no accounts in"), "{err}");
+        assert!(err.contains("notedown cloud account add"), "{err}");
+        assert!(!dir.path().join("pipeline").exists());
     }
 
     fn json_out(out: &std::process::Output) -> serde_json::Value {

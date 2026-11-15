@@ -22,12 +22,12 @@ pub fn read(local: &Path, slug: &str) -> Result<u64> {
 /// The cursor of account `slug`, `None` when there is no cursor file.
 pub(crate) fn load(local: &Path, slug: &str) -> Result<Option<u64>> {
     let path = path(local, slug);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(Error::Io { path, source }),
     };
-    let c: Cursor = serde_json::from_str(&text).map_err(|e| Error::Corrupt {
+    let c: Cursor = serde_json::from_slice(&bytes).map_err(|e| Error::Corrupt {
         path,
         message: e.to_string(),
     })?;
@@ -73,6 +73,8 @@ mod tests {
         assert!(v["updatedAt"].as_u64().unwrap() > 0);
         std::fs::write(path(d.path(), "b"), "{").unwrap();
         assert!(read(d.path(), "b").is_err());
+        std::fs::write(path(d.path(), "c"), [0xff, 0xfe, b'{']).unwrap();
+        assert!(matches!(read(d.path(), "c"), Err(Error::Corrupt { .. })));
         assert_eq!(old(d.path()).unwrap(), None);
         assert!(!d.path().join("journal").exists());
     }

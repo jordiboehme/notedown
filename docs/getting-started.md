@@ -217,17 +217,17 @@ The server keeps a PDF of every note in `share/` in the data folder, for example
 
 The sync server is small. It can run on a Raspberry Pi that stays on all day, so your computer doesn't have to.
 
-Build it on the Pi (64-bit Raspberry Pi OS, arm64) without the OCR part:
+Do step 1 of part 1 first (clone the repository and install rustup). Then build it on the Pi (64-bit Raspberry Pi OS, arm64) without the OCR part:
 
 ```sh
-cargo build --release --no-default-features -p notedown
+cargo install --path crates/notedown --no-default-features
 ```
 
 This build has `serve`, `cloud` and `render`. It has no OCR, so there is no `pipeline`, `convert`, `model` or `mcp`, and `serve` has no `--pipeline`. The build needs a C compiler (on Raspberry Pi OS: `sudo apt install build-essential`). It does not need the C++ toolchain for llama.cpp that the OCR build needs. There are no release binaries yet.
 
-Set up the account, the import and the server as in part 2, with the binary from `target/release/`. Two things to know:
+Set up the account, the import and the server as in part 2, with the installed `notedown`. Two things to know:
 
-- The Pi has no clock that runs while it is off, so it needs NTP after every start (Raspberry Pi OS does this by default). The server signs the upload and download URLs with the time. It refuses a URL that is more than 5 minutes in the future or older than its time limit (30 minutes for uploads and 24 hours for downloads).
+- Most Pis have no clock that runs while they are off, so they need NTP after every start (Raspberry Pi OS does this by default). The server signs the upload and download URLs with the time. It refuses a URL that is more than 5 minutes in the future or older than its time limit (30 minutes for uploads and 24 hours for downloads).
 - The device keeps the address of its Private Cloud. If the address of the Pi changes, you have to log out of the cloud on the device and set it up again. Give the Pi a fixed address: a fixed lease in your router or a static address.
 
 Note text for an agent does not work on the Pi alone yet. A pipeline on a second machine that reads the Pi over the network is planned, but it is not there. Until then, run `notedown serve --pipeline` on one machine with the OCR build (for example a Mac) to get note text, as described below.
@@ -244,7 +244,7 @@ notedown pipeline --data ~/notedown-data
 
 Or start both with one command: `notedown serve --data ~/notedown-data --pipeline`. The pipeline stops when the server stops. It needs the OCR model (`notedown model pull`). It waits 10 minutes after the last change of a note before it reads it, so a note you are still writing is read once. `notedown pipeline --data ~/notedown-data --once` reads everything that is due now and stops.
 
-The first run reads every note in scope, newest note first, and prints its progress (`ocr: 12 of 380 pages`). One page takes up to about half a minute, so a few hundred pages take a few hours. You can stop it at any time: every finished page is kept. By default only notes in `NOTE/Note` are read. The `[pipeline]` section of `server.toml` changes that (`ingest_folders`, `ingest_exclude`, `ingest_keyword`). The pipeline writes only its own files in the data folder: the `pipeline/` folder and its journal cursor `journal/consumers/pipeline.cursor`. It never writes your files.
+The first run reads every note in scope, newest note first, and prints its progress (`ocr: 12 of 380 pages`). One page takes up to about half a minute, so a few hundred pages take a few hours. You can stop it at any time: every finished page is kept. By default only notes in `NOTE/Note` are read. The `[pipeline]` section of `server.toml` changes that (`ingest_folders`, `ingest_exclude`, `ingest_keyword`). The pipeline writes only its own files in the data folder: the `pipeline/` folder. It never writes your files.
 
 **Add the MCP server to Claude Code.**
 

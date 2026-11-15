@@ -75,12 +75,24 @@ pub trait ServerData: Send + Sync {
 /// The server data in a folder on this machine.
 pub struct FolderSource {
     root: PathBuf,
+    /// A folder of another machine (a mount): a missing `accounts/` may mean it is not mounted.
+    shared: bool,
 }
 
 impl FolderSource {
+    /// The data folder of the server on this machine.
     pub fn new(root: &Path) -> FolderSource {
         FolderSource {
             root: root.to_path_buf(),
+            shared: false,
+        }
+    }
+
+    /// The data folder of the server on another machine.
+    pub fn shared(root: &Path) -> FolderSource {
+        FolderSource {
+            root: root.to_path_buf(),
+            shared: true,
         }
     }
 }
@@ -109,6 +121,9 @@ impl ServerData for FolderSource {
                     "{} is not a folder; is the server folder mounted?",
                     dir.display()
                 )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !self.shared => {
+                return Err(Error::NoAccounts(self.root.clone()));
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Error::Read(format!(

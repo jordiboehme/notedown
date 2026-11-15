@@ -520,8 +520,17 @@ impl Worker {
     /// One pass over all accounts: the due notes whose settle time is over (all of them with
     /// `ignore_settle`), page by page, each page written at once.
     pub fn run_once(&mut self, ignore_settle: bool) -> Result<Progress> {
+        // Before the lock, so a run with nothing to do leaves no `pipeline/` folder behind.
+        let accounts = match self.followed() {
+            Ok(f) => f.served,
+            // A new server folder without accounts: nothing to read, not an error.
+            Err(e @ Error::NoAccounts(_)) => {
+                self.say(&format!("notedown pipeline: {e}"));
+                return Ok(Progress::default());
+            }
+            Err(e) => return Err(e),
+        };
         let lock = self.take_lock()?;
-        let accounts = self.followed()?.served;
         let mut stores = BTreeMap::new();
         let (progress, _) = self.pass(&lock, &mut stores, &accounts, ignore_settle, &|| false)?;
         Ok(progress)
@@ -530,12 +539,13 @@ impl Worker {
     /// Reads note `note` (a key or a wire path) or, with `None`, every note in scope again,
     /// with the whole page as the change region. Changed text gives normal versions.
     pub fn reocr(&mut self, note: Option<&str>) -> Result<Progress> {
+        let served = self.followed()?.served;
         let lock = self.take_lock()?;
         let source = self.setup.source.clone();
         let mut progress = Progress::default();
         let mut found = false;
         let mut stores = BTreeMap::new();
-        for account in self.followed()?.served {
+        for account in served {
             let slug = account.slug.clone();
             stores.insert(
                 slug.clone(),

@@ -310,6 +310,10 @@ jobs:
       - name: The Pi build has no OCR in its dependency tree
         run: |
           tree="$(cargo tree --locked --target aarch64-unknown-linux-gnu -p notedown --no-default-features -e normal)"
+          if test -z "$tree"; then
+            echo "cargo tree printed nothing, so the check proves nothing"
+            exit 1
+          fi
           if printf '%s\n' "$tree" | grep -E 'llama-cpp|notedown-ocr|notedown-pipeline|notedown-convert'; then
             echo "the Pi build pulls in OCR"
             exit 1

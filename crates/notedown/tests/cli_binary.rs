@@ -2166,3 +2166,397 @@ fn the_pi_build_has_no_pipeline() {
         assert!(!commands.contains(&gone), "{gone} is in the Pi build");
     }
 }
+
+#[test]
+fn serve_prints_the_rest_api_line() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("server.toml"),
+        "listen = [\"127.0.0.1:0\"]\n",
+    )
+    .unwrap();
+    let out = serve_startup(dir.path(), &[]);
+    let rest = out
+        .lines()
+        .find(|l| l.starts_with("REST API: "))
+        .unwrap_or_else(|| panic!("no REST line: {out}"));
+    let base = rest
+        .strip_prefix("REST API: ")
+        .and_then(|r| r.split("/rest/v1").next())
+        .unwrap();
+    assert!(base.starts_with("http://127.0.0.1:"), "{rest}");
+    assert_eq!(
+        rest,
+        format!("REST API: {base}/rest/v1 (connect a pipeline with notedown connect {base})")
+    );
+    let at = |prefix: &str| out.lines().position(|l| l.starts_with(prefix));
+    assert!(at("REST API: ") > at("listening on: "), "{out}");
+}
+
+/// Issues a REST token the way a login does: a code, then the hash of the password with it.
+fn issue_token(data: &std::path::Path, email: &str, password: &str, name: &str) -> String {
+    use notedown_cloud::auth::{Auth, expected_login_hash, md5_hex};
+    let auth = Auth::open(data).unwrap();
+    let (code, _) = auth.challenge(email, 1_000).unwrap();
+    let hash = expected_login_hash(&md5_hex(password), &code);
+    let (_, info, _) = auth.rest_login(email, &hash, name, 2_000).unwrap();
+    info.id
+}
+
+fn account_with_tokens() -> (tempfile::TempDir, String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let out = cloud(
+        d,
+        &[
+            "add",
+            "jordi",
+            "--email",
+            "j@example.org",
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(out.status.success());
+    let first = issue_token(d, "j@example.org", "secret", "laptop");
+    let second = issue_token(d, "j@example.org", "secret", "studio");
+    (dir, first, second)
+}
+
+#[test]
+fn tokens_list_and_revoke() {
+    let (dir, first, second) = account_with_tokens();
+    let d = dir.path();
+    let out = cloud(d, &["tokens", "list", "jordi"], None);
+    assert!(out.status.success());
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    // Both tokens have the same creation time (the test clock), so the list is in id order.
+    let mut want = [(&first, "laptop"), (&second, "studio")];
+    want.sort();
+    for (line, (id, name)) in lines.iter().zip(want) {
+        let rest = line
+            .strip_prefix(&format!("{id}  {name}  created "))
+            .unwrap();
+        assert!(rest.starts_with("1970-01-01T00:00:02"), "{line}");
+    }
+    let out = cloud(d, &["tokens", "revoke", "jordi", &first], None);
+    assert_eq!(stdout(&out), format!("revoked {first}\n"));
+    let out = cloud(d, &["tokens", "revoke", "jordi", &first], None);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(&format!("no token {first} for jordi")),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let issued = issue_token(d, "j@example.org", "secret", "third");
+    assert_ne!(issued, second);
+    let out = cloud(d, &["tokens", "revoke", "jordi", "--all"], None);
+    assert_eq!(stdout(&out), "revoked 2 tokens\n");
+    let out = cloud(d, &["tokens", "list", "jordi"], None);
+    assert_eq!(stdout(&out), "no tokens\n");
+}
+
+#[test]
+fn passwd_revokes_the_tokens() {
+    let (dir, _, _) = account_with_tokens();
+    let d = dir.path();
+    let out = cloud(
+        d,
+        &["passwd", "jordi", "--password-stdin"],
+        Some("other1\n"),
+    );
+    assert!(out.status.success());
+    assert_eq!(
+        stdout(&out),
+        "password of jordi changed\nrevoked 2 REST tokens\n"
+    );
+    assert_eq!(
+        stdout(&cloud(d, &["tokens", "list", "jordi"], None)),
+        "no tokens\n"
+    );
+    let out = cloud(
+        d,
+        &["passwd", "jordi", "--password-stdin"],
+        Some("other2\n"),
+    );
+    assert_eq!(stdout(&out), "password of jordi changed\n");
+}
+
+#[test]
+fn revoke_refuses_a_bad_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let out = cloud(d, &["tokens", "revoke", "jordi", "../account"], None);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("token id"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (dir, _, _) = account_with_tokens();
+    let out = cloud(
+        dir.path(),
+        &["tokens", "revoke", "jordi", "../account"],
+        None,
+    );
+    assert!(!out.status.success());
+    assert_eq!(
+        stdout(&cloud(dir.path(), &["tokens", "list", "jordi"], None))
+            .lines()
+            .count(),
+        2
+    );
+}
+
+/// A running `notedown serve` on a random loopback port; it is killed on drop.
+#[cfg(feature = "ocr")]
+struct Server {
+    child: std::process::Child,
+    url: String,
+}
+
+#[cfg(feature = "ocr")]
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(feature = "ocr")]
+fn running_server(data: &std::path::Path) -> Server {
+    use std::io::BufRead;
+    std::fs::write(data.join("server.toml"), "listen = [\"127.0.0.1:0\"]\n").unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["serve", "--data"])
+        .arg(data)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut url = None;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        if let Some(r) = line.strip_prefix("REST API: ") {
+            url = r.split("/rest/v1").next().map(str::to_string);
+        }
+        if line.starts_with("press Ctrl-C") {
+            break;
+        }
+    }
+    // Keep reading so the server never blocks on a full pipe.
+    std::thread::spawn(move || std::io::copy(&mut reader, &mut std::io::sink()).map(|_| ()));
+    Server {
+        child,
+        url: url.expect("no REST line"),
+    }
+}
+
+#[cfg(feature = "ocr")]
+fn connect_cmd(url: &str, local: &std::path::Path, password: &str) -> std::process::Output {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["connect", url, "--data"])
+        .arg(local)
+        .args(["--email", "j@example.org", "--password-stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut pipe = child.stdin.take().unwrap();
+    pipe.write_all(format!("{password}\n").as_bytes()).unwrap();
+    drop(pipe);
+    child.wait_with_output().unwrap()
+}
+
+#[cfg(feature = "ocr")]
+fn server_with_account() -> (tempfile::TempDir, Server) {
+    let dir = tempfile::tempdir().unwrap();
+    let out = cloud(
+        dir.path(),
+        &[
+            "add",
+            "jordi",
+            "--email",
+            "j@example.org",
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(out.status.success());
+    let server = running_server(dir.path());
+    (dir, server)
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn connect_logs_in_and_writes_pipeline_toml() {
+    let (_data, server) = server_with_account();
+    let local = tempfile::tempdir().unwrap();
+    let out = connect_cmd(&server.url, local.path(), "secret");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    let file = local.path().join("tokens/jordi.token");
+    let first = text.lines().next().unwrap();
+    assert!(
+        first.starts_with(&format!("connected to {} as jordi (user id ", server.url))
+            && first.contains("), token ")
+            && first.ends_with(&format!(" stored in {}", file.display())),
+        "{text}"
+    );
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert_eq!(
+        std::fs::read_to_string(local.path().join("pipeline.toml")).unwrap(),
+        format!("[server]\nurl = \"{}\"\n", server.url)
+    );
+    let token = std::fs::read_to_string(&file).unwrap();
+    assert!(token.trim().starts_with("ndt1."));
+    // The same URL with a trailing slash reconnects and names the older token.
+    let out = connect_cmd(&format!("{}/", server.url), local.path(), "secret");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("an older token ") && text.contains(" still works"),
+        "{text}"
+    );
+    assert_ne!(std::fs::read_to_string(&file).unwrap(), token);
+}
+
+#[cfg(unix)]
+#[cfg(feature = "ocr")]
+#[test]
+fn connect_stores_the_token_privately() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_data, server) = server_with_account();
+    let local = tempfile::tempdir().unwrap();
+    let out = connect_cmd(&server.url, local.path(), "secret");
+    assert!(out.status.success());
+    let file = local.path().join("tokens/jordi.token");
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&file), 0o600);
+    assert_eq!(mode(&local.path().join("tokens")), 0o700);
+    let token = std::fs::read_to_string(&file).unwrap();
+    let token = token.trim();
+    assert!(!token.is_empty());
+    for text in [
+        stdout(&out),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ] {
+        assert!(!text.contains(token), "the token is printed: {text}");
+        assert!(!text.contains("secret"), "{text}");
+    }
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn connect_with_a_wrong_password_says_so() {
+    let (_data, server) = server_with_account();
+    let local = tempfile::tempdir().unwrap();
+    let out = connect_cmd(&server.url, local.path(), "wrong");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.lines()
+            .any(|l| l == "error: the server refused the email or the password"),
+        "{err}"
+    );
+    assert!(!local.path().join("tokens").exists());
+    assert!(!local.path().join("pipeline.toml").exists());
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn connect_checks_the_folder_before_the_password() {
+    let (data, server) = server_with_account();
+    // An empty password is refused, but only after the folder is checked.
+    let out = connect_cmd(&server.url, data.path(), "");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("holds a server's data"), "{err}");
+
+    let local = tempfile::tempdir().unwrap();
+    std::fs::write(
+        local.path().join("pipeline.toml"),
+        "[server]\nfolder = \"/srv/notedown\"\n",
+    )
+    .unwrap();
+    let out = connect_cmd(&server.url, local.path(), "");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.lines().any(|l| l
+            == "error: pipeline.toml points at the folder /srv/notedown; change it or use \
+                another --data folder"),
+        "{err}"
+    );
+    assert!(!local.path().join("tokens").exists());
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn connect_refuses_a_url_with_a_user_name_or_a_password() {
+    let (_data, server) = server_with_account();
+    let local = tempfile::tempdir().unwrap();
+    let url = server.url.replace("http://", "http://jordi:hidden@");
+    let out = connect_cmd(&url, local.path(), "secret");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.lines().any(|l| l
+            == "error: the server url must not hold a user name or a password; connect asks \
+                for the password"),
+        "{err}"
+    );
+    assert!(!err.contains("hidden"), "{err}");
+    assert!(!local.path().join("tokens").exists());
+    assert!(!local.path().join("pipeline.toml").exists());
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn connect_refuses_another_url_in_pipeline_toml() {
+    let (_data, server) = server_with_account();
+    let local = tempfile::tempdir().unwrap();
+    std::fs::write(
+        local.path().join("pipeline.toml"),
+        "[server]\nurl = \"http://other.example:1\"\n",
+    )
+    .unwrap();
+    let out = connect_cmd(&server.url, local.path(), "secret");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(
+            "pipeline.toml points at http://other.example:1; change it or use another --data folder"
+        ),
+        "{err}"
+    );
+    assert!(!local.path().join("tokens").exists());
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn connect_refuses_a_server_data_folder() {
+    let (data, server) = server_with_account();
+    let out = connect_cmd(&server.url, data.path(), "secret");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("holds a server's data"), "{err}");
+    assert!(!data.path().join("pipeline.toml").exists());
+    assert!(!data.path().join("tokens").exists());
+}

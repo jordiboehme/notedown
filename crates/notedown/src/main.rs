@@ -58,6 +58,10 @@ enum Command {
     /// text store and writes bookmarks, it never runs OCR
     #[cfg(feature = "ocr")]
     Mcp(McpArgs),
+    /// Log in to a Supernote Private Cloud server over REST, keep the account's token and write
+    /// pipeline.toml, so the pipeline on this machine reads the server over the network
+    #[cfg(feature = "ocr")]
+    Connect(ConnectArgs),
 }
 
 #[cfg(feature = "ocr")]
@@ -428,6 +432,27 @@ enum AccountAction {
         /// Confirm the deletion
         #[arg(long)]
         yes: bool,
+    },
+    /// List or revoke the REST tokens of an account
+    Tokens {
+        #[command(subcommand)]
+        action: TokensAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokensAction {
+    /// List the tokens (id, name and creation time, never the token itself)
+    List { slug: String },
+    /// Revoke one token by its id, or all of them
+    Revoke {
+        slug: String,
+        /// The token id from `tokens list`
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        id: Option<String>,
+        /// Revoke every token of the account
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -1575,8 +1600,11 @@ fn account_command(data: &Path, action: AccountAction) -> Result<ExitCode> {
                 return Err(anyhow!("account {slug} does not exist"));
             }
             let password = read_password(password_stdin, true)?;
-            accounts.set_password(&slug, &password)?;
+            let revoked = accounts.set_password(&slug, &password)?;
             println!("password of {slug} changed");
+            if revoked > 0 {
+                println!("revoked {revoked} REST tokens");
+            }
         }
         AccountAction::List => {
             for a in accounts.list()? {
@@ -1602,8 +1630,46 @@ fn account_command(data: &Path, action: AccountAction) -> Result<ExitCode> {
             accounts.remove(&slug, &journal)?;
             println!("removed account {slug}");
         }
+        AccountAction::Tokens { action } => tokens_command(data, action)?,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn tokens_command(data: &Path, action: TokensAction) -> Result<()> {
+    use notedown_cloud::auth::{list_tokens, revoke_all_tokens, revoke_token};
+    match action {
+        TokensAction::List { slug } => {
+            let tokens = list_tokens(data, &slug)?;
+            if tokens.is_empty() {
+                println!("no tokens");
+            }
+            for t in tokens {
+                println!("{}  {}  created {}", t.id, t.name, rfc3339_ms(t.created_ms));
+            }
+        }
+        TokensAction::Revoke {
+            slug, id: Some(id), ..
+        } => {
+            if !revoke_token(data, &slug, &id)? {
+                return Err(anyhow!("no token {id} for {slug}"));
+            }
+            println!("revoked {id}");
+        }
+        TokensAction::Revoke { slug, id: None, .. } => {
+            let n = revoke_all_tokens(data, &slug)?;
+            println!("revoked {n} tokens");
+        }
+    }
+    Ok(())
+}
+
+fn rfc3339_ms(ms: u64) -> String {
+    use time::format_description::well_known::Rfc3339;
+    i64::try_from(ms / 1000)
+        .ok()
+        .and_then(|s| time::OffsetDateTime::from_unix_timestamp(s).ok())
+        .and_then(|t| t.format(&Rfc3339).ok())
+        .unwrap_or_else(|| ms.to_string())
 }
 
 /// The URLs a device can use: `http://<ip>:<port>` for each listen address. A wildcard address
@@ -1628,6 +1694,19 @@ fn device_urls(listen: &[std::net::SocketAddr], host_ips: &[std::net::Ipv4Addr])
     urls
 }
 
+/// The base URLs of the REST API: the device URLs, else (loopback only) the bound addresses
+/// that a client can use. An unspecified address (`0.0.0.0`, `[::]`) is never one.
+fn rest_bases(bound: &[std::net::SocketAddr], device_urls: &[String]) -> Vec<String> {
+    if !device_urls.is_empty() {
+        return device_urls.to_vec();
+    }
+    bound
+        .iter()
+        .filter(|a| !a.ip().is_unspecified())
+        .map(|a| format!("http://{a}"))
+        .collect()
+}
+
 fn host_ipv4s() -> Vec<std::net::Ipv4Addr> {
     if_addrs::get_if_addrs()
         .unwrap_or_default()
@@ -1641,7 +1720,7 @@ fn host_ipv4s() -> Vec<std::net::Ipv4Addr> {
 
 fn serve_command(args: ServeArgs) -> Result<ExitCode> {
     use notedown_cloud::Config;
-    use notedown_cloud::server::{AppState, bind, serve_until};
+    use notedown_cloud::server::{AppState, bind, serve_until_with};
     let (mut config, config_warnings) = Config::load_with_warnings(&args.data)?;
     // The flag counts for this run only; server.toml is not rewritten.
     let capture_from_file = config.capture && !args.capture;
@@ -1665,8 +1744,18 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
         if urls.is_empty() {
             println!("device URL: none found, use the IP address of this host");
         }
-        for url in urls {
+        for url in &urls {
             println!("device URL: {url}");
+        }
+        let bases = rest_bases(&bound, &urls);
+        if bases.is_empty() {
+            println!("REST API: none found, use the IP address of this host");
+        }
+        for base in &bases {
+            println!(
+                "REST API: {base}{} (connect a pipeline with notedown connect {base})",
+                notedown_cloud::rest::PREFIX
+            );
         }
         if let Some(url) = &config.external_base_url {
             println!("external base URL: {url}");
@@ -1756,7 +1845,13 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
         }
         println!("press Ctrl-C to stop");
         std::io::stdout().flush()?;
-        let served = serve_until(listeners, state.clone(), shutdown.wait()).await;
+        let served = serve_until_with(
+            listeners,
+            state.clone(),
+            notedown_cloud::rest::router(state.clone()),
+            shutdown.wait(),
+        )
+        .await;
         #[cfg(feature = "ocr")]
         drop(guard);
         served?;
@@ -2072,6 +2167,48 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
 }
 
 #[cfg(feature = "ocr")]
+#[derive(clap::Args)]
+struct ConnectArgs {
+    /// The server, for example http://pi.local:19072
+    url: String,
+    /// The pipeline's own data folder (it gets pipeline.toml and tokens/)
+    #[arg(long)]
+    data: PathBuf,
+    /// The email of the account
+    #[arg(long)]
+    email: String,
+    /// Read the password from the first line of stdin instead of asking for it
+    #[arg(long)]
+    password_stdin: bool,
+    /// The name the token gets on the server
+    #[arg(long, default_value = "pipeline")]
+    name: String,
+}
+
+#[cfg(feature = "ocr")]
+fn connect_command(a: ConnectArgs) -> Result<ExitCode> {
+    // A wrong folder or URL is said before the password is asked for.
+    notedown_pipeline::connect::check(&a.url, &a.data)?;
+    let password = read_password(a.password_stdin, false)?;
+    let c = notedown_pipeline::connect::connect(&a.url, &a.data, &a.email, &password, &a.name)?;
+    let url = a.url.trim().trim_end_matches('/');
+    println!(
+        "connected to {url} as {} (user id {}), token {} stored in {}",
+        c.slug,
+        c.user_id,
+        c.token_id,
+        c.token_file.display()
+    );
+    if let Some(old) = c.replaced_token_id {
+        println!(
+            "an older token {old} still works; revoke it on the server with notedown cloud \
+             account tokens revoke"
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(feature = "ocr")]
 fn mcp_command(args: McpArgs) -> Result<ExitCode> {
     // serve_stdio builds its own runtime; this is plain synchronous code.
     notedown_pipeline::mcp::serve_stdio(&args.data, args.account.as_deref())?;
@@ -2092,6 +2229,8 @@ fn main() -> ExitCode {
         Command::Pipeline(a) => pipeline_command(a),
         #[cfg(feature = "ocr")]
         Command::Mcp(a) => mcp_command(a),
+        #[cfg(feature = "ocr")]
+        Command::Connect(a) => connect_command(a),
     };
     let _ = std::io::stdout().flush();
     match result {
@@ -2123,6 +2262,19 @@ mod tests {
             device_urls(&listen, &ips),
             ["http://192.168.1.20:19072", "http://10.0.0.5:19072"]
         );
+    }
+
+    #[test]
+    fn the_rest_base_is_never_an_unspecified_address() {
+        let bound: Vec<std::net::SocketAddr> = vec![
+            "0.0.0.0:19072".parse().unwrap(),
+            "[::]:19072".parse().unwrap(),
+        ];
+        assert!(rest_bases(&bound, &[]).is_empty());
+        let local = ["127.0.0.1:19072".parse().unwrap()];
+        assert_eq!(rest_bases(&local, &[]), ["http://127.0.0.1:19072"]);
+        let lan = ["http://192.168.1.20:19072".to_string()];
+        assert_eq!(rest_bases(&bound, &lan), lan);
     }
 
     #[test]

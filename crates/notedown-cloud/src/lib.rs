@@ -4,7 +4,8 @@
 //! codes and tokens, the HTTP routes (login, server queries, in accept mode the sync session,
 //! listing, queries, signed downloads and uploads, refusal of every other file operation), the
 //! auto-sync socket, the file store of each account with its recycle bin and upload staging, the
-//! change journal, the page index of notes and the app data (digests and to-dos).
+//! change journal, the page index of notes, the app data (digests and to-dos), the read-only
+//! folder readers that the pipeline and the REST read API share, and the REST read API itself.
 
 pub mod fsutil;
 
@@ -20,7 +21,9 @@ pub mod localtime;
 pub mod pages;
 pub mod push;
 pub mod put;
+pub mod read;
 pub mod render;
+pub mod rest;
 pub mod server;
 pub mod socket;
 pub mod store;

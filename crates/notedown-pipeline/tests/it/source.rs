@@ -1,5 +1,6 @@
-//! The `ServerData` contract. The functions take any source, so the REST source of plan 2 runs
-//! the same checks as the folder source.
+//! The `ServerData` contract. The functions take any source, so the REST source runs the same
+//! checks as the folder source. `on_account` is called right after a check creates an account
+//! (`anna`, `bob`) and before it changes or removes it, so a REST test can log it in.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -72,6 +73,9 @@ impl ServerData for Flaky {
         self.check()?;
         self.inner.journal(slug, from, limit)
     }
+    fn knows_gone(&self, slug: &str) -> bool {
+        self.inner.knows_gone(slug)
+    }
 }
 
 fn mtime_ms(path: PathBuf) -> u64 {
@@ -115,12 +119,13 @@ pub(crate) fn journal_from_a_position(src: &dyn ServerData, d: &Data) {
     assert!(!ahead.changed);
 }
 
-pub(crate) fn journal_is_per_account(src: &dyn ServerData, d: &Data) {
+pub(crate) fn journal_is_per_account(src: &dyn ServerData, d: &Data, on_account: &dyn Fn(&str)) {
     d.put("test1", "NOTE/Note");
     let before = src.journal(SLUG, 1, 10_000).unwrap();
     Accounts::new(&d.data)
         .create("anna", "anna@example.org", "secret")
         .unwrap();
+    on_account("anna");
     let journal = Journal::open(&d.data).unwrap();
     notedown_cloud::put::put(
         &d.data,
@@ -208,9 +213,10 @@ pub(crate) fn a_missing_account(src: &dyn ServerData, d: &Data) {
     }
 }
 
-pub(crate) fn removed_accounts(src: &dyn ServerData, d: &Data) {
+pub(crate) fn removed_accounts(src: &dyn ServerData, d: &Data, on_account: &dyn Fn(&str)) {
     let accounts = Accounts::new(&d.data);
     let bob = accounts.create("bob", "bob@example.org", "secret").unwrap();
+    on_account("bob");
     let journal = Journal::open(&d.data).unwrap();
     notedown_cloud::put::put(
         &d.data,
@@ -237,21 +243,21 @@ pub(crate) fn removed_accounts(src: &dyn ServerData, d: &Data) {
     assert!(other.removed.is_empty());
 }
 
-fn contract(src: &dyn ServerData, d: &Data) {
+pub(crate) fn contract(src: &dyn ServerData, d: &Data, on_account: &dyn Fn(&str)) {
     journal_from_a_position(src, d);
-    journal_is_per_account(src, d);
+    journal_is_per_account(src, d, on_account);
     records_with_change_times(src, d);
     note_bytes(src, d);
     digests_keep_only_live_ones(src, d);
     a_missing_account(src, d);
-    removed_accounts(src, d);
+    removed_accounts(src, d, on_account);
 }
 
 #[test]
 fn folder_source_meets_the_contract() {
     let d = setup();
     let src = FolderSource::new(&d.data);
-    contract(&src, &d);
+    contract(&src, &d, &|_| {});
     let accounts = src.accounts().unwrap();
     assert!(accounts.iter().any(|a| a.slug == SLUG && a.user_id > 0));
     assert!(src.describe().contains(d.data.to_str().unwrap()));

@@ -2,6 +2,7 @@
 
 pub mod compose;
 pub mod config;
+pub mod connect;
 pub mod cursor;
 pub mod delta;
 pub mod errors;
@@ -13,6 +14,7 @@ pub mod ocr;
 pub mod page;
 pub mod records;
 pub mod region;
+pub mod rest;
 pub mod retention;
 pub mod scope;
 pub mod search;
@@ -62,6 +64,9 @@ pub enum Error {
     Account(String),
     #[error("mcp: {0}")]
     Mcp(String),
+    /// `notedown connect` failed; the text says why.
+    #[error("{0}")]
+    Connect(String),
     #[error("invalid {what}: {message}")]
     Invalid { what: &'static str, message: String },
     #[error("{path}: {message}")]

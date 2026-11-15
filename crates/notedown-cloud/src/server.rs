@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 use crate::api::limit::{RateLimiter, RetryTracker};
-use crate::auth::Auth;
+use crate::auth::{Auth, RestTokens};
 use crate::diag::{Capture, Clock, LogEntry, LogKind, ProtocolLog, SystemClock};
 use crate::journal::{Journal, JournalOptions};
 use crate::push::{PushPlanner, PushTiming};
@@ -30,12 +30,16 @@ pub struct AppState {
     pub config: Config,
     pub data_dir: PathBuf,
     pub auth: Auth,
+    /// Checks the tokens of the REST read API (`keys/rest.key`).
+    pub rest_tokens: RestTokens,
     pub log: ProtocolLog,
     pub clock: Arc<dyn Clock>,
     /// The change journal (server-wide).
     pub journal: Journal,
     pub(crate) limiter: RateLimiter,
     pub(crate) retries: RetryTracker,
+    /// When the request log last wrote a REST token refusal, per token id and path.
+    pub(crate) rest_refusals: crate::rest::RefusalLog,
     /// The sync session of each account (`synchronous/start|end`).
     pub sync_locks: SyncLocks,
     /// The live auto-sync socket sessions (pushes are handed to them).
@@ -137,8 +141,10 @@ impl AppState {
                 (store.slug().to_string(), Arc::new(store))
             })
             .collect();
+        let auth = Auth::open(data_dir)?;
         Ok(Arc::new(AppState {
-            auth: Auth::open(data_dir)?,
+            rest_tokens: RestTokens::new(data_dir, auth.rest_key().clone()),
+            auth,
             url_signer: UrlSigner::load_or_create(data_dir)?,
             sync_locks: SyncLocks::new(),
             sockets: crate::socket::SocketRegistry::new(),
@@ -155,6 +161,7 @@ impl AppState {
             config,
             limiter: RateLimiter::default(),
             retries: RetryTracker::default(),
+            rest_refusals: crate::rest::RefusalLog::default(),
         }))
     }
 

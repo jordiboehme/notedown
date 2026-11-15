@@ -221,6 +221,9 @@ enum Outcome {
     Done,
     /// The server lists the account as alive.
     Alive,
+    /// The server leaves the account out but does not know it is gone (a refused token, a
+    /// failed request): the removal stays and nothing is deleted.
+    Wait,
 }
 
 /// Where the worker's own messages go.
@@ -315,7 +318,9 @@ impl Worker {
     /// The accounts the worker follows. The one place this set is made. A local folder that
     /// cannot be listed is said and left out for this turn (its cursors stay).
     fn followed(&self) -> Result<Followed> {
-        let all = self.setup.source.accounts()?;
+        let all = self.setup.source.accounts();
+        self.say_refusals();
+        let all = all?;
         let served = self.setup.serve(&all);
         let mut journals: Vec<String> = served.iter().map(|a| a.slug.clone()).collect();
         match crate::setup::local_stores(&self.setup.local, self.setup.two_machines) {
@@ -334,6 +339,29 @@ impl Worker {
             served,
             journals,
         })
+    }
+
+    /// Says each refused token of the source once (topic `token:<slug>`); a refusal that is
+    /// gone is settled, so it is said again when it comes back.
+    fn say_refusals(&self) {
+        let refusals = self.setup.source.refusals();
+        let topics: Vec<String> = refusals
+            .iter()
+            .map(|(slug, _)| format!("token:{slug}"))
+            .collect();
+        let gone: Vec<String> = self
+            .said
+            .borrow()
+            .keys()
+            .filter(|t| t.starts_with("token:") && !topics.contains(t))
+            .cloned()
+            .collect();
+        for topic in gone {
+            self.settled(&topic);
+        }
+        for (topic, (_, message)) in topics.iter().zip(refusals) {
+            self.say_once(topic, format!("notedown pipeline: {message}"));
+        }
     }
 
     /// Takes the writer lock and sweeps the tombstones a crash or a failed delete left.
@@ -421,7 +449,8 @@ impl Worker {
     /// Carries out the pending removals of every account in `seq` order; a removal that fails
     /// stays (said once while its message stays the same) and so do the later ones of its
     /// account. A removal whose account looks alive is dropped only when a list read after the
-    /// removal still shows it; a fresh one waits one turn. Gives whether any removal was done.
+    /// removal still shows it; a fresh one waits one turn. A removal whose account the source
+    /// leaves out without knowing it is gone waits too. Gives whether any removal was done.
     fn removals(
         &self,
         lock: &WriterLock,
@@ -445,7 +474,11 @@ impl Worker {
                         }
                         break;
                     }
-                    Ok(_) => {
+                    Ok(Outcome::Wait) => {
+                        self.settled(&topic);
+                        break;
+                    }
+                    Ok(Outcome::Alive | Outcome::Done) => {
                         list.pop_first();
                         self.settled(&topic);
                         done = true;
@@ -469,9 +502,11 @@ impl Worker {
 
     /// One `account.removed` event of account `slug`: deletes the store when it is of the
     /// removed user id and the server does not list the slug with that id (a crash between
-    /// the server's record and its removal leaves the account alive). A store without owner
-    /// counts as the removed one only on one machine, and only when the server lists no
-    /// account of that slug. A missing store is not created.
+    /// the server's record and its removal leaves the account alive). A slug left out of the
+    /// list counts as gone only when the source knows it ([`ServerData::knows_gone`]); else
+    /// the removal waits. A store without owner counts as the removed one only on one
+    /// machine, and only when the server lists no account of that slug. A missing store is not
+    /// created.
     fn remove(
         &self,
         lock: &WriterLock,
@@ -504,6 +539,9 @@ impl Worker {
         }
         if alive {
             return Ok(Outcome::Alive);
+        }
+        if listed.is_none() && !self.setup.source.knows_gone(slug) {
+            return Ok(Outcome::Wait);
         }
         stores.remove(slug);
         let destroyed = TextStore::destroy(&self.setup.local, slug, lock)?;
@@ -797,7 +835,11 @@ impl Worker {
                     follows.insert(slug.to_string(), f);
                 }
                 Err(e) => {
-                    self.say_once(&topic, format!("notedown pipeline: account {slug}: {e}"));
+                    self.say_journal(
+                        slug,
+                        &topic,
+                        format!("notedown pipeline: account {slug}: {e}"),
+                    );
                     return (false, removed);
                 }
             }
@@ -808,7 +850,8 @@ impl Worker {
             let batch = match self.setup.source.journal(slug, f.read + 1, JOURNAL_PAGE) {
                 Ok(b) => b,
                 Err(e) => {
-                    self.say_once(
+                    self.say_journal(
+                        slug,
                         &topic,
                         format!("notedown pipeline: account {slug}: journal: {e}"),
                     );
@@ -834,6 +877,15 @@ impl Worker {
                 return (changed, removed);
             }
         }
+    }
+
+    /// Says a journal failure of account `slug` once, unless the refusal of its token is said:
+    /// a refused token fails every journal read, and the refusal already tells what to do.
+    fn say_journal(&self, slug: &str, topic: &str, message: String) {
+        if self.said.borrow().contains_key(&format!("token:{slug}")) {
+            return;
+        }
+        self.say_once(topic, message);
     }
 
     /// Writes the cursor of account `slug` after a good pass, when it moved or has no file.

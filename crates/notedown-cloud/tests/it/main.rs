@@ -18,6 +18,7 @@ mod perf;
 mod push;
 mod recycle;
 mod render;
+mod rest;
 mod scan;
 mod serve;
 mod socket;

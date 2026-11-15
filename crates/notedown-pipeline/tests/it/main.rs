@@ -4,6 +4,8 @@ mod end_to_end;
 mod fake_engine;
 mod mcp;
 mod reading;
+mod rest;
+mod rest_split;
 mod source;
 mod split;
 mod worker;

@@ -166,18 +166,30 @@ struct Touch {
     serial: String,
 }
 
-struct Flow {
+pub(crate) struct Flow {
     file: Option<std::fs::File>,
     seek_to: Option<u64>,
     remaining: u64,
     touch: Option<Touch>,
 }
 
+impl Flow {
+    /// The first `size` bytes of `file` from its start, with no sync lock to extend.
+    pub(crate) fn whole(file: std::fs::File, size: u64) -> Flow {
+        Flow {
+            file: Some(file),
+            seek_to: None,
+            remaining: size,
+            touch: None,
+        }
+    }
+}
+
 /// The file's bytes as a body: read in blocking steps of [`CHUNK`], never the whole file in
 /// memory. Each step extends the device's sync lock (when `touch` is set). A file that shrinks
 /// while it streams ends the body with an error (the client sees a cut transfer, never wrong
 /// bytes as complete).
-fn stream_body(flow: Flow) -> Body {
+pub(crate) fn stream_body(flow: Flow) -> Body {
     let stream = futures_util::stream::unfold(flow, |mut flow| async move {
         if flow.remaining == 0 {
             return None;

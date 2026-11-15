@@ -1,6 +1,7 @@
 //! HTTP routes of the cloud server and the request log.
 //!
-//! Every request passes [`log_request`], which writes exactly one protocol-log line for it.
+//! Every request passes [`log_request`], which writes exactly one protocol-log line for it,
+//! except the quiet answers of the REST read API ([`crate::rest::unlogged`]).
 //! Routes: login and binding ([`login`]), server queries ([`server`]), in accept mode the sync
 //! session, listing, queries, capacity, upload apply and finish, folders, delete, move and copy
 //! ([`files`]), signed downloads and uploads ([`oss`]), the digests ([`digests`]), the to-dos
@@ -477,6 +478,8 @@ fn raw_json(bytes: &[u8]) -> Option<String> {
 /// envelope result, duration, device, firmware and flags. The request body is read up to
 /// [`MAX_REQUEST_BODY`]; a larger one is not passed on (the answer is still an envelope). The
 /// byte uploads of accept mode are passed on unread and logged as `<N bytes, not logged>`.
+/// A REST read that succeeded and a repeated REST token refusal are passed on without a line
+/// ([`crate::rest::unlogged`]).
 pub async fn log_request(
     State(state): State<Arc<AppState>>,
     request: Request,
@@ -484,6 +487,8 @@ pub async fn log_request(
 ) -> Response {
     let started = Instant::now();
     let (mut parts, body) = request.into_parts();
+    let method = parts.method.clone();
+    let path = parts.uri.path().to_string();
     // The real peer, or the stand-in that tests install with `MockConnectInfo`.
     let peer = parts
         .extensions
@@ -576,6 +581,11 @@ pub async fn log_request(
             }
         }
     };
+
+    // The polls of the REST API and repeated token refusals leave no line.
+    if crate::rest::unlogged(&state, &method, &path, &response) {
+        return response;
+    }
 
     if response.extensions().get::<Streamed>().is_some() {
         // A download: one entry with status and size, written before the bytes flow (its

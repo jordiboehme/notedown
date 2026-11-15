@@ -764,3 +764,366 @@ fn a_failed_journal_append_removes_nothing() {
     assert!(accounts.get("jordi").unwrap().is_some());
     assert!(d.path().join("accounts/jordi").is_dir());
 }
+
+// REST tokens
+
+use notedown_cloud::auth::{
+    Account, RestKey, RestTokens, TokenCheck, TokenInfo, list_tokens, revoke_all_tokens,
+    revoke_token,
+};
+
+fn rest() -> (tempfile::TempDir, Auth, RestTokens) {
+    let (d, auth) = setup();
+    let tokens = RestTokens::new(d.path(), RestKey::load_or_create(d.path()).unwrap());
+    (d, auth, tokens)
+}
+
+fn rest_login(auth: &Auth, name: &str) -> (String, TokenInfo, Account) {
+    let (code, _) = auth.challenge("jordi@example.org", NOW).unwrap();
+    auth.rest_login("jordi@example.org", &hash_for(&code, "secret"), name, NOW)
+        .unwrap()
+}
+
+fn removed_by_hand(d: &tempfile::TempDir, slug: &str, user_id: u64) -> u64 {
+    use notedown_cloud::journal::{Event, EventBody, new_op_id};
+    let mut event = [Event::new(
+        slug,
+        Origin::Cli,
+        None,
+        &new_op_id(),
+        EventBody::AccountRemoved { user_id },
+    )];
+    journal(d).append(&mut event).unwrap()[0]
+}
+
+fn is_refused(check: TokenCheck) -> bool {
+    matches!(check, TokenCheck::Refused)
+}
+
+#[test]
+fn a_token_checks_as_its_account() {
+    let (d, auth, tokens) = rest();
+    let (token, info, account) = rest_login(&auth, "mac mini");
+    assert!(token.starts_with("ndt1."));
+    assert_eq!(account.slug, "jordi");
+    assert_eq!(info.name, "mac mini");
+    assert_eq!(info.user_id, account.user_id);
+    assert_eq!(info.created_ms, NOW);
+    assert_eq!(info.id.len(), 8);
+    match tokens.check(&token, NOW).unwrap() {
+        TokenCheck::Valid(a) => assert_eq!(a.slug, "jordi"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(list_tokens(d.path(), "jordi").unwrap(), [info]);
+    assert!(is_refused(tokens.check("ndt1.x.y", NOW).unwrap()));
+    assert!(is_refused(tokens.check("", NOW).unwrap()));
+}
+
+#[test]
+fn a_revoked_token_is_refused() {
+    let (d, auth, tokens) = rest();
+    let (one, a, _) = rest_login(&auth, "one");
+    let (two, b, _) = rest_login(&auth, "two");
+    assert_ne!(a.id, b.id);
+    assert!(revoke_token(d.path(), "jordi", &a.id).unwrap());
+    assert!(!revoke_token(d.path(), "jordi", &a.id).unwrap());
+    assert!(revoke_token(d.path(), "jordi", "../x").is_err());
+    assert!(is_refused(tokens.check(&one, NOW).unwrap()));
+    assert!(matches!(
+        tokens.check(&two, NOW).unwrap(),
+        TokenCheck::Valid(_)
+    ));
+    assert_eq!(revoke_all_tokens(d.path(), "jordi").unwrap(), 1);
+    assert!(is_refused(tokens.check(&two, NOW).unwrap()));
+    assert!(list_tokens(d.path(), "jordi").unwrap().is_empty());
+}
+
+#[test]
+fn a_password_change_refuses_every_token() {
+    let (_d, auth, tokens) = rest();
+    let (one, _, _) = rest_login(&auth, "one");
+    let (two, _, _) = rest_login(&auth, "two");
+    assert_eq!(auth.accounts().set_password("jordi", "secret").unwrap(), 2);
+    assert!(is_refused(tokens.check(&one, NOW).unwrap()));
+    assert!(is_refused(tokens.check(&two, NOW).unwrap()));
+    assert_eq!(auth.accounts().set_password("jordi", "new").unwrap(), 0);
+}
+
+#[test]
+fn a_removed_account_token_is_removed_with_its_seq() {
+    let (d, auth, tokens) = rest();
+    let (token, _, account) = rest_login(&auth, "one");
+    let journal = journal(&d);
+    auth.accounts().remove("jordi", &journal).unwrap();
+    let seq = journal.read_from(0).unwrap().last().unwrap().unwrap().seq;
+    match tokens.check(&token, NOW).unwrap() {
+        TokenCheck::Removed { user_id, seq: s } => {
+            assert_eq!(user_id, account.user_id);
+            assert_eq!(s, seq);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn two_removal_records_use_the_last() {
+    let (d, auth, tokens) = rest();
+    let (token, _, account) = rest_login(&auth, "one");
+    auth.accounts().remove("jordi", &journal(&d)).unwrap();
+    // Another account's removal and a removal of another user id of this slug in between.
+    removed_by_hand(&d, "anna", account.user_id);
+    removed_by_hand(&d, "jordi", account.user_id + 7);
+    let last = removed_by_hand(&d, "jordi", account.user_id);
+    removed_by_hand(&d, "jordi", account.user_id + 8);
+    match tokens.check(&token, NOW).unwrap() {
+        TokenCheck::Removed { user_id, seq } => {
+            assert_eq!(user_id, account.user_id);
+            assert_eq!(seq, last);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_refused_token_of_a_live_account_with_a_removal_record_is_refused() {
+    let (d, auth, tokens) = rest();
+    let (token, info, account) = rest_login(&auth, "one");
+    // A crash between the record and the removal leaves a live account with a record.
+    removed_by_hand(&d, "jordi", account.user_id);
+    assert!(matches!(
+        tokens.check(&token, NOW).unwrap(),
+        TokenCheck::Valid(_)
+    ));
+    assert!(revoke_token(d.path(), "jordi", &info.id).unwrap());
+    assert!(is_refused(tokens.check(&token, NOW).unwrap()));
+    // A fresh check (no cache) says the same.
+    let fresh = RestTokens::new(d.path(), RestKey::load_or_create(d.path()).unwrap());
+    assert!(is_refused(fresh.check(&token, NOW).unwrap()));
+}
+
+#[test]
+fn a_token_of_a_reused_slug_is_removed_not_valid() {
+    let (d, auth, tokens) = rest();
+    let (token, _, old) = rest_login(&auth, "one");
+    auth.accounts().remove("jordi", &journal(&d)).unwrap();
+    let new = auth
+        .accounts()
+        .create("jordi", "jordi@example.org", "secret")
+        .unwrap();
+    assert_ne!(new.user_id, old.user_id);
+    let (fresh, _, _) = rest_login(&auth, "two");
+    match tokens.check(&token, NOW).unwrap() {
+        TokenCheck::Removed { user_id, .. } => assert_eq!(user_id, old.user_id),
+        other => panic!("{other:?}"),
+    }
+    match tokens.check(&fresh, NOW).unwrap() {
+        TokenCheck::Valid(a) => assert_eq!(a.user_id, new.user_id),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_token_for_an_unknown_user_id_is_refused() {
+    let (d, auth, tokens) = rest();
+    let (token, _, _) = rest_login(&auth, "one");
+    // An older backup restored: the slug holds another user id and the journal no removal.
+    let mut a = auth.accounts().get("jordi").unwrap().unwrap();
+    a.user_id += 100;
+    auth.accounts().save(&a).unwrap();
+    assert!(is_refused(tokens.check(&token, NOW).unwrap()));
+    // The account folder is gone without a record.
+    std::fs::remove_dir_all(d.path().join("accounts/jordi")).unwrap();
+    assert!(is_refused(tokens.check(&token, NOW + 61_000).unwrap()));
+}
+
+#[test]
+fn a_damaged_account_file_is_an_error_not_a_removal() {
+    let (d, auth, tokens) = rest();
+    let (token, _, account) = rest_login(&auth, "one");
+    removed_by_hand(&d, "jordi", account.user_id);
+    std::fs::write(d.path().join("accounts/jordi/account.json"), "{").unwrap();
+    assert!(tokens.check(&token, NOW).is_err());
+}
+
+#[test]
+fn issuing_never_stores_the_token() {
+    let (d, auth, _tokens) = rest();
+    let (token, info, _) = rest_login(&auth, "one");
+    let nonce = token.split('.').nth(1).unwrap().to_string();
+    let mut stack = vec![d.path().to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!text.contains(&token), "{}", path.display());
+            assert!(!text.contains(&nonce), "{}", path.display());
+        }
+    }
+    let dir = d.path().join("accounts/jordi/tokens");
+    let file = dir.join(format!("{}.json", info.id));
+    let stored: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let keys: Vec<_> = stored.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys.len(), 5);
+    for k in ["id", "name", "userId", "sha256", "createdMs"] {
+        assert!(stored.get(k).is_some(), "{k}");
+    }
+    use sha2::Digest;
+    assert_eq!(
+        stored["sha256"],
+        const_hex::encode(sha2::Sha256::digest(token.as_bytes()))
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(&dir), 0o700);
+    }
+}
+
+#[test]
+fn rest_login_counts_failures_like_the_device_login() {
+    let (_d, auth, _tokens) = rest();
+    let failed = |auth: &Auth| auth.accounts().get("jordi").unwrap().unwrap().failed_logins;
+    // A missing code does not count.
+    let err = auth
+        .rest_login("jordi@example.org", &hash_for("nocode", "secret"), "x", NOW)
+        .unwrap_err();
+    assert_eq!(err.code(), "E0019");
+    assert_eq!(failed(&auth), 0);
+    let err = auth
+        .rest_login("ghost@example.org", "00", "x", NOW)
+        .unwrap_err();
+    assert_eq!(err.code(), "E0018");
+    for i in 1..=6 {
+        let (code, _) = auth.challenge("jordi@example.org", NOW).unwrap();
+        let wrong = hash_for(&code, "bad");
+        let err = if i % 2 == 0 {
+            auth.rest_login("jordi@example.org", &wrong, "x", NOW)
+                .unwrap_err()
+        } else {
+            auth.login("jordi@example.org", &wrong, "SN1", NOW)
+                .unwrap_err()
+        };
+        assert_eq!(err.code(), "E0019", "attempt {i}");
+        assert_eq!(failed(&auth), i);
+    }
+    // Locked for both logins, also with the right password.
+    let (code, _) = auth.challenge("jordi@example.org", NOW).unwrap();
+    let err = auth
+        .rest_login("jordi@example.org", &hash_for(&code, "secret"), "x", NOW)
+        .unwrap_err();
+    assert_eq!(err.code(), "E0045");
+    let (code, _) = auth.challenge("jordi@example.org", NOW).unwrap();
+    let err = auth
+        .login("jordi@example.org", &hash_for(&code, "secret"), "SN1", NOW)
+        .unwrap_err();
+    assert_eq!(err.code(), "E0045");
+    // After the cooldown a good REST login resets the counter.
+    let later = NOW + notedown_cloud::auth::LOCK_COOLDOWN_MS;
+    let (code, _) = auth.challenge("jordi@example.org", later).unwrap();
+    auth.rest_login("jordi@example.org", &hash_for(&code, "secret"), "x", later)
+        .unwrap();
+    let a = auth.accounts().get("jordi").unwrap().unwrap();
+    assert!(!a.locked);
+    assert_eq!(a.failed_logins, 0);
+}
+
+#[test]
+fn a_locked_account_keeps_its_tokens() {
+    let (_d, auth, tokens) = rest();
+    let (token, _, _) = rest_login(&auth, "one");
+    for _ in 0..6 {
+        let (code, _) = auth.challenge("jordi@example.org", NOW).unwrap();
+        let _ = auth.rest_login("jordi@example.org", &hash_for(&code, "bad"), "x", NOW);
+    }
+    assert!(auth.accounts().get("jordi").unwrap().unwrap().locked);
+    assert!(matches!(
+        tokens.check(&token, NOW).unwrap(),
+        TokenCheck::Valid(_)
+    ));
+}
+
+#[test]
+fn the_removal_lookup_is_cached() {
+    let (d, auth, tokens) = rest();
+    let (token, _, account) = rest_login(&auth, "one");
+    auth.accounts().remove("jordi", &journal(&d)).unwrap();
+    let first = tokens.check(&token, NOW).unwrap();
+    assert!(matches!(first, TokenCheck::Removed { .. }));
+    std::fs::remove_dir_all(d.path().join("journal")).unwrap();
+    // Without the journal a fresh lookup finds nothing ...
+    let fresh = RestTokens::new(d.path(), RestKey::load_or_create(d.path()).unwrap());
+    assert!(is_refused(fresh.check(&token, NOW).unwrap()));
+    // ... but a found removal is kept, also much later.
+    match tokens.check(&token, NOW + 86_400_000).unwrap() {
+        TokenCheck::Removed { user_id, .. } => assert_eq!(user_id, account.user_id),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn no_removal_is_cached_for_a_minute() {
+    let (d, auth, tokens) = rest();
+    let (token, _, account) = rest_login(&auth, "one");
+    // The folder goes first, the record comes later (a removal seen half-way).
+    std::fs::remove_dir_all(d.path().join("accounts/jordi")).unwrap();
+    assert!(is_refused(tokens.check(&token, NOW).unwrap()));
+    let seq = removed_by_hand(&d, "jordi", account.user_id);
+    assert!(is_refused(tokens.check(&token, NOW + 59_000).unwrap()));
+    assert!(matches!(
+        tokens.check(&token, NOW + 60_000).unwrap(),
+        TokenCheck::Removed { seq: s, .. } if s == seq
+    ));
+}
+
+#[test]
+fn listing_tokens_creates_no_key() {
+    let d = data();
+    let accounts = Accounts::new(d.path());
+    accounts.create("jordi", "jordi@example.org", "pw").unwrap();
+    assert!(list_tokens(d.path(), "jordi").unwrap().is_empty());
+    assert!(!revoke_token(d.path(), "jordi", "0123abcd").unwrap());
+    assert_eq!(revoke_all_tokens(d.path(), "jordi").unwrap(), 0);
+    assert_eq!(accounts.set_password("jordi", "new").unwrap(), 0);
+    assert!(!d.path().join("keys").exists());
+    assert!(matches!(
+        list_tokens(d.path(), "ghost"),
+        Err(Error::NoAccount(_))
+    ));
+}
+
+#[test]
+fn a_restored_and_removed_again_account_gives_the_new_seq() {
+    let (d, auth, tokens) = rest();
+    let (token, info, _) = rest_login(&auth, "one");
+    let dir = d.path().join("accounts/jordi");
+    let token_file = format!("tokens/{}.json", info.id);
+    let account_json = std::fs::read(dir.join("account.json")).unwrap();
+    let token_json = std::fs::read(dir.join(&token_file)).unwrap();
+    let journal = journal(&d);
+    auth.accounts().remove("jordi", &journal).unwrap();
+    let first = match tokens.check(&token, NOW).unwrap() {
+        TokenCheck::Removed { seq, .. } => seq,
+        other => panic!("{other:?}"),
+    };
+    // A backup brings the account back by hand.
+    std::fs::create_dir_all(dir.join("tokens")).unwrap();
+    std::fs::write(dir.join("account.json"), &account_json).unwrap();
+    std::fs::write(dir.join(&token_file), &token_json).unwrap();
+    assert!(matches!(
+        tokens.check(&token, NOW).unwrap(),
+        TokenCheck::Valid(_)
+    ));
+    auth.accounts().remove("jordi", &journal).unwrap();
+    match tokens.check(&token, NOW).unwrap() {
+        TokenCheck::Removed { seq, .. } => assert!(seq > first, "{seq} > {first}"),
+        other => panic!("{other:?}"),
+    }
+}

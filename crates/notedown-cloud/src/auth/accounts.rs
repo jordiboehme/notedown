@@ -315,8 +315,10 @@ impl Accounts {
         }
     }
 
-    /// Sets a new password and clears the lock and the failed-login counter.
-    pub fn set_password(&self, slug: &str, password: &str) -> Result<()> {
+    /// Sets a new password and clears the lock and the failed-login counter. Every REST token
+    /// of the account is deleted first, under the account lock; returns how many there were.
+    /// When the delete fails, the password stays as it was.
+    pub fn set_password(&self, slug: &str, password: &str) -> Result<usize> {
         validate_password(password)?;
         if self.get(slug)?.is_none() {
             return Err(Error::NoAccount(slug.to_string()));
@@ -325,11 +327,13 @@ impl Accounts {
         let mut account = self
             .get(slug)?
             .ok_or_else(|| Error::NoAccount(slug.to_string()))?;
+        let deleted = super::rest_tokens::delete_tokens(&self.account_dir(slug))?;
         account.password_md5 = md5_hex(password);
         account.locked = false;
         account.locked_at_ms = None;
         account.failed_logins = 0;
-        self.save(&account)
+        self.save(&account)?;
+        Ok(deleted)
     }
 
     /// All accounts, sorted by slug. Folders without an `account.json` are skipped.

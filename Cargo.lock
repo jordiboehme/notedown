@@ -1765,6 +1765,7 @@ dependencies = [
  "notedown-convert",
  "notedown-note",
  "notedown-ocr",
+ "reqwest",
  "rmcp",
  "schemars",
  "serde",

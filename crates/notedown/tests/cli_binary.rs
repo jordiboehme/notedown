@@ -15,6 +15,7 @@ fn render_command_writes_pngs() {
     assert!(dir.path().join("test2-page-001.png").exists());
 }
 
+#[cfg(feature = "ocr")]
 #[test]
 fn convert_reports_missing_model_with_hint() {
     let dir = tempfile::tempdir().unwrap();
@@ -28,6 +29,7 @@ fn convert_reports_missing_model_with_hint() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("notedown model pull"));
 }
 
+#[cfg(feature = "ocr")]
 #[test]
 fn convert_updates_an_old_header_without_loading_the_model() {
     use sha2::Digest;
@@ -70,6 +72,7 @@ fn convert_updates_an_old_header_without_loading_the_model() {
     );
 }
 
+#[cfg(feature = "ocr")]
 #[test]
 fn model_path_prints_cache_dir() {
     let dir = tempfile::tempdir().unwrap();
@@ -82,6 +85,7 @@ fn model_path_prints_cache_dir() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("chandra-ocr-2.Q4_K_M.gguf"));
 }
 
+#[cfg(feature = "ocr")]
 #[test]
 fn model_verify_fails_for_empty_cache() {
     let dir = tempfile::tempdir().unwrap();
@@ -1680,446 +1684,467 @@ fn cloud_diagnose_prints_the_report_and_writes_the_zip() {
 }
 
 // ---- notedown pipeline and notedown mcp ----
+#[cfg(feature = "ocr")]
+mod pipeline_and_mcp {
+    use super::*;
 
-const NOTE_A: &str = "F20240424175151947577oMie9HNQYnTa";
-const NOTE_B: &str = "F20240424175151947577oMie9HNQYnTb";
+    const NOTE_A: &str = "F20240424175151947577oMie9HNQYnTa";
+    const NOTE_B: &str = "F20240424175151947577oMie9HNQYnTb";
 
-fn text_block(id: &str, text: &str) -> notedown_pipeline::model::Block {
-    notedown_pipeline::model::Block {
-        id: id.into(),
-        label: "text".into(),
-        bbox: [0, 0, 10, 10],
-        text: text.into(),
-        replaces: Vec::new(),
-    }
-}
-
-fn page_line(
-    note: &str,
-    path: &str,
-    change: notedown_pipeline::model::LineChange,
-    blocks: Vec<notedown_pipeline::model::Block>,
-) -> notedown_pipeline::model::LogLine {
-    let mut line = notedown_pipeline::model::LogLine::new(note, change);
-    line.page_id = Some("P1".into());
-    line.position = Some(0);
-    line.path = Some(path.into());
-    line.blocks = blocks;
-    line
-}
-
-/// A data folder with the accounts `slugs`; the first one gets a text store seeded through
-/// the library:
-/// - seq 1: Planview new
-/// - seq 2: Garden new
-/// - seq 3: Planview edited
-fn pipeline_fixture(slugs: &[&str]) -> tempfile::TempDir {
-    use notedown_pipeline::model::LineChange;
-    use notedown_pipeline::store::{TextStore, WriterLock};
-    let dir = tempfile::tempdir().unwrap();
-    let data = dir.path();
-    for (i, slug) in slugs.iter().enumerate() {
-        notedown_cloud::auth::Accounts::new(data)
-            .create(slug, &format!("{slug}{i}@example.org"), "secret")
-            .unwrap();
-    }
-    let w = WriterLock::take(data).unwrap();
-    let store = TextStore::open_writer(data, slugs[0], &w).unwrap();
-    let mut lines = vec![
-        page_line(
-            NOTE_A,
-            "NOTE/Note/Planview.note",
-            LineChange::New,
-            vec![text_block("b1", "Meeting with Anna on Friday")],
-        ),
-        page_line(
-            NOTE_B,
-            "NOTE/Note/Garden.note",
-            LineChange::New,
-            vec![text_block("b1", "Plant tomatoes in May")],
-        ),
-        page_line(
-            NOTE_A,
-            "NOTE/Note/Planview.note",
-            LineChange::Edited,
-            vec![text_block("b1", "Meeting with Anne on Friday")],
-        ),
-    ];
-    store.append(&w, &mut lines).unwrap();
-    store.repair(&w).unwrap();
-    dir
-}
-
-fn pipeline_cmd(data: &std::path::Path, args: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
-        .arg("pipeline")
-        .args(args)
-        .arg("--data")
-        .arg(data)
-        .env("NOTEDOWN_MODEL_DIR", data.join("no-model"))
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap()
-}
-
-fn json_out(out: &std::process::Output) -> serde_json::Value {
-    assert!(
-        out.status.success(),
-        "{}{}",
-        stdout(out),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {}", stdout(out)))
-}
-
-/// `2026-10-08 23:14 +02:00`: a time at this computer's offset, as the MCP server shows it.
-fn assert_local_time(v: &serde_json::Value) {
-    let t = v.as_str().unwrap_or_else(|| panic!("no time string: {v}"));
-    let b = t.as_bytes();
-    let digits = |r: std::ops::Range<usize>| r.into_iter().all(|i| b[i].is_ascii_digit());
-    assert!(
-        b.len() == 23
-            && digits(0..4)
-            && b[4] == b'-'
-            && b[10] == b' '
-            && b[13] == b':'
-            && b[16] == b' '
-            && (b[17] == b'+' || b[17] == b'-')
-            && b[20] == b':',
-        "{t}"
-    );
-}
-
-#[test]
-fn pipeline_changes_and_ack() {
-    let dir = pipeline_fixture(&["jordi"]);
-    let d = dir.path();
-    let first = json_out(&pipeline_cmd(
-        d,
-        &["changes", "--account", "jordi", "--consumer", "agent"],
-    ));
-    assert_eq!(first["from"], 0);
-    assert_eq!(first["upTo"], 3);
-    assert_eq!(first["more"], false);
-    let notes = first["notes"].as_array().unwrap();
-    assert_eq!(notes.len(), 2, "{first}");
-    let text = first.to_string();
-    assert!(text.contains("Meeting with Anne on Friday"), "{text}");
-    assert!(text.contains("Plant tomatoes in May"), "{text}");
-
-    // The account may be left out when there is only one; the manifest holds no text.
-    let summary = json_out(&pipeline_cmd(
-        d,
-        &["changes", "--consumer", "agent", "--summary"],
-    ));
-    assert_eq!(summary["upTo"], 3);
-    assert_eq!(summary["notes"].as_array().unwrap().len(), 2);
-    assert!(!summary.to_string().contains("Meeting"), "{summary}");
-
-    // A fixed range of one note.
-    let range = json_out(&pipeline_cmd(
-        d,
-        &["changes", "--from", "0", "--up-to", "3", "--notes", NOTE_B],
-    ));
-    let notes = range["notes"].as_array().unwrap();
-    assert_eq!(notes.len(), 1, "{range}");
-    assert_eq!(notes[0]["key"], NOTE_B);
-
-    // "since" a seq needs no bookmark.
-    let since = json_out(&pipeline_cmd(d, &["changes", "--since", "2"]));
-    assert_eq!(since["from"], 2);
-    assert_eq!(since["notes"].as_array().unwrap().len(), 1, "{since}");
-
-    let ack = json_out(&pipeline_cmd(
-        d,
-        &[
-            "ack",
-            "--account",
-            "jordi",
-            "--consumer",
-            "agent",
-            "--up-to",
-            "3",
-        ],
-    ));
-    assert_eq!(ack["seq"], 3);
-    assert_local_time(&ack["updatedAt"]);
-    assert!(ack.get("clamped").is_none(), "{ack}");
-    // An upTo past the log stops at its end and says so.
-    let past = json_out(&pipeline_cmd(
-        d,
-        &["ack", "--consumer", "agent", "--up-to", "99"],
-    ));
-    assert_eq!(past["seq"], 3, "{past}");
-    assert_eq!(past["clamped"], true, "{past}");
-    assert_eq!(past["logEnd"], 3, "{past}");
-
-    let after = json_out(&pipeline_cmd(d, &["changes", "--consumer", "agent"]));
-    assert_eq!(after["from"], 3);
-    assert_eq!(after["notes"].as_array().unwrap().len(), 0, "{after}");
-
-    // One start only, and notes need a fixed range.
-    let both = pipeline_cmd(d, &["changes", "--consumer", "agent", "--since", "1"]);
-    assert_eq!(both.status.code(), Some(2));
-    let no_range = pipeline_cmd(d, &["changes", "--consumer", "agent", "--notes", NOTE_A]);
-    assert_eq!(no_range.status.code(), Some(2));
-    let unknown = pipeline_cmd(d, &["changes", "--account", "nobody", "--consumer", "x"]);
-    assert_eq!(unknown.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&unknown.stderr).contains("no account nobody"));
-    assert!(!d.join("pipeline/nobody").exists());
-}
-
-#[test]
-fn pipeline_refuses_a_second_writer() {
-    let dir = pipeline_fixture(&["jordi"]);
-    let d = dir.path();
-    let lock = notedown_pipeline::store::WriterLock::take(d).unwrap();
-    for args in [&["--once"][..], &["--reocr"][..], &[][..]] {
-        let out = pipeline_cmd(d, args);
-        assert_eq!(out.status.code(), Some(1), "{args:?}");
-        assert!(
-            String::from_utf8_lossy(&out.stderr)
-                .contains("another notedown pipeline runs for this data folder"),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        // A refused writer says only that.
-        assert_eq!(
-            String::from_utf8_lossy(&out.stderr).lines().count(),
-            1,
-            "{args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    drop(lock);
-    // No page is due: the run needs no model and ends at once.
-    let out = pipeline_cmd(d, &["--once"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(stdout(&out), "0 pages read, 0 versions written, 0 failed\n");
-}
-
-#[test]
-fn mcp_refuses_without_account_when_two_exist() {
-    let dir = pipeline_fixture(&["jordi", "anna"]);
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
-        .args(["mcp", "--data"])
-        .arg(dir.path())
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(1));
-    assert_eq!(stdout(&out), "", "stdout belongs to the MCP protocol");
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("this data folder has several accounts: anna, jordi"),
-        "{err}"
-    );
-    assert!(err.contains("--account"), "{err}");
-}
-
-#[test]
-fn consumers_lists_and_removes() {
-    let dir = pipeline_fixture(&["jordi", "anna"]);
-    let d = dir.path();
-    let ack = pipeline_cmd(
-        d,
-        &[
-            "ack",
-            "--account",
-            "jordi",
-            "--consumer",
-            "agent",
-            "--up-to",
-            "2",
-        ],
-    );
-    json_out(&ack);
-    let list = json_out(&pipeline_cmd(d, &["consumers"]));
-    assert_eq!(list["jordi"][0]["consumer"], "agent", "{list}");
-    assert_eq!(list["jordi"][0]["seq"], 2, "{list}");
-    assert_local_time(&list["jordi"][0]["updatedAt"]);
-    assert_eq!(list["anna"], serde_json::json!([]), "{list}");
-    let one = json_out(&pipeline_cmd(d, &["consumers", "--account", "anna"]));
-    assert_eq!(one, serde_json::json!({"anna": []}));
-
-    // Two accounts: removing needs the account.
-    let no_account = pipeline_cmd(d, &["consumers", "--remove", "agent"]);
-    assert_eq!(no_account.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&no_account.stderr).contains("several accounts"));
-
-    let removed = pipeline_cmd(d, &["consumers", "--account", "jordi", "--remove", "agent"]);
-    assert!(removed.status.success());
-    assert_eq!(
-        stdout(&removed),
-        "removed the bookmark of agent in account jordi\n"
-    );
-    let list = json_out(&pipeline_cmd(d, &["consumers"]));
-    assert_eq!(list["jordi"], serde_json::json!([]), "{list}");
-    let again = pipeline_cmd(d, &["consumers", "--account", "jordi", "--remove", "agent"]);
-    assert_eq!(again.status.code(), Some(1));
-    assert!(
-        String::from_utf8_lossy(&again.stderr).contains("no bookmark agent in account jordi"),
-        "{}",
-        String::from_utf8_lossy(&again.stderr)
-    );
-}
-
-#[test]
-fn diagnose_reports_the_pipeline_line_and_leaves_its_texts_out() {
-    use notedown_pipeline::model::PageOcrState;
-    use notedown_pipeline::store::{TextStore, WriterLock};
-    let dir = pipeline_fixture(&["jordi"]);
-    let d = dir.path();
-    {
-        let w = WriterLock::take(d).unwrap();
-        let store = TextStore::open_writer(d, "jordi", &w).unwrap();
-        let mut a = store.note(NOTE_A).unwrap().unwrap();
-        a.pages[0].state = PageOcrState::Failed;
-        store.save_note(&w, &a).unwrap();
-        let mut b = store.note(NOTE_B).unwrap().unwrap();
-        let mut second = b.pages[0].clone();
-        second.page_id = "P2".into();
-        second.position = 1;
-        second.state = PageOcrState::Pending;
-        b.pages.push(second.clone());
-        second.page_id = "P3".into();
-        second.position = 2;
-        b.pages.push(second);
-        store.save_note(&w, &b).unwrap();
-    }
-    // A note state that cannot be read counts nothing and stops nothing.
-    std::fs::write(d.join("pipeline/jordi/notes/broken.json"), "{").unwrap();
-    notedown_cloud::journal::Journal::open(d)
-        .unwrap()
-        .set_cursor("pipeline", 7)
-        .unwrap();
-    let zip_path = dir.path().join("b.zip");
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
-        .args(["cloud", "diagnose", "--data"])
-        .arg(d)
-        .arg("--out")
-        .arg(&zip_path)
-        .output()
-        .unwrap();
-    let text = stdout(&out);
-    assert!(
-        out.status.success(),
-        "{text}{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        text.contains("\nPipeline  cursor 7, 2 pages pending, 1 failed\n"),
-        "{text}"
-    );
-    let mut zip = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
-    for i in 0..zip.len() {
-        let mut f = zip.by_index(i).unwrap();
-        let name = f.name().unwrap().into_owned();
-        assert!(!name.starts_with("pipeline/"), "{name}");
-        let mut body = Vec::new();
-        std::io::Read::read_to_end(&mut f, &mut body).unwrap();
-        let body = String::from_utf8_lossy(&body);
-        for secret in ["Meeting with An", "Plant tomatoes", "Planview", "Garden"] {
-            assert!(!body.contains(secret), "{secret} in {name}");
+    fn text_block(id: &str, text: &str) -> notedown_pipeline::model::Block {
+        notedown_pipeline::model::Block {
+            id: id.into(),
+            label: "text".into(),
+            bbox: [0, 0, 10, 10],
+            text: text.into(),
+            replaces: Vec::new(),
         }
     }
 
-    // Without a pipeline the line says so in numbers too.
-    let empty = tempfile::tempdir().unwrap();
-    notedown_cloud::auth::Accounts::new(empty.path())
-        .create("solo", "solo@example.org", "pw")
-        .unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
-        .args(["cloud", "diagnose", "--data"])
-        .arg(empty.path())
-        .arg("--out")
-        .arg(empty.path().join("b.zip"))
-        .output()
-        .unwrap();
-    assert!(
-        stdout(&out).contains("\nPipeline  cursor none, 0 pages pending, 0 failed\n"),
-        "{}",
-        stdout(&out)
-    );
-}
-
-#[test]
-fn serve_pipeline_starts_the_pipeline_and_stops_it_with_the_server() {
-    use std::io::BufRead;
-    let dir = tempfile::tempdir().unwrap();
-    let data = dir.path();
-    std::fs::write(data.join("server.toml"), "listen = [\"127.0.0.1:0\"]\n").unwrap();
-    let mut serve = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
-        .args(["serve", "--pipeline", "--data"])
-        .arg(data)
-        .env("NOTEDOWN_MODEL_DIR", data.join("no-model"))
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut reader = std::io::BufReader::new(serve.stdout.take().unwrap());
-    let mut pid = None;
-    loop {
-        let mut line = String::new();
-        assert!(
-            reader.read_line(&mut line).unwrap() > 0,
-            "serve ended early"
-        );
-        if let Some(rest) = line.strip_prefix("pipeline: started notedown pipeline (pid ") {
-            pid = Some(rest.trim().trim_end_matches(')').to_string());
-        }
-        if line.starts_with("press Ctrl-C") {
-            break;
-        }
+    fn page_line(
+        note: &str,
+        path: &str,
+        change: notedown_pipeline::model::LineChange,
+        blocks: Vec<notedown_pipeline::model::Block>,
+    ) -> notedown_pipeline::model::LogLine {
+        let mut line = notedown_pipeline::model::LogLine::new(note, change);
+        line.page_id = Some("P1".into());
+        line.position = Some(0);
+        line.path = Some(path.into());
+        line.blocks = blocks;
+        line
     }
-    let pid = pid.expect("the start line names the pid");
-    let alive = |pid: &str| {
-        std::process::Command::new("kill")
-            .args(["-0", pid])
-            .stderr(std::process::Stdio::null())
-            .status()
+
+    /// A data folder with the accounts `slugs`; the first one gets a text store seeded through
+    /// the library:
+    /// - seq 1: Planview new
+    /// - seq 2: Garden new
+    /// - seq 3: Planview edited
+    fn pipeline_fixture(slugs: &[&str]) -> tempfile::TempDir {
+        use notedown_pipeline::model::LineChange;
+        use notedown_pipeline::store::{TextStore, WriterLock};
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        for (i, slug) in slugs.iter().enumerate() {
+            notedown_cloud::auth::Accounts::new(data)
+                .create(slug, &format!("{slug}{i}@example.org"), "secret")
+                .unwrap();
+        }
+        let w = WriterLock::take(data).unwrap();
+        let store = TextStore::open_writer(data, slugs[0], &w).unwrap();
+        let mut lines = vec![
+            page_line(
+                NOTE_A,
+                "NOTE/Note/Planview.note",
+                LineChange::New,
+                vec![text_block("b1", "Meeting with Anna on Friday")],
+            ),
+            page_line(
+                NOTE_B,
+                "NOTE/Note/Garden.note",
+                LineChange::New,
+                vec![text_block("b1", "Plant tomatoes in May")],
+            ),
+            page_line(
+                NOTE_A,
+                "NOTE/Note/Planview.note",
+                LineChange::Edited,
+                vec![text_block("b1", "Meeting with Anne on Friday")],
+            ),
+        ];
+        store.append(&w, &mut lines).unwrap();
+        store.repair(&w).unwrap();
+        dir
+    }
+
+    fn pipeline_cmd(data: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+            .arg("pipeline")
+            .args(args)
+            .arg("--data")
+            .arg(data)
+            .env("NOTEDOWN_MODEL_DIR", data.join("no-model"))
+            .stdin(std::process::Stdio::null())
+            .output()
             .unwrap()
-            .success()
-    };
-    // Give the child time to start; it waits for work and keeps running.
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    assert!(alive(&pid));
-    let st = std::process::Command::new("kill")
-        .args(["-TERM", &serve.id().to_string()])
-        .status()
+    }
+
+    fn json_out(out: &std::process::Output) -> serde_json::Value {
+        assert!(
+            out.status.success(),
+            "{}{}",
+            stdout(out),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {}", stdout(out)))
+    }
+
+    /// `2026-10-08 23:14 +02:00`: a time at this computer's offset, as the MCP server shows it.
+    fn assert_local_time(v: &serde_json::Value) {
+        let t = v.as_str().unwrap_or_else(|| panic!("no time string: {v}"));
+        let b = t.as_bytes();
+        let digits = |r: std::ops::Range<usize>| r.into_iter().all(|i| b[i].is_ascii_digit());
+        assert!(
+            b.len() == 23
+                && digits(0..4)
+                && b[4] == b'-'
+                && b[10] == b' '
+                && b[13] == b':'
+                && b[16] == b' '
+                && (b[17] == b'+' || b[17] == b'-')
+                && b[20] == b':',
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn pipeline_changes_and_ack() {
+        let dir = pipeline_fixture(&["jordi"]);
+        let d = dir.path();
+        let first = json_out(&pipeline_cmd(
+            d,
+            &["changes", "--account", "jordi", "--consumer", "agent"],
+        ));
+        assert_eq!(first["from"], 0);
+        assert_eq!(first["upTo"], 3);
+        assert_eq!(first["more"], false);
+        let notes = first["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 2, "{first}");
+        let text = first.to_string();
+        assert!(text.contains("Meeting with Anne on Friday"), "{text}");
+        assert!(text.contains("Plant tomatoes in May"), "{text}");
+
+        // The account may be left out when there is only one; the manifest holds no text.
+        let summary = json_out(&pipeline_cmd(
+            d,
+            &["changes", "--consumer", "agent", "--summary"],
+        ));
+        assert_eq!(summary["upTo"], 3);
+        assert_eq!(summary["notes"].as_array().unwrap().len(), 2);
+        assert!(!summary.to_string().contains("Meeting"), "{summary}");
+
+        // A fixed range of one note.
+        let range = json_out(&pipeline_cmd(
+            d,
+            &["changes", "--from", "0", "--up-to", "3", "--notes", NOTE_B],
+        ));
+        let notes = range["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 1, "{range}");
+        assert_eq!(notes[0]["key"], NOTE_B);
+
+        // "since" a seq needs no bookmark.
+        let since = json_out(&pipeline_cmd(d, &["changes", "--since", "2"]));
+        assert_eq!(since["from"], 2);
+        assert_eq!(since["notes"].as_array().unwrap().len(), 1, "{since}");
+
+        let ack = json_out(&pipeline_cmd(
+            d,
+            &[
+                "ack",
+                "--account",
+                "jordi",
+                "--consumer",
+                "agent",
+                "--up-to",
+                "3",
+            ],
+        ));
+        assert_eq!(ack["seq"], 3);
+        assert_local_time(&ack["updatedAt"]);
+        assert!(ack.get("clamped").is_none(), "{ack}");
+        // An upTo past the log stops at its end and says so.
+        let past = json_out(&pipeline_cmd(
+            d,
+            &["ack", "--consumer", "agent", "--up-to", "99"],
+        ));
+        assert_eq!(past["seq"], 3, "{past}");
+        assert_eq!(past["clamped"], true, "{past}");
+        assert_eq!(past["logEnd"], 3, "{past}");
+
+        let after = json_out(&pipeline_cmd(d, &["changes", "--consumer", "agent"]));
+        assert_eq!(after["from"], 3);
+        assert_eq!(after["notes"].as_array().unwrap().len(), 0, "{after}");
+
+        // One start only, and notes need a fixed range.
+        let both = pipeline_cmd(d, &["changes", "--consumer", "agent", "--since", "1"]);
+        assert_eq!(both.status.code(), Some(2));
+        let no_range = pipeline_cmd(d, &["changes", "--consumer", "agent", "--notes", NOTE_A]);
+        assert_eq!(no_range.status.code(), Some(2));
+        let unknown = pipeline_cmd(d, &["changes", "--account", "nobody", "--consumer", "x"]);
+        assert_eq!(unknown.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&unknown.stderr).contains("no account nobody"));
+        assert!(!d.join("pipeline/nobody").exists());
+    }
+
+    #[test]
+    fn pipeline_refuses_a_second_writer() {
+        let dir = pipeline_fixture(&["jordi"]);
+        let d = dir.path();
+        let lock = notedown_pipeline::store::WriterLock::take(d).unwrap();
+        for args in [&["--once"][..], &["--reocr"][..], &[][..]] {
+            let out = pipeline_cmd(d, args);
+            assert_eq!(out.status.code(), Some(1), "{args:?}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr)
+                    .contains("another notedown pipeline runs for this data folder"),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // A refused writer says only that.
+            assert_eq!(
+                String::from_utf8_lossy(&out.stderr).lines().count(),
+                1,
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        drop(lock);
+        // No page is due: the run needs no model and ends at once.
+        let out = pipeline_cmd(d, &["--once"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(stdout(&out), "0 pages read, 0 versions written, 0 failed\n");
+    }
+
+    #[test]
+    fn mcp_refuses_without_account_when_two_exist() {
+        let dir = pipeline_fixture(&["jordi", "anna"]);
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+            .args(["mcp", "--data"])
+            .arg(dir.path())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(stdout(&out), "", "stdout belongs to the MCP protocol");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("this data folder has several accounts: anna, jordi"),
+            "{err}"
+        );
+        assert!(err.contains("--account"), "{err}");
+    }
+
+    #[test]
+    fn consumers_lists_and_removes() {
+        let dir = pipeline_fixture(&["jordi", "anna"]);
+        let d = dir.path();
+        let ack = pipeline_cmd(
+            d,
+            &[
+                "ack",
+                "--account",
+                "jordi",
+                "--consumer",
+                "agent",
+                "--up-to",
+                "2",
+            ],
+        );
+        json_out(&ack);
+        let list = json_out(&pipeline_cmd(d, &["consumers"]));
+        assert_eq!(list["jordi"][0]["consumer"], "agent", "{list}");
+        assert_eq!(list["jordi"][0]["seq"], 2, "{list}");
+        assert_local_time(&list["jordi"][0]["updatedAt"]);
+        assert_eq!(list["anna"], serde_json::json!([]), "{list}");
+        let one = json_out(&pipeline_cmd(d, &["consumers", "--account", "anna"]));
+        assert_eq!(one, serde_json::json!({"anna": []}));
+
+        // Two accounts: removing needs the account.
+        let no_account = pipeline_cmd(d, &["consumers", "--remove", "agent"]);
+        assert_eq!(no_account.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&no_account.stderr).contains("several accounts"));
+
+        let removed = pipeline_cmd(d, &["consumers", "--account", "jordi", "--remove", "agent"]);
+        assert!(removed.status.success());
+        assert_eq!(
+            stdout(&removed),
+            "removed the bookmark of agent in account jordi\n"
+        );
+        let list = json_out(&pipeline_cmd(d, &["consumers"]));
+        assert_eq!(list["jordi"], serde_json::json!([]), "{list}");
+        let again = pipeline_cmd(d, &["consumers", "--account", "jordi", "--remove", "agent"]);
+        assert_eq!(again.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&again.stderr).contains("no bookmark agent in account jordi"),
+            "{}",
+            String::from_utf8_lossy(&again.stderr)
+        );
+    }
+
+    #[test]
+    fn diagnose_reports_the_pipeline_line_and_leaves_its_texts_out() {
+        use notedown_pipeline::model::PageOcrState;
+        use notedown_pipeline::store::{TextStore, WriterLock};
+        let dir = pipeline_fixture(&["jordi"]);
+        let d = dir.path();
+        {
+            let w = WriterLock::take(d).unwrap();
+            let store = TextStore::open_writer(d, "jordi", &w).unwrap();
+            let mut a = store.note(NOTE_A).unwrap().unwrap();
+            a.pages[0].state = PageOcrState::Failed;
+            store.save_note(&w, &a).unwrap();
+            let mut b = store.note(NOTE_B).unwrap().unwrap();
+            let mut second = b.pages[0].clone();
+            second.page_id = "P2".into();
+            second.position = 1;
+            second.state = PageOcrState::Pending;
+            b.pages.push(second.clone());
+            second.page_id = "P3".into();
+            second.position = 2;
+            b.pages.push(second);
+            store.save_note(&w, &b).unwrap();
+        }
+        // A note state that cannot be read counts nothing and stops nothing.
+        std::fs::write(d.join("pipeline/jordi/notes/broken.json"), "{").unwrap();
+        notedown_cloud::journal::Journal::open(d)
+            .unwrap()
+            .set_cursor("pipeline", 7)
+            .unwrap();
+        let zip_path = dir.path().join("b.zip");
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+            .args(["cloud", "diagnose", "--data"])
+            .arg(d)
+            .arg("--out")
+            .arg(&zip_path)
+            .output()
+            .unwrap();
+        let text = stdout(&out);
+        assert!(
+            out.status.success(),
+            "{text}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            text.contains("\nPipeline  cursor 7, 2 pages pending, 1 failed\n"),
+            "{text}"
+        );
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
+        for i in 0..zip.len() {
+            let mut f = zip.by_index(i).unwrap();
+            let name = f.name().unwrap().into_owned();
+            assert!(!name.starts_with("pipeline/"), "{name}");
+            let mut body = Vec::new();
+            std::io::Read::read_to_end(&mut f, &mut body).unwrap();
+            let body = String::from_utf8_lossy(&body);
+            for secret in ["Meeting with An", "Plant tomatoes", "Planview", "Garden"] {
+                assert!(!body.contains(secret), "{secret} in {name}");
+            }
+        }
+
+        // Without a pipeline the line says so in numbers too.
+        let empty = tempfile::tempdir().unwrap();
+        notedown_cloud::auth::Accounts::new(empty.path())
+            .create("solo", "solo@example.org", "pw")
+            .unwrap();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+            .args(["cloud", "diagnose", "--data"])
+            .arg(empty.path())
+            .arg("--out")
+            .arg(empty.path().join("b.zip"))
+            .output()
+            .unwrap();
+        assert!(
+            stdout(&out).contains("\nPipeline  cursor none, 0 pages pending, 0 failed\n"),
+            "{}",
+            stdout(&out)
+        );
+    }
+
+    #[test]
+    fn serve_pipeline_starts_the_pipeline_and_stops_it_with_the_server() {
+        use std::io::BufRead;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        std::fs::write(data.join("server.toml"), "listen = [\"127.0.0.1:0\"]\n").unwrap();
+        let mut serve = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+            .args(["serve", "--pipeline", "--data"])
+            .arg(data)
+            .env("NOTEDOWN_MODEL_DIR", data.join("no-model"))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut reader = std::io::BufReader::new(serve.stdout.take().unwrap());
+        let mut pid = None;
+        loop {
+            let mut line = String::new();
+            assert!(
+                reader.read_line(&mut line).unwrap() > 0,
+                "serve ended early"
+            );
+            if let Some(rest) = line.strip_prefix("pipeline: started notedown pipeline (pid ") {
+                pid = Some(rest.trim().trim_end_matches(')').to_string());
+            }
+            if line.starts_with("press Ctrl-C") {
+                break;
+            }
+        }
+        let pid = pid.expect("the start line names the pid");
+        let alive = |pid: &str| {
+            std::process::Command::new("kill")
+                .args(["-0", pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        // Give the child time to start; it waits for work and keeps running.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(alive(&pid));
+        let st = std::process::Command::new("kill")
+            .args(["-TERM", &serve.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let status = serve.wait().unwrap();
+        assert!(status.success(), "{status:?}");
+        assert!(!alive(&pid), "the pipeline child still runs");
+        notedown_pipeline::store::WriterLock::take(data).unwrap();
+    }
+
+    #[test]
+    fn pipeline_once_without_the_model_says_so_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        notedown_cloud::auth::Accounts::new(data)
+            .create("jordi", "jordi@example.org", "secret")
+            .unwrap();
+        let journal = notedown_cloud::journal::Journal::open(data).unwrap();
+        notedown_cloud::put::put(
+            data,
+            "jordi",
+            &journal,
+            std::path::Path::new(NOTE),
+            "NOTE/Note",
+            None,
+        )
         .unwrap();
-    assert!(st.success());
-    let status = serve.wait().unwrap();
-    assert!(status.success(), "{status:?}");
-    assert!(!alive(&pid), "the pipeline child still runs");
-    notedown_pipeline::store::WriterLock::take(data).unwrap();
+        let out = pipeline_cmd(data, &["--once"]);
+        assert_eq!(out.status.code(), Some(1));
+        let err = String::from_utf8_lossy(&out.stderr);
+        let message = "the OCR model is missing, run `notedown model pull`";
+        assert_eq!(err.matches(message).count(), 1, "{err}");
+        assert_eq!(stdout(&out), "");
+    }
 }
 
+#[cfg(not(feature = "ocr"))]
 #[test]
-fn pipeline_once_without_the_model_says_so_once() {
-    let dir = tempfile::tempdir().unwrap();
-    let data = dir.path();
-    notedown_cloud::auth::Accounts::new(data)
-        .create("jordi", "jordi@example.org", "secret")
-        .unwrap();
-    let journal = notedown_cloud::journal::Journal::open(data).unwrap();
-    notedown_cloud::put::put(
-        data,
-        "jordi",
-        &journal,
-        std::path::Path::new(NOTE),
-        "NOTE/Note",
-        None,
-    )
-    .unwrap();
-    let out = pipeline_cmd(data, &["--once"]);
-    assert_eq!(out.status.code(), Some(1));
-    let err = String::from_utf8_lossy(&out.stderr);
-    let message = "the OCR model is missing, run `notedown model pull`";
-    assert_eq!(err.matches(message).count(), 1, "{err}");
-    assert_eq!(stdout(&out), "");
+fn the_pi_build_has_no_pipeline() {
+    let help = stdout(&notedown(&["--help"]));
+    let commands: Vec<&str> = help
+        .lines()
+        .filter_map(|l| {
+            l.strip_prefix("  ")
+                .and_then(|l| l.split_whitespace().next())
+        })
+        .collect();
+    assert!(commands.contains(&"serve"));
+    for gone in ["pipeline", "mcp", "convert", "model"] {
+        assert!(!commands.contains(&gone), "{gone} is in the Pi build");
+    }
 }

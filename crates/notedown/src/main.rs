@@ -1,15 +1,22 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "ocr")]
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
+#[cfg(feature = "ocr")]
 use notedown_convert::inputs;
+#[cfg(feature = "ocr")]
 use notedown_convert::links::FileIndex;
+#[cfg(feature = "ocr")]
 use notedown_convert::pipeline::{Options, Outcome, convert_one};
 use notedown_note::{Notebook, RenderOptions, VersionPolicy, encode_png};
+#[cfg(feature = "ocr")]
 use notedown_ocr::model::{self, DEFAULT_MODEL};
+#[cfg(feature = "ocr")]
 use notedown_ocr::{LlamaEngine, OcrEngine, OcrError, OcrOptions, PageOcr};
 
 #[derive(Parser)]
@@ -26,10 +33,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Convert .note and .png files (or folders of them) to Markdown
+    #[cfg(feature = "ocr")]
     Convert(ConvertArgs),
     /// Render the pages of a .note file as PNG images, or as one PDF with --pdf
     Render(RenderArgs),
     /// Manage the OCR model files
+    #[cfg(feature = "ocr")]
     Model {
         #[command(subcommand)]
         action: ModelAction,
@@ -43,12 +52,15 @@ enum Command {
     },
     /// Read the pages of the notes in a data folder as text (OCR) and keep the text store for
     /// agents. Runs until stopped (Ctrl-C). Loads the OCR model only when a page is due
+    #[cfg(feature = "ocr")]
     Pipeline(PipelineArgs),
     /// The MCP server over stdio: the note texts of one account for an agent. It only reads the
     /// text store and writes bookmarks, it never runs OCR
+    #[cfg(feature = "ocr")]
     Mcp(McpArgs),
 }
 
+#[cfg(feature = "ocr")]
 #[derive(clap::Args)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 struct PipelineArgs {
@@ -69,6 +81,7 @@ struct PipelineArgs {
     note: Option<String>,
 }
 
+#[cfg(feature = "ocr")]
 #[derive(Subcommand)]
 enum PipelineAction {
     /// List the bookmarks of the consumers per account as JSON, or remove one
@@ -103,6 +116,7 @@ enum PipelineAction {
     },
 }
 
+#[cfg(feature = "ocr")]
 #[derive(clap::Args)]
 #[command(group(clap::ArgGroup::new("start").required(true).args(["consumer", "since", "from"])))]
 struct ChangesArgs {
@@ -133,6 +147,7 @@ struct ChangesArgs {
     notes: Option<Vec<String>>,
 }
 
+#[cfg(feature = "ocr")]
 #[derive(clap::Args)]
 struct McpArgs {
     /// The data folder
@@ -157,6 +172,7 @@ struct ServeArgs {
     refuse_sync: bool,
     /// Also run `notedown pipeline` for the same data folder. It stops when the server stops
     #[arg(long)]
+    #[cfg(feature = "ocr")]
     pipeline: bool,
 }
 
@@ -415,6 +431,7 @@ enum AccountAction {
     },
 }
 
+#[cfg(feature = "ocr")]
 #[derive(clap::Args)]
 struct ConvertArgs {
     /// Files or folders to convert (folders are searched recursively)
@@ -467,6 +484,7 @@ struct RenderArgs {
     pdf: bool,
 }
 
+#[cfg(feature = "ocr")]
 #[derive(Subcommand)]
 enum ModelAction {
     /// Download the model files into the cache
@@ -477,6 +495,7 @@ enum ModelAction {
     Verify,
 }
 
+#[cfg(feature = "ocr")]
 /// Loads the model on the first page that needs OCR, so an up-to-date folder never loads it.
 struct LazyEngine {
     label: String,
@@ -488,6 +507,7 @@ struct LazyEngine {
     loaded_in: Option<Duration>,
 }
 
+#[cfg(feature = "ocr")]
 impl OcrEngine for LazyEngine {
     fn ocr_png(&mut self, png: &[u8]) -> Result<PageOcr, OcrError> {
         if self.engine.is_none() {
@@ -530,10 +550,12 @@ fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
+#[cfg(feature = "ocr")]
 fn display_name(rel: &Path) -> String {
     rel.to_string_lossy().into_owned()
 }
 
+#[cfg(feature = "ocr")]
 fn convert(args: ConvertArgs) -> Result<ExitCode> {
     let (found, warnings) = inputs::collect(&args.paths, args.out.as_deref());
     for w in &warnings {
@@ -679,6 +701,7 @@ fn render(args: RenderArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+#[cfg(feature = "ocr")]
 fn model_command(action: ModelAction) -> Result<ExitCode> {
     match action {
         ModelAction::Pull => {
@@ -1716,8 +1739,11 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
         // The handlers are in place before the child starts, so a stop signal always ends
         // the server and with it the child.
         let shutdown = Shutdown::new()?;
+        #[cfg(feature = "ocr")]
         let child: PipelineChild = std::sync::Arc::new(std::sync::Mutex::new(None));
+        #[cfg(feature = "ocr")]
         let guard = PipelineGuard(child.clone());
+        #[cfg(feature = "ocr")]
         if args.pipeline {
             let started = start_pipeline(&args.data)?;
             println!("pipeline: started notedown pipeline (pid {})", started.id());
@@ -1727,6 +1753,7 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
         println!("press Ctrl-C to stop");
         std::io::stdout().flush()?;
         let served = serve_until(listeners, state.clone(), shutdown.wait()).await;
+        #[cfg(feature = "ocr")]
         drop(guard);
         served?;
         println!("stopped");
@@ -1779,6 +1806,7 @@ impl Shutdown {
     }
 }
 
+#[cfg(feature = "ocr")]
 /// `notedown pipeline --data <data>` as a child process of the server.
 fn start_pipeline(data: &Path) -> Result<std::process::Child> {
     let exe = std::env::current_exe().context("cannot find the notedown program")?;
@@ -1791,8 +1819,10 @@ fn start_pipeline(data: &Path) -> Result<std::process::Child> {
         .context("cannot start notedown pipeline")
 }
 
+#[cfg(feature = "ocr")]
 type PipelineChild = std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>;
 
+#[cfg(feature = "ocr")]
 /// Says once when the pipeline child ends by itself; the server keeps running.
 async fn watch_pipeline(child: PipelineChild) {
     loop {
@@ -1816,19 +1846,23 @@ async fn watch_pipeline(child: PipelineChild) {
     }
 }
 
+#[cfg(feature = "ocr")]
 /// How long the pipeline child gets to stop after SIGTERM before it is killed.
 const PIPELINE_STOP_WAIT: Duration = Duration::from_secs(5);
 
+#[cfg(feature = "ocr")]
 /// The pipeline child of `serve --pipeline`. Dropping the guard stops the child, also on an
 /// error or a panic of the server.
 struct PipelineGuard(PipelineChild);
 
+#[cfg(feature = "ocr")]
 impl Drop for PipelineGuard {
     fn drop(&mut self) {
         stop_pipeline(&self.0);
     }
 }
 
+#[cfg(feature = "ocr")]
 /// Stops the pipeline child, if it still runs: SIGTERM (it ends between two pages), then a
 /// kill after [`PIPELINE_STOP_WAIT`].
 fn stop_pipeline(child: &PipelineChild) {
@@ -1860,6 +1894,7 @@ fn stop_pipeline(child: &PipelineChild) {
     let _ = c.wait();
 }
 
+#[cfg(feature = "ocr")]
 /// Sets the flag on Ctrl-C or SIGTERM. The handlers are in place when this returns.
 fn stop_flag() -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>> {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1879,6 +1914,7 @@ fn stop_flag() -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>> {
     Ok(stop)
 }
 
+#[cfg(feature = "ocr")]
 fn pipeline_command(args: PipelineArgs) -> Result<ExitCode> {
     use notedown_pipeline::worker::{EngineLoader, Worker};
     if let Some(action) = args.action {
@@ -1934,6 +1970,7 @@ fn pipeline_command(args: PipelineArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+#[cfg(feature = "ocr")]
 fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
     use notedown_pipeline::delta::{self, MAX_CHARS, Start};
     use notedown_pipeline::format::to_json;
@@ -2032,6 +2069,7 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+#[cfg(feature = "ocr")]
 fn mcp_command(args: McpArgs) -> Result<ExitCode> {
     // serve_stdio builds its own runtime; this is plain synchronous code.
     notedown_pipeline::mcp::serve_stdio(&args.data, args.account.as_deref())?;
@@ -2041,12 +2079,16 @@ fn mcp_command(args: McpArgs) -> Result<ExitCode> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
+        #[cfg(feature = "ocr")]
         Command::Convert(a) => convert(a),
         Command::Render(a) => render(a),
+        #[cfg(feature = "ocr")]
         Command::Model { action } => model_command(action),
         Command::Serve(a) => serve_command(a),
         Command::Cloud { action } => cloud_command(action),
+        #[cfg(feature = "ocr")]
         Command::Pipeline(a) => pipeline_command(a),
+        #[cfg(feature = "ocr")]
         Command::Mcp(a) => mcp_command(a),
     };
     let _ = std::io::stdout().flush();
@@ -2054,6 +2096,7 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e:#}");
+            #[cfg(feature = "ocr")]
             if matches!(
                 e.downcast_ref::<OcrError>(),
                 Some(OcrError::ModelMissing { .. })

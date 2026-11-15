@@ -260,10 +260,9 @@ jobs:
       - name: cargo test --doc
         run: cargo test --workspace --doc --locked
 
-  # Linux on arm64, the Raspberry Pi. notedown-cloud is the sync server and
-  # has no OCR dependency, so this job builds it without llama.cpp. Once the
-  # notedown binary gets a feature that leaves OCR out, this job becomes the
-  # full Pi server build: that binary, built and tested here.
+  # Linux on arm64, the Raspberry Pi. This job is the spec's Pi build check:
+  # the notedown binary without its `ocr` feature (no llama.cpp) is built,
+  # linted and tested here, and the dependency tree must not contain OCR.
   pi:
     name: pi (arm64)
     timeout-minutes: 30
@@ -298,6 +297,23 @@ jobs:
 
       - name: cargo test --doc -p notedown-cloud
         run: cargo test -p notedown-cloud --doc --locked
+
+      - name: cargo clippy -p notedown --no-default-features
+        run: cargo clippy -p notedown --no-default-features --all-targets --locked -- -D warnings
+
+      - name: cargo nextest run -p notedown --no-default-features
+        run: cargo nextest run -p notedown --no-default-features --locked --no-tests=warn
+
+      - name: cargo build --release -p notedown --no-default-features
+        run: cargo build --release -p notedown --no-default-features --locked
+
+      - name: The Pi build has no OCR in its dependency tree
+        run: |
+          tree="$(cargo tree --locked --target aarch64-unknown-linux-gnu -p notedown --no-default-features -e normal)"
+          if printf '%s\n' "$tree" | grep -E 'llama-cpp|notedown-ocr|notedown-pipeline|notedown-convert'; then
+            echo "the Pi build pulls in OCR"
+            exit 1
+          fi
 
   # Dependency audit: advisories (RustSec), licenses (the allowlist in
   # deny.toml), sources and bans. security.yml also checks advisories every

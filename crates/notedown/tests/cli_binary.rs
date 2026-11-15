@@ -2311,11 +2311,13 @@ fn revoke_refuses_a_bad_id() {
 }
 
 /// A running `notedown serve` on a random loopback port; it is killed on drop.
+#[cfg(feature = "ocr")]
 struct Server {
     child: std::process::Child,
     url: String,
 }
 
+#[cfg(feature = "ocr")]
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -2323,6 +2325,7 @@ impl Drop for Server {
     }
 }
 
+#[cfg(feature = "ocr")]
 fn running_server(data: &std::path::Path) -> Server {
     use std::io::BufRead;
     std::fs::write(data.join("server.toml"), "listen = [\"127.0.0.1:0\"]\n").unwrap();
@@ -2355,6 +2358,7 @@ fn running_server(data: &std::path::Path) -> Server {
     }
 }
 
+#[cfg(feature = "ocr")]
 fn connect_cmd(url: &str, local: &std::path::Path, password: &str) -> std::process::Output {
     use std::io::Write;
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
@@ -2372,6 +2376,7 @@ fn connect_cmd(url: &str, local: &std::path::Path, password: &str) -> std::proce
     child.wait_with_output().unwrap()
 }
 
+#[cfg(feature = "ocr")]
 fn server_with_account() -> (tempfile::TempDir, Server) {
     let dir = tempfile::tempdir().unwrap();
     let out = cloud(
@@ -2390,6 +2395,7 @@ fn server_with_account() -> (tempfile::TempDir, Server) {
     (dir, server)
 }
 
+#[cfg(feature = "ocr")]
 #[test]
 fn connect_logs_in_and_writes_pipeline_toml() {
     let (_data, server) = server_with_account();
@@ -2432,6 +2438,7 @@ fn connect_logs_in_and_writes_pipeline_toml() {
 }
 
 #[cfg(unix)]
+#[cfg(feature = "ocr")]
 #[test]
 fn connect_stores_the_token_privately() {
     use std::os::unix::fs::PermissionsExt;
@@ -2455,6 +2462,7 @@ fn connect_stores_the_token_privately() {
     }
 }
 
+#[cfg(feature = "ocr")]
 #[test]
 fn connect_with_a_wrong_password_says_so() {
     let (_data, server) = server_with_account();
@@ -2471,6 +2479,7 @@ fn connect_with_a_wrong_password_says_so() {
     assert!(!local.path().join("pipeline.toml").exists());
 }
 
+#[cfg(feature = "ocr")]
 #[test]
 fn connect_checks_the_folder_before_the_password() {
     let (data, server) = server_with_account();
@@ -2498,6 +2507,7 @@ fn connect_checks_the_folder_before_the_password() {
     assert!(!local.path().join("tokens").exists());
 }
 
+#[cfg(feature = "ocr")]
 #[test]
 fn connect_refuses_a_url_with_a_user_name_or_a_password() {
     let (_data, server) = server_with_account();
@@ -2517,6 +2527,7 @@ fn connect_refuses_a_url_with_a_user_name_or_a_password() {
     assert!(!local.path().join("pipeline.toml").exists());
 }
 
+#[cfg(feature = "ocr")]
 #[test]
 fn connect_refuses_another_url_in_pipeline_toml() {
     let (_data, server) = server_with_account();
@@ -2538,6 +2549,7 @@ fn connect_refuses_another_url_in_pipeline_toml() {
     assert!(!local.path().join("tokens").exists());
 }
 
+#[cfg(feature = "ocr")]
 #[test]
 fn connect_refuses_a_server_data_folder() {
     let (data, server) = server_with_account();

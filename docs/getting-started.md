@@ -10,13 +10,12 @@ The examples use a Nomad. Other Supernote devices should work the same way, but 
 
 ### 1. Install notedown
 
-```sh
-brew install jordiboehme/tap/notedown
-```
-
-Or build it from source with a recent Rust toolchain:
+There is no release yet, so build it from source. rustup installs the toolchain that
+`rust-toolchain.toml` names:
 
 ```sh
+git clone https://github.com/jordiboehme/notedown.git
+cd notedown
 cargo install --path crates/notedown
 ```
 

@@ -1,179 +1,13 @@
-//! The page records of an account (`accounts/<slug>/pages/<key>.json`) and its note files,
-//! read straight from disk. Only [`crate::source::FolderSource`] reads them this way; the worker
-//! goes through [`crate::source::ServerData`].
-//!
-//! The pipeline never writes below `accounts/`, so it does not open a `notedown_cloud` `Store`
-//! (opening one probes the folder with a temp file and compacts `ids.jsonl`). The checks are
-//! those of `notedown_cloud::pages::read_record`: the key comes from the file name, and a
-//! record whose `fileId` is not that key, or whose `noteId` is not a valid `FILE_ID`, is not
-//! used.
+//! The page records of an account and what the pipeline makes of them: the digests of a note
+//! and the page-index key of a link. The records themselves are read by
+//! [`notedown_cloud::read`], through [`crate::source::ServerData`].
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::collections::BTreeMap;
 
-use notedown_cloud::appdata::{DIGESTS_DIR, Digest};
-use notedown_cloud::auth::Accounts;
-use notedown_cloud::pages::{PAGES_DIR, PageRecord, valid_file_id, valid_key};
-use notedown_cloud::store::WirePath;
+use notedown_cloud::appdata::Digest;
 use notedown_note::DigestRef;
 
-use crate::{Error, Result};
-
-/// A page record and the time of the note's last page change: the record file's mtime, in
-/// ms since the epoch. The server writes a record only when the note's bytes change (and when
-/// it moves the note).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Record {
-    pub record: PageRecord,
-    pub changed_ms: u64,
-}
-
-/// The page records of one account.
-#[derive(Debug, Default)]
-pub struct Records {
-    /// By key.
-    pub records: BTreeMap<String, Record>,
-    /// Keys whose record file exists but cannot be used now. Their notes are left alone,
-    /// never taken as deleted.
-    pub unreadable: BTreeSet<String>,
-    /// False when `pages/` itself is missing: nothing is known, so no note counts as deleted.
-    pub complete: bool,
-}
-
-impl Records {
-    /// Whether the note `key` may count as deleted: the folder was listed and holds no record
-    /// file of it.
-    pub fn gone(&self, key: &str) -> bool {
-        self.complete && !self.records.contains_key(key) && !self.unreadable.contains(key)
-    }
-}
-
-/// `accounts/<slug>`.
-pub(crate) fn account_dir(data: &Path, slug: &str) -> PathBuf {
-    Accounts::new(data).account_dir(slug)
-}
-
-/// The key of a record file name: `<FILE_ID>.json` or `path-<md5>.json`.
-fn key_of(name: &str) -> Option<String> {
-    let stem = name.strip_suffix(".json")?;
-    let key = match stem.strip_prefix("path-") {
-        Some(md5) => format!("path:{md5}"),
-        None => stem.to_string(),
-    };
-    valid_key(&key).then_some(key)
-}
-
-fn io(path: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
-    move |source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    }
-}
-
-/// Reads every page record of account `slug`.
-pub(crate) fn read(data: &Path, slug: &str) -> Result<Records> {
-    let dir = account_dir(data, slug).join(PAGES_DIR);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Records::default()),
-        Err(e) => return Err(io(&dir)(e)),
-    };
-    let mut out = Records {
-        complete: true,
-        ..Records::default()
-    };
-    for entry in entries {
-        let entry = entry.map_err(io(&dir))?;
-        let Some(key) = entry.file_name().to_str().and_then(key_of) else {
-            continue;
-        };
-        match read_one(&entry.path(), &key) {
-            Some(r) => {
-                out.records.insert(key, r);
-            }
-            None => {
-                out.unreadable.insert(key);
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// The record of `key`, `None` when it is missing or cannot be used.
-pub(crate) fn read_key(data: &Path, slug: &str, key: &str) -> Option<Record> {
-    if !valid_key(key) {
-        return None;
-    }
-    let name = match key.strip_prefix("path:") {
-        Some(md5) => format!("path-{md5}.json"),
-        None => format!("{key}.json"),
-    };
-    read_one(&account_dir(data, slug).join(PAGES_DIR).join(name), key)
-}
-
-fn read_one(path: &Path, key: &str) -> Option<Record> {
-    let file = std::fs::File::open(path).ok()?;
-    let changed_ms = file
-        .metadata()
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_millis() as u64);
-    let record: PageRecord = match serde_json::from_reader(std::io::BufReader::new(file)) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("warning: {}: cannot be read: {e}", path.display());
-            return None;
-        }
-    };
-    let ok = record.file_id == key
-        && record
-            .note_id
-            .iter()
-            .all(|id| valid_file_id(Some(id)).is_some());
-    if !ok {
-        eprintln!(
-            "warning: {} has a fileId or noteId that does not match its name",
-            path.display()
-        );
-        return None;
-    }
-    Some(Record { record, changed_ms })
-}
-
-/// The live digest items of account `slug`, read from `accounts/<slug>/digests/items/*.json`
-/// (spec 2.1). A file that cannot be read is left out with a warning.
-pub(crate) fn digests(data: &Path, slug: &str) -> Result<Vec<Digest>> {
-    let dir = account_dir(data, slug).join(DIGESTS_DIR).join("items");
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(io(&dir)(e)),
-    };
-    let mut out = Vec::new();
-    for entry in entries {
-        let path = entry.map_err(io(&dir))?.path();
-        let is_json = path.extension().is_some_and(|x| x == "json")
-            && !path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with('.'));
-        if !is_json {
-            continue;
-        }
-        let digest = std::fs::read(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|b| serde_json::from_slice::<Digest>(&b).map_err(|e| e.to_string()));
-        match digest {
-            Ok(d) if d.is_live() => out.push(d),
-            Ok(_) => {}
-            Err(e) => eprintln!("warning: {}: cannot be read: {e}", path.display()),
-        }
-    }
-    out.sort_by_key(|d| d.id);
-    Ok(out)
-}
+pub use notedown_cloud::read::{Record, Records};
 
 /// The digests that point to the note with `file_id` at wire `path`: by
 /// `metadata.note_fileId`, or, only for a digest without one, by `sourcePath` (relative to the
@@ -208,23 +42,6 @@ pub fn digests_of(digests: &[Digest], file_id: Option<&str>, path: &str) -> Vec<
             source: None,
         })
         .collect()
-}
-
-/// The file of the note at wire `path`: `accounts/<slug>/files/<path>`.
-pub(crate) fn note_file(data: &Path, slug: &str, path: &str) -> Result<PathBuf> {
-    let wire = WirePath::parse(path)?;
-    Ok(wire.to_fs(&account_dir(data, slug).join("files")))
-}
-
-/// Whether the note file at wire `path` is missing: it is not there, and the account's
-/// `files/` folder is. Any other error (a folder in its place, no access) is no answer, and
-/// without `files/` nothing is known, so neither counts as missing.
-pub(crate) fn note_missing(data: &Path, slug: &str, path: &str) -> bool {
-    let Ok(file) = note_file(data, slug, path) else {
-        return false;
-    };
-    matches!(std::fs::metadata(&file), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
-        && account_dir(data, slug).join("files").is_dir()
 }
 
 /// The page-index key of a link target. `file_id` is the raw `FILE_ID` of the target as the
@@ -264,6 +81,8 @@ pub fn link_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notedown_cloud::pages::PageRecord;
+    use notedown_cloud::read::digests;
 
     fn rec(key: &str, note_id: Option<&str>, path: &str) -> (String, Record) {
         (
@@ -304,12 +123,6 @@ mod tests {
             Some(plain)
         );
         assert_eq!(link_key(&records, Some("F9"), "/x/y.note"), None);
-        assert_eq!(
-            key_of("path-0123456789abcdef0123456789abcdef.json").as_deref(),
-            Some(copy)
-        );
-        assert_eq!(key_of("F1.json").as_deref(), Some("F1"));
-        assert_eq!(key_of("../x.json"), None);
     }
 
     #[test]
@@ -373,32 +186,5 @@ mod tests {
         assert_eq!(ids, ["u1", "u2", "7"]);
         assert_eq!(found[0].time_ms, Some(5));
         assert!(digests_of(&all, None, "NOTE/Note/c.note").is_empty());
-    }
-
-    #[test]
-    fn records_are_read_with_their_checks() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("accounts/jordi/pages");
-        let missing = read(tmp.path(), "jordi").unwrap();
-        assert!(!missing.complete);
-        assert!(!missing.gone("F1"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let good = rec("F1", None, "NOTE/Note/a.note").1.record;
-        std::fs::write(dir.join("F1.json"), serde_json::to_vec(&good).unwrap()).unwrap();
-        let mut wrong = good.clone();
-        wrong.file_id = "F3".into();
-        std::fs::write(dir.join("F2.json"), serde_json::to_vec(&wrong).unwrap()).unwrap();
-        std::fs::write(dir.join("F4.json"), "{").unwrap();
-        let r = read(tmp.path(), "jordi").unwrap();
-        assert!(r.complete);
-        assert_eq!(r.records["F1"].record, good);
-        assert!(r.records["F1"].changed_ms > 0);
-        assert_eq!(r.unreadable.iter().collect::<Vec<_>>(), ["F2", "F4"]);
-        assert!(!r.gone("F2") && !r.gone("F1") && r.gone("F5"));
-        assert_eq!(read_key(tmp.path(), "jordi", "F1").unwrap().record, good);
-        assert_eq!(
-            note_file(tmp.path(), "jordi", "NOTE/Note/a.note").unwrap(),
-            tmp.path().join("accounts/jordi/files/NOTE/Note/a.note")
-        );
     }
 }

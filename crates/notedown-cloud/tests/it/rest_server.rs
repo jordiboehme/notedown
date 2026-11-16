@@ -39,6 +39,11 @@ impl Drop for Server {
 }
 
 pub(crate) fn start() -> Server {
+    start_with(|_| {})
+}
+
+/// [`start`] with `edit` applied to the server's config first.
+pub(crate) fn start_with(edit: impl FnOnce(&mut Config)) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
@@ -50,11 +55,12 @@ pub(crate) fn start() -> Server {
         .enable_all()
         .build()
         .unwrap();
-    let config = Config {
+    let mut config = Config {
         listen: vec!["127.0.0.1:0".parse().unwrap()],
         sync: SyncMode::Accept,
         ..Config::default()
     };
+    edit(&mut config);
     let listeners = rt.block_on(bind(&config)).unwrap();
     let addr = listeners[0].local_addr().unwrap();
     let state = AppState::open(config, &data).unwrap();
@@ -81,7 +87,12 @@ pub(crate) fn start() -> Server {
 /// [`start`] with the account imported: the protect gate is open and the native folders are
 /// there (ids without events).
 pub(crate) fn start_imported() -> Server {
-    let s = start();
+    start_imported_with(|_| {})
+}
+
+/// [`start_imported`] with `edit` applied to the server's config first.
+pub(crate) fn start_imported_with(edit: impl FnOnce(&mut Config)) -> Server {
+    let s = start_with(edit);
     let store = s.state.store("jordi").unwrap();
     let g = store.lock().unwrap();
     store.ensure_native_folders(&g).unwrap();

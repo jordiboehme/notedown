@@ -335,7 +335,7 @@ fn scan_scope(
 /// [`scan_scope`] for every existing folder on the way to `target` (stored spelling,
 /// [`Store::way_scopes`]): the root, then each folder above `target` that is a real folder on
 /// disk, direct children only.
-fn scan_way(
+pub(crate) fn scan_way(
     state: &AppState,
     store: &Store,
     guard: &WriteGuard,

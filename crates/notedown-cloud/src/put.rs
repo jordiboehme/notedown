@@ -179,7 +179,9 @@ fn stage_and_commit(
 /// `way_scan(path)` (the scans of the folders on the way, which also refuse a scan hold), then
 /// a file at `path` with these bytes is [`PutOutcome::Unchanged`], then `precondition`
 /// (`Error::PreconditionFailed`), then the plan, the page events and the commit. It never
-/// removes the staged file; the caller does.
+/// removes the staged file; the caller does. Once the commit is durable it never fails: a hash
+/// cache that can't be written and a modification time that can't be read (then 0) are only
+/// warned about.
 #[allow(clippy::too_many_arguments)] // one call per caller; the decisions file names them all
 pub fn commit_staged(
     store: &Store,
@@ -197,6 +199,8 @@ pub fn commit_staged(
     if precondition != Precondition::None {
         check_precondition(store, guard, path, md5, &precondition)?;
     }
+    // The size of the staged bytes: what is at `path` after the commit, also when unchanged.
+    let size = std::fs::metadata(staged).map_err(io_err(staged))?.len();
     let mut commit = store.plan_put_with(
         guard,
         path,
@@ -229,17 +233,26 @@ pub fn commit_staged(
     };
     crate::pages::plan_page_events(store, guard, &mut commit);
     let seqs = store.commit(guard, commit, journal)?;
-    store.flush_cache(guard)?;
+    // The commit is durable: nothing after it may turn it into an error.
+    if let Err(e) = store.flush_cache(guard) {
+        eprintln!("notedown cloud: warning: {path}: the hash cache is not written: {e}");
+    }
     let fs = store.fs_path(path);
-    let meta = std::fs::metadata(&fs).map_err(io_err(&fs))?;
+    let mtime_ms = match std::fs::metadata(&fs) {
+        Ok(meta) => crate::store::mtime_ms(&meta),
+        Err(e) => {
+            eprintln!("notedown cloud: warning: {path}: no modification time: {e}");
+            0
+        }
+    };
     Ok(PutResult {
         id,
         path: path.clone(),
         outcome,
         seqs,
         md5,
-        size: meta.len(),
-        mtime_ms: crate::store::mtime_ms(&meta),
+        size,
+        mtime_ms,
     })
 }
 

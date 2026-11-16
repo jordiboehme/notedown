@@ -18,6 +18,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
+use super::errors::write_error;
 use super::routes::{Refusal, account_of, bad_request, error, internal, not_modified, query};
 use crate::Error;
 use crate::api::files::gate_locked;
@@ -56,14 +57,11 @@ impl From<&Entry> for AppEntry {
     }
 }
 
-/// The answer to a store error: 423 `scan_hold` while a scan holds the account, 423
-/// `not_imported` while the protect gate is closed, else 500 `internal`.
+/// The answer to a store error: that of a write ([`write_error`]: 423 `scan_hold` while a scan
+/// holds the account, 423 `not_imported` while the protect gate is closed, 503 `store_damaged`,
+/// else 500 `internal`).
 fn store_error(e: Error) -> Response {
-    match e {
-        Error::ScanHold(_) => error(StatusCode::LOCKED, "scan_hold"),
-        Error::GateClosed(_) => error(StatusCode::LOCKED, "not_imported"),
-        e => internal(e),
-    }
+    write_error(e)
 }
 
 /// Runs store work off the runtime; an error is [`store_error`], a panic a 500.

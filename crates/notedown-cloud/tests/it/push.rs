@@ -14,7 +14,7 @@ use axum::body::Body;
 use axum::extract::connect_info::MockConnectInfo;
 use axum::http::Request;
 use futures_util::{SinkExt, StreamExt};
-use notedown_cloud::auth::{Accounts, Imported, expected_login_hash, md5_hex};
+use notedown_cloud::auth::{Accounts, Imported, Scope, expected_login_hash, md5_hex};
 use notedown_cloud::journal::{Event, EventBody, FileKind, Origin, new_op_id};
 use notedown_cloud::push::{
     RETRY_MS, file_syn_message, follow_once, server_message_frame, start_seq, startsync_item, tick,
@@ -345,6 +345,39 @@ fn one_put_pushes_each_bound_device_once() {
     assert!(f.outbound(A).is_empty() && f.outbound(B).is_empty());
     assert!(!f.pending(A) && !f.pending(B));
     f.advance_ms(300);
+    assert_eq!(f.ping(A), Some(startsync(None, t, t + 300)));
+    assert_eq!(f.ping(B), Some(startsync(None, t, t + 300)));
+}
+
+#[tokio::test]
+async fn a_rest_upload_is_pushed_to_every_bound_device() {
+    let mut f = Fixture::new();
+    let now = f.state.now_ms();
+    let (code, _) = f.state.auth.challenge(EMAIL, now).unwrap();
+    let hash = expected_login_hash(&md5_hex("secret"), &code);
+    let (token, _, _) = f
+        .state
+        .auth
+        .rest_login(EMAIL, &hash, "mac", Scope::Write, now)
+        .unwrap();
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/rest/v1/files?path=NOTE%2FNote%2Fa.txt")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-length", "5")
+        .body(Body::from("hello"))
+        .unwrap();
+    let resp = notedown_cloud::rest::router(f.state.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 201);
+    assert!(f.follow() > 0);
+    f.advance_ms(2000);
+    let t = f.now();
+    assert_eq!(tick(&f.state, t), 2);
+    f.advance_ms(300);
+    // No device made the change: every bound device gets it (`equipmentNo` "null-null").
     assert_eq!(f.ping(A), Some(startsync(None, t, t + 300)));
     assert_eq!(f.ping(B), Some(startsync(None, t, t + 300)));
 }

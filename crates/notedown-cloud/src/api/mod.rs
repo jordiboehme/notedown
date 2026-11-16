@@ -476,8 +476,10 @@ fn raw_json(bytes: &[u8]) -> Option<String> {
 
 /// Writes one [`LogEntry`] per request: method, path, query, headers, masked bodies, status,
 /// envelope result, duration, device, firmware and flags. The request body is read up to
-/// [`MAX_REQUEST_BODY`]; a larger one is not passed on (the answer is still an envelope). The
-/// byte uploads of accept mode are passed on unread and logged as `<N bytes, not logged>`.
+/// [`MAX_REQUEST_BODY`]; a larger one is not passed on (the answer is still an envelope, or the
+/// JSON 413 `too_large` of the REST API). The byte uploads of accept mode and the app's upload
+/// ([`crate::rest::is_streamed_write`]) are passed on unread and logged as
+/// `<N bytes, not logged>`.
 /// A REST read that succeeded and a repeated REST token refusal are passed on without a line
 /// ([`crate::rest::unlogged`]).
 pub async fn log_request(
@@ -517,7 +519,9 @@ pub async fn log_request(
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let response = if is_streamed_upload(&state, &parts.method, parts.uri.path()) {
+    let response = if is_streamed_upload(&state, &parts.method, parts.uri.path())
+        || crate::rest::is_streamed_write(&parts.method, parts.uri.path())
+    {
         // Counted while the handler streams it; never buffered here.
         let seen = Arc::new(AtomicU64::new(0));
         let counter = seen.clone();
@@ -559,25 +563,30 @@ pub async fn log_request(
                         &content_type
                     }
                 )));
-                let normalized = refuse::normalize(parts.uri.path());
-                let accepted = state.sync_mode() == SyncMode::Accept
-                    && is_accept_implemented(&parts.method, parts.uri.path());
-                let reply = if accepted {
-                    // An implemented route: the note in request_body explains the refusal.
-                    Reply::bad_params("body too large")
-                } else if refuse::is_refused_path(&normalized) {
-                    refuse::refusal(&parts.method, &parts.uri)
+                if crate::rest::is_rest_path(parts.uri.path()) {
+                    // The REST API answers in its own JSON, in every sync mode.
+                    crate::rest::body_too_large()
                 } else {
-                    // The note in request_body explains the refusal; only a path no route takes is
-                    // unknown.
-                    let reply = Reply::bad_params("body too large");
-                    if is_implemented(&parts.method, parts.uri.path()) {
-                        reply
+                    let normalized = refuse::normalize(parts.uri.path());
+                    let accepted = state.sync_mode() == SyncMode::Accept
+                        && is_accept_implemented(&parts.method, parts.uri.path());
+                    let reply = if accepted {
+                        // An implemented route: the note in request_body explains the refusal.
+                        Reply::bad_params("body too large")
+                    } else if refuse::is_refused_path(&normalized) {
+                        refuse::refusal(&parts.method, &parts.uri)
                     } else {
-                        reply.flag(FLAG_UNKNOWN)
-                    }
-                };
-                reply.into_response()
+                        // The note in request_body explains the refusal; only a path no route
+                        // takes is unknown.
+                        let reply = Reply::bad_params("body too large");
+                        if is_implemented(&parts.method, parts.uri.path()) {
+                            reply
+                        } else {
+                            reply.flag(FLAG_UNKNOWN)
+                        }
+                    };
+                    reply.into_response()
+                }
             }
         }
     };

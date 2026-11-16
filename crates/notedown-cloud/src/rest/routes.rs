@@ -6,15 +6,16 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use axum::body::{Body, Bytes};
+use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{MethodRouter, any, get, post};
+use axum::routing::{MethodRouter, any, get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{PREFIX, RefusedToken, browse};
+use super::{PREFIX, RefusedToken, browse, write};
 use crate::api::ClientAddr;
 use crate::api::envelope::{LogMessage, Streamed};
 use crate::api::oss::{Flow, stream_body};
@@ -48,6 +49,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(&path("/tree"), get_only(get(browse::tree)))
         .route(&path("/entries/{id}"), get_only(get(browse::entry)))
         .route(&path("/files/{id}"), get_only(get(browse::file)))
+        // The upload streams its body to staging and enforces its own limit.
+        .route(
+            &path("/files"),
+            put(write::upload)
+                .fallback(no_route)
+                .layer(DefaultBodyLimit::disable()),
+        )
         .route(PREFIX, any(no_route))
         .route(&path("/"), any(no_route))
         .route(&path("/{*rest}"), any(no_route))
@@ -96,7 +104,7 @@ pub(super) type Refusal = Box<Response>;
 
 /// Who a token speaks for.
 enum Caller {
-    Live(Box<Account>),
+    Live(Box<Account>, Scope),
     Removed {
         slug: String,
         user_id: u64,
@@ -146,8 +154,8 @@ async fn caller(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(Caller, S
     let st = state.clone();
     let now = state.now_ms();
     match blocking(move || st.rest_tokens.check(&token, now)).await? {
-        // The scope is enforced by the write routes.
-        TokenCheck::Valid(account, _scope) => Ok((Caller::Live(Box::new(account)), id)),
+        // The scope is enforced by the write routes ([`writer_of`]).
+        TokenCheck::Valid(account, scope) => Ok((Caller::Live(Box::new(account), scope), id)),
         TokenCheck::Removed { user_id, seq } => Ok((Caller::Removed { slug, user_id, seq }, id)),
         TokenCheck::Refused => Err(Box::new(refused(id))),
     }
@@ -159,7 +167,21 @@ pub(super) async fn account_of(
     headers: &HeaderMap,
 ) -> Result<Account, Refusal> {
     match caller(state, headers).await? {
-        (Caller::Live(account), _) => Ok(*account),
+        (Caller::Live(account, _), _) => Ok(*account),
+        (Caller::Removed { user_id, seq, .. }, id) => Err(Box::new(removed(id, user_id, seq))),
+    }
+}
+
+/// [`account_of`] for a write: a read token is 403 `read_only_token`.
+pub(super) async fn writer_of(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Result<Account, Refusal> {
+    match caller(state, headers).await? {
+        (Caller::Live(account, Scope::Write), _) => Ok(*account),
+        (Caller::Live(_, Scope::Read), _) => {
+            Err(Box::new(error(StatusCode::FORBIDDEN, "read_only_token")))
+        }
         (Caller::Removed { user_id, seq, .. }, id) => Err(Box::new(removed(id, user_id, seq))),
     }
 }
@@ -355,7 +377,7 @@ async fn journal(State(state): State<Arc<AppState>>, headers: HeaderMap, uri: Ur
     };
     let limit = usize::try_from(limit).map_or(JOURNAL_LIMIT, |l| l.min(JOURNAL_LIMIT));
     let (slug, until) = match caller {
-        Caller::Live(a) => (a.slug, u64::MAX),
+        Caller::Live(a, _) => (a.slug, u64::MAX),
         Caller::Removed { slug, seq, .. } => (slug, seq),
     };
     let data = state.data_dir.clone();

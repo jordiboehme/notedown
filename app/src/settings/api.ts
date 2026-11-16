@@ -46,6 +46,8 @@ export const mcpInfo = () => invoke<{ sidecar: string; dataDir: string }>("mcp_i
 export const openLink = (url: string) => invoke("open_link", { url });
 export const getAutostart = () => invoke<boolean>("get_autostart");
 export const setAutostart = (on: boolean) => invoke<boolean>("set_autostart", { on });
+/** Logs in and keeps a write token in the Keychain; answers the config with the account. */
+export const logIn = (email: string, password: string) => invoke<AppConfig>("log_in", { email, password });
 export const logOut = () => invoke("log_out");
 export const modelState = () => invoke<ModelState>("model_state");
 export const modelPull = () => invoke("model_pull");

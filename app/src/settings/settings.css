@@ -97,7 +97,9 @@
   outline-offset: 0;
 }
 
-.settings input[type="text"] {
+.settings input[type="text"],
+.settings input[type="email"],
+.settings input[type="password"] {
   font: inherit;
   color: var(--primary);
   width: 240px;

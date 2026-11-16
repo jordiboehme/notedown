@@ -19,6 +19,7 @@
     "allow-open-link",
     "allow-get-autostart",
     "allow-set-autostart",
+    "allow-log-in",
     "allow-log-out",
     "allow-model-state",
     "allow-model-pull",

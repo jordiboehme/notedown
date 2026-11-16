@@ -2,6 +2,7 @@
 
 pub mod commands;
 pub mod config;
+pub mod login;
 pub mod model;
 pub mod pidfile;
 pub mod poller;
@@ -9,6 +10,7 @@ pub mod probe;
 pub mod process;
 pub mod processes;
 pub mod quit;
+pub mod rest;
 pub mod serve_info;
 pub mod status;
 pub mod supervisor;
@@ -118,6 +120,7 @@ pub fn run() {
             commands::open_settings,
             commands::quit_app,
             commands::request_quit,
+            commands::log_in,
             commands::log_out,
             commands::process_logs,
             commands::mcp_info,
@@ -407,7 +410,7 @@ mod tests {
         names.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    const SETTINGS_ONLY: [&str; 16] = [
+    const SETTINGS_ONLY: [&str; 17] = [
         "get_config",
         "set_mode",
         "set_start_view",
@@ -415,6 +418,7 @@ mod tests {
         "stop_processes",
         "set_autostart",
         "get_autostart",
+        "log_in",
         "log_out",
         "model_pull",
         "model_pause",
@@ -501,7 +505,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 21);
+        assert_eq!(handler_commands().len(), 22);
     }
 
     #[test]
@@ -518,6 +522,7 @@ mod tests {
             "open_settings",
             "quit_app",
             "request_quit",
+            "log_in",
             "log_out",
             "process_logs",
             "mcp_info",

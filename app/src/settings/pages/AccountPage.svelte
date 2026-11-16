@@ -1,28 +1,53 @@
 <script lang="ts">
-  import { failure, logOut } from "../api";
+  import { failure, logIn, logOut } from "../api";
+  import { accountActions } from "../account";
   import { config } from "../config.svelte";
   import Form from "../kit/Form.svelte";
   import Row from "../kit/Row.svelte";
   import Section from "../kit/Section.svelte";
 
-  // Settings > Account: who is logged in where. Log out deletes the login of this Mac.
-  let note = $state<{ text: string; tone: "secondary" | "good" | "bad" } | null>(null);
-  let busy = $state(false);
+  // Settings > Account: who is logged in where. Log in keeps a write token in the Keychain;
+  // Log out deletes the login of this Mac.
+  type Note = { text: string; tone: "secondary" | "good" | "bad" };
+  let loginNote = $state<Note | null>(null);
+  let logoutNote = $state<Note | null>(null);
+  let busy = $state<"logIn" | "logOut" | null>(null);
+  let email = $state(config.current?.email ?? "");
+  let password = $state("");
 
   const current = $derived(config.current);
   const server = $derived(
     current?.mode === "local" ? "This Mac" : current?.mode === "remote" ? (current.serverUrl ?? "Not set") : "Not set up yet",
   );
+  const actions = $derived(
+    accountActions({ mode: current?.mode ?? null, account: current?.account ?? null, email, password, busy }),
+  );
+
+  async function enter(event: SubmitEvent) {
+    event.preventDefault();
+    if (!actions.logIn.enabled) return;
+    busy = "logIn";
+    loginNote = null;
+    try {
+      config.current = await logIn(email, password);
+      loginNote = { text: `Logged in as ${config.current.account}.`, tone: "good" };
+    } catch (error) {
+      loginNote = { text: failure(error), tone: "bad" };
+    } finally {
+      password = "";
+      busy = null;
+    }
+  }
 
   async function leave() {
-    busy = true;
+    busy = "logOut";
     try {
       await logOut();
-      note = { text: "Logged out. The login is deleted from this Mac.", tone: "good" };
+      logoutNote = { text: "Logged out. The login is deleted from this Mac.", tone: "good" };
     } catch (error) {
-      note = { text: failure(error), tone: "bad" };
+      logoutNote = { text: failure(error), tone: "bad" };
     } finally {
-      busy = false;
+      busy = null;
     }
   }
 </script>
@@ -36,13 +61,33 @@
       <span class="value">Not known yet</span>
     </Row>
   </Section>
+  <form onsubmit={enter}>
+    <Section title="Log in">
+      <Row title="E-mail">
+        <input type="email" bind:value={email} autocomplete="username" spellcheck="false" />
+      </Row>
+      <Row title="Password">
+        <input type="password" bind:value={password} autocomplete="current-password" />
+      </Row>
+      <Row title="Log in" note={loginNote?.text ?? actions.logIn.note} tone={loginNote?.tone ?? "secondary"}>
+        <button type="submit" class="button strong" disabled={!actions.logIn.enabled}>Log in</button>
+      </Row>
+    </Section>
+  </form>
   <Section>
     <Row
       title="Log out"
-      note={note?.text ?? "Deletes the login from this Mac. The notes stay where they are."}
-      tone={note?.tone ?? "secondary"}
+      note={logoutNote?.text ?? "Deletes the login from this Mac. The notes stay where they are."}
+      tone={logoutNote?.tone ?? "secondary"}
     >
-      <button type="button" class="button" disabled={busy || !current?.account} onclick={leave}>Log out</button>
+      <button type="button" class="button" disabled={!actions.logOut.enabled} onclick={leave}>Log out</button>
     </Row>
   </Section>
 </Form>
+
+<style>
+  /* The form only groups the fields for Return; the page keeps its layout. */
+  form {
+    display: contents;
+  }
+</style>

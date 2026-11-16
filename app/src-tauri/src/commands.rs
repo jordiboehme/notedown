@@ -8,6 +8,7 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::config::{self, AppConfig, Mode, StartView};
+use crate::login::{self, Password};
 use crate::model::{ModelControl, ModelState};
 use crate::poller::Poller;
 use crate::processes::{ProcessStates, Processes};
@@ -137,6 +138,14 @@ impl ConfigState {
 
     pub fn set_start_view(&self, view: StartView) -> Result<AppConfig, String> {
         self.update(|c| c.start_view = view)
+    }
+
+    /// Keeps the account and the e-mail of a login.
+    pub fn set_login(&self, account: &str, email: &str) -> Result<AppConfig, String> {
+        self.update(|c| {
+            c.account = Some(account.to_owned());
+            c.email = Some(email.to_owned());
+        })
     }
 }
 
@@ -336,6 +345,36 @@ pub fn quit_app(app: AppHandle) {
 #[tauri::command]
 pub fn request_quit(app: AppHandle) {
     crate::request_quit(&app);
+}
+
+/// Log in with an e-mail and a password, off the main thread: the client is made, used and
+/// dropped on a blocking thread. The answer is the config with the new account; the password
+/// and the token never come back. Then the status polls again.
+#[tauri::command]
+pub async fn log_in(
+    config: State<'_, ConfigState>,
+    processes: State<'_, Arc<Processes>>,
+    poller: State<'_, Poller>,
+    email: String,
+    password: String,
+) -> Result<AppConfig, String> {
+    let state = config.inner().clone();
+    let serve_info = processes.serve_info();
+    let password = Password::new(password);
+    let saved = tauri::async_runtime::spawn_blocking(move || {
+        login::log_in(
+            &state,
+            &serve_info,
+            &KeychainStore::new(),
+            &email,
+            &password,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    poller.poll_now();
+    Ok(saved)
 }
 
 /// Log out: deletes the token from the Keychain, off the main thread, then polls again.

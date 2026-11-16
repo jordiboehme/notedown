@@ -168,13 +168,18 @@ impl Library {
                 },
             }
         }
-        self.first_page(&session, &key)
+        self.first_page(&session, &key, true)
     }
 
     /// Lists `key` from its first page. A folder that is not there is dropped and the window
     /// hears it. A binding that changes before or during the call answers
     /// [`LibraryError::Changed`].
-    fn first_page(&self, session: &Session, key: &Key) -> Result<Listed, LibraryError> {
+    fn first_page(
+        &self,
+        session: &Session,
+        key: &Key,
+        by_window: bool,
+    ) -> Result<Listed, LibraryError> {
         let generation = session.generation();
         let ticket = self
             .with_cache(|c, _| {
@@ -199,7 +204,8 @@ impl Library {
                     next: page.next.clone(),
                 };
                 let merged = self.with_cache(|c, out| {
-                    (c.generation() == generation).then(|| c.merge_first(ticket, key, page, out))
+                    (c.generation() == generation)
+                        .then(|| c.merge_first(ticket, key, page, by_window, out))
                 });
                 // A newer first page of the same listing won and was dropped since: this page
                 // is answered, not kept.
@@ -275,12 +281,12 @@ impl Library {
             return;
         };
         let generation = session.generation();
-        // Dropped listings whose first page failed before.
-        let pending = lock(&self.inner.cache).pending();
-        self.relist(&session, pending);
+        // Dropped listings whose first page failed before, and waiting ones whose wait is over.
+        let due = lock(&self.inner.cache).due(now);
+        self.relist(&session, due, true, now);
         if relist {
             let keys = self.with_cache(|c, _| c.relist_keys(generation));
-            self.relist(&session, keys);
+            self.relist(&session, keys, false, now);
             self.polled(now);
             return;
         }
@@ -307,10 +313,10 @@ impl Library {
             };
             self.polled(now);
             if page.gap {
-                // A listing that cannot be read now keeps its old seq: the next poll meets the
-                // gap again and tries again.
+                // A listing that cannot be read now waits and is tried again later; the others
+                // are followed meanwhile.
                 let keys = self.with_cache(|c, _| c.relist_keys(generation));
-                self.relist(&session, keys);
+                self.relist(&session, keys, true, now);
                 return;
             }
             let applied = self.with_cache(|c, out| c.apply(generation, seq + 1, &page, out));
@@ -330,7 +336,7 @@ impl Library {
             if !fetched.is_empty() {
                 self.with_cache(|c, out| c.insert_fetched(generation, applied.end, fetched, out));
             }
-            self.relist(&session, applied.relist);
+            self.relist(&session, applied.relist, false, now);
             if applied.stop {
                 self.stop_following(&session);
                 return;
@@ -346,19 +352,21 @@ impl Library {
     }
 
     /// Lists `keys` again from their first page; the new page replaces the folder only when it
-    /// comes. One that is not there anymore is dropped; one that cannot be read now keeps its
-    /// folder with the error, or, when it was dropped, is tried again at the next step.
-    fn relist(&self, session: &Session, keys: Vec<Key>) {
+    /// comes. One that is not there anymore is dropped; for one that cannot be read now see
+    /// [`Cache::relist_failed`] (`gap`: its old `seq` is not valid).
+    fn relist(&self, session: &Session, keys: Vec<Key>, gap: bool, now: u64) {
         let generation = session.generation();
         for key in keys {
             if session.is_cancelled() {
                 return;
             }
-            match self.first_page(session, &key) {
+            match self.first_page(session, &key, false) {
                 Ok(_) => {}
                 Err(LibraryError::Rest(e)) if !not_there(&e) => {
                     let text = e.to_string();
-                    self.with_cache(|c, out| c.relist_failed(generation, &key, &text, out));
+                    self.with_cache(|c, out| {
+                        c.relist_failed(generation, &key, &text, gap, now, out);
+                    });
                 }
                 Err(LibraryError::Changed) => return,
                 Err(_) => {}

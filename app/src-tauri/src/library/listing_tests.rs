@@ -856,9 +856,9 @@ fn a_gap_while_the_server_does_not_answer_keeps_the_folders() {
         tree(10, &[file(1, "NOTE/Note/a.note", MD5_A)], None),
         gap(500, 500),
         unreachable(),
-        // The folder still has seq 10: the next poll meets the gap again and lists again.
-        gap(500, 500),
+        // Its seq is not valid after the gap: the folder is not followed until it is listed.
         tree(500, &[file(1, "NOTE/Note/a.note", MD5_B)], None),
+        events(&[], 501),
     ]);
     s.list(NOTE, None);
     s.folders();
@@ -867,6 +867,9 @@ fn a_gap_while_the_server_does_not_answer_keeps_the_folders() {
     assert_eq!(names(&kept), ["a.note"]);
     assert_eq!(kept.error.as_deref(), Some("The server does not answer."));
     assert_eq!(s.folders(), [kept]);
+    s.time.pass(2_000);
+    s.follow();
+    s.time.pass(28_000);
     s.follow();
     let again = listed(&s, NOTE);
     assert_eq!(again.entries[0].md5.as_deref(), Some(MD5_B));
@@ -877,8 +880,8 @@ fn a_gap_while_the_server_does_not_answer_keeps_the_folders() {
             "/tree?path=NOTE%2FNote",
             "/events?from=11",
             "/tree?path=NOTE%2FNote",
-            "/events?from=11",
             "/tree?path=NOTE%2FNote",
+            "/events?from=501",
         ]
     );
 }
@@ -903,6 +906,8 @@ fn a_show_after_a_minute_while_unreachable_keeps_the_folders() {
     // It follows on from where the folder was.
     s.library.follow_step();
     assert!(listed(&s, NOTE).entries.is_empty());
+    // The follower keeps it current: the error of the failed listing is gone.
+    assert_eq!(listed(&s, NOTE).error, None);
     assert_eq!(
         s.targets(),
         [
@@ -926,6 +931,7 @@ fn a_dropped_folder_that_cannot_be_listed_is_tried_again() {
             12,
         ),
         unreachable(),
+        unreachable(),
         tree(12, &[file(1, "NOTE/Note/sub2/a.note", MD5_A)], None),
         events(&[], 13),
     ]);
@@ -939,12 +945,16 @@ fn a_dropped_folder_that_cannot_be_listed_is_tried_again() {
         Some("The server does not answer.")
     );
     assert!(!is_listed(&s, "NOTE/Note/sub2", false));
+    // It fails again the same way: the window is not told again.
+    s.follow();
+    assert_eq!(s.folders(), []);
     s.follow();
     assert_eq!(names(&listed(&s, "NOTE/Note/sub2")), ["a.note"]);
     assert_eq!(
         s.targets()[1..],
         [
             "/events?from=11",
+            "/tree?path=NOTE%2FNote%2Fsub2",
             "/tree?path=NOTE%2FNote%2Fsub2",
             "/tree?path=NOTE%2FNote%2Fsub2",
             "/events?from=13",
@@ -1044,6 +1054,112 @@ fn only_the_shown_folders_are_kept_and_listed_again() {
             "/events?from=11",
             "/tree?path=NOTE%2FNote",
             "/tree?path=NOTE%2FNote&kind=folder",
+        ]
+    );
+}
+
+#[test]
+fn a_folder_that_keeps_failing_after_a_gap_waits_while_the_others_are_followed() {
+    let s = setup(vec![
+        tree(10, &[file(1, "NOTE/A/a.note", MD5_A)], None),
+        tree(10, &[file(2, "NOTE/B/b.note", MD5_A)], None),
+        gap(500, 500),
+        tree(500, &[file(1, "NOTE/A/a.note", MD5_B)], None),
+        unreachable(),
+        events(&[], 502),
+        unreachable(),
+        events(&[], 503),
+        events(&[], 504),
+        tree(600, &[file(2, "NOTE/B/b.note", MD5_B)], None),
+        events(&[], 505),
+    ]);
+    s.list("NOTE/A", None);
+    s.list("NOTE/B", None);
+    s.follow();
+    assert_eq!(
+        listed(&s, "NOTE/B").error.as_deref(),
+        Some("The server does not answer.")
+    );
+    // The others are followed from their new seq; B waits 30 s, then 60 s, then is listed.
+    s.time.pass(2_000);
+    s.follow();
+    s.time.pass(28_000);
+    s.follow();
+    s.time.pass(30_000);
+    s.follow();
+    s.time.pass(30_000);
+    s.follow();
+    let b = listed(&s, "NOTE/B");
+    assert_eq!(b.entries[0].md5.as_deref(), Some(MD5_B));
+    assert_eq!(b.error, None);
+    assert_eq!(
+        s.targets()[2..],
+        [
+            "/events?from=11",
+            "/tree?path=NOTE%2FA",
+            "/tree?path=NOTE%2FB",
+            "/events?from=501",
+            "/tree?path=NOTE%2FB",
+            "/events?from=502",
+            "/events?from=503",
+            "/tree?path=NOTE%2FB",
+            "/events?from=504",
+        ]
+    );
+}
+
+#[test]
+fn the_window_keeps_what_it_listed_until_it_says_otherwise() {
+    let s = setup(vec![
+        tree(10, &[file(1, "NOTE/Note/a.note", MD5_A)], None),
+        tree(10, &[file(3, "NOTE/Other/o.note", MD5_A)], None),
+        gap(500, 500),
+        tree(500, &[file(1, "NOTE/Note/a.note", MD5_B)], None),
+        tree(500, &[file(3, "NOTE/Other/o.note", MD5_B)], None),
+        tree(500, &[file(4, "NOTE/Note/sub/x.note", MD5_A)], Some("t1:x")),
+        events(
+            &[with(
+                ev(501, "folder.moved", 5, "NOTE/Note/sub2"),
+                json!({"oldPath": "NOTE/Note/sub"}),
+            )],
+            502,
+        ),
+        entry(&folder(5, "NOTE/Note/sub2")),
+        unreachable(),
+        events(&[], 503),
+    ]);
+    s.list(NOTE, None);
+    s.library.set_shown(&[Key::new(NOTE, false)]);
+    // Listed after the window said what it shows: kept until it says again.
+    s.list("NOTE/Other", None);
+    s.follow();
+    assert_eq!(
+        listed(&s, "NOTE/Other").entries[0].md5.as_deref(),
+        Some(MD5_B)
+    );
+    s.library.set_shown(&[Key::new(NOTE, false)]);
+    assert!(!is_listed(&s, "NOTE/Other", false));
+
+    // A shown folder that moves while it pages is listed at its new path; when that fails and
+    // the window stops showing it, it is not listed again.
+    s.list("NOTE/Note/sub", None);
+    s.library
+        .set_shown(&[Key::new(NOTE, false), Key::new("NOTE/Note/sub", false)]);
+    s.follow();
+    s.library.set_shown(&[Key::new(NOTE, false)]);
+    s.follow();
+    assert!(!is_listed(&s, "NOTE/Note/sub2", false));
+    assert_eq!(
+        s.targets()[2..],
+        [
+            "/events?from=11",
+            "/tree?path=NOTE%2FNote",
+            "/tree?path=NOTE%2FOther",
+            "/tree?path=NOTE%2FNote%2Fsub",
+            "/events?from=501",
+            "/entries/5",
+            "/tree?path=NOTE%2FNote%2Fsub2",
+            "/events?from=502",
         ]
     );
 }

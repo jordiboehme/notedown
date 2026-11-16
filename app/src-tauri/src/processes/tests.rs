@@ -336,6 +336,36 @@ fn remote_mode_reclaims_and_runs_no_server() {
 }
 
 #[test]
+fn a_start_on_this_mac_makes_the_data_folder_first() {
+    let rig = Rig::new();
+    // The pipeline fails without its folder, as the real one does.
+    std::fs::write(
+        rig.dir.path().join("pipeline.sh"),
+        "[ -d \"$3\" ] || { echo 'error: no data folder' >&2; exit 1; }\nexec /bin/sleep 312",
+    )
+    .unwrap();
+    let p = rig.processes(Path::new("/bin/sleep"));
+    let fresh = rig.dir.path().join("fresh").join("data");
+    let config = AppConfig {
+        data_dir: fresh.clone(),
+        ..rig.config()
+    };
+    p.start_all(&config);
+    assert!(fresh.is_dir(), "the data folder was not made");
+    // The pipeline found its folder at its first start. (The server probes the default port
+    // here, so it may be Outside on a Mac that runs Notedown; it is not looked at.)
+    let pid = running_pid(p.pipeline());
+    // A pipeline without its folder is Running for a moment, then in Backoff.
+    std::thread::sleep(Duration::from_millis(300));
+    let state = p.pipeline().state();
+    p.stop_all();
+    assert!(
+        matches!(state, ChildState::Running { pid: now, .. } if now == pid),
+        "{state:?}"
+    );
+}
+
+#[test]
 fn a_start_reads_the_config_inside_its_lock() {
     let rig = Rig::new();
     rig.listen_on(free_port());

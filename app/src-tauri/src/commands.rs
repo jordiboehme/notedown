@@ -15,12 +15,20 @@ use crate::status::Status;
 use crate::token::{KeychainStore, TokenStore, token_key};
 use crate::windows::{self, WindowKind};
 
+/// How the config is written to its folder: [`config::save`], or a slow one in tests.
+pub type SaveFn = Arc<dyn Fn(&Path, &AppConfig) -> std::io::Result<()> + Send + Sync>;
+
 /// The live config and the folder it is saved in.
+#[derive(Clone)]
 pub struct ConfigState {
     pub dir: PathBuf,
+    /// Held only to read or swap the config, never during a save.
     pub config: Arc<Mutex<AppConfig>>,
     /// The file was broken and set aside at start; cleared by the next save.
     reset: Arc<AtomicBool>,
+    /// One change at a time, across its save, so two changes never lose one another.
+    saving: Arc<Mutex<()>>,
+    save: SaveFn,
 }
 
 /// Reads the live config from another thread (the poller), without a handle to the app.
@@ -45,11 +53,18 @@ impl ConfigReader {
 
 impl ConfigState {
     pub fn load(dir: PathBuf) -> Self {
+        Self::load_with(dir, Arc::new(config::save))
+    }
+
+    /// [`load`](Self::load) with another way to save.
+    pub fn load_with(dir: PathBuf, save: SaveFn) -> Self {
         let loaded = config::load_checked(&dir);
         Self {
             dir,
             config: Arc::new(Mutex::new(loaded.config)),
             reset: Arc::new(AtomicBool::new(loaded.reset)),
+            saving: Arc::default(),
+            save,
         }
     }
 
@@ -74,12 +89,14 @@ impl ConfigState {
     }
 
     /// Changes the config and saves it; the change stays in memory only when the save worked.
+    /// The save (with its fsync) runs outside the config's lock, so a read never waits for
+    /// it; the new config is swapped in under a short lock afterwards.
     fn update(&self, change: impl FnOnce(&mut AppConfig)) -> Result<AppConfig, String> {
-        let mut guard = self.config.lock().map_err(|e| e.to_string())?;
-        let mut next = guard.clone();
+        let _saving = self.saving.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut next = self.current();
         change(&mut next);
-        config::save(&self.dir, &next).map_err(|e| format!("the config was not saved: {e}"))?;
-        *guard = next.clone();
+        (self.save)(&self.dir, &next).map_err(|e| format!("the config was not saved: {e}"))?;
+        *self.config.lock().unwrap_or_else(PoisonError::into_inner) = next.clone();
         self.reset.store(false, Ordering::SeqCst);
         Ok(next)
     }
@@ -245,12 +262,16 @@ pub async fn set_mode(
     .await
 }
 
+/// Saves the folder view, off the main thread: the save waits for the disk.
 #[tauri::command]
-pub fn set_start_view(
+pub async fn set_start_view(
     state: State<'_, ConfigState>,
     start_view: StartView,
 ) -> Result<AppConfig, String> {
-    state.set_start_view(start_view)
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || state.set_start_view(start_view))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Starts both children afresh as the config asks (Start on the Server page). Off the main
@@ -462,6 +483,74 @@ mod tests {
         let reloaded = config::load(dir.path());
         assert_eq!(reloaded.mode, Mode::Local);
         assert_eq!(reloaded.start_view, StartView::Columns);
+    }
+
+    /// A save that says when it starts and then waits for `release`.
+    fn held_save(
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> SaveFn {
+        let release = Mutex::new(release);
+        Arc::new(move |dir: &Path, config: &AppConfig| {
+            let _ = started.send(());
+            let _ = release
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10));
+            config::save(dir, config)
+        })
+    }
+
+    #[test]
+    fn reading_the_config_does_not_wait_for_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let state =
+            ConfigState::load_with(dir.path().to_owned(), held_save(started_tx, release_rx));
+        let saver = state.clone();
+        let saving = std::thread::spawn(move || saver.set_start_view(StartView::Columns));
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the save did not start");
+        // While the save runs, the config reads at once, as it was.
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let reader = state.clone();
+        std::thread::spawn(move || {
+            let _ = read_tx.send(reader.current());
+        });
+        let read = read_rx.recv_timeout(std::time::Duration::from_secs(2));
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            read.expect("the read waited for the save").start_view,
+            StartView::Tree
+        );
+        assert_eq!(
+            saving.join().unwrap().unwrap().start_view,
+            StartView::Columns
+        );
+        assert_eq!(state.current().start_view, StartView::Columns);
+    }
+
+    #[test]
+    fn changes_at_the_same_time_are_all_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let slow: SaveFn = Arc::new(|dir: &Path, config: &AppConfig| {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            config::save(dir, config)
+        });
+        let state = ConfigState::load_with(dir.path().to_owned(), slow);
+        let a = state.clone();
+        let b = state.clone();
+        let view = std::thread::spawn(move || a.set_start_view(StartView::Columns));
+        let mode =
+            std::thread::spawn(move || b.set_mode(Mode::Local, Some("/data/x".into()), None));
+        view.join().unwrap().unwrap();
+        mode.join().unwrap().unwrap();
+        for config in [state.current(), config::load(dir.path())] {
+            assert_eq!(config.start_view, StartView::Columns);
+            assert_eq!(config.mode, Mode::Local);
+        }
     }
 
     #[test]

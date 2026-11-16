@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, Mode};
 use crate::pidfile;
 use crate::probe::{self, ServerProbe};
 use crate::process::{self, ChildKind, Launch, SpawnFn};
@@ -138,6 +138,16 @@ impl Processes {
         }
         let config = &read();
         self.stop_both();
+        if config.mode == Mode::Local {
+            // On a fresh Mac the folder is not there yet; the pipeline would fail at its first
+            // start without it. A failure here is only logged: the child then says what is wrong.
+            if let Err(e) = std::fs::create_dir_all(&config.data_dir) {
+                eprintln!(
+                    "notedown: the data folder {} could not be made: {e}",
+                    config.data_dir.display()
+                );
+            }
+        }
         std::thread::scope(|s| {
             for sup in [&self.server, &self.pipeline] {
                 s.spawn(move || self.reclaim(sup));

@@ -143,7 +143,8 @@ fn not_reset() -> Loaded {
 
 /// Writes `<dir>/config.json` durably: the new content goes to a temp file that is flushed to
 /// disk (`sync_all`, a full fsync on macOS), then renamed over the old file, then the folder is
-/// flushed too. A crash leaves the old file or the new one, never half of one.
+/// flushed too. A crash leaves the old file or the new one, never half of one. A failed flush
+/// of the folder after the rename is logged, not an error.
 pub fn save(dir: &Path, config: &AppConfig) -> io::Result<()> {
     use std::io::Write;
     fs::create_dir_all(dir)?;
@@ -159,7 +160,19 @@ pub fn save(dir: &Path, config: &AppConfig) -> io::Result<()> {
         let _ = fs::remove_file(&temp);
         return Err(e);
     }
-    fs::File::open(dir)?.sync_all()
+    sync_folder(dir);
+    Ok(())
+}
+
+/// Flushes the rename to disk. The new file is in place already, so a failure here is only
+/// logged: the save worked, it may just not survive a power cut.
+fn sync_folder(dir: &Path) {
+    if let Err(e) = fs::File::open(dir).and_then(|folder| folder.sync_all()) {
+        eprintln!(
+            "notedown: the config folder {} could not be flushed: {e}",
+            dir.display()
+        );
+    }
 }
 
 /// The address without a user or a password in it, for a status line or the Keychain key.
@@ -262,6 +275,20 @@ mod tests {
         next.mode = Mode::Local;
         save(dir.path(), &next).unwrap();
         assert_eq!(load(dir.path()).mode, Mode::Local);
+    }
+
+    #[test]
+    fn a_failed_folder_sync_after_the_rename_is_no_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("config");
+        fs::create_dir(&folder).unwrap();
+        // Write and search, but no read: the file goes in, the folder cannot be opened.
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o300)).unwrap();
+        let saved = save(&folder, &sample());
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+        saved.unwrap();
+        assert_eq!(load(&folder), sample());
     }
 
     #[test]

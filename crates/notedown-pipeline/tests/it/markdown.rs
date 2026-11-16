@@ -1170,3 +1170,55 @@ fn a_new_store_drops_the_writer_of_the_old_one() {
     let keys: Vec<&String> = m["files"].as_object().unwrap().keys().collect();
     assert_eq!(keys, [&key], "{m}");
 }
+
+/// While the Markdown folder fails, the files are tried again at the end of the pass, not
+/// after every note: a folder that works again in the middle of a pass gets its files only at
+/// the end of it.
+#[test]
+fn a_failing_folder_is_tried_again_only_at_the_end_of_a_pass() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    let d = setup();
+    d.put("test1", "NOTE/Note/A");
+    d.put("test1", "NOTE/Note/B");
+    d.put("test1", "NOTE/Note/C");
+    let out = tempfile::tempdir().unwrap();
+    let md = out.path().join("md");
+    // A file where the folder should be: every write fails.
+    std::fs::write(&md, "not a folder").unwrap();
+    let s = crate::worker::one_machine(&d, with_dir(&md));
+    let said = Said::default();
+    let (mut w, _clock) = continuous(&s, &said);
+    let fixed = Arc::new(AtomicBool::new(false));
+    let seen_mid_pass = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (dir, f, seen, lines) = (
+        md.clone(),
+        fixed.clone(),
+        seen_mid_pass.clone(),
+        said.clone(),
+    );
+    w.run(move || {
+        let failed = lines.lines().iter().any(|l| l.contains("Markdown files"));
+        if failed && !f.swap(true, Ordering::SeqCst) {
+            std::fs::remove_file(&dir).unwrap();
+            std::fs::create_dir(&dir).unwrap();
+            return false;
+        }
+        let now = files(&dir);
+        if now.len() == 3 {
+            return true;
+        }
+        if f.load(Ordering::SeqCst) && !now.is_empty() {
+            seen.lock().unwrap().push(format!("{now:?}"));
+        }
+        false
+    })
+    .unwrap();
+    assert!(fixed.load(Ordering::SeqCst), "{:?}", said.lines());
+    assert_eq!(
+        *seen_mid_pass.lock().unwrap(),
+        Vec::<String>::new(),
+        "files written before the end of the pass"
+    );
+    assert_eq!(files(&md), ["A/test1.md", "B/test1.md", "C/test1.md"]);
+}

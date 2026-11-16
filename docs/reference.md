@@ -286,7 +286,8 @@ that both use gets `(2)` for one of them.
 - A note gets its file once a page has text. The file of a note is written as soon as the pipeline has
   read the note, so a long first run shows the files one by one. Moves, deletes and scope changes
   follow with the next written note or at the end of the pass. Only the notes whose text, path or
-  scope changed are looked at; the first pass after a start looks at every note. A file whose text is the same is not written again,
+  scope changed are looked at; the first pass after a start looks at every note. While the folder
+  cannot be written, the error is said once and the files are tried again at the end of each pass. A file whose text is the same is not written again,
   so sync tools see no change. A moved note moves its file, a deleted note or a note that leaves the
   scope loses it.
 - Notedown changes only files it wrote. They are listed in `pipeline/<account>/markdown.json`. When a

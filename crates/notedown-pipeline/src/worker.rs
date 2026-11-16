@@ -678,6 +678,16 @@ impl Worker {
         }
     }
 
+    /// [`write_markdown`](Self::write_markdown) right after a note of a pass is read. While
+    /// the Markdown files of the account fail, it waits for the end of the pass: each try
+    /// reads every pending note again. The changed notes stay in the store's touched set.
+    fn write_note_markdown(&self, slug: &str, text: &TextStore, served: usize) {
+        if self.said.borrow().contains_key(&format!("markdown:{slug}")) {
+            return;
+        }
+        self.write_markdown(slug, text, served);
+    }
+
     /// Says once (while the list stays the same) the accounts that have a Markdown folder but
     /// are not served: a typo in a slug, or an account that is gone.
     fn say_unserved(&self, served: &[String]) {
@@ -1314,9 +1324,9 @@ impl Worker {
                         *left = left.saturating_sub(d.pages.len() as u64);
                         let _ = text.set_queued(lock, *left);
                     }
-                    self.write_markdown(slug, text, served.len());
+                    self.write_note_markdown(slug, text, served.len());
                 }
-                Ok(()) => self.write_markdown(slug, text, served.len()),
+                Ok(()) => self.write_note_markdown(slug, text, served.len()),
                 Err(Error::ModelMissing) => {
                     self.clear_work(lock);
                     for slug in stores.keys() {

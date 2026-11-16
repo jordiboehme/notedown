@@ -129,8 +129,12 @@ struct Work {
 }
 
 /// How one run of a download ended.
-enum End {
-    Done { path: PathBuf, size: u64 },
+pub(super) enum End {
+    Done {
+        path: PathBuf,
+        size: u64,
+        label: String,
+    },
     Failed(String),
     Cancelled,
 }
@@ -238,9 +242,9 @@ fn inside(dir: &Path, name: &str) -> Option<PathBuf> {
     (path.parent() == Some(dir) && path.file_name().is_some_and(|n| n == name)).then_some(path)
 }
 
-/// The md5 of the file at `path`, as lower-case hex.
-fn md5_of(path: &Path) -> std::io::Result<String> {
-    let mut file = File::open(path)?;
+/// The md5 of the open temp file, read from its start, as lower-case hex.
+fn md5_of(file: &mut File) -> std::io::Result<String> {
+    file.seek(SeekFrom::Start(0))?;
     let mut hasher = Md5::new();
     let mut buf = vec![0u8; CHUNK];
     loop {
@@ -253,24 +257,74 @@ fn md5_of(path: &Path) -> std::io::Result<String> {
     Ok(crate::login::hex(&hasher.finalize()))
 }
 
-/// Opens the temp file of a run: the one a failed run left, or a new one. Never through a
-/// symlink.
-fn open_part(path: &Path) -> std::io::Result<File> {
+/// A new file at `path`; fails when anything is there, a symlink too.
+fn create_new(path: &Path) -> std::io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Opens the temp file of a run. A first run only makes a new one; a retry opens the one its
+/// failed run left (or a new one when that is gone). Never through a symlink.
+fn open_part(path: &Path, first: bool) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if first {
+        return create_new(path);
+    }
     let opened = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path);
     match opened {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_new(path),
         other => other,
     }
+}
+
+/// Puts the finished temp file `part` in `dir` under the first free name for `name` and
+/// answers that path; never replaces a file. `link` is `fs::hard_link`. Where the volume has no
+/// hard links, the name is taken with an empty new file first and the temp file is renamed
+/// over that placeholder.
+fn place_file(
+    dir: &Path,
+    part: &Path,
+    name: &str,
+    link: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<PathBuf, String> {
+    use std::io::ErrorKind::AlreadyExists;
+    for n in 1..=MAX_COPY {
+        let Some(target) = inside(dir, &nth_name(name, n)) else {
+            return Err(BAD_NAME.to_owned());
+        };
+        match link(part, &target) {
+            Ok(()) => {
+                let _ = fs::remove_file(part);
+                return Ok(target);
+            }
+            // Never replaces: the next number.
+            Err(e) if e.kind() == AlreadyExists => continue,
+            Err(_) => {}
+        }
+        match create_new(&target) {
+            Ok(_) => {}
+            Err(e) if e.kind() == AlreadyExists => continue,
+            Err(_) => return Err(NOT_SAVED.to_owned()),
+        }
+        // Replaces only the empty placeholder just made.
+        if fs::rename(part, &target).is_ok() {
+            return Ok(target);
+        }
+        let _ = fs::remove_file(&target);
+        return Err(NOT_SAVED.to_owned());
+    }
+    Err(format!(
+        "There are too many copies of {name} in the Downloads folder."
+    ))
 }
 
 /// Removes the temp files of earlier runs from `dir`: files and symlinks named like one, not
@@ -347,6 +401,10 @@ async fn fetch(
         file.write_all(&chunk).map_err(|_| Stop::Disk)?;
         at += len;
         count.store(at, Ordering::SeqCst);
+    }
+    // An answer that ended early: what came is kept for a retry.
+    if at < want.size {
+        return Err(Stop::Rest(RestError::Cut));
     }
     Ok(())
 }
@@ -519,23 +577,46 @@ impl Library {
 
     /// Takes the end of a run into the queue and tells the window.
     fn finish_download(&self, id: u64, end: End) {
+        lock(&self.inner.downloads.queue).busy -= 1;
+        self.settle_download(id, end);
+    }
+
+    /// Takes the end of a run of job `id` into the queue and tells the window. A file that was
+    /// placed counts, also when a cancel came meanwhile: the job ends Done, never with the file
+    /// removed.
+    pub(super) fn settle_download(&self, id: u64, end: End) {
         let mut queue = lock(&self.inner.downloads.queue);
-        queue.busy -= 1;
+        if let End::Done { path, size, label } = end {
+            let shown = path.to_string_lossy().into_owned();
+            lock(&self.inner.downloads.finished).insert(path);
+            let mut job = match queue.items.remove(&id) {
+                Some(item) => item.job,
+                None => Job {
+                    id,
+                    kind: JobKind::Download,
+                    label,
+                    done: 0,
+                    total: Some(size),
+                    state: JobState::Done,
+                    text: None,
+                    question: None,
+                    result: None,
+                },
+            };
+            job.state = JobState::Done;
+            job.done = size;
+            job.total = Some(size);
+            job.text = None;
+            job.result = Some(shown);
+            self.send(&job);
+            return;
+        }
         // Cancelled meanwhile: the canceller told the window.
         let Some(item) = queue.items.get_mut(&id) else {
             return;
         };
         match end {
-            End::Done { path, size } => {
-                let mut item = queue.items.remove(&id).expect("the item is there");
-                let shown = path.to_string_lossy().into_owned();
-                lock(&self.inner.downloads.finished).insert(path);
-                item.job.state = JobState::Done;
-                item.job.done = size;
-                item.job.text = None;
-                item.job.result = Some(shown);
-                self.send(&item.job);
-            }
+            End::Done { .. } => unreachable!("handled above"),
             End::Failed(text) => {
                 item.job.state = JobState::Failed;
                 item.job.text = Some(text);
@@ -626,13 +707,18 @@ impl Library {
         if stopped() {
             return End::Cancelled;
         }
-        let mut file = match open_part(&part) {
+        let mut file = match open_part(&part, work.part.is_none()) {
             Ok(file) => file,
             Err(_) => return End::Failed(NOT_SAVED.to_owned()),
         };
         let Ok(meta) = file.metadata() else {
             return End::Failed(NOT_SAVED.to_owned());
         };
+        // A failed run that had every byte: when they are right, place them with no request;
+        // else they are fetched again (a whole answer cuts the file first).
+        if meta.len() == want.size && md5_of(&mut file).is_ok_and(|md5| md5 == want.md5) {
+            return place_checked(&dir, &part, &want);
+        }
         // What a failed run left counts only when it is shorter than the file.
         let from = if meta.len() < want.size {
             meta.len()
@@ -648,7 +734,6 @@ impl Library {
             &stopped,
             &mut |done| self.download_progress(work.id, done),
         );
-        drop(file);
         match ended {
             Err(text) => End::Failed(text),
             Ok(Watched::Cancelled) => {
@@ -671,20 +756,15 @@ impl Library {
             Ok(Watched::Done(Err(Stop::Disk))) => End::Failed(NOT_SAVED.to_owned()),
             Ok(Watched::Done(Ok(()))) => {
                 self.settle(&session, &Ok::<(), RestError>(()));
-                self.place_download(&dir, &part, &want, &stopped)
+                self.place_download(&dir, &part, &mut file, &want)
             }
         }
     }
 
-    /// The last step: the md5 of the temp file, then a hard link to the first free name.
-    fn place_download(
-        &self,
-        dir: &Path,
-        part: &Path,
-        want: &Want,
-        stopped: &dyn Fn() -> bool,
-    ) -> End {
-        match md5_of(part) {
+    /// The last step: the md5 of the temp file (through its open handle), then the first free
+    /// name. A cancel from here on comes too late: the job ends Done.
+    fn place_download(&self, dir: &Path, part: &Path, file: &mut File, want: &Want) -> End {
+        match md5_of(file) {
             Ok(md5) if md5 == want.md5 => {}
             Ok(_) => {
                 let _ = fs::remove_file(part);
@@ -692,31 +772,7 @@ impl Library {
             }
             Err(_) => return End::Failed(NOT_SAVED.to_owned()),
         }
-        if stopped() {
-            let _ = fs::remove_file(part);
-            return End::Cancelled;
-        }
-        for n in 1..=MAX_COPY {
-            let Some(target) = inside(dir, &nth_name(&want.name, n)) else {
-                return End::Failed(BAD_NAME.to_owned());
-            };
-            match fs::hard_link(part, &target) {
-                Ok(()) => {
-                    let _ = fs::remove_file(part);
-                    return End::Done {
-                        path: target,
-                        size: want.size,
-                    };
-                }
-                // Never replaces: the next number.
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(_) => return End::Failed(NOT_SAVED.to_owned()),
-            }
-        }
-        End::Failed(format!(
-            "There are too many copies of {} in the Downloads folder.",
-            want.name
-        ))
+        place_checked(dir, part, want)
     }
 
     /// Waits until no download thread runs. For tests: every thread ends before the test does.
@@ -731,6 +787,18 @@ impl Library {
                 handle.join().expect("a download thread panicked");
             }
         }
+    }
+}
+
+/// Places a temp file whose md5 was checked under the first free name.
+fn place_checked(dir: &Path, part: &Path, want: &Want) -> End {
+    match place_file(dir, part, &want.name, &|from, to| fs::hard_link(from, to)) {
+        Ok(path) => End::Done {
+            path,
+            size: want.size,
+            label: want.name.clone(),
+        },
+        Err(text) => End::Failed(text),
     }
 }
 
@@ -753,6 +821,23 @@ fn download_worker(weak: &Weak<Inner>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn without_hard_links_a_placeholder_is_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        std::fs::write(dir.join("a.txt"), b"old").unwrap();
+        let part = dir.join(".a.txt.1.part");
+        std::fs::write(&part, b"hello").unwrap();
+        let no_links = |_: &Path, _: &Path| -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        };
+        let placed = place_file(dir, &part, "a.txt", &no_links).unwrap();
+        assert_eq!(placed, dir.join("a (2).txt"));
+        assert_eq!(std::fs::read(&placed).unwrap(), b"hello");
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"old");
+        assert!(!part.exists());
+    }
 
     #[test]
     fn names_of_temp_files_and_copies() {

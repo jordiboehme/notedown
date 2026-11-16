@@ -672,7 +672,9 @@ impl Library {
     /// Ends the job `job`: an upload or a download wherever it is (a running one drops its
     /// request), or a restore that asks for a name. A job that is not there is left alone.
     pub fn cancel(&self, job: u64) {
-        if lock(&self.inner.uploads).cancel(self, job) || self.cancel_download(job) {
+        // The upload lock is let go before the downloads are looked at.
+        let upload = lock(&self.inner.uploads).cancel(self, job);
+        if upload || self.cancel_download(job) {
             return;
         }
         let asking = {

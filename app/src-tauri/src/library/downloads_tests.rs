@@ -644,3 +644,159 @@ fn two_downloads_run_at_a_time() {
     release.send(()).unwrap();
     s.library.join_downloads();
 }
+
+#[test]
+fn a_late_cancel_still_reports_done() {
+    let body = pattern(10_000);
+    let md5 = md5_hex(&body);
+    let s = setup(vec![
+        (ENTRY.into(), entry("big.bin", json!(md5), 10_000)),
+        (FILE.into(), cut_after(&body, 4_000)),
+    ]);
+    let ended = download(&s);
+    s.library.cancel(ended.id);
+    assert_eq!(last_job(&s).state, JobState::Cancelled);
+    // The run had placed the file when the cancel came: Done wins and the file stays.
+    let placed = s.dir.join("big.bin");
+    std::fs::write(&placed, &body).unwrap();
+    s.library.settle_download(
+        ended.id,
+        super::downloads::End::Done {
+            path: placed.clone(),
+            size: 10_000,
+            label: "big.bin".to_owned(),
+        },
+    );
+    let done = last_job(&s);
+    assert_eq!((done.id, done.state), (ended.id, JobState::Done));
+    assert_eq!(done.result.as_deref(), Some(placed.to_str().unwrap()));
+    assert_eq!(std::fs::read(&placed).unwrap(), body);
+    assert!(s.library.reveal_command(placed.to_str().unwrap()).is_ok());
+}
+
+#[test]
+fn a_first_run_never_opens_an_existing_temp_file() {
+    let s = setup(vec![
+        (ENTRY.into(), hello_entry("a.txt")),
+        (FILE.into(), hello()),
+        (ENTRY.into(), hello_entry("b.txt")),
+        (FILE.into(), hello()),
+    ]);
+    // The first download sweeps; then a file takes the temp name of the next job.
+    assert_eq!(download(&s).state, JobState::Done);
+    let planted = part(&s, "b.txt", 2);
+    std::fs::write(&planted, b"hel").unwrap();
+    let ended = download(&s);
+    assert_eq!(ended.id, 2);
+    assert_eq!(ended.state, JobState::Failed);
+    assert_eq!(
+        ended.text.as_deref(),
+        Some("The file could not be saved in the Downloads folder.")
+    );
+    assert_eq!(std::fs::read(&planted).unwrap(), b"hel");
+    assert_eq!(by_line(&s.server.received(), FILE).len(), 1);
+}
+
+#[test]
+fn a_short_body_is_a_cut_and_resumes() {
+    let rest = file_answer(
+        "206 Partial Content",
+        &[("etag", &tag(HELLO_MD5)), ("content-range", "bytes 3-4/5")],
+        b"lo",
+    );
+    let s = setup(vec![
+        (ENTRY.into(), hello_entry("a.txt")),
+        // A whole answer of 3 bytes for a file of 5.
+        (
+            FILE.into(),
+            Act::Raw(file_answer("200 OK", &[("etag", &tag(HELLO_MD5))], b"hel")),
+        ),
+        (ENTRY.into(), hello_entry("a.txt")),
+        (FILE.into(), Act::Raw(rest)),
+    ]);
+    let ended = download(&s);
+    assert_eq!(ended.state, JobState::Failed);
+    assert_eq!(ended.text.as_deref(), Some("The connection was cut."));
+    assert_eq!(std::fs::read(part(&s, "a.txt", ended.id)).unwrap(), b"hel");
+    s.library.retry(ended.id).unwrap();
+    s.library.join_downloads();
+    assert_eq!(last_job(&s).state, JobState::Done);
+    assert_eq!(std::fs::read(s.dir.join("a.txt")).unwrap(), b"hello");
+    let requests = s.server.received();
+    assert_eq!(
+        by_line(&requests, FILE)[1].header("range"),
+        Some("bytes=3-")
+    );
+}
+
+#[test]
+fn a_retry_with_all_bytes_only_places() {
+    let body = pattern(10_000);
+    let md5 = md5_hex(&body);
+    let s = setup(vec![
+        (ENTRY.into(), entry("big.bin", json!(md5), 10_000)),
+        (FILE.into(), cut_after(&body, 4_000)),
+        (ENTRY.into(), entry("big.bin", json!(md5), 10_000)),
+    ]);
+    let ended = download(&s);
+    assert_eq!(ended.state, JobState::Failed);
+    // All bytes are there by now (a run that failed after the body).
+    std::fs::write(part(&s, "big.bin", ended.id), &body).unwrap();
+    s.library.retry(ended.id).unwrap();
+    s.library.join_downloads();
+    let again = last_job(&s);
+    assert_eq!(again.state, JobState::Done, "{again:?}");
+    assert_eq!(std::fs::read(s.dir.join("big.bin")).unwrap(), body);
+    assert_eq!(names(&s.dir), ["big.bin"]);
+    // No second request for the bytes.
+    assert_eq!(by_line(&s.server.received(), FILE).len(), 1);
+}
+
+#[test]
+fn a_retry_after_the_file_changed_starts_again() {
+    let old = pattern(10_000);
+    let new = b"a new version".to_vec();
+    let s = setup(vec![
+        (ENTRY.into(), entry("big.bin", json!(md5_hex(&old)), 10_000)),
+        (FILE.into(), cut_after(&old, 4_000)),
+        (
+            ENTRY.into(),
+            entry("big.bin", json!(md5_hex(&new)), new.len() as u64),
+        ),
+        (FILE.into(), whole(&new)),
+    ]);
+    let ended = download(&s);
+    assert_eq!(ended.state, JobState::Failed);
+    assert!(part(&s, "big.bin", ended.id).exists());
+    s.library.retry(ended.id).unwrap();
+    s.library.join_downloads();
+    let again = last_job(&s);
+    assert_eq!(again.state, JobState::Done, "{again:?}");
+    assert_eq!(again.total, Some(new.len() as u64));
+    assert_eq!(std::fs::read(s.dir.join("big.bin")).unwrap(), new);
+    assert_eq!(names(&s.dir), ["big.bin"]);
+    let requests = s.server.received();
+    let files = by_line(&requests, FILE);
+    assert_eq!(files[1].header("range"), None);
+    assert_eq!(files[1].header("if-range"), None);
+}
+
+#[test]
+fn a_retry_with_wrong_full_bytes_fetches_again() {
+    let body = pattern(10_000);
+    let md5 = md5_hex(&body);
+    let s = setup(vec![
+        (ENTRY.into(), entry("big.bin", json!(md5), 10_000)),
+        (FILE.into(), cut_after(&body, 4_000)),
+        (ENTRY.into(), entry("big.bin", json!(md5), 10_000)),
+        (FILE.into(), whole(&body)),
+    ]);
+    let ended = download(&s);
+    std::fs::write(part(&s, "big.bin", ended.id), vec![0u8; 10_000]).unwrap();
+    s.library.retry(ended.id).unwrap();
+    s.library.join_downloads();
+    assert_eq!(last_job(&s).state, JobState::Done);
+    assert_eq!(std::fs::read(s.dir.join("big.bin")).unwrap(), body);
+    let requests = s.server.received();
+    assert_eq!(by_line(&requests, FILE)[1].header("range"), None);
+}

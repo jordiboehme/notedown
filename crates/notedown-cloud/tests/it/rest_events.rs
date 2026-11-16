@@ -9,7 +9,8 @@ use notedown_cloud::read;
 use serde_json::{Value, json};
 
 use crate::rest_server::{
-    EMAIL, PASSWORD, Server, delete, mkdir, mv, start, start_imported, upload, uploaded, writer,
+    EMAIL, PASSWORD, Server, delete, mkdir, mv, start, start_imported, tree_all, upload, uploaded,
+    writer,
 };
 
 /// One page of `/events` from `from` (200).
@@ -65,14 +66,9 @@ fn remove_and_create(s: &Server) -> (u64, u64) {
     (old, new)
 }
 
-/// `GET /tree?recursive=true` of the root: (seq, entries).
+/// `GET /tree?recursive=true` of the root, every page: (lowest seq, entries).
 fn listing(s: &Server, token: &str) -> (u64, Vec<Value>) {
-    let (status, tree) = s.get(Some(token), "/tree?recursive=true");
-    assert_eq!(status, 200, "{tree}");
-    (
-        tree["seq"].as_u64().unwrap(),
-        tree["entries"].as_array().unwrap().clone(),
-    )
+    tree_all(s, token, "recursive=true")
 }
 
 #[test]

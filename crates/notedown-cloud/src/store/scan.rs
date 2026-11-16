@@ -421,6 +421,8 @@ impl Store {
                 found.push(top);
             }
         }
+        self.counts.scanned();
+        self.counts.stated(found.len());
         let mut cache = {
             let state = self.state();
             if opts.scope.is_root() && opts.recursive {

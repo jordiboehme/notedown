@@ -310,3 +310,28 @@ pub(crate) fn json_of(r: Response) -> (u16, Value) {
 pub(crate) fn q(s: &str) -> String {
     s.replace('/', "%2F").replace(' ', "%20")
 }
+
+/// Every entry of `GET /tree` with `query` (`path=...&recursive=...`, or empty), page by page
+/// along `next`, and the lowest `seq` of the pages (each page answers 200).
+pub(crate) fn tree_all(s: &Server, token: &str, query: &str) -> (u64, Vec<Value>) {
+    let mut entries = Vec::new();
+    let mut seq = u64::MAX;
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut url = format!("/tree?{query}");
+        if let Some(c) = &cursor {
+            url.push_str(&format!("&cursor={c}"));
+        }
+        let (status, page) = s.get(Some(token), &url);
+        assert_eq!(status, 200, "{url}: {page}");
+        seq = seq.min(page["seq"].as_u64().unwrap());
+        entries.extend(page["entries"].as_array().unwrap().iter().cloned());
+        match page["next"].as_str() {
+            Some(next) => cursor = Some(next.to_string()),
+            None => {
+                assert!(page["next"].is_null(), "{page}");
+                return (seq, entries);
+            }
+        }
+    }
+}

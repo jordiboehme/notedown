@@ -165,3 +165,114 @@ pub(crate) fn walk(
     }
     Ok(())
 }
+
+/// A window of a walk ([`walk_window`]): what it lists and how many entries it collects.
+pub(crate) struct Window<'a> {
+    pub recursive: bool,
+    /// Only folders: files are neither stat'ed nor collected.
+    pub folders_only: bool,
+    /// Collect at most this many entries.
+    pub want: usize,
+    /// Counts each `symlink_metadata` call.
+    pub stated: &'a dyn Fn(usize),
+}
+
+/// Collect into `out` the listable entries below the folder `path` (at `dir` on disk) that come
+/// after the anchor in the order of paths, in that order, until `out` holds `window.want`.
+/// `rest` is the anchor below `path` (its segments after those of `path`); empty starts at the
+/// beginning. Each folder on the way is read by names only (`read_dir` and the type of each
+/// name, no stat), its names sorted by bytes: the order of [`WirePath`]. With `recursive` a
+/// folder is followed by what is in it (a pre-order walk). Only the entries that are collected
+/// are stat'ed. The anchor itself is not collected, nor anything before it. When the anchor or
+/// a folder on its way is gone, the walk goes on with the names after it. Names are skipped as
+/// in [`walk`]; a folder that vanished is skipped too.
+pub(crate) fn walk_window(
+    path: &WirePath,
+    dir: &Path,
+    rest: &[String],
+    window: &Window<'_>,
+    out: &mut Vec<Found>,
+) -> Result<()> {
+    if out.len() >= window.want {
+        return Ok(());
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(e) => return Err(io_err(dir)(e)),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(io_err(dir))?;
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        // The type of the name itself (a symlink stays a symlink), mostly without a stat.
+        let is_dir = match entry.file_type() {
+            Ok(ft) if ft.is_dir() => true,
+            Ok(ft) if ft.is_file() => false,
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(io_err(&entry.path())(e)),
+        };
+        names.push((name, is_dir));
+    }
+    names.sort_unstable();
+    for (name, is_dir) in names {
+        if out.len() >= window.want {
+            break;
+        }
+        let Ok(child) = path.join(&name) else {
+            continue;
+        };
+        let fs_path = dir.join(&name);
+        if let Some(first) = rest.first() {
+            match name.as_str().cmp(first.as_str()) {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Equal => {
+                    // The anchor or a folder on its way: shown before, its later names not.
+                    if window.recursive && is_dir {
+                        walk_window(&child, &fs_path, &rest[1..], window, out)?;
+                    }
+                    continue;
+                }
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        if window.folders_only && !is_dir {
+            continue;
+        }
+        (window.stated)(1);
+        let meta = match std::fs::symlink_metadata(&fs_path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(io_err(&fs_path)(e)),
+        };
+        let Some(kind) = listable(&meta) else {
+            continue;
+        };
+        if window.folders_only && kind != Kind::Folder {
+            continue;
+        }
+        out.push(Found {
+            path: child.clone(),
+            fs_path: fs_path.clone(),
+            kind,
+            meta,
+        });
+        if window.recursive && kind == Kind::Folder {
+            walk_window(&child, &fs_path, &[], window, out)?;
+        }
+    }
+    Ok(())
+}

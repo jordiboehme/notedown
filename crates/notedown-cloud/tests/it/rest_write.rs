@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::rest_server::{
     EMAIL, PASSWORD, Server, delete, header, json_of, mkdir, mv, q, send_json, start,
-    start_imported, upload, upload_with, uploaded, writer,
+    start_imported, tree_all, upload, upload_with, uploaded, writer,
 };
 
 fn md5_hex(bytes: &[u8]) -> String {
@@ -87,8 +87,8 @@ fn get_with(
 fn tree_lists_the_children_of_the_root() {
     let s = start_imported();
     let token = s.token();
-    let (status, answer) = s.get(Some(&token), "/tree");
-    assert_eq!(status, 200, "{answer}");
+    let (_, entries) = tree_all(&s, &token, "");
+    let answer = json!({ "entries": entries });
     let got: BTreeSet<String> = paths(&answer).into_iter().collect();
     let want: BTreeSet<String> = ["DOCUMENT", "EXPORT", "INBOX", "NOTE", "SCREENSHOT"]
         .into_iter()
@@ -524,8 +524,8 @@ fn a_hidden_file_is_never_listed_or_served() {
     s.put("keep.note", b"k");
     let path = s.put("a.note", b"a");
     let id = id_of(&s, &path);
-    let (status, answer) = s.get(Some(&token), "/tree?recursive=true");
-    assert_eq!(status, 200);
+    let (_, entries) = tree_all(&s, &token, "recursive=true");
+    let answer = json!({ "entries": entries });
     assert!(paths(&answer).iter().all(|p| !p.contains("/.")), "{answer}");
     for p in ["NOTE/Note/.dir", "NOTE/Note/.hidden.note"] {
         let (status, answer) = s.get(Some(&token), &format!("/tree?path={}", q(p)));

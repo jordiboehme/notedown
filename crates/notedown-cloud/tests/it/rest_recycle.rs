@@ -20,12 +20,22 @@ fn md5_hex(bytes: &[u8]) -> String {
     const_hex::encode(Md5::digest(bytes))
 }
 
-/// The items of `GET /recycle` with `query` (200 expected).
+/// The items of `GET /recycle` with `query` (200 expected) and whether it has a `next` page.
 fn bin(s: &Server, token: &str, query: &str) -> (Vec<Value>, bool) {
+    let (items, next) = bin_page(s, token, query);
+    (items, next.is_some())
+}
+
+/// The items of `GET /recycle` with `query` (200 expected) and its `next` cursor.
+fn bin_page(s: &Server, token: &str, query: &str) -> (Vec<Value>, Option<String>) {
     let (status, answer) = s.get(Some(token), &format!("/recycle{query}"));
     assert_eq!(status, 200, "{answer}");
     let items = answer["items"].as_array().unwrap().clone();
-    (items, answer["more"].as_bool().unwrap())
+    let next = match &answer["next"] {
+        Value::Null => None,
+        v => Some(v.as_str().unwrap().to_string()),
+    };
+    (items, next)
 }
 
 fn keys(items: &[Value]) -> Vec<String> {
@@ -192,26 +202,26 @@ fn the_bin_pages() {
         .collect();
     assert!(at.windows(2).all(|w| w[0] >= w[1]), "{at:?}");
 
-    let (first, more) = bin(&s, &t, "?limit=1");
-    assert_eq!((keys(&first), more), (keys(&all[..1]), true));
-    let after = |key: &str| format!("?limit=1&after={}", q(key));
-    let (second, more) = bin(&s, &t, &after(&keys(&first)[0]));
-    assert_eq!((keys(&second), more), (keys(&all[1..2]), true));
-    let (third, more) = bin(&s, &t, &after(&keys(&second)[0]));
+    let (first, next) = bin_page(&s, &t, "?limit=1");
+    assert_eq!(keys(&first), keys(&all[..1]));
+    let after = |cursor: &str| format!("?limit=1&cursor={cursor}");
+    let (second, next_2) = bin_page(&s, &t, &after(&next.clone().unwrap()));
+    assert_eq!(keys(&second), keys(&all[1..2]));
+    let (third, more) = bin(&s, &t, &after(&next_2.unwrap()));
     assert_eq!((keys(&third), more), (keys(&all[2..]), false));
-    let (rest, more) = bin(&s, &t, &format!("?after={}", q(&keys(&first)[0])));
+    let (rest, more) = bin(&s, &t, &format!("?cursor={}", next.unwrap()));
     assert_eq!((keys(&rest), more), (keys(&all[1..]), false));
     // 0 is 1, as for /events.
     let (one, more) = bin(&s, &t, "?limit=0");
     assert_eq!((one.len(), more), (1, true));
 
-    for bad in ["?limit=x", "?after=nokey", "?after=x%2FNOTE"] {
+    for (bad, code) in [
+        ("?limit=x", "bad_request"),
+        ("?cursor=nokey", "bad_cursor"),
+        ("?cursor=x%2FNOTE", "bad_cursor"),
+    ] {
         let (status, answer) = s.get(Some(&t), &format!("/recycle{bad}"));
-        assert_eq!(
-            (status, &answer["error"]),
-            (400, &json!("bad_request")),
-            "{bad}"
-        );
+        assert_eq!((status, &answer["error"]), (400, &json!(code)), "{bad}");
     }
 }
 

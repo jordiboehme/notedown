@@ -213,6 +213,7 @@ pub fn show_window(app: &AppHandle, kind: WindowKind, page: Option<String>) -> t
     window.set_focus()?;
     shown.set(kind, true);
     tell_poller(app, false);
+    tell_library(app, kind, true);
     Ok(())
 }
 
@@ -249,6 +250,17 @@ pub fn hide_window(app: &AppHandle, kind: WindowKind) {
     let visible = app.state::<Shown>().set(kind, false);
     apply_policy(app, &visible);
     tell_poller(app, false);
+    tell_library(app, kind, false);
+}
+
+/// Tells the library's follower that its window was shown or hidden: it follows the changes
+/// only while the window is visible. It never blocks (a flag and a wake of its thread).
+fn tell_library(app: &AppHandle, kind: WindowKind, visible: bool) {
+    if kind == WindowKind::Library
+        && let Some(library) = app.try_state::<crate::library::Library>()
+    {
+        library.set_visible(visible);
+    }
 }
 
 /// Hides every window (Quit).

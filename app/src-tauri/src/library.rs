@@ -12,9 +12,13 @@
 //! until the next call answers 401.
 //!
 //! Every event of the library is a [`LibraryEvent`]; none of them holds the token.
+//!
+//! The listed folders and how they follow the server's changes: `library/cache.rs` (the rules)
+//! and `library/listing.rs` (the calls and the follower).
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
@@ -269,6 +273,16 @@ struct Inner {
     rebinding: Mutex<()>,
     /// Held only for short reads and swaps, never across a Keychain read or a call.
     bound: Mutex<Bound>,
+    /// The cache worker: the listed folders. A page merge or a batch of events runs whole under
+    /// this lock, in the order they take it; no call is made under it. Never taken together
+    /// with `bound`.
+    cache: Mutex<cache::Cache>,
+    /// Whether the window is visible and when the follower last read the events.
+    follow: Mutex<listing::Follow>,
+    /// One follow step at a time.
+    stepping: Mutex<()>,
+    /// Wakes the follower's thread, once it runs.
+    waker: Mutex<Option<Sender<()>>>,
 }
 
 /// What the library is bound to.
@@ -328,6 +342,10 @@ impl Library {
                     view: None,
                     refused: false,
                 }),
+                cache: Mutex::new(cache::Cache::default()),
+                follow: Mutex::new(listing::Follow::default()),
+                stepping: Mutex::new(()),
+                waker: Mutex::new(None),
             }),
         }
     }
@@ -364,7 +382,7 @@ impl Library {
         let key = token_key(&config);
         let place = Some((base.clone(), key.clone()));
         // Stop what the old binding does before the Keychain is read.
-        let (old, still_refused) = {
+        let (old, still_refused, generation) = {
             let mut bound = lock(&inner.bound);
             if !again && bound.place == place {
                 return;
@@ -375,11 +393,12 @@ impl Library {
             bound.cancelled = Arc::new(AtomicBool::new(false));
             bound.generation += 1;
             bound.place = place;
-            (bound.rest.take(), still_refused)
+            (bound.rest.take(), still_refused, bound.generation)
         };
         // The client goes outside the lock: its end waits for its thread.
         drop(old);
-        // Task 3: the follower stops and the cache is dropped here.
+        // The follower of the old binding stops (its session is cancelled) and the cache goes.
+        self.reset_listing(generation);
         // A binding that failed on this Mac (the Keychain, the client) records no place: the
         // next nudge tries again.
         let (view, rest, failed) = match (base, key) {
@@ -484,6 +503,12 @@ impl Library {
     }
 }
 
+mod cache;
+mod listing;
+
+pub use cache::{Key, Listed};
+pub use listing::{FOLLOW_EVERY, RecycleItem, RecyclePage};
+
 /// A library that is never set up, for tests of other parts that need one.
 #[cfg(test)]
 pub(crate) fn idle() -> Library {
@@ -496,3 +521,6 @@ pub(crate) fn idle() -> Library {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod listing_tests;

@@ -8,7 +8,7 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::config::{self, AppConfig, Mode, StartView};
-use crate::library::{Library, StateView};
+use crate::library::{Entry, Library, Listed, RecyclePage, StateView};
 use crate::login::{self, LoginError, LoginGate, Password};
 use crate::model::{ModelControl, ModelState};
 use crate::poller::Poller;
@@ -555,6 +555,48 @@ pub async fn log_out(
 #[tauri::command]
 pub fn library_state(library: State<'_, Library>) -> Option<StateView> {
     library.state()
+}
+
+/// The folder at `path` as loaded so far, with the cursor of its next page: the first page
+/// without `cursor`, else the page after it. `foldersOnly` lists only its folders (the tree).
+/// The calls run off the main thread.
+#[tauri::command]
+pub async fn library_list(
+    library: State<'_, Library>,
+    path: String,
+    cursor: Option<String>,
+    folders_only: Option<bool>,
+) -> Result<Listed, String> {
+    let library = library.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library.list(&path, cursor.as_deref(), folders_only.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
+/// One file or folder by its id.
+#[tauri::command]
+pub async fn library_entry(library: State<'_, Library>, id: u64) -> Result<Entry, String> {
+    let library = library.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || library.entry(id))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// A page of the recycle bin: the first one without `cursor`.
+#[tauri::command]
+pub async fn library_recycle(
+    library: State<'_, Library>,
+    cursor: Option<String>,
+) -> Result<RecyclePage, String> {
+    let library = library.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || library.recycle(cursor.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 /// The last lines of both children's output, for the Server page.

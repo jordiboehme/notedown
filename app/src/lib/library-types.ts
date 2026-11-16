@@ -20,6 +20,25 @@ export type FolderState = {
   error: string | null;
 };
 
+/**
+ * The answer of `library_list`: the folder as loaded so far (it replaces what the window shows)
+ * and the cursor of its next page, or null once it is complete.
+ */
+export type Listing = { folder: FolderState; next: string | null };
+
+export type RecycleItem = {
+  key: string;
+  path: string;
+  name: string;
+  kind: "file" | "folder";
+  deletedAt: number;
+  size: number;
+  files: number | null;
+};
+
+/** The answer of `library_recycle`: one page of the bin. */
+export type RecyclePage = { items: RecycleItem[]; next: string | null };
+
 export type LibraryState = "loggedOut" | "notSetUp" | "unreachable" | "notImported" | "refused" | "ready";
 
 /**

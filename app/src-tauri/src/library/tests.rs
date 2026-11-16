@@ -13,17 +13,17 @@ use crate::login::{LoginGate, Password};
 use crate::rest::test_http::{Scripted, answer};
 use crate::token::{MemoryStore, Token, TokenError};
 
-const TOKEN: &str = "tok-SECRET-4711";
+pub(super) const TOKEN: &str = "tok-SECRET-4711";
 
 /// A store in memory that counts its reads.
 #[derive(Default)]
-struct CountingStore {
+pub(super) struct CountingStore {
     inner: MemoryStore,
     gets: AtomicUsize,
 }
 
 impl CountingStore {
-    fn with(key: &str, token: &str) -> Arc<Self> {
+    pub(super) fn with(key: &str, token: &str) -> Arc<Self> {
         let store = Arc::new(Self::default());
         store.inner.set(key, &Token::new(token)).unwrap();
         store
@@ -51,7 +51,7 @@ impl TokenStore for CountingStore {
 
 /// The place the library reads, changed by the test.
 #[derive(Clone)]
-struct Place(Arc<Mutex<(AppConfig, ServeInfo)>>);
+pub(super) struct Place(Arc<Mutex<(AppConfig, ServeInfo)>>);
 
 impl Place {
     fn new(config: AppConfig) -> Self {
@@ -59,7 +59,7 @@ impl Place {
     }
 
     /// Remote mode at the scripted server's port.
-    fn remote(port: u16, account: Option<&str>) -> Self {
+    pub(super) fn remote(port: u16, account: Option<&str>) -> Self {
         Self::new(AppConfig {
             mode: Mode::Remote,
             server_url: Some(format!("http://127.0.0.1:{port}")),
@@ -88,22 +88,22 @@ impl Place {
         change(&mut self.0.lock().unwrap().0);
     }
 
-    fn func(&self) -> PlaceFn {
+    pub(super) fn func(&self) -> PlaceFn {
         let place = self.0.clone();
         Arc::new(move || place.lock().unwrap().clone())
     }
 }
 
 #[derive(Clone, Default)]
-struct Events(Arc<Mutex<Vec<LibraryEvent>>>);
+pub(super) struct Events(pub(super) Arc<Mutex<Vec<LibraryEvent>>>);
 
 impl Events {
-    fn emit(&self) -> Emit {
+    pub(super) fn emit(&self) -> Emit {
         let events = self.0.clone();
         Arc::new(move |event| events.lock().unwrap().push(event))
     }
 
-    fn all(&self) -> Vec<LibraryEvent> {
+    pub(super) fn all(&self) -> Vec<LibraryEvent> {
         self.0.lock().unwrap().clone()
     }
 
@@ -118,7 +118,7 @@ impl Events {
     }
 }
 
-fn no_sleep() -> Sleeper {
+pub(super) fn no_sleep() -> Sleeper {
     Arc::new(|_: Duration| {})
 }
 
@@ -140,7 +140,7 @@ fn get_account(library: &Library) -> Result<Value, LibraryError> {
     library.call(|rest| rest.get_json::<Value>("/account", &[]))
 }
 
-fn remote_key(port: u16, slug: &str) -> String {
+pub(super) fn remote_key(port: u16, slug: &str) -> String {
     format!("http://127.0.0.1:{port}|{slug}")
 }
 

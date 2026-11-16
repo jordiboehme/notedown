@@ -106,6 +106,7 @@ pub fn run() {
             let poller = status_poller(sidecar_spawn, reader, processes.clone());
             let library = library_for(app.handle().clone(), library_reader, processes.clone());
             let rebind = library_worker(library.clone());
+            library.start_following(library::FOLLOW_EVERY);
             app.manage(library);
             let serve_rebind = rebind.clone();
             processes.on_serve_info(move || {
@@ -150,7 +151,10 @@ pub fn run() {
             commands::model_pull,
             commands::model_pause,
             commands::model_remove,
-            commands::library_state
+            commands::library_state,
+            commands::library_list,
+            commands::library_entry,
+            commands::library_recycle
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
@@ -501,7 +505,16 @@ mod tests {
                 "quit_app"
             ])
         );
-        assert_eq!(granted("library"), set(&["library_state", "open_settings"]));
+        assert_eq!(
+            granted("library"),
+            set(&[
+                "library_state",
+                "library_list",
+                "library_entry",
+                "library_recycle",
+                "open_settings"
+            ])
+        );
         let mut settings = set(&SETTINGS_ONLY);
         settings.remove("process_states");
         settings.insert("get_status".into());
@@ -567,7 +580,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 24);
+        assert_eq!(handler_commands().len(), 27);
     }
 
     #[test]
@@ -597,6 +610,9 @@ mod tests {
             "model_pause",
             "model_remove",
             "library_state",
+            "library_list",
+            "library_entry",
+            "library_recycle",
         ]);
         assert_eq!(manifest_commands(), all);
         // Every granted command is a real one.
@@ -608,7 +624,14 @@ mod tests {
     #[test]
     fn library_state_is_only_the_librarys() {
         for window in ["panel", "settings"] {
-            assert!(!granted(window).contains("library_state"), "{window}");
+            for command in [
+                "library_state",
+                "library_list",
+                "library_entry",
+                "library_recycle",
+            ] {
+                assert!(!granted(window).contains(command), "{window} has {command}");
+            }
         }
     }
 

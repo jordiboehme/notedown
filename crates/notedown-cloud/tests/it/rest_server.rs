@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use notedown_cloud::auth::{Accounts, expected_login_hash, md5_hex};
+use notedown_cloud::auth::{Accounts, Imported, expected_login_hash, md5_hex};
 use notedown_cloud::put;
 use notedown_cloud::rest;
 use notedown_cloud::server::{AppState, bind, serve_until_with};
@@ -76,6 +76,26 @@ pub(crate) fn start() -> Server {
         stop: Some(tx),
         _dir: dir,
     }
+}
+
+/// [`start`] with the account imported: the protect gate is open and the native folders are
+/// there (ids without events).
+pub(crate) fn start_imported() -> Server {
+    let s = start();
+    let store = s.state.store("jordi").unwrap();
+    let g = store.lock().unwrap();
+    store.ensure_native_folders(&g).unwrap();
+    drop(g);
+    let accounts = Accounts::new(&s.data);
+    let mut a = accounts.get("jordi").unwrap().unwrap();
+    a.imported = Some(Imported {
+        at: "2026-11-16T10:00:00Z".into(),
+        source: "/backup/Supernote".into(),
+        files: 0,
+        bytes: 0,
+    });
+    accounts.save(&a).unwrap();
+    s
 }
 
 impl Server {

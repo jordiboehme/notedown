@@ -14,7 +14,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{PREFIX, RefusedToken};
+use super::{PREFIX, RefusedToken, browse};
 use crate::api::ClientAddr;
 use crate::api::envelope::{LogMessage, Streamed};
 use crate::api::oss::{Flow, stream_body};
@@ -45,6 +45,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(&path("/note"), get_only(get(note)))
         .route(&path("/digests"), get_only(get(digests)))
         .route(&path("/journal"), get_only(get(journal)))
+        .route(&path("/tree"), get_only(get(browse::tree)))
+        .route(&path("/entries/{id}"), get_only(get(browse::entry)))
+        .route(&path("/files/{id}"), get_only(get(browse::file)))
         .route(PREFIX, any(no_route))
         .route(&path("/"), any(no_route))
         .route(&path("/{*rest}"), any(no_route))
@@ -52,11 +55,11 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 /// `{"error": code}` with `status`.
-fn error(status: StatusCode, code: &str) -> Response {
+pub(super) fn error(status: StatusCode, code: &str) -> Response {
     (status, Json(json!({ "error": code }))).into_response()
 }
 
-fn bad_request(message: &str) -> Response {
+pub(super) fn bad_request(message: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
         Json(json!({"error": "bad_request", "message": message})),
@@ -65,7 +68,7 @@ fn bad_request(message: &str) -> Response {
 }
 
 /// 500 `internal`; `detail` (never a secret) goes to the request log and stderr only.
-fn internal(detail: impl std::fmt::Display) -> Response {
+pub(super) fn internal(detail: impl std::fmt::Display) -> Response {
     let detail = detail.to_string();
     eprintln!("notedown cloud: rest: {detail}");
     let mut r = error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
@@ -89,7 +92,7 @@ async fn blocking<T: Send + 'static>(
 }
 
 /// An answer that ends a handler early (boxed: a `Response` is large).
-type Refusal = Box<Response>;
+pub(super) type Refusal = Box<Response>;
 
 /// Who a token speaks for.
 enum Caller {
@@ -151,7 +154,10 @@ async fn caller(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(Caller, S
 }
 
 /// The live account of the caller; a removed one is 410.
-async fn account_of(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Account, Refusal> {
+pub(super) async fn account_of(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Result<Account, Refusal> {
     match caller(state, headers).await? {
         (Caller::Live(account), _) => Ok(*account),
         (Caller::Removed { user_id, seq, .. }, id) => Err(Box::new(removed(id, user_id, seq))),
@@ -309,7 +315,7 @@ async fn digests(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
 }
 
 /// The query of a route; a query that does not parse is a 400.
-fn query<T: serde::de::DeserializeOwned>(uri: &Uri) -> Result<T, Refusal> {
+pub(super) fn query<T: serde::de::DeserializeOwned>(uri: &Uri) -> Result<T, Refusal> {
     Query::<T>::try_from_uri(uri)
         .map(|Query(q)| q)
         .map_err(|e| Box::new(bad_request(&e.body_text())))
@@ -372,7 +378,7 @@ enum Opened {
 }
 
 /// Whether `If-None-Match` names `etag` (weak comparison) or is `*`.
-fn not_modified(headers: &HeaderMap, etag: &str) -> bool {
+pub(super) fn not_modified(headers: &HeaderMap, etag: &str) -> bool {
     let strip = |t: &str| t.trim().trim_start_matches("W/").to_string();
     headers
         .get_all(header::IF_NONE_MATCH)

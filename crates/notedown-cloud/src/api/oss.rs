@@ -302,11 +302,49 @@ fn send_file(
         headers.get(header::RANGE).and_then(|v| v.to_str().ok()),
         size,
     );
+    let mut r = send_range(file, size, range, touch);
+    if r.status() != StatusCode::RANGE_NOT_SATISFIABLE
+        && let Ok(v) = HeaderValue::from_str(&content_disposition(name))
+    {
+        r.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+    }
+    r.extensions_mut().insert(LogDevice(serial));
+    r
+}
+
+/// The response that sends `file` (`size` bytes) whose strong ETag is `etag` (`"<md5>"`), with
+/// that `ETag`: one `Range` supported (206, `Content-Range`), 416 for a start past the end. An
+/// `If-Range` that is not exactly `etag` (strong comparison: a weak tag or a date never
+/// matches) sends the whole file (200).
+pub(crate) fn send_tagged(
+    headers: &HeaderMap,
+    file: std::fs::File,
+    size: u64,
+    etag: &str,
+) -> Response {
+    let range = match headers.get(header::IF_RANGE) {
+        Some(v) if v.to_str().ok().map(str::trim) != Some(etag) => ByteRange::Full,
+        _ => parse_range(
+            headers.get(header::RANGE).and_then(|v| v.to_str().ok()),
+            size,
+        ),
+    };
+    let mut r = send_range(file, size, range, None);
+    if let Ok(v) = HeaderValue::from_str(etag) {
+        r.headers_mut().insert(header::ETAG, v);
+    }
+    r
+}
+
+/// The response that sends `range` of `file` (`size` bytes): 200 for the whole file, 206 with
+/// `Content-Range` for a part, 416 with `bytes */<size>` (the file is dropped). The body streams
+/// ([`stream_body`]), extending the sync lock of `touch`.
+fn send_range(file: std::fs::File, size: u64, range: ByteRange, touch: Option<Touch>) -> Response {
     let (status, start, len) = match range {
         ByteRange::Full => (StatusCode::OK, 0, size),
         ByteRange::Partial { start, end } => (StatusCode::PARTIAL_CONTENT, start, end - start + 1),
         ByteRange::Unsatisfiable => {
-            let mut r = (
+            return (
                 StatusCode::RANGE_NOT_SATISFIABLE,
                 [
                     (header::CONTENT_RANGE, format!("bytes */{size}")),
@@ -314,8 +352,6 @@ fn send_file(
                 ],
             )
                 .into_response();
-            r.extensions_mut().insert(LogDevice(serial));
-            return r;
         }
     };
     let body = stream_body(Flow {
@@ -333,9 +369,6 @@ fn send_file(
     );
     h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
     h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    if let Ok(v) = HeaderValue::from_str(&content_disposition(name)) {
-        h.insert(header::CONTENT_DISPOSITION, v);
-    }
     if status == StatusCode::PARTIAL_CONTENT {
         let end = start + len - 1;
         if let Ok(v) = HeaderValue::from_str(&format!("bytes {start}-{end}/{size}")) {
@@ -343,7 +376,6 @@ fn send_file(
         }
     }
     r.extensions_mut().insert(Streamed);
-    r.extensions_mut().insert(LogDevice(serial));
     r
 }
 

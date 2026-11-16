@@ -740,6 +740,36 @@ pub async fn library_cancel_drop(library: State<'_, Library>, drop_id: u64) -> R
     Ok(())
 }
 
+/// Downloads the file `id` into the Downloads folder: answers the queued `download` job, whose
+/// events follow. Retry and Cancel are `library_retry` and `library_cancel`.
+#[tauri::command]
+pub async fn library_download(library: State<'_, Library>, id: u64) -> Result<Job, String> {
+    let library = library.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || library.download(id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Show in Finder: `/usr/bin/open -R -- <path>`, only for a file Notedown downloaded in this
+/// run, by the path its job answered.
+#[tauri::command]
+pub async fn library_reveal(library: State<'_, Library>, path: String) -> Result<(), String> {
+    let library = library.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let status = library
+            .reveal_command(&path)?
+            .status()
+            .map_err(|e| e.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("The Finder did not open.".to_owned())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// The last lines of both children's output, for the Server page.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProcessLogs {

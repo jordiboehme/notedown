@@ -57,7 +57,7 @@ pub const DROP_GONE: &str = "This drop is not there anymore. Drop the files agai
 /// A drop with nothing that can be uploaded.
 pub const NOTHING: &str = "There is nothing in the drop to upload.";
 /// The answer to a job that is not there (ended, cancelled, or of an earlier binding).
-pub const JOB_GONE: &str = "This upload is not there anymore.";
+pub const JOB_GONE: &str = "This job is not there anymore.";
 /// The text of a job that was skipped.
 pub const SKIPPED: &str = "Skipped.";
 /// A dropped file that cannot be read (or that became a symlink since the drop).
@@ -412,7 +412,7 @@ fn copy_name(name: &str, n: u32) -> String {
     }
 }
 
-fn is_md5(s: &str) -> bool {
+pub(super) fn is_md5(s: &str) -> bool {
     s.len() == 32 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
@@ -503,7 +503,7 @@ impl Uploads {
 }
 
 impl Library {
-    fn send(&self, job: &Job) {
+    pub(super) fn send(&self, job: &Job) {
         (self.inner.emit)(LibraryEvent::Job { job: job.clone() });
     }
 
@@ -650,8 +650,12 @@ impl Library {
         Ok(())
     }
 
-    /// Tries a failed upload again, from where it was (its target and answer).
+    /// Tries a failed upload or download again, from where it was (an upload with its target
+    /// and answer, a download with the bytes it has).
     pub fn retry(&self, job: u64) -> Result<(), String> {
+        if self.has_download(job) {
+            return self.retry_download(job);
+        }
         let mut up = lock(&self.inner.uploads);
         let Some(item) = up.items.get(&job) else {
             return Err(JOB_GONE.to_owned());
@@ -665,10 +669,10 @@ impl Library {
         Ok(())
     }
 
-    /// Ends the job `job`: an upload wherever it is (a running one drops its request), or a
-    /// restore that asks for a name. A job that is not there is left alone.
+    /// Ends the job `job`: an upload or a download wherever it is (a running one drops its
+    /// request), or a restore that asks for a name. A job that is not there is left alone.
     pub fn cancel(&self, job: u64) {
-        if lock(&self.inner.uploads).cancel(self, job) {
+        if lock(&self.inner.uploads).cancel(self, job) || self.cancel_download(job) {
             return;
         }
         let asking = {

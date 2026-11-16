@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::header::{
-    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, IF_MATCH, IF_NONE_MATCH,
-    RETRY_AFTER as RETRY_AFTER_HEADER,
+    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, IF_MATCH, IF_NONE_MATCH, IF_RANGE,
+    RANGE, RETRY_AFTER as RETRY_AFTER_HEADER,
 };
 use reqwest::{Method, Url};
 use serde::de::DeserializeOwned;
@@ -377,17 +377,8 @@ impl Rest {
         precondition: &Precondition,
     ) -> Result<Put, RestError> {
         let url = self.url("/files", &[("path", path)])?;
-        // No redirect is followed and the app's own server sees no proxy, as for the JSON calls.
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none());
-        if crate::poller::is_loopback(&self.base) {
-            builder = builder.no_proxy();
-        }
-        let client = builder
-            .build()
-            .map_err(|e| RestError::Failed(format!("no HTTP client: {}", e.without_url())))?;
-        let mut request = client
+        let mut request = self
+            .transfer_client()?
             .put(url)
             .header(CONTENT_LENGTH, HeaderValue::from(body.remaining()));
         if let Some(bearer) = self.bearer()? {
@@ -418,6 +409,58 @@ impl Rest {
         } else {
             Err(error_for(status, &answer, retry_after.as_deref()))
         }
+    }
+
+    /// The client of one transfer: no total timeout (the caller watches the bytes), no
+    /// redirect followed, and no proxy for the app's own server, as for the JSON calls. Made
+    /// per transfer, inside the transfer's runtime.
+    fn transfer_client(&self) -> Result<reqwest::Client, RestError> {
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none());
+        if crate::poller::is_loopback(&self.base) {
+            builder = builder.no_proxy();
+        }
+        builder
+            .build()
+            .map_err(|e| RestError::Failed(format!("no HTTP client: {}", e.without_url())))
+    }
+
+    /// `GET /files/{id}`, once: the answer with its head, 200 or 206, for the caller to read
+    /// the body from. With `from` above 0 it asks for the bytes from there on, only while the
+    /// file is still the one with `md5` (`Range` and `If-Range`); the server answers 206, or
+    /// 200 with the whole file when it changed. Like [`put_file`](Self::put_file) it has no
+    /// total timeout and runs inside a runtime: the caller watches the bytes.
+    pub async fn get_file(
+        &self,
+        id: u64,
+        from: u64,
+        md5: &str,
+    ) -> Result<reqwest::Response, RestError> {
+        let url = self.url(&format!("/files/{id}"), &[])?;
+        let mut request = self.transfer_client()?.get(url);
+        if let Some(bearer) = self.bearer()? {
+            request = request.header(AUTHORIZATION, bearer);
+        }
+        if from > 0 {
+            let tag = HeaderValue::from_str(&format!("\"{md5}\""))
+                .map_err(|_| RestError::Garbled("no valid md5".to_owned()))?;
+            request = request
+                .header(RANGE, format!("bytes={from}-"))
+                .header(IF_RANGE, tag);
+        }
+        let response = request.send().await.map_err(cut)?;
+        let status = response.status().as_u16();
+        if status == 200 || status == 206 {
+            return Ok(response);
+        }
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let answer = response.bytes().await.map_err(cut)?;
+        Err(error_for(status, &answer, retry_after.as_deref()))
     }
 
     /// One request with an optional JSON body.

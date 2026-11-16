@@ -314,6 +314,8 @@ struct Inner {
     /// The drops and the upload queue. Held only for short changes and the events they send,
     /// never across a call or a file read.
     uploads: Mutex<uploads::Uploads>,
+    /// The Downloads folder, the download queue and the files downloaded in this run.
+    downloads: downloads::Shared,
 }
 
 /// What the library is bound to.
@@ -380,6 +382,7 @@ impl Library {
                 next_job: AtomicU64::new(0),
                 asking: Mutex::new(HashMap::new()),
                 uploads: Mutex::new(uploads::Uploads::default()),
+                downloads: downloads::Shared::default(),
             }),
         }
     }
@@ -435,6 +438,7 @@ impl Library {
         self.reset_listing(generation);
         self.cancel_asking();
         self.cancel_uploads();
+        self.cancel_downloads();
         // A binding that failed on this Mac (the Keychain, the client) records no place: the
         // next nudge tries again.
         let (view, rest, failed) = match (base, key) {
@@ -541,6 +545,7 @@ impl Library {
 
 mod cache;
 mod changes;
+mod downloads;
 mod listing;
 mod uploads;
 
@@ -569,3 +574,6 @@ mod changes_tests;
 
 #[cfg(test)]
 mod uploads_tests;
+
+#[cfg(test)]
+mod downloads_tests;

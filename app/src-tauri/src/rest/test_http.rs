@@ -212,6 +212,37 @@ pub enum Act {
     },
     /// Reads at least `after` bytes of the body, then closes the connection without an answer.
     Cut { after: usize },
+    /// Answers with these bytes as they are (a file with its head, see [`file_answer`]).
+    Raw(Vec<u8>),
+    /// Sends the first `after` bytes of `reply`, then closes the connection: an answer cut off
+    /// in the middle of its body.
+    Partial { reply: Vec<u8>, after: usize },
+    /// Sends the first `after` bytes of `reply` and says `reached`; then sends nothing more
+    /// until `release` (or the end of the server). Then it says on `closed` whether the client
+    /// had closed or reset the connection (true), or was still there (false).
+    Trickle {
+        reply: Vec<u8>,
+        after: usize,
+        reached: std::sync::mpsc::Sender<()>,
+        release: Receiver<()>,
+        closed: std::sync::mpsc::Sender<bool>,
+    },
+}
+
+/// The answer of a file: the status, the header lines and the bytes, with their length.
+pub fn file_answer(status: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+    let mut head = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/octet-stream\r\n\
+         content-length: {}\r\nconnection: close\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+    let mut out = head.into_bytes();
+    out.extend_from_slice(body);
+    out
 }
 
 /// A scripted HTTP server on loopback that serves each connection on a thread of its own and
@@ -449,6 +480,49 @@ fn serve(
             request.body = body;
             let _ = tx.send(request);
             let _ = stream.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+        Some(Act::Raw(reply)) => {
+            read_body(&mut stream, &mut body, length, &mut |_| {});
+            request.body = body;
+            let _ = tx.send(request);
+            let _ = stream.write_all(&reply);
+            let _ = stream.flush();
+            return;
+        }
+        Some(Act::Partial { reply, after }) => {
+            read_body(&mut stream, &mut body, length, &mut |_| {});
+            request.body = body;
+            let _ = tx.send(request);
+            let _ = stream.write_all(&reply[..after.min(reply.len())]);
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+        Some(Act::Trickle {
+            reply,
+            after,
+            reached,
+            release,
+            closed,
+        }) => {
+            read_body(&mut stream, &mut body, length, &mut |_| {});
+            request.body = body;
+            let _ = tx.send(request);
+            let _ = stream.write_all(&reply[..after.min(reply.len())]);
+            let _ = stream.flush();
+            let _ = reached.send(());
+            let until = Instant::now() + WAIT;
+            while Instant::now() < until && !stop.load(Ordering::SeqCst) {
+                if release.recv_timeout(Duration::from_millis(20)).is_ok() {
+                    break;
+                }
+            }
+            // A client that went away has closed or reset the stream; one that waits still
+            // runs into the read timeout.
+            let mut rest = Vec::new();
+            let end = read_body(&mut stream, &mut rest, 1, &mut |_| {});
+            let _ = closed.send(end == BodyEnd::Closed);
             return;
         }
     };

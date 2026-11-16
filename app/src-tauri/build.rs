@@ -44,6 +44,8 @@ const COMMANDS: &[&str] = &[
     "library_retry",
     "library_cancel",
     "library_cancel_drop",
+    "library_download",
+    "library_reveal",
 ];
 
 fn main() {

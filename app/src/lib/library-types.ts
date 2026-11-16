@@ -60,6 +60,11 @@ export type Clash = { name: string; existing: string; canReplace: boolean };
  * `library_move`, `library_delete`, `library_restore`, `library_empty`) answer their job as it
  * ended. A restore into a taken path answers it as `asking` with `question`; the window asks for
  * another name and calls `library_restore(key, path)`, which goes on with the same job.
+ * `library_download(id)` answers its `download` job as it was queued (label the file name, `total`
+ * its size); its events follow, and a done job's `result` is the absolute path of the file in the
+ * Downloads folder (`name (2).ext` when the name is taken). A failed download keeps what came:
+ * `library_retry(job)` goes on from there, `library_cancel(job)` ends it. `library_reveal(path)`
+ * shows that `result` in the Finder; it takes only a path a download of this run answered.
  */
 export type Job = {
   id: number;

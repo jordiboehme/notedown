@@ -167,7 +167,9 @@ pub fn run() {
             commands::library_answer,
             commands::library_retry,
             commands::library_cancel,
-            commands::library_cancel_drop
+            commands::library_cancel_drop,
+            commands::library_download,
+            commands::library_reveal
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
@@ -360,19 +362,29 @@ fn library_for(
     config: commands::ConfigReader,
     processes: Arc<Processes>,
 ) -> Library {
+    // The Downloads folder in the user's home. Nothing reads it before the first download.
+    let downloads = app
+        .path()
+        .home_dir()
+        .ok()
+        .map(|home| home.join("Downloads"));
     let (tx, rx) = mpsc::channel::<LibraryEvent>();
     std::thread::spawn(move || {
         for event in rx {
             let _ = app.emit_to(windows::WindowKind::Library.label(), LIBRARY_EVENT, event);
         }
     });
-    Library::new(
+    let library = Library::new(
         Arc::new(KeychainStore::new()),
         Arc::new(move || (config.current(), processes.serve_info())),
         Arc::new(move |event| {
             let _ = tx.send(event);
         }),
-    )
+    );
+    if let Some(downloads) = downloads {
+        library.set_downloads(downloads);
+    }
+    library
 }
 
 /// The thread that binds the library again when the server's address may have changed (a new
@@ -537,6 +549,8 @@ mod tests {
                 "library_retry",
                 "library_cancel",
                 "library_cancel_drop",
+                "library_download",
+                "library_reveal",
                 "open_settings"
             ])
         );
@@ -605,7 +619,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 39);
+        assert_eq!(handler_commands().len(), 41);
     }
 
     #[test]
@@ -650,6 +664,8 @@ mod tests {
             "library_retry",
             "library_cancel",
             "library_cancel_drop",
+            "library_download",
+            "library_reveal",
         ]);
         assert_eq!(manifest_commands(), all);
         // Every granted command is a real one.
@@ -678,6 +694,8 @@ mod tests {
                 "library_retry",
                 "library_cancel",
                 "library_cancel_drop",
+                "library_download",
+                "library_reveal",
             ] {
                 assert!(!granted(window).contains(command), "{window} has {command}");
             }

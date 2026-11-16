@@ -5,5 +5,12 @@
 	<!-- A menu bar app: no Dock icon at launch. A library or settings window turns it on. -->
 	<key>LSUIElement</key>
 	<true/>
+	<!-- macOS asks once before Notedown reads these folders; these texts say why. -->
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Notedown saves the files you download from your library in the Downloads folder.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Notedown reads the files you drop on the library window to upload them.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Notedown reads the files you drop on the library window to upload them.</string>
 </dict>
 </plist>

@@ -340,29 +340,53 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// The app commands a window may call, from all capability files that name it.
-    fn granted(window: &str) -> BTreeSet<String> {
-        let files = [
-            include_str!("../capabilities/default.json"),
-            include_str!("../capabilities/panel.json"),
-            include_str!("../capabilities/settings.json"),
-        ];
-        let mut commands = BTreeSet::new();
-        for text in files {
-            let cap: serde_json::Value = serde_json::from_str(text).unwrap();
+    /// The capability files, read from the folder, so a new file is never left out.
+    fn capability_files() -> Vec<(String, serde_json::Value)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities");
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                let text = std::fs::read_to_string(&path).unwrap();
+                (name, serde_json::from_str(&text).unwrap())
+            })
+            .collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        files
+    }
+
+    /// Every permission a window has, from all capability files that name it.
+    fn permissions(window: &str) -> BTreeSet<String> {
+        let mut all = BTreeSet::new();
+        for (_, cap) in capability_files() {
             let windows = cap["windows"].as_array().unwrap();
             if !windows.iter().any(|w| w == window) {
                 continue;
             }
             for permission in cap["permissions"].as_array().unwrap() {
-                let name = permission.as_str().unwrap();
-                // App permissions have no plugin prefix: `allow-get-status`.
-                if let Some(command) = name.strip_prefix("allow-") {
-                    commands.insert(command.replace('-', "_"));
-                }
+                all.insert(permission.as_str().unwrap().to_owned());
             }
         }
-        commands
+        all
+    }
+
+    /// The app commands a window may call.
+    fn granted(window: &str) -> BTreeSet<String> {
+        permissions(window)
+            .iter()
+            // App permissions have no plugin prefix: `allow-get-status`.
+            .filter_map(|name| name.strip_prefix("allow-"))
+            .map(|command| command.replace('-', "_"))
+            .collect()
+    }
+
+    /// The core and plugin permissions of a window: everything with a prefix.
+    fn core(window: &str) -> BTreeSet<String> {
+        permissions(window)
+            .into_iter()
+            .filter(|name| name.contains(':'))
+            .collect()
     }
 
     /// The commands build.rs gives permissions to, in its `COMMANDS` list.
@@ -426,6 +450,58 @@ mod tests {
                 "library has {command}"
             );
         }
+    }
+
+    #[test]
+    fn the_capabilities_are_one_file_per_window_that_calls_tauri() {
+        let names: Vec<String> = capability_files().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["panel.json", "settings.json"]);
+    }
+
+    #[test]
+    fn each_window_has_only_the_core_permissions_it_uses() {
+        // The panel follows the status and the Quit question, and fits its height.
+        assert_eq!(
+            core("panel"),
+            set(&[
+                "core:event:allow-listen",
+                "core:event:allow-unlisten",
+                "core:window:allow-set-size",
+            ])
+        );
+        // The settings follow events, name the window after the page and show the version.
+        assert_eq!(
+            core("settings"),
+            set(&[
+                "core:app:allow-version",
+                "core:event:allow-listen",
+                "core:event:allow-unlisten",
+                "core:window:allow-set-title",
+            ])
+        );
+        // The library placeholder calls nothing.
+        assert_eq!(permissions("library"), set(&[]));
+    }
+
+    /// The commands of `generate_handler!` in this file.
+    fn handler_commands() -> BTreeSet<String> {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find(concat!("generate_handler", "!["))
+            .expect("no command list in lib.rs");
+        let list = &source[start..];
+        let list = &list[list.find('[').unwrap() + 1..list.find(']').unwrap()];
+        list.split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| entry.rsplit("::").next().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_handler_list_is_the_manifest() {
+        assert_eq!(handler_commands(), manifest_commands());
+        assert_eq!(handler_commands().len(), 21);
     }
 
     #[test]

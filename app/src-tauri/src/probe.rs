@@ -5,7 +5,7 @@ use std::fs::{File, TryLockError};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// `<data>/pipeline/.writer.lock`, as `notedown_pipeline::store` names it.
 const PIPELINE_DIR: &str = "pipeline";
@@ -26,34 +26,79 @@ pub enum ServerProbe {
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const ANSWER_TIMEOUT: Duration = Duration::from_millis(1500);
 /// The most of an answer the probe reads.
-const MAX_ANSWER: u64 = 16 * 1024;
+const MAX_ANSWER: usize = 16 * 1024;
 
-/// Asks `127.0.0.1:<port>` whether it is a Notedown server: `GET /rest/v1/account` without a
-/// token must give 401 with the error code `token_refused`.
-pub fn server(port: u16) -> ServerProbe {
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+/// Asks `addr` whether it is a Notedown server: `GET /rest/v1/account` without a token must
+/// give 401 with the error code `token_refused`. The whole probe takes at most the connect
+/// timeout plus [`ANSWER_TIMEOUT`], however slowly the other side answers.
+pub fn server_at(addr: SocketAddr) -> ServerProbe {
     let mut stream = match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
         Ok(s) => s,
         Err(_) => return ServerProbe::None,
     };
-    if is_notedown(&mut stream, port).unwrap_or(false) {
+    let deadline = Instant::now() + ANSWER_TIMEOUT;
+    if is_notedown(&mut stream, addr, deadline).unwrap_or(false) {
         ServerProbe::Notedown
     } else {
         ServerProbe::Other
     }
 }
 
-fn is_notedown(stream: &mut TcpStream, port: u16) -> std::io::Result<bool> {
-    stream.set_read_timeout(Some(ANSWER_TIMEOUT))?;
-    stream.set_write_timeout(Some(ANSWER_TIMEOUT))?;
+/// Asks `127.0.0.1:<port>` whether it is a Notedown server.
+pub fn server(port: u16) -> ServerProbe {
+    server_at(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+}
+
+/// The time left until `deadline`, as a socket timeout; none left is an error.
+fn left(deadline: Instant) -> std::io::Result<Option<Duration>> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        Err(std::io::ErrorKind::TimedOut.into())
+    } else {
+        Ok(Some(left))
+    }
+}
+
+fn is_notedown(
+    stream: &mut TcpStream,
+    addr: SocketAddr,
+    deadline: Instant,
+) -> std::io::Result<bool> {
+    stream.set_write_timeout(left(deadline)?)?;
     write!(
         stream,
-        "GET /rest/v1/account HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json\r\n\
+        "GET /rest/v1/account HTTP/1.1\r\nHost: {addr}\r\nAccept: application/json\r\n\
          Connection: close\r\n\r\n"
     )?;
     let mut answer = Vec::new();
-    stream.take(MAX_ANSWER).read_to_end(&mut answer)?;
+    let mut buf = [0u8; 4096];
+    // Each read waits at most the time left, so a peer that sends a byte now and then cannot
+    // stretch the probe.
+    while answer.len() < MAX_ANSWER && !complete(&answer) {
+        stream.set_read_timeout(left(deadline)?)?;
+        match stream.read(&mut buf)? {
+            0 => break,
+            n => answer.extend_from_slice(&buf[..n]),
+        }
+    }
     Ok(token_refused(&answer))
+}
+
+/// Whether `answer` holds the head and, by its `Content-Length`, the whole body. Without a
+/// length the answer ends with the connection.
+fn complete(answer: &[u8]) -> bool {
+    let Some(end) = answer.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&answer[..end]);
+    let length = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    });
+    length.is_some_and(|n| answer.len() - (end + 4) >= n)
 }
 
 /// Whether an HTTP answer is 401 with the JSON body `{"error":"token_refused", ...}`.
@@ -124,7 +169,12 @@ pub(crate) mod test_server {
     impl TestServer {
         /// Answers each connection with `response`; `None` closes it without a word.
         pub fn start(response: Option<String>) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            Self::start_on("127.0.0.1:0", response)
+        }
+
+        /// [`start`](Self::start) on another address, such as `[::1]:0`.
+        pub fn start_on(addr: &str, response: Option<String>) -> Self {
+            let listener = TcpListener::bind(addr).unwrap();
             listener.set_nonblocking(true).unwrap();
             let port = listener.local_addr().unwrap().port();
             let stop = Arc::new(AtomicBool::new(false));
@@ -225,6 +275,48 @@ mod tests {
         assert_eq!(server(port), ServerProbe::Other);
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(listener);
+    }
+
+    #[test]
+    fn a_dripping_listener_does_not_hold_the_probe() {
+        // Answers one byte every 200 ms, for much longer than the probe may take.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let drip = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let answer = notedown_401();
+            for b in answer.as_bytes().iter().cycle().take(100) {
+                if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                if std::io::Write::write_all(&mut stream, &[*b]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        let started = Instant::now();
+        let got = server(port);
+        let took = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        drip.join().unwrap();
+        assert_eq!(got, ServerProbe::Other);
+        assert!(
+            took < Duration::from_millis(2500),
+            "the probe took {took:?}"
+        );
+    }
+
+    #[test]
+    fn a_server_on_ipv6_loopback_is_recognised() {
+        let s = TestServer::start_on("[::1]:0", Some(notedown_401()));
+        let addr: SocketAddr = format!("[::1]:{}", s.port).parse().unwrap();
+        assert_eq!(server_at(addr), ServerProbe::Notedown);
+        let other = TestServer::start_on("[::1]:0", Some(http("200 OK", "{}")));
+        let addr: SocketAddr = format!("[::1]:{}", other.port).parse().unwrap();
+        assert_eq!(server_at(addr), ServerProbe::Other);
     }
 
     #[test]

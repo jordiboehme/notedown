@@ -215,8 +215,8 @@ impl Processes {
     fn found_outside(&self, kind: ChildKind, config: &AppConfig) -> bool {
         match kind {
             ChildKind::Server => {
-                let port = serve_info::server_toml_port(&config.data_dir);
-                probe::server(port) == ServerProbe::Notedown
+                let addr = serve_info::server_toml_addr(&config.data_dir);
+                probe::server_at(addr) == ServerProbe::Notedown
             }
             ChildKind::Pipeline => probe::pipeline_lock(&config.data_dir),
         }

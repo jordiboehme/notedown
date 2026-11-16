@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::config::Mode;
-use crate::pidfile::PidFile;
+use crate::pidfile::tests::Orphan;
 use crate::probe::test_server::{TestServer, free_port, notedown_401};
 use crate::supervisor::system_clock;
 
@@ -139,47 +139,42 @@ fn alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
-/// A `/bin/sleep` of an "earlier run": no child of the test, in its own group.
-fn orphan_sleep() -> (u32, u32) {
+/// A `/bin/sleep` of an "earlier run": no child of the test, leading its own group.
+fn orphan_sleep() -> Orphan {
     crate::pidfile::tests::orphan_sleep(313)
-}
-
-fn kill_group(pgid: u32) {
-    crate::pidfile::tests::kill_group(pgid);
 }
 
 #[test]
 fn our_own_orphan_is_stopped_and_restarted() {
     let rig = Rig::new();
     rig.listen_on(free_port());
-    let (orphan, pgid) = orphan_sleep();
+    let o = orphan_sleep();
     let path = pidfile::path(&rig.run_dir(), ChildKind::Server);
-    pidfile::write(
-        &path,
-        &PidFile {
-            pid: orphan,
-            pgid,
-            started_ms: 1,
-            exe: "/bin/sleep".into(),
-        },
-    )
-    .unwrap();
+    pidfile::write(&path, &o.pid_file()).unwrap();
 
     // The sidecar is /bin/sleep, so the orphan is ours.
     let p = rig.processes(Path::new("/bin/sleep"));
     p.start_all(&rig.config());
-    let gone = wait_until(|| !alive(orphan));
-    kill_group(pgid);
+    let gone = wait_until(|| !alive(o.pid));
+    o.kill();
     assert!(gone, "the orphan still runs");
 
     let pid = running_pid(p.server());
-    assert_ne!(pid, orphan);
+    assert_ne!(pid, o.pid);
     running_pid(p.pipeline());
     let pf = pidfile::read(&path).expect("no pid file for the new server");
     assert_eq!(pf.pid, pid);
     assert_eq!(pf.pgid, pid);
     assert_eq!(pf.exe, PathBuf::from("/bin/sleep"));
-    assert!(pidfile::read(&pidfile::path(&rig.run_dir(), ChildKind::Pipeline)).is_some());
+    // What the supervisor writes is ours by the same check a later start makes (pid and
+    // group, start time, program): the fake pipeline execs /bin/sleep.
+    let pipeline_file = pidfile::path(&rig.run_dir(), ChildKind::Pipeline);
+    assert!(
+        wait_until(|| pidfile::read(&pipeline_file)
+            .is_some_and(|pf| pidfile::ours(&pf, Path::new("/bin/sleep")))),
+        "the pipeline's own pid file is not ours: {:?}",
+        pidfile::read(&pipeline_file)
+    );
 
     p.stop_all();
     assert!(
@@ -211,24 +206,15 @@ fn a_pid_file_of_a_stranger_does_not_make_it_ours() {
     let rig = Rig::new();
     let other = TestServer::start(Some(notedown_401()));
     rig.listen_on(other.port);
-    let (stranger, pgid) = orphan_sleep();
+    let o = orphan_sleep();
     let path = pidfile::path(&rig.run_dir(), ChildKind::Server);
-    pidfile::write(
-        &path,
-        &PidFile {
-            pid: stranger,
-            pgid,
-            started_ms: 1,
-            exe: "/bin/sleep".into(),
-        },
-    )
-    .unwrap();
+    pidfile::write(&path, &o.pid_file()).unwrap();
 
     // The sidecar is another program: the sleep is not ours and is left alone.
     let p = rig.processes(Path::new("/bin/cat"));
     p.start_all(&rig.config());
-    let still = alive(stranger);
-    kill_group(pgid);
+    let still = alive(o.pid);
+    o.kill();
     assert!(still, "a process that is not ours was stopped");
     assert!(pidfile::read(&path).is_none(), "the stale pid file stayed");
     assert_eq!(p.server().state(), outside("server"));
@@ -320,7 +306,7 @@ fn the_serve_info_follows_the_server() {
     assert_eq!(info.listen, vec!["0.0.0.0:19072".parse().unwrap()]);
     assert_eq!(info.device_urls, vec!["http://192.168.1.20:19072"]);
     assert_eq!(
-        serve_info::local_rest_base(&info, 1),
+        serve_info::local_rest_base(&info, "127.0.0.1:1".parse().unwrap()),
         "http://127.0.0.1:19072/rest/v1"
     );
     p.stop_all();
@@ -330,15 +316,10 @@ fn the_serve_info_follows_the_server() {
 #[test]
 fn remote_mode_reclaims_and_runs_no_server() {
     let rig = Rig::new();
-    let (orphan, pgid) = orphan_sleep();
+    let o = orphan_sleep();
     pidfile::write(
         &pidfile::path(&rig.run_dir(), ChildKind::Server),
-        &PidFile {
-            pid: orphan,
-            pgid,
-            started_ms: 1,
-            exe: "/bin/sleep".into(),
-        },
+        &o.pid_file(),
     )
     .unwrap();
     let p = rig.processes(Path::new("/bin/sleep"));
@@ -347,8 +328,8 @@ fn remote_mode_reclaims_and_runs_no_server() {
         ..rig.config()
     };
     p.start_all(&config);
-    let gone = wait_until(|| !alive(orphan));
-    kill_group(pgid);
+    let gone = wait_until(|| !alive(o.pid));
+    o.kill();
     assert!(gone, "the orphan server of an earlier Local run still runs");
     assert_eq!(p.server().state(), ChildState::Stopped);
     assert_eq!(p.pipeline().state(), ChildState::NotConnected);

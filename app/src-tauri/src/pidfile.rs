@@ -52,13 +52,19 @@ pub fn remove(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// Whether the pid file names a live process of ours: the pid lives, its process group is still
-/// the one in the file, and it runs the sidecar.
+/// How far the start time of the process may be from `started_ms`. The supervisor reads its
+/// clock just before the spawn, and the system keeps the start to the microsecond.
+const START_TOLERANCE_MS: u64 = 3000;
+
+/// Whether the pid file names a live process of ours:
+/// - the pid leads its own process group, the one in the file, as the supervisor starts it;
+/// - the process started when the file says (so a reused pid is not taken for ours);
+/// - it runs the sidecar.
 pub fn ours(pf: &PidFile, sidecar: &Path) -> bool {
     let Ok(pid) = i32::try_from(pf.pid) else {
         return false;
     };
-    if pid <= 1 {
+    if pid <= 1 || pf.pid != pf.pgid {
         return false;
     }
     // SAFETY: getpgid only reads the group of a process; -1 when there is no such process.
@@ -66,10 +72,45 @@ pub fn ours(pf: &PidFile, sidecar: &Path) -> bool {
     if pgid < 0 || u32::try_from(pgid).ok() != Some(pf.pgid) {
         return false;
     }
+    let Some(start) = start_ms_of(pid) else {
+        return false;
+    };
+    if start.abs_diff(pf.started_ms) > START_TOLERANCE_MS {
+        return false;
+    }
     let Some(exe) = exe_of(pid) else {
         return false;
     };
     same_file(&exe, sidecar)
+}
+
+/// When a process started, ms since the epoch.
+#[cfg(target_os = "macos")]
+fn start_ms_of(pid: i32) -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: proc_pidinfo writes at most `size` bytes into `info`, which is that large.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if n != size {
+        return None;
+    }
+    // SAFETY: proc_pidinfo filled the whole struct (it returned its size).
+    let info = unsafe { info.assume_init() };
+    Some(info.pbi_start_tvsec * 1000 + info.pbi_start_tvusec / 1000)
+}
+
+/// When a process started; unknown off macOS, so no process counts as ours there.
+#[cfg(not(target_os = "macos"))]
+fn start_ms_of(_pid: i32) -> Option<u64> {
+    None
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -169,31 +210,82 @@ pub(crate) mod tests {
         unsafe { libc::kill(pid as i32, 0) == 0 }
     }
 
-    /// A `/bin/sleep` that is no child of the test: the shell that starts it in a new process
-    /// group ends at once, so the sleep belongs to launchd, as a child of a crashed app would.
-    /// Gives the sleep's pid and its group.
-    pub(crate) fn orphan_sleep(secs: u32) -> (u32, u32) {
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    /// A `/bin/sleep` of an "earlier run" that is no child of the test: the shell that starts
+    /// it ends at once, so the sleep belongs to launchd, as a child of a crashed app would.
+    pub(crate) struct Orphan {
+        pub pid: u32,
+        pub pgid: u32,
+        /// The wall clock just before the start, as the supervisor takes it.
+        pub started_ms: u64,
+    }
+
+    impl Orphan {
+        /// The pid file the app would have written for it.
+        pub fn pid_file(&self) -> PidFile {
+            PidFile {
+                pid: self.pid,
+                pgid: self.pgid,
+                started_ms: self.started_ms,
+                exe: "/bin/sleep".into(),
+            }
+        }
+
+        pub fn kill(&self) {
+            kill_group(self.pgid);
+        }
+    }
+
+    /// Runs `script` in a new process group; it prints the pid of the sleep it leaves behind.
+    fn orphan(script: &str) -> Orphan {
+        let started_ms = now_ms();
         let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg(format!(
-            "/bin/sleep {secs} </dev/null >/dev/null 2>&1 & echo $!"
-        ));
+        cmd.arg("-c").arg(script);
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
         let child = cmd.stdout(std::process::Stdio::piped()).spawn().unwrap();
-        let pgid = child.id();
+        let shell = child.id();
         let out = child.wait_with_output().unwrap();
         let pid: u32 = String::from_utf8(out.stdout)
             .unwrap()
             .trim()
             .parse()
             .unwrap();
-        // The fork runs the shell until it has exec'd the sleep.
+        // The fork runs the shell (or perl) until it has exec'd the sleep.
         let sleep = Path::new("/bin/sleep");
         let ready = wait_until(|| exe_of(pid as i32).as_deref() == Some(sleep));
+        // SAFETY: getpgid only reads the group of a process.
+        let pgid = unsafe { libc::getpgid(pid as i32) } as u32;
         if !ready {
-            kill_group(pgid);
+            kill_group(shell);
+            kill_group(pid);
             panic!("the sleep did not start");
         }
-        (pid, pgid)
+        Orphan {
+            pid,
+            pgid,
+            started_ms,
+        }
+    }
+
+    /// A sleep that leads its own process group, as the supervisor starts its children.
+    pub(crate) fn orphan_sleep(secs: u32) -> Orphan {
+        orphan(&format!(
+            "/usr/bin/perl -e 'setpgrp(0, 0); exec \"/bin/sleep\", \"{secs}\"' \
+             </dev/null >/dev/null 2>&1 & echo $!"
+        ))
+    }
+
+    /// A sleep in the group of the shell that started it: it leads no group.
+    fn orphan_in_group(secs: u32) -> Orphan {
+        orphan(&format!(
+            "/bin/sleep {secs} </dev/null >/dev/null 2>&1 & echo $!"
+        ))
     }
 
     pub(crate) fn kill_group(pgid: u32) {
@@ -251,41 +343,70 @@ pub(crate) mod tests {
 
     #[test]
     fn ours_needs_a_live_pid_with_the_sidecar() {
-        let (pid, pgid) = orphan_sleep(301);
-        let pf = PidFile {
-            pid,
-            pgid,
-            started_ms: 0,
-            exe: sleep_exe(),
-        };
+        let o = orphan_sleep(301);
+        assert_eq!(o.pid, o.pgid, "the orphan leads its group");
+        let pf = o.pid_file();
         assert!(ours(&pf, &sleep_exe()), "a live sleep is ours as sidecar");
         assert!(!ours(&pf, Path::new("/bin/cat")), "another program is not");
         let other_group = PidFile {
-            pgid: pgid + 100_000,
+            pgid: o.pgid + 100_000,
             ..pf.clone()
         };
         assert!(!ours(&other_group, &sleep_exe()), "another group is not");
-        kill_group(pgid);
-        assert!(wait_until(|| !alive(pid)));
+        o.kill();
+        assert!(wait_until(|| !alive(o.pid)));
         assert!(!ours(&pf, &sleep_exe()), "a dead pid is not");
+    }
+
+    #[test]
+    fn a_pid_file_with_another_start_time_is_not_ours() {
+        let o = orphan_sleep(304);
+        let pf = o.pid_file();
+        let near = PidFile {
+            started_ms: pf.started_ms + 1500,
+            ..pf.clone()
+        };
+        let long_before = PidFile {
+            started_ms: pf.started_ms - 3_600_000,
+            ..pf.clone()
+        };
+        let later = PidFile {
+            started_ms: pf.started_ms + 60_000,
+            ..pf.clone()
+        };
+        let results = (
+            ours(&pf, &sleep_exe()),
+            ours(&near, &sleep_exe()),
+            ours(&long_before, &sleep_exe()),
+            ours(&later, &sleep_exe()),
+        );
+        o.kill();
+        assert_eq!(
+            results,
+            (true, true, false, false),
+            "(exact, within the tolerance, an hour before, a minute later)"
+        );
+    }
+
+    #[test]
+    fn a_pid_that_leads_no_group_is_not_ours() {
+        let o = orphan_in_group(305);
+        assert_ne!(o.pid, o.pgid);
+        let ok = ours(&o.pid_file(), &sleep_exe());
+        o.kill();
+        assert!(!ok, "a pid file with pid != pgid was taken for ours");
     }
 
     #[test]
     fn reclaim_stops_our_child_and_removes_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let p = path(dir.path(), ChildKind::Server);
-        let (pid, pgid) = orphan_sleep(302);
-        let pf = PidFile {
-            pid,
-            pgid,
-            started_ms: 0,
-            exe: sleep_exe(),
-        };
-        write(&p, &pf).unwrap();
+        let o = orphan_sleep(302);
+        write(&p, &o.pid_file()).unwrap();
         let got = reclaim(&p, &sleep_exe(), Duration::from_millis(200));
-        let gone = wait_until(|| !alive(pid));
-        kill_group(pgid);
-        assert_eq!(got, Reclaimed::Stopped { pid });
+        let gone = wait_until(|| !alive(o.pid));
+        o.kill();
+        assert_eq!(got, Reclaimed::Stopped { pid: o.pid });
         assert!(gone, "the old child still runs");
         assert!(!p.exists());
     }
@@ -294,17 +415,11 @@ pub(crate) mod tests {
     fn reclaim_leaves_a_stranger_alone() {
         let dir = tempfile::tempdir().unwrap();
         let p = path(dir.path(), ChildKind::Pipeline);
-        let (pid, pgid) = orphan_sleep(303);
-        let pf = PidFile {
-            pid,
-            pgid,
-            started_ms: 0,
-            exe: sleep_exe(),
-        };
-        write(&p, &pf).unwrap();
+        let o = orphan_sleep(303);
+        write(&p, &o.pid_file()).unwrap();
         let got = reclaim(&p, Path::new("/bin/cat"), Duration::from_millis(200));
-        let still = alive(pid);
-        kill_group(pgid);
+        let still = alive(o.pid);
+        o.kill();
         assert_eq!(got, Reclaimed::Stale);
         assert!(still, "a process that is not ours was signalled");
         assert!(!p.exists());

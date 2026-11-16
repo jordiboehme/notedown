@@ -524,7 +524,7 @@ fn a_listener_may_read_the_state_while_the_child_starts() {
     });
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let starter = sup.clone();
-    std::thread::spawn(move || {
+    let starting = std::thread::spawn(move || {
         starter.start(vec![]);
         let _ = done_tx.send(());
     });
@@ -557,4 +557,7 @@ fn a_listener_may_read_the_state_while_the_child_starts() {
         panic!("a listener that reads the state deadlocked the supervisor");
     }
     running_pid(&sup);
+    // The starter's clone is gone before the test ends, so the last drop (which stops the
+    // child) runs here and not on a thread the end of the test binary could cut short.
+    starting.join().unwrap();
 }

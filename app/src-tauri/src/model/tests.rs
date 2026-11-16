@@ -337,8 +337,16 @@ fn no_pull_starts_while_the_model_is_removed() {
 fn progress_after_a_pause_is_dropped() {
     let dir = tempfile::tempdir().unwrap();
     // The pull still says something while it ends.
+    // The progress comes once the sleep runs: a SIGTERM to the group before its exec could
+    // be lost in the forked shell and leave the sleep behind.
     let pull = r#"  trap 'echo "{\"file\":\"m.gguf\",\"done\":2,\"total\":100}"; exit 0' TERM
   "$S" 317 &
+  child=$!
+  i=0
+  until [ "$(ps -o comm= -p "$child")" = "$S" ] || [ "$i" -ge 500 ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
   echo '{"file":"m.gguf","done":1,"total":100}'
   wait"#;
     let (control, events) = control(sidecar(dir.path(), pull));

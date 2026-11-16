@@ -318,6 +318,7 @@ fn place_panel(app: &AppHandle, panel: &WebviewWindow, area: Area, cursor: Optio
             scale: m.scale_factor(),
         })
         .collect();
+    // No screen fits: the panel opens where it was last.
     if let Some((x, y)) = tray::panel_place(area, cursor, PANEL_WIDTH, &screens) {
         let _ = panel.set_position(tauri::LogicalPosition::new(x, y));
     }

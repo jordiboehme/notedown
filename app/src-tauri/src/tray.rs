@@ -208,10 +208,14 @@ impl Screen {
     }
 }
 
+/// The height of a menu bar in points: 24 on most screens, 37 under a notch.
+const MENU_BAR_POINTS: std::ops::RangeInclusive<f64> = 20.0..=40.0;
+
 /// Where the panel goes, in logical points: centred under the tray icon on the screen it is
 /// on. `tray` is physical, scaled by its own screen, which is not known; `cursor` (logical
-/// points, at the click) names that screen. Without a cursor the first screen whose logical
-/// area holds the scaled-down icon is taken. `None` when no screen fits.
+/// points, at the click) names that screen. Without a cursor the screens whose logical area
+/// holds the scaled-down icon are candidates, and the one where the icon is as high as a menu
+/// bar wins (else the first). `None` when no screen fits.
 pub fn panel_place(
     tray: Area,
     cursor: Option<(f64, f64)>,
@@ -228,10 +232,21 @@ pub fn panel_place(
     };
     let screen = match cursor {
         Some(point) => screens.iter().find(|s| holds(s.logical(), point)),
-        None => screens.iter().find(|s| {
-            let icon = scaled(s);
-            holds(s.logical(), (icon.x + icon.w / 2.0, icon.y + icon.h / 2.0))
-        }),
+        None => {
+            let candidates: Vec<&Screen> = screens
+                .iter()
+                .filter(|s| {
+                    let icon = scaled(s);
+                    holds(s.logical(), (icon.x + icon.w / 2.0, icon.y + icon.h / 2.0))
+                })
+                .collect();
+            // Read at the wrong scale, the icon is not as high as a menu bar.
+            candidates
+                .iter()
+                .find(|s| MENU_BAR_POINTS.contains(&scaled(s).h))
+                .or(candidates.first())
+                .copied()
+        }
     }?;
     Some(panel_position(scaled(screen), panel_w, screen.logical()))
 }
@@ -341,6 +356,57 @@ mod tests {
         );
         // Nothing fits.
         assert_eq!(panel_place(far, None, 340.0, &[]), None);
+    }
+
+    #[test]
+    fn a_second_launch_finds_the_screen_by_the_menu_bar_height() {
+        let screens = two_screens();
+        // On the display at 3000 points: halved, its centre lies on the laptop too, but
+        // there the icon would be 12 points high, too low for a menu bar.
+        let display = Area {
+            x: 3000.0,
+            y: 0.0,
+            w: 24.0,
+            h: 24.0,
+        };
+        assert_eq!(
+            panel_place(display, None, 340.0, &screens),
+            Some((2842.0, 24.0))
+        );
+        // A 1x display below the laptop, at (0, 982) in points.
+        let below = [
+            screens[0],
+            Screen {
+                physical: Area {
+                    x: 0.0,
+                    y: 982.0,
+                    w: 1920.0,
+                    h: 1080.0,
+                },
+                scale: 1.0,
+            },
+        ];
+        let tray = Area {
+            x: 1000.0,
+            y: 982.0,
+            w: 24.0,
+            h: 24.0,
+        };
+        assert_eq!(
+            panel_place(tray, None, 340.0, &below),
+            Some((842.0, 1006.0))
+        );
+        // A notch laptop (a 37 point menu bar) still counts as a menu bar.
+        let notch = Area {
+            x: 2000.0,
+            y: 0.0,
+            w: 48.0,
+            h: 74.0,
+        };
+        assert_eq!(
+            panel_place(notch, None, 340.0, &screens),
+            Some((842.0, 37.0))
+        );
     }
 
     #[test]

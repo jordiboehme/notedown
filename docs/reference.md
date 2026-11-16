@@ -65,10 +65,11 @@ grid) is left out because it confuses OCR; add `--keep-template` to keep it, in 
 
 `render` takes more options:
 
-- `--page N` renders only page N (1-based). Repeat it for more pages. Each path is printed on its own
-  line as soon as the PNG is written. A page that fails (for example a number past the end) prints
-  `error: page N: <reason>` on stderr and the run goes on with the next page. The exit code is 1 at
-  the end if any page failed. `--page` cannot be combined with `--pdf`.
+- `--page N` renders only page N (1-based). Repeat it for more pages; a page given twice is rendered
+  once. `--page` cannot be combined with `--pdf`.
+- With or without `--page`, each path is printed on its own line as soon as the PNG is written. A page
+  that fails (for example a number past the end) prints `error: page N: <reason>` on stderr and the
+  run goes on with the next page. The exit code is 1 at the end if any page failed.
 - `--allow-unknown-version` opens a note of a newer format version, as `convert` does.
 - The file name does not need the `.note` extension, because the format is read from the file itself.
 

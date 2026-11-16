@@ -765,8 +765,8 @@ fn render(args: RenderArgs) -> Result<ExitCode> {
         let result = (|| -> Result<PathBuf> {
             if n == 0 || n > nb.pages.len() {
                 return Err(anyhow!(
-                    "the note has {} pages and they count from 1",
-                    nb.pages.len()
+                    "the note has {} and pages count from 1",
+                    plural(nb.pages.len(), "page")
                 ));
             }
             let img = nb.render_page(n - 1, &opts)?;

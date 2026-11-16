@@ -119,6 +119,50 @@ fn a_failed_page_does_not_stop_the_others() {
 }
 
 #[test]
+fn a_page_past_the_end_of_a_one_page_note_is_said_in_the_singular() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("one.note");
+    std::fs::write(&note, blank_note(1, "SN_FILE_VER_20230015")).unwrap();
+    let out_dir = dir.path().join("o");
+    let out = render_run(&note, &out_dir, &["--page", "2"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("the note has 1 page "), "{err}");
+}
+
+#[test]
+fn a_page_given_twice_is_written_and_printed_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("three.note");
+    std::fs::write(&note, blank_note(3, "SN_FILE_VER_20230015")).unwrap();
+    let out_dir = dir.path().join("o");
+    let out = render_run(&note, &out_dir, &["--page", "2", "--page", "2"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(png_names(&out_dir), vec!["three-page-002.png"]);
+    let lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        lines,
+        vec![out_dir.join("three-page-002.png").display().to_string()]
+    );
+}
+
+#[test]
+fn page_with_pdf_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("two.note");
+    std::fs::write(&note, blank_note(2, "SN_FILE_VER_20230015")).unwrap();
+    let out_dir = dir.path().join("o");
+    let out = render_run(&note, &out_dir, &["--page", "1", "--pdf"]);
+    assert!(!out.status.success(), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--pdf"), "{err}");
+    assert!(!out_dir.exists(), "nothing is written");
+}
+
+#[test]
 fn allow_unknown_version_opens_a_newer_note() {
     let dir = tempfile::tempdir().unwrap();
     let note = dir.path().join("newer.note");

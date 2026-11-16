@@ -63,6 +63,15 @@ notedown render "Test 2.note" --out pages
 grid) is left out because it confuses OCR; add `--keep-template` to keep it, in `render` and in
 `convert`.
 
+`render` takes more options:
+
+- `--page N` renders only page N (1-based). Repeat it for more pages. Each path is printed on its own
+  line as soon as the PNG is written. A page that fails (for example a number past the end) prints
+  `error: page N: <reason>` on stderr and the run goes on with the next page. The exit code is 1 at
+  the end if any page failed. `--page` cannot be combined with `--pdf`.
+- `--allow-unknown-version` opens a note of a newer format version, as `convert` does.
+- The file name does not need the `.note` extension, because the format is read from the file itself.
+
 Other `convert` options: `--force`, `--model GGUF`, `--mmproj GGUF`, `--max-tokens N` (default 4096),
 `--threads N` and `--allow-unknown-version`.
 

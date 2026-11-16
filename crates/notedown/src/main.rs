@@ -525,6 +525,13 @@ struct RenderArgs {
     /// Write one PDF with all pages instead of one PNG per page
     #[arg(long)]
     pdf: bool,
+    /// Render only this page (1-based, can be repeated); a page that fails is
+    /// reported on stderr and the others still run
+    #[arg(long, value_name = "N", conflicts_with = "pdf")]
+    page: Vec<usize>,
+    /// Accept .note files with an unknown format version
+    #[arg(long)]
+    allow_unknown_version: bool,
 }
 
 #[cfg(feature = "ocr")]
@@ -704,14 +711,13 @@ fn convert(args: ConvertArgs) -> Result<ExitCode> {
 }
 
 fn render(args: RenderArgs) -> Result<ExitCode> {
-    let kind_ok = args
-        .file
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("note"));
-    if !kind_ok {
-        return Err(anyhow!("{} is not a .note file", args.file.display()));
-    }
-    let nb = Notebook::open(&args.file, VersionPolicy::Strict)
+    // The format is read from the bytes, so the file name does not matter.
+    let policy = if args.allow_unknown_version {
+        VersionPolicy::AllowUnknown
+    } else {
+        VersionPolicy::Strict
+    };
+    let nb = Notebook::open(&args.file, policy)
         .with_context(|| format!("cannot read {}", args.file.display()))?;
     let dir = match &args.out {
         Some(d) => d.clone(),
@@ -739,16 +745,48 @@ fn render(args: RenderArgs) -> Result<ExitCode> {
         println!("{}", path.display());
         return Ok(ExitCode::SUCCESS);
     }
-    for i in 0..nb.pages.len() {
-        let img = nb
-            .render_page(i, &opts)
-            .with_context(|| format!("page {}", i + 1))?;
-        let path = dir.join(format!("{stem}-page-{:03}.png", i + 1));
-        std::fs::write(&path, encode_png(&img)?)
-            .with_context(|| format!("cannot write {}", path.display()))?;
-        println!("{}", path.display());
+    let pages: Vec<usize> = if args.page.is_empty() {
+        (1..=nb.pages.len()).collect()
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        args.page
+            .iter()
+            .copied()
+            .filter(|n| seen.insert(*n))
+            .collect()
+    };
+    let mut failed = false;
+    for n in pages {
+        let result = (|| -> Result<PathBuf> {
+            if n == 0 || n > nb.pages.len() {
+                return Err(anyhow!(
+                    "the note has {} pages and they count from 1",
+                    nb.pages.len()
+                ));
+            }
+            let img = nb.render_page(n - 1, &opts)?;
+            let path = dir.join(format!("{stem}-page-{n:03}.png"));
+            std::fs::write(&path, encode_png(&img)?)
+                .with_context(|| format!("cannot write {}", path.display()))?;
+            Ok(path)
+        })();
+        match result {
+            Ok(path) => {
+                let mut out = std::io::stdout().lock();
+                writeln!(out, "{}", path.display())?;
+                out.flush()?;
+            }
+            Err(e) => {
+                eprintln!("error: page {n}: {e:#}");
+                failed = true;
+            }
+        }
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 /// One progress line of `model pull --json`.

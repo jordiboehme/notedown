@@ -9,6 +9,7 @@
 //! from the file name, and a record whose `fileId` is not that key, or whose `noteId` is not a
 //! valid `FILE_ID`, is not used.
 
+mod events;
 mod journal;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,6 +25,7 @@ use crate::pages::{PAGES_DIR, PageRecord, valid_file_id, valid_key};
 use crate::store::WirePath;
 use crate::{Result, io_err};
 
+pub use events::{EventPage, FileEvent, events};
 pub use journal::{journal, journal_until};
 
 /// An account of the server.

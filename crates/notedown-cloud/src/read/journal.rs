@@ -121,7 +121,8 @@ pub(super) struct Walked {
     /// The real `seq`s taken do not follow on each other from `max(from, 1)`: a taken `seq`
     /// was above the one expected (the first expected is `max(from, 1)`, then one past the
     /// last taken). A journal file that was removed shows so. A line without a real `seq` is
-    /// not looked at here.
+    /// not looked at here. Only the lines taken count: `false` on a walk with `more` says
+    /// nothing about the lines from `next` on (the next walk checks those).
     pub(super) broken: bool,
 }
 
@@ -246,7 +247,9 @@ impl Seek for Counted<'_> {
 pub(super) struct Line {
     /// The `seq` the line carries, `None` when none can be read.
     pub(super) seq: Option<u64>,
-    /// The `seq`, else the one after the last real one: only for placing the line before `from`.
+    /// The `seq`, else the one after the last real one. It places the line against `from`,
+    /// `until` and an events floor, and it is the `seq` a visitor reports for the line (as
+    /// [`Removal::seq`]); for a line without a real `seq` it is only an estimate.
     pub(super) est: u64,
     pub(super) account: Option<String>,
     pub(super) event: Option<Event>,

@@ -961,3 +961,51 @@ fn a_note_back_in_scope_gets_its_file_again() {
     run(&d, with_dir(out.path()), "hello");
     assert_eq!(files(out.path()), ["test1.md"]);
 }
+
+#[test]
+fn a_folder_inside_the_data_folder_is_refused() {
+    let d = setup();
+    let out = tempfile::tempdir().unwrap();
+    let named = |dir: PathBuf| vec![(Some(SLUG.to_string()), dir)];
+    let refused = |s: &Setup, flags: Vec<(Option<String>, PathBuf)>| {
+        let e = s.clone().with_markdown_dirs(flags).err().expect("refused");
+        e.to_string()
+    };
+    // One machine: the data folder is the server's and the pipeline's.
+    let s = crate::worker::one_machine(&d, no_settle());
+    for dir in [
+        d.data.clone(),
+        d.data.join("md"),
+        d.data.join("pipeline"),
+        d.data.join("accounts").join(SLUG).join("files"),
+        d.data.join("..").join(d.data.file_name().unwrap()).join("x"),
+    ] {
+        let e = refused(&s, named(dir.clone()));
+        assert!(e.contains("inside") && e.contains("--markdown-dir"), "{dir:?}: {e}");
+    }
+    let e = refused(&s, vec![(None, d.data.join("md"))]);
+    assert!(e.contains("inside"), "{e}");
+    // From the config too.
+    let s = crate::worker::one_machine(&d, with_dir(&d.data.join("md")));
+    let e = refused(&s, Vec::new());
+    assert!(e.contains("inside") && e.contains("markdown_dirs"), "{e}");
+    // A folder next to it, with a name that starts the same, is fine.
+    let s = crate::worker::one_machine(&d, no_settle());
+    let mut next_to = d.data.clone().into_os_string();
+    next_to.push("-md");
+    assert!(s.clone().with_markdown_dirs(named(next_to.into())).is_ok());
+    assert!(s.with_markdown_dirs(named(out.path().to_path_buf())).is_ok());
+
+    // Two machines: the server's folder and the pipeline's own `pipeline/` are refused, the
+    // local folder itself is not the server's.
+    let local = two_machines(&d, None);
+    let s = Setup::load(local.path()).unwrap();
+    for dir in [d.data.join("md"), local.path().join("pipeline").join("md")] {
+        let e = refused(&s, named(dir.clone()));
+        assert!(e.contains("inside"), "{dir:?}: {e}");
+    }
+    assert!(
+        s.with_markdown_dirs(named(local.path().join("md")))
+            .is_ok()
+    );
+}

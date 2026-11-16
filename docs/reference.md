@@ -255,12 +255,17 @@ Turn it on with `notedown pipeline --data DIR --markdown-dir SLUG=FOLDER`. Repea
 accounts. `--markdown-dir FOLDER` without `SLUG=` is only allowed when the pipeline serves exactly one
 account; with more, Notedown stops with an error that names them (when the server cannot be
 reached at the start, it says so later and writes no files). A relative folder is taken from the
-current folder. The Mac app passes `~/Documents/Markdown` or the folder you chose.
+current folder. For a folder whose name contains `=`, write `./name=x`, so the part before `=` is
+not taken as an account. The Mac app passes `~/Documents/Markdown` or the folder you chose.
 
 You can also set the folders in the config, in `pipeline.toml` (two machines) or `server.toml` (one
 machine). A flag wins over the config for its account. A folder for an account the pipeline does not
-serve is reported once and gets no files. A relative path in the file is below the data
-folder; `~` is not expanded, so use a full path.
+serve is reported once and gets no files. A relative path in `pipeline.toml` is below the folder
+of that file; `~` is not expanded, so use a full path.
+
+The folder must lie outside the server's data folder and outside the pipeline's own `pipeline/`
+folder. Notedown refuses to start with such a folder and names it. So in `server.toml`, where the
+data folder holds the file, give a full path to a folder outside of it.
 
 ```toml
 [pipeline.markdown_dirs]
@@ -274,7 +279,7 @@ that both use gets `(2)` for one of them.
 - Do not edit these files. Notedown overwrites them when the note changes.
 - Layout: the note's folder as on the device, then `<title>.md`. `Note/Work/Meeting.note` gives
   `Work/Meeting.md`, a note in `MyStyle` goes to `MyStyle/...`, a note in another folder keeps its
-  path (`Document/Books/a.note` gives `Document/Books/a.md`). A very long title is cut to about 200
+  path (`Document/Books/a.note` gives `Document/Books/a.md`). A very long note name is cut to about 200
   bytes, so that every file name (and the temp file of its write) fits in 255 bytes.
 - Content: the same document the MCP server's `get_note` gives: frontmatter, the text of each page and
   the anchor of every block as an HTML comment.

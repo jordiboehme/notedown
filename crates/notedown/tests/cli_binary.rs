@@ -2408,7 +2408,22 @@ mod pipeline_and_mcp {
         ok(&pipeline_cmd(data, &["--once"]));
         assert!(!manifest.exists());
 
-        let from_config = data.join("from-config");
+        // The Markdown folders lie outside the data folder; one inside is refused.
+        let md = tempfile::tempdir().unwrap();
+        let inside = data.join("inside");
+        let out = pipeline_cmd(
+            data,
+            &[
+                "--once",
+                "--markdown-dir",
+                &format!("jordi={}", inside.display()),
+            ],
+        );
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("inside the server's data folder"), "{err}");
+        assert!(!inside.exists());
+        let from_config = md.path().join("from-config");
         std::fs::write(
             data.join("server.toml"),
             format!("[pipeline.markdown_dirs]\njordi = {from_config:?}\n"),
@@ -2419,7 +2434,7 @@ mod pipeline_and_mcp {
 
         // The flag wins, with or without the account.
         for flag in ["jordi=", ""] {
-            let target = data.join(format!("from-flag-{}", flag.len()));
+            let target = md.path().join(format!("from-flag-{}", flag.len()));
             let arg = format!("{flag}{}", target.display());
             ok(&pipeline_cmd(data, &["--once", "--markdown-dir", &arg]));
             assert_eq!(manifest_dir(), target.to_str().unwrap());
@@ -2455,7 +2470,7 @@ mod pipeline_and_mcp {
         notedown_cloud::auth::Accounts::new(data)
             .create("anna", "anna@example.org", "secret")
             .unwrap();
-        let never = data.join("never");
+        let never = md.path().join("never");
         let out = pipeline_cmd(data, &["--once", "--markdown-dir", never.to_str().unwrap()]);
         assert!(!out.status.success());
         let err = String::from_utf8_lossy(&out.stderr);

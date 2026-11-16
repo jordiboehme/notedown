@@ -119,6 +119,9 @@ pub struct Setup {
     accounts: Option<Vec<String>>,
     /// The `--markdown-dir` folder given without an account.
     pub markdown_only: Option<PathBuf>,
+    /// The server's data folder when the pipeline reads it as a folder (one machine, or
+    /// `[server] folder`); `None` with a URL.
+    server_folder: Option<PathBuf>,
 }
 
 impl Setup {
@@ -128,6 +131,10 @@ impl Setup {
     pub fn load(data: &Path) -> Result<Setup> {
         match LocalConfig::load(data)? {
             Some(c) => {
+                let server_folder = match &c.server {
+                    ServerAt::Folder(f) => Some(f.clone()),
+                    ServerAt::Url(_) => None,
+                };
                 let source: Arc<dyn ServerData> = match &c.server {
                     ServerAt::Folder(f) => Arc::new(FolderSource::shared(f)),
                     ServerAt::Url(url) => {
@@ -141,6 +148,7 @@ impl Setup {
                     two_machines: true,
                     accounts: c.accounts,
                     markdown_only: None,
+                    server_folder,
                 })
             }
             None => Ok(Setup {
@@ -150,6 +158,7 @@ impl Setup {
                 two_machines: false,
                 accounts: None,
                 markdown_only: None,
+                server_folder: Some(data.to_path_buf()),
             }),
         }
     }
@@ -158,7 +167,15 @@ impl Setup {
     /// account wins over `markdown_dirs` of the config for that account. A flag without one is
     /// for the only account served (see [`markdown_dir`](Self::markdown_dir)); it cannot be
     /// given twice or with flags that name an account, and no account can be named twice.
+    /// A folder (from a flag or the config) that is the server's data folder, lies inside it
+    /// or inside the pipeline's own `<local>/pipeline` is refused.
     pub fn with_markdown_dirs(mut self, flags: Vec<(Option<String>, PathBuf)>) -> Result<Setup> {
+        for dir in self.cfg.markdown_dirs.values() {
+            self.check_markdown_place("markdown_dirs", dir)?;
+        }
+        for (_, dir) in &flags {
+            self.check_markdown_place("--markdown-dir", dir)?;
+        }
         let bad = |message: &str| Error::Invalid {
             what: "--markdown-dir",
             message: message.to_string(),
@@ -184,6 +201,34 @@ impl Setup {
         }
         self.cfg.markdown_dirs.extend(named);
         Ok(self)
+    }
+
+    /// An error when `dir` is the server's data folder or lies inside it, or inside the
+    /// pipeline's own folder: the writer would put files among the server's or its own.
+    fn check_markdown_place(&self, what: &'static str, dir: &Path) -> Result<()> {
+        let dir = clean_absolute(dir);
+        let places = [
+            self.server_folder
+                .as_deref()
+                .map(|f| ("the server's data folder", clean_absolute(f))),
+            Some((
+                "the pipeline's own folder",
+                clean_absolute(&self.local.join(PIPELINE_DIR)),
+            )),
+        ];
+        for (name, place) in places.into_iter().flatten() {
+            if dir.starts_with(&place) {
+                return Err(Error::Invalid {
+                    what,
+                    message: format!(
+                        "the Markdown folder {} is inside {name} {}; pick a folder outside it",
+                        dir.display(),
+                        place.display()
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The Markdown folder of account `slug` when the worker serves `served` accounts: the
@@ -228,6 +273,23 @@ impl Setup {
             None => all.to_vec(),
         }
     }
+}
+
+/// `path` made absolute ([`std::path::absolute`]) with its `.` and `..` parts taken out by
+/// name; symlinks are not followed.
+fn clean_absolute(path: &Path) -> PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out = PathBuf::new();
+    for part in abs.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// A `--markdown-dir` value: `SLUG=DIR` for one account, or `DIR` alone. The text before

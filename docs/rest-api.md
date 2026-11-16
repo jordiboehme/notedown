@@ -145,7 +145,8 @@ Gives the file and folder changes of the account since the `seq` in `from` (0 by
 {
   "events": [
     {"seq": 813, "ts": 1763290000123, "type": "file.created", "origin": "app",
-     "opId": "8f2c1d", "id": 41, "path": "NOTE/Note/a.note", "fileKind": "note",
+     "opId": "3f2c1d7a-8b4e-4c2a-9d1f-6e5a7b8c9d0e",
+     "id": 41, "path": "NOTE/Note/a.note", "fileKind": "note",
      "md5": "9e107d9d372bb6826bd81d3542a419d6", "size": 20480}
   ],
   "next": 814, "end": 813, "more": false, "gap": false
@@ -153,7 +154,7 @@ Gives the file and folder changes of the account since the `seq` in `from` (0 by
 ```
 
 - `next` is one past the last `seq` read. Ask again from `next`. A page without events for the account can still move `next`.
-- `end` is the highest `seq` of the journal as far as the server can tell. It is 0 for an empty journal.
+- `end` is the highest `seq` of the journal as far as the server can tell. It is 0 for an empty journal. For a token of a removed account it is at most the `seq` of the removal.
 - `more` means the page stopped at its limit: ask again at once. Then `next` is larger than `from`. A page also stops after 10000 journal lines, whoever they belong to, so a page can be short or empty and still have `more`.
 - `gap` means events may be missing between `from` and `next`. See below.
 
@@ -183,15 +184,16 @@ The origins are the same as in the journal. A scan or a snapshot can create an e
 
 | Event | What the app does |
 | --- | --- |
-| `file.created`, `folder.created` | Set the entry with this `id`. Take `path`, `md5`, `size` and the kind from the event. A different entry at the same `path` is replaced. |
+| `file.created`, `folder.created` | Set the entry with this `id`. Take `path` from the event. For a file also take `md5`, `size` and `fileKind`. A folder has none of these. A different entry at the same `path` is replaced. |
 | `file.modified` | Set `md5` and `size` of the entry. |
 | `file.moved` | Set the new `path`. |
 | `folder.moved` | Set the new `path` of the folder. Change the `oldPath` prefix of every entry below it to the new path. |
-| `file.copied` | Add the entry `id` at `path`. Take `md5`, `size` and `fileKind` from the entry `sourceId`, or ask `GET /entries/{id}`. |
+| `file.copied` | Add the entry `id` at `path`. Take `md5` and `size` from the entry `sourceId`, or ask `GET /entries/{id}`. `/tree` and `/entries` have no `fileKind`: the app has it only from an earlier event of the source. |
 | `file.deleted` | Remove the entry. |
 | `folder.deleted` | Remove the folder and every entry below it. |
 | `account.removed` | The account is gone. Stop. |
 
+- An app that listed several folders follows on from the lowest of their `seq` numbers plus one. It applies the events in order and treats each create as an upsert, so an event that a later listing already holds does no harm.
 - An event can name an id that the app does not hold, for example in a folder it never listed. Ask `GET /entries/{id}` for it, or ignore it when it is outside what the app shows.
 - A copy whose source is in a hidden path has a `sourceId` that the app cannot read. Ask `GET /entries/{id}` for the new id.
 
@@ -202,6 +204,7 @@ When `gap` is true, the app lists again and follows on from the `seq` of that li
 - `from` is past the end of the journal.
 - A journal file was removed, so the `seq` numbers do not follow on.
 - A journal line of the account is of a type this version does not know, or does not parse.
+- A journal line does not parse and the server cannot read its account.
 - `from` is at or below the removal of an earlier account that had the same name.
 - A move came from a hidden path into sight. The app has nothing of what came in.
 
@@ -215,9 +218,11 @@ An app never sees the events of another account. This includes an earlier accoun
 
 A token of a removed account reads up to the removal. The last event is then `account.removed` with `userId`. A token that is still valid while its account is removed gets the same: the page ends with the removal.
 
+A removal by an older server, from before the journal had the `account.removed` record, sets no such limit: a name used again since then can show events of the old account.
+
 ### Limits
 
-- The first call for an account name reads the whole journal once. That is fine, but it is slow on a very large journal. The next calls read only what is new.
+- The first call for an account name after each server start reads the whole journal once. The server keeps what it found in memory, so the next calls read only what is new. The whole journal is also read when a token's account is removed while it polls. That is fine, but it is slow on a very large journal.
 - When the server fails to write a batch of journal lines, it cuts the batch. A poll that read a part of it before the cut has moved past numbers that are given out again. `/journal` has the same limit. A listing fixes it.
 
 ## Write

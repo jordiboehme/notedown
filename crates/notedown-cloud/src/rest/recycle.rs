@@ -1,6 +1,7 @@
 //! The recycle bin for the Mac app: `GET /recycle` lists what the user deleted, newest first,
-//! and `POST /recycle/restore` brings one item back. Any valid token reads, a read token too;
-//! a restore needs a write token.
+//! `POST /recycle/restore` brings one item back and `POST /recycle/empty` removes every deleted
+//! file and folder for good. Any valid token reads, a read token too; a restore and Empty need
+//! a write token.
 //!
 //! An item is a deleted file, or a deleted folder with what was in it, as
 //! [`Store::recycle_items`] finds it: old versions of replaced files, the folders a delete left
@@ -18,8 +19,18 @@
 //! plan ([`Store::plan_restore`](crate::store::Store::plan_restore)) with its page changes and
 //! the commit. Origin `app`, no device. The restored entry gets a new id, as does everything in
 //! a restored folder.
+//!
+//! Empty is a write too: the token and the sync mode, then under one store lock the gates and
+//! the device sync lock ([`locked`]), the items of the bin, the prune with
+//! [`PrunePlan::Empty`] under that same lock ([`Store::prune_recycle_with`]) and the lines that
+//! are left. It takes every `deleted` line, also those the bin does not list, and never an old
+//! version of a replaced file. One `recycle.pruned` event per removed line, one op id, origin
+//! `app`. It changes nothing in `files/`, so the usage stays.
+//!
+//! [`Store::prune_recycle_with`]: crate::store::Store::prune_recycle_with
 
 use std::cmp::Reverse;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::Json;
@@ -38,7 +49,9 @@ use crate::api::files::{gate_locked, scan_way};
 use crate::auth::Account;
 use crate::journal::Origin;
 use crate::server::AppState;
-use crate::store::{ItemKind, Kind, PendingOp, RecycleItem, WirePath};
+use crate::store::{
+    IndexLine, ItemKind, Kind, PendingOp, PrunePlan, RecycleItem, RecycleReason, WirePath,
+};
 
 /// The default and the largest `limit` of `GET /recycle`.
 pub const RECYCLE_LIMIT: usize = 500;
@@ -226,6 +239,57 @@ pub(super) async fn restore(
         super::write::run(move || restore_item(&st, &account, &body.key, path)).await
     };
     match restored.await {
+        Ok(answer) => Json(answer).into_response(),
+        Err(r) => *r,
+    }
+}
+
+/// `POST /recycle/empty` under the store lock (module docs): `removed` counts the items of the
+/// bin that are gone after the prune and `bytes` their size before it; `kept` counts the
+/// `deleted` lines that are still in the index (the prune could not remove them, for example
+/// because of a symlink in their slot).
+fn empty_bin(state: &AppState, slug: &str) -> crate::Result<Result<Value, Stop>> {
+    let (store, guard) = match locked(state, slug)? {
+        Ok(v) => v,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let before = store.recycle_items(&guard)?;
+    store.prune_recycle_with(
+        &guard,
+        &state.journal,
+        PrunePlan::Empty,
+        state.now_ms(),
+        Origin::App,
+        false,
+    )?;
+    let left: HashSet<String> = store
+        .recycle_items(&guard)?
+        .into_iter()
+        .map(|i| i.key)
+        .collect();
+    let (removed, bytes) = before
+        .iter()
+        .filter(|i| !left.contains(&i.key))
+        .fold((0u64, 0u64), |(n, b), i| (n + 1, b + i.size));
+    let kept = store
+        .recycle_lines(&guard)?
+        .iter()
+        .filter(|l| matches!(l, IndexLine::Entry(e) if e.reason == RecycleReason::Deleted))
+        .count();
+    Ok(Ok(
+        json!({"removed": removed, "bytes": bytes, "kept": kept}),
+    ))
+}
+
+/// `POST /recycle/empty`: removes every deleted file and folder of the bin for good (module
+/// docs). A body is not read. 200 `{"removed", "bytes", "kept"}`.
+pub(super) async fn empty(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let emptied = async {
+        let account = writer(&state, &headers).await?;
+        let st = state.clone();
+        super::write::run(move || empty_bin(&st, &account.slug)).await
+    };
+    match emptied.await {
         Ok(answer) => Json(answer).into_response(),
         Err(r) => *r,
     }

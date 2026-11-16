@@ -13,8 +13,8 @@ use notedown_cloud::push::{PushPlanner, PushTiming};
 use notedown_cloud::server::AppState;
 use notedown_cloud::store::retention::Retention;
 use notedown_cloud::store::{
-    CrashPoint, IndexLine, PENDING_FILE, PutOptions, Recovery, RecycleEntry, RecycleItem,
-    RecycleReason, ScanOptions, Store, WirePath,
+    CrashPoint, IndexLine, PENDING_FILE, PrunePlan, PutOptions, Recovery, RecycleEntry,
+    RecycleItem, RecycleReason, ScanOptions, Store, WirePath,
 };
 use notedown_cloud::{Clock, Config};
 use time::{OffsetDateTime, UtcOffset};
@@ -314,6 +314,40 @@ fn a_second_prune_removes_and_journals_nothing() {
     assert_eq!(again.kept, 4);
     assert_eq!(f.tree(), tree);
     assert_eq!(f.journal.last_seq().unwrap(), seq);
+}
+
+/// The hourly prune through `prune_recycle_with` and a guard of the caller does what
+/// `prune_recycle` does: the same report, index, slots and events.
+#[test]
+fn the_hourly_prune_is_unchanged() {
+    let (old, new) = (Fixture::new(), Fixture::new());
+    scene(&old);
+    scene(&new);
+    for dry_run in [true, false] {
+        let a = old.prune(NOW, Origin::Retention, dry_run);
+        let b = {
+            let g = new.store.lock_recovered(&new.journal).unwrap();
+            new.store
+                .prune_recycle_with(
+                    &g,
+                    &new.journal,
+                    PrunePlan::Retention(RETENTION, offset()),
+                    NOW,
+                    Origin::Retention,
+                    dry_run,
+                )
+                .unwrap()
+        };
+        assert_eq!(a, b, "dry run {dry_run}");
+        assert_eq!(a.removed.len(), 3);
+        assert_eq!(old.index_text(), new.index_text());
+        assert_eq!(old.tree(), new.tree());
+        let shape = |f: &Fixture| -> Vec<(Origin, EventBody)> {
+            f.events().into_iter().map(|e| (e.origin, e.body)).collect()
+        };
+        assert_eq!(shape(&old), shape(&new));
+    }
+    assert_eq!(new.events().len(), 3);
 }
 
 #[test]

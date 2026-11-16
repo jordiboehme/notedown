@@ -39,8 +39,8 @@ pub use ids::{FIRST_ID, registry_loads};
 pub use list::Entry;
 pub use path::WirePath;
 pub use recycle::{
-    IndexLine, ItemKind, PruneFailure, PruneReport, RECYCLE_INDEX, RecycleEntry, RecycleItem,
-    RecycleReason, recycle_items,
+    IndexLine, ItemKind, PruneFailure, PrunePlan, PruneReport, RECYCLE_INDEX, RecycleEntry,
+    RecycleItem, RecycleReason, recycle_items,
 };
 pub use scan::{SCAN_HOLD_FILE, ScanHold, ScanOptions, ScanReport};
 

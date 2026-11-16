@@ -35,7 +35,8 @@
 //!
 //! [`Store::prune_recycle`] applies the retention ([`super::retention`]): it journals a
 //! `recycle.pruned` event per removed line, rewrites the index atomically and then removes the
-//! slots. A line it can't read stays as it is.
+//! slots. A line it can't read stays as it is. [`Store::prune_recycle_with`] does the same
+//! under a lock the caller holds, also for Empty ([`PrunePlan::Empty`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -43,7 +44,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::commit::{RECYCLE_DIR, is_dot_entry};
+use super::commit::{RECYCLE_DIR, WriteGuard, is_dot_entry};
 use super::retention::Retention;
 use super::{Store, StoreGuard, WirePath, is_native_folder};
 use crate::journal::{Event, EventBody, Journal, Origin, new_op_id};
@@ -78,6 +79,17 @@ pub struct PruneReport {
     /// of a symlink in or below their slot path, and a symlinked `recycle/` (one entry, nothing
     /// pruned). The prune goes on after each.
     pub failed: Vec<PruneFailure>,
+}
+
+/// Which lines a prune removes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrunePlan {
+    /// The retention of `server.toml` with the local offset that counts days and months
+    /// ([`super::retention::plan`]): the hourly prune and `cloud recycle prune`.
+    Retention(Retention, time::UtcOffset),
+    /// Every deleted file and folder, never an old version of a replaced file
+    /// ([`super::retention::plan_empty`]): Empty of the Mac app.
+    Empty,
 }
 
 /// A slot the prune couldn't remove, or a line it kept because of its slot path.
@@ -539,13 +551,43 @@ impl Store {
         origin: Origin,
         dry_run: bool,
     ) -> Result<PruneReport> {
+        let plan = PrunePlan::Retention(*retention, offset);
         // Held to the end. Only a real run recovers.
-        let (_plain, _recovered);
         if dry_run {
-            _plain = self.lock()?;
+            let guard = self.lock()?;
+            self.prune_locked(&guard, journal, plan, now_ms, origin, true)
         } else {
-            _recovered = self.lock_recovered(journal)?;
+            let guard = self.lock_recovered(journal)?;
+            self.prune_locked(&guard, journal, plan, now_ms, origin, false)
         }
+    }
+
+    /// [`Store::prune_recycle`] with `plan` under the lock the caller holds (recovery ran under
+    /// it): for a caller that checks more under the same lock first, such as Empty over REST.
+    /// The steps, the report and the events are those of [`Store::prune_recycle`].
+    pub fn prune_recycle_with(
+        &self,
+        guard: &WriteGuard,
+        journal: &Journal,
+        plan: PrunePlan,
+        now_ms: u64,
+        origin: Origin,
+        dry_run: bool,
+    ) -> Result<PruneReport> {
+        self.prune_locked(guard, journal, plan, now_ms, origin, dry_run)
+    }
+
+    /// The prune of [`Store::prune_recycle`] under `guard`.
+    fn prune_locked(
+        &self,
+        guard: &StoreGuard,
+        journal: &Journal,
+        plan: PrunePlan,
+        now_ms: u64,
+        origin: Origin,
+        dry_run: bool,
+    ) -> Result<PruneReport> {
+        self.check_guard(guard)?;
         let root = self.recycle_dir();
         if std::fs::symlink_metadata(&root).is_ok_and(|m| m.file_type().is_symlink()) {
             return Ok(PruneReport {
@@ -588,19 +630,24 @@ impl Store {
             at.push(i);
         }
         let linked = linked_slots.len();
-        let mut live = HashSet::new();
-        for e in &entries {
-            if !live.contains(&e.id) && self.path_of(e.id)?.is_some() {
-                live.insert(e.id);
+        let mut remove = match plan {
+            PrunePlan::Retention(retention, offset) => {
+                let mut live = HashSet::new();
+                for e in &entries {
+                    if !live.contains(&e.id) && self.path_of(e.id)?.is_some() {
+                        live.insert(e.id);
+                    }
+                }
+                super::retention::plan(
+                    &entries,
+                    &|id| live.contains(&id),
+                    &retention,
+                    now_ms,
+                    offset,
+                )
             }
-        }
-        let mut remove = super::retention::plan(
-            &entries,
-            &|id| live.contains(&id),
-            retention,
-            now_ms,
-            offset,
-        );
+            PrunePlan::Empty => super::retention::plan_empty(&entries),
+        };
         // A folder slot with a symlink inside keeps its line.
         let is_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
         remove.retain(|&i| {

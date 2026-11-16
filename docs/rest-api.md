@@ -78,6 +78,7 @@ A refused token gets 401 `token_refused` with `WWW-Authenticate: Bearer`. A toke
 | `DELETE /entries/{id}` | write | Delete a file or folder |
 | `GET /recycle` | read | List the recycle bin |
 | `POST /recycle/restore` | write | Bring an item of the recycle bin back |
+| `POST /recycle/empty` | write | Remove every deleted file and folder from the recycle bin |
 
 The routes for the records, the digests and the note by path are made for the pipeline. This page does not describe their bodies. The sections below are for an app that browses and manages files.
 
@@ -214,7 +215,7 @@ When `gap` is true, the app lists again and follows on from the `seq` of that li
 
 An event with a hidden path (a name that starts with a dot) is not shown. A move from a visible to a hidden path comes as a `file.deleted` or `folder.deleted` of the old path. A move from a hidden to a visible path sets `gap`.
 
-The recycle bin does not list an item with a hidden path either.
+The recycle bin does not list an item with a hidden path either. Empty removes it all the same.
 
 ### Accounts
 
@@ -315,7 +316,7 @@ Moves the file, or the folder with everything in it, to the recycle bin. Nothing
 
 A delete moves the file or folder to the recycle bin of the account. The bin lists each thing the user deleted once. A deleted folder is one item with everything that was in it.
 
-The bin also keeps the old versions of replaced files. They are not listed. When a delete leaves a folder with only dot-files, the server moves that folder to the bin as well. The user did not delete it, so it is not listed either. By default the server removes an item 90 days after the delete. The [getting started guide](getting-started.md) has the settings (`recycle_keep_deleted_days`, `recycle_prune`).
+The bin also keeps the old versions of replaced files. They are not listed. When a delete leaves a folder with only dot-files, the server moves that folder to the bin as well. The user did not delete it, so it is not listed either. By default the server removes an item 90 days after the delete. The [getting started guide](getting-started.md) has the settings (`recycle_keep_deleted_days`, `recycle_prune`). Empty removes every deleted item at once.
 
 ### `GET /recycle?limit=&after=`
 
@@ -359,16 +360,32 @@ Body `{"key": "1763290000000/NOTE/Note/b.note", "path": "NOTE/Note/b.note"}`. Br
 - The devices see a new file. They do not know that it was there before.
 - The old versions of a restored file stay in the bin and now belong to the new id.
 - A note comes back with its text. It is not read again.
-- The item leaves the bin. A key already restored is 404 `not_found`, as is a key that the server pruned. Once an item has left the bin, a later delete of the same path in the same millisecond (the same `deletedAt`) gets its key again, so an old key can then name that newer delete.
+- The item leaves the bin. A key already restored is 404 `not_found`, as is a key that the server pruned or that Empty removed. Once an item has left the bin, a later delete of the same path in the same millisecond (the same `deletedAt`) gets its key again, so an old key can then name that newer delete.
 
 The rules for the target are those of a write:
 
 - Anything at `path`, also with a name that differs only in case or Unicode form, is 409 `name_taken` with `existing`. A folder is never merged into a folder that is there. Choose another `path` instead.
 - A file on the way is 409 `not_a_folder`.
-- A path outside the device trees or a tree root is 403 `not_writable`. A name that starts with a dot is 400 `bad_name`. This also holds for the old path, when the body has none.
+- A path outside the device trees or a tree root is 403 `not_writable`. A name that starts with a dot is 400 `bad_name`. A name with more than 255 bytes is 400 `name_too_long`. This also holds for the old path, when the body has none.
 - An item whose bytes in the bin are damaged (a symlink in them or on the way to them) is 409 `slot_damaged`. Nothing is changed.
 - The bytes of the item count against the quota as for an upload: 507 `quota_exceeded` for an account with `quota_bytes`.
 - A restore waits like every write: 423 `device_syncing` with `Retry-After`, `scan_hold` and `not_imported`. The item stays in the bin.
+
+### `POST /recycle/empty`
+
+No body. Removes every deleted file and folder from the bin for good. The answer is:
+
+```json
+{"removed": 2, "bytes": 102400, "kept": 0}
+```
+
+- `removed` is the number of items that left the bin. `bytes` is their size in the bin before Empty.
+- Empty also removes what a delete put in the bin but the bin does not list: hidden paths and folders that a delete left with only dot-files.
+- The old versions of replaced files stay. That includes the old versions of a file that was restored. The server prunes them by its rules as before.
+- `kept` counts the lines of the bin index for deleted files and folders that Empty could not remove, because there is a symlink in their bytes or on the way to them. They stay in the bin. It is usually 0.
+- The journal gets one `recycle.pruned` event per removed line of the bin index, with `origin` `app`. `/events` does not show them.
+- An empty bin gives `{"removed": 0, "bytes": 0, "kept": 0}` and no event.
+- Empty waits like every write: 423 `device_syncing` with `Retry-After`, `scan_hold` and `not_imported`. A read token is 403 `read_only_token`.
 
 ## While a device syncs
 

@@ -553,3 +553,235 @@ fn a_restore_after_a_device_delete_shows_the_file_to_the_device() {
     assert_eq!(Device::id_of(&entries, "NOTE/Note/a.txt"), new.to_string());
     d.ok("/api/file/2/files/synchronous/end", end);
 }
+
+// ------------------------------------------------------------------------------- empty
+
+/// `POST /recycle/empty` without a body: (status, answer, `Retry-After`).
+fn empty(s: &Server, token: &str) -> (u16, Value, Option<String>) {
+    send_json(s, token, "POST", "/recycle/empty", None)
+}
+
+/// The lines of the bin index (no index: none).
+fn index_lines(s: &Server) -> Vec<Value> {
+    std::fs::read_to_string(index_path(s))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+fn recycle_dir(s: &Server) -> std::path::PathBuf {
+    s.data.join("accounts/jordi/recycle")
+}
+
+#[test]
+fn empty_removes_deleted_files_and_folders() {
+    let s = start_imported();
+    let t = writer(&s);
+    let (_, file) = deleted(&s, &t, "NOTE/Note/c.txt", b"cccc");
+    uploaded(&s, &t, "NOTE/Note/W/a.txt", b"aa");
+    uploaded(&s, &t, "NOTE/Note/W/S/b.txt", b"bbb");
+    let (_, folder) = mkdir(&s, &t, "NOTE/Note/W");
+    assert_eq!(delete(&s, &t, folder["id"].as_u64().unwrap()).0, 200);
+    let (items, _) = bin(&s, &t, "");
+    assert_eq!(items.len(), 2, "{items:?}");
+    let slots: Vec<_> = keys(&items)
+        .iter()
+        .map(|k| recycle_dir(&s).join(k))
+        .collect();
+    assert!(slots.iter().all(|p| p.exists()));
+    let n = events(&s).len();
+
+    let (status, answer, _) = empty(&s, &t);
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer, json!({"removed": 2, "bytes": 4 + 2 + 3, "kept": 0}));
+    assert_eq!(bin(&s, &t, "").0, Vec::<Value>::new());
+    assert!(slots.iter().all(|p| !p.exists()), "{file}");
+    assert_eq!(index_lines(&s), Vec::<Value>::new());
+    // One event per line: the file, the folder's two files and the folder itself.
+    let new = events(&s)[n..].to_vec();
+    assert_eq!(new.len(), 4, "{new:?}");
+    for e in &new {
+        assert_eq!(e["type"], "recycle.pruned");
+        assert_eq!(e["origin"], "app");
+        assert_eq!(e["opId"], new[0]["opId"]);
+        assert_eq!(e["reason"], "deleted");
+        assert!(e.get("device").is_none_or(Value::is_null), "{e}");
+    }
+    let mut paths: Vec<&str> = new.iter().map(|e| e["path"].as_str().unwrap()).collect();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        [
+            "NOTE/Note/W",
+            "NOTE/Note/W/S/b.txt",
+            "NOTE/Note/W/a.txt",
+            "NOTE/Note/c.txt"
+        ]
+    );
+}
+
+/// A folder that a delete left with only dot-files is in the bin, but no item: Empty takes it.
+#[test]
+fn empty_removes_a_pruned_parent_too() {
+    let s = start_imported();
+    let t = writer(&s);
+    let id = uploaded(&s, &t, "NOTE/Note/P/a.txt", b"a");
+    std::fs::write(files(&s).join("NOTE/Note/P/.DS_Store"), b"dots").unwrap();
+    assert_eq!(delete(&s, &t, id).0, 200);
+    assert_eq!(index_lines(&s).len(), 2);
+    let (status, answer, _) = empty(&s, &t);
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer, json!({"removed": 1, "bytes": 1, "kept": 0}));
+    assert_eq!(index_lines(&s), Vec::<Value>::new());
+}
+
+#[test]
+fn empty_keeps_old_versions_of_live_files() {
+    let s = start_imported();
+    let t = writer(&s);
+    let live = uploaded(&s, &t, "NOTE/Note/a.txt", b"one");
+    assert_eq!(upload(&s, &t, "NOTE/Note/a.txt", b"two").0, 200);
+    deleted(&s, &t, "NOTE/Note/b.txt", b"bb");
+    let old = index_lines(&s)
+        .into_iter()
+        .find(|l| l["reason"] == "overwritten")
+        .unwrap();
+    let (status, answer, _) = empty(&s, &t);
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer, json!({"removed": 1, "bytes": 2, "kept": 0}));
+    assert_eq!(index_lines(&s), std::slice::from_ref(&old));
+    assert_eq!(old["id"], live);
+    let slot = recycle_dir(&s).join(format!(
+        "{}/{}",
+        old["deletedAt"],
+        old["path"].as_str().unwrap()
+    ));
+    assert_eq!(std::fs::read(slot).unwrap(), b"one");
+}
+
+#[test]
+fn empty_keeps_the_old_versions_of_a_restored_file() {
+    let s = start_imported();
+    let t = writer(&s);
+    let old = uploaded(&s, &t, "NOTE/Note/a.txt", b"one");
+    assert_eq!(upload(&s, &t, "NOTE/Note/a.txt", b"two").0, 200);
+    assert_eq!(delete(&s, &t, old).0, 200);
+    let key = only_key(&s, &t);
+    let (status, answer, _) = restore(&s, &t, json!({"key": key}));
+    assert_eq!(status, 200, "{answer}");
+    let new = answer["id"].as_u64().unwrap();
+    // Something to remove, so Empty writes the index.
+    deleted(&s, &t, "NOTE/Note/b.txt", b"bb");
+
+    let (status, answer, _) = empty(&s, &t);
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer, json!({"removed": 1, "bytes": 2, "kept": 0}));
+    let lines = index_lines(&s);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["reason"], "overwritten");
+    assert_eq!(lines[0]["id"], new);
+    let slot = recycle_dir(&s).join(format!(
+        "{}/{}",
+        lines[0]["deletedAt"],
+        lines[0]["path"].as_str().unwrap()
+    ));
+    assert_eq!(std::fs::read(slot).unwrap(), b"one");
+    assert_eq!(
+        std::fs::read(files(&s).join("NOTE/Note/a.txt")).unwrap(),
+        b"two"
+    );
+}
+
+#[test]
+fn empty_with_nothing_to_remove() {
+    let s = start_imported();
+    let t = writer(&s);
+    let n = events(&s).len();
+    let (status, answer, _) = empty(&s, &t);
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer, json!({"removed": 0, "bytes": 0, "kept": 0}));
+    // Old versions alone: nothing to remove either.
+    uploaded(&s, &t, "NOTE/Note/a.txt", b"one");
+    assert_eq!(upload(&s, &t, "NOTE/Note/a.txt", b"two").0, 200);
+    let n2 = events(&s).len();
+    assert!(n2 > n);
+    let (status, answer, _) = empty(&s, &t);
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer, json!({"removed": 0, "bytes": 0, "kept": 0}));
+    assert_eq!(events(&s).len(), n2);
+    assert_eq!(index_lines(&s).len(), 1);
+}
+
+#[test]
+fn empty_waits_while_a_device_syncs() {
+    let s = start_imported();
+    let t = writer(&s);
+    let (_, key) = deleted(&s, &t, "NOTE/Note/a.txt", b"a");
+    s.state
+        .sync_locks
+        .start("jordi", "SN078C10000000", s.state.now_ms());
+    let n = events(&s).len();
+    let (status, answer, retry) = empty(&s, &t);
+    assert_eq!(status, 423, "{answer}");
+    assert_eq!(answer, json!({"error": "device_syncing"}));
+    assert_eq!(retry.as_deref(), Some("5"));
+    assert_eq!(events(&s).len(), n);
+    assert_eq!(keys(&bin(&s, &t, "").0), [key]);
+}
+
+#[test]
+fn empty_answers_not_imported_and_scan_hold() {
+    let s = start();
+    assert!(s.state.config.protect);
+    let t = writer(&s);
+    let (status, answer, _) = empty(&s, &t);
+    assert_eq!((status, answer), (423, json!({"error": "not_imported"})));
+
+    let s = start_imported();
+    let t = writer(&s);
+    let (_, key) = deleted(&s, &t, "NOTE/Note/a.txt", b"a");
+    let gone = s.put("gone.note", b"g");
+    std::fs::remove_file(files(&s).join(&gone)).unwrap();
+    assert_eq!(
+        s.get(Some(&t), &format!("/tree?path={}", q("NOTE/Note"))).0,
+        423
+    );
+    let n = events(&s).len();
+    let (status, answer, _) = empty(&s, &t);
+    assert_eq!((status, answer), (423, json!({"error": "scan_hold"})));
+    assert_eq!(events(&s).len(), n);
+    assert!(recycle_dir(&s).join(&key).exists());
+}
+
+#[test]
+fn empty_needs_a_write_token() {
+    let s = start_imported();
+    let t = writer(&s);
+    let (_, key) = deleted(&s, &t, "NOTE/Note/a.txt", b"a");
+    let (status, answer, _) = empty(&s, &s.token());
+    assert_eq!((status, answer), (403, json!({"error": "read_only_token"})));
+    let (status, answer, _) = empty(&s, "no-token");
+    assert_eq!((status, answer), (401, json!({"error": "token_refused"})));
+    assert_eq!(keys(&bin(&s, &t, "").0), [key]);
+    // Only POST.
+    let (status, answer) = s.get(Some(&t), "/recycle/empty");
+    assert_eq!((status, answer), (404, json!({"error": "no_route"})));
+}
+
+#[test]
+fn empty_then_the_hourly_prune_finds_nothing() {
+    let s = start_imported();
+    let t = writer(&s);
+    uploaded(&s, &t, "NOTE/Note/a.txt", b"one");
+    assert_eq!(upload(&s, &t, "NOTE/Note/a.txt", b"two").0, 200);
+    deleted(&s, &t, "NOTE/Note/b.txt", b"bb");
+    assert_eq!(empty(&s, &t).0, 200);
+    let n = events(&s).len();
+    let lines = index_lines(&s);
+    let report = s.state.prune_recycle_all().unwrap();
+    assert_eq!(report.removed, 0, "{report:?}");
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+    assert_eq!(events(&s).len(), n);
+    assert_eq!(index_lines(&s), lines);
+}

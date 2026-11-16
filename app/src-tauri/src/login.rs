@@ -6,7 +6,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::commands::ConfigState;
+use crate::commands::{ConfigState, TryUpdateError};
 use crate::config::AppConfig;
 use crate::poller::rest_base;
 use crate::rest::{Rest, RestError};
@@ -40,6 +40,29 @@ pub enum LoginError {
     Keychain(String),
     /// The config was not saved; the token was deleted again.
     Save(String),
+    /// Another login runs.
+    Busy,
+    /// The mode, the address or the folder changed while the login ran.
+    ServerChanged,
+    /// The server answered a token that may not write.
+    NoWriteAccess,
+    /// A failed login whose new token could not be deleted again.
+    Rollback {
+        error: Box<LoginError>,
+        keychain: String,
+    },
+}
+
+/// One login at a time.
+#[derive(Default)]
+pub struct LoginGate(std::sync::Mutex<()>);
+
+/// Whether the Keychain holds a token for the account of `config`.
+pub fn has_login(store: &dyn TokenStore, config: &AppConfig) -> Result<bool, String> {
+    match token_key(config) {
+        Some(key) => Ok(store.get(&key).map_err(|e| e.to_string())?.is_some()),
+        None => Ok(false),
+    }
 }
 
 impl fmt::Display for LoginError {
@@ -50,6 +73,15 @@ impl fmt::Display for LoginError {
             Self::Rest(error) => error.fmt(f),
             Self::Keychain(why) => write!(f, "The Keychain did not take the login ({why})."),
             Self::Save(why) => write!(f, "The login was not kept: {why}."),
+            Self::Busy => f.write_str("A login is already running."),
+            Self::ServerChanged => {
+                f.write_str("The server changed during the login. Log in again.")
+            }
+            Self::NoWriteAccess => f.write_str("The server gave this Mac no write access."),
+            Self::Rollback { error, keychain } => write!(
+                f,
+                "{error} The new login could not be removed from the Keychain ({keychain})."
+            ),
         }
     }
 }
@@ -106,20 +138,40 @@ struct LoginBody<'a> {
 struct LoginAnswer {
     token: String,
     slug: String,
+    scope: String,
+}
+
+/// Deletes the new token again after a failed step; a delete that fails is named.
+fn undo(store: &dyn TokenStore, key: &str, error: LoginError) -> LoginError {
+    match store.delete(key) {
+        Ok(()) => error,
+        Err(e) => LoginError::Rollback {
+            error: Box::new(error),
+            keychain: e.0,
+        },
+    }
 }
 
 /// Logs in to the server of the config and keeps a write token for the account it answers.
 /// The token is written first, under the key of the answer's `slug`; then the config gets
 /// the account and the e-mail. When that save fails, the token is deleted again. The token of
-/// another account that the config named before is deleted last (that is a log out of it). A
-/// login is never tried a second time by itself: six wrong tries lock the account.
+/// another account that the config named before is deleted last (that is a log out of it), so
+/// a failed login keeps the account that works. When the mode, the address or the folder
+/// changed while the login ran, nothing is kept. One login runs at a time, and a login is
+/// never tried a second time by itself: six wrong tries lock the account.
 pub fn log_in(
+    gate: &LoginGate,
     state: &ConfigState,
     serve_info: &ServeInfo,
     store: &dyn TokenStore,
     email: &str,
     password: &Password,
 ) -> Result<AppConfig, LoginError> {
+    let _running = match gate.0.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => return Err(LoginError::Busy),
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+    };
     let before = state.current();
     let base = rest_base(&before, serve_info).ok_or(LoginError::NoMode)?;
     let email = email.trim();
@@ -138,6 +190,9 @@ pub fn log_in(
     if answer.token.is_empty() || answer.slug.is_empty() {
         return Err(RestError::Garbled("no token or no account in the answer".to_owned()).into());
     }
+    if answer.scope != "write" {
+        return Err(LoginError::NoWriteAccess);
+    }
 
     let mut next = before.clone();
     next.account = Some(answer.slug.clone());
@@ -145,15 +200,30 @@ pub fn log_in(
     store
         .set(&key, &Token::new(answer.token))
         .map_err(|e| LoginError::Keychain(e.0))?;
-    let saved = match state.set_login(&answer.slug, email) {
-        Ok(saved) => saved,
-        Err(why) => {
-            // Without the account in the config, nothing would find the token again.
-            let _ = store.delete(&key);
-            return Err(LoginError::Save(why));
+    // Checked under the config's lock: the server must still be the one logged in to (in
+    // Local mode the folder is the server, though the key leaves it out), and the key the one
+    // of the config, or Log out could never find the token.
+    let saved = state.try_update(|c| {
+        let mut probe = c.clone();
+        probe.account = Some(answer.slug.clone());
+        let same_server = (c.mode, &c.server_url, &c.data_dir)
+            == (before.mode, &before.server_url, &before.data_dir);
+        if !same_server || token_key(&probe).as_deref() != Some(key.as_str()) {
+            return Err(LoginError::ServerChanged);
+        }
+        c.account = Some(answer.slug.clone());
+        c.email = Some(email.to_owned());
+        Ok(())
+    });
+    let (replaced, saved) = match saved {
+        Ok(both) => both,
+        Err(TryUpdateError::Refused(error)) => return Err(undo(store, &key, error)),
+        // Without the account in the config, nothing would find the token again.
+        Err(TryUpdateError::NotSaved(why)) => {
+            return Err(undo(store, &key, LoginError::Save(why)));
         }
     };
-    if let Some(old) = token_key(&before)
+    if let Some(old) = token_key(&replaced)
         && old != key
     {
         let _ = store.delete(&old);

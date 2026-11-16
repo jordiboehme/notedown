@@ -76,6 +76,7 @@ pub fn run() {
         .on_window_event(windows::on_window_event)
         .manage(Shown::default())
         .manage(Arc::new(QuitFlow::new()))
+        .manage(Arc::new(login::LoginGate::default()))
         .setup(|app| {
             // A menu bar app: no Dock icon until a library or settings window shows. The
             // Info.plist says so too (LSUIElement), so the bundle never shows one at launch.
@@ -121,6 +122,7 @@ pub fn run() {
             commands::quit_app,
             commands::request_quit,
             commands::log_in,
+            commands::has_login,
             commands::log_out,
             commands::process_logs,
             commands::mcp_info,
@@ -410,7 +412,7 @@ mod tests {
         names.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    const SETTINGS_ONLY: [&str; 17] = [
+    const SETTINGS_ONLY: [&str; 18] = [
         "get_config",
         "set_mode",
         "set_start_view",
@@ -419,6 +421,7 @@ mod tests {
         "set_autostart",
         "get_autostart",
         "log_in",
+        "has_login",
         "log_out",
         "model_pull",
         "model_pause",
@@ -505,7 +508,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 22);
+        assert_eq!(handler_commands().len(), 23);
     }
 
     #[test]
@@ -523,6 +526,7 @@ mod tests {
             "quit_app",
             "request_quit",
             "log_in",
+            "has_login",
             "log_out",
             "process_logs",
             "mcp_info",

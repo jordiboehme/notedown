@@ -65,6 +65,15 @@ pub struct Scripted {
 impl Scripted {
     /// Answers the next connections with `answers`, in order; then accepts no more.
     pub fn start(answers: Vec<String>) -> Self {
+        Self::start_with(answers, |_, _| {})
+    }
+
+    /// [`start`](Self::start), and runs `hook` with the number and the request of each call
+    /// before it answers: a test changes things while a call waits for its answer.
+    pub fn start_with(
+        answers: Vec<String>,
+        mut hook: impl FnMut(usize, &Request) + Send + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -72,13 +81,14 @@ impl Scripted {
         let flag = stop.clone();
         let (tx, requests) = channel();
         let thread = std::thread::spawn(move || {
-            for reply in answers {
+            for (n, reply) in answers.into_iter().enumerate() {
                 let Some(mut stream) = accept(&listener, &flag) else {
                     return;
                 };
                 let Some(request) = read_request(&mut stream) else {
                     return;
                 };
+                hook(n, &request);
                 let _ = tx.send(request);
                 let _ = stream.write_all(reply.as_bytes());
                 let _ = stream.flush();

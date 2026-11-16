@@ -8,7 +8,7 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::config::{self, AppConfig, Mode, StartView};
-use crate::login::{self, Password};
+use crate::login::{self, LoginGate, Password};
 use crate::model::{ModelControl, ModelState};
 use crate::poller::Poller;
 use crate::processes::{ProcessStates, Processes};
@@ -18,6 +18,14 @@ use crate::windows::{self, WindowKind};
 
 /// How the config is written to its folder: [`config::save`], or a slow one in tests.
 pub type SaveFn = Arc<dyn Fn(&Path, &AppConfig) -> std::io::Result<()> + Send + Sync>;
+
+/// Why [`ConfigState::try_update`] changed nothing.
+pub enum TryUpdateError<E> {
+    /// The change refused.
+    Refused(E),
+    /// The save failed.
+    NotSaved(String),
+}
 
 /// The live config and the folder it is saved in.
 #[derive(Clone)]
@@ -93,13 +101,32 @@ impl ConfigState {
     /// The save (with its fsync) runs outside the config's lock, so a read never waits for
     /// it; the new config is swapped in under a short lock afterwards.
     fn update(&self, change: impl FnOnce(&mut AppConfig)) -> Result<AppConfig, String> {
+        self.try_update(|c| {
+            change(c);
+            Ok::<(), ()>(())
+        })
+        .map(|(_, next)| next)
+        .map_err(|e| match e {
+            TryUpdateError::NotSaved(why) => why,
+            TryUpdateError::Refused(()) => unreachable!("the change never refuses"),
+        })
+    }
+
+    /// [`update`](Self::update) with a change that may refuse, made while no other change
+    /// runs. Answers the config it replaced and the new one.
+    pub fn try_update<E>(
+        &self,
+        change: impl FnOnce(&mut AppConfig) -> Result<(), E>,
+    ) -> Result<(AppConfig, AppConfig), TryUpdateError<E>> {
         let _saving = self.saving.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut next = self.current();
-        change(&mut next);
-        (self.save)(&self.dir, &next).map_err(|e| format!("the config was not saved: {e}"))?;
+        let before = self.current();
+        let mut next = before.clone();
+        change(&mut next).map_err(TryUpdateError::Refused)?;
+        (self.save)(&self.dir, &next)
+            .map_err(|e| TryUpdateError::NotSaved(format!("the config was not saved: {e}")))?;
         *self.config.lock().unwrap_or_else(PoisonError::into_inner) = next.clone();
         self.reset.store(false, Ordering::SeqCst);
-        Ok(next)
+        Ok((before, next))
     }
 
     /// Sets where the server runs. Remote needs an `http://` or `https://` address; a folder
@@ -140,11 +167,11 @@ impl ConfigState {
         self.update(|c| c.start_view = view)
     }
 
-    /// Keeps the account and the e-mail of a login.
-    pub fn set_login(&self, account: &str, email: &str) -> Result<AppConfig, String> {
+    /// Forgets the account and the e-mail (Log out).
+    pub fn forget_login(&self) -> Result<AppConfig, String> {
         self.update(|c| {
-            c.account = Some(account.to_owned());
-            c.email = Some(email.to_owned());
+            c.account = None;
+            c.email = None;
         })
     }
 }
@@ -201,13 +228,13 @@ fn expand_home(dir: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Log out: deletes the token of the account in the config. The account stays, so the
-/// pipeline still knows whose notes it reads.
-pub fn log_out_of(store: &dyn TokenStore, config: &AppConfig) -> Result<(), String> {
-    match token_key(config) {
-        Some(key) => store.delete(&key).map_err(|e| e.to_string()),
-        None => Ok(()),
+/// Log out: deletes the token of the account in the config, then forgets the account and
+/// the e-mail. The answer is the config without them.
+pub fn log_out_of(store: &dyn TokenStore, state: &ConfigState) -> Result<AppConfig, String> {
+    if let Some(key) = token_key(&state.current()) {
+        store.delete(&key).map_err(|e| e.to_string())?;
     }
+    state.forget_login()
 }
 
 pub fn allowed_link(url: &str) -> bool {
@@ -355,14 +382,17 @@ pub async fn log_in(
     config: State<'_, ConfigState>,
     processes: State<'_, Arc<Processes>>,
     poller: State<'_, Poller>,
+    gate: State<'_, Arc<LoginGate>>,
     email: String,
     password: String,
 ) -> Result<AppConfig, String> {
     let state = config.inner().clone();
+    let gate = gate.inner().clone();
     let serve_info = processes.serve_info();
     let password = Password::new(password);
     let saved = tauri::async_runtime::spawn_blocking(move || {
         login::log_in(
+            &gate,
             &state,
             &serve_info,
             &KeychainStore::new(),
@@ -377,18 +407,29 @@ pub async fn log_in(
     Ok(saved)
 }
 
-/// Log out: deletes the token from the Keychain, off the main thread, then polls again.
+/// Whether the Keychain keeps a login for the account in the config, off the main thread.
+#[tauri::command]
+pub async fn has_login(config: State<'_, ConfigState>) -> Result<bool, String> {
+    let config = config.current();
+    tauri::async_runtime::spawn_blocking(move || login::has_login(&KeychainStore::new(), &config))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Log out: deletes the token from the Keychain and forgets the account, off the main thread,
+/// then polls again.
 #[tauri::command]
 pub async fn log_out(
     config: State<'_, ConfigState>,
     poller: State<'_, Poller>,
-) -> Result<(), String> {
-    let config = config.current();
-    tauri::async_runtime::spawn_blocking(move || log_out_of(&KeychainStore::new(), &config))
-        .await
-        .map_err(|e| e.to_string())??;
+) -> Result<AppConfig, String> {
+    let state = config.inner().clone();
+    let after =
+        tauri::async_runtime::spawn_blocking(move || log_out_of(&KeychainStore::new(), &state))
+            .await
+            .map_err(|e| e.to_string())??;
     poller.poll_now();
-    Ok(())
+    Ok(after)
 }
 
 /// The last lines of both children's output, for the Server page.
@@ -793,21 +834,30 @@ mod tests {
     }
 
     #[test]
-    fn log_out_deletes_the_token_only() {
+    fn log_out_deletes_the_token_and_forgets_the_account() {
         use crate::token::{MemoryStore, Token, TokenStore};
-        let store = MemoryStore::new();
+        let dir = tempfile::tempdir().unwrap();
         let config = AppConfig {
             mode: Mode::Local,
             account: Some("jordi".into()),
+            email: Some("me@example.org".into()),
             ..AppConfig::default()
         };
+        config::save(dir.path(), &config).unwrap();
+        let state = ConfigState::load(dir.path().to_path_buf());
+        let store = MemoryStore::new();
         store.set("local|jordi", &Token::new("secret")).unwrap();
         store.set("local|other", &Token::new("other")).unwrap();
-        log_out_of(&store, &config).unwrap();
+        let after = log_out_of(&store, &state).unwrap();
         assert_eq!(store.get("local|jordi").unwrap(), None);
         assert!(store.get("local|other").unwrap().is_some());
+        assert_eq!(after.account, None);
+        assert_eq!(after.email, None);
+        assert_eq!(after.mode, Mode::Local);
+        assert_eq!(state.current(), after);
+        assert_eq!(config::load(dir.path()), after);
         // Without an account there is nothing to delete.
-        log_out_of(&store, &AppConfig::default()).unwrap();
+        log_out_of(&store, &state).unwrap();
     }
 
     #[test]

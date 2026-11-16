@@ -29,6 +29,13 @@ pub const RETRY_AFTER: Duration = Duration::from_secs(5);
 /// Sleeps for a while. Injected, so tests do not really wait.
 pub type Sleeper = Arc<dyn Fn(Duration) + Send + Sync>;
 
+/// Milliseconds since the first call, from a monotonic clock: a wall clock set back or
+/// forward never makes a wait longer or shorter.
+pub fn monotonic_clock() -> Clock {
+    let start = std::time::Instant::now();
+    Arc::new(move || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX))
+}
+
 /// The real sleep.
 pub fn real_sleeper() -> Sleeper {
     Arc::new(std::thread::sleep)
@@ -107,11 +114,13 @@ impl fmt::Display for RestError {
             Self::StoreDamaged => {
                 f.write_str("The server cannot read its files. See the server's log.")
             }
-            Self::Server {
-                status,
-                code: Some(code),
-            } => write!(f, "The server answered {status} ({code})."),
-            Self::Server { status, code: None } => write!(f, "The server answered {status}."),
+            Self::Server { status, code } => match code.as_deref() {
+                Some(code) => match code_text(code) {
+                    Some(text) => f.write_str(text),
+                    None => write!(f, "The server answered {status} ({code})."),
+                },
+                None => write!(f, "The server answered {status}."),
+            },
             Self::Garbled(why) => write!(f, "The answer of the server could not be read ({why})."),
             Self::Failed(why) => write!(f, "The request failed ({why})."),
         }
@@ -119,6 +128,27 @@ impl fmt::Display for RestError {
 }
 
 impl std::error::Error for RestError {}
+
+/// The text of an error code that has no variant of its own.
+fn code_text(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "is_a_folder" => "This is a folder, not a file.",
+        "not_a_folder" => "A file is where a folder should be.",
+        "not_a_file" => "This is not a file.",
+        "into_itself" => "A folder cannot move into itself.",
+        "sync_refused" => "The server takes no files now.",
+        "slot_damaged" => "This item of the recycle bin is damaged.",
+        "bad_length" | "bad_md5" => "The file did not arrive whole. Try again.",
+        "length_required" => "The server needs the size of the file.",
+        "bad_cursor" => "The list changed on the server. Load it again.",
+        "missing" => "The note is not on the server.",
+        "no_record" => "The server has nothing for this note.",
+        "no_route" => "The server does not know this request. Update the server.",
+        "bad_request" => "The server did not understand the request.",
+        "internal" => "The server had an error. See the server's log.",
+        _ => return None,
+    })
+}
 
 /// The error of an answer that was no success: by its code, then by its status.
 pub fn error_for(status: u16, body: &[u8], retry_after: Option<&str>) -> RestError {
@@ -174,15 +204,10 @@ impl Rest {
     /// A client with the wall clock and real sleeps. Make it on a thread that may block, never
     /// inside an async task.
     pub fn new(base: &str, token: Option<Token>) -> Result<Self, RestError> {
-        Self::with_timing(
-            base,
-            token,
-            crate::supervisor::system_clock(),
-            real_sleeper(),
-        )
+        Self::with_timing(base, token, monotonic_clock(), real_sleeper())
     }
 
-    /// [`new`](Self::new) with another clock and sleeper.
+    /// [`new`](Self::new) with another clock (milliseconds, monotonic) and sleeper.
     pub fn with_timing(
         base: &str,
         token: Option<Token>,

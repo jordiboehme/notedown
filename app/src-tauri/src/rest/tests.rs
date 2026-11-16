@@ -175,6 +175,36 @@ fn rest_maps_the_error_codes() {
         assert_eq!(error.to_string(), text);
     }
     // Every text is a plain sentence without a dash of the long kinds.
+    // The codes without a variant have their own plain text.
+    for code in [
+        "is_a_folder",
+        "not_a_folder",
+        "not_a_file",
+        "into_itself",
+        "sync_refused",
+        "slot_damaged",
+        "bad_length",
+        "bad_md5",
+        "length_required",
+        "bad_cursor",
+        "missing",
+        "no_record",
+        "no_route",
+        "bad_request",
+        "internal",
+    ] {
+        let text = error_for(409, err(code).as_bytes(), None).to_string();
+        assert!(!text.contains("answered"), "{code}: {text}");
+        assert!(!text.contains(code), "{code}: {text}");
+    }
+    assert_eq!(
+        error_for(409, err("not_a_folder").as_bytes(), None).to_string(),
+        "A file is where a folder should be."
+    );
+    assert_eq!(
+        error_for(500, err("internal").as_bytes(), None).to_string(),
+        "The server had an error. See the server's log."
+    );
     for error in [
         RestError::ScanHold,
         RestError::ReadOnlyToken,

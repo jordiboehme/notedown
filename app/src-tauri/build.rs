@@ -17,6 +17,7 @@ const COMMANDS: &[&str] = &[
     "quit_app",
     "request_quit",
     "log_in",
+    "has_login",
     "log_out",
     "process_logs",
     "mcp_info",

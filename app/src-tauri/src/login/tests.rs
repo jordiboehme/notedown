@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::json;
 
@@ -28,9 +28,13 @@ fn code_answer() -> String {
 }
 
 fn token_answer(slug: &str) -> String {
+    scoped_answer(slug, "write")
+}
+
+fn scoped_answer(slug: &str, scope: &str) -> String {
     answer(
         "201 Created",
-        &format!(r#"{{"token":"tok-123","id":"t1","slug":"{slug}","userId":7,"scope":"write"}}"#),
+        &format!(r#"{{"token":"tok-123","id":"t1","slug":"{slug}","userId":7,"scope":"{scope}"}}"#),
     )
 }
 
@@ -68,6 +72,7 @@ fn login_stores_a_write_token() {
     let store = MemoryStore::new();
 
     let saved = log_in(
+        &LoginGate::default(),
         &state,
         &ServeInfo::default(),
         &store,
@@ -131,6 +136,7 @@ fn a_failed_save_removes_the_token() {
     let store = MemoryStore::new();
 
     let error = log_in(
+        &LoginGate::default(),
         &state,
         &ServeInfo::default(),
         &store,
@@ -151,6 +157,7 @@ fn login_without_a_mode_is_refused() {
     let state = ConfigState::load(dir.path().to_path_buf());
     let store = MemoryStore::new();
     let error = log_in(
+        &LoginGate::default(),
         &state,
         &ServeInfo::default(),
         &store,
@@ -171,6 +178,7 @@ fn an_empty_field_is_refused_before_any_request() {
     let store = MemoryStore::new();
     for (email, password) in [(" ", PASSWORD), ("me@example.org", "")] {
         let error = log_in(
+            &LoginGate::default(),
             &state,
             &ServeInfo::default(),
             &store,
@@ -196,6 +204,7 @@ fn a_wrong_password_says_so() {
     let state = remote_config(dir.path(), server.port, None);
     let store = MemoryStore::new();
     let error = log_in(
+        &LoginGate::default(),
         &state,
         &ServeInfo::default(),
         &store,
@@ -224,6 +233,7 @@ fn too_many_tries_says_so() {
     let store = MemoryStore::new();
     for _ in 0..2 {
         let error = log_in(
+            &LoginGate::default(),
             &state,
             &ServeInfo::default(),
             &store,
@@ -248,6 +258,7 @@ fn another_account_replaces_the_old_one() {
         .unwrap();
     store.set("local|other", &Token::new("other")).unwrap();
     let saved = log_in(
+        &LoginGate::default(),
         &state,
         &ServeInfo::default(),
         &store,
@@ -283,6 +294,7 @@ fn a_keychain_that_refuses_keeps_the_config() {
     let dir = tempfile::tempdir().unwrap();
     let state = remote_config(dir.path(), server.port, None);
     let error = log_in(
+        &LoginGate::default(),
         &state,
         &ServeInfo::default(),
         &NoKeychain,
@@ -304,6 +316,7 @@ fn no_login_error_holds_the_password() {
         let state = remote_config(dir.path(), port, None);
         errors.push(
             log_in(
+                &LoginGate::default(),
                 &state,
                 &ServeInfo::default(),
                 &MemoryStore::new(),
@@ -358,6 +371,9 @@ fn no_login_error_holds_the_password() {
         LoginError::Missing,
         LoginError::Keychain("locked".into()),
         LoginError::Save("the config was not saved: full".into()),
+        LoginError::Busy,
+        LoginError::ServerChanged,
+        LoginError::NoWriteAccess,
     ]);
     for error in &errors {
         for text in [
@@ -370,4 +386,293 @@ fn no_login_error_holds_the_password() {
             }
         }
     }
+}
+
+#[test]
+fn a_server_change_during_the_login_keeps_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    // The port is known only once the server runs; the hook reads the state from here.
+    let slot: Arc<Mutex<Option<ConfigState>>> = Arc::default();
+    let hook_slot = slot.clone();
+    let server = Scripted::start_with(vec![code_answer(), token_answer("jordi")], move |n, _| {
+        if n == 1 {
+            // Another address on the Server page while the login waits for its answer.
+            let state = hook_slot.lock().unwrap().clone().unwrap();
+            state
+                .set_mode(
+                    Mode::Remote,
+                    None,
+                    Some("http://other.example:19072".into()),
+                )
+                .unwrap();
+        }
+    });
+    let state = remote_config(dir.path(), server.port, None);
+    *slot.lock().unwrap() = Some(state.clone());
+    let store = MemoryStore::new();
+    let error = log_in(
+        &LoginGate::default(),
+        &state,
+        &ServeInfo::default(),
+        &store,
+        "me@example.org",
+        &Password::new(PASSWORD),
+    )
+    .unwrap_err();
+    assert_eq!(error, LoginError::ServerChanged);
+    assert_eq!(
+        error.to_string(),
+        "The server changed during the login. Log in again."
+    );
+    assert_eq!(store.get(&key(server.port, "jordi")).unwrap(), None);
+    assert_eq!(store.get("http://other.example:19072|jordi").unwrap(), None);
+    assert_eq!(state.current().account, None);
+    assert_eq!(state.current().email, None);
+}
+
+#[test]
+fn a_second_login_while_one_runs_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(LoginGate::default());
+    let slot: Arc<Mutex<Option<ConfigState>>> = Arc::default();
+    let second: Arc<Mutex<Option<Result<AppConfig, LoginError>>>> = Arc::default();
+    let (hook_gate, hook_slot, hook_second) = (gate.clone(), slot.clone(), second.clone());
+    let server = Scripted::start_with(
+        vec![code_answer(), token_answer("jordi"), code_answer()],
+        move |n, _| {
+            if n == 0 {
+                let state = hook_slot.lock().unwrap().clone().unwrap();
+                let result = log_in(
+                    &hook_gate,
+                    &state,
+                    &ServeInfo::default(),
+                    &MemoryStore::new(),
+                    "me@example.org",
+                    &Password::new(PASSWORD),
+                );
+                *hook_second.lock().unwrap() = Some(result);
+            }
+        },
+    );
+    let state = remote_config(dir.path(), server.port, None);
+    *slot.lock().unwrap() = Some(state.clone());
+    let store = MemoryStore::new();
+    let saved = log_in(
+        &gate,
+        &state,
+        &ServeInfo::default(),
+        &store,
+        "me@example.org",
+        &Password::new(PASSWORD),
+    )
+    .unwrap();
+    assert_eq!(saved.account.as_deref(), Some("jordi"));
+    let second = second.lock().unwrap().take().expect("the second login ran");
+    let error = second.unwrap_err();
+    assert_eq!(error, LoginError::Busy);
+    assert_eq!(error.to_string(), "A login is already running.");
+    // The second one sent nothing.
+    assert_eq!(server.received().len(), 2);
+    // Once the first ended, a login runs again (and stops at the empty e-mail).
+    let again = log_in(
+        &gate,
+        &state,
+        &ServeInfo::default(),
+        &store,
+        "",
+        &Password::new(PASSWORD),
+    );
+    assert_eq!(again.unwrap_err(), LoginError::Missing);
+}
+
+#[test]
+fn a_failed_login_keeps_the_old_accounts_token() {
+    let server = Scripted::start(vec![
+        code_answer(),
+        answer("401 Unauthorized", r#"{"error":"login_failed"}"#),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let state = remote_config(dir.path(), server.port, Some("old"));
+    let store = MemoryStore::new();
+    store
+        .set(&key(server.port, "old"), &Token::new("old-token"))
+        .unwrap();
+    let error = log_in(
+        &LoginGate::default(),
+        &state,
+        &ServeInfo::default(),
+        &store,
+        "me@example.org",
+        &Password::new("wrong"),
+    )
+    .unwrap_err();
+    assert_eq!(error, LoginError::Rest(RestError::LoginFailed));
+    let old = store.get(&key(server.port, "old")).unwrap().unwrap();
+    assert_eq!(old.expose(), "old-token");
+    assert_eq!(state.current().account.as_deref(), Some("old"));
+}
+
+#[test]
+fn a_local_login_keeps_the_token_under_local_and_the_slug() {
+    let server = Scripted::start(vec![code_answer(), token_answer("jordi")]);
+    let dir = tempfile::tempdir().unwrap();
+    let config = AppConfig {
+        mode: Mode::Local,
+        data_dir: dir.path().join("data"),
+        ..AppConfig::default()
+    };
+    config::save(dir.path(), &config).unwrap();
+    let state = ConfigState::load(dir.path().to_path_buf());
+    let serve_info = ServeInfo {
+        listen: vec![format!("127.0.0.1:{}", server.port).parse().unwrap()],
+        ..ServeInfo::default()
+    };
+    let store = MemoryStore::new();
+    let saved = log_in(
+        &LoginGate::default(),
+        &state,
+        &serve_info,
+        &store,
+        "me@example.org",
+        &Password::new(PASSWORD),
+    )
+    .unwrap();
+    assert_eq!(saved.account.as_deref(), Some("jordi"));
+    assert_eq!(
+        store.get("local|jordi").unwrap().unwrap().expose(),
+        "tok-123"
+    );
+    assert_eq!(server.next().target, "/rest/v1/login/code");
+}
+
+#[test]
+fn a_token_without_write_access_is_refused() {
+    let server = Scripted::start(vec![code_answer(), scoped_answer("jordi", "read")]);
+    let dir = tempfile::tempdir().unwrap();
+    let state = remote_config(dir.path(), server.port, Some("old"));
+    let store = MemoryStore::new();
+    store
+        .set(&key(server.port, "old"), &Token::new("old-token"))
+        .unwrap();
+    let error = log_in(
+        &LoginGate::default(),
+        &state,
+        &ServeInfo::default(),
+        &store,
+        "me@example.org",
+        &Password::new(PASSWORD),
+    )
+    .unwrap_err();
+    assert_eq!(error, LoginError::NoWriteAccess);
+    assert_eq!(
+        error.to_string(),
+        "The server gave this Mac no write access."
+    );
+    assert_eq!(store.get(&key(server.port, "jordi")).unwrap(), None);
+    assert!(store.get(&key(server.port, "old")).unwrap().is_some());
+    assert_eq!(state.current().account.as_deref(), Some("old"));
+}
+
+/// A store that keeps tokens but cannot delete them.
+struct NoDelete(MemoryStore);
+
+impl TokenStore for NoDelete {
+    fn get(&self, key: &str) -> Result<Option<Token>, TokenError> {
+        self.0.get(key)
+    }
+    fn set(&self, key: &str, token: &Token) -> Result<(), TokenError> {
+        self.0.set(key, token)
+    }
+    fn delete(&self, _: &str) -> Result<(), TokenError> {
+        Err(TokenError("locked".into()))
+    }
+}
+
+#[test]
+fn a_failed_rollback_is_named() {
+    let server = Scripted::start(vec![code_answer(), token_answer("jordi")]);
+    let dir = tempfile::tempdir().unwrap();
+    let config = AppConfig {
+        mode: Mode::Remote,
+        server_url: Some(server_url(server.port)),
+        ..AppConfig::default()
+    };
+    config::save(dir.path(), &config).unwrap();
+    let state = ConfigState::load_with(
+        dir.path().to_path_buf(),
+        Arc::new(|_: &Path, _: &AppConfig| Err(std::io::Error::other("the disk is full"))),
+    );
+    let error = log_in(
+        &LoginGate::default(),
+        &state,
+        &ServeInfo::default(),
+        &NoDelete(MemoryStore::new()),
+        "me@example.org",
+        &Password::new(PASSWORD),
+    )
+    .unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("the disk is full"), "{text}");
+    assert!(
+        text.contains("The new login could not be removed from the Keychain"),
+        "{text}"
+    );
+    assert!(!text.contains("tok-123"), "{text}");
+}
+
+#[test]
+fn has_login_says_whether_a_token_is_kept() {
+    let store = MemoryStore::new();
+    let config = AppConfig {
+        mode: Mode::Local,
+        account: Some("jordi".into()),
+        ..AppConfig::default()
+    };
+    assert!(!has_login(&store, &config).unwrap());
+    store.set("local|jordi", &Token::new("t")).unwrap();
+    assert!(has_login(&store, &config).unwrap());
+    // No account, or no mode: no login.
+    assert!(!has_login(&store, &AppConfig::default()).unwrap());
+}
+
+#[test]
+fn a_new_local_folder_during_the_login_keeps_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = dir.path().join("other-data");
+    let slot: Arc<Mutex<Option<ConfigState>>> = Arc::default();
+    let hook_slot = slot.clone();
+    let server = Scripted::start_with(vec![code_answer(), token_answer("jordi")], move |n, _| {
+        if n == 1 {
+            // The key `local|jordi` stays the same, but the folder is another server.
+            let state = hook_slot.lock().unwrap().clone().unwrap();
+            state
+                .set_mode(Mode::Local, Some(other.clone()), None)
+                .unwrap();
+        }
+    });
+    let config = AppConfig {
+        mode: Mode::Local,
+        data_dir: dir.path().join("data"),
+        ..AppConfig::default()
+    };
+    config::save(dir.path(), &config).unwrap();
+    let state = ConfigState::load(dir.path().to_path_buf());
+    *slot.lock().unwrap() = Some(state.clone());
+    let serve_info = ServeInfo {
+        listen: vec![format!("127.0.0.1:{}", server.port).parse().unwrap()],
+        ..ServeInfo::default()
+    };
+    let store = MemoryStore::new();
+    let error = log_in(
+        &LoginGate::default(),
+        &state,
+        &serve_info,
+        &store,
+        "me@example.org",
+        &Password::new(PASSWORD),
+    )
+    .unwrap_err();
+    assert_eq!(error, LoginError::ServerChanged);
+    assert_eq!(store.get("local|jordi").unwrap(), None);
+    assert_eq!(state.current().account, None);
 }

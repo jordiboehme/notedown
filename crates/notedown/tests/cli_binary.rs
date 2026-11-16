@@ -2691,3 +2691,192 @@ fn model_pull_offers_json_progress() {
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("--json"));
 }
+
+/// A process that a test started and that is killed when the test ends, also on a failure.
+/// Only while it is still there: a pid that is gone may belong to another process soon.
+struct Orphan(String);
+
+impl Drop for Orphan {
+    fn drop(&mut self) {
+        if gone(&self.0) {
+            return;
+        }
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &self.0])
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+/// Whether the process is gone. A zombie counts as gone: `kill -0` still finds one on Linux.
+fn gone(pid: &str) -> bool {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .unwrap();
+    let stat = String::from_utf8_lossy(&out.stdout);
+    let stat = stat.trim();
+    stat.is_empty() || stat.starts_with('Z')
+}
+
+/// Starts `notedown <args> --exit-with-parent $$` from a short-lived `sh` parent. The parent
+/// waits until the child's log has the line `started`, then exits. Returns the child's log
+/// (stdout and stderr) once the child is gone; fails when it is still there 3 s later.
+fn ends_with_its_parent(args: &[&str], data: &std::path::Path, started: &str) -> String {
+    let log = data.join("child.log");
+    let script = r#"
+log="$1"; shift
+"$@" --exit-with-parent $$ >"$log" 2>&1 </dev/null &
+child=$!
+i=0
+while [ "$i" -lt 100 ] && kill -0 "$child" 2>/dev/null && ! grep -q "$STARTED" "$log"; do
+  sleep 0.1
+  i=$((i + 1))
+done
+echo "$child"
+"#;
+    let out = std::process::Command::new("sh")
+        .args(["-c", script, "sh"])
+        .arg(&log)
+        .arg(env!("CARGO_BIN_EXE_notedown"))
+        .args(args)
+        .env("STARTED", started)
+        .env("NOTEDOWN_MODEL_DIR", data.join("no-model"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let pid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let _orphan = Orphan(pid.clone());
+    let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
+    // The child ran with the flag before its parent left; a refused flag never gets here.
+    assert!(read_log().contains(started), "{}", read_log());
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !gone(&pid) {
+        assert!(
+            std::time::Instant::now() < end,
+            "the child still runs 3 s after its parent: {}",
+            read_log()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    read_log()
+}
+
+#[test]
+fn serve_exits_when_its_parent_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path();
+    std::fs::write(data.join("server.toml"), "listen = [\"127.0.0.1:0\"]\n").unwrap();
+    let data_arg = data.to_str().unwrap();
+    let log = ends_with_its_parent(&["serve", "--data", data_arg], data, "press Ctrl-C");
+    // The same stop as on SIGTERM: the server says so on its way out.
+    assert!(log.lines().any(|l| l == "stopped"), "{log}");
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn pipeline_exits_when_its_parent_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path();
+    let data_arg = data.to_str().unwrap();
+    let log = ends_with_its_parent(&["pipeline", "--data", data_arg], data, "running for");
+    assert!(log.contains("notedown pipeline: stopped"), "{log}");
+    notedown_pipeline::store::WriterLock::take(data).unwrap();
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn model_pull_exits_when_its_parent_is_gone() {
+    use std::io::{BufRead, Read};
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().unwrap();
+    // A proxy that takes the connection and never answers: the pull waits in it, so nothing
+    // leaves this machine and the test knows the pull runs.
+    let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    proxy.set_nonblocking(true).unwrap();
+    let proxy_url = format!("http://127.0.0.1:{}", proxy.local_addr().unwrap().port());
+    // A second guard: no part file can be written, so no download could go on even without
+    // the proxy.
+    let model_dir = dir.path().join("model");
+    std::fs::create_dir(&model_dir).unwrap();
+    std::fs::set_permissions(&model_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    /// Makes the folder writable again at the end, also on a failure, so it can be removed.
+    struct Writable<'a>(&'a std::path::Path);
+    impl Drop for Writable<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let _writable = Writable(&model_dir);
+    let log = dir.path().join("child.log");
+    // The parent starts the pull, says its pid and lives until its stdin closes.
+    let mut parent = std::process::Command::new("sh")
+        .args([
+            "-c",
+            r#""$@" --exit-with-parent $$ >"$LOG" 2>&1 </dev/null &
+echo $!
+read x || true"#,
+            "sh",
+        ])
+        .arg(env!("CARGO_BIN_EXE_notedown"))
+        .args(["model", "pull", "--json"])
+        .env("LOG", &log)
+        .env("NOTEDOWN_MODEL_DIR", &model_dir)
+        .env("HTTPS_PROXY", &proxy_url)
+        .env("https_proxy", &proxy_url)
+        .env("HTTP_PROXY", &proxy_url)
+        .env("http_proxy", &proxy_url)
+        .env("ALL_PROXY", &proxy_url)
+        .env("all_proxy", &proxy_url)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(parent.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let pid = line.trim().to_string();
+    let _orphan = Orphan(pid.clone());
+    let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
+    // The pull asks the proxy for the model host: the flag was taken and the pull runs.
+    let until = Instant::now() + Duration::from_secs(10);
+    let mut stream = loop {
+        match proxy.accept() {
+            Ok((stream, _)) => break stream,
+            Err(_) if Instant::now() < until && !gone(&pid) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => {
+                drop(parent.stdin.take());
+                let _ = parent.wait();
+                panic!("the pull never asked the proxy: {}", read_log());
+            }
+        }
+    };
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut head = [0u8; 256];
+    let n = stream.read(&mut head).unwrap_or(0);
+    let head = String::from_utf8_lossy(&head[..n]).to_string();
+    assert!(head.starts_with("CONNECT huggingface.co:443"), "{head}");
+    // The parent leaves; the pull follows within a few seconds.
+    drop(parent.stdin.take());
+    assert!(parent.wait().unwrap().success());
+    let end = Instant::now() + Duration::from_secs(3);
+    while !gone(&pid) {
+        assert!(
+            Instant::now() < end,
+            "the pull still runs 3 s after its parent: {}",
+            read_log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(stream);
+}

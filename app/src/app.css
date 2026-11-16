@@ -1,0 +1,28 @@
+@import "tailwindcss";
+
+/* Notedown's two colours, from docs/assets/build.py: paper and ink, and the
+   rim of the app icon. Controls keep the system look. */
+@theme {
+  --color-paper: #e9e6dc;
+  --color-ink: #1d1c1a;
+  --color-rim: #c9c5b8;
+}
+
+/* Light and dark follow the system. */
+:root {
+  color-scheme: light dark;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}

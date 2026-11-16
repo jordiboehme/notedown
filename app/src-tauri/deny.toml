@@ -1,0 +1,35 @@
+# The dependency audit of the Mac app. The app is its own Cargo workspace, so the Tauri tree
+# has its own check and the root deny.toml stays as it is.
+
+[graph]
+# The app is for macOS only. Without this, the Linux and Windows webview trees (GTK, WebView2)
+# would be checked too, with their own licences and advisories.
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+
+[licenses]
+# Only the licences the app tree uses; add one when a new crate needs it.
+allow = [
+    # notedown-app itself.
+    "AGPL-3.0-or-later",
+    # Most of the Tauri tree.
+    "MIT",
+    "Apache-2.0",
+    # brotli and brotli-decompressor (tauri-codegen compresses the frontend assets).
+    "BSD-3-Clause",
+    # cssparser, cssparser-macros, dtoa-short and selectors (HTML handling in tauri-utils),
+    # option-ext (dirs).
+    "MPL-2.0",
+    # The ICU crates under url and idna, and unicode-ident.
+    "Unicode-3.0",
+    # foldhash (hashbrown).
+    "Zlib",
+]
+
+[bans]
+# The Tauri tree has many crates in two versions (syn, hashbrown, getrandom and more); there is
+# nothing to choose there.
+multiple-versions = "allow"
+
+[advisories]
+# No advisory is ignored. When one has to be, list it here with the reason and when it goes.
+ignore = []

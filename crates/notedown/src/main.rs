@@ -83,6 +83,9 @@ struct PipelineArgs {
     /// With --reocr: only this note, by key or path (NOTE/Note/Plan.note)
     #[arg(long, value_name = "NOTE", requires = "reocr")]
     note: Option<String>,
+    /// Stop when the process PID is no longer the parent (for the Mac app)
+    #[arg(long, value_name = "PID", hide = true, conflicts_with_all = ["once", "reocr"])]
+    exit_with_parent: Option<u32>,
 }
 
 #[cfg(feature = "ocr")]
@@ -190,6 +193,9 @@ struct ServeArgs {
     #[arg(long)]
     #[cfg(feature = "ocr")]
     pipeline: bool,
+    /// Stop when the process PID is no longer the parent (for the Mac app)
+    #[arg(long, value_name = "PID", hide = true)]
+    exit_with_parent: Option<u32>,
 }
 
 #[derive(Subcommand)]
@@ -529,6 +535,9 @@ enum ModelAction {
         /// Print one JSON line per progress update on stdout
         #[arg(long)]
         json: bool,
+        /// Stop when the process PID is no longer the parent (for the Mac app)
+        #[arg(long, value_name = "PID", hide = true)]
+        exit_with_parent: Option<u32>,
     },
     /// Print the cache folder and the model file paths
     Path,
@@ -757,7 +766,12 @@ fn ready_json(path: &Path) -> String {
 #[cfg(feature = "ocr")]
 fn model_command(action: ModelAction) -> Result<ExitCode> {
     match action {
-        ModelAction::Pull { json } => {
+        ModelAction::Pull {
+            json,
+            exit_with_parent: parent,
+        } => {
+            // SIGTERM ends the pull as it is; the part file stays and the next pull continues.
+            exit_with_parent(parent);
             let mut last = Instant::now() - Duration::from_secs(10);
             let mut current = String::new();
             let mut progress = |file: &str, done: u64, total: u64| {
@@ -1878,6 +1892,7 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
         // The handlers are in place before the child starts, so a stop signal always ends
         // the server and with it the child.
         let shutdown = Shutdown::new()?;
+        exit_with_parent(args.exit_with_parent);
         #[cfg(feature = "ocr")]
         let child: PipelineChild = std::sync::Arc::new(std::sync::Mutex::new(None));
         #[cfg(feature = "ocr")]
@@ -1949,6 +1964,35 @@ impl Shutdown {
         #[cfg(not(unix))]
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+/// With `--exit-with-parent <pid>`: a thread checks once per second whether `pid` is still the
+/// parent of this process. When it is not, it sends this process SIGTERM, so it stops the same
+/// way as on a stop signal. macOS has no parent-death signal; this is how a child of the Mac app
+/// ends when the app dies without a clean Quit. Call it once the stop handlers are in place.
+fn exit_with_parent(parent: Option<u32>) {
+    #[cfg(unix)]
+    {
+        let Some(parent) = parent else {
+            return;
+        };
+        std::thread::spawn(move || {
+            while std::os::unix::process::parent_id() == parent {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            let sent = std::process::Command::new("kill")
+                .args(["-TERM", &std::process::id().to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if !sent {
+                eprintln!("the parent process {parent} is gone and SIGTERM failed, stopping now");
+                std::process::exit(1);
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = parent;
 }
 
 #[cfg(feature = "ocr")]
@@ -2105,6 +2149,7 @@ fn pipeline_command(args: PipelineArgs) -> Result<ExitCode> {
         });
     }
     let stop = stop_flag()?;
+    exit_with_parent(args.exit_with_parent);
     // Said only once the writer lock is held: a refused second writer prints only the refusal.
     let started = || {
         eprintln!(

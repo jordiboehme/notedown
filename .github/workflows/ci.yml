@@ -344,6 +344,87 @@ jobs:
           command: check
           arguments: --all-features --locked
 
+      # The Mac app is its own workspace with its own Cargo.lock and
+      # deny.toml (next to its manifest). Its deny.toml checks the macOS
+      # targets only.
+      - name: cargo-deny for the Mac app
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          rust-version: '1.99.0'
+          manifest-path: app/src-tauri/Cargo.toml
+          command: check
+          arguments: --all-features --locked
+
+  # The Mac app in app/: its frontend checks and its own Cargo workspace in
+  # app/src-tauri. The root workspace jobs do not see it. tauri-build needs
+  # the sidecar file to exist, so a stub stands in for the notedown program
+  # (building it would build llama.cpp). generate_context! needs ../dist, so
+  # the frontend is built first.
+  app:
+    name: app
+    timeout-minutes: 45
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: app/src-tauri -> target
+          shared-key: app
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: npm ci
+        run: npm ci
+        working-directory: app
+
+      - name: npm run check
+        run: npm run check
+        working-directory: app
+
+      - name: vitest
+        run: npx vitest run
+        working-directory: app
+
+      - name: npm run build
+        run: npm run build
+        working-directory: app
+
+      - name: Stub sidecar
+        working-directory: app/src-tauri
+        run: |
+          set -euo pipefail
+          triple="$(rustc -vV | sed -n 's/host: //p')"
+          mkdir -p binaries
+          printf '#!/bin/sh\nexit 0\n' >"binaries/notedown-$triple"
+          chmod 755 "binaries/notedown-$triple"
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+        working-directory: app/src-tauri
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+        working-directory: app/src-tauri
+
+      - name: cargo test
+        run: cargo test --locked
+        working-directory: app/src-tauri
+
   # Static checks of the workflows. actionlint catches expression, type and
   # shell errors; zizmor catches the security mistakes (template injection,
   # over-wide tokens, persisted credentials, unpinned or impostor actions).
@@ -379,7 +460,7 @@ jobs:
   ci-passed:
     name: ci-passed
     timeout-minutes: 5
-    needs: [changes, fmt, clippy, test, pi, cargo-deny, workflow-lint]
+    needs: [changes, fmt, clippy, test, pi, cargo-deny, app, workflow-lint]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:

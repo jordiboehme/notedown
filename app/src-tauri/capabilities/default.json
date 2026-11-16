@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The Notedown windows. No shell access: every call of the notedown program is made in Rust.",
+  "windows": ["panel", "library", "settings"],
+  "permissions": ["core:default"]
+}

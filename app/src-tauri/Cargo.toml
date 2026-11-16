@@ -1,0 +1,33 @@
+[package]
+name = "notedown-app"
+description = "The Notedown menu bar app for macOS"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/jordiboehme/notedown"
+publish = false
+
+# Its own workspace, with its own Cargo.lock and deny.toml: the Tauri tree stays out of the
+# CLI's workspace, its lock file and its dependency audit.
+[workspace]
+
+# Named apart from the binary (main.rs), so the two targets do not clash.
+[lib]
+name = "notedown_app_lib"
+
+[build-dependencies]
+tauri-build = { version = "=2.7.4", features = [] }
+
+[dependencies]
+tauri = { version = "=2.12.5", features = [] }
+
+[dev-dependencies]
+serde_json = "=1.0.154"
+
+# Lean debug builds, as in the root workspace.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

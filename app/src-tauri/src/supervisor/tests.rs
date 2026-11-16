@@ -508,7 +508,8 @@ fn the_backoff_doubles_up_to_a_minute() {
 #[test]
 fn a_listener_may_read_the_state_while_the_child_starts() {
     let rig = Rig::new();
-    let script = rig.script("child", "exec sleep 307");
+    // Its own number: the deadlock path below looks for it among this binary's children.
+    let script = rig.script("child", "exec sleep 319");
     let sup = Arc::new(rig.supervisor(ChildKind::Server, &script));
     let weak = Arc::downgrade(&sup);
     let read = Arc::new(Mutex::new(Vec::new()));
@@ -533,7 +534,7 @@ fn a_listener_may_read_the_state_while_the_child_starts() {
     if !finished {
         // Deadlocked: the supervisor cannot be dropped (stop would hang), so end the child by
         // hand and leak the rest.
-        if let Ok(out) = Command::new("pgrep").args(["-f", "sleep 307"]).output() {
+        if let Ok(out) = Command::new("pgrep").args(["-f", "sleep 319"]).output() {
             for pid in String::from_utf8_lossy(&out.stdout).split_whitespace() {
                 if let Ok(pid) = pid.parse::<i32>() {
                     let parent = Command::new("ps")

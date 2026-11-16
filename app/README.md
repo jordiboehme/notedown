@@ -66,7 +66,7 @@ The menu bar (tray) icons in `src-tauri/icons/tray` are made from
 change to the SVG, make them again:
 
 ```sh
-sh app/scripts/tray-icons.sh
+sh scripts/tray-icons.sh
 ```
 
 The script needs `rsvg-convert` (`brew install librsvg`) and runs from any folder.

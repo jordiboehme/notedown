@@ -501,6 +501,9 @@ impl Worker {
                     );
                     return Ok(false);
                 }
+                // A writer of this slug is of a store that is gone (a store gets its first
+                // owner before any writer): its files and its manifest are not of this one.
+                self.remove_stale_writer(slug);
                 text.set_owner(account.user_id, lock)?;
             }
         }
@@ -580,7 +583,12 @@ impl Worker {
         let dir = self.setup.local.join(crate::store::PIPELINE_DIR).join(slug);
         match std::fs::symlink_metadata(&dir) {
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Outcome::Done),
+            // On one machine the server deletes the store itself (account removed, or its
+            // slug given again). The writer still knows the files of that store.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.remove_stale_writer(slug);
+                return Ok(Outcome::Done);
+            }
             Err(source) => return Err(Error::Io { path: dir, source }),
         }
         let owner = match stores.get(slug) {
@@ -693,6 +701,20 @@ impl Worker {
                 unserved.join(", ")
             ),
         );
+    }
+
+    /// The store of account `slug` is gone without [`remove_markdown`](Self::remove_markdown)
+    /// (the server deleted it): drops its writer and removes the files the writer holds, with
+    /// the folders it made. Best effort: a failure is said.
+    fn remove_stale_writer(&self, slug: &str) {
+        let Some(writer) = self.markdown.borrow_mut().remove(slug) else {
+            return;
+        };
+        if let Err(e) = writer.remove_files() {
+            self.say(&format!(
+                "notedown pipeline: account {slug}: its Markdown files cannot all be removed: {e}"
+            ));
+        }
     }
 
     /// Before the store of account `slug` is deleted: drops its writer and removes the

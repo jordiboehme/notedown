@@ -1124,3 +1124,49 @@ fn a_stopped_pass_has_the_files_of_the_notes_it_finished() {
     w.run(move || !files(&dir).is_empty()).unwrap();
     assert_eq!(files(out.path()).len(), 1, "{:?}", files(out.path()));
 }
+
+/// One machine: the server deletes `pipeline/<slug>` itself when it removes an account and
+/// when it gives the slug to a new one. The running worker still removes the old account's
+/// files, and the new account starts with a manifest of its own notes only.
+#[test]
+fn a_slug_given_again_on_one_machine_starts_a_new_manifest() {
+    let d = setup();
+    d.put("test1", "NOTE/Note/Sub");
+    let out = tempfile::tempdir().unwrap();
+    let s = crate::worker::one_machine(&d, with_dir(out.path()));
+    let said = Said::default();
+    let (mut w, clock) = continuous(&s, &said);
+    w.run(stop_at(&clock, clock.now_ms() + 1)).unwrap();
+    assert_eq!(files(out.path()), ["Sub/test1.md"]);
+    remove_account(&d.data, SLUG);
+    create_account(&d.data, SLUG);
+    let key = put_into(&d.data, SLUG, "test2", "NOTE/Note");
+    clock.sleep(Duration::from_secs(60));
+    w.run(stop_at(&clock, clock.now_ms() + 5_000)).unwrap();
+    assert_eq!(files(out.path()), ["test2.md"], "{:?}", said.lines());
+    assert!(!out.path().join("Sub").exists());
+    let m = manifest(&d);
+    let keys: Vec<&String> = m["files"].as_object().unwrap().keys().collect();
+    assert_eq!(keys, [&key], "{m}");
+}
+
+/// The same without the removal event (`run_once` reads no journal): the new store gets its
+/// first owner, and the writer of the old store goes with its files.
+#[test]
+fn a_new_store_drops_the_writer_of_the_old_one() {
+    let d = setup();
+    d.put("test1", "NOTE/Note/Sub");
+    let out = tempfile::tempdir().unwrap();
+    let mut w = worker(&d, with_dir(out.path()), engine_reading("hello"));
+    w.run_once(true).unwrap();
+    assert_eq!(files(out.path()), ["Sub/test1.md"]);
+    remove_account(&d.data, SLUG);
+    create_account(&d.data, SLUG);
+    let key = put_into(&d.data, SLUG, "test2", "NOTE/Note");
+    w.run_once(true).unwrap();
+    assert_eq!(files(out.path()), ["test2.md"]);
+    assert!(!out.path().join("Sub").exists());
+    let m = manifest(&d);
+    let keys: Vec<&String> = m["files"].as_object().unwrap().keys().collect();
+    assert_eq!(keys, [&key], "{m}");
+}

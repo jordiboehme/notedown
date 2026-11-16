@@ -117,6 +117,12 @@ impl Writer {
         &self.dir
     }
 
+    /// Removes the files this writer holds and the folders it made, when empty, as
+    /// [`remove_files`] does from its manifest on disk: for a store that is gone already.
+    pub fn remove_files(&self) -> Result<()> {
+        remove_listed(&self.manifest)
+    }
+
     /// Brings the files of the notes `changed` (and, on the first sync, of every note) up to
     /// date with `store`, then writes the manifest if it changed. Names are freed first (the
     /// files of notes that lose theirs or move), then the notes are placed, so a name freed in
@@ -464,6 +470,11 @@ pub fn remove_files(manifest_path: &Path) -> Result<()> {
             });
         }
     };
+    remove_listed(&manifest)
+}
+
+/// Removes the files `manifest` lists and then the folders the writer made, when empty.
+fn remove_listed(manifest: &Manifest) -> Result<()> {
     let mut first_error = None;
     for rel in manifest.files.values().filter(|r| safe_rel(r).is_some()) {
         let path = manifest.dir.join(rel);

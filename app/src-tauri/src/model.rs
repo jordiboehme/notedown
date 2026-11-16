@@ -204,7 +204,7 @@ impl ModelControl {
             .stderr(Stdio::piped());
         let mut child = command
             .spawn()
-            .map_err(|e| format!("notedown could not start: {e}"))?;
+            .map_err(|e| format!("The notedown program could not start: {e}"))?;
         run.busy = true;
         run.pgid = Some(child.id());
         run.stop_requested = false;
@@ -338,7 +338,7 @@ impl Inner {
             }
             let child = command
                 .spawn()
-                .map_err(|e| format!("notedown could not start: {e}"))?;
+                .map_err(|e| format!("the notedown program could not start: {e}"))?;
             run.checks.push(child.id());
             child
         };
@@ -352,7 +352,9 @@ impl Inner {
                 let _ = tx.send(output);
             });
             let output = match rx.recv_timeout(CHECK_TIMEOUT) {
-                Ok(output) => output.map_err(|e| format!("notedown could not be read: {e}")),
+                Ok(output) => output.map_err(|e| {
+                    format!("the answer of the notedown program could not be read: {e}")
+                }),
                 Err(_) => {
                     let run = lock(&self.run);
                     if run.checks.contains(&pid) {
@@ -388,7 +390,9 @@ impl Inner {
         };
         match (line("model: "), line("mmproj: ")) {
             (Some(model), Some(mmproj)) => Ok(Paths { model, mmproj }),
-            _ => Err("The model folder is not known: notedown did not name it".to_owned()),
+            _ => Err(
+                "The model folder is not known: the notedown program did not name it".to_owned(),
+            ),
         }
     }
 

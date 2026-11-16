@@ -516,7 +516,10 @@ fn the_status_call_reads_its_answer() {
     let PipelineCall::Failed(text) = gone else {
         panic!("{gone:?}")
     };
-    assert!(text.starts_with("notedown could not start"), "{text}");
+    assert!(
+        text.starts_with("the notedown program could not start"),
+        "{text}"
+    );
 }
 
 #[test]

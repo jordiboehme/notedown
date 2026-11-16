@@ -130,14 +130,16 @@ pub fn run_bounded(spawn: &SpawnFn, args: &[String], timeout: Duration) -> Resul
         .stderr(Stdio::piped());
     let child = command
         .spawn()
-        .map_err(|e| format!("notedown could not start: {e}"))?;
+        .map_err(|e| format!("the notedown program could not start: {e}"))?;
     let pid = child.id();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
     });
     match rx.recv_timeout(timeout) {
-        Ok(output) => output.map_err(|e| format!("notedown could not be read: {e}")),
+        Ok(output) => {
+            output.map_err(|e| format!("the answer of the notedown program could not be read: {e}"))
+        }
         Err(_) => {
             // The waiter has not reaped the child yet, so the pid is still this child's.
             if let Ok(pid) = i32::try_from(pid) {

@@ -521,6 +521,18 @@ fn a_backoff_is_attention() {
         s.attention,
         vec![Attention::ServerBackoff, Attention::PipelineBackoff]
     );
+    // An error that ends its sentence gets no second period; an ellipsis stays one.
+    parts.server = backoff("The port is taken.");
+    parts.pipeline = backoff("it waits...");
+    let s = status_from(&parts, NOW);
+    assert_eq!(
+        s.server.line,
+        "Stopped with an error: The port is taken. It starts again soon."
+    );
+    assert_eq!(
+        s.pipeline.line,
+        "Stopped with an error: it waits... It starts again soon."
+    );
 }
 
 #[test]

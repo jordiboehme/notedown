@@ -387,7 +387,9 @@ fn child_line(state: &ChildState, running: &str) -> String {
         ChildState::Running { .. } => running.to_owned(),
         ChildState::Stopping => "Stopping...".to_owned(),
         ChildState::Backoff { last_error, .. } => {
-            format!("Stopped with an error: {last_error}. It starts again soon.")
+            // The sentence gets one period: an error that ends with one loses it here.
+            let error = last_error.strip_suffix('.').unwrap_or(last_error);
+            format!("Stopped with an error: {error}. It starts again soon.")
         }
         ChildState::Outside { .. } => OUTSIDE_LINE.to_owned(),
     }

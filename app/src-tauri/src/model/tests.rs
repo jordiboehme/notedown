@@ -294,8 +294,16 @@ fn a_sidecar_that_cannot_answer_is_a_problem() {
     let (control, _) = control(spawn_program(dir.path().join("missing")));
     let state = control.state();
     assert!(!state.installed);
-    assert!(state.problem.is_some());
-    assert!(control.pull().is_err());
+    let problem = state.problem.unwrap();
+    assert!(
+        problem.contains(": the notedown program could not start"),
+        "{problem}"
+    );
+    let refused = control.pull().unwrap_err();
+    assert!(
+        refused.starts_with("The notedown program could not start"),
+        "{refused}"
+    );
 }
 
 /// Waits until the fake sidecar was called with `what`.

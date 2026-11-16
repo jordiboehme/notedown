@@ -619,3 +619,23 @@ fn a_broken_device_file_does_not_fail_the_account() {
         .collect();
     assert_eq!(serials, ["GOOD-1"], "{me}");
 }
+
+#[test]
+fn the_account_lists_the_newest_sync_first_and_never_synced_last() {
+    use notedown_cloud::auth::Devices;
+    let s = start_imported();
+    let token = s.token();
+    let devices = Devices::new(&s.data);
+    // Serial order is A, B, C, D; the sync times give another order.
+    devices.mark_synced("jordi", "SN-A", 1_000).unwrap();
+    devices.mark_synced("jordi", "SN-B", 3_000).unwrap();
+    devices.mark_synced("jordi", "SN-C", 2_000).unwrap();
+    devices.update("jordi", "SN-D", |d| d.bound = true).unwrap();
+    let (status, me) = s.get(Some(&token), "/account");
+    assert_eq!(status, 200, "{me}");
+    let list = me["devices"].as_array().unwrap();
+    let serials: Vec<&str> = list.iter().map(|d| d["serial"].as_str().unwrap()).collect();
+    assert_eq!(serials, ["SN-B", "SN-C", "SN-A", "SN-D"], "{me}");
+    assert_eq!(list[0]["lastSyncMs"], 3_000, "{me}");
+    assert!(list[3]["lastSyncMs"].is_null(), "{me}");
+}

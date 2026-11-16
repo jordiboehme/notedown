@@ -381,13 +381,28 @@ async fn a_finished_sync_records_the_time() {
 async fn a_sync_end_after_the_lock_lapsed_still_records_the_time() {
     let s = Server::new();
     let a = s.login(SERIAL).await;
+    let b = s.login(OTHER).await;
     assert_ok(&s.post(START, &a, json!({"equipmentNo": SERIAL})).await);
+    // The lock lapses and the other device takes it.
     s.advance_ms(60_000);
+    assert_ok(&s.post(START, &b, json!({"equipmentNo": OTHER})).await);
     assert_ok(
         &s.post(END, &a, json!({"equipmentNo": SERIAL, "flag": "Y"}))
             .await,
     );
+    let ends = s.requests_to(END);
+    assert_eq!(ends.len(), 1);
+    let flags = ends[0]["flags"].to_string();
+    assert!(
+        flags.contains("sync_end_ok") && flags.contains("sync_lock_not_held"),
+        "{flags}"
+    );
     assert_eq!(last_sync(&s, SERIAL), Some(T0 as u64 + 60_000));
+    // The other device still holds its lock.
+    assert_err(
+        &s.post(START, &a, json!({"equipmentNo": SERIAL})).await,
+        "E0078",
+    );
 }
 
 #[tokio::test]
@@ -407,15 +422,30 @@ async fn a_failed_sync_end_does_not_record_the_time() {
 #[tokio::test]
 async fn an_old_device_file_still_reads() {
     let s = Server::new();
-    let a = s.login(SERIAL).await;
-    assert_ok(&s.post(START, &a, json!({"equipmentNo": SERIAL})).await);
+    let _ = s.login(SERIAL).await;
     let file = s
         .data()
         .join("accounts/jordi/devices")
         .join(format!("{SERIAL}.json"));
-    let text = std::fs::read_to_string(&file).unwrap();
-    assert!(!text.contains("last_sync_ms"), "{text}");
-    assert_eq!(last_sync(&s, SERIAL), None);
+    // A device file as the version before the last sync wrote it.
+    let old = format!(
+        r#"{{"serial":"{SERIAL}","name":"Nomad","bound":true,"firmware":"Chauvet 3.20.29","total_capacity":"32000000000","token_generation":4,"last_login_ms":1700000000000}}"#
+    );
+    std::fs::write(&file, old).unwrap();
+    let devices = notedown_cloud::auth::Devices::new(s.data());
+    let d = devices.get("jordi", SERIAL).unwrap().unwrap();
+    assert_eq!(d.last_sync_ms, None);
+    assert_eq!(d.name.as_deref(), Some("Nomad"));
+    assert!(d.bound);
+    assert_eq!(d.token_generation, 4);
+    assert_eq!(d.last_login_ms, 1_700_000_000_000);
+    // A sync on top of it keeps the old fields.
+    devices
+        .mark_synced("jordi", SERIAL, 1_800_000_000_000)
+        .unwrap();
+    let d = devices.get("jordi", SERIAL).unwrap().unwrap();
+    assert_eq!(d.last_sync_ms, Some(1_800_000_000_000));
+    assert_eq!((d.token_generation, d.bound), (4, true));
 }
 
 #[tokio::test]

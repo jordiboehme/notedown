@@ -392,13 +392,13 @@ Below 20230015 [ratta-notelib]: Ratta's old decoder paints only `0x61` (0x00) an
 
 Output palettes in Ratta's renderer [ratta-notelib, `fetchNoteRLEData_15`]: with a built-in template the composite becomes an 8-bit gray image directly (gray = `RLE_INDEX[code]`, unpainted pixels 255), so black is 0. With a `user_` template the composite goes through `NOTE_COLOR_CONVERT_INDEX`, an ARGB table that is opaque gray i for index i except index 0 (gray 1) and 0xFF (fully transparent), and is drawn over the template image; there black is 1, as in the device export (6.2). The `.mark` palette is different (6.4).
 
-Pixels where Ratta's renderer differed from notedown's golden images and test vectors before 2026-10-08 (current layers, per the table above) [verified by code counts]:
+Pixels where Ratta's renderer differed from Notedown's golden images and test vectors before 2026-10-08 (current layers, per the table above) [verified by code counts]:
 
 - t1 page 1: 2 pixels (`0x66`: 0 versus 1). This is the only golden image affected.
 - bike and content goldens: 0 pixels (`0x63`/`0x64` map the same in both).
 - bike-digest page 3 (test vector 11.3a, no golden image): 41 pixels, by code `0x01` 3, `0x30` 5, `0x31` 5, `0x50` 2, `0xFE` 1, `0xFF` 4, `0x67` 4, `0x68` 2, `0x9E` 5, `0xCA` 10. Some steps are large: `0x30` becomes 0x63 instead of 0x30, `0x67` becomes 0x31 instead of 0x67, `0xFF` becomes 0x62 instead of 0xFF.
 
-notedown: from 2026-10-08 notedown uses Ratta's table for 20230015 and higher, because it is the inverse of the device's encoder and the samples fit it. The goldens were updated (t1: 2 pixels per image). Files below 20230015 keep supernotelib's X table: no sample is older, and Ratta's old decoder drops anti-aliasing.
+Notedown: from 2026-10-08 Notedown uses Ratta's table for 20230015 and higher, because it is the inverse of the device's encoder and the samples fit it. The goldens were updated (t1: 2 pixels per image). Files below 20230015 keep supernotelib's X table: no sample is older, and Ratta's old decoder drops anti-aliasing.
 
 ### 5.4 Template layer (BGLAYER)
 
@@ -432,7 +432,7 @@ The device exports in `tests/fixtures/device/` differ from the goldens [verified
 
 So the device composites `result = level * below / 255` for anti-aliasing codes [inferred from the over-black and over-white cases; intermediate backgrounds not observed].
 
-notedown's `RenderStyle::Device` uses the table of 5.3 since 2026-10-08. So its output changed for the raw codes `0x00`, `0x01`, `0x30`, `0x31`, `0x50`, `0x51`, `0xFE`, `0xFF` and the named marker codes `0x67` and `0x68`. The notes behind the device exports (t1 and t2, page 1) contain none of these codes, so the exports still match with 0 differing pixels [verified by code counts]. How the device exports these codes is not known [unknown].
+Notedown's `RenderStyle::Device` uses the table of 5.3 since 2026-10-08. So its output changed for the raw codes `0x00`, `0x01`, `0x30`, `0x31`, `0x50`, `0x51`, `0xFE`, `0xFF` and the named marker codes `0x67` and `0x68`. The notes behind the device exports (t1 and t2, page 1) contain none of these codes, so the exports still match with 0 differing pixels [verified by code counts]. How the device exports these codes is not known [unknown].
 
 ### 6.3 Other images
 
@@ -869,7 +869,7 @@ Entities and fields a parser should expose (no API prescribed). Section referenc
 
 Projects surveyed (feature inventory only): supernotelib (reference, Python), supernote-typescript (TypeScript, also used by supernote-obsidian-plugin), calamus (Rust, format notes plus bitmap and stroke rendering), sntool and snorg (Go; snorg uses sntool), sn2md (Python, uses supernotelib; its templates show the fields users want), supernote-obsidian-plugin, allenporter/supernote (Python server, own copy of a supernotelib-style parser), ultrabridge (Go server; reads keywords, titles and RECOGNTEXT, writes RECOGNTEXT).
 
-"Required" = at least one other parser extracts it; notedown's parser must match it. "Beyond baseline" = found only in this work.
+"Required" = at least one other parser extracts it; Notedown's parser must match it. "Beyond baseline" = found only in this work.
 
 | Data kind | supernotelib | supernote-typescript | calamus | sntool/snorg | sn2md | allenporter | ultrabridge | This doc | Status |
 |---|---|---|---|---|---|---|---|---|---|

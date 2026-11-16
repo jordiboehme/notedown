@@ -1,9 +1,9 @@
 <picture>
   <source media="(prefers-reduced-motion: reduce)" srcset="docs/assets/banner-static.png">
-  <img src="docs/assets/banner.gif" alt="notedown" width="100%">
+  <img src="docs/assets/banner.gif" alt="Notedown" width="100%">
 </picture>
 
-# notedown
+# Notedown
 
 **Your handwriting, readable by machines.**
 
@@ -11,19 +11,19 @@
 [![License: AGPL-3.0](https://img.shields.io/github/license/jordiboehme/notedown)](LICENSE)
 [![Works best with Crystalline](.github/badges/works-best-with-crystalline.svg)](https://github.com/jordiboehme/crystalline)
 
-You write on a Supernote. Your AI agent reads Markdown. notedown sits in between.
+You write on a Supernote. Your AI agent reads Markdown. Notedown sits in between.
 
 It reads `.note` files (and PNG pages), runs a local OCR model on every page and writes Markdown. A
 drawn diagram becomes a Mermaid block, links between notes stay links, and digests and keywords end
 up in the front matter. Nothing leaves your machine.
 
-notedown can also be the Private Cloud of your Supernote. Clouds? Where we're going, we don't need
+Notedown can also be the Private Cloud of your Supernote. Clouds? Where we're going, we don't need
 someone else's cloud. Your device syncs with a small server at home, every change lands in a journal,
 and a pipeline turns new pages into text while you still hold the pen. Agents read that text over MCP.
 
 One Rust binary. Local OCR with Metal on a Mac. No accounts at a vendor, no telemetry.
 
-notedown is for Supernote devices and is not affiliated with Ratta.
+Notedown is for Supernote devices and is not affiliated with Ratta.
 
 ## Status
 
@@ -33,9 +33,9 @@ What works today:
 - The Private Cloud: device sync, digests, to-dos, a recycle bin and a journal.
 - The pipeline: keeps the note text up to date and serves it to agents over MCP (stdio).
 
-The sync server also builds for a Raspberry Pi without the OCR part (see the [getting started guide](docs/getting-started.md#the-server-on-a-raspberry-pi)).
+The sync server runs on any machine, for example a Raspberry Pi, a NAS, an Intel box or a Mac. It also builds without the OCR part for a small machine (see the [getting started guide](docs/getting-started.md#the-server-on-another-machine)).
 
-A pipeline on a Mac can read the server on the Pi over the network (`notedown connect`, see the [getting started guide](docs/getting-started.md#a-pipeline-on-a-mac)).
+A pipeline on a Mac can read the server over the network (`notedown connect`, see the [getting started guide](docs/getting-started.md#a-pipeline-on-a-mac)).
 
 An app can browse and manage the files of an account over the REST API (see the [REST API](docs/rest-api.md)).
 
@@ -50,7 +50,7 @@ notedown model pull                       # once, about 3.4 GB
 notedown convert ~/Supernote/Note --out ~/notes-md
 ```
 
-notedown can also be the Private Cloud of your Supernote. Back up the device, fill the cloud with the
+Notedown can also be the Private Cloud of your Supernote. Back up the device, fill the cloud with the
 backup and the digests from the device's own `.snbak` backup, start the server and log in on the
 device:
 
@@ -124,11 +124,11 @@ Other `convert` options: `--force`, `--model GGUF`, `--mmproj GGUF`, `--max-toke
 ### Skipping and overwriting
 
 A file is skipped when its `.md` already exists and the front matter has the same source checksum, the
-same model and the same notedown major version. The model is not even loaded when every file is
+same model and the same Notedown major version. The model is not even loaded when every file is
 skipped.
 
-A `.md` file from an older notedown has a front matter without `type`. When its source checksum, model
-and major version still match, notedown only replaces the front matter with the new one and keeps the
+A `.md` file from an older Notedown has a front matter without `type`. When its source checksum, model
+and major version still match, Notedown only replaces the front matter with the new one and keeps the
 text below it byte for byte. No OCR runs for this and the model isn't loaded. The run prints "updated
 the header of ..." for each such file. `generated` keeps the old version and time, `source_date` and
 `last_modified` come from the source file as it is now.
@@ -138,18 +138,18 @@ changed, so `resource`, `source_date` and `last_modified` are right again. A hea
 the links in the old text as they are. Use `--force` to convert the file again and rewrite them.
 
 Other tools may change the front matter of a converted file, for example Crystalline when it writes the
-note back or adds a `verified` key. notedown still knows the file as its own as long as `generated.by`
-starts with `notedown/`. Keys that notedown doesn't know are kept and written after its own keys when
-notedown writes the file again, together with comment lines. notedown's own keys (like `tags` or
-`title`) get notedown's values again. A file with CRLF line endings keeps them.
+note back or adds a `verified` key. Notedown still knows the file as its own as long as `generated.by`
+starts with `notedown/`. Keys that Notedown doesn't know are kept and written after its own keys when
+Notedown writes the file again, together with comment lines. Notedown's own keys (like `tags` or
+`title`) get Notedown's values again. A file with CRLF line endings keeps them.
 
-notedown never overwrites a `.md` file it did not write itself. Such a file counts as a failure (exit
+Notedown never overwrites a `.md` file it did not write itself. Such a file counts as a failure (exit
 code 1) and the error is printed.
 
 `--force` does both: it converts files that are up to date again, and it replaces a `.md` file that
-notedown did not write.
+Notedown did not write.
 
-When notedown searches a folder, it skips what it writes itself: `<name>.assets/` folders, the `--out`
+When Notedown searches a folder, it skips what it writes itself: `<name>.assets/` folders, the `--out`
 folder and `<name>-page-NNN.png` images next to `<name>.note`. Hidden files and symbolic links to
 folders are skipped too.
 
@@ -200,14 +200,14 @@ The keys of the front matter:
 - `resource` is the source file, relative to the folder of the `.md` file. It works with and without
   `--out`, and also when `--out` is a symbolic link.
 - `tags` is always `[supernote]`.
-- `generated` says who wrote the text and when: `by` is notedown with its version, `model` the OCR
+- `generated` says who wrote the text and when: `by` is Notedown with its version, `model` the OCR
   model and `at` the time of the conversion in UTC.
 - `source_date` is the day the source file was last changed, in local time.
 - `sources` names the source file once more, with `last_modified`, the time it was last changed in
   UTC. When that time can't be read, `source_date` and `last_modified` are left out.
 - `status` is `draft` when a page hit the token limit and its text may be cut off. Otherwise it's
   `stable`.
-- `source_sha256` is the checksum of the source file. notedown uses it to skip files that didn't
+- `source_sha256` is the checksum of the source file. Notedown uses it to skip files that didn't
   change.
 - `file_id` is the `FILE_ID` of the note. A PNG page has none.
 - `pages` is the number of pages.
@@ -216,7 +216,7 @@ The keys of the front matter:
 
 OKF reserves the names `index.md` and `log.md`. A source named `index` or `log` (in any case) keeps its
 extension in the name of the `.md` file: `index.note` becomes `index.note.md` and `Log.png` becomes
-`Log.png.md`. Links to such a note use that name. An `index.md` or `log.md` that an older notedown
+`Log.png.md`. Links to such a note use that name. An `index.md` or `log.md` that an older Notedown
 wrote for the same note stays where it is and is no longer updated. The run prints a warning that names
 it, so you can delete it.
 
@@ -239,12 +239,12 @@ A note digest is a text box that the Supernote device created from selected hand
 a digest. `digests:` in the front matter lists each such text box: `page` (1-based), `digest_id`,
 the `text` of the box and its `rect` as `left,top,width,height` in page pixels. The text is also
 part of the page text from the OCR, so the Markdown body does not change. The annotation of the digest
-itself is stored outside the `.note` file and is not available to notedown. The key is left out when
+itself is stored outside the `.note` file and is not available to Notedown. The key is left out when
 a note has no digests.
 
 ## Private Cloud
 
-notedown can run a small server that the Supernote Nomad accepts as its Private Cloud. It stores your
+Notedown can run a small server that the Supernote Nomad accepts as its Private Cloud. It stores your
 files as real files in a data folder and writes every change to a journal.
 
 - Protect mode is on by default. The server refuses every file request until `notedown cloud import`
@@ -253,7 +253,7 @@ files as real files in a data folder and writes every change to a journal.
   newest old versions, the version the file had at the end of each of the last 7 days and at the end
   of each of the last 12 months. A deleted file's versions are removed 90 days after the delete. See
   `server.toml` and `notedown cloud recycle prune --dry-run`.
-- `notedown cloud put` adds a file from the computer. notedown then tells the connected devices to sync.
+- `notedown cloud put` adds a file from the computer. Notedown then tells the connected devices to sync.
   With "Auto Sync" on, the file usually arrives a few seconds later. If it doesn't, start a manual sync.
 - `notedown cloud journal tail` prints the changes as JSON lines.
 - `notedown serve --refuse-sync` refuses every sync and exchanges no files. It's for recording the
@@ -301,7 +301,7 @@ to the internet directly. Found a problem? Please report it privately, see [SECU
 
 ## Support
 
-notedown is free and open source. If it earned its place next to your pen, you can support or sponsor
+Notedown is free and open source. If it earned its place next to your pen, you can support or sponsor
 the work here:
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/V7V31T6CL9)
@@ -312,8 +312,8 @@ and let's talk.
 
 ## License
 
-notedown is licensed under AGPL-3.0-or-later, see `LICENSE`.
+Notedown is licensed under AGPL-3.0-or-later, see `LICENSE`.
 
-The OCR model is Chandra OCR 2 by Datalab. notedown downloads the weights on request and does not ship
+The OCR model is Chandra OCR 2 by Datalab. Notedown downloads the weights on request and does not ship
 them. They are under a modified OpenRAIL-M license: free for personal use and for organisations under 2
 million USD revenue. See the model card for the exact terms.

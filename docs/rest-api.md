@@ -1,6 +1,6 @@
 # The REST API
 
-The notedown server has a REST API under `/rest/v1`. It is for programs that work with an account's files over the network. Two programs use it today. The pipeline on a Mac reads notes and the journal with it (`notedown connect`). A Mac app browses the files of the account and manages them: it uploads, creates folders, renames, moves and deletes.
+The Notedown server has a REST API under `/rest/v1`. It is for programs that work with an account's files over the network. Two programs use it today. The pipeline on a Mac reads notes and the journal with it (`notedown connect`). A Mac app browses the files of the account and manages them: it uploads, creates folders, renames, moves and deletes.
 
 This page is for people who build such a client. It lists every route, its answers and its error codes. For the setup of a server, see the [getting started guide](getting-started.md). For the files and the journal on disk, see the [sync protocol](sync-protocol.md).
 
@@ -180,7 +180,7 @@ Limits and order of the checks:
 
 After an early refusal the server may close the connection while the client still sends the body. A client can see a broken pipe or a reset instead of the answer. It should read the answer first when it has one, and retry otherwise.
 
-A large upload or a replace holds the store lock for a while, most of all on a Raspberry Pi. Other requests of the account, a device sync included, wait for it.
+A large upload or a replace holds the store lock for a while, most of all on a small machine such as a Raspberry Pi. Other requests of the account, a device sync included, wait for it.
 
 ### `POST /folders`
 
@@ -255,4 +255,4 @@ The server logs every write in the protocol log, with the path in the request li
 
 ## Update order
 
-Update the Mac before the Pi. The new server writes journal lines with the origin `app`. An older pipeline does not know it and skips such lines, so it would miss the change. A new pipeline reads the origin as it should. A pipeline that reads over REST works with either order, because `notedown connect` sends no scope. The Mac first is still the safe order.
+Update the Mac before the server. The new server writes journal lines with the origin `app`. An older pipeline does not know it and skips such lines, so it would miss the change. A new pipeline reads the origin as it should. A pipeline that reads over REST works with either order, because `notedown connect` sends no scope. The Mac first is still the safe order.

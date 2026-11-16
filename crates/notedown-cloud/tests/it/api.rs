@@ -1512,3 +1512,22 @@ async fn tokens_in_unknown_fields_and_raw_bodies_are_masked() {
             .starts_with("<masked:")
     );
 }
+
+#[tokio::test]
+async fn a_login_works_while_another_device_file_is_broken() {
+    let s = Server::new();
+    let devices = s.data().join("accounts/jordi/devices");
+    std::fs::create_dir_all(&devices).unwrap();
+    // Another device that was bound, but its file no longer parses.
+    std::fs::write(devices.join("SN078C19999999.json"), "{\"bound\": tr").unwrap();
+    let (login, _, _) = s.login("secret", SERIAL, "202407").await;
+    assert_ok(&login);
+    assert_eq!(login["isBind"], "N", "only readable devices count");
+    assert_eq!(login["isBindEquipment"], "N");
+
+    assert_ok(&s.bind(SERIAL, "202407").await);
+    let (login, _, _) = s.login("secret", SERIAL, "202407").await;
+    assert_ok(&login);
+    assert_eq!(login["isBind"], "Y");
+    assert_eq!(login["isBindEquipment"], "Y");
+}

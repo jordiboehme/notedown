@@ -1,5 +1,6 @@
 //! The REST routes of the Mac app: browse (`/tree`, `/entries/{id}`), download
-//! (`/files/{id}`) and upload (`PUT /files?path=`), on a real socket next to the device routes.
+//! (`/files/{id}`), upload (`PUT /files?path=`), new folders (`POST /folders`), move (`POST
+//! /move`) and delete (`DELETE /entries/{id}`), on a real socket next to the device routes.
 
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -1397,4 +1398,761 @@ fn without_quota_bytes_there_is_no_quota_check() {
     let (status, answer) = upload(&s, &t, "NOTE/Note/big.bin", &vec![1u8; 3_000_000]);
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(status, 201, "{answer}");
+}
+
+// ------------------------------------------------------- folders, move, delete
+
+/// A JSON write with the token: (status, answer, `Retry-After`).
+fn send_json(
+    s: &Server,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (u16, Value, Option<String>) {
+    let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+    let mut req = s.client.request(method, s.url(path)).bearer_auth(token);
+    if let Some(body) = body {
+        req = req
+            .header("Content-Type", "application/json")
+            .body(body.to_string());
+    }
+    let r = req.send().unwrap();
+    let retry = header(&r, "retry-after");
+    let (status, answer) = json_of(r);
+    (status, answer, retry)
+}
+
+/// `POST /folders {"path"}`.
+fn mkdir(s: &Server, token: &str, path: &str) -> (u16, Value) {
+    let (status, answer, _) = send_json(s, token, "POST", "/folders", Some(json!({"path": path})));
+    (status, answer)
+}
+
+/// `POST /move {"id", "to"}`.
+fn mv(s: &Server, token: &str, id: u64, to: &str) -> (u16, Value) {
+    let (status, answer, _) =
+        send_json(s, token, "POST", "/move", Some(json!({"id": id, "to": to})));
+    (status, answer)
+}
+
+/// `DELETE /entries/{id}`.
+fn delete(s: &Server, token: &str, id: u64) -> (u16, Value) {
+    let (status, answer, _) = send_json(s, token, "DELETE", &format!("/entries/{id}"), None);
+    (status, answer)
+}
+
+/// Uploads `bytes` to `path` (201) and returns the new id.
+fn uploaded(s: &Server, token: &str, path: &str, bytes: &[u8]) -> u64 {
+    let (status, answer) = upload(s, token, path, bytes);
+    assert_eq!(status, 201, "{path}: {answer}");
+    answer["id"].as_u64().unwrap()
+}
+
+/// The seqs of `events`.
+fn seqs(events: &[Value]) -> Value {
+    json!(
+        events
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>()
+    )
+}
+
+/// The names in the folder at the wire path `rel`, as the file system has them.
+fn names_in(s: &Server, rel: &str) -> BTreeSet<String> {
+    std::fs::read_dir(files(s).join(rel))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// The page record paths of the account.
+fn record_paths(s: &Server) -> Vec<String> {
+    notedown_cloud::read::records(&s.data, "jordi")
+        .unwrap()
+        .records
+        .values()
+        .map(|r| r.record.path.clone())
+        .collect()
+}
+
+fn test_note() -> Vec<u8> {
+    std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/notes/test1.note"),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_new_folder_and_its_parents_are_created() {
+    let s = start_imported();
+    let t = writer(&s);
+    let n = events(&s).len();
+    let (status, answer) = mkdir(&s, &t, "NOTE/Note/A/B/C");
+    assert_eq!(status, 201, "{answer}");
+    assert_eq!(answer["path"], "NOTE/Note/A/B/C");
+    assert_eq!(answer["id"], id_of(&s, "NOTE/Note/A/B/C"));
+    let ev = events_after(&s, n);
+    assert_eq!(
+        types(&ev),
+        ["folder.created", "folder.created", "folder.created"]
+    );
+    let paths: Vec<&str> = ev.iter().map(|e| e["path"].as_str().unwrap()).collect();
+    assert_eq!(paths, ["NOTE/Note/A", "NOTE/Note/A/B", "NOTE/Note/A/B/C"]);
+    for e in &ev {
+        assert_eq!(e["origin"], "app", "{e}");
+        assert!(e["device"].is_null(), "{e}");
+    }
+    assert_eq!(answer["seqs"], seqs(&ev));
+    assert!(files(&s).join("NOTE/Note/A/B/C").is_dir());
+}
+
+#[test]
+fn an_existing_folder_is_200() {
+    let s = start_imported();
+    let t = writer(&s);
+    let (status, first) = mkdir(&s, &t, "NOTE/Note/A");
+    assert_eq!(status, 201, "{first}");
+    let n = events(&s).len();
+    let (status, again) = mkdir(&s, &t, "NOTE/Note/A");
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(
+        again,
+        json!({"id": first["id"], "path": "NOTE/Note/A", "seqs": []})
+    );
+    assert_eq!(events(&s).len(), n);
+    // A folder made by hand is journaled by the scan first, then it is there.
+    std::fs::create_dir_all(files(&s).join("NOTE/Note/Hand")).unwrap();
+    let (status, hand) = mkdir(&s, &t, "NOTE/Note/Hand");
+    assert_eq!(status, 200, "{hand}");
+    assert_eq!(hand["seqs"], json!([]));
+    let ev = events_after(&s, n);
+    assert_eq!(types(&ev), ["folder.created"]);
+    assert_eq!(ev[0]["origin"], "scan");
+    assert_eq!(hand["id"], ev[0]["id"]);
+}
+
+#[test]
+fn a_folder_beside_a_case_twin_is_refused() {
+    let s = start_imported();
+    let t = writer(&s);
+    assert_eq!(mkdir(&s, &t, "NOTE/Note/Work").0, 201);
+    let n = events(&s).len();
+    for path in ["NOTE/Note/work", "NOTE/Note/WORK/sub"] {
+        let (status, answer) = mkdir(&s, &t, path);
+        assert_eq!(status, 409, "{path}: {answer}");
+        assert_eq!(answer, json!({"error": "name_taken", "existing": "Work"}));
+    }
+    assert_eq!(events(&s).len(), n);
+}
+
+#[test]
+fn a_folder_onto_a_file_is_refused() {
+    let s = start_imported();
+    let t = writer(&s);
+    uploaded(&s, &t, "NOTE/Note/f.txt", b"f");
+    let n = events(&s).len();
+    let (status, answer) = mkdir(&s, &t, "NOTE/Note/f.txt");
+    assert_eq!(status, 409, "{answer}");
+    assert_eq!(answer, json!({"error": "name_taken", "existing": "f.txt"}));
+    let (status, answer) = mkdir(&s, &t, "NOTE/Note/f.txt/sub");
+    assert_eq!(status, 409, "{answer}");
+    assert_eq!(answer, json!({"error": "not_a_folder"}));
+    for (path, code) in [
+        ("NOTE/Other/x", "not_writable"),
+        ("NOTE/Note", "not_writable"),
+        ("NOTE/Note/.x", "bad_name"),
+    ] {
+        let (_, answer) = mkdir(&s, &t, path);
+        assert_eq!(answer["error"], code, "{path}");
+    }
+    assert_eq!(events(&s).len(), n);
+}
+
+#[test]
+fn a_rename_keeps_the_id() {
+    let s = start_imported();
+    let t = writer(&s);
+    let id = uploaded(&s, &t, "NOTE/Note/a.txt", b"a");
+    let n = events(&s).len();
+    let (status, answer) = mv(&s, &t, id, "NOTE/Note/b.txt");
+    assert_eq!(status, 200, "{answer}");
+    let ev = events_after(&s, n);
+    assert_eq!(types(&ev), ["file.moved"]);
+    assert_eq!(ev[0]["oldPath"], "NOTE/Note/a.txt");
+    assert_eq!(ev[0]["path"], "NOTE/Note/b.txt");
+    assert_eq!(ev[0]["origin"], "app");
+    assert!(ev[0]["device"].is_null());
+    assert_eq!(
+        answer,
+        json!({"id": id, "path": "NOTE/Note/b.txt", "seqs": seqs(&ev), "removed": []})
+    );
+    assert_eq!(id_of(&s, "NOTE/Note/b.txt"), id);
+    assert!(!files(&s).join("NOTE/Note/a.txt").exists());
+    assert_eq!(
+        std::fs::read(files(&s).join("NOTE/Note/b.txt")).unwrap(),
+        b"a"
+    );
+}
+
+#[test]
+fn a_case_only_rename_works() {
+    let s = start_imported();
+    let t = writer(&s);
+    let file = uploaded(&s, &t, "NOTE/Note/a.txt", b"a");
+    uploaded(&s, &t, "NOTE/Note/Work/w.txt", b"w");
+    let folder = id_of(&s, "NOTE/Note/Work");
+    let (status, answer) = mv(&s, &t, file, "NOTE/Note/A.txt");
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["path"], "NOTE/Note/A.txt");
+    let (status, answer) = mv(&s, &t, folder, "NOTE/Note/WORK");
+    assert_eq!(status, 200, "{answer}");
+    let names = names_in(&s, "NOTE/Note");
+    assert!(
+        names.contains("A.txt") && !names.contains("a.txt"),
+        "{names:?}"
+    );
+    assert!(
+        names.contains("WORK") && !names.contains("Work"),
+        "{names:?}"
+    );
+    assert_eq!(id_of(&s, "NOTE/Note/A.txt"), file);
+    assert_eq!(id_of(&s, "NOTE/Note/WORK"), folder);
+    assert_eq!(
+        std::fs::read(files(&s).join("NOTE/Note/WORK/w.txt")).unwrap(),
+        b"w"
+    );
+}
+
+#[test]
+fn a_move_across_trees_keeps_the_id() {
+    let s = start_imported();
+    let t = writer(&s);
+    let id = uploaded(&s, &t, "NOTE/Note/a.pdf", b"pdf");
+    let n = events(&s).len();
+    let (status, answer) = mv(&s, &t, id, "DOCUMENT/Document/Sub/a.pdf");
+    assert_eq!(status, 200, "{answer}");
+    let ev = events_after(&s, n);
+    assert_eq!(types(&ev), ["folder.created", "file.moved"]);
+    assert_eq!(ev[0]["path"], "DOCUMENT/Document/Sub");
+    assert!(ev.iter().all(|e| e["origin"] == "app"));
+    assert_eq!(answer["id"], id);
+    assert_eq!(answer["seqs"], seqs(&ev));
+    assert_eq!(id_of(&s, "DOCUMENT/Document/Sub/a.pdf"), id);
+    assert_eq!(
+        std::fs::read(files(&s).join("DOCUMENT/Document/Sub/a.pdf")).unwrap(),
+        b"pdf"
+    );
+}
+
+#[test]
+fn a_moved_note_keeps_its_page_records() {
+    let s = start_imported();
+    let t = writer(&s);
+    let id = uploaded(&s, &t, "NOTE/Note/t.note", &test_note());
+    let before = record_paths(&s);
+    assert_eq!(before, ["NOTE/Note/t.note"]);
+    let (status, answer) = mv(&s, &t, id, "NOTE/Note/Work/t.note");
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(record_paths(&s), ["NOTE/Note/Work/t.note"]);
+}
+
+#[test]
+fn a_move_onto_an_existing_name_is_refused() {
+    let s = start_imported();
+    let t = writer(&s);
+    let a = uploaded(&s, &t, "NOTE/Note/a.txt", b"a");
+    uploaded(&s, &t, "NOTE/Note/b.txt", b"b");
+    uploaded(&s, &t, "NOTE/Note/X/b.txt", b"xb");
+    let n = events(&s).len();
+    for (to, existing) in [
+        ("NOTE/Note/b.txt", "b.txt"),
+        ("NOTE/Note/B.txt", "b.txt"),
+        ("NOTE/Note/X/b.txt", "b.txt"),
+        ("NOTE/Note/X/B.txt", "b.txt"),
+        ("NOTE/Note/X", "X"),
+        ("NOTE/Note/x/a.txt", "X"),
+    ] {
+        let (status, answer) = mv(&s, &t, a, to);
+        assert_eq!(status, 409, "{to}: {answer}");
+        assert_eq!(
+            answer,
+            json!({"error": "name_taken", "existing": existing}),
+            "{to}"
+        );
+    }
+    let (status, answer) = mv(&s, &t, a, "NOTE/Note/b.txt/a.txt");
+    assert_eq!(status, 409, "{answer}");
+    assert_eq!(answer, json!({"error": "not_a_folder"}));
+    assert_eq!(events(&s).len(), n);
+    assert_eq!(
+        std::fs::read(files(&s).join("NOTE/Note/b.txt")).unwrap(),
+        b"b"
+    );
+}
+
+#[test]
+fn a_move_out_of_the_trees_is_refused() {
+    let s = start_imported();
+    let t = writer(&s);
+    let a = uploaded(&s, &t, "NOTE/Note/a.txt", b"a");
+    let n = events(&s).len();
+    for to in [
+        "NOTE/Other/a.txt",
+        "a.txt",
+        "NOTE/a.txt",
+        "NOTE/Note",
+        "EXPORT",
+    ] {
+        let (status, answer) = mv(&s, &t, a, to);
+        assert_eq!(status, 403, "{to}: {answer}");
+        assert_eq!(answer, json!({"error": "not_writable"}), "{to}");
+    }
+    for (to, code) in [("NOTE/Note/.a.txt", "bad_name"), ("", "bad_name")] {
+        let (status, answer) = mv(&s, &t, a, to);
+        assert_eq!(status, 400, "{to}: {answer}");
+        assert_eq!(answer["error"], code, "{to}");
+    }
+    assert_eq!(events(&s).len(), n);
+    assert!(files(&s).join("NOTE/Note/a.txt").exists());
+}
+
+#[test]
+fn a_folder_cannot_move_into_itself() {
+    let s = start_imported();
+    let t = writer(&s);
+    assert_eq!(mkdir(&s, &t, "NOTE/Note/W/X").0, 201);
+    let w = id_of(&s, "NOTE/Note/W");
+    let n = events(&s).len();
+    for to in ["NOTE/Note/W/W", "NOTE/Note/W/X/W"] {
+        let (status, answer) = mv(&s, &t, w, to);
+        assert_eq!(status, 400, "{to}: {answer}");
+        assert_eq!(answer, json!({"error": "into_itself"}));
+    }
+    assert_eq!(events(&s).len(), n);
+}
+
+#[test]
+fn a_move_to_the_same_path_changes_nothing() {
+    let s = start_imported();
+    let t = writer(&s);
+    let a = uploaded(&s, &t, "NOTE/Note/a.txt", b"a");
+    let n = events(&s).len();
+    let (status, answer) = mv(&s, &t, a, "NOTE/Note/a.txt");
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(
+        answer,
+        json!({"id": a, "path": "NOTE/Note/a.txt", "seqs": [], "removed": []})
+    );
+    assert_eq!(events(&s).len(), n);
+}
+
+#[test]
+fn a_move_that_empties_a_folder_reports_it_removed() {
+    let s = start_imported();
+    let t = writer(&s);
+    let a = uploaded(&s, &t, "NOTE/Note/P/Q/a.txt", b"a");
+    let (p, q) = (id_of(&s, "NOTE/Note/P"), id_of(&s, "NOTE/Note/P/Q"));
+    let n = events(&s).len();
+    let (status, answer) = mv(&s, &t, a, "NOTE/Note/a.txt");
+    assert_eq!(status, 200, "{answer}");
+    let ev = events_after(&s, n);
+    assert_eq!(
+        types(&ev),
+        ["file.moved", "folder.deleted", "folder.deleted"]
+    );
+    assert_eq!(
+        answer["removed"],
+        json!([{"id": q, "path": "NOTE/Note/P/Q"}, {"id": p, "path": "NOTE/Note/P"}])
+    );
+    assert!(!files(&s).join("NOTE/Note/P").exists());
+}
+
+#[test]
+fn a_source_outside_the_trees_cannot_be_moved_or_deleted() {
+    let s = start_imported();
+    let t = writer(&s);
+    hand(&s, "NOTE/Other/x.txt", b"x");
+    // The listing journals the file and gives it its id.
+    let (status, listed) = s.get(Some(&t), &format!("/tree?path={}", q("NOTE/Other")));
+    assert_eq!(status, 200, "{listed}");
+    let id = find(&listed, "NOTE/Other/x.txt")["id"].as_u64().unwrap();
+    let n = events(&s).len();
+    let (status, answer) = mv(&s, &t, id, "NOTE/Note/x.txt");
+    assert_eq!(status, 403, "{answer}");
+    assert_eq!(answer, json!({"error": "not_writable"}));
+    let (status, answer) = mv(&s, &t, id, "NOTE/Other/x.txt");
+    assert_eq!(status, 403, "{answer}");
+    let (status, answer) = delete(&s, &t, id);
+    assert_eq!(status, 403, "{answer}");
+    assert_eq!(answer, json!({"error": "not_writable"}));
+    assert_eq!(events(&s).len(), n);
+    assert!(files(&s).join("NOTE/Other/x.txt").exists());
+}
+
+#[test]
+fn a_tree_root_cannot_be_renamed_moved_or_deleted() {
+    let s = start_imported();
+    let t = writer(&s);
+    let n = events(&s).len();
+    for root in [
+        "NOTE/Note",
+        "NOTE/MyStyle",
+        "DOCUMENT/Document",
+        "EXPORT",
+        "SCREENSHOT",
+        "INBOX",
+        "NOTE",
+        "DOCUMENT",
+    ] {
+        let id = id_of(&s, root);
+        for to in ["EXPORT/Renamed", root] {
+            let (status, answer) = mv(&s, &t, id, to);
+            assert_eq!(status, 403, "{root} to {to}: {answer}");
+            assert_eq!(answer, json!({"error": "not_writable"}), "{root}");
+        }
+        let (status, answer) = delete(&s, &t, id);
+        assert_eq!(status, 403, "{root}: {answer}");
+        assert_eq!(answer, json!({"error": "not_writable"}), "{root}");
+        assert!(files(&s).join(root).is_dir());
+    }
+    assert_eq!(events(&s).len(), n);
+}
+
+#[test]
+fn a_delete_moves_the_file_to_the_recycle_bin() {
+    let s = start_imported();
+    let t = writer(&s);
+    let id = uploaded(&s, &t, "NOTE/Note/a.txt", b"bytes");
+    let n = events(&s).len();
+    let (status, answer) = delete(&s, &t, id);
+    assert_eq!(status, 200, "{answer}");
+    let ev = events_after(&s, n);
+    assert_eq!(types(&ev), ["file.deleted"]);
+    assert_eq!(ev[0]["origin"], "app");
+    assert_eq!(ev[0]["id"], id);
+    assert_eq!(
+        answer,
+        json!({"id": id, "path": "NOTE/Note/a.txt", "seqs": seqs(&ev), "removed": []})
+    );
+    let store = s.state.store("jordi").unwrap();
+    let g = store.lock().unwrap();
+    let recycled = store.recycle_index(&g).unwrap();
+    assert_eq!(recycled.len(), 1);
+    assert_eq!(recycled[0].id, id);
+    assert_eq!(serde_json::to_value(recycled[0].reason).unwrap(), "deleted");
+    assert_eq!(ev[0]["recycle"], recycled[0].location());
+    assert_eq!(
+        std::fs::read(store.recycle_path(&recycled[0]).unwrap()).unwrap(),
+        b"bytes"
+    );
+    assert!(!files(&s).join("NOTE/Note/a.txt").exists());
+}
+
+#[test]
+fn a_folder_delete_takes_its_content() {
+    let s = start_imported();
+    let t = writer(&s);
+    let a = uploaded(&s, &t, "NOTE/Note/W/a.txt", b"a");
+    let b = uploaded(&s, &t, "NOTE/Note/W/S/b.txt", b"b");
+    let (w, sub) = (id_of(&s, "NOTE/Note/W"), id_of(&s, "NOTE/Note/W/S"));
+    let n = events(&s).len();
+    let (status, answer) = delete(&s, &t, w);
+    assert_eq!(status, 200, "{answer}");
+    let ev = events_after(&s, n);
+    let pos = |id: u64| ev.iter().position(|e| e["id"] == id).unwrap();
+    assert_eq!(ev.len(), 4, "{ev:?}");
+    assert!(
+        pos(b) < pos(sub) && pos(sub) < pos(w) && pos(a) < pos(w),
+        "{ev:?}"
+    );
+    assert_eq!(ev[pos(w)]["type"], "folder.deleted");
+    assert!(ev.iter().all(|e| e["origin"] == "app"));
+    assert_eq!(answer["path"], "NOTE/Note/W");
+    assert_eq!(answer["removed"], json!([]));
+    assert_eq!(answer["seqs"], seqs(&ev));
+    assert!(!files(&s).join("NOTE/Note/W").exists());
+    let store = s.state.store("jordi").unwrap();
+    let g = store.lock().unwrap();
+    let recycled = store.recycle_index(&g).unwrap();
+    let ids: BTreeSet<u64> = recycled.iter().map(|r| r.id).collect();
+    assert!(ids.contains(&a) && ids.contains(&b), "{recycled:?}");
+}
+
+#[test]
+fn a_deleted_note_drops_its_page_records() {
+    let s = start_imported();
+    let t = writer(&s);
+    let id = uploaded(&s, &t, "NOTE/Note/t.note", &test_note());
+    assert_eq!(record_paths(&s), ["NOTE/Note/t.note"]);
+    let (status, answer) = delete(&s, &t, id);
+    assert_eq!(status, 200, "{answer}");
+    assert!(record_paths(&s).is_empty());
+}
+
+#[test]
+fn a_retried_delete_is_404() {
+    let s = start_imported();
+    let t = writer(&s);
+    let id = uploaded(&s, &t, "NOTE/Note/a.txt", b"a");
+    assert_eq!(delete(&s, &t, id).0, 200);
+    let n = events(&s).len();
+    let (status, answer) = delete(&s, &t, id);
+    assert_eq!(status, 404, "{answer}");
+    assert_eq!(answer, json!({"error": "not_found"}));
+    let (status, answer) = mv(&s, &t, id, "NOTE/Note/b.txt");
+    assert_eq!(status, 404, "{answer}");
+    assert_eq!(answer, json!({"error": "not_found"}));
+    assert_eq!(delete(&s, &t, 999_999).0, 404);
+    assert_eq!(events(&s).len(), n);
+}
+
+#[test]
+fn a_delete_of_the_last_file_reports_the_removed_folder() {
+    let s = start_imported();
+    let t = writer(&s);
+    let a = uploaded(&s, &t, "NOTE/Note/P/Q/a.txt", b"a");
+    let (p, q) = (id_of(&s, "NOTE/Note/P"), id_of(&s, "NOTE/Note/P/Q"));
+    let (status, answer) = delete(&s, &t, a);
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(
+        answer["removed"],
+        json!([{"id": q, "path": "NOTE/Note/P/Q"}, {"id": p, "path": "NOTE/Note/P"}])
+    );
+    assert!(!files(&s).join("NOTE/Note/P").exists());
+}
+
+#[test]
+fn a_folder_delete_reports_only_the_folders_it_left_empty() {
+    let s = start_imported();
+    let t = writer(&s);
+    uploaded(&s, &t, "NOTE/Note/P/A/sub/x.txt", b"x");
+    let (p, a) = (id_of(&s, "NOTE/Note/P"), id_of(&s, "NOTE/Note/P/A"));
+    let (status, answer) = delete(&s, &t, a);
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["removed"], json!([{"id": p, "path": "NOTE/Note/P"}]));
+}
+
+#[test]
+fn a_bad_write_body_is_400() {
+    let s = start_imported();
+    let t = writer(&s);
+    let a = uploaded(&s, &t, "NOTE/Note/a.txt", b"a");
+    for (path, body) in [
+        ("/folders", json!({})),
+        ("/folders", json!({"path": 1})),
+        (
+            "/move",
+            json!({"id": a.to_string(), "to": "NOTE/Note/b.txt"}),
+        ),
+        ("/move", json!({"id": a})),
+        ("/move", json!({"to": "NOTE/Note/b.txt"})),
+    ] {
+        let (status, answer, _) = send_json(&s, &t, "POST", path, Some(body.clone()));
+        assert_eq!(status, 400, "{path} {body}: {answer}");
+        assert_eq!(answer["error"], "bad_request", "{path} {body}");
+    }
+    let (status, _, _) = send_json(&s, &t, "DELETE", "/entries/abc", None);
+    assert_eq!(status, 400);
+    assert!(files(&s).join("NOTE/Note/a.txt").exists());
+}
+
+/// Every kind of write once, for the gates: (what, status, answer, `Retry-After`).
+fn every_write(s: &Server, t: &str, id: u64) -> Vec<(&'static str, u16, Value, Option<String>)> {
+    let r = s
+        .client
+        .put(s.url(&format!("/files?path={}", q("NOTE/Note/new.txt"))))
+        .bearer_auth(t)
+        .body("new")
+        .send()
+        .unwrap();
+    let retry = header(&r, "retry-after");
+    let (status, answer) = json_of(r);
+    let mut all = vec![("upload", status, answer, retry)];
+    let (status, answer, retry) = send_json(
+        s,
+        t,
+        "POST",
+        "/folders",
+        Some(json!({"path": "NOTE/Note/New"})),
+    );
+    all.push(("folder", status, answer, retry));
+    let (status, answer, retry) = send_json(
+        s,
+        t,
+        "POST",
+        "/move",
+        Some(json!({"id": id, "to": "NOTE/Note/moved.txt"})),
+    );
+    all.push(("move", status, answer, retry));
+    let (status, answer, retry) = send_json(s, t, "DELETE", &format!("/entries/{id}"), None);
+    all.push(("delete", status, answer, retry));
+    all
+}
+
+#[test]
+fn writes_wait_while_a_scan_holds_the_account() {
+    let s = start_imported();
+    let t = writer(&s);
+    // A folder to move and delete: a file would keep the account above the hold's minimum.
+    let (status, folder) = mkdir(&s, &t, "NOTE/Note/F");
+    assert_eq!(status, 201, "{folder}");
+    let f = folder["id"].as_u64().unwrap();
+    let gone = s.put("gone.note", b"g");
+    std::fs::remove_file(files(&s).join(&gone)).unwrap();
+    assert_eq!(
+        s.get(Some(&t), &format!("/tree?path={}", q("NOTE/Note"))).0,
+        423
+    );
+    let n = events(&s).len();
+    for (what, status, answer, _) in every_write(&s, &t, f) {
+        assert_eq!(status, 423, "{what}: {answer}");
+        assert_eq!(answer, json!({"error": "scan_hold"}), "{what}");
+    }
+    assert_eq!(events(&s).len(), n);
+    assert!(files(&s).join("NOTE/Note/F").is_dir());
+    assert!(!files(&s).join("NOTE/Note/New").exists());
+}
+
+#[test]
+fn writes_wait_for_the_import_in_protect_mode() {
+    let s = start();
+    assert!(s.state.config.protect);
+    let t = writer(&s);
+    let n = events(&s).len();
+    // Any id: the gate comes before the lookup.
+    for (what, status, answer, _) in every_write(&s, &t, 1000) {
+        assert_eq!(status, 423, "{what}: {answer}");
+        assert_eq!(answer, json!({"error": "not_imported"}), "{what}");
+    }
+    assert_eq!(events(&s).len(), n);
+}
+
+#[test]
+fn a_write_during_a_device_sync_waits() {
+    use crate::fake_device::{SERIAL, sign_in};
+    let s = start_imported();
+    let t = writer(&s);
+    let a = uploaded(&s, &t, "NOTE/Note/a.txt", b"a");
+    let base = s.base.clone();
+    let mut d = sign_in(base, EMAIL, PASSWORD);
+    d.ok(
+        "/api/file/2/files/synchronous/start",
+        json!({"equipmentNo": SERIAL}),
+    );
+    let n = events(&s).len();
+    for (what, status, answer, retry) in every_write(&s, &t, a) {
+        assert_eq!(status, 423, "{what}: {answer}");
+        assert_eq!(answer, json!({"error": "device_syncing"}), "{what}");
+        assert_eq!(retry.as_deref(), Some("5"), "{what}");
+    }
+    // Reads always work.
+    assert_eq!(
+        s.get(Some(&t), &format!("/tree?path={}", q("NOTE/Note"))).0,
+        200
+    );
+    assert_eq!(events(&s).len(), n);
+    d.ok(
+        "/api/file/2/files/synchronous/end",
+        json!({"equipmentNo": SERIAL, "flag": "Y"}),
+    );
+    let done = every_write(&s, &t, a);
+    let codes: Vec<u16> = done.iter().map(|(_, status, _, _)| *status).collect();
+    assert_eq!(codes, [201, 201, 200, 200], "{done:?}");
+    assert!(files(&s).join("NOTE/Note/new.txt").exists());
+    assert!(files(&s).join("NOTE/Note/New").is_dir());
+    assert!(!files(&s).join("NOTE/Note/moved.txt").exists());
+    assert!(!files(&s).join("NOTE/Note/a.txt").exists());
+}
+
+#[test]
+fn a_staged_device_upload_survives_an_app_write_of_another_path() {
+    use crate::fake_device::{SERIAL, multipart, sign_in};
+    let s = start_imported();
+    let t = writer(&s);
+    let a = uploaded(&s, &t, "NOTE/Note/a.txt", b"a");
+    let mut d = sign_in(s.base.clone(), EMAIL, PASSWORD);
+    d.ok(
+        "/api/file/2/files/synchronous/start",
+        json!({"equipmentNo": SERIAL}),
+    );
+    let bytes = b"device note bytes".to_vec();
+    let applied = d.ok(
+        "/api/file/3/files/upload/apply",
+        json!({"equipmentNo": SERIAL, "path": "/NOTE/Note/dev.note",
+               "fileName": "dev.note", "size": bytes.len()}),
+    );
+    let url = applied["fullUploadUrl"].as_str().unwrap().to_string();
+    let (ct, body) = multipart("dev.note", &bytes);
+    let req = d.http.post(&url).header("content-type", ct).body(body);
+    let (status, _) = d.send(req);
+    assert_eq!(status, 200);
+    d.ok(
+        "/api/file/2/files/synchronous/end",
+        json!({"equipmentNo": SERIAL, "flag": "Y"}),
+    );
+    // The app writes other paths while the device's bytes wait in staging.
+    let codes: Vec<u16> = every_write(&s, &t, a)
+        .iter()
+        .map(|(_, status, _, _)| *status)
+        .collect();
+    assert_eq!(codes, [201, 201, 200, 200]);
+    d.ok(
+        "/api/file/2/files/synchronous/start",
+        json!({"equipmentNo": SERIAL}),
+    );
+    d.ok(
+        "/api/file/2/files/upload/finish",
+        json!({"equipmentNo": SERIAL, "path": "/NOTE/Note/", "fileName": "dev.note",
+               "content_hash": md5_hex(&bytes), "innerName": applied["innerName"],
+               "size": bytes.len().to_string()}),
+    );
+    d.ok(
+        "/api/file/2/files/synchronous/end",
+        json!({"equipmentNo": SERIAL, "flag": "Y"}),
+    );
+    assert_eq!(
+        std::fs::read(files(&s).join("NOTE/Note/dev.note")).unwrap(),
+        bytes
+    );
+}
+
+#[test]
+fn a_read_token_cannot_write() {
+    let s = start_imported();
+    let w = writer(&s);
+    let a = uploaded(&s, &w, "NOTE/Note/a.txt", b"a");
+    let t = s.token();
+    for (what, status, answer, _) in every_write(&s, &t, a) {
+        assert_eq!(status, 403, "{what}: {answer}");
+        assert_eq!(answer, json!({"error": "read_only_token"}), "{what}");
+    }
+    assert!(files(&s).join("NOTE/Note/a.txt").exists());
+}
+
+#[test]
+fn a_removed_account_token_cannot_write() {
+    let s = start_imported();
+    let t = writer(&s);
+    let a = uploaded(&s, &t, "NOTE/Note/a.txt", b"a");
+    let accounts = s.state.auth.accounts();
+    accounts.remove("jordi", &s.state.journal).unwrap();
+    accounts.create("jordi", EMAIL, PASSWORD).unwrap();
+    for (what, status, answer, _) in every_write(&s, &t, a) {
+        assert_eq!(status, 410, "{what}: {answer}");
+        assert_eq!(answer["error"], "account_removed", "{what}");
+    }
+}
+
+#[test]
+fn a_refused_token_cannot_write() {
+    let s = start_imported();
+    let t = writer(&s);
+    let a = uploaded(&s, &t, "NOTE/Note/a.txt", b"a");
+    for (what, status, answer, _) in every_write(&s, "nonsense", a) {
+        assert_eq!(status, 401, "{what}: {answer}");
+        assert_eq!(answer["error"], "token_refused", "{what}");
+    }
+    assert!(files(&s).join("NOTE/Note/a.txt").exists());
 }

@@ -47,7 +47,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(&path("/digests"), get_only(get(digests)))
         .route(&path("/journal"), get_only(get(journal)))
         .route(&path("/tree"), get_only(get(browse::tree)))
-        .route(&path("/entries/{id}"), get_only(get(browse::entry)))
+        .route(
+            &path("/entries/{id}"),
+            get(browse::entry).delete(write::delete).fallback(no_route),
+        )
         .route(&path("/files/{id}"), get_only(get(browse::file)))
         // The upload streams its body to staging and enforces its own limit.
         .route(
@@ -56,6 +59,8 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .fallback(no_route)
                 .layer(DefaultBodyLimit::disable()),
         )
+        .route(&path("/folders"), post(write::folder).fallback(no_route))
+        .route(&path("/move"), post(write::move_).fallback(no_route))
         .route(PREFIX, any(no_route))
         .route(&path("/"), any(no_route))
         .route(&path("/{*rest}"), any(no_route))

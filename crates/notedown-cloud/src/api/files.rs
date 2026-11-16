@@ -1530,7 +1530,8 @@ fn way_is_open(store: &Store, guard: &StoreGuard, parent: &WirePath) -> crate::R
 }
 
 /// Create the folder `path` and each missing folder above it, parents first, one commit each
-/// (`folder.created` with `origin` and `device`). Existing folders are kept.
+/// (`folder.created` with `origin` and `device`). Existing folders are kept. Returns the seqs
+/// of the events.
 pub(crate) fn create_folders(
     state: &AppState,
     store: &Store,
@@ -1538,7 +1539,8 @@ pub(crate) fn create_folders(
     path: &WirePath,
     origin: Origin,
     device: Option<String>,
-) -> crate::Result<()> {
+) -> crate::Result<Vec<u64>> {
+    let mut seqs = Vec::new();
     let mut cur = WirePath::root();
     for segment in path.segments() {
         cur = cur.join(segment)?;
@@ -1549,9 +1551,9 @@ pub(crate) fn create_folders(
             continue;
         }
         let c = store.plan_create_folder(guard, &cur, origin, device.clone())?;
-        store.commit(guard, c, &state.journal)?;
+        seqs.extend(store.commit(guard, c, &state.journal)?);
     }
-    Ok(())
+    Ok(seqs)
 }
 
 /// The listed entry at `path` after a commit.
@@ -1566,7 +1568,7 @@ fn entry_after(store: &Store, guard: &StoreGuard, path: &WirePath) -> crate::Res
 /// everything below it, a file through its parent folder (direct children only). So a hand
 /// change inside it is journaled before the write, and a source that is gone from disk is
 /// journaled as deleted by the scan and counts as unknown.
-fn source_of(
+pub(crate) fn source_of(
     state: &AppState,
     store: &Store,
     guard: &WriteGuard,
@@ -1909,14 +1911,16 @@ pub async fn copy_v3(
                         continue;
                     };
                     match e.tag {
-                        Kind::Folder => create_folders(
-                            st,
-                            &store,
-                            &guard,
-                            &target,
-                            Origin::Device,
-                            device.clone(),
-                        )?,
+                        Kind::Folder => {
+                            create_folders(
+                                st,
+                                &store,
+                                &guard,
+                                &target,
+                                Origin::Device,
+                                device.clone(),
+                            )?;
+                        }
                         Kind::File => copy_file(&e.path, &target)?,
                     }
                 }

@@ -17,29 +17,41 @@
 //!
 //! Only an account with `quota_bytes` has a quota; without it there is no check and no walk,
 //! as for a device upload. The cached usage learns each upload's size change, so it stays warm.
+//!
+//! The other writes take a JSON body or an id: `POST /folders {"path"}`, `POST /move {"id",
+//! "to"}` and `DELETE /entries/{id}`. Before the store lock: the token, the body (400
+//! `bad_request`), the path ([`parse_target`]) and the sync mode. Then in one blocking task
+//! under one store lock: the gates, the device sync lock and the sync mode as for an upload,
+//! then the source ([`source_of`]: it is scanned first; 404 `not_found`, 403 `not_writable`
+//! outside the trees or for a tree root, [`check_source`]), the scans of the folders on the way
+//! to the target, the target check ([`check_target`], [`check_move`]), the plan with its page
+//! changes, the commit. Origin `app`, no device. A move or a delete removes the folders it
+//! leaves empty, as a device change does, and lists them in `removed`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Json;
-use axum::body::Body;
-use axum::extract::State;
+use axum::body::{Body, Bytes};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use serde::Deserialize;
-use serde_json::json;
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
 
-use super::check::{Want, WriteRefusal, check_target, parse_target};
+use super::browse::id_arg;
+use super::check::{Want, WriteRefusal, check_move, check_source, check_target, parse_target};
 use super::errors::{device_syncing, write_error};
 use super::routes::{Refusal, bad_request, error, internal, query, writer_of};
 use crate::SyncMode;
-use crate::api::files::{gate_locked, scan_way};
+use crate::api::files::{create_folders, gate_locked, scan_way, source_of};
 use crate::auth::Account;
 use crate::journal::Origin;
 use crate::put::{Precondition, PutOutcome, PutResult, commit_staged};
 use crate::server::AppState;
-use crate::store::{Store, WirePath};
+use crate::store::{Kind, PendingOp, Store, WirePath, WriteGuard};
 use crate::sync::staging::{STAGING_DIR, StreamFile};
 
 /// The header with the MD5 the client computed (lowercase or uppercase hex).
@@ -67,9 +79,10 @@ struct UploadQuery {
     path: Option<String>,
 }
 
-/// Why a look or the commit refuses the upload.
+/// Why a look or the commit refuses a write.
 enum Stop {
     Target(WriteRefusal),
+    NotFound,
     SyncRefused,
     DeviceSyncing,
     Quota,
@@ -81,6 +94,7 @@ impl Stop {
     fn response(self) -> Response {
         match self {
             Stop::Target(r) => r.response(),
+            Stop::NotFound => error(StatusCode::NOT_FOUND, "not_found"),
             Stop::SyncRefused => error(StatusCode::CONFLICT, "sync_refused"),
             Stop::DeviceSyncing => device_syncing(),
             Stop::Quota => error(StatusCode::INSUFFICIENT_STORAGE, "quota_exceeded"),
@@ -209,6 +223,23 @@ fn quota_look(
     Ok(over_quota(quota, used, current_size(&store, path), size))
 }
 
+/// The checks every write makes first under the store lock: the gates (423 `not_imported`,
+/// `scan_hold` as errors), the device sync lock, the sync mode.
+fn gates(state: &AppState, store: &Store) -> crate::Result<Result<(), Stop>> {
+    gate_locked(state, store)?;
+    if state
+        .sync_locks
+        .holder(store.slug(), state.now_ms())
+        .is_some()
+    {
+        return Ok(Err(Stop::DeviceSyncing));
+    }
+    if state.sync_mode() == SyncMode::Refuse {
+        return Ok(Err(Stop::SyncRefused));
+    }
+    Ok(Ok(()))
+}
+
 /// The upload's commit under the store lock (module docs).
 #[allow(clippy::too_many_arguments)]
 fn commit(
@@ -223,12 +254,8 @@ fn commit(
     let slug = &account.slug;
     let store = state.store(slug)?;
     let guard = store.lock_recovered(&state.journal)?;
-    gate_locked(state, &store)?;
-    if state.sync_locks.holder(slug, state.now_ms()).is_some() {
-        return Ok(Err(Stop::DeviceSyncing));
-    }
-    if state.sync_mode() == SyncMode::Refuse {
-        return Ok(Err(Stop::SyncRefused));
+    if let Err(stop) = gates(state, &store)? {
+        return Ok(Err(stop));
     }
     scan_way(state, &store, &guard, path)?;
     if let Err(r) = check_target(&store, &guard, path, Want::File)? {
@@ -402,4 +429,214 @@ async fn receive(
         })),
     )
         .into_response())
+}
+
+// ------------------------------------------------------- folders, move, delete
+
+/// The JSON body of a write; anything else is a 400 that names the `shape`.
+fn json_body<T: DeserializeOwned>(body: &Bytes, shape: &str) -> Result<T, Refusal> {
+    serde_json::from_slice(body)
+        .map_err(|_| Box::new(bad_request(&format!("the body must be {shape}"))))
+}
+
+/// What every JSON write checks before the store lock: the write token and the sync mode.
+async fn writer(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Account, Refusal> {
+    let account = writer_of(state, headers).await?;
+    if state.sync_mode() == SyncMode::Refuse {
+        return Err(Box::new(Stop::SyncRefused.response()));
+    }
+    Ok(account)
+}
+
+/// The folders that a planned move or delete removes because it leaves them empty (deepest
+/// first), as `{"id", "path"}`.
+fn removed(op: &PendingOp) -> Value {
+    let prune = match op {
+        PendingOp::Move { prune, .. } | PendingOp::Delete { prune, .. } => prune.as_slice(),
+        _ => &[],
+    };
+    json!(
+        prune
+            .iter()
+            .map(|p| json!({"id": p.id, "path": p.path}))
+            .collect::<Vec<_>>()
+    )
+}
+
+/// The store, its recovered lock and the gates of a write.
+fn locked(state: &AppState, slug: &str) -> crate::Result<Result<(Arc<Store>, WriteGuard), Stop>> {
+    let store = state.store(slug)?;
+    let guard = store.lock_recovered(&state.journal)?;
+    Ok(gates(state, &store)?.map(|()| (store, guard)))
+}
+
+#[derive(Deserialize)]
+struct FolderBody {
+    path: String,
+}
+
+/// `POST /folders` under the store lock: the folder and every missing folder above it.
+fn make_folder(
+    state: &AppState,
+    slug: &str,
+    path: &WirePath,
+) -> crate::Result<Result<(StatusCode, Value), Stop>> {
+    let (store, guard) = match locked(state, slug)? {
+        Ok(v) => v,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    // A folder made by hand is journaled (origin `scan`) before it counts as there.
+    scan_way(state, &store, &guard, path)?;
+    if let Err(r) = check_target(&store, &guard, path, Want::Folder)? {
+        return Ok(Err(Stop::Target(r)));
+    }
+    let seqs = create_folders(state, &store, &guard, path, Origin::App, None)?;
+    let Some(entry) = store.entry(&guard, path)?.filter(|e| e.tag == Kind::Folder) else {
+        return Err(crate::Error::Invalid {
+            what: "path",
+            message: format!("{path} is no folder after its creation"),
+        });
+    };
+    let status = if seqs.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok(Ok((
+        status,
+        json!({"id": entry.id, "path": path.display(), "seqs": seqs}),
+    )))
+}
+
+/// `POST /folders {"path"}`: creates the folder and the missing folders above it, one
+/// `folder.created` each, parents first. 201 `{"id", "path", "seqs"}`; 200 with no seqs when the
+/// folder is there. A file at the path is 409 `name_taken`, a file on the way 409
+/// `not_a_folder`.
+pub(super) async fn folder(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let made = async {
+        let account = writer(&state, &headers).await?;
+        let body: FolderBody = json_body(&body, "{\"path\"}")?;
+        let path = parse_target(&body.path).map_err(|r| Box::new(r.response()))?;
+        let st = state.clone();
+        run(move || make_folder(&st, &account.slug, &path)).await
+    };
+    match made.await {
+        Ok((status, answer)) => (status, Json(answer)).into_response(),
+        Err(r) => *r,
+    }
+}
+
+#[derive(Deserialize)]
+struct MoveBody {
+    id: u64,
+    to: String,
+}
+
+/// `POST /move` under the store lock.
+fn move_entry(
+    state: &AppState,
+    slug: &str,
+    id: u64,
+    to: &WirePath,
+) -> crate::Result<Result<Value, Stop>> {
+    let (store, guard) = match locked(state, slug)? {
+        Ok(v) => v,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let Some(src) = source_of(state, &store, &guard, id)? else {
+        return Ok(Err(Stop::NotFound));
+    };
+    if let Err(r) = check_source(&src.path) {
+        return Ok(Err(Stop::Target(r)));
+    }
+    if *to == src.path {
+        return Ok(Ok(
+            json!({"id": id, "path": to.display(), "seqs": [], "removed": []}),
+        ));
+    }
+    scan_way(state, &store, &guard, to)?;
+    if let Err(r) = check_move(&store, &guard, &src.path, src.tag == Kind::Folder, to)? {
+        return Ok(Err(Stop::Target(r)));
+    }
+    let mut c = store.plan_move_at(&guard, &src.path, to, state.now_ms(), Origin::App, None)?;
+    crate::pages::plan_page_move(&store, &guard, &mut c);
+    let removed = removed(&c.op);
+    let seqs = store.commit(&guard, c, &state.journal)?;
+    // A move changes no usage.
+    Ok(Ok(
+        json!({"id": id, "path": to.display(), "seqs": seqs, "removed": removed}),
+    ))
+}
+
+/// `POST /move {"id", "to"}`: renames or moves the file or folder `id` to the wire path `to`;
+/// the id stays. Missing folders on the way are created. 200 `{"id", "path", "seqs",
+/// "removed"}`; the same path is 200 with no seqs. A case-only rename is allowed; any other
+/// entry at `to`, also in another case, is 409 `name_taken`; a folder into itself 400
+/// `into_itself`; an unknown id 404 `not_found`.
+pub(super) async fn move_(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let moved = async {
+        let account = writer(&state, &headers).await?;
+        let body: MoveBody = json_body(&body, "{\"id\": <number>, \"to\"}")?;
+        let to = parse_target(&body.to).map_err(|r| Box::new(r.response()))?;
+        let st = state.clone();
+        run(move || move_entry(&st, &account.slug, body.id, &to)).await
+    };
+    match moved.await {
+        Ok(answer) => Json(answer).into_response(),
+        Err(r) => *r,
+    }
+}
+
+/// `DELETE /entries/{id}` under the store lock.
+fn delete_entry(state: &AppState, slug: &str, id: u64) -> crate::Result<Result<Value, Stop>> {
+    let (store, guard) = match locked(state, slug)? {
+        Ok(v) => v,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let Some(src) = source_of(state, &store, &guard, id)? else {
+        return Ok(Err(Stop::NotFound));
+    };
+    if let Err(r) = check_source(&src.path) {
+        return Ok(Err(Stop::Target(r)));
+    }
+    let mut c = store.plan_delete(&guard, &src.path, state.now_ms(), Origin::App, None)?;
+    crate::pages::plan_page_delete(&store, &guard, &mut c);
+    let removed = removed(&c.op);
+    let seqs = store.commit(&guard, c, &state.journal)?;
+    // The bytes left `files/` for the recycle bin; under the lock, so the cache stays right.
+    match src.tag {
+        Kind::File => state.adjust_usage(slug, 0, src.size),
+        Kind::Folder => state.invalidate_usage(slug),
+    }
+    Ok(Ok(
+        json!({"id": id, "path": src.path.display(), "seqs": seqs, "removed": removed}),
+    ))
+}
+
+/// `DELETE /entries/{id}`: moves the file, or the folder with everything in it, to the recycle
+/// bin (`file.deleted` with `recycle`, `folder.deleted`, children first). 200 `{"id", "path",
+/// "seqs", "removed"}`; an unknown id (also a retried delete) 404 `not_found`.
+pub(super) async fn delete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let deleted = async {
+        let account = writer(&state, &headers).await?;
+        let id = id_arg(&id)?;
+        let st = state.clone();
+        run(move || delete_entry(&st, &account.slug, id)).await
+    };
+    match deleted.await {
+        Ok(answer) => Json(answer).into_response(),
+        Err(r) => *r,
+    }
 }

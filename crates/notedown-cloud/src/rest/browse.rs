@@ -124,7 +124,7 @@ fn entry_of(
 }
 
 /// The id of a route path; anything but a number is a 400.
-fn id_arg(text: &str) -> Result<u64, Refusal> {
+pub(super) fn id_arg(text: &str) -> Result<u64, Refusal> {
     text.parse()
         .map_err(|_| Box::new(bad_request("the id is not a number")))
 }

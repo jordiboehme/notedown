@@ -224,9 +224,10 @@ impl NotesServer {
     }
 
     #[tool(
-        description = "The state of the text store: notes, pages with text, pending, waiting and \
-failed pages, whether the pipeline runs and the page it reads, its last error, the region_missed \
-count, the oldest kept version and the consumers with their bookmarks, last read and notes behind.",
+        description = "The state of the text store: notes, pages with text, pending, queued, \
+waiting and failed pages, whether the pipeline runs and the page it reads, its last error, the \
+region_missed count, the oldest kept version and the consumers with their bookmarks, last read \
+and notes behind.",
         annotations(read_only_hint = true)
     )]
     async fn status(&self) -> std::result::Result<String, String> {
@@ -442,6 +443,7 @@ impl NotesServer {
             "unscoped": f.unscoped,
             "pagesWithText": f.pages_with_text,
             "pending": f.pending,
+            "queued": f.queued,
             "waiting": f.waiting,
             "nextDue": at(f.next_due_ms),
             "failed": f.failed,

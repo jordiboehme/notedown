@@ -252,6 +252,9 @@ pub struct Stats {
     pub last_run_ms: u64,
     /// Due pages of notes still within their settle time at the end of the last pass.
     pub waiting: u64,
+    /// Pages of the due notes in the queue of the pass that are not read yet: set at the start
+    /// of a pass, lowered as its notes are read, 0 after a full pass.
+    pub queued: u64,
     /// When the next settle time or retry ends (ms), as of the last pass.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_due_ms: Option<u64>,
@@ -855,17 +858,40 @@ impl TextStore {
         self.update_stats(|s| s.last_run_ms = ms)
     }
 
-    /// The end of a good pass at `ms`: sets `last_run_ms`, `waiting` and `next_due_ms`, and
-    /// clears `last_error`.
+    /// The start of a pass: sets `queued`, `waiting` and `next_due_ms`. The last error stays
+    /// until the pass ends well.
+    pub fn set_pass_start(
+        &self,
+        _w: &WriterLock,
+        queued: u64,
+        waiting: u64,
+        next_due_ms: Option<u64>,
+    ) -> Result<Stats> {
+        self.update_stats(|s| {
+            s.queued = queued;
+            s.waiting = waiting;
+            s.next_due_ms = next_due_ms;
+        })
+    }
+
+    /// Sets `queued`, the pages of the pass not read yet.
+    pub fn set_queued(&self, _w: &WriterLock, queued: u64) -> Result<Stats> {
+        self.update_stats(|s| s.queued = queued)
+    }
+
+    /// The end of a good pass at `ms`: sets `last_run_ms`, `queued` (0 unless the pass was
+    /// stopped), `waiting` and `next_due_ms`, and clears `last_error`.
     pub fn set_pass_end(
         &self,
         _w: &WriterLock,
         ms: u64,
+        queued: u64,
         waiting: u64,
         next_due_ms: Option<u64>,
     ) -> Result<Stats> {
         self.update_stats(|s| {
             s.last_run_ms = ms;
+            s.queued = queued;
             s.waiting = waiting;
             s.next_due_ms = next_due_ms;
             s.last_error = None;

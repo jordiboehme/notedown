@@ -53,6 +53,7 @@ fn status_counts_pages_and_consumers() {
     assert_eq!(f.notes, 1);
     assert_eq!(f.pages_with_text, pages);
     assert_eq!((f.pending, f.waiting, f.failed, f.truncated), (0, 0, 0, 0));
+    assert_eq!(f.queued, 0);
     assert_eq!(f.errors, 0);
     assert_eq!(f.next_due_ms, None);
     assert!(f.last_error.is_none());
@@ -70,6 +71,7 @@ fn status_counts_pages_and_consumers() {
         "notes",
         "pagesWithText",
         "pending",
+        "queued",
         "waiting",
         "nextDueMs",
         "failed",
@@ -614,4 +616,36 @@ fn a_broken_error_or_stats_file_does_not_fail_the_status() {
     let f = status_facts(&d.data, SLUG, now_ms()).expect("a broken stats.json");
     assert_eq!(f.notes, 1);
     assert_eq!((f.waiting, f.last_run_ms), (0, None));
+}
+
+#[test]
+fn a_stopped_pass_shows_the_queue_and_a_full_pass_empties_it() {
+    let d = setup();
+    d.put("test1", "NOTE/Note");
+    d.put("test2", "NOTE/Note");
+    // The stop says yes once the engine has read one page.
+    let called = Arc::new(AtomicBool::new(false));
+    let seen: Arc<Mutex<Vec<StatusFacts>>> = Arc::default();
+    let (data, out, flag) = (d.data.clone(), seen.clone(), called.clone());
+    let engine = engine_reading("hello").on_call(move || {
+        out.lock()
+            .unwrap()
+            .push(status_facts(&data, SLUG, now_ms()).unwrap());
+        flag.store(true, Ordering::SeqCst);
+    });
+    let stop = move || called.load(Ordering::SeqCst);
+    worker(&d, no_settle(), engine).run(stop).unwrap();
+    let first = seen.lock().unwrap()[0].clone();
+    assert!(first.queued > 0, "the queue at the first page: {first:?}");
+    let f = facts(&d.data);
+    assert!(
+        f.queued > 0,
+        "a stopped pass leaves pages in the queue: {f:?}"
+    );
+    assert!(f.queued <= first.queued, "{} {}", f.queued, first.queued);
+
+    worker(&d, no_settle(), engine_reading("hello"))
+        .run_once(true)
+        .unwrap();
+    assert_eq!(facts(&d.data).queued, 0);
 }

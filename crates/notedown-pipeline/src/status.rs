@@ -26,6 +26,9 @@ pub struct StatusFacts {
     pub pages_with_text: usize,
     /// Pages of notes the worker started on and has not read yet.
     pub pending: usize,
+    /// Pages of due notes in the worker's queue that are not read yet: set at the start of a
+    /// pass, lowered as its notes are read and 0 after a full pass.
+    pub queued: u64,
     /// Due pages of notes still within their settle time, as of the last pass.
     pub waiting: u64,
     /// When the next settle time or retry ends (ms): the last pass's value or the next retry
@@ -116,6 +119,7 @@ pub fn status_facts(data: &Path, slug: &str, now_ms: u64) -> crate::Result<Statu
         notes: notes.len(),
         pages_with_text: pages().filter(|p| !p.blocks.is_empty()).count(),
         pending: count(PageOcrState::Pending),
+        queued: stats.queued,
         waiting: stats.waiting,
         next_due_ms,
         failed: count(PageOcrState::Failed),

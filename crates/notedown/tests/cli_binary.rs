@@ -2045,6 +2045,7 @@ mod pipeline_and_mcp {
                 "notes",
                 "pagesWithText",
                 "pending",
+                "queued",
                 "running",
                 "truncated",
                 "waiting"

@@ -104,7 +104,7 @@ enum PipelineAction {
     /// server. A consumer's bookmark does not move, use ack for that
     Changes(ChangesArgs),
     /// Print the status of one account as JSON: whether the pipeline runs and the page it
-    /// reads, the pages with text, pending, waiting and failed, the last error and the
+    /// reads, the pages with text, pending, queued, waiting and failed, the last error and the
     /// consumers with their last ack, last read and notes behind. Creates and changes nothing.
     /// Each call reads the whole text log, so do not ask more often than every few seconds
     Status {

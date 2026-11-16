@@ -1097,6 +1097,18 @@ impl Worker {
         });
         let first_run = queue.iter().any(|(_, d)| d.new);
         let total: usize = queue.iter().map(|(_, d)| d.pages.len()).sum();
+        // Per account for its stats: the pages of the queue not read yet. Written now and
+        // after each note (best effort), so the status shows how much is still to read.
+        let mut queued: BTreeMap<String, u64> = BTreeMap::new();
+        for (slug, d) in &queue {
+            *queued.entry(slug.clone()).or_default() += d.pages.len() as u64;
+        }
+        for (slug, text) in stores.iter() {
+            let (pages, due) = waiting.get(slug).copied().unwrap_or_default();
+            let left = queued.get(slug).copied().unwrap_or(0);
+            let _ = text.set_pass_start(lock, left, pages, due);
+        }
+        let mut stopped = false;
         let mut report = |p: &Progress| {
             if first_run {
                 eprintln!("ocr: {} of {total} pages", p.attempted);
@@ -1117,6 +1129,7 @@ impl Worker {
                 for (s, _) in &queue[i.saturating_sub(1)..] {
                     unsure.insert(s.clone());
                 }
+                stopped = true;
                 break;
             }
             let (Some(text), Some((r, digests))) = (stores.get(slug), recs.get(slug)) else {
@@ -1139,6 +1152,13 @@ impl Worker {
                 told_missing: &self.told_missing,
             };
             match note::process(&job, &mut self.engine, d, &mut progress, &mut report, stop) {
+                // A stop between its pages leaves the note in the queue.
+                Ok(()) if !stop() => {
+                    if let Some(left) = queued.get_mut(slug) {
+                        *left = left.saturating_sub(d.pages.len() as u64);
+                        let _ = text.set_queued(lock, *left);
+                    }
+                }
                 Ok(()) => {}
                 Err(Error::ModelMissing) => {
                     self.clear_work(lock);
@@ -1173,7 +1193,13 @@ impl Worker {
         let end = self.clock.now_ms();
         for (slug, text) in stores.iter() {
             let (pages, due) = waiting.get(slug).copied().unwrap_or_default();
-            text.set_pass_end(lock, end, pages, due)?;
+            // A full pass read the whole queue; a stopped one leaves the rest for the next.
+            let left = if stopped {
+                queued.get(slug).copied().unwrap_or(0)
+            } else {
+                0
+            };
+            text.set_pass_end(lock, end, left, pages, due)?;
         }
         progress.next_due = next_due;
         Ok((progress, unsure))

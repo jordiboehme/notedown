@@ -77,14 +77,32 @@ export type Job = {
  * A binding sends `state` and then `relist` (drop what is shown and list again); the answer of a
  * call sends `state` alone. `recycle` says the bin may have changed (the app's own delete,
  * restore or Empty, or a delete the library read from the server): the window lists the bin
- * again when it shows it, and ignores it otherwise.
+ * again when it shows it, and ignores it otherwise. `drop` says files or folders were dropped on
+ * the window: Rust keeps their paths under `dropId`; the window finds the folder at `position`
+ * (physical pixels: divide by `devicePixelRatio`) and calls `library_upload(dropId, folder)`.
  */
 export type LibraryEvent =
   | { type: "state"; state: LibraryState; text: string | null; page: string | null }
   | { type: "folder"; folder: FolderState }
   | { type: "job"; job: Job }
   | { type: "relist" }
-  | { type: "recycle" };
+  | { type: "recycle" }
+  | { type: "drop"; dropId: number; position: { x: number; y: number }; count: number };
+
+/**
+ * What `library_upload(dropId, folder, many?, packages?)` asks before it starts (null: the jobs
+ * are queued). `packages`: the drop holds packages such as an `.app`; call again with
+ * `packages: true` to upload what is in them or `false` to leave them out. `many`: more than 500
+ * files ("Upload 1,234 files?"); call again with `many: true`. Packages are asked first.
+ */
+export type UploadAsk = { ask: "many" | "packages"; text: string };
+
+/**
+ * The answer to an upload job that asks (`library_answer(job, choice)`). `replace` only when its
+ * question says `canReplace`. Other upload commands: `library_retry(job)` for a failed upload,
+ * `library_cancel(job)` (also ends a restore that asks), `library_cancel_drop(dropId)` (Cancel all).
+ */
+export type UploadChoice = "replace" | "keepBoth" | "skip";
 
 /** The name of the Tauri event that carries every `LibraryEvent`. */
 export const LIBRARY_EVENT = "library";

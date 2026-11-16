@@ -18,6 +18,7 @@ pub mod supervisor;
 #[cfg(test)]
 mod test_procs;
 pub mod token;
+pub mod transfer;
 pub mod tray;
 pub mod windows;
 
@@ -161,7 +162,12 @@ pub fn run() {
             commands::library_move,
             commands::library_delete,
             commands::library_restore,
-            commands::library_empty
+            commands::library_empty,
+            commands::library_upload,
+            commands::library_answer,
+            commands::library_retry,
+            commands::library_cancel,
+            commands::library_cancel_drop
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
@@ -526,6 +532,11 @@ mod tests {
                 "library_delete",
                 "library_restore",
                 "library_empty",
+                "library_upload",
+                "library_answer",
+                "library_retry",
+                "library_cancel",
+                "library_cancel_drop",
                 "open_settings"
             ])
         );
@@ -594,7 +605,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 34);
+        assert_eq!(handler_commands().len(), 39);
     }
 
     #[test]
@@ -634,6 +645,11 @@ mod tests {
             "library_delete",
             "library_restore",
             "library_empty",
+            "library_upload",
+            "library_answer",
+            "library_retry",
+            "library_cancel",
+            "library_cancel_drop",
         ]);
         assert_eq!(manifest_commands(), all);
         // Every granted command is a real one.
@@ -657,6 +673,11 @@ mod tests {
                 "library_delete",
                 "library_restore",
                 "library_empty",
+                "library_upload",
+                "library_answer",
+                "library_retry",
+                "library_cancel",
+                "library_cancel_drop",
             ] {
                 assert!(!granted(window).contains(command), "{window} has {command}");
             }

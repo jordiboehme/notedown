@@ -8,7 +8,7 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::config::{self, AppConfig, Mode, StartView};
-use crate::library::{Entry, Job, Key, Library, Listed, RecyclePage, StateView};
+use crate::library::{Choice, Entry, Job, Key, Library, Listed, RecyclePage, StateView, UploadAsk};
 use crate::login::{self, LoginError, LoginGate, Password};
 use crate::model::{ModelControl, ModelState};
 use crate::poller::Poller;
@@ -687,6 +687,57 @@ pub async fn library_restore(
 #[tauri::command]
 pub async fn library_empty(library: State<'_, Library>) -> Result<Job, String> {
     change(&library, |l| l.empty_bin()).await
+}
+
+/// Uploads the drop `drop_id` (files and folders dropped on the library window; Rust kept their
+/// paths) into `folder`. Answers a question to ask first, or none when the jobs are queued: the
+/// window then follows their `job` events. Call it again with `many` after "Upload 1,234
+/// files?", and with `packages` (true: go into them, false: leave them out) after the package
+/// question.
+#[tauri::command]
+pub async fn library_upload(
+    library: State<'_, Library>,
+    drop_id: u64,
+    folder: String,
+    many: Option<bool>,
+    packages: Option<bool>,
+) -> Result<Option<UploadAsk>, String> {
+    let library = library.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library.upload(drop_id, &folder, many.unwrap_or(false), packages)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The answer to an upload that asks about a name in the way: replace, keepBoth or skip.
+#[tauri::command]
+pub async fn library_answer(
+    library: State<'_, Library>,
+    job: u64,
+    choice: Choice,
+) -> Result<(), String> {
+    library.answer(job, choice)
+}
+
+/// Tries a failed upload again.
+#[tauri::command]
+pub async fn library_retry(library: State<'_, Library>, job: u64) -> Result<(), String> {
+    library.retry(job)
+}
+
+/// Cancels a job: an upload wherever it is, or a restore that asks for a name.
+#[tauri::command]
+pub async fn library_cancel(library: State<'_, Library>, job: u64) -> Result<(), String> {
+    library.cancel(job);
+    Ok(())
+}
+
+/// Cancel all: every job of the drop `drop_id` ends, and an unused drop is forgotten.
+#[tauri::command]
+pub async fn library_cancel_drop(library: State<'_, Library>, drop_id: u64) -> Result<(), String> {
+    library.cancel_drop(drop_id);
+    Ok(())
 }
 
 /// The last lines of both children's output, for the Server page.

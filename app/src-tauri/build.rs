@@ -39,6 +39,11 @@ const COMMANDS: &[&str] = &[
     "library_delete",
     "library_restore",
     "library_empty",
+    "library_upload",
+    "library_answer",
+    "library_retry",
+    "library_cancel",
+    "library_cancel_drop",
 ];
 
 fn main() {

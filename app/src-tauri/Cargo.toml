@@ -42,6 +42,12 @@ sha2 = "=0.11.1"
 toml = "=1.2.1"
 # Names the user types (a new folder, a rename, a restore) are sent in NFC, as the server keeps them.
 unicode-normalization = "=0.1.26"
+# Uploads stream a file as the body of one PUT on a runtime of the upload's own thread, so a
+# cancel or a stalled connection drops the request (the blocking client cannot be stopped while
+# it waits for the socket). All three are in the tree through reqwest already.
+tokio = { version = "=1.54.1", default-features = false, features = ["rt", "time"] }
+http-body = "=1.1.0"
+bytes = "=1.12.1"
 
 [dev-dependencies]
 tempfile = "=3.27.0"

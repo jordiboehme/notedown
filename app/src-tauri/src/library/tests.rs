@@ -642,7 +642,22 @@ fn no_library_event_holds_the_token() {
         serde_json::to_value(LibraryEvent::Recycle).unwrap(),
         json!({ "type": "recycle" })
     );
-    all.extend([folder, job, LibraryEvent::Relist, LibraryEvent::Recycle]);
+    let dropped = LibraryEvent::Drop {
+        drop_id: 4,
+        position: Position { x: 120, y: 48 },
+        count: 2,
+    };
+    assert_eq!(
+        serde_json::to_value(&dropped).unwrap(),
+        json!({ "type": "drop", "dropId": 4, "position": { "x": 120, "y": 48 }, "count": 2 })
+    );
+    all.extend([
+        folder,
+        job,
+        LibraryEvent::Relist,
+        LibraryEvent::Recycle,
+        dropped,
+    ]);
 
     let token = TOKEN;
     for event in &all {

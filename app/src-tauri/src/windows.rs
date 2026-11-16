@@ -337,7 +337,8 @@ fn place_panel(app: &AppHandle, panel: &WebviewWindow, area: Area, cursor: Optio
 }
 
 /// The window events of the app: closing a window hides it (a menu bar app never quits on a
-/// close), and the panel hides when it loses the focus.
+/// close), the panel hides when it loses the focus, and files dropped on the library are kept
+/// for an upload.
 pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
     let Some(kind) = WindowKind::from_label(window.label()) else {
         return;
@@ -347,6 +348,15 @@ pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
         WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
             hide_window(app, kind);
+        }
+        // Files dropped on the library: Rust keeps their paths, the window gets a drop id. A
+        // short lock and a channel send, so the main thread never waits.
+        WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position })
+            if kind == WindowKind::Library =>
+        {
+            if let Some(library) = app.try_state::<crate::library::Library>() {
+                library.dropped(paths.clone(), position.x, position.y);
+            }
         }
         WindowEvent::Focused(false) if kind == WindowKind::Panel => {
             let shown = app.state::<Shown>();

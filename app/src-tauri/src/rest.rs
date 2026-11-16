@@ -8,14 +8,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::header::{
-    AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER as RETRY_AFTER_HEADER,
+    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, IF_MATCH, IF_NONE_MATCH,
+    RETRY_AFTER as RETRY_AFTER_HEADER,
 };
 use reqwest::{Method, Url};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::supervisor::Clock;
 use crate::token::Token;
+use crate::transfer::FileBody;
 
 /// How long a connection may take to open.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -84,6 +86,11 @@ pub enum RestError {
     Garbled(String),
     /// The request failed on the way, without the address in the detail.
     Failed(String),
+    /// An upload got no answer: the connection broke while the body was sent or before the
+    /// answer came.
+    Cut,
+    /// A transfer whose bytes stood still for a minute was ended.
+    Stalled,
 }
 
 impl fmt::Display for RestError {
@@ -123,6 +130,8 @@ impl fmt::Display for RestError {
             },
             Self::Garbled(why) => write!(f, "The answer of the server could not be read ({why})."),
             Self::Failed(why) => write!(f, "The request failed ({why})."),
+            Self::Cut => f.write_str("The connection was cut."),
+            Self::Stalled => f.write_str("The connection stalled."),
         }
     }
 }
@@ -189,6 +198,23 @@ pub fn error_for(status: u16, body: &[u8], retry_after: Option<&str>) -> RestErr
             code: code.map(str::to_owned),
         },
     }
+}
+
+/// The precondition of an upload: a new file only, or a replace of the file with this md5.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Precondition {
+    Create,
+    Replace(String),
+}
+
+/// The answer of `PUT /files?path=`, as far as the app uses it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Put {
+    pub path: String,
+    /// `created`, `replaced` or `unchanged`.
+    pub outcome: String,
+    #[serde(default)]
+    pub seqs: Vec<u64>,
 }
 
 /// A client for one server and one token (or none, for the login).
@@ -323,6 +349,77 @@ impl Rest {
         }
     }
 
+    /// The `Authorization` header of this client's token, marked sensitive.
+    fn bearer(&self) -> Result<Option<HeaderValue>, RestError> {
+        let Some(token) = &self.token else {
+            return Ok(None);
+        };
+        // The value never shows in an error or a log line: only the header carries it.
+        let Ok(mut value) = HeaderValue::from_str(&format!("Bearer {}", token.expose())) else {
+            return Err(RestError::Failed(
+                "the stored login cannot be sent".to_owned(),
+            ));
+        };
+        value.set_sensitive(true);
+        Ok(Some(value))
+    }
+
+    /// `PUT /files?path=<path>` with `body` streamed as the bytes of the file, once. Its client
+    /// has no total timeout (a large file on a small server takes minutes): the caller watches
+    /// the body's counter and drops this future when it stands still (see
+    /// [`crate::transfer::watched`]). It runs inside a runtime. A connection that breaks without
+    /// an answer is [`RestError::Cut`]: after an early refusal the server may close it while
+    /// the body is still sent.
+    pub async fn put_file(
+        &self,
+        path: &str,
+        body: FileBody,
+        precondition: &Precondition,
+    ) -> Result<Put, RestError> {
+        let url = self.url("/files", &[("path", path)])?;
+        // No redirect is followed and the app's own server sees no proxy, as for the JSON calls.
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none());
+        if crate::poller::is_loopback(&self.base) {
+            builder = builder.no_proxy();
+        }
+        let client = builder
+            .build()
+            .map_err(|e| RestError::Failed(format!("no HTTP client: {}", e.without_url())))?;
+        let mut request = client
+            .put(url)
+            .header(CONTENT_LENGTH, HeaderValue::from(body.remaining()));
+        if let Some(bearer) = self.bearer()? {
+            request = request.header(AUTHORIZATION, bearer);
+        }
+        request = match precondition {
+            Precondition::Create => request.header(IF_NONE_MATCH, HeaderValue::from_static("*")),
+            Precondition::Replace(md5) => {
+                let tag = HeaderValue::from_str(&format!("\"{md5}\""))
+                    .map_err(|_| RestError::Garbled("no valid md5".to_owned()))?;
+                request.header(IF_MATCH, tag)
+            }
+        };
+        let response = request
+            .body(reqwest::Body::wrap(body))
+            .send()
+            .await
+            .map_err(cut)?;
+        let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let answer = response.bytes().await.map_err(cut)?;
+        if (200..300).contains(&status) {
+            serde_json::from_slice(&answer).map_err(garbled)
+        } else {
+            Err(error_for(status, &answer, retry_after.as_deref()))
+        }
+    }
+
     /// One request with an optional JSON body.
     fn send<T: DeserializeOwned>(
         &self,
@@ -331,15 +428,8 @@ impl Rest {
         body: Option<Vec<u8>>,
     ) -> Result<T, RestError> {
         let mut request = self.client.request(method, url);
-        if let Some(token) = &self.token {
-            // The value never shows in an error or a log line: only the header carries it.
-            let Ok(mut value) = HeaderValue::from_str(&format!("Bearer {}", token.expose())) else {
-                return Err(RestError::Failed(
-                    "the stored login cannot be sent".to_owned(),
-                ));
-            };
-            value.set_sensitive(true);
-            request = request.header(AUTHORIZATION, value);
+        if let Some(bearer) = self.bearer()? {
+            request = request.header(AUTHORIZATION, bearer);
         }
         if let Some(body) = body {
             request = request
@@ -368,6 +458,15 @@ fn failed(e: reqwest::Error) -> RestError {
         RestError::Unreachable
     } else {
         RestError::Failed(e.without_url().to_string())
+    }
+}
+
+/// A transfer that got no answer: no connection is unreachable, a broken one is cut.
+fn cut(e: reqwest::Error) -> RestError {
+    if e.is_connect() || e.is_timeout() {
+        RestError::Unreachable
+    } else {
+        RestError::Cut
     }
 }
 

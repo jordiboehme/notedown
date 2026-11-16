@@ -200,10 +200,26 @@ pub enum LibraryEvent {
     /// The library bound again (or must list again): the window drops what it shows and lists
     /// its folders again.
     Relist,
-    /// The recycle bin may have changed (the app's own delete, restore or Empty, or a
-    /// `file.deleted` or `folder.deleted` the follower read): the window lists the bin again
-    /// when it shows it, and ignores this otherwise.
+    /// The recycle bin may have changed (the app's own delete, restore or Empty, a replace by
+    /// an upload, or a `file.deleted` or `folder.deleted` the follower read): the window lists
+    /// the bin again when it shows it, and ignores this otherwise.
     Recycle,
+    /// Files or folders were dropped on the window. Rust keeps their paths under `drop_id`; the
+    /// window finds the folder at `position` (physical pixels in the web view) and calls
+    /// `library_upload(dropId, folder)`. `count` is the number of dropped paths.
+    #[serde(rename_all = "camelCase")]
+    Drop {
+        drop_id: u64,
+        position: Position,
+        count: usize,
+    },
+}
+
+/// A point in the web view, in physical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Position {
+    pub x: i64,
+    pub y: i64,
 }
 
 /// Where the library's events go. It must not block: the app only puts them into a channel.
@@ -295,6 +311,9 @@ struct Inner {
     next_job: AtomicU64,
     /// Restores that ask for another name, by the key of their bin item.
     asking: Mutex<HashMap<String, Job>>,
+    /// The drops and the upload queue. Held only for short changes and the events they send,
+    /// never across a call or a file read.
+    uploads: Mutex<uploads::Uploads>,
 }
 
 /// What the library is bound to.
@@ -360,6 +379,7 @@ impl Library {
                 waker: Mutex::new(None),
                 next_job: AtomicU64::new(0),
                 asking: Mutex::new(HashMap::new()),
+                uploads: Mutex::new(uploads::Uploads::default()),
             }),
         }
     }
@@ -414,6 +434,7 @@ impl Library {
         // The follower of the old binding stops (its session is cancelled) and the cache goes.
         self.reset_listing(generation);
         self.cancel_asking();
+        self.cancel_uploads();
         // A binding that failed on this Mac (the Keychain, the client) records no place: the
         // next nudge tries again.
         let (view, rest, failed) = match (base, key) {
@@ -521,9 +542,11 @@ impl Library {
 mod cache;
 mod changes;
 mod listing;
+mod uploads;
 
 pub use cache::{Key, Listed};
 pub use listing::{FOLLOW_EVERY, RecycleItem, RecyclePage};
+pub use uploads::{Ask, Choice, UploadAsk};
 
 /// A library that is never set up, for tests of other parts that need one.
 #[cfg(test)]
@@ -543,3 +566,6 @@ mod listing_tests;
 
 #[cfg(test)]
 mod changes_tests;
+
+#[cfg(test)]
+mod uploads_tests;

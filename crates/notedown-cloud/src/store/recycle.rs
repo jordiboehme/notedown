@@ -28,6 +28,11 @@
 //! A commit that is discarded (not applied) removes its copy with
 //! [`Store::discard_recycled`]; no line was written for it.
 //!
+//! A restore (`PendingOp::Restore`, [`Store::plan_restore`]) renames the slot of an item back
+//! into `files/`. After that it drops the item's lines in one atomic rewrite of the index, in
+//! which the old versions of each restored file move to its new id, and removes the emptied
+//! folders of the slot. Both steps are idempotent.
+//!
 //! [`Store::prune_recycle`] applies the retention ([`super::retention`]): it journals a
 //! `recycle.pruned` event per removed line, rewrites the index atomically and then removes the
 //! slots. A line it can't read stays as it is.
@@ -404,6 +409,66 @@ impl Store {
         Ok(true)
     }
 
+    /// Drop the index lines equal to one of `lines` and give each `overwritten` line whose id is
+    /// the first of a pair in `reid` the second one, in one atomic rewrite; every other line
+    /// stays byte for byte (a line that can't be read too). Nothing is written when no line
+    /// changes, so a second run does nothing: ids are never reused, and a slot names its line.
+    /// Returns whether the index was written.
+    pub(super) fn drop_recycled(
+        &self,
+        lines: &[RecycleEntry],
+        reid: &[(u64, u64)],
+    ) -> Result<bool> {
+        let mut changed = false;
+        let mut text = Vec::new();
+        for (bytes, entry) in self.read_index_lines()? {
+            match entry {
+                Some(e) if lines.contains(&e) => {
+                    changed = true;
+                    continue;
+                }
+                Some(e) if e.reason == RecycleReason::Overwritten => {
+                    if let Some(&(_, new)) = reid.iter().find(|(old, _)| *old == e.id) {
+                        changed = true;
+                        text.extend_from_slice(RecycleEntry { id: new, ..e }.line().as_bytes());
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            text.extend_from_slice(&bytes);
+            text.push(b'\n');
+        }
+        if !changed {
+            return Ok(false);
+        }
+        super::write_atomic_short(&self.recycle_dir().join(RECYCLE_INDEX), &text)?;
+        Ok(true)
+    }
+
+    /// Remove the empty folders above the slot `slot` (gone now) up to `recycle/`, which stays.
+    /// A folder that is gone already is passed; one that is not empty ends the walk. Failures
+    /// are ignored: an empty folder left in `recycle/` is harmless.
+    pub(super) fn remove_slot_parents(&self, slot: &Path) {
+        let root = self.recycle_dir();
+        let mut removed = false;
+        let mut dir = slot.parent();
+        while let Some(d) = dir {
+            if d == root || !d.starts_with(&root) {
+                break;
+            }
+            match std::fs::remove_dir(d) {
+                Ok(()) => removed = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => break,
+            }
+            dir = d.parent();
+        }
+        if removed {
+            let _ = crate::fsutil::fsync_dir(&root);
+        }
+    }
+
     /// Remove the copy of a discarded commit from its slot (nothing else is touched). A missing
     /// copy is fine.
     pub(super) fn discard_recycled(&self, entry: &RecycleEntry) {
@@ -692,6 +757,13 @@ impl Store {
                 return false;
             };
             if self.has_symlink(&slot) {
+                // The slot is not looked at: its line tells the kind (a file line has an MD5).
+                let folder = item.entry.md5.is_empty() || !item.owned.is_empty();
+                item.set_kind(if folder {
+                    ItemKind::Folder
+                } else {
+                    ItemKind::File
+                });
                 return true;
             }
             match std::fs::symlink_metadata(&slot) {
@@ -716,7 +788,7 @@ impl Store {
 
     /// Whether `recycle/` or any part of `slot` below it is a symlink. A missing part ends the
     /// check (nothing below it exists).
-    fn has_symlink(&self, slot: &Path) -> bool {
+    pub(super) fn has_symlink(&self, slot: &Path) -> bool {
         let root = self.recycle_dir();
         let Ok(rel) = slot.strip_prefix(&root) else {
             return true;
@@ -756,7 +828,7 @@ impl Store {
 
 /// Whether there is a symlink anywhere below `dir` (none is followed). A folder that can't be
 /// read counts as none: removing it fails then and is reported.
-fn holds_symlink(dir: &Path) -> bool {
+pub(super) fn holds_symlink(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
@@ -1167,6 +1239,44 @@ mod tests {
         let old = entry("NOTE/Note/P", "", T, RecycleReason::Deleted);
         slot(&store, &old, &[(".DS_Store", b"d"), ("Q/.keep", b"")]);
         assert!(store.recycle_items(&g).unwrap().is_empty());
+    }
+
+    /// A slot that is a symlink is listed (a restore refuses it), with size 0 and the kind its
+    /// line tells, whatever the symlink points to.
+    #[test]
+    fn a_symlinked_slot_is_listed_with_the_kind_of_its_line() {
+        let (_dir, store) = store();
+        let g = store.lock().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target_file = outside.path().join("f");
+        std::fs::write(&target_file, b"12345").unwrap();
+        let link = |e: &RecycleEntry, to: &Path| {
+            let p = store.recycle_path(e).unwrap();
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(to, &p).unwrap();
+            store.append_recycled(e).unwrap();
+        };
+        // A file whose slot points to a folder, an empty folder whose slot points to a file.
+        let file = entry("NOTE/Note/a.txt", "m", T, RecycleReason::Deleted);
+        link(&file, outside.path());
+        let empty = entry("NOTE/Note/E", "", T + 1, RecycleReason::Deleted);
+        link(&empty, &target_file);
+        let items = store.recycle_items(&g).unwrap();
+        assert_eq!(
+            keys(&items),
+            [
+                format!("{}/NOTE/Note/E", T + 1),
+                format!("{T}/NOTE/Note/a.txt")
+            ]
+        );
+        assert_eq!(
+            (items[0].kind, items[0].size, items[0].files),
+            (ItemKind::Folder, 0, Some(0))
+        );
+        assert_eq!(
+            (items[1].kind, items[1].size, items[1].md5.as_deref()),
+            (ItemKind::File, 0, Some("m"))
+        );
     }
 
     #[test]

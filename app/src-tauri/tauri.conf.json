@@ -15,7 +15,14 @@
         "title": "Notedown",
         "width": 340,
         "height": 240,
-        "resizable": false
+        "maxWidth": 340,
+        "maxHeight": 520,
+        "resizable": false,
+        "visible": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visibleOnAllWorkspaces": true
       }
     ],
     "security": {

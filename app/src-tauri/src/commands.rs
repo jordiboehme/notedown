@@ -4,12 +4,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::config::{self, AppConfig, Mode, StartView};
 use crate::poller::Poller;
 use crate::processes::{ProcessStates, Processes};
 use crate::status::Status;
+use crate::windows::{self, WindowKind};
 
 /// The live config and the folder it is saved in.
 pub struct ConfigState {
@@ -165,6 +166,24 @@ pub fn get_status(poller: State<'_, Poller>) -> Status {
 #[tauri::command]
 pub fn process_states(processes: State<'_, Arc<Processes>>) -> ProcessStates {
     processes.states()
+}
+
+/// Opens the library window. Async, so the window is made off the main thread.
+#[tauri::command]
+pub async fn open_library(app: AppHandle) -> Result<(), String> {
+    windows::show_window(&app, WindowKind::Library, None).map_err(|e| e.to_string())
+}
+
+/// Opens the settings window, at `page` when given.
+#[tauri::command]
+pub async fn open_settings(app: AppHandle, page: Option<String>) -> Result<(), String> {
+    windows::show_window(&app, WindowKind::Settings, page).map_err(|e| e.to_string())
+}
+
+/// Quit: stops every child, then ends the app. Returns at once.
+#[tauri::command]
+pub fn quit_app(app: AppHandle) {
+    crate::quit_app(&app);
 }
 
 #[cfg(test)]

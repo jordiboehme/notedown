@@ -7,10 +7,13 @@ pub mod poller;
 pub mod probe;
 pub mod process;
 pub mod processes;
+pub mod quit;
 pub mod serve_info;
 pub mod status;
 pub mod supervisor;
 pub mod token;
+pub mod tray;
+pub mod windows;
 
 use std::sync::{Arc, mpsc};
 
@@ -19,9 +22,12 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent};
 use poller::{Inputs, Poller, RealSources, TICK_EVERY};
 use process::ChildKind;
 use processes::{Options, Processes, REPROBE_EVERY};
+use quit::{ExitDecision, QuitFlow};
 use status::Status;
 use supervisor::ChildState;
 use token::KeychainStore;
+use tray::{TrayIconKind, tray_icon_for};
+use windows::Shown;
 
 /// The bundle identifier of the app, as `tauri.conf.json` names it. The app's config, data and
 /// Keychain entries are filed under it.
@@ -43,7 +49,22 @@ struct ProcessStateEvent {
 
 pub fn run() {
     let app = tauri::Builder::default()
+        // First: a second launch hands over to the running app and ends inside this plugin,
+        // before `setup` could reclaim the running app's children as its own.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            windows::show_panel(app);
+        }))
+        .menu(tray::app_menu)
+        .on_menu_event(|app, event| tray::on_menu_event(app, event.id().as_ref()))
+        .on_window_event(windows::on_window_event)
+        .manage(Shown::default())
+        .manage(Arc::new(QuitFlow::new()))
         .setup(|app| {
+            // A menu bar app: no Dock icon until a library or settings window shows. The
+            // Info.plist says so too (LSUIElement), so the bundle never shows one at launch.
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            tray::build(app.handle())?;
             let config_dir = app.path().app_config_dir()?;
             let config = commands::ConfigState::load(config_dir);
             let reader = config.reader();
@@ -75,27 +96,42 @@ pub fn run() {
             commands::start_processes,
             commands::stop_processes,
             commands::process_states,
-            commands::get_status
+            commands::get_status,
+            commands::open_library,
+            commands::open_settings,
+            commands::quit_app
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
-    app.run(|app, event| {
-        // Every way out ends here, also Cmd+Q and the Dock's Quit: no child stays behind. After
-        // `quit_app` this finds nothing left to stop.
-        if let RunEvent::Exit = event {
-            stop_for_good(app);
+    app.run(|app, event| match event {
+        // Any exit request waits for the Quit flow; closing the last window (no code) never
+        // quits a menu bar app.
+        RunEvent::ExitRequested { code, api, .. } => {
+            match app.state::<Arc<QuitFlow>>().on_exit_request(code) {
+                ExitDecision::Allow => {}
+                ExitDecision::Prevent => api.prevent_exit(),
+                ExitDecision::PreventAndQuit => {
+                    api.prevent_exit();
+                    quit_app(app);
+                }
+            }
         }
+        // The last stop for a way out that skips the Quit flow (the Dock's native Quit,
+        // logout). After the Quit flow it finds nothing left to stop.
+        RunEvent::Exit => stop_for_good(app),
+        _ => {}
     });
 }
 
-/// Quit: stops every child off the main thread, then ends the app. The Quit item of the menu
-/// and the panel call this.
+/// Quit: hides the windows, stops every child off the main thread, then ends the app. The
+/// Quit items, Cmd+Q, the panel and every exit request run this; a second call while it runs
+/// does nothing.
 pub fn quit_app(app: &AppHandle) {
-    let app = app.clone();
-    std::thread::spawn(move || {
-        stop_for_good(&app);
-        app.exit(0);
-    });
+    let flow = app.state::<Arc<QuitFlow>>().inner().clone();
+    let stop_app = app.clone();
+    let exit_app = app.clone();
+    windows::hide_all(app);
+    flow.quit_with(move || stop_for_good(&stop_app), move || exit_app.exit(0));
 }
 
 /// Probes again what runs outside the app (when the panel opens), off the main thread: a probe
@@ -103,9 +139,12 @@ pub fn quit_app(app: &AppHandle) {
 pub fn reprobe_outside(app: &AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
-        let config = app.state::<commands::ConfigState>().current();
-        if let Some(processes) = app.try_state::<Arc<Processes>>() {
-            processes.reprobe(&config);
+        // A second launch can open the panel before `setup` has managed these.
+        if let (Some(config), Some(processes)) = (
+            app.try_state::<commands::ConfigState>(),
+            app.try_state::<Arc<Processes>>(),
+        ) {
+            processes.reprobe(&config.current());
         }
     });
 }
@@ -172,7 +211,13 @@ fn report_status(app: AppHandle, poller: &Poller) {
         let _ = tx.send(status.clone());
     });
     std::thread::spawn(move || {
+        let mut icon = TrayIconKind::Normal;
         for status in rx {
+            let kind = tray_icon_for(&status.attention);
+            if kind != icon {
+                tray::set_icon(&app, kind);
+                icon = kind;
+            }
             let _ = app.emit(STATUS_EVENT, status);
         }
     });

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::process::spawn_program;
-use crate::test_procs::{gone, kill_in, tagged_sleep};
+use crate::test_procs::{gone, kill_in, left_in, tagged_sleep};
 
 /// How long a test waits for an event before it fails.
 const WAIT: Duration = Duration::from_secs(10);
@@ -124,6 +124,13 @@ fn model_progress_lines_are_events() {
         ]
     );
     assert!(!control.state().pulling);
+    // The pull ends by itself when the app dies.
+    let calls = fs::read_to_string(dir.path().join("calls")).unwrap();
+    let pull = format!(
+        "model pull --json --exit-with-parent {}",
+        std::process::id()
+    );
+    assert!(calls.lines().any(|l| l == pull), "{calls}");
 }
 
 #[test]
@@ -341,7 +348,7 @@ fn progress_after_a_pause_is_dropped() {
     let state = control.state();
     assert!(!state.pulling);
     assert_eq!(state.progress, None);
-    assert!(gone(dir.path()));
+    assert!(gone(dir.path()), "{}", left_in(dir.path()));
 }
 
 #[test]

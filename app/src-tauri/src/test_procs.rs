@@ -54,6 +54,19 @@ pub fn gone(dir: &Path) -> bool {
     }
 }
 
+/// What still runs in `dir`, for a failure message.
+pub fn left_in(dir: &Path) -> String {
+    let pids: Vec<String> = pids_in(dir).iter().map(i32::to_string).collect();
+    if pids.is_empty() {
+        return "nothing".to_owned();
+    }
+    let out = Command::new("ps")
+        .args(["-o", "pid,ppid,pgid,stat,command", "-p", &pids.join(",")])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 /// Sends SIGKILL to every process that names `dir`, so a failed test leaves nothing behind.
 pub fn kill_in(dir: &Path) {
     for pid in pids_in(dir) {

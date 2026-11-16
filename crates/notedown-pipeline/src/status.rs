@@ -80,14 +80,15 @@ pub fn status_facts(data: &Path, slug: &str, now_ms: u64) -> crate::Result<Statu
     let notes: Vec<_> = store.notes()?.into_iter().filter(|n| !n.deleted).collect();
     let pages = || notes.iter().flat_map(|n| &n.pages);
     let count = |s: PageOcrState| pages().filter(|p| p.state == s).count();
-    let stats = store.stats()?;
+    // A broken stats or error file is no reason to fail the status: it reads as none.
+    let stats = store.stats().unwrap_or_default();
     let errors = Errors::load_quietly(store.dir())?;
     let next_due_ms = [stats.next_due_ms, errors.next_try(now_ms)]
         .into_iter()
         .flatten()
         .filter(|&t| t > now_ms)
         .min();
-    let last_error = match (stats.last_error, source_error(data)?) {
+    let last_error = match (stats.last_error, source_error(data).ok().flatten()) {
         (Some(a), Some(b)) => Some(if b.at_ms > a.at_ms { b } else { a }),
         (a, b) => a.or(b),
     };

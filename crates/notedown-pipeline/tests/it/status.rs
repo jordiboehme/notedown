@@ -594,3 +594,24 @@ fn a_past_next_due_time_is_not_shown() {
     std::fs::write(&path, serde_json::to_vec(&stats).unwrap()).unwrap();
     assert_eq!(facts(&d.data).next_due_ms, Some(later));
 }
+
+#[test]
+fn a_broken_error_or_stats_file_does_not_fail_the_status() {
+    let d = setup();
+    d.put("test1", "NOTE/Note");
+    worker(&d, no_settle(), engine_reading("hello"))
+        .run_once(true)
+        .unwrap();
+    std::fs::write(d.data.join("pipeline/last_error.json"), "{not json").unwrap();
+    let f = status_facts(&d.data, SLUG, now_ms()).expect("a broken last_error.json");
+    assert_eq!(f.notes, 1);
+    assert!(f.last_error.is_none());
+    std::fs::write(
+        d.data.join("pipeline").join(SLUG).join("stats.json"),
+        [0xff, 0x00],
+    )
+    .unwrap();
+    let f = status_facts(&d.data, SLUG, now_ms()).expect("a broken stats.json");
+    assert_eq!(f.notes, 1);
+    assert_eq!((f.waiting, f.last_run_ms), (0, None));
+}

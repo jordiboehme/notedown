@@ -53,9 +53,18 @@ pub enum LoginError {
     },
 }
 
-/// One login at a time.
+/// One login at a time, and no log out during a login.
 #[derive(Default)]
 pub struct LoginGate(std::sync::Mutex<()>);
+
+impl LoginGate {
+    /// Waits until no login runs and keeps the next one out while the guard lives.
+    pub fn hold(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
 /// Whether the Keychain holds a token for the account of `config`.
 pub fn has_login(store: &dyn TokenStore, config: &AppConfig) -> Result<bool, String> {

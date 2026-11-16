@@ -229,8 +229,14 @@ fn expand_home(dir: &Path) -> Result<PathBuf, String> {
 }
 
 /// Log out: deletes the token of the account in the config, then forgets the account and
-/// the e-mail. The answer is the config without them.
-pub fn log_out_of(store: &dyn TokenStore, state: &ConfigState) -> Result<AppConfig, String> {
+/// the e-mail. The answer is the config without them. It takes the login lock: a log out
+/// during a login waits for it and then removes the token it left, so none stays behind.
+pub fn log_out_of(
+    gate: &LoginGate,
+    store: &dyn TokenStore,
+    state: &ConfigState,
+) -> Result<AppConfig, String> {
+    let _no_login = gate.hold();
     if let Some(key) = token_key(&state.current()) {
         store.delete(&key).map_err(|e| e.to_string())?;
     }
@@ -416,18 +422,21 @@ pub async fn has_login(config: State<'_, ConfigState>) -> Result<bool, String> {
         .map_err(|e| e.to_string())?
 }
 
-/// Log out: deletes the token from the Keychain and forgets the account, off the main thread,
-/// then polls again.
+/// Log out: deletes the token from the Keychain and forgets the account, off the main thread
+/// (where it may wait for a running login), then polls again.
 #[tauri::command]
 pub async fn log_out(
     config: State<'_, ConfigState>,
     poller: State<'_, Poller>,
+    gate: State<'_, Arc<LoginGate>>,
 ) -> Result<AppConfig, String> {
     let state = config.inner().clone();
-    let after =
-        tauri::async_runtime::spawn_blocking(move || log_out_of(&KeychainStore::new(), &state))
-            .await
-            .map_err(|e| e.to_string())??;
+    let gate = gate.inner().clone();
+    let after = tauri::async_runtime::spawn_blocking(move || {
+        log_out_of(&gate, &KeychainStore::new(), &state)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     poller.poll_now();
     Ok(after)
 }
@@ -848,7 +857,8 @@ mod tests {
         let store = MemoryStore::new();
         store.set("local|jordi", &Token::new("secret")).unwrap();
         store.set("local|other", &Token::new("other")).unwrap();
-        let after = log_out_of(&store, &state).unwrap();
+        let gate = LoginGate::default();
+        let after = log_out_of(&gate, &store, &state).unwrap();
         assert_eq!(store.get("local|jordi").unwrap(), None);
         assert!(store.get("local|other").unwrap().is_some());
         assert_eq!(after.account, None);
@@ -857,7 +867,7 @@ mod tests {
         assert_eq!(state.current(), after);
         assert_eq!(config::load(dir.path()), after);
         // Without an account there is nothing to delete.
-        log_out_of(&store, &state).unwrap();
+        log_out_of(&gate, &store, &state).unwrap();
     }
 
     #[test]

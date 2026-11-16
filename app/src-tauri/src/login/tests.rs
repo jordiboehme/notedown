@@ -676,3 +676,51 @@ fn a_new_local_folder_during_the_login_keeps_nothing() {
     assert_eq!(store.get("local|jordi").unwrap(), None);
     assert_eq!(state.current().account, None);
 }
+
+/// A log out that runs on a thread of its own.
+type LogOut = std::thread::JoinHandle<Result<AppConfig, String>>;
+
+#[test]
+fn a_log_out_during_a_login_leaves_no_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(LoginGate::default());
+    let store = Arc::new(MemoryStore::new());
+    let slot: Arc<Mutex<Option<ConfigState>>> = Arc::default();
+    let leaving: Arc<Mutex<Option<LogOut>>> = Arc::default();
+    let (hook_gate, hook_store, hook_slot, hook_leaving) =
+        (gate.clone(), store.clone(), slot.clone(), leaving.clone());
+    let server = Scripted::start_with(vec![code_answer(), token_answer("jordi")], move |n, _| {
+        if n == 1 {
+            // Log out is pressed while the login waits for its token.
+            let (gate, store) = (hook_gate.clone(), hook_store.clone());
+            let state = hook_slot.lock().unwrap().clone().unwrap();
+            *hook_leaving.lock().unwrap() = Some(std::thread::spawn(move || {
+                crate::commands::log_out_of(&gate, &*store, &state)
+            }));
+        }
+    });
+    let state = remote_config(dir.path(), server.port, None);
+    *slot.lock().unwrap() = Some(state.clone());
+    let saved = log_in(
+        &gate,
+        &state,
+        &ServeInfo::default(),
+        &*store,
+        "me@example.org",
+        &Password::new(PASSWORD),
+    )
+    .unwrap();
+    assert_eq!(saved.account.as_deref(), Some("jordi"));
+    let after = leaving
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the log out started")
+        .join()
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.account, None);
+    assert_eq!(after.email, None);
+    assert_eq!(store.get(&key(server.port, "jordi")).unwrap(), None);
+    assert_eq!(state.current().account, None);
+}

@@ -2784,3 +2784,99 @@ fn pipeline_exits_when_its_parent_is_gone() {
     assert!(log.contains("notedown pipeline: stopped"), "{log}");
     notedown_pipeline::store::WriterLock::take(data).unwrap();
 }
+
+#[cfg(feature = "ocr")]
+#[test]
+fn model_pull_exits_when_its_parent_is_gone() {
+    use std::io::{BufRead, Read};
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().unwrap();
+    // A proxy that takes the connection and never answers: the pull waits in it, so nothing
+    // leaves this machine and the test knows the pull runs.
+    let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    proxy.set_nonblocking(true).unwrap();
+    let proxy_url = format!("http://127.0.0.1:{}", proxy.local_addr().unwrap().port());
+    // A second guard: no part file can be written, so no download could go on even without
+    // the proxy.
+    let model_dir = dir.path().join("model");
+    std::fs::create_dir(&model_dir).unwrap();
+    std::fs::set_permissions(&model_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    /// Makes the folder writable again at the end, also on a failure, so it can be removed.
+    struct Writable<'a>(&'a std::path::Path);
+    impl Drop for Writable<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let _writable = Writable(&model_dir);
+    let log = dir.path().join("child.log");
+    // The parent starts the pull, says its pid and lives until its stdin closes.
+    let mut parent = std::process::Command::new("sh")
+        .args([
+            "-c",
+            r#""$@" --exit-with-parent $$ >"$LOG" 2>&1 </dev/null &
+echo $!
+read x || true"#,
+            "sh",
+        ])
+        .arg(env!("CARGO_BIN_EXE_notedown"))
+        .args(["model", "pull", "--json"])
+        .env("LOG", &log)
+        .env("NOTEDOWN_MODEL_DIR", &model_dir)
+        .env("HTTPS_PROXY", &proxy_url)
+        .env("https_proxy", &proxy_url)
+        .env("HTTP_PROXY", &proxy_url)
+        .env("http_proxy", &proxy_url)
+        .env("ALL_PROXY", &proxy_url)
+        .env("all_proxy", &proxy_url)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(parent.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let pid = line.trim().to_string();
+    let _orphan = Orphan(pid.clone());
+    let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
+    // The pull asks the proxy for the model host: the flag was taken and the pull runs.
+    let until = Instant::now() + Duration::from_secs(10);
+    let mut stream = loop {
+        match proxy.accept() {
+            Ok((stream, _)) => break stream,
+            Err(_) if Instant::now() < until && !gone(&pid) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => {
+                drop(parent.stdin.take());
+                let _ = parent.wait();
+                panic!("the pull never asked the proxy: {}", read_log());
+            }
+        }
+    };
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut head = [0u8; 256];
+    let n = stream.read(&mut head).unwrap_or(0);
+    let head = String::from_utf8_lossy(&head[..n]).to_string();
+    assert!(head.starts_with("CONNECT huggingface.co:443"), "{head}");
+    // The parent leaves; the pull follows within a few seconds.
+    drop(parent.stdin.take());
+    assert!(parent.wait().unwrap().success());
+    let end = Instant::now() + Duration::from_secs(3);
+    while !gone(&pid) {
+        assert!(
+            Instant::now() < end,
+            "the pull still runs 3 s after its parent: {}",
+            read_log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(stream);
+}

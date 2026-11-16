@@ -535,6 +535,9 @@ enum ModelAction {
         /// Print one JSON line per progress update on stdout
         #[arg(long)]
         json: bool,
+        /// Stop when the process PID is no longer the parent (for the Mac app)
+        #[arg(long, value_name = "PID", hide = true)]
+        exit_with_parent: Option<u32>,
     },
     /// Print the cache folder and the model file paths
     Path,
@@ -763,7 +766,12 @@ fn ready_json(path: &Path) -> String {
 #[cfg(feature = "ocr")]
 fn model_command(action: ModelAction) -> Result<ExitCode> {
     match action {
-        ModelAction::Pull { json } => {
+        ModelAction::Pull {
+            json,
+            exit_with_parent: parent,
+        } => {
+            // SIGTERM ends the pull as it is; the part file stays and the next pull continues.
+            exit_with_parent(parent);
             let mut last = Instant::now() - Duration::from_secs(10);
             let mut current = String::new();
             let mut progress = |file: &str, done: u64, total: u64| {

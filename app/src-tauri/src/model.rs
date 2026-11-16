@@ -188,7 +188,15 @@ impl ModelControl {
         if run.removing {
             return Err(REMOVE_RUNS.to_owned());
         }
-        let mut command = (self.inner.spawn)(&args(&["model", "pull", "--json"]));
+        // The pull also ends when the app dies without a clean Quit, as the children do.
+        let parent = std::process::id().to_string();
+        let mut command = (self.inner.spawn)(&args(&[
+            "model",
+            "pull",
+            "--json",
+            "--exit-with-parent",
+            &parent,
+        ]));
         command
             .process_group(0)
             .stdin(Stdio::null())

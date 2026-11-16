@@ -47,7 +47,7 @@ Useful options:
 - `--force`: convert again, even when the Markdown is up to date.
 - `notedown render "My note.note"`: only the page images, no OCR.
 
-The README has all options and the output format.
+The [reference](reference.md) has all options and the output format.
 
 ## Part 2: Notedown as Private Cloud
 

@@ -822,6 +822,35 @@ fn the_worker_says_a_refusal_once() {
 }
 
 #[test]
+fn a_refused_token_on_a_fresh_folder_is_the_last_error() {
+    let rig = Rig::new();
+    rig.connect(SLUG);
+    rig.d.put("test1", "NOTE/Note");
+    let clock = TestClock::at(now_ms());
+    let s = rest_setup(&rig, &clock);
+    revoke_all_tokens(&rig.d.data, SLUG).unwrap();
+    let said = Said::default();
+    let mut w = worker(&s, &clock, &said);
+    w.run(stop_at(&clock, clock.now_ms() + 2_000)).unwrap();
+    // No store of the account was made, the refusal shows all the same.
+    assert!(!rig.local.path().join("pipeline").join(SLUG).exists());
+    let status = |c: &TestClock| {
+        notedown_pipeline::status::status_facts(rig.local.path(), SLUG, c.now_ms()).unwrap()
+    };
+    let e = status(&clock)
+        .last_error
+        .expect("the refusal is the last error");
+    assert_eq!(
+        e.text,
+        refused_message(&rig.server.url(), rig.local.path(), SLUG)
+    );
+    // A new login clears it.
+    rig.connect(SLUG);
+    w.run(stop_at(&clock, clock.now_ms() + 2_000)).unwrap();
+    assert!(status(&clock).last_error.is_none(), "{:?}", said.lines());
+}
+
+#[test]
 fn a_flapping_network_is_said_once() {
     // Every other request is closed after its head, the others get an answer that is no HTTP:
     // two kinds of transport error, one after the other.

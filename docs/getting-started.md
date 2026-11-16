@@ -303,7 +303,7 @@ The first run reads every note in scope, newest note first, and prints its progr
 claude mcp add notedown -- notedown mcp --data ~/notedown-data
 ```
 
-With more than one account in the data folder, add `--account me`. The server only reads the text and the bookmarks of the agents. It never runs OCR. Ask Claude "what changed in my notes since yesterday?" to try it.
+With more than one account in the data folder, add `--account me`. The server only reads the text and the bookmarks of the agents, and it keeps the time an agent last read the changes. It never runs OCR. Ask Claude "what changed in my notes since yesterday?" to try it.
 
 **Install the ingest skill.** The skill tells the agent how to put the changes into Crystalline: it plans, gives the notes of one folder to one sub-agent, and confirms only when all of them succeeded. Copy it from a source checkout of Notedown:
 

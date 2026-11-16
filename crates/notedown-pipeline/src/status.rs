@@ -10,10 +10,11 @@ use time::UtcOffset;
 use crate::delta::{self, Start};
 use crate::errors::Errors;
 use crate::model::PageOcrState;
-use crate::store::{LastError, TextStore, Work, WriterLock};
+use crate::store::{LastError, TextStore, Work, WriterLock, source_error};
 
 /// The status of one account. The serialized fields are the JSON of
-/// `notedown pipeline status`; the skipped ones are for the MCP `status` tool.
+/// `notedown pipeline status`; the skipped ones are for the MCP `status` tool. `waiting` and
+/// `nextDueMs` are as of the worker's last pass; a stopped worker leaves them as they were.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusFacts {
@@ -28,7 +29,7 @@ pub struct StatusFacts {
     /// Due pages of notes still within their settle time, as of the last pass.
     pub waiting: u64,
     /// When the next settle time or retry ends (ms): the last pass's value or the next retry
-    /// of a failed page, whichever comes first.
+    /// of a failed page, whichever comes first; `None` when that time has passed.
     pub next_due_ms: Option<u64>,
     /// Pages whose tries are used up.
     pub failed: usize,
@@ -36,7 +37,8 @@ pub struct StatusFacts {
     pub truncated: usize,
     /// Failed pages (and notes that do not parse) that are tried again.
     pub errors: usize,
-    /// The last failure of the worker as a whole; cleared by a good pass.
+    /// The last failure of the worker as a whole, of this account or of the source (the newer
+    /// one); cleared by a good pass or a good look at the source.
     pub last_error: Option<LastError>,
     /// When the last pass ended (ms).
     pub last_run_ms: Option<u64>,
@@ -79,9 +81,14 @@ pub fn status_facts(data: &Path, slug: &str, now_ms: u64) -> crate::Result<Statu
     let pages = || notes.iter().flat_map(|n| &n.pages);
     let count = |s: PageOcrState| pages().filter(|p| p.state == s).count();
     let stats = store.stats()?;
-    let errors = Errors::load(store.dir())?;
-    let next_due_ms = match (stats.next_due_ms, errors.next_try(now_ms)) {
-        (Some(a), Some(b)) => Some(a.min(b)),
+    let errors = Errors::load_quietly(store.dir())?;
+    let next_due_ms = [stats.next_due_ms, errors.next_try(now_ms)]
+        .into_iter()
+        .flatten()
+        .filter(|&t| t > now_ms)
+        .min();
+    let last_error = match (stats.last_error, source_error(data)?) {
+        (Some(a), Some(b)) => Some(if b.at_ms > a.at_ms { b } else { a }),
         (a, b) => a.or(b),
     };
     // A file a killed worker left is not shown; a broken one is no reason to fail the status.
@@ -113,7 +120,7 @@ pub fn status_facts(data: &Path, slug: &str, now_ms: u64) -> crate::Result<Statu
         failed: count(PageOcrState::Failed),
         truncated: count(PageOcrState::Truncated),
         errors: errors.entries().iter().filter(|e| !e.exhausted()).count(),
-        last_error: stats.last_error,
+        last_error,
         last_run_ms: (stats.last_run_ms > 0).then_some(stats.last_run_ms),
         in_work,
         consumers,

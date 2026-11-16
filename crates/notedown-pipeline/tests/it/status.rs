@@ -5,8 +5,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use notedown_cloud::appdata::Digest;
+use notedown_cloud::auth::Accounts;
+use notedown_cloud::journal::Journal;
 use notedown_ocr::{OcrEngine, OcrError};
 use notedown_pipeline::PipelineConfig;
+use notedown_pipeline::records::{Record, Records};
+use notedown_pipeline::source::{JournalBatch, NoteBytes, ServerAccount, ServerData};
 use notedown_pipeline::status::{StatusFacts, status_facts};
 use notedown_pipeline::store::{Bookmark, TextStore, WORK_FILE, Work, WriterLock};
 use notedown_pipeline::worker::{Clock, Worker};
@@ -381,4 +386,211 @@ fn a_writer_starts_while_status_probes() {
         .join()
         .unwrap()
         .expect("the writer waits for the probe");
+}
+
+/// The server data of one machine, with a switch that fails the account list and a list of
+/// refused tokens, as a server that cannot be reached or a revoked token would.
+struct Flaky {
+    inner: Arc<dyn ServerData>,
+    fail: Arc<AtomicBool>,
+    refused: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl ServerData for Flaky {
+    fn describe(&self) -> String {
+        "flaky server".into()
+    }
+    fn accounts(&self) -> notedown_pipeline::Result<Vec<ServerAccount>> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(notedown_pipeline::Error::Read(
+                "the server cannot be reached".into(),
+            ));
+        }
+        let refused = self.refused.lock().unwrap().clone();
+        Ok(self
+            .inner
+            .accounts()?
+            .into_iter()
+            .filter(|a| !refused.iter().any(|(s, _)| s == &a.slug))
+            .collect())
+    }
+    fn records(&self, slug: &str) -> notedown_pipeline::Result<Records> {
+        self.inner.records(slug)
+    }
+    fn record(&self, slug: &str, key: &str) -> notedown_pipeline::Result<Option<Record>> {
+        self.inner.record(slug, key)
+    }
+    fn note(&self, slug: &str, path: &str) -> notedown_pipeline::Result<NoteBytes> {
+        self.inner.note(slug, path)
+    }
+    fn note_exists(&self, slug: &str, path: &str) -> notedown_pipeline::Result<Option<bool>> {
+        self.inner.note_exists(slug, path)
+    }
+    fn digests(&self, slug: &str) -> notedown_pipeline::Result<Vec<Digest>> {
+        self.inner.digests(slug)
+    }
+    fn journal(
+        &self,
+        slug: &str,
+        from: u64,
+        limit: usize,
+    ) -> notedown_pipeline::Result<JournalBatch> {
+        self.inner.journal(slug, from, limit)
+    }
+    fn refusals(&self) -> Vec<(String, String)> {
+        self.refused.lock().unwrap().clone()
+    }
+}
+
+struct FlakyRig {
+    setup: notedown_pipeline::setup::Setup,
+    fail: Arc<AtomicBool>,
+    refused: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+fn flaky(d: &crate::worker::Data) -> FlakyRig {
+    let mut setup = one_machine(d, no_settle());
+    let fail = Arc::new(AtomicBool::new(false));
+    let refused: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    setup.source = Arc::new(Flaky {
+        inner: setup.source.clone(),
+        fail: fail.clone(),
+        refused: refused.clone(),
+    });
+    FlakyRig {
+        setup,
+        fail,
+        refused,
+    }
+}
+
+fn quiet() -> Arc<dyn Fn(&str) + Send + Sync> {
+    Arc::new(|_: &str| {})
+}
+
+#[test]
+fn an_account_list_error_is_the_last_error_until_the_list_works() {
+    let d = setup();
+    d.put("test1", "NOTE/Note");
+    let rig = flaky(&d);
+    let clock = TestClock::at(now_ms());
+    let t0 = clock.now_ms();
+    let during: Arc<Mutex<Option<StatusFacts>>> = Arc::default();
+    let (c, fail, data, seen) = (
+        clock.clone(),
+        rig.fail.clone(),
+        d.data.clone(),
+        during.clone(),
+    );
+    // A good turn (a pass), then the list fails from 2 s to 5 s, then works again.
+    let stop = move || {
+        let t = c.now_ms() - t0;
+        if (4_000..5_000).contains(&t) {
+            *seen.lock().unwrap() = Some(status_facts(&data, SLUG, c.now_ms()).unwrap());
+        }
+        fail.store((2_000..5_000).contains(&t), Ordering::SeqCst);
+        t >= 8_000
+    };
+    Worker::new(&rig.setup, Box::new(engine_reading("hello")))
+        .with_clock(Arc::new(clock.clone()))
+        .with_messages(quiet())
+        .run(stop)
+        .unwrap();
+    let during = during
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("a status while it failed");
+    let e = during.last_error.expect("the list error is the last error");
+    assert!(
+        e.text.contains("the server cannot be reached"),
+        "{}",
+        e.text
+    );
+    let f = facts(&d.data);
+    assert!(f.last_error.is_none(), "{:?}", f.last_error);
+    // The recovery started a pass at once, not after the rescan time.
+    assert!(
+        f.last_run_ms.is_some_and(|ms| ms >= t0 + 5_000),
+        "{:?} {t0}",
+        f.last_run_ms
+    );
+}
+
+#[test]
+fn a_refused_token_is_the_last_error_until_it_works_again() {
+    let d = setup();
+    d.put("test1", "NOTE/Note");
+    let rig = flaky(&d);
+    rig.refused
+        .lock()
+        .unwrap()
+        .push((SLUG.into(), "the token of jordi was refused".into()));
+    let clock = TestClock::at(now_ms());
+    let mut w = Worker::new(&rig.setup, Box::new(engine_reading("hello")))
+        .with_clock(Arc::new(clock.clone()))
+        .with_messages(quiet());
+    w.run(stop_at(&clock, clock.now_ms() + 2_000)).unwrap();
+    let e = facts(&d.data)
+        .last_error
+        .expect("the refusal is the last error");
+    assert!(
+        e.text.contains("the token of jordi was refused"),
+        "{}",
+        e.text
+    );
+    rig.refused.lock().unwrap().clear();
+    w.run(stop_at(&clock, clock.now_ms() + 2_000)).unwrap();
+    assert!(facts(&d.data).last_error.is_none());
+}
+
+#[test]
+fn in_work_names_only_the_account_being_read() {
+    let d = setup();
+    d.put("test1", "NOTE/Note");
+    Accounts::new(&d.data)
+        .create("anna", "anna@example.org", "secret")
+        .unwrap();
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/notes/test2.note");
+    let journal = Journal::open(&d.data).unwrap();
+    notedown_cloud::put::put(&d.data, "anna", &journal, &src, "NOTE/Note", None).unwrap();
+    // Per engine call: the page in work of jordi and of anna.
+    type Seen = Vec<(Option<Work>, Option<Work>)>;
+    let seen: Arc<Mutex<Seen>> = Arc::default();
+    let (data, out) = (d.data.clone(), seen.clone());
+    let engine = engine_reading("hello").on_call(move || {
+        let of = |slug: &str| status_facts(&data, slug, now_ms()).unwrap().in_work;
+        out.lock().unwrap().push((of(SLUG), of("anna")));
+    });
+    worker(&d, no_settle(), engine).run_once(true).unwrap();
+    let seen = seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    for (jordi, anna) in seen.iter() {
+        assert!(
+            jordi.is_some() != anna.is_some(),
+            "one account in work at a time: {jordi:?} {anna:?}"
+        );
+    }
+    assert!(seen.iter().any(|(j, _)| j.is_some()) && seen.iter().any(|(_, a)| a.is_some()));
+}
+
+#[test]
+fn a_past_next_due_time_is_not_shown() {
+    let d = setup();
+    d.put("test1", "NOTE/Note");
+    worker(&d, no_settle(), engine_reading("hello"))
+        .run_once(true)
+        .unwrap();
+    let path = d.data.join("pipeline").join(SLUG).join("stats.json");
+    let mut stats: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    stats["waiting"] = json!(1);
+    stats["nextDueMs"] = json!(now_ms() - 1_000);
+    std::fs::write(&path, serde_json::to_vec(&stats).unwrap()).unwrap();
+    assert_eq!(facts(&d.data).next_due_ms, None);
+    let later = now_ms() + 60_000;
+    stats["nextDueMs"] = json!(later);
+    std::fs::write(&path, serde_json::to_vec(&stats).unwrap()).unwrap();
+    assert_eq!(facts(&d.data).next_due_ms, Some(later));
 }

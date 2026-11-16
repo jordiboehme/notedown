@@ -46,7 +46,7 @@ use crate::retention;
 use crate::scope::in_scope;
 use crate::setup::Setup;
 use crate::source::{Removal, ServerAccount, ServerData};
-use crate::store::{LastError, TextStore, WriterLock};
+use crate::store::{LastError, TextStore, WriterLock, clear_source_error, set_source_error};
 use crate::{Error, Result};
 use note::{Mode, NoteJob};
 
@@ -400,6 +400,34 @@ impl Worker {
         }
     }
 
+    /// Keeps the last error of the source after a look at it (`<local>/pipeline/
+    /// last_error.json`): `failed`, the error of the account list, else the refused tokens.
+    /// With neither, the error is cleared. Best effort, as [`keep_error`](Self::keep_error).
+    fn source_seen(&self, lock: &WriterLock, failed: Option<String>) {
+        let text = failed.or_else(|| {
+            let refused: Vec<String> = self
+                .setup
+                .source
+                .refusals()
+                .into_iter()
+                .map(|(_, message)| message)
+                .collect();
+            (!refused.is_empty()).then(|| refused.join("; "))
+        });
+        let local = &self.setup.local;
+        let _ = match text {
+            Some(text) => set_source_error(
+                local,
+                lock,
+                LastError {
+                    text,
+                    at_ms: self.clock.now_ms(),
+                },
+            ),
+            None => clear_source_error(local, lock),
+        };
+    }
+
     /// Deletes the tombstones under `<local>/pipeline`; the ones that stay are said once.
     fn sweep(&self, lock: &WriterLock) {
         let swept = TextStore::sweep_all(&self.setup.local, lock);
@@ -598,6 +626,7 @@ impl Worker {
             Err(e) => return Err(e),
         };
         let lock = self.take_lock()?;
+        self.source_seen(&lock, None);
         let mut stores = BTreeMap::new();
         let (progress, _) = self.pass(&lock, &mut stores, &accounts, ignore_settle, &|| false)?;
         Ok(progress)
@@ -608,6 +637,7 @@ impl Worker {
     pub fn reocr(&mut self, note: Option<&str>) -> Result<Progress> {
         let served = self.followed()?.served;
         let lock = self.take_lock()?;
+        self.source_seen(&lock, None);
         let source = self.setup.source.clone();
         let mut progress = Progress::default();
         let mut found = false;
@@ -720,20 +750,32 @@ impl Worker {
         let mut stores = BTreeMap::new();
         let mut look = true;
         let mut next_wake = 0u64;
+        // The last look at the source: whether its account list failed, and the refused
+        // tokens. A change means a pass at once, so its errors clear without the rescan.
+        let mut source_failed = false;
+        let mut refused: Vec<String> = Vec::new();
         loop {
             match self.followed() {
                 // Nothing known: no pass, no cursor moves; asked again at the next poll.
                 Err(e) => {
                     let message = format!("{}: {e}", self.setup.source.describe());
-                    if let Ok(slugs) = crate::setup::local_stores(&self.setup.local, false) {
-                        for slug in slugs {
-                            self.keep_error(&lock, &slug, message.clone());
-                        }
-                    }
+                    self.source_seen(&lock, Some(message.clone()));
+                    source_failed = true;
                     self.say_once("accounts", format!("notedown pipeline: {message}"));
                 }
                 Ok(followed) => {
                     self.settled("accounts");
+                    let now_refused: Vec<String> = self
+                        .setup
+                        .source
+                        .refusals()
+                        .into_iter()
+                        .map(|(slug, _)| slug)
+                        .collect();
+                    look |= source_failed || now_refused != refused;
+                    source_failed = false;
+                    refused = now_refused;
+                    self.source_seen(&lock, None);
                     for slug in &followed.journals {
                         let (changed, removed) = self.follow(slug, &mut follows);
                         look |= changed;
@@ -972,10 +1014,6 @@ impl Worker {
         // Per account for its stats: the waiting pages and the next due time.
         let mut waiting: BTreeMap<String, (u64, Option<u64>)> = BTreeMap::new();
         let mut unsure: BTreeSet<String> = BTreeSet::new();
-        // A refused token leaves its account out of the pass: its store keeps the refusal.
-        for (slug, message) in self.setup.source.refusals() {
-            self.keep_error(lock, &slug, message);
-        }
         // Only the stores of this pass stay open: no stamp or prune touches another one, and a
         // removed account's folder is never made again.
         stores.retain(|slug, _| accounts.iter().any(|a| &a.slug == slug));
@@ -1067,6 +1105,8 @@ impl Worker {
         let clock = self.clock.clone();
         let now_fn = || clock.now_ms();
         let mut broken: Vec<String> = Vec::new();
+        // The account read last: its work file goes when the queue moves to another account.
+        let mut in_work: Option<&String> = None;
         for (i, (slug, d)) in queue.iter().enumerate() {
             if broken.contains(slug) {
                 continue;
@@ -1082,6 +1122,12 @@ impl Worker {
             let (Some(text), Some((r, digests))) = (stores.get(slug), recs.get(slug)) else {
                 continue;
             };
+            if let Some(last) = in_work.filter(|last| *last != slug)
+                && let Ok(store) = TextStore::at(&self.setup.local, last)
+            {
+                let _ = store.clear_work(lock);
+            }
+            in_work = Some(slug);
             let job = NoteJob {
                 source: &*source,
                 slug,

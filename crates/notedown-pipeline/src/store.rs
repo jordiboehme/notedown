@@ -36,6 +36,9 @@ const CONSUMERS_DIR: &str = "consumers";
 const STATS_FILE: &str = "stats.json";
 /// `<data>/pipeline/<slug>/work.json`: the page the writer reads now.
 pub const WORK_FILE: &str = "work.json";
+/// `<data>/pipeline/last_error.json`: the last error of the source as a whole (the account
+/// list failed, a token was refused), which no account store may hold.
+pub const LAST_ERROR_FILE: &str = "last_error.json";
 /// How long [`WriterLock::take`] tries before [`Error::WriterBusy`]: a status probe holds the
 /// lock for a moment and must not stop a starting writer.
 const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -255,6 +258,32 @@ pub struct Stats {
     /// The last failure of the worker; cleared by a good pass.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<LastError>,
+}
+
+/// The last error of the source as a whole (`<data>/pipeline/last_error.json`), `None` when
+/// there is none.
+pub fn source_error(data: &Path) -> Result<Option<LastError>> {
+    read_json(&data.join(PIPELINE_DIR).join(LAST_ERROR_FILE))
+}
+
+/// Keeps `error` as the last error of the source. The same text again keeps the first time
+/// and writes nothing.
+pub fn set_source_error(data: &Path, _w: &WriterLock, error: LastError) -> Result<()> {
+    if source_error(data)?.is_some_and(|e| e.text == error.text) {
+        return Ok(());
+    }
+    let path = data.join(PIPELINE_DIR).join(LAST_ERROR_FILE);
+    notedown_cloud::fsutil::write_atomic(&path, &json_bytes(&error)?, false)?;
+    Ok(())
+}
+
+/// Removes the last error of the source; a missing one is fine.
+pub fn clear_source_error(data: &Path, _w: &WriterLock) -> Result<()> {
+    let path = data.join(PIPELINE_DIR).join(LAST_ERROR_FILE);
+    match std::fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(io_err(&path)(e)),
+        _ => Ok(()),
+    }
 }
 
 /// `work.json`: the page the writer reads now.

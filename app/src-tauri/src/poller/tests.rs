@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::Instant;

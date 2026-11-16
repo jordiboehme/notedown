@@ -24,6 +24,8 @@ tauri-build = { version = "=2.7.4", features = [] }
 tauri = { version = "=2.12.5", features = ["tray-icon", "image-png"] }
 # A second launch opens the panel of the running app instead of starting a second one.
 tauri-plugin-single-instance = "=2.5.5"
+# "Start at login" on the General page, as a LaunchAgent. Off until the user turns it on.
+tauri-plugin-autostart = "=2.7.0"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 # The token lives in the macOS Keychain; without apple-native keyring can fall back to a mock.

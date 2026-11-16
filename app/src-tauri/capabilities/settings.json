@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "settings",
+  "description": "The settings window names itself after the page it shows. Start at login goes through Rust commands, so no window gets the autostart permissions.",
+  "windows": ["settings"],
+  "permissions": ["core:window:allow-set-title"]
+}

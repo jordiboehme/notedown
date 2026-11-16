@@ -3,8 +3,8 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Arc;
+use std::process::{Command, ExitStatus, Output, Stdio};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use crate::config::{self, AppConfig, Mode};
@@ -118,6 +118,58 @@ pub fn spawn_program(program: PathBuf) -> SpawnFn {
         cmd.args(args);
         cmd
     })
+}
+
+/// Runs a short `notedown` call to its end and returns what it printed. A call that takes
+/// longer than `timeout` gets SIGKILL and is an error.
+pub fn run_bounded(spawn: &SpawnFn, args: &[String], timeout: Duration) -> Result<Output, String> {
+    let mut command: Command = spawn(args);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command
+        .spawn()
+        .map_err(|e| format!("notedown could not start: {e}"))?;
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(output) => output.map_err(|e| format!("notedown could not be read: {e}")),
+        Err(_) => {
+            // The waiter has not reaped the child yet, so the pid is still this child's.
+            if let Ok(pid) = i32::try_from(pid) {
+                // SAFETY: kill only sends a signal; the pid belongs to our unreaped child.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            let _ = rx.recv();
+            Err("it did not answer in time".to_owned())
+        }
+    }
+}
+
+/// What a failed `notedown` call says: its last `error: ` line without that prefix (not the
+/// warnings before it), else all of its stderr lines, else how it ended.
+pub fn error_text(stderr: &[u8], status: ExitStatus) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let text = match lines.iter().rev().find_map(|l| l.strip_prefix("error: ")) {
+        Some(error) => error.to_owned(),
+        None => lines.join(" "),
+    };
+    if !text.is_empty() {
+        return text;
+    }
+    match status.code() {
+        Some(code) => format!("it ended with exit code {code}"),
+        None => "it ended by a signal".to_owned(),
+    }
 }
 
 /// Sends `signal` to every process in the group `pgid`. A group that is gone is no error.

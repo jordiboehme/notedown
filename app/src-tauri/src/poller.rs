@@ -8,13 +8,13 @@
 //! second.
 
 use reqwest::header::{AUTHORIZATION, HeaderValue};
-use std::process::{Command, Output, Stdio};
+use std::process::Output;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::config::{self, AppConfig, ExistingSetup, Mode};
-use crate::process::SpawnFn;
+use crate::process::{self, SpawnFn};
 use crate::processes::ProcessStates;
 use crate::serve_info::{self, ServeInfo};
 use crate::status::{
@@ -556,35 +556,9 @@ impl RealSources {
 
 /// Runs `pipeline status` and reads its answer; ends it after `timeout`.
 pub fn run_status(spawn: &SpawnFn, args: &[String], timeout: Duration) -> PipelineCall {
-    let mut command: Command = spawn(args);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let child = match command.spawn() {
-        Ok(child) => child,
-        Err(e) => return PipelineCall::Failed(format!("notedown could not start: {e}")),
-    };
-    let pid = child.id();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    let output = match rx.recv_timeout(timeout) {
-        Ok(output) => output,
-        Err(_) => {
-            // The waiter has not reaped the child yet, so the pid is still this child's.
-            if let Ok(pid) = i32::try_from(pid) {
-                // SAFETY: kill only sends a signal; the pid belongs to our unreaped child.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-            }
-            let _ = rx.recv();
-            return PipelineCall::Failed("it did not answer in time".to_owned());
-        }
-    };
-    match output {
+    match process::run_bounded(spawn, args, timeout) {
         Ok(output) => read_status(&output),
-        Err(e) => PipelineCall::Failed(format!("notedown could not be read: {e}")),
+        Err(why) => PipelineCall::Failed(why),
     }
 }
 
@@ -595,24 +569,7 @@ fn read_status(output: &Output) -> PipelineCall {
             Err(e) => PipelineCall::Failed(format!("the answer could not be read: {e}")),
         };
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let lines: Vec<&str> = stderr
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    // The error line of `notedown` (`error: ...`) without the warnings before it.
-    let text = match lines.iter().rev().find_map(|l| l.strip_prefix("error: ")) {
-        Some(error) => error.to_owned(),
-        None => lines.join(" "),
-    };
-    if !text.is_empty() {
-        return PipelineCall::Failed(text);
-    }
-    PipelineCall::Failed(match output.status.code() {
-        Some(code) => format!("it ended with exit code {code}"),
-        None => "it ended by a signal".to_owned(),
-    })
+    PipelineCall::Failed(process::error_text(&output.stderr, output.status))
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 
 pub mod commands;
 pub mod config;
+pub mod model;
 pub mod pidfile;
 pub mod poller;
 pub mod probe;
@@ -19,6 +20,7 @@ use std::sync::{Arc, mpsc};
 
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
 
+use model::{ModelControl, ModelEvent};
 use poller::{Inputs, Poller, RealSources, TICK_EVERY};
 use process::ChildKind;
 use processes::{Options, Processes, REPROBE_EVERY};
@@ -38,6 +40,10 @@ pub fn identifier() -> &'static str {
 /// The event that reports a new state of a child: `{ kind: "server" | "pipeline", state }`.
 pub const PROCESS_STATE_EVENT: &str = "process-state";
 
+/// How long a stopped model download may take to end before SIGKILL. A download has nothing
+/// to save: its part file is kept as it is.
+const MODEL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The event that carries a new [`Status`].
 pub const STATUS_EVENT: &str = "status";
 
@@ -54,6 +60,13 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             windows::show_panel(app);
         }))
+        // "Start at login" on the General page. Only Rust calls it (get_autostart,
+        // set_autostart); no window has its permissions. It is off until the user turns it on.
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .macos_launcher(tauri_plugin_autostart::MacosLauncher::LaunchAgent)
+                .build(),
+        )
         .menu(tray::app_menu)
         .on_menu_event(|app, event| tray::on_menu_event(app, event.id().as_ref()))
         .on_window_event(windows::on_window_event)
@@ -81,6 +94,7 @@ pub fn run() {
                 server_grace: ChildKind::Server.grace(),
                 pipeline_grace: ChildKind::Pipeline.grace(),
             }));
+            app.manage(model_control(app.handle().clone(), sidecar_spawn.clone()));
             let poller = status_poller(sidecar_spawn, reader, processes.clone());
             report_states(app.handle().clone(), &processes, poller.clone());
             report_status(app.handle().clone(), &poller);
@@ -101,7 +115,17 @@ pub fn run() {
             commands::open_library,
             commands::open_settings,
             commands::quit_app,
-            commands::request_quit
+            commands::request_quit,
+            commands::log_out,
+            commands::process_logs,
+            commands::mcp_info,
+            commands::open_link,
+            commands::get_autostart,
+            commands::set_autostart,
+            commands::model_state,
+            commands::model_pull,
+            commands::model_pause,
+            commands::model_remove
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
@@ -181,14 +205,44 @@ pub fn reprobe_outside(app: &AppHandle) {
     });
 }
 
-/// Stops both children for good, at once. The model pull joins here later.
+/// Stops both children and the model download for good, all at once.
 fn stop_for_good(app: &AppHandle) {
     if let Some(poller) = app.try_state::<Poller>() {
         poller.stop();
     }
-    if let Some(processes) = app.try_state::<Arc<Processes>>() {
-        processes.quit();
-    }
+    let model = app.try_state::<ModelControl>().map(|m| m.inner().clone());
+    std::thread::scope(|s| {
+        if let Some(model) = model {
+            s.spawn(move || model.quit());
+        }
+        if let Some(processes) = app.try_state::<Arc<Processes>>() {
+            processes.quit();
+        }
+    });
+}
+
+/// The model download. Its events only go into a channel; a thread of its own emits them.
+fn model_control(app: AppHandle, spawn: process::SpawnFn) -> ModelControl {
+    let (tx, rx) = mpsc::channel::<ModelEvent>();
+    std::thread::spawn(move || {
+        for event in rx {
+            let _ = match event {
+                ModelEvent::Progress(progress) => app.emit(model::MODEL_PROGRESS_EVENT, progress),
+                ModelEvent::Ready(state) => app.emit(model::MODEL_READY_EVENT, state),
+                ModelEvent::Failed { text } => app.emit(
+                    model::MODEL_FAILED_EVENT,
+                    serde_json::json!({ "text": text }),
+                ),
+            };
+        }
+    });
+    ModelControl::new(
+        spawn,
+        MODEL_GRACE,
+        Arc::new(move |event: &ModelEvent| {
+            let _ = tx.send(event.clone());
+        }),
+    )
 }
 
 /// Starts the children as the config asks, then probes what is `Outside` every 30 s.

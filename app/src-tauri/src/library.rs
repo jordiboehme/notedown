@@ -16,8 +16,9 @@
 //! The listed folders and how they follow the server's changes: `library/cache.rs` (the rules)
 //! and `library/listing.rs` (the calls and the follower).
 
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -199,6 +200,10 @@ pub enum LibraryEvent {
     /// The library bound again (or must list again): the window drops what it shows and lists
     /// its folders again.
     Relist,
+    /// The recycle bin may have changed (the app's own delete, restore or Empty, or a
+    /// `file.deleted` or `folder.deleted` the follower read): the window lists the bin again
+    /// when it shows it, and ignores this otherwise.
+    Recycle,
 }
 
 /// Where the library's events go. It must not block: the app only puts them into a channel.
@@ -286,6 +291,10 @@ struct Inner {
     stepping: Mutex<()>,
     /// Wakes the follower's thread, once it runs.
     waker: Mutex<Option<Sender<()>>>,
+    /// The id of the last job.
+    next_job: AtomicU64,
+    /// Restores that ask for another name, by the key of their bin item.
+    asking: Mutex<HashMap<String, Job>>,
 }
 
 /// What the library is bound to.
@@ -349,6 +358,8 @@ impl Library {
                 follow: Mutex::new(listing::Follow::default()),
                 stepping: Mutex::new(()),
                 waker: Mutex::new(None),
+                next_job: AtomicU64::new(0),
+                asking: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -402,6 +413,7 @@ impl Library {
         drop(old);
         // The follower of the old binding stops (its session is cancelled) and the cache goes.
         self.reset_listing(generation);
+        self.cancel_asking();
         // A binding that failed on this Mac (the Keychain, the client) records no place: the
         // next nudge tries again.
         let (view, rest, failed) = match (base, key) {
@@ -507,6 +519,7 @@ impl Library {
 }
 
 mod cache;
+mod changes;
 mod listing;
 
 pub use cache::{Key, Listed};
@@ -527,3 +540,6 @@ mod tests;
 
 #[cfg(test)]
 mod listing_tests;
+
+#[cfg(test)]
+mod changes_tests;

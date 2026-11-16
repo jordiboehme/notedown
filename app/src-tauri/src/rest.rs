@@ -280,6 +280,19 @@ impl Rest {
         self.send(Method::POST, url, Some(to_body(body)?))
     }
 
+    /// `POST` without a body, once (a change job waits by itself, see
+    /// [`wait_while_syncing`](Self::wait_while_syncing)).
+    pub fn post_empty_once<T: DeserializeOwned>(&self, path: &str) -> Result<T, RestError> {
+        let url = self.url(path, &[])?;
+        self.send(Method::POST, url, None)
+    }
+
+    /// `DELETE` once, with a JSON answer.
+    pub fn delete_json_once<T: DeserializeOwned>(&self, path: &str) -> Result<T, RestError> {
+        let url = self.url(path, &[])?;
+        self.send(Method::DELETE, url, None)
+    }
+
     /// `DELETE` with a JSON answer; waits while a Supernote syncs.
     pub fn delete_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, RestError> {
         let url = self.url(path, &[])?;

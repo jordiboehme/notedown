@@ -55,6 +55,12 @@ export type LibraryStateView = { state: LibraryState; text: string | null; page:
 
 export type Clash = { name: string; existing: string; canReplace: boolean };
 
+/**
+ * An upload, a download or a change. The change commands (`library_new_folder`, `library_rename`,
+ * `library_move`, `library_delete`, `library_restore`, `library_empty`) answer their job as it
+ * ended. A restore into a taken path answers it as `asking` with `question`; the window asks for
+ * another name and calls `library_restore(key, path)`, which goes on with the same job.
+ */
 export type Job = {
   id: number;
   kind: "upload" | "download" | "change";
@@ -69,13 +75,16 @@ export type Job = {
 
 /**
  * A binding sends `state` and then `relist` (drop what is shown and list again); the answer of a
- * call sends `state` alone.
+ * call sends `state` alone. `recycle` says the bin may have changed (the app's own delete,
+ * restore or Empty, or a delete the library read from the server): the window lists the bin
+ * again when it shows it, and ignores it otherwise.
  */
 export type LibraryEvent =
   | { type: "state"; state: LibraryState; text: string | null; page: string | null }
   | { type: "folder"; folder: FolderState }
   | { type: "job"; job: Job }
-  | { type: "relist" };
+  | { type: "relist" }
+  | { type: "recycle" };
 
 /** The name of the Tauri event that carries every `LibraryEvent`. */
 export const LIBRARY_EVENT = "library";

@@ -8,7 +8,7 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::config::{self, AppConfig, Mode, StartView};
-use crate::library::{Entry, Key, Library, Listed, RecyclePage, StateView};
+use crate::library::{Entry, Job, Key, Library, Listed, RecyclePage, StateView};
 use crate::login::{self, LoginError, LoginGate, Password};
 use crate::model::{ModelControl, ModelState};
 use crate::poller::Poller;
@@ -622,6 +622,71 @@ pub async fn library_recycle(
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())
+}
+
+/// Runs a change of the library off the main thread and answers its job as it ended.
+async fn change(
+    library: &Library,
+    work: impl FnOnce(Library) -> Job + Send + 'static,
+) -> Result<Job, String> {
+    let library = library.clone();
+    tauri::async_runtime::spawn_blocking(move || work(library))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Makes the folder `name` in `parent`, as a change job.
+#[tauri::command]
+pub async fn library_new_folder(
+    library: State<'_, Library>,
+    parent: String,
+    name: String,
+) -> Result<Job, String> {
+    change(&library, move |l| l.new_folder(&parent, &name)).await
+}
+
+/// Renames the file or folder `id` to `name` in its folder, as a change job.
+#[tauri::command]
+pub async fn library_rename(
+    library: State<'_, Library>,
+    id: u64,
+    name: String,
+) -> Result<Job, String> {
+    change(&library, move |l| l.rename(id, &name)).await
+}
+
+/// Moves the file or folder `id` into the folder `toFolder`, as a change job.
+#[tauri::command]
+pub async fn library_move(
+    library: State<'_, Library>,
+    id: u64,
+    to_folder: String,
+) -> Result<Job, String> {
+    change(&library, move |l| l.move_to(id, &to_folder)).await
+}
+
+/// Moves the file or folder `id` to the recycle bin, as a change job.
+#[tauri::command]
+pub async fn library_delete(library: State<'_, Library>, id: u64) -> Result<Job, String> {
+    change(&library, move |l| l.delete(id)).await
+}
+
+/// Brings the bin item `key` back, at `path` or where it was, as a change job. A taken path
+/// answers the job as `asking` with the clash; the window asks for a name and calls again
+/// with `path`, which goes on with the same job.
+#[tauri::command]
+pub async fn library_restore(
+    library: State<'_, Library>,
+    key: String,
+    path: Option<String>,
+) -> Result<Job, String> {
+    change(&library, move |l| l.restore(&key, path.as_deref())).await
+}
+
+/// Removes every deleted item from the recycle bin for good, as a change job.
+#[tauri::command]
+pub async fn library_empty(library: State<'_, Library>) -> Result<Job, String> {
+    change(&library, |l| l.empty_bin()).await
 }
 
 /// The last lines of both children's output, for the Server page.

@@ -33,6 +33,12 @@ const COMMANDS: &[&str] = &[
     "library_entry",
     "library_recycle",
     "library_shown",
+    "library_new_folder",
+    "library_rename",
+    "library_move",
+    "library_delete",
+    "library_restore",
+    "library_empty",
 ];
 
 fn main() {

@@ -35,6 +35,9 @@ pub struct Follow {
     stopped: bool,
     /// The binding these values belong to: an answer of an older one stops nothing.
     generation: u64,
+    /// The `seqs` of the app's own writes that the follower has not read yet: their deletes
+    /// were announced to the bin view already.
+    pub(super) own: std::collections::BTreeSet<u64>,
 }
 
 /// An item of the recycle bin.
@@ -98,6 +101,7 @@ impl Library {
         follow.last_poll = None;
         follow.stopped = false;
         follow.generation = generation;
+        follow.own.clear();
     }
 
     /// The account is gone (`account.removed` or a 410): no more reads until the next
@@ -250,8 +254,25 @@ impl Library {
     /// folder is sent only when it changed).
     pub fn wrote(&self, seqs: &[u64]) {
         if !seqs.is_empty() {
+            lock(&self.inner.follow).own.extend(seqs);
             self.wake();
         }
+    }
+
+    /// Whether `page` may have changed the recycle bin: a `file.deleted` or `folder.deleted`
+    /// that is not the app's own (the window heard of those at the write), or a gap. The own
+    /// `seqs` that the page passed are forgotten.
+    fn bin_changed(&self, page: &EventPage) -> bool {
+        let mut follow = lock(&self.inner.follow);
+        let mut changed = page.gap;
+        for event in &page.events {
+            let own = follow.own.remove(&event.seq);
+            if !own && matches!(event.kind.as_str(), "file.deleted" | "folder.deleted") {
+                changed = true;
+            }
+        }
+        follow.own.retain(|seq| *seq >= page.next);
+        changed
     }
 
     fn wake(&self) {
@@ -312,6 +333,9 @@ impl Library {
                 Err(_) => return,
             };
             self.polled(now);
+            if self.bin_changed(&page) {
+                (self.inner.emit)(LibraryEvent::Recycle);
+            }
             if page.gap {
                 // A listing that cannot be read now waits and is tried again later; the others
                 // are followed meanwhile.

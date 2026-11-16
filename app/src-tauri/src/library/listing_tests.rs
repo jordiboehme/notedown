@@ -7,39 +7,39 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::tests::{CountingStore, Events, Place, TOKEN, no_sleep, remote_key};
+use super::tests::{CountingStore, Events, Place, TOKEN, remote_key};
 use super::*;
 use crate::rest::test_http::{Scripted, answer};
 
-const NOTE: &str = "NOTE/Note";
-const MD5_A: &str = "0cc175b9c0f1b6a831c399e269772661";
+pub(super) const NOTE: &str = "NOTE/Note";
+pub(super) const MD5_A: &str = "0cc175b9c0f1b6a831c399e269772661";
 const MD5_B: &str = "92eb5ffee6ae2fec3ad71c777531578f";
 const MD5_C: &str = "4a8a08f09d37b73795649038408b5f33";
 
 /// A clock the test moves.
 #[derive(Clone, Default)]
-struct Time(Arc<AtomicU64>);
+pub(super) struct Time(Arc<AtomicU64>);
 
 impl Time {
-    fn clock(&self) -> Clock {
+    pub(super) fn clock(&self) -> Clock {
         let now = self.0.clone();
         Arc::new(move || now.load(Ordering::SeqCst))
     }
 
-    fn pass(&self, ms: u64) {
+    pub(super) fn pass(&self, ms: u64) {
         self.0.fetch_add(ms, Ordering::SeqCst);
     }
 }
 
-struct Setup {
-    server: Scripted,
-    library: Library,
-    events: Events,
-    time: Time,
+pub(super) struct Setup {
+    pub(super) server: Scripted,
+    pub(super) library: Library,
+    pub(super) events: Events,
+    pub(super) time: Time,
 }
 
 /// A library bound to a scripted server that answers `answers` in order.
-fn setup(answers: Vec<String>) -> Setup {
+pub(super) fn setup(answers: Vec<String>) -> Setup {
     setup_hooked(answers, |_, _, _| {})
 }
 
@@ -61,8 +61,12 @@ fn setup_hooked(
     let place = Place::remote(server.port, Some("jordi"));
     let events = Events::default();
     let time = Time::default();
-    let library =
-        Library::with_timing(store, place.func(), events.emit(), time.clock(), no_sleep());
+    // A wait (423 `device_syncing`) moves the clock instead of sleeping.
+    let slept = time.clone();
+    let sleeper: Sleeper = Arc::new(move |d: Duration| {
+        slept.pass(u64::try_from(d.as_millis()).unwrap());
+    });
+    let library = Library::with_timing(store, place.func(), events.emit(), time.clock(), sleeper);
     library.refresh();
     assert_eq!(library.state().unwrap().state, LibraryState::Ready);
     *slot.lock().unwrap() = Some(library.clone());
@@ -76,7 +80,7 @@ fn setup_hooked(
 
 impl Setup {
     /// The targets of the requests made so far, without the `/rest/v1` prefix.
-    fn targets(&self) -> Vec<String> {
+    pub(super) fn targets(&self) -> Vec<String> {
         self.server
             .received()
             .into_iter()
@@ -96,35 +100,35 @@ impl Setup {
             .collect()
     }
 
-    fn list(&self, path: &str, cursor: Option<&str>) -> Listed {
+    pub(super) fn list(&self, path: &str, cursor: Option<&str>) -> Listed {
         self.library.list(path, cursor, false).unwrap()
     }
 
     /// One follow step while the window is visible.
-    fn follow(&self) {
+    pub(super) fn follow(&self) {
         self.library.set_visible(true);
         self.library.follow_step();
     }
 }
 
-fn file(id: u64, path: &str, md5: &str) -> Value {
+pub(super) fn file(id: u64, path: &str, md5: &str) -> Value {
     json!({"id": id, "path": path, "name": path.rsplit('/').next().unwrap(), "kind": "file",
            "size": 10, "md5": md5, "mtimeMs": 1_763_290_000_000_i64, "writable": true})
 }
 
-fn folder(id: u64, path: &str) -> Value {
+pub(super) fn folder(id: u64, path: &str) -> Value {
     json!({"id": id, "path": path, "name": path.rsplit('/').next().unwrap(), "kind": "folder",
            "size": null, "md5": null, "mtimeMs": 1_763_290_000_000_i64, "writable": true})
 }
 
-fn tree(seq: u64, entries: &[Value], next: Option<&str>) -> String {
+pub(super) fn tree(seq: u64, entries: &[Value], next: Option<&str>) -> String {
     answer(
         "200 OK",
         &json!({"seq": seq, "entries": entries, "next": next}).to_string(),
     )
 }
 
-fn events(list: &[Value], next: u64) -> String {
+pub(super) fn events(list: &[Value], next: u64) -> String {
     answer(
         "200 OK",
         &json!({"events": list, "next": next, "end": next - 1, "more": false, "gap": false})
@@ -132,15 +136,15 @@ fn events(list: &[Value], next: u64) -> String {
     )
 }
 
-fn entry(value: &Value) -> String {
+pub(super) fn entry(value: &Value) -> String {
     answer("200 OK", &value.to_string())
 }
 
-fn not_found() -> String {
+pub(super) fn not_found() -> String {
     answer("404 Not Found", r#"{"error":"not_found"}"#)
 }
 
-fn ev(seq: u64, kind: &str, id: u64, path: &str) -> Value {
+pub(super) fn ev(seq: u64, kind: &str, id: u64, path: &str) -> Value {
     json!({"seq": seq, "ts": 1_763_290_000_000_i64 + seq as i64, "type": kind,
            "origin": "device", "opId": format!("op-{seq}"), "id": id, "path": path})
 }
@@ -843,7 +847,7 @@ fn unreachable() -> String {
     answer("502 Bad Gateway", "")
 }
 
-fn gap(next: u64, end: u64) -> String {
+pub(super) fn gap(next: u64, end: u64) -> String {
     answer(
         "200 OK",
         &json!({"events": [], "next": next, "end": end, "more": false, "gap": true}).to_string(),

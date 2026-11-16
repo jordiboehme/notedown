@@ -638,7 +638,11 @@ fn no_library_event_holds_the_token() {
         serde_json::to_value(LibraryEvent::Relist).unwrap(),
         json!({ "type": "relist" })
     );
-    all.extend([folder, job, LibraryEvent::Relist]);
+    assert_eq!(
+        serde_json::to_value(LibraryEvent::Recycle).unwrap(),
+        json!({ "type": "recycle" })
+    );
+    all.extend([folder, job, LibraryEvent::Relist, LibraryEvent::Recycle]);
 
     let token = TOKEN;
     for event in &all {

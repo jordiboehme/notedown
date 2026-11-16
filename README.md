@@ -5,7 +5,7 @@
 
 # Notedown
 
-**Your handwriting, readable by machines.**
+**Ink in. Markdown out. Agents welcome.**
 
 [![CI](https://github.com/jordiboehme/notedown/actions/workflows/ci.yml/badge.svg)](https://github.com/jordiboehme/notedown/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/github/license/jordiboehme/notedown)](LICENSE)

@@ -1,9 +1,10 @@
 //! The MCP server (spec 6): `notedown mcp`, stdio, one account per session.
 //!
-//! The tools read the text store of the account; only `ack` writes (a bookmark). A tool error is
-//! an MCP error result (`isError`), the server keeps running. The answers are the texts of
-//! [`crate::format`]: TOON for lists, a TOON head plus Markdown for a delta, the OKF document for a
-//! note and short plain text for `ack` and `get_block` (spec 6.3).
+//! The tools read the text store of the account; only `ack` and `get_changes` with a consumer
+//! write, both the consumer's bookmark: `ack` moves it, `get_changes` keeps the time of the read.
+//! A tool error is an MCP error result (`isError`), the server keeps running. The answers are the
+//! texts of [`crate::format`]: TOON for lists, a TOON head plus Markdown for a delta, the OKF
+//! document for a note and short plain text for `ack` and `get_block` (spec 6.3).
 //!
 //! Decisions (spec points left open):
 //! - `get_changes` takes exactly one start: `consumer`, `since` or `from` with `upTo`. `notes`
@@ -21,7 +22,7 @@
 //!   manifest.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -107,6 +108,8 @@ pub fn serve_stdio(data: &Path, account: Option<&str>) -> crate::Result<()> {
 #[derive(Clone)]
 pub struct NotesServer {
     slug: String,
+    /// The local data folder, for the status.
+    data: PathBuf,
     store: Arc<TextStore>,
     /// The offset of dates shown to people, read once at the start.
     local: UtcOffset,
@@ -213,6 +216,7 @@ impl NotesServer {
         let store = TextStore::open(data, &slug)?;
         Ok(NotesServer {
             slug,
+            data: data.to_path_buf(),
             store: Arc::new(store),
             local: notedown_cloud::localtime::local_utc_offset().unwrap_or(UtcOffset::UTC),
             tool_router: Self::tool_router(),
@@ -220,8 +224,10 @@ impl NotesServer {
     }
 
     #[tool(
-        description = "The state of the text store: notes, pages with text, pending and failed \
-pages, the region_missed count, the oldest kept version and the bookmarks of the consumers.",
+        description = "The state of the text store: notes, pages with text, pending, queued, \
+waiting and failed pages, whether the pipeline runs and the page it reads, its last error, the \
+region_missed count, the oldest kept version and the consumers with their bookmarks, last read \
+and notes behind.",
         annotations(read_only_hint = true)
     )]
     async fn status(&self) -> std::result::Result<String, String> {
@@ -248,8 +254,9 @@ changed after a seq, a date, an RFC 3339 time or a duration like 3d.",
 (a seq, date, time or duration) or from with upTo (a fixed range from a manifest). summary: true \
 gives only the manifest, without text. notes gives only these notes and needs from and upTo. The \
 answer head has the fields from, upTo and more. Ingest, then call ack with the upTo field, and \
-repeat while more is true. With since, pass the previous upTo as since.",
-        annotations(read_only_hint = true)
+repeat while more is true. With since, pass the previous upTo as since. With consumer, the time of \
+this read is kept for the status.",
+        annotations(read_only_hint = false)
     )]
     async fn get_changes(
         &self,
@@ -321,6 +328,12 @@ impl ServerHandler for NotesServer {
             .with_server_info(Implementation::new("notedown", env!("CARGO_PKG_VERSION")))
             .with_instructions(instructions(&self.slug))
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// The newest `seq` and its time per note key, and the first line of the log.
@@ -406,38 +419,47 @@ impl NotesServer {
     }
 
     fn status_text(&self) -> crate::Result<String> {
-        let notes: Vec<NoteState> = self
-            .store
-            .notes()?
-            .into_iter()
-            .filter(|n| !n.deleted)
-            .collect();
-        let pages = notes.iter().flat_map(|n| &n.pages);
-        let count = |s: PageOcrState| pages.clone().filter(|p| p.state == s).count();
-        let with_text = pages.clone().filter(|p| !p.blocks.is_empty()).count();
+        let f = crate::status::status_facts(&self.data, &self.slug, now_ms())?;
         let facts = self.log_facts()?;
-        let stats = self.store.stats()?;
-        let consumers: Vec<Value> = self
-            .store
-            .consumers()?
-            .into_iter()
-            .map(|(name, b)| {
-                json!({"name": name, "seq": b.seq, "updatedAt": stamp(b.updated_at, self.local)})
+        let at = |ms: Option<u64>| ms.map(|ms| stamp(ms, self.local));
+        let consumers: Vec<Value> = f
+            .consumers
+            .iter()
+            .map(|c| {
+                json!({
+                    "name": c.name,
+                    "seq": c.seq,
+                    "updatedAt": at(c.acked_at),
+                    "readAt": at(c.read_at),
+                    "notesBehind": c.notes_behind,
+                    "more": c.more,
+                })
             })
             .collect();
         let status = json!({
-            "account": self.slug,
-            "notes": notes.len(),
-            "unscoped": notes.iter().filter(|n| n.unscoped).count(),
-            "pagesWithText": with_text,
-            "pending": count(PageOcrState::Pending),
-            "failed": count(PageOcrState::Failed),
-            "truncated": count(PageOcrState::Truncated),
-            "regionMissed": stats.region_missed,
+            "account": f.account,
+            "running": f.running,
+            "notes": f.notes,
+            "unscoped": f.unscoped,
+            "pagesWithText": f.pages_with_text,
+            "pending": f.pending,
+            "queued": f.queued,
+            "waiting": f.waiting,
+            "nextDue": at(f.next_due_ms),
+            "failed": f.failed,
+            "truncated": f.truncated,
+            "errors": f.errors,
+            "lastError": f.last_error.as_ref().map(|e| e.text.clone()),
+            "lastErrorAt": at(f.last_error.as_ref().map(|e| e.at_ms)),
+            "inWork": f
+                .in_work
+                .as_ref()
+                .map(|w| format!("{} page {} of {}", w.path, w.page, w.pages)),
+            "regionMissed": f.region_missed,
             "lastSeq": facts.last_seq,
             "oldestKeptSeq": facts.first.map(|(seq, _)| seq),
             "oldestKept": facts.first.map(|(_, ts)| stamp(ts, self.local)),
-            "lastRun": (stats.last_run_ms > 0).then(|| stamp(stats.last_run_ms, self.local)),
+            "lastRun": at(f.last_run_ms),
             "consumers": consumers,
         });
         Ok(format::status_text(&status))
@@ -516,6 +538,10 @@ impl NotesServer {
             (_, _, Some(r)) => r,
             _ => unreachable!("one start is given"),
         };
+        let reader = match &start {
+            Start::Bookmark(c) => Some(c.clone()),
+            _ => None,
+        };
         if p.notes.is_some() && !matches!(start, Start::Range { .. }) {
             return Err(invalid(
                 "notes needs a fixed range: give from and upTo from the manifest",
@@ -526,6 +552,7 @@ impl NotesServer {
                 return Err(invalid("summary and notes do not go together"));
             }
             let manifest = delta::manifest(&self.store, &start, self.local)?;
+            self.stamp_read(reader.as_deref());
             return Ok(format::manifest_text(&manifest));
         }
         let d = delta::delta(
@@ -535,7 +562,16 @@ impl NotesServer {
             MAX_CHARS,
             self.local,
         )?;
+        self.stamp_read(reader.as_deref());
         Ok(format::delta_text(&d))
+    }
+
+    /// Keeps the time of a read of `consumer` for the status. Best effort: a store that cannot
+    /// be written (mounted read-only) still answers.
+    fn stamp_read(&self, consumer: Option<&str>) {
+        if let Some(c) = consumer {
+            let _ = self.store.mark_read(c, now_ms());
+        }
     }
 
     fn ack_text(&self, p: AckParams) -> crate::Result<String> {

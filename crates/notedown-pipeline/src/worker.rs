@@ -46,7 +46,7 @@ use crate::retention;
 use crate::scope::in_scope;
 use crate::setup::Setup;
 use crate::source::{Removal, ServerAccount, ServerData};
-use crate::store::{TextStore, WriterLock};
+use crate::store::{LastError, TextStore, WriterLock, clear_source_error, set_source_error};
 use crate::{Error, Result};
 use note::{Mode, NoteJob};
 
@@ -364,11 +364,68 @@ impl Worker {
         }
     }
 
-    /// Takes the writer lock and sweeps the tombstones a crash or a failed delete left.
+    /// Takes the writer lock, sweeps the tombstones a crash or a failed delete left and
+    /// removes the work files a killed worker left.
     fn take_lock(&self) -> Result<WriterLock> {
         let lock = WriterLock::take(&self.setup.local)?;
         self.sweep(&lock);
+        self.clear_work(&lock);
         Ok(lock)
+    }
+
+    /// Removes `work.json` of every store in the local folder. Creates nothing; a file that
+    /// cannot be removed only shows an old page while the worker runs.
+    fn clear_work(&self, lock: &WriterLock) {
+        let Ok(slugs) = crate::setup::local_stores(&self.setup.local, false) else {
+            return;
+        };
+        for slug in slugs {
+            if let Ok(text) = TextStore::at(&self.setup.local, &slug) {
+                let _ = text.clear_work(lock);
+            }
+        }
+    }
+
+    /// Keeps `text` as the last error of account `slug` for the status, in a store that
+    /// exists. Best effort: the error was said already.
+    fn keep_error(&self, lock: &WriterLock, slug: &str, text: String) {
+        if let Ok(store) = TextStore::at(&self.setup.local, slug) {
+            let _ = store.set_last_error(
+                lock,
+                LastError {
+                    text,
+                    at_ms: self.clock.now_ms(),
+                },
+            );
+        }
+    }
+
+    /// Keeps the last error of the source after a look at it (`<local>/pipeline/
+    /// last_error.json`): `failed`, the error of the account list, else the refused tokens.
+    /// With neither, the error is cleared. Best effort, as [`keep_error`](Self::keep_error).
+    fn source_seen(&self, lock: &WriterLock, failed: Option<String>) {
+        let text = failed.or_else(|| {
+            let refused: Vec<String> = self
+                .setup
+                .source
+                .refusals()
+                .into_iter()
+                .map(|(_, message)| message)
+                .collect();
+            (!refused.is_empty()).then(|| refused.join("; "))
+        });
+        let local = &self.setup.local;
+        let _ = match text {
+            Some(text) => set_source_error(
+                local,
+                lock,
+                LastError {
+                    text,
+                    at_ms: self.clock.now_ms(),
+                },
+            ),
+            None => clear_source_error(local, lock),
+        };
     }
 
     /// Deletes the tombstones under `<local>/pipeline`; the ones that stay are said once.
@@ -569,6 +626,7 @@ impl Worker {
             Err(e) => return Err(e),
         };
         let lock = self.take_lock()?;
+        self.source_seen(&lock, None);
         let mut stores = BTreeMap::new();
         let (progress, _) = self.pass(&lock, &mut stores, &accounts, ignore_settle, &|| false)?;
         Ok(progress)
@@ -579,6 +637,7 @@ impl Worker {
     pub fn reocr(&mut self, note: Option<&str>) -> Result<Progress> {
         let served = self.followed()?.served;
         let lock = self.take_lock()?;
+        self.source_seen(&lock, None);
         let source = self.setup.source.clone();
         let mut progress = Progress::default();
         let mut found = false;
@@ -638,17 +697,22 @@ impl Worker {
                     mode: Mode::Reocr,
                     told_missing: &self.told_missing,
                 };
-                note::process(
+                let read = note::process(
                     &job,
                     &mut self.engine,
                     &d,
                     &mut progress,
                     &mut |_| {},
                     &|| false,
-                )?;
+                );
+                if let Err(e) = read {
+                    self.clear_work(&lock);
+                    return Err(e);
+                }
             }
             text.set_last_run(&lock, self.clock.now_ms())?;
         }
+        self.clear_work(&lock);
         if let Some(n) = note
             && !found
         {
@@ -686,15 +750,32 @@ impl Worker {
         let mut stores = BTreeMap::new();
         let mut look = true;
         let mut next_wake = 0u64;
+        // The last look at the source: whether its account list failed, and the refused
+        // tokens. A change means a pass at once, so its errors clear without the rescan.
+        let mut source_failed = false;
+        let mut refused: Vec<String> = Vec::new();
         loop {
             match self.followed() {
                 // Nothing known: no pass, no cursor moves; asked again at the next poll.
-                Err(e) => self.say_once(
-                    "accounts",
-                    format!("notedown pipeline: {}: {e}", self.setup.source.describe()),
-                ),
+                Err(e) => {
+                    let message = format!("{}: {e}", self.setup.source.describe());
+                    self.source_seen(&lock, Some(message.clone()));
+                    source_failed = true;
+                    self.say_once("accounts", format!("notedown pipeline: {message}"));
+                }
                 Ok(followed) => {
                     self.settled("accounts");
+                    let now_refused: Vec<String> = self
+                        .setup
+                        .source
+                        .refusals()
+                        .into_iter()
+                        .map(|(slug, _)| slug)
+                        .collect();
+                    look |= source_failed || now_refused != refused;
+                    source_failed = false;
+                    refused = now_refused;
+                    self.source_seen(&lock, None);
                     for slug in &followed.journals {
                         let (changed, removed) = self.follow(slug, &mut follows);
                         look |= changed;
@@ -930,6 +1011,8 @@ impl Worker {
         let mut queue: Vec<(String, DueNote)> = Vec::new();
         let mut recs: BTreeMap<String, (records::Records, Vec<Digest>)> = BTreeMap::new();
         let mut next_due: Option<u64> = None;
+        // Per account for its stats: the waiting pages and the next due time.
+        let mut waiting: BTreeMap<String, (u64, Option<u64>)> = BTreeMap::new();
         let mut unsure: BTreeSet<String> = BTreeSet::new();
         // Only the stores of this pass stay open: no stamp or prune touches another one, and a
         // removed account's folder is never made again.
@@ -956,6 +1039,7 @@ impl Worker {
                 )?;
                 if let Some(t) = Errors::load(text.dir())?.next_try(now) {
                     next_due = Some(next_due.map_or(t, |n| n.min(t)));
+                    waiting.entry(slug.clone()).or_default().1 = Some(t);
                 }
                 recs.insert(
                     slug.clone(),
@@ -978,6 +1062,7 @@ impl Worker {
                 }
                 Err(e) => {
                     self.say_once(&topic, format!("notedown pipeline: account {slug}: {e}"));
+                    self.keep_error(lock, &slug, e.to_string());
                     // A failed write blocks the store until a repair: open it again next time.
                     stores.remove(&slug);
                     unsure.insert(slug);
@@ -991,6 +1076,9 @@ impl Worker {
                 } else {
                     progress.waiting += d.pages.len();
                     next_due = Some(next_due.map_or(ends, |n| n.min(ends)));
+                    let w = waiting.entry(slug.clone()).or_default();
+                    w.0 += d.pages.len() as u64;
+                    w.1 = Some(w.1.map_or(ends, |n| n.min(ends)));
                 }
             }
         }
@@ -1009,6 +1097,18 @@ impl Worker {
         });
         let first_run = queue.iter().any(|(_, d)| d.new);
         let total: usize = queue.iter().map(|(_, d)| d.pages.len()).sum();
+        // Per account for its stats: the pages of the queue not read yet. Written now and
+        // after each note (best effort), so the status shows how much is still to read.
+        let mut queued: BTreeMap<String, u64> = BTreeMap::new();
+        for (slug, d) in &queue {
+            *queued.entry(slug.clone()).or_default() += d.pages.len() as u64;
+        }
+        for (slug, text) in stores.iter() {
+            let (pages, due) = waiting.get(slug).copied().unwrap_or_default();
+            let left = queued.get(slug).copied().unwrap_or(0);
+            let _ = text.set_pass_start(lock, left, pages, due);
+        }
+        let mut stopped = false;
         let mut report = |p: &Progress| {
             if first_run {
                 eprintln!("ocr: {} of {total} pages", p.attempted);
@@ -1017,6 +1117,8 @@ impl Worker {
         let clock = self.clock.clone();
         let now_fn = || clock.now_ms();
         let mut broken: Vec<String> = Vec::new();
+        // The account read last: its work file goes when the queue moves to another account.
+        let mut in_work: Option<&String> = None;
         for (i, (slug, d)) in queue.iter().enumerate() {
             if broken.contains(slug) {
                 continue;
@@ -1027,11 +1129,18 @@ impl Worker {
                 for (s, _) in &queue[i.saturating_sub(1)..] {
                     unsure.insert(s.clone());
                 }
+                stopped = true;
                 break;
             }
             let (Some(text), Some((r, digests))) = (stores.get(slug), recs.get(slug)) else {
                 continue;
             };
+            if let Some(last) = in_work.filter(|last| *last != slug)
+                && let Ok(store) = TextStore::at(&self.setup.local, last)
+            {
+                let _ = store.clear_work(lock);
+            }
+            in_work = Some(slug);
             let job = NoteJob {
                 source: &*source,
                 slug,
@@ -1043,13 +1152,28 @@ impl Worker {
                 told_missing: &self.told_missing,
             };
             match note::process(&job, &mut self.engine, d, &mut progress, &mut report, stop) {
+                // A stop between its pages leaves the note in the queue. A stop right after a
+                // note that was read to its end also keeps its pages counted until the next pass.
+                Ok(()) if !stop() => {
+                    if let Some(left) = queued.get_mut(slug) {
+                        *left = left.saturating_sub(d.pages.len() as u64);
+                        let _ = text.set_queued(lock, *left);
+                    }
+                }
                 Ok(()) => {}
-                Err(Error::ModelMissing) => return Err(Error::ModelMissing),
+                Err(Error::ModelMissing) => {
+                    self.clear_work(lock);
+                    for slug in stores.keys() {
+                        self.keep_error(lock, slug, Error::ModelMissing.to_string());
+                    }
+                    return Err(Error::ModelMissing);
+                }
                 Err(e) => {
                     self.say_once(
                         &format!("note:{slug}"),
                         format!("notedown pipeline: {}: {e}", d.path),
                     );
+                    self.keep_error(lock, slug, format!("{}: {e}", d.path));
                     broken.push(slug.clone());
                 }
             }
@@ -1066,9 +1190,17 @@ impl Worker {
             stores.remove(&slug);
             unsure.insert(slug);
         }
+        self.clear_work(lock);
         let end = self.clock.now_ms();
-        for text in stores.values() {
-            text.set_last_run(lock, end)?;
+        for (slug, text) in stores.iter() {
+            let (pages, due) = waiting.get(slug).copied().unwrap_or_default();
+            // A full pass read the whole queue; a stopped one leaves the rest for the next.
+            let left = if stopped {
+                queued.get(slug).copied().unwrap_or(0)
+            } else {
+                0
+            };
+            text.set_pass_end(lock, end, left, pages, due)?;
         }
         progress.next_due = next_due;
         Ok((progress, unsure))

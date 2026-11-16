@@ -7,12 +7,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use notedown_cloud::auth::Accounts;
-use notedown_cloud::journal::{Event, EventBody, Journal, Origin};
+use notedown_cloud::journal::{Event, EventBody, FileKind, Journal, Origin};
+use notedown_cloud::pages::{self, PageRecord};
 use notedown_cloud::push::{PushPlanner, PushTiming};
 use notedown_cloud::server::AppState;
 use notedown_cloud::store::retention::Retention;
 use notedown_cloud::store::{
-    CrashPoint, IndexLine, PENDING_FILE, PutOptions, RecycleEntry, RecycleReason, Store, WirePath,
+    CrashPoint, IndexLine, PENDING_FILE, PrunePlan, PutOptions, Recovery, RecycleEntry,
+    RecycleItem, RecycleReason, ScanOptions, Store, WirePath,
 };
 use notedown_cloud::{Clock, Config};
 use time::{OffsetDateTime, UtcOffset};
@@ -47,6 +49,7 @@ fn entry(id: u64, path: &str, deleted_at: u64, reason: RecycleReason) -> Recycle
         md5: format!("{:032x}", deleted_at),
         deleted_at,
         reason,
+        pruned: false,
     }
 }
 
@@ -269,6 +272,7 @@ fn a_prune_removes_the_planned_slots_and_lines_and_journals_one_batch() {
                 md5: md5.clone(),
                 deleted_at: *deleted_at,
                 reason: *reason,
+                pruned: false,
             },
             other => panic!("{other:?}"),
         })
@@ -310,6 +314,40 @@ fn a_second_prune_removes_and_journals_nothing() {
     assert_eq!(again.kept, 4);
     assert_eq!(f.tree(), tree);
     assert_eq!(f.journal.last_seq().unwrap(), seq);
+}
+
+/// The hourly prune through `prune_recycle_with` and a guard of the caller does what
+/// `prune_recycle` does: the same report, index, slots and events.
+#[test]
+fn the_hourly_prune_is_unchanged() {
+    let (old, new) = (Fixture::new(), Fixture::new());
+    scene(&old);
+    scene(&new);
+    for dry_run in [true, false] {
+        let a = old.prune(NOW, Origin::Retention, dry_run);
+        let b = {
+            let g = new.store.lock_recovered(&new.journal).unwrap();
+            new.store
+                .prune_recycle_with(
+                    &g,
+                    &new.journal,
+                    PrunePlan::Retention(RETENTION, offset()),
+                    NOW,
+                    Origin::Retention,
+                    dry_run,
+                )
+                .unwrap()
+        };
+        assert_eq!(a, b, "dry run {dry_run}");
+        assert_eq!(a.removed.len(), 3);
+        assert_eq!(old.index_text(), new.index_text());
+        assert_eq!(old.tree(), new.tree());
+        let shape = |f: &Fixture| -> Vec<(Origin, EventBody)> {
+            f.events().into_iter().map(|e| (e.origin, e.body)).collect()
+        };
+        assert_eq!(shape(&old), shape(&new));
+    }
+    assert_eq!(new.events().len(), 3);
 }
 
 #[test]
@@ -958,4 +996,769 @@ fn a_recycle_pruned_event_plans_no_push() {
     planner.observe(&event, &["SN100".to_string()], NOW);
     assert!(planner.pending("jordi", "SN100").is_none());
     assert!(planner.due(NOW + 24 * HOUR).is_empty());
+}
+
+// ------------------------------------------------------------------ restore
+
+/// A minimal note (docs/note-format.md 1 to 4) with `FILE_ID` `file_id` and the pages `ids`.
+fn note(file_id: &str, ids: &[&str]) -> Vec<u8> {
+    fn block(data: &mut Vec<u8>, payload: &[u8]) -> u32 {
+        let at = data.len() as u32;
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(payload);
+        at
+    }
+    let mut d = b"noteSN_FILE_VER_20230015".to_vec();
+    let h = block(
+        &mut d,
+        format!("<FILE_ID:{file_id}><APPLY_EQUIPMENT:N6>").as_bytes(),
+    );
+    let mut footer = format!("<FILE_FEATURE:{h}>");
+    for (n, id) in ids.iter().enumerate() {
+        let at = block(&mut d, format!("<PAGEID:{id}><PAGESTYLE:s>").as_bytes());
+        footer.push_str(&format!("<PAGE{}:{at}>", n + 1));
+    }
+    let f = block(&mut d, footer.as_bytes());
+    d.extend_from_slice(b"tail");
+    d.extend_from_slice(&f.to_le_bytes());
+    d
+}
+
+const FID: &str = "F20261116120000000000abcdefABCDEF";
+
+fn md5_hex(bytes: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    const_hex::encode(Md5::digest(bytes))
+}
+
+/// `(type, path)` of the file and folder events, page events as `(type, fileId)`.
+fn shape(events: &[Event]) -> Vec<(String, String)> {
+    events
+        .iter()
+        .map(|e| {
+            let what = match &e.body {
+                EventBody::FileCreated { path, .. }
+                | EventBody::FileDeleted { path, .. }
+                | EventBody::FolderCreated { path, .. }
+                | EventBody::FolderDeleted { path, .. } => path.clone(),
+                EventBody::PageAdded { file_id, .. } => file_id.clone(),
+                other => format!("{other:?}"),
+            };
+            (e.body.type_name().to_string(), what)
+        })
+        .collect()
+}
+
+fn ev(kind: &str, path: &str) -> (String, String) {
+    (kind.to_string(), path.to_string())
+}
+
+impl Fixture {
+    /// A put through the page indexer, with missing parents created; `recycle_at` keeps the
+    /// replaced bytes as an old version.
+    fn put(&self, path: &str, bytes: &[u8], recycle_at: Option<u64>) -> u64 {
+        let g = self.store.lock_recovered(&self.journal).unwrap();
+        let dir = self.store.account_dir().join("staging/u1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let staged = dir.join("f");
+        std::fs::write(&staged, bytes).unwrap();
+        let options = PutOptions {
+            create_parents: true,
+            recycle_at_ms: recycle_at,
+            ..PutOptions::default()
+        };
+        let mut c = self
+            .store
+            .plan_put_with(&g, &wp(path), &staged, Origin::Device, None, options)
+            .unwrap();
+        pages::plan_page_events(&self.store, &g, &mut c);
+        self.store.commit(&g, c, &self.journal).unwrap();
+        self.store.id_of(&wp(path)).unwrap().unwrap()
+    }
+
+    /// A delete at `ms`, with the page records, as every writer does it.
+    fn delete(&self, path: &str, ms: u64) -> Vec<Event> {
+        let before = self.journal.last_seq().unwrap();
+        let g = self.store.lock_recovered(&self.journal).unwrap();
+        let mut c = self
+            .store
+            .plan_delete(&g, &wp(path), ms, Origin::Device, None)
+            .unwrap();
+        pages::plan_page_delete(&self.store, &g, &mut c);
+        self.store.commit(&g, c, &self.journal).unwrap();
+        self.since(before)
+    }
+
+    fn since(&self, seq: u64) -> Vec<Event> {
+        self.journal
+            .read_from(seq + 1)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect()
+    }
+
+    fn items(&self) -> Vec<RecycleItem> {
+        let g = self.store.lock().unwrap();
+        self.store.recycle_items(&g).unwrap()
+    }
+
+    fn item(&self, path: &str) -> RecycleItem {
+        self.items()
+            .into_iter()
+            .find(|i| i.path == path)
+            .unwrap_or_else(|| panic!("no item {path}"))
+    }
+
+    fn try_restore(
+        &self,
+        item: &RecycleItem,
+        crash: Option<CrashPoint>,
+    ) -> notedown_cloud::Result<Vec<u64>> {
+        let g = self.store.lock_recovered(&self.journal)?;
+        let mut c = self
+            .store
+            .plan_restore(&g, item, &wp(&item.path), NOW + DAY, Origin::App)?;
+        pages::plan_page_restore(&self.store, &g, &mut c)?;
+        self.store.commit_until(&g, c, &self.journal, crash)
+    }
+
+    /// Restore `item` at its old path; returns the events of the restore.
+    fn restore(&self, item: &RecycleItem) -> Vec<Event> {
+        let before = self.journal.last_seq().unwrap();
+        self.try_restore(item, None).unwrap();
+        self.since(before)
+    }
+
+    /// A second process after a crash: fresh handles, then recovery.
+    fn restart_and_recover(&self) -> Recovery {
+        let store = Store::open(self._dir.path(), "jordi").unwrap();
+        let journal = Journal::open(self._dir.path()).unwrap();
+        let g = store.lock().unwrap();
+        store.recover(&g, &journal).unwrap()
+    }
+
+    fn id(&self, path: &str) -> Option<u64> {
+        self.store.id_of(&wp(path)).unwrap()
+    }
+
+    fn bytes(&self, path: &str) -> Vec<u8> {
+        std::fs::read(self.store.fs_path(&wp(path))).unwrap()
+    }
+
+    fn record(&self, file_name: &str) -> Option<PageRecord> {
+        let p = self
+            .store
+            .account_dir()
+            .join(pages::PAGES_DIR)
+            .join(format!("{file_name}.json"));
+        Some(serde_json::from_slice(&std::fs::read(p).ok()?).unwrap())
+    }
+
+    fn index_lines(&self) -> Vec<RecycleEntry> {
+        let g = self.store.lock().unwrap();
+        self.store.recycle_index(&g).unwrap()
+    }
+
+    fn scan_events(&self) -> Vec<Event> {
+        let before = self.journal.last_seq().unwrap();
+        let g = self.store.lock_recovered(&self.journal).unwrap();
+        self.store
+            .scan(&g, &self.journal, &ScanOptions::all(0), NOW + 2 * DAY)
+            .unwrap();
+        self.since(before)
+    }
+}
+
+#[test]
+fn a_restore_brings_a_file_back_with_a_new_id() {
+    let f = Fixture::new();
+    let old = f.put("NOTE/Note/x.txt", b"hello", None);
+    f.delete("NOTE/Note/x.txt", NOW);
+    let item = f.item("NOTE/Note/x.txt");
+    let slot = f.slot_path(&item.entry);
+    assert!(slot.is_file());
+    let events = f.restore(&item);
+    assert_eq!(f.bytes("NOTE/Note/x.txt"), b"hello");
+    let id = f.id("NOTE/Note/x.txt").unwrap();
+    assert_ne!(id, old);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].origin, Origin::App);
+    assert_eq!(
+        events[0].body,
+        EventBody::FileCreated {
+            id,
+            path: "NOTE/Note/x.txt".into(),
+            kind: FileKind::Document,
+            md5: md5_hex(b"hello"),
+            size: 5,
+            pages_changed: None,
+        }
+    );
+    assert!(f.items().is_empty());
+    assert!(f.index_lines().is_empty());
+    assert!(!slot.exists());
+    // The emptied folders of the slot are gone too.
+    assert!(!f.recycle().join(NOW.to_string()).exists());
+    assert!(f.recycle().is_dir());
+}
+
+#[test]
+fn a_restore_creates_missing_parents() {
+    let f = Fixture::new();
+    f.put("DOCUMENT/Document/a/b/x.pdf", b"pdf", None);
+    let deleted = f.delete("DOCUMENT/Document/a/b/x.pdf", NOW);
+    assert_eq!(
+        shape(&deleted),
+        [
+            ev("file.deleted", "DOCUMENT/Document/a/b/x.pdf"),
+            ev("folder.deleted", "DOCUMENT/Document/a/b"),
+            ev("folder.deleted", "DOCUMENT/Document/a"),
+        ]
+    );
+    let events = f.restore(&f.item("DOCUMENT/Document/a/b/x.pdf"));
+    assert_eq!(
+        shape(&events),
+        [
+            ev("folder.created", "DOCUMENT/Document/a"),
+            ev("folder.created", "DOCUMENT/Document/a/b"),
+            ev("file.created", "DOCUMENT/Document/a/b/x.pdf"),
+        ]
+    );
+    let EventBody::FolderCreated { id, .. } = &events[0].body else {
+        panic!()
+    };
+    assert_eq!(f.id("DOCUMENT/Document/a"), Some(*id));
+    assert_eq!(f.bytes("DOCUMENT/Document/a/b/x.pdf"), b"pdf");
+}
+
+#[test]
+fn a_folder_restore_brings_its_tree_back() {
+    let f = Fixture::new();
+    let a = f.put("NOTE/Note/W/a.txt", b"aaa", None);
+    let b = f.put("NOTE/Note/W/S/b.txt", b"bb", None);
+    let w = f.id("NOTE/Note/W").unwrap();
+    f.delete("NOTE/Note/W", NOW);
+    let item = f.item("NOTE/Note/W");
+    assert_eq!(item.files, Some(2));
+    // A dot-file moves along without an event.
+    std::fs::write(f.slot_path(&item.entry).join(".DS_Store"), b"d").unwrap();
+    let events = f.restore(&item);
+    assert_eq!(
+        shape(&events),
+        [
+            ev("folder.created", "NOTE/Note/W"),
+            ev("folder.created", "NOTE/Note/W/S"),
+            ev("file.created", "NOTE/Note/W/S/b.txt"),
+            ev("file.created", "NOTE/Note/W/a.txt"),
+        ]
+    );
+    let ids: Vec<u64> = events
+        .iter()
+        .map(|e| match &e.body {
+            EventBody::FileCreated { id, path, .. } | EventBody::FolderCreated { id, path } => {
+                assert_eq!(f.id(path), Some(*id), "{path}");
+                *id
+            }
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    for old in [a, b, w] {
+        assert!(!ids.contains(&old));
+    }
+    assert!(events.iter().all(|e| e.origin == Origin::App));
+    assert_eq!(f.bytes("NOTE/Note/W/a.txt"), b"aaa");
+    assert_eq!(f.bytes("NOTE/Note/W/S/b.txt"), b"bb");
+    assert_eq!(f.bytes("NOTE/Note/W/.DS_Store"), b"d");
+    assert!(f.items().is_empty());
+    assert!(f.index_lines().is_empty());
+}
+
+#[test]
+fn a_folder_restore_journals_only_the_files_that_are_there() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/W/a.txt", b"aaa", None);
+    f.put("NOTE/Note/W/b.txt", b"bb", None);
+    f.delete("NOTE/Note/W", NOW);
+    let item = f.item("NOTE/Note/W");
+    std::fs::remove_file(f.slot_path(&item.entry).join("b.txt")).unwrap();
+    let events = f.restore(&item);
+    assert_eq!(
+        shape(&events),
+        [
+            ev("folder.created", "NOTE/Note/W"),
+            ev("file.created", "NOTE/Note/W/a.txt"),
+        ]
+    );
+    assert_eq!(f.id("NOTE/Note/W/b.txt"), None);
+    // Every line of the item goes, also the one whose file was missing.
+    assert!(f.index_lines().is_empty());
+}
+
+#[test]
+fn a_restore_of_a_vanished_slot_is_not_found() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/x.txt", b"hello", None);
+    f.delete("NOTE/Note/x.txt", NOW);
+    let item = f.item("NOTE/Note/x.txt");
+    std::fs::remove_file(f.slot_path(&item.entry)).unwrap();
+    let before = f.journal.last_seq().unwrap();
+    let r = f.try_restore(&item, None);
+    assert!(
+        matches!(r, Err(notedown_cloud::Error::NotFound(_))),
+        "{r:?}"
+    );
+    assert!(!f.store.fs_path(&wp("NOTE/Note/x.txt")).exists());
+    assert_eq!(f.id("NOTE/Note/x.txt"), None);
+    assert!(!f.store.account_dir().join(PENDING_FILE).exists());
+    assert_eq!(f.journal.last_seq().unwrap(), before);
+}
+
+#[test]
+fn a_restore_refuses_a_symlink_in_the_slot() {
+    let f = Fixture::new();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret"), b"s").unwrap();
+    // A symlink inside a folder slot.
+    f.put("NOTE/Note/W/a.txt", b"aaa", None);
+    f.delete("NOTE/Note/W", NOW);
+    let item = f.item("NOTE/Note/W");
+    let slot = f.slot_path(&item.entry);
+    std::os::unix::fs::symlink(outside.path().join("secret"), slot.join("link.txt")).unwrap();
+    let r = f.try_restore(&item, None);
+    assert!(
+        matches!(r, Err(notedown_cloud::Error::RecycleSlotDamaged(_))),
+        "{r:?}"
+    );
+    assert!(slot.join("a.txt").is_file());
+    assert_eq!(f.id("NOTE/Note/W"), None);
+    // A file slot that is a symlink itself.
+    f.put("NOTE/Note/x.txt", b"x", None);
+    f.delete("NOTE/Note/x.txt", NOW + 1);
+    let item = f.item("NOTE/Note/x.txt");
+    let slot = f.slot_path(&item.entry);
+    std::fs::remove_file(&slot).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("secret"), &slot).unwrap();
+    let r = f.try_restore(&item, None);
+    assert!(
+        matches!(r, Err(notedown_cloud::Error::RecycleSlotDamaged(_))),
+        "{r:?}"
+    );
+    assert!(!f.store.fs_path(&wp("NOTE/Note/x.txt")).exists());
+    assert_eq!(f.items().len(), 2);
+    assert!(!f.store.account_dir().join(PENDING_FILE).exists());
+}
+
+#[test]
+fn a_restore_moves_the_old_versions_to_the_new_id() {
+    let f = Fixture::new();
+    let old = f.put("NOTE/Note/x.txt", b"one", None);
+    f.put("NOTE/Note/x.txt", b"two", Some(NOW - HOUR));
+    f.delete("NOTE/Note/x.txt", NOW);
+    let version = f.index_lines()[0].clone();
+    assert_eq!(
+        (version.id, version.reason),
+        (old, RecycleReason::Overwritten)
+    );
+    f.restore(&f.item("NOTE/Note/x.txt"));
+    let id = f.id("NOTE/Note/x.txt").unwrap();
+    assert_eq!(
+        f.index_lines(),
+        [RecycleEntry {
+            id,
+            ..version.clone()
+        }]
+    );
+    assert_eq!(std::fs::read(f.slot_path(&version)).unwrap(), b"one");
+    assert_eq!(f.bytes("NOTE/Note/x.txt"), b"two");
+}
+
+/// A file in a restored folder: its old versions follow it to its new id too.
+#[test]
+fn a_folder_restore_moves_the_old_versions_of_its_files() {
+    let f = Fixture::new();
+    let old = f.put("NOTE/Note/W/a.txt", b"one", None);
+    f.put("NOTE/Note/W/a.txt", b"two", Some(NOW - HOUR));
+    f.delete("NOTE/Note/W", NOW);
+    let version = f.index_lines()[0].clone();
+    assert_eq!(
+        (version.id, version.reason),
+        (old, RecycleReason::Overwritten)
+    );
+    f.restore(&f.item("NOTE/Note/W"));
+    let id = f.id("NOTE/Note/W/a.txt").unwrap();
+    assert_ne!(id, old);
+    assert_eq!(f.index_lines(), [RecycleEntry { id, ..version }]);
+}
+
+#[test]
+fn a_restore_cut_after_the_rename_is_finished_by_recovery() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/x.txt", b"hello", None);
+    f.put("NOTE/Note/W/a.txt", b"aaa", None);
+    f.put("NOTE/Note/W/S/b.txt", b"bb", None);
+    f.delete("NOTE/Note/x.txt", NOW);
+    f.delete("NOTE/Note/W", NOW + 1);
+    for (path, files) in [
+        ("NOTE/Note/x.txt", vec!["NOTE/Note/x.txt"]),
+        (
+            "NOTE/Note/W",
+            vec!["NOTE/Note/W/S/b.txt", "NOTE/Note/W/a.txt"],
+        ),
+    ] {
+        let item = f.item(path);
+        let before = f.journal.last_seq().unwrap();
+        f.try_restore(&item, Some(CrashPoint::BeforeAppend))
+            .unwrap();
+        assert!(f.store.account_dir().join(PENDING_FILE).exists());
+        assert!(f.since(before).is_empty());
+        assert!(matches!(f.restart_and_recover(), Recovery::Repaired { .. }));
+        let events = f.since(before);
+        assert!(events.iter().all(|e| e.origin == Origin::Repair));
+        let created: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::FileCreated { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(created, files);
+        for file in files {
+            assert!(f.id(file).is_some());
+        }
+        assert!(!f.slot_path(&item.entry).exists());
+        assert!(!f.store.account_dir().join(PENDING_FILE).exists());
+    }
+    assert!(f.items().is_empty());
+    assert!(f.index_lines().is_empty());
+    assert!(f.scan_events().is_empty());
+}
+
+#[test]
+fn a_restore_cut_before_clear_keeps_the_other_items() {
+    use std::os::unix::fs::MetadataExt;
+    let f = Fixture::new();
+    for (n, name) in ["x.txt", "y.txt", "z.txt"].iter().enumerate() {
+        f.put(&format!("NOTE/Note/{name}"), name.as_bytes(), None);
+        f.delete(&format!("NOTE/Note/{name}"), NOW + n as u64);
+    }
+    let item = f.item("NOTE/Note/y.txt");
+    let before = f.journal.last_seq().unwrap();
+    f.try_restore(&item, Some(CrashPoint::BeforeClear)).unwrap();
+    assert!(f.store.account_dir().join(PENDING_FILE).exists());
+    let inode = std::fs::metadata(f.index_path()).unwrap().ino();
+    let index = f.index_text();
+    assert!(matches!(
+        f.restart_and_recover(),
+        Recovery::Repaired { seqs, .. } if seqs.is_empty()
+    ));
+    // The index was written once: recovery found nothing left to do.
+    assert_eq!(std::fs::metadata(f.index_path()).unwrap().ino(), inode);
+    assert_eq!(f.index_text(), index);
+    let keys: Vec<String> = f.items().into_iter().map(|i| i.key).collect();
+    assert_eq!(
+        keys,
+        [
+            format!("{}/NOTE/Note/z.txt", NOW + 2),
+            format!("{NOW}/NOTE/Note/x.txt"),
+        ]
+    );
+    assert!(f.slot_path(&f.item("NOTE/Note/x.txt").entry).is_file());
+    assert!(f.slot_path(&f.item("NOTE/Note/z.txt").entry).is_file());
+    assert_eq!(
+        shape(&f.since(before)),
+        [ev("file.created", "NOTE/Note/y.txt")]
+    );
+    assert_eq!(f.bytes("NOTE/Note/y.txt"), b"y.txt");
+}
+
+#[test]
+fn a_restore_cut_before_apply_is_discarded() {
+    for crash in [CrashPoint::BeforeApply, CrashPoint::BeforeRename] {
+        let f = Fixture::new();
+        f.put("DOCUMENT/Document/a/b/x.pdf", b"pdf", None);
+        f.delete("DOCUMENT/Document/a/b/x.pdf", NOW);
+        let item = f.item("DOCUMENT/Document/a/b/x.pdf");
+        let before = f.journal.last_seq().unwrap();
+        f.try_restore(&item, Some(crash)).unwrap();
+        assert!(f.store.account_dir().join(PENDING_FILE).exists());
+        assert!(matches!(
+            f.restart_and_recover(),
+            Recovery::Discarded { .. }
+        ));
+        assert_eq!(f.items(), std::slice::from_ref(&item), "{crash:?}");
+        assert!(f.slot_path(&item.entry).is_file());
+        assert!(!f.store.fs_path(&wp("DOCUMENT/Document/a")).exists());
+        for p in [
+            "DOCUMENT/Document/a",
+            "DOCUMENT/Document/a/b",
+            "DOCUMENT/Document/a/b/x.pdf",
+        ] {
+            assert_eq!(f.id(p), None, "{crash:?} {p}");
+        }
+        assert!(f.since(before).is_empty());
+        // No row of a planned path is left for the scan to find gone.
+        assert!(f.scan_events().is_empty(), "{crash:?}");
+    }
+}
+
+#[test]
+fn a_restored_note_has_its_page_record() {
+    let f = Fixture::new();
+    let bytes = note(FID, &["PA", "PB", "PC"]);
+    f.put("NOTE/Note/n.note", &bytes, None);
+    assert!(f.record(FID).is_some());
+    f.delete("NOTE/Note/n.note", NOW);
+    assert!(f.record(FID).is_none());
+    let events = f.restore(&f.item("NOTE/Note/n.note"));
+    let id = f.id("NOTE/Note/n.note").unwrap();
+    assert_eq!(
+        shape(&events),
+        [
+            ev("file.created", "NOTE/Note/n.note"),
+            ev("page.added", FID),
+            ev("page.added", FID),
+            ev("page.added", FID),
+        ]
+    );
+    assert!(matches!(
+        events[0].body,
+        EventBody::FileCreated {
+            pages_changed: Some(3),
+            ..
+        }
+    ));
+    assert!(
+        events[1..]
+            .iter()
+            .all(|e| matches!(e.body, EventBody::PageAdded { id: i, .. } if i == id))
+    );
+    let rec = f.record(FID).unwrap();
+    assert_eq!(rec.file_id, FID);
+    assert_eq!(rec.path, "NOTE/Note/n.note");
+    assert_eq!(rec.md5, md5_hex(&bytes));
+    assert_eq!(rec.size, bytes.len() as u64);
+    assert_eq!(rec.pages.len(), 3);
+}
+
+#[test]
+fn a_restored_folder_indexes_every_note() {
+    let f = Fixture::new();
+    // Two copies of one note: the first in path order gets the FILE_ID, the other its path key.
+    let bytes = note(FID, &["PA"]);
+    f.put("NOTE/Note/W/a.note", &bytes, None);
+    f.put("NOTE/Note/W/b.note", &bytes, None);
+    f.put("NOTE/Note/W/c.txt", b"c", None);
+    f.delete("NOTE/Note/W", NOW);
+    let events = f.restore(&f.item("NOTE/Note/W"));
+    let path_key = format!("path:{}", md5_hex(b"NOTE/Note/W/b.note"));
+    assert_eq!(
+        shape(&events),
+        [
+            ev("folder.created", "NOTE/Note/W"),
+            ev("file.created", "NOTE/Note/W/a.note"),
+            ev("page.added", FID),
+            ev("file.created", "NOTE/Note/W/b.note"),
+            ev("page.added", &path_key),
+            ev("file.created", "NOTE/Note/W/c.txt"),
+        ]
+    );
+    assert_eq!(f.record(FID).unwrap().path, "NOTE/Note/W/a.note");
+    let rec = f
+        .record(&format!("path-{}", md5_hex(b"NOTE/Note/W/b.note")))
+        .unwrap();
+    assert_eq!(rec.path, "NOTE/Note/W/b.note");
+    assert_eq!(rec.md5, md5_hex(&bytes));
+    assert!(f.scan_events().is_empty());
+}
+
+#[test]
+fn a_restore_cut_before_append_still_writes_the_note_record() {
+    let f = Fixture::new();
+    let bytes = note(FID, &["PA", "PB"]);
+    f.put("NOTE/Note/n.note", &bytes, None);
+    f.delete("NOTE/Note/n.note", NOW);
+    let before = f.journal.last_seq().unwrap();
+    f.try_restore(&f.item("NOTE/Note/n.note"), Some(CrashPoint::BeforeAppend))
+        .unwrap();
+    assert!(f.record(FID).is_none());
+    assert!(matches!(f.restart_and_recover(), Recovery::Repaired { .. }));
+    let rec = f.record(FID).unwrap();
+    assert_eq!(rec.path, "NOTE/Note/n.note");
+    assert_eq!(rec.md5, md5_hex(&bytes));
+    assert_eq!(
+        shape(&f.since(before)),
+        [
+            ev("file.created", "NOTE/Note/n.note"),
+            ev("page.added", FID),
+            ev("page.added", FID),
+        ]
+    );
+}
+
+#[test]
+fn a_restore_is_not_journaled_again_by_the_scan() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/W/a.txt", b"aaa", None);
+    f.put("NOTE/Note/W/S/n.note", &note(FID, &["PA"]), None);
+    f.delete("NOTE/Note/W", NOW);
+    std::fs::write(
+        f.slot_path(&f.item("NOTE/Note/W").entry).join(".DS_Store"),
+        b"d",
+    )
+    .unwrap();
+    f.restore(&f.item("NOTE/Note/W"));
+    assert!(f.scan_events().is_empty());
+    assert_eq!(f.record(FID).unwrap().path, "NOTE/Note/W/S/n.note");
+}
+
+#[test]
+fn a_restored_file_can_be_deleted_and_restored_again() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/x.txt", b"hello", None);
+    f.delete("NOTE/Note/x.txt", NOW);
+    let first = f.item("NOTE/Note/x.txt");
+    f.restore(&first);
+    // A later delete of the same path is a new item with its own slot. (A delete in the very
+    // ms of the restored one would get its freed slot and key again: the restore leaves no
+    // trace of the slot.)
+    f.delete("NOTE/Note/x.txt", NOW + 1);
+    let second = f.item("NOTE/Note/x.txt");
+    assert_ne!(second.key, first.key);
+    assert_eq!(f.items().len(), 1);
+    // The first key is gone for good.
+    assert!(!f.slot_path(&first.entry).exists());
+    assert_eq!(
+        f.try_restore(&first, None).map_err(|e| e.to_string()),
+        Err(format!("recycle bin item {} is not there", first.key))
+    );
+    let events = f.restore(&second);
+    assert_eq!(shape(&events), [ev("file.created", "NOTE/Note/x.txt")]);
+    assert_eq!(f.bytes("NOTE/Note/x.txt"), b"hello");
+    assert!(f.items().is_empty());
+    assert!(f.index_lines().is_empty());
+}
+
+/// A file the plan can't read (here one with no index line, so it must be hashed) fails the
+/// plan before any registry row is planned: the next scan finds nothing gone.
+#[test]
+fn a_restore_that_cant_read_a_file_plans_no_row() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    f.put("NOTE/Note/W/a.txt", b"aaa", None);
+    f.delete("NOTE/Note/W", NOW);
+    let item = f.item("NOTE/Note/W");
+    let extra = f.slot_path(&item.entry).join("extra.txt");
+    std::fs::write(&extra, b"by hand").unwrap();
+    std::fs::set_permissions(&extra, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let before = f.journal.last_seq().unwrap();
+    let r = f.try_restore(&item, None);
+    std::fs::set_permissions(&extra, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(f.id("NOTE/Note/W"), None);
+    assert_eq!(f.id("NOTE/Note/W/a.txt"), None);
+    assert!(!f.store.account_dir().join(PENDING_FILE).exists());
+    assert_eq!(f.journal.last_seq().unwrap(), before);
+    assert!(f.scan_events().is_empty());
+    assert_eq!(f.item("NOTE/Note/W").key, item.key);
+    assert!(extra.is_file());
+}
+
+/// A discarded folder restore drops every row it planned, also when something was made by
+/// hand at the target meanwhile: the scan then journals what is really there, and nothing
+/// that never was.
+#[test]
+fn a_discarded_folder_restore_drops_its_rows() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/W/a.txt", b"aaa", None);
+    f.put("NOTE/Note/W/S/b.txt", b"bb", None);
+    f.delete("NOTE/Note/W", NOW);
+    f.put("NOTE/Note/V/c.txt", b"c", None);
+    f.delete("NOTE/Note/V", NOW + 1);
+    // Nothing at the target: every row goes.
+    f.try_restore(&f.item("NOTE/Note/W"), Some(CrashPoint::BeforeApply))
+        .unwrap();
+    assert!(matches!(
+        f.restart_and_recover(),
+        Recovery::Discarded { .. }
+    ));
+    for p in [
+        "NOTE/Note/W",
+        "NOTE/Note/W/a.txt",
+        "NOTE/Note/W/S",
+        "NOTE/Note/W/S/b.txt",
+    ] {
+        assert_eq!(f.id(p), None, "{p}");
+    }
+    assert!(f.scan_events().is_empty());
+    // A folder made by hand at the target before the recovery.
+    f.try_restore(&f.item("NOTE/Note/V"), Some(CrashPoint::BeforeApply))
+        .unwrap();
+    let hand = f.store.fs_path(&wp("NOTE/Note/V/x.txt"));
+    std::fs::create_dir_all(hand.parent().unwrap()).unwrap();
+    std::fs::write(&hand, b"x").unwrap();
+    assert!(matches!(
+        f.restart_and_recover(),
+        Recovery::Discarded { .. }
+    ));
+    assert_eq!(f.id("NOTE/Note/V/c.txt"), None);
+    assert_eq!(
+        shape(&f.scan_events()),
+        [
+            ev("folder.created", "NOTE/Note/V"),
+            ev("file.created", "NOTE/Note/V/x.txt"),
+        ]
+    );
+}
+
+/// Recovery keys two copies of one note as the commit would have: the first in path order
+/// gets the FILE_ID, the other its path key.
+#[test]
+fn a_recovered_folder_restore_keys_copies_like_the_commit() {
+    let f = Fixture::new();
+    let bytes = note(FID, &["PA"]);
+    f.put("NOTE/Note/W/a.note", &bytes, None);
+    f.put("NOTE/Note/W/b.note", &bytes, None);
+    f.delete("NOTE/Note/W", NOW);
+    let before = f.journal.last_seq().unwrap();
+    f.try_restore(&f.item("NOTE/Note/W"), Some(CrashPoint::BeforeAppend))
+        .unwrap();
+    assert!(matches!(f.restart_and_recover(), Recovery::Repaired { .. }));
+    let path_key = format!("path:{}", md5_hex(b"NOTE/Note/W/b.note"));
+    assert_eq!(
+        shape(&f.since(before)),
+        [
+            ev("folder.created", "NOTE/Note/W"),
+            ev("file.created", "NOTE/Note/W/a.note"),
+            ev("page.added", FID),
+            ev("file.created", "NOTE/Note/W/b.note"),
+            ev("page.added", &path_key),
+        ]
+    );
+    assert_eq!(f.record(FID).unwrap().path, "NOTE/Note/W/a.note");
+    let rec = f
+        .record(&format!("path-{}", md5_hex(b"NOTE/Note/W/b.note")))
+        .unwrap();
+    assert_eq!(rec.path, "NOTE/Note/W/b.note");
+    assert!(f.scan_events().is_empty());
+}
+
+/// The rewrite of the index keeps every other line byte for byte: a line it can't read and
+/// the old versions of other files.
+#[test]
+fn a_restore_keeps_the_other_lines_byte_for_byte() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/o.txt", b"one", None);
+    f.put("NOTE/Note/o.txt", b"two", Some(NOW - 2 * HOUR));
+    f.raw_line("not json at all");
+    f.put("NOTE/Note/x.txt", b"hello", None);
+    f.delete("NOTE/Note/x.txt", NOW);
+    f.put("NOTE/Note/o.txt", b"three", Some(NOW + 1));
+    let text = f.index_text();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 4);
+    f.restore(&f.item("NOTE/Note/x.txt"));
+    assert_eq!(
+        f.index_text(),
+        format!("{}\n{}\n{}\n", lines[0], lines[1], lines[3])
+    );
 }

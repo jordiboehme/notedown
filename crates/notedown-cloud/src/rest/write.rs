@@ -27,6 +27,9 @@
 //! to the target, the target check ([`check_target`], [`check_move`]), the plan with its page
 //! changes, the commit. Origin `app`, no device. A move or a delete removes the folders it
 //! leaves empty, as a device change does, and lists them in `removed`.
+//!
+//! `POST /recycle/restore` ([`super::recycle`]) is a write of the same kind and uses these
+//! helpers.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -80,7 +83,7 @@ struct UploadQuery {
 }
 
 /// Why a look or the commit refuses a write.
-enum Stop {
+pub(super) enum Stop {
     Target(WriteRefusal),
     NotFound,
     SyncRefused,
@@ -91,7 +94,7 @@ enum Stop {
 }
 
 impl Stop {
-    fn response(self) -> Response {
+    pub(super) fn response(self) -> Response {
         match self {
             Stop::Target(r) => r.response(),
             Stop::NotFound => error(StatusCode::NOT_FOUND, "not_found"),
@@ -240,6 +243,34 @@ fn gates(state: &AppState, store: &Store) -> crate::Result<Result<(), Stop>> {
     Ok(Ok(()))
 }
 
+/// Whether writing `size` bytes over `current` bytes takes the account over its quota, checked
+/// under the store lock. Only an account with `quota_bytes` has a quota (the device uploads
+/// check none). The tree is walked only when the cached usage is cold or near the quota.
+pub(super) fn quota_locked(
+    state: &AppState,
+    store: &Store,
+    guard: &WriteGuard,
+    account: &Account,
+    current: u64,
+    size: u64,
+) -> crate::Result<bool> {
+    let Some(quota) = account.quota_bytes else {
+        return Ok(false);
+    };
+    if size <= current {
+        return Ok(false);
+    }
+    let cached = state
+        .cached_usage(&account.slug)
+        .filter(|&used| !near_quota(quota, used, current, size));
+    if cached.is_some() {
+        return Ok(false);
+    }
+    let used = store.disk_bytes(guard)?;
+    state.remember_usage(&account.slug, used);
+    Ok(over_quota(quota, used, current, size))
+}
+
 /// The upload's commit under the store lock (module docs).
 #[allow(clippy::too_many_arguments)]
 fn commit(
@@ -262,21 +293,8 @@ fn commit(
         return Ok(Err(Stop::Target(r)));
     }
     let current = current_size(&store, path);
-    // Only an account with `quota_bytes` has a quota (the device uploads check none). The
-    // tree is walked only when the cached usage is cold or near the quota.
-    if let Some(quota) = account.quota_bytes
-        && size > current
-    {
-        let cached = state
-            .cached_usage(slug)
-            .filter(|&used| !near_quota(quota, used, current, size));
-        if cached.is_none() {
-            let used = store.disk_bytes(&guard)?;
-            state.remember_usage(slug, used);
-            if over_quota(quota, used, current, size) {
-                return Ok(Err(Stop::Quota));
-            }
-        }
+    if quota_locked(state, &store, &guard, account, current, size)? {
+        return Ok(Err(Stop::Quota));
     }
     let done = commit_staged(
         &store,
@@ -302,7 +320,7 @@ fn commit(
 }
 
 /// Runs blocking work; a store error is [`write_error`], a panic a 500.
-async fn run<T: Send + 'static>(
+pub(super) async fn run<T: Send + 'static>(
     work: impl FnOnce() -> crate::Result<Result<T, Stop>> + Send + 'static,
 ) -> Result<T, Refusal> {
     match tokio::task::spawn_blocking(work).await {
@@ -434,13 +452,13 @@ async fn receive(
 // ------------------------------------------------------- folders, move, delete
 
 /// The JSON body of a write; anything else is a 400 that names the `shape`.
-fn json_body<T: DeserializeOwned>(body: &Bytes, shape: &str) -> Result<T, Refusal> {
+pub(super) fn json_body<T: DeserializeOwned>(body: &Bytes, shape: &str) -> Result<T, Refusal> {
     serde_json::from_slice(body)
         .map_err(|_| Box::new(bad_request(&format!("the body must be {shape}"))))
 }
 
 /// What every JSON write checks before the store lock: the write token and the sync mode.
-async fn writer(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Account, Refusal> {
+pub(super) async fn writer(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Account, Refusal> {
     let account = writer_of(state, headers).await?;
     if state.sync_mode() == SyncMode::Refuse {
         return Err(Box::new(Stop::SyncRefused.response()));
@@ -453,6 +471,8 @@ async fn writer(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Account, R
 fn removed(op: &PendingOp) -> Value {
     let prune = match op {
         PendingOp::Move { prune, .. } | PendingOp::Delete { prune, .. } => prune.as_slice(),
+        // A restore leaves no folder empty.
+        PendingOp::Restore { .. } => &[],
         _ => &[],
     };
     json!(
@@ -464,7 +484,10 @@ fn removed(op: &PendingOp) -> Value {
 }
 
 /// The store, its recovered lock and the gates of a write.
-fn locked(state: &AppState, slug: &str) -> crate::Result<Result<(Arc<Store>, WriteGuard), Stop>> {
+pub(super) fn locked(
+    state: &AppState,
+    slug: &str,
+) -> crate::Result<Result<(Arc<Store>, WriteGuard), Stop>> {
     let store = state.store(slug)?;
     let guard = store.lock_recovered(&state.journal)?;
     Ok(gates(state, &store)?.map(|()| (store, guard)))

@@ -502,10 +502,26 @@ pub async fn sync_end(
     bytes: Bytes,
 ) -> Reply {
     let req = device_request!(state, headers, bytes);
-    let released = state.sync_locks.end(&req.slug, &req.serial, state.now_ms());
+    let now = state.now_ms();
+    let released = state.sync_locks.end(&req.slug, &req.serial, now);
     let mut reply = req.ok(json!({}));
     reply = match field(&req.body, "flag").as_deref() {
-        Some("Y") | Some("y") => reply.flag(FLAG_SYNC_END_OK),
+        Some("Y") | Some("y") => {
+            // Also when the lock had lapsed: the device did finish. A write error is logged and
+            // never fails the device's reply.
+            let st = state.clone();
+            let (slug, serial) = (req.slug.clone(), req.serial.clone());
+            let done = tokio::task::spawn_blocking(move || {
+                st.auth.devices().mark_synced(&slug, &serial, now)
+            })
+            .await;
+            match done {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("notedown cloud: last sync not recorded: {e}"),
+                Err(e) => eprintln!("notedown cloud: last sync task failed: {e}"),
+            }
+            reply.flag(FLAG_SYNC_END_OK)
+        }
         Some("N") | Some("n") => reply.flag(FLAG_SYNC_END_FAILED),
         _ => reply.flag(FLAG_SYNC_END_UNKNOWN),
     };

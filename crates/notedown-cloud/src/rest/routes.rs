@@ -15,13 +15,13 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{PREFIX, RefusedToken, browse, write};
+use super::{PREFIX, RefusedToken, browse, recycle, write};
 use crate::api::ClientAddr;
 use crate::api::envelope::{LogMessage, Streamed};
 use crate::api::oss::{Flow, stream_body};
 use crate::auth::{Account, AuthError, Scope, TokenCheck};
 use crate::pages::valid_key;
-use crate::read::{self, NoteFile, ServerAccount};
+use crate::read::{self, DeviceView, NoteFile, ServerAccount};
 use crate::server::AppState;
 use crate::store::WirePath;
 
@@ -71,6 +71,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(&path("/folders"), json_body(post(write::folder)))
         .route(&path("/move"), json_body(post(write::move_)))
+        .route(&path("/recycle"), get_only(get(recycle::list)))
+        .route(&path("/recycle/restore"), json_body(post(recycle::restore)))
+        .route(&path("/recycle/empty"), json_body(post(recycle::empty)))
         .route(PREFIX, any(no_route))
         .route(&path("/"), any(no_route))
         .route(&path("/{*rest}"), any(no_route))
@@ -292,16 +295,41 @@ async fn login(
     }
 }
 
-/// `GET /account`: `{"slug","userId"}`.
+/// `GET /account`: [`ServerAccount`], the devices newest sync first.
 async fn account(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match account_of(&state, &headers).await {
-        Ok(a) => Json(ServerAccount {
-            slug: a.slug,
-            user_id: a.user_id,
+    let a = match account_of(&state, &headers).await {
+        Ok(a) => a,
+        Err(r) => return *r,
+    };
+    let st = state.clone();
+    let slug = a.slug.clone();
+    let list = blocking(move || st.auth.devices().list_readable(&slug)).await;
+    let list = match list {
+        Ok(l) => l,
+        Err(r) => return *r,
+    };
+    let now = state.now_ms();
+    let holder = state.sync_locks.holder(&a.slug, now);
+    let mut devices: Vec<DeviceView> = list
+        .into_iter()
+        .map(|d| DeviceView {
+            syncing: holder.as_deref() == Some(d.serial.as_str()),
+            online: state.sockets.is_connected(&a.slug, &d.serial, now),
+            serial: d.serial,
+            name: d.name,
+            bound: d.bound,
+            last_login_ms: d.last_login_ms,
+            last_sync_ms: d.last_sync_ms,
         })
-        .into_response(),
-        Err(r) => *r,
-    }
+        .collect();
+    // Newest sync first, never synced last; `sort_by` is stable, so ties stay by serial.
+    devices.sort_by_key(|x| std::cmp::Reverse(x.last_sync_ms));
+    Json(ServerAccount {
+        slug: a.slug,
+        user_id: a.user_id,
+        devices,
+    })
+    .into_response()
 }
 
 /// `GET /records`: [`read::Records`].
@@ -364,7 +392,7 @@ struct JournalQuery {
     limit: Option<String>,
 }
 
-fn number(text: Option<&str>, name: &str, default: u64) -> Result<u64, Refusal> {
+pub(super) fn number(text: Option<&str>, name: &str, default: u64) -> Result<u64, Refusal> {
     match text {
         None => Ok(default),
         Some(t) => t

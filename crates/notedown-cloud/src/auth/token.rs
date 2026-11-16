@@ -1,7 +1,9 @@
 //! Server key, tokens and the per-device token generation.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -169,6 +171,10 @@ pub struct Device {
     pub token_generation: u64,
     /// Milliseconds since the epoch of the last login.
     pub last_login_ms: u64,
+    /// Milliseconds since the epoch of the last `synchronous/end` with the flag `Y`. Missing
+    /// in files of older versions and until the first finished sync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync_ms: Option<u64>,
 }
 
 impl Device {
@@ -181,6 +187,7 @@ impl Device {
             total_capacity: None,
             token_generation: 0,
             last_login_ms: 0,
+            last_sync_ms: None,
         }
     }
 }
@@ -190,6 +197,25 @@ pub struct Devices {
     data_dir: PathBuf,
     /// Serializes every read-modify-write of device files in this process.
     write_lock: Arc<Mutex<()>>,
+    /// The device files [`Devices::list_readable`] skipped, with the stamp of the file when it
+    /// warned, so a file that stays broken is warned once and not on every poll.
+    broken: Arc<Mutex<HashMap<(String, String), FileStamp>>>,
+}
+
+/// The modification time and length of a file, to tell when it changed.
+type FileStamp = (Option<SystemTime>, u64);
+
+fn file_stamp(path: &Path) -> FileStamp {
+    std::fs::metadata(path).map_or((None, 0), |m| (m.modified().ok(), m.len()))
+}
+
+/// A device file whose bytes are there but do not parse: bad JSON or not UTF-8.
+fn unparsable(e: &Error) -> bool {
+    match e {
+        Error::Config { .. } => true,
+        Error::Io { source, .. } => source.kind() == std::io::ErrorKind::InvalidData,
+        _ => false,
+    }
 }
 
 fn valid_serial(serial: &str) -> bool {
@@ -205,6 +231,22 @@ impl Devices {
         Devices {
             data_dir: data_dir.to_path_buf(),
             write_lock: Arc::new(Mutex::new(())),
+            broken: Arc::default(),
+        }
+    }
+
+    /// Whether to warn that the device file of `slug`/`serial` with `stamp` is skipped: yes the
+    /// first time and after the file changed, no while it stays the same.
+    fn warn_broken(&self, slug: &str, serial: &str, stamp: FileStamp) -> bool {
+        let mut broken = self.broken.lock().unwrap_or_else(|e| e.into_inner());
+        broken.insert((slug.to_string(), serial.to_string()), stamp) != Some(stamp)
+    }
+
+    /// Forgets a skipped device file that reads well again or is gone.
+    fn forget_broken(&self, slug: &str, serial: &str) {
+        let mut broken = self.broken.lock().unwrap_or_else(|e| e.into_inner());
+        if !broken.is_empty() {
+            broken.remove(&(slug.to_string(), serial.to_string()));
         }
     }
 
@@ -252,8 +294,20 @@ impl Devices {
         }
     }
 
-    /// All devices of one account, sorted by serial.
+    /// All devices of one account, sorted by serial. A device file that cannot be read fails
+    /// the call; [`list_readable`](Self::list_readable) skips it instead.
     pub fn list(&self, slug: &str) -> Result<Vec<Device>> {
+        self.list_inner(slug, false)
+    }
+
+    /// [`list`](Self::list), but a device file that is not valid JSON (or not UTF-8) is skipped
+    /// with a warning on stderr, so one broken file does not hide the other devices. The
+    /// warning comes once per file, and again only after the file changed or read well.
+    pub fn list_readable(&self, slug: &str) -> Result<Vec<Device>> {
+        self.list_inner(slug, true)
+    }
+
+    fn list_inner(&self, slug: &str, skip_broken: bool) -> Result<Vec<Device>> {
         super::accounts::validate_slug(slug)?;
         let dir = self.data_dir.join("accounts").join(slug).join("devices");
         let entries = match std::fs::read_dir(&dir) {
@@ -271,8 +325,20 @@ impl Devices {
             if !valid_serial(serial) {
                 continue;
             }
-            if let Some(d) = self.get(slug, serial)? {
-                out.push(d);
+            match self.get(slug, serial) {
+                Ok(found) => {
+                    if skip_broken {
+                        self.forget_broken(slug, serial);
+                    }
+                    out.extend(found);
+                }
+                Err(e) if skip_broken && unparsable(&e) => {
+                    // Once per broken file: the pipeline asks for the devices every second.
+                    if self.warn_broken(slug, serial, file_stamp(&entry.path())) {
+                        eprintln!("notedown cloud: device {serial} of account {slug} skipped: {e}");
+                    }
+                }
+                Err(e) => return Err(e),
             }
         }
         out.sort_by(|a, b| a.serial.cmp(&b.serial));
@@ -350,6 +416,13 @@ impl Devices {
         self.bump_inner(slug, serial, Some(now_ms))
     }
 
+    /// Record the end of a good sync (`synchronous/end` with the flag `Y`). Creates the record
+    /// when missing, like the other changes; [`Error::NoAccount`] for a removed account.
+    pub fn mark_synced(&self, slug: &str, serial: &str, now_ms: u64) -> Result<()> {
+        self.update(slug, serial, |d| d.last_sync_ms = Some(now_ms))
+            .map(|_| ())
+    }
+
     /// Like [`bump`](Self::bump) for logout and unbinding: `last_login_ms` stays as it was.
     pub fn invalidate(&self, slug: &str, serial: &str) -> Result<u64> {
         self.bump_inner(slug, serial, None)
@@ -363,5 +436,52 @@ impl Devices {
             }
         })?;
         Ok(device.token_generation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn broken_keys(d: &Devices) -> Vec<(String, String)> {
+        let mut keys: Vec<_> = d.broken.lock().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn a_broken_device_file_is_warned_once_until_it_changes_or_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let devices_dir = dir.path().join("accounts/jordi/devices");
+        std::fs::create_dir_all(&devices_dir).unwrap();
+        let file = devices_dir.join("BROKEN-1.json");
+        std::fs::write(&file, "{not json").unwrap();
+        let d = Devices::new(dir.path());
+        let key = ("jordi".to_string(), "BROKEN-1".to_string());
+
+        assert!(d.list_readable("jordi").unwrap().is_empty());
+        assert_eq!(broken_keys(&d), std::slice::from_ref(&key));
+        // The same file again: no new warning.
+        let stamp = d.broken.lock().unwrap()[&key];
+        assert!(!d.warn_broken(&key.0, &key.1, stamp));
+        assert!(d.list_readable("jordi").unwrap().is_empty());
+        assert_eq!(broken_keys(&d), std::slice::from_ref(&key));
+        // A clone (the shared state of the server) knows it too.
+        assert!(!d.clone().warn_broken(&key.0, &key.1, stamp));
+
+        // Changed but still broken: warned again.
+        std::fs::write(&file, "{still not json, longer").unwrap();
+        let changed = file_stamp(&file);
+        assert_ne!(changed, stamp);
+        assert!(d.warn_broken(&key.0, &key.1, changed));
+
+        // Read well: forgotten, so a later break is warned again.
+        std::fs::write(
+            &file,
+            r#"{"serial":"BROKEN-1","token_generation":1,"last_login_ms":5}"#,
+        )
+        .unwrap();
+        assert_eq!(d.list_readable("jordi").unwrap().len(), 1);
+        assert!(broken_keys(&d).is_empty());
     }
 }

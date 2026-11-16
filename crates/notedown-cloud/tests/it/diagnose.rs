@@ -157,6 +157,7 @@ pub fn fixture() -> Fixture {
             total_capacity: None,
             token_generation: 1,
             last_login_ms: 1_791_322_352_199,
+            last_sync_ms: None,
         };
         write(
             &acc.join(format!("devices/{serial}.json")),

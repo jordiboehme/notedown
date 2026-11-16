@@ -103,6 +103,18 @@ enum PipelineAction {
     /// Print the changes of the text store as JSON: the same answers as get_changes of the MCP
     /// server. A consumer's bookmark does not move, use ack for that
     Changes(ChangesArgs),
+    /// Print the status of one account as JSON: whether the pipeline runs and the page it
+    /// reads, the pages with text, pending, queued, waiting and failed, the last error and the
+    /// consumers with their last ack, last read and notes behind. Creates and changes nothing.
+    /// Each call reads the whole text log, so do not ask more often than every few seconds
+    Status {
+        /// The data folder
+        #[arg(long, value_name = "DIR")]
+        data: PathBuf,
+        /// The account slug (can be left out when the data folder has only one account)
+        #[arg(long)]
+        account: Option<String>,
+    },
     /// Move the bookmark of a consumer to --up-to, never backwards, and print it as JSON
     Ack {
         /// The data folder
@@ -512,8 +524,12 @@ struct RenderArgs {
 #[cfg(feature = "ocr")]
 #[derive(Subcommand)]
 enum ModelAction {
-    /// Download the model files into the cache
-    Pull,
+    /// Download the model files into the cache (continues a stopped download)
+    Pull {
+        /// Print one JSON line per progress update on stdout
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the cache folder and the model file paths
     Path,
     /// Check size and SHA-256 of the model files
@@ -726,10 +742,22 @@ fn render(args: RenderArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// One progress line of `model pull --json`.
+#[cfg(feature = "ocr")]
+fn progress_json(file: &str, done: u64, total: u64) -> String {
+    serde_json::json!({ "file": file, "done": done, "total": total }).to_string()
+}
+
+/// The last line of `model pull --json`.
+#[cfg(feature = "ocr")]
+fn ready_json(path: &Path) -> String {
+    serde_json::json!({ "ready": path.display().to_string() }).to_string()
+}
+
 #[cfg(feature = "ocr")]
 fn model_command(action: ModelAction) -> Result<ExitCode> {
     match action {
-        ModelAction::Pull => {
+        ModelAction::Pull { json } => {
             let mut last = Instant::now() - Duration::from_secs(10);
             let mut current = String::new();
             let mut progress = |file: &str, done: u64, total: u64| {
@@ -738,14 +766,26 @@ fn model_command(action: ModelAction) -> Result<ExitCode> {
                     current = file.to_string();
                 }
                 let finished = total > 0 && done >= total;
-                if new_file || finished || last.elapsed() >= Duration::from_secs(2) {
+                let wait = Duration::from_millis(if json { 250 } else { 2000 });
+                if new_file || finished || last.elapsed() >= wait {
                     last = Instant::now();
-                    let pct = (done * 100).checked_div(total).unwrap_or(0);
-                    eprintln!("downloading {file}: {pct}%");
+                    if json {
+                        use std::io::Write;
+                        let mut out = std::io::stdout().lock();
+                        let _ = writeln!(out, "{}", progress_json(file, done, total));
+                        let _ = out.flush();
+                    } else {
+                        let pct = (done * 100).checked_div(total).unwrap_or(0);
+                        eprintln!("downloading {file}: {pct}%");
+                    }
                 }
             };
             let paths = model::pull(&DEFAULT_MODEL, &mut progress)?;
-            eprintln!("model ready: {}", paths.model.display());
+            if json {
+                println!("{}", ready_json(&paths.model));
+            } else {
+                eprintln!("model ready: {}", paths.model.display());
+            }
             Ok(ExitCode::SUCCESS)
         }
         ModelAction::Path => {
@@ -2113,10 +2153,13 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
                     .join(&slug);
                 if dir.is_dir() {
                     for (name, b) in TextStore::open(&data, &slug)?.consumers()? {
+                        // A consumer that only read has no ack yet: no time.
+                        let at = |ms: u64| (ms > 0).then(|| delta::stamp(ms, local));
                         list.push(serde_json::json!({
                             "consumer": name,
                             "seq": b.seq,
-                            "updatedAt": delta::stamp(b.updated_at, local),
+                            "updatedAt": at(b.updated_at),
+                            "readAt": b.read_at.and_then(at),
                         }));
                     }
                 }
@@ -2145,6 +2188,14 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
                 let d = delta::delta(&store, &start, a.notes.as_deref(), MAX_CHARS, local)?;
                 println!("{}", to_json(&d));
             }
+        }
+        PipelineAction::Status { data, account } => {
+            let slug = resolve_account(&data, account.as_deref())?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            let facts = notedown_pipeline::status::status_facts(&data, &slug, now)?;
+            println!("{}", to_json(&facts));
         }
         PipelineAction::Ack {
             data,
@@ -2257,6 +2308,20 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn progress_json_has_file_done_and_total() {
+        let v: serde_json::Value =
+            serde_json::from_str(&super::progress_json("a.gguf", 5, 10)).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"file": "a.gguf", "done": 5, "total": 10})
+        );
+        let r: serde_json::Value =
+            serde_json::from_str(&super::ready_json(std::path::Path::new("/m/a.gguf"))).unwrap();
+        assert_eq!(r, serde_json::json!({"ready": "/m/a.gguf"}));
+    }
+
     use super::*;
     use std::net::Ipv4Addr;
 

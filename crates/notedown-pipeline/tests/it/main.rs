@@ -8,4 +8,5 @@ mod rest;
 mod rest_split;
 mod source;
 mod split;
+mod status;
 mod worker;

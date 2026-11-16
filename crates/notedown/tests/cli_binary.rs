@@ -1999,6 +1999,94 @@ mod pipeline_and_mcp {
     }
 
     #[test]
+    fn pipeline_status_prints_json() {
+        let dir = pipeline_fixture(&["jordi"]);
+        let d = dir.path();
+        json_out(&pipeline_cmd(
+            d,
+            &[
+                "ack",
+                "--account",
+                "jordi",
+                "--consumer",
+                "agent",
+                "--up-to",
+                "1",
+            ],
+        ));
+        // The CLI reads without a read time: no bookmark for this consumer.
+        json_out(&pipeline_cmd(
+            d,
+            &["changes", "--account", "jordi", "--consumer", "reader"],
+        ));
+        // A read over MCP of a consumer that never acked.
+        let store = notedown_pipeline::store::TextStore::open(d, "jordi").unwrap();
+        store.mark_read("fresh", 1_700_000_000_000).unwrap();
+
+        let status = json_out(&pipeline_cmd(d, &["status", "--account", "jordi"]));
+        let mut keys: Vec<&str> = status
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "account",
+                "consumers",
+                "errors",
+                "failed",
+                "inWork",
+                "lastError",
+                "lastRunMs",
+                "nextDueMs",
+                "notes",
+                "pagesWithText",
+                "pending",
+                "queued",
+                "running",
+                "truncated",
+                "waiting"
+            ],
+            "{status}"
+        );
+        assert_eq!(status["account"], "jordi", "{status}");
+        assert_eq!(status["running"], false, "{status}");
+        assert_eq!(status["notes"], 2, "{status}");
+        assert_eq!(status["pagesWithText"], 2, "{status}");
+        assert_eq!(status["inWork"], serde_json::Value::Null, "{status}");
+        let consumers = status["consumers"].as_array().unwrap();
+        assert_eq!(consumers.len(), 2, "{status}");
+        let agent = &consumers[0];
+        assert_eq!(agent["name"], "agent", "{status}");
+        assert_eq!(agent["seq"], 1, "{status}");
+        assert!(
+            agent["ackedAt"].as_u64().is_some_and(|ms| ms > 0),
+            "{status}"
+        );
+        assert_eq!(agent["readAt"], serde_json::Value::Null, "{status}");
+        assert_eq!(agent["notesBehind"], 2, "{status}");
+        assert_eq!(agent["more"], false, "{status}");
+        let fresh = &consumers[1];
+        assert_eq!(fresh["name"], "fresh", "{status}");
+        assert_eq!(fresh["ackedAt"], serde_json::Value::Null, "{status}");
+        assert_eq!(fresh["readAt"], 1_700_000_000_000u64, "{status}");
+
+        // The never-acked consumer in the list of bookmarks.
+        let list = json_out(&pipeline_cmd(d, &["consumers", "--account", "jordi"]));
+        let fresh = &list["jordi"][1];
+        assert_eq!(fresh["consumer"], "fresh", "{list}");
+        assert_eq!(fresh["updatedAt"], serde_json::Value::Null, "{list}");
+        assert_local_time(&fresh["readAt"]);
+
+        // An unknown account fails.
+        let out = pipeline_cmd(d, &["status", "--account", "nobody"]);
+        assert_eq!(out.status.code(), Some(1));
+    }
+
+    #[test]
     fn diagnose_reports_the_pipeline_line_and_leaves_its_texts_out() {
         use notedown_pipeline::model::PageOcrState;
         use notedown_pipeline::store::{TextStore, WriterLock};
@@ -2591,4 +2679,15 @@ fn connect_refuses_a_server_data_folder() {
     assert!(err.contains("holds a server's data"), "{err}");
     assert!(!data.path().join("pipeline.toml").exists());
     assert!(!data.path().join("tokens").exists());
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn model_pull_offers_json_progress() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["model", "pull", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("--json"));
 }

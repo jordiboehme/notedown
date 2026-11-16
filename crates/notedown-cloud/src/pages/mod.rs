@@ -56,7 +56,9 @@
 //! `pending.json`: a missing or stale record is harmless (see above). [`Store::snapshot`] writes
 //! the record of every note it journals, before its append. Moves carry the record along with
 //! [`plan_page_move`], and deletes remove it with [`plan_page_delete`] (a crash between the
-//! delete and its record removal leaves the record to the cleanup below). A record that already
+//! delete and its record removal leaves the record to the cleanup below). A restore from the
+//! recycle bin writes the records of the notes it brings back ([`plan_page_restore`]), and
+//! recovery writes them again for a restore it finishes. A record that already
 //! has the new bytes is not written again, and the `pages/` folder is synced once per commit,
 //! scan or snapshot.
 //!
@@ -824,6 +826,144 @@ pub fn plan_page_delete(store: &Store, _guard: &WriteGuard, commit: &mut Commit)
         .flat_map(|(_, records)| records)
         .filter_map(|(key, _)| record_write(store, key, None));
     commit.side_writes.extend(gone);
+}
+
+/// The page index of a planned restore (`Store::plan_restore`): every `.note` it brings back
+/// (the file itself, or every note in the restored folder, in path order) is fingerprinted from
+/// its bytes in the recycle slot, as a new note (no state before). Its page events go right
+/// after its `file.created`, which gets `pagesChanged`, and its record is attached for
+/// [`Store::commit`] to write. Keys are chosen as a scan chooses them ([`Claims`]): of several
+/// copies of one note the first in path order gets the `FILE_ID`, unless a record on disk names
+/// it for another file. The note keeps its key, so the pipeline sees its old text come back.
+/// Call it after `plan_restore` and before `Store::commit`, under the same guard (the slot must
+/// still be in place). Does nothing for other operations. A note that does not parse gives
+/// `page.index_failed`.
+pub fn plan_page_restore(
+    store: &Store,
+    _guard: &WriteGuard,
+    commit: &mut Commit,
+) -> crate::Result<()> {
+    for (id, diff) in index_restored(store, commit, true)? {
+        let Some(at) = commit
+            .events
+            .iter()
+            .position(|e| matches!(e, EventBody::FileCreated { id: i, .. } if *i == id))
+        else {
+            continue;
+        };
+        if let Some(EventBody::FileCreated { pages_changed, .. }) = commit.events.get_mut(at) {
+            *pages_changed = diff.pages_changed();
+        }
+        let tail = commit.events.split_off(at + 1);
+        commit.events.extend(diff.events(id));
+        commit.events.extend(tail);
+        commit.side_writes.extend(diff_writes(store, &diff));
+    }
+    Ok(())
+}
+
+/// The page records of the notes of an applied restore, made again from their live paths
+/// with the keys [`plan_page_restore`] chose: recovery writes them, since side writes are not
+/// part of the intent. Empty for other operations.
+pub(crate) fn restore_records(store: &Store, commit: &Commit) -> Vec<SideWrite> {
+    match index_restored(store, commit, false) {
+        Ok(notes) => notes
+            .iter()
+            .flat_map(|(_, diff)| diff_writes(store, diff))
+            .collect(),
+        Err(e) => {
+            eprintln!(
+                "warning: account {}: the page records of a restore: {e}",
+                store.slug()
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// The record writes of a diff: removals of the records it drops, then its record.
+fn diff_writes(store: &Store, diff: &PageDiff) -> Vec<SideWrite> {
+    let mut writes: Vec<SideWrite> = diff
+        .drop_records
+        .iter()
+        .filter_map(|key| record_write(store, key, None))
+        .collect();
+    if let Some(record) = &diff.record {
+        let bytes = crate::fsutil::json_bytes(record);
+        writes.extend(record_write(store, &record.file_id, Some(bytes)));
+    }
+    writes
+}
+
+/// Each `.note` of a restore with its new id and its diff as a new note, in path order. The
+/// bytes are read in the slot (`in_slot`, before the commit) or at the live path. The MD5 and
+/// size come from the note's `file.created`.
+fn index_restored(
+    store: &Store,
+    commit: &Commit,
+    in_slot: bool,
+) -> crate::Result<Vec<(u64, PageDiff)>> {
+    let PendingOp::Restore {
+        kind,
+        recycle,
+        to,
+        id,
+        inside,
+        ..
+    } = &commit.op
+    else {
+        return Ok(Vec::new());
+    };
+    let to = WirePath::parse_named(to)?;
+    let mut notes: Vec<(u64, WirePath)> = match kind {
+        Kind::File => vec![(*id, to.clone())],
+        Kind::Folder => inside
+            .iter()
+            .filter(|e| e.kind == Kind::File)
+            .map(|e| Ok((e.id, WirePath::parse_named(&e.path)?)))
+            .collect::<crate::Result<_>>()?,
+    };
+    notes.retain(|(_, p)| FileKind::of(p.name().unwrap_or_default()) == FileKind::Note);
+    notes.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut slot = store.recycle_dir();
+    slot.extend(recycle.split('/'));
+    let mut claims = Claims::new();
+    let mut out = Vec::new();
+    for (id, path) in notes {
+        let Some((md5, size)) = commit.events.iter().find_map(|e| match e {
+            EventBody::FileCreated {
+                id: i, md5, size, ..
+            } if *i == id => Some((md5.clone(), *size)),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let source = if in_slot {
+            let mut p = slot.clone();
+            p.extend(
+                path.segments()
+                    .get(to.segments().len()..)
+                    .unwrap_or_default(),
+            );
+            p
+        } else {
+            store.fs_path(&path)
+        };
+        let w = Write {
+            target: &path,
+            md5,
+            size,
+            current_md5: None,
+            limit: MAX_NOTE_BYTES,
+            known: None,
+        };
+        let diff = match fingerprint_file(&source, MAX_NOTE_BYTES) {
+            Ok(note) => compute(store, &w, note, Some(&mut claims)),
+            Err(reason) => PageDiff::failed(&path, reason),
+        };
+        out.push((id, diff));
+    }
+    Ok(out)
 }
 
 /// The record changes for notes that moved from the first path to the second (see

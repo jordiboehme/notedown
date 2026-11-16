@@ -33,6 +33,13 @@ The files go to `~/Library/Caches/notedown/models` on macOS and `$XDG_CACHE_HOME
 Linux. Set `NOTEDOWN_MODEL_DIR` to use another folder. `notedown model path` shows the paths and
 `notedown model verify` checks the files.
 
+A pull that stops (you end it, or the connection breaks) keeps what it has. The next
+`notedown model pull` continues from there. Run only one pull at a time.
+
+`notedown model pull --json` is for apps. It prints one JSON line per progress step on stdout:
+`{"file": "<name>", "done": <bytes>, "total": <bytes>}`. The last line is `{"ready": "<path>"}`.
+An error is plain text on stderr, and the exit code is not 0.
+
 ## Convert and render
 
 ```sh
@@ -204,6 +211,29 @@ files as real files in a data folder and writes every change to a journal.
 Read the [getting started guide](getting-started.md) before you switch a device. It covers the
 backup, the import, the first sync, daily use, the way back and troubleshooting. The protocol is
 documented in the [sync protocol](sync-protocol.md).
+
+## Pipeline status
+
+`notedown pipeline status --data DIR [--account A]` prints the state of the OCR pipeline of one account
+as one JSON object. `--account` can be left out when the data folder has only one account. It creates
+and changes nothing. Each call reads the whole text log, so do not poll more often than every few
+seconds. The fields:
+
+- `account`: the account slug.
+- `running`: a pipeline runs on this data folder now.
+- `notes`, `pagesWithText`: the notes that are not deleted and their pages with text.
+- `pending`: pages of notes the pipeline started on and has not read yet.
+- `queued`: pages of the current pass that are not read yet. It is 0 after a full pass.
+- `waiting`: pages of notes that changed less than the settle time ago, as of the last pass.
+- `nextDueMs`: when the next settle time or retry ends (ms since 1970), or `null`.
+- `failed`, `truncated`, `errors`: pages whose tries are used up, pages whose text was cut and failed
+  pages that are tried again.
+- `lastError`: `{"text", "atMs"}` of the last failure of the pipeline as a whole, or `null`. A good
+  pass clears it.
+- `lastRunMs`: when the last pass ended, or `null`.
+- `inWork`: `{"note", "path", "page", "pages", "startedMs"}` of the page it reads now, or `null`.
+- `consumers`: one entry per consumer of the changes, `{"name", "seq", "ackedAt", "readAt",
+  "notesBehind", "more"}`.
 
 ## Format documentation and tests
 

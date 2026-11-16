@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 
 use time::{Date, OffsetDateTime, UtcOffset};
 
-use super::RecycleEntry;
+use super::{RecycleEntry, RecycleReason};
 
 const DAY_MS: u64 = 86_400_000;
 
@@ -108,11 +108,23 @@ pub fn plan(
     remove
 }
 
+/// Which lines Empty removes: every `deleted` line, also one the bin does not list (a hidden
+/// path, a folder a delete left with only dot-files), and never an `overwritten` line. The old
+/// versions of replaced files keep following [`plan`]. Returns the indices into `entries`,
+/// ascending.
+pub fn plan_empty(entries: &[RecycleEntry]) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.reason == RecycleReason::Deleted)
+        .map(|(i, _)| i)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use time::{Month, PrimitiveDateTime, Time};
 
-    use super::super::RecycleReason;
     use super::*;
 
     fn offset() -> UtcOffset {
@@ -133,6 +145,7 @@ mod tests {
             md5: "m".into(),
             deleted_at,
             reason,
+            pruned: false,
         }
     }
 
@@ -294,6 +307,43 @@ mod tests {
         let entries = vec![over(5, u64::MAX), over(5, u64::MAX - 1)];
         let got = plan(&entries, &live5, &r(1, 7, 12, u32::MAX), now, offset());
         assert!(got.is_empty());
+    }
+
+    #[test]
+    fn plan_empty_takes_every_deleted_line() {
+        let del = RecycleReason::Deleted;
+        let mut folder = entry(7, 1_000, del);
+        folder.path = "NOTE/Note/W".into();
+        folder.md5 = String::new();
+        let mut parent = folder.clone();
+        parent.path = "NOTE/Note/P".into();
+        parent.pruned = true;
+        let mut dotted = entry(8, 2_000, del);
+        dotted.path = "NOTE/Note/.hidden".into();
+        let entries = vec![
+            entry(5, 500, del),
+            folder,
+            parent,
+            dotted,
+            entry(9, u64::MAX, del),
+        ];
+        assert_eq!(plan_empty(&entries), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn plan_empty_never_takes_an_overwritten_line() {
+        let del = RecycleReason::Deleted;
+        // Old versions of a live file, of a deleted file and of a restored one stay.
+        let entries = vec![
+            over(5, 100),
+            over(9, 200),
+            entry(9, 300, del),
+            over(5, 400),
+            over(11, 500),
+        ];
+        assert_eq!(plan_empty(&entries), vec![2]);
+        assert!(plan_empty(&[over(5, 1)]).is_empty());
+        assert!(plan_empty(&[]).is_empty());
     }
 
     #[test]

@@ -33,7 +33,7 @@ pub fn start_seq(state: &AppState) -> crate::Result<u64> {
 
 /// The bound devices of `slug` (D6). A read error gives no targets.
 fn bound_targets(state: &AppState, slug: &str) -> Vec<String> {
-    match state.auth.devices().list(slug) {
+    match state.auth.devices().list_readable(slug) {
         Ok(devices) => devices
             .into_iter()
             .filter(|d| d.bound)

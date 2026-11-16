@@ -27,7 +27,7 @@ On macOS the OCR model runs on the GPU (Metal). On Linux it runs on the CPU. The
 notedown model pull
 ```
 
-This is done once. The model is about 3.4 GB and every file is checked against a pinned SHA-256 sum. `notedown model path` shows where the files are and `notedown model verify` checks them again.
+This is done once. The model is about 3.4 GB and every file is checked against a pinned SHA-256 sum. If the download stops, run the command again: it continues where it stopped. `notedown model path` shows where the files are and `notedown model verify` checks them again.
 
 ### 3. Get your notes onto the computer
 
@@ -203,6 +203,10 @@ One safety stop: if a scan would delete files and leave fewer than `scan_min_fil
 
 **Find an old version.** Every overwrite and every delete moves the old file into `accounts/me/recycle/`. `recycle/index.jsonl` lists what is where. The server prunes the recycle bin by these rules. For each file it keeps the 3 newest old versions, the version the file had at the end of each of the last 7 days and the version it had at the end of each of the last 12 months. Every other old version is removed. A deleted file's versions are removed 90 days after the delete. The settings are `recycle_prune`, `recycle_keep_latest`, `recycle_keep_daily`, `recycle_keep_monthly` and `recycle_keep_deleted_days` in `server.toml`. Set `recycle_prune = false` and the server never prunes. Restart the server after you change them.
 
+An app can list the deleted files and folders, bring them back and empty the bin over the [REST API](rest-api.md) (`GET /recycle`, `POST /recycle/restore` and `POST /recycle/empty`). To restore, it needs a token for writing. Empty needs one too. A restored file comes back with a new id, and the device sees it as a new file. An old version of a replaced file can't be restored this way. Copy it out of `recycle/` by hand.
+
+Empty removes every deleted file and folder from `recycle/` at once, also those the app does not list. It does not remove the old versions of replaced files, also not of files that were restored. The server prunes them by the rules above, so they are not kept for good. After Empty, the old versions of a deleted file are removed 90 days after the newest of them, which can be right away.
+
 To see what a prune would remove, run `notedown cloud recycle prune --data ~/notedown-data --account me --dry-run`. It changes nothing. Without `--dry-run` it prunes right away, also when `recycle_prune` is off. Run the dry run before the first start of a new version. The server prunes about once an hour while it runs. The first prune runs one hour after it starts. A server that's restarted more often than that prunes less, so then run `notedown cloud recycle prune` by hand.
 
 After `notedown cloud import --replace` every file gets a new id. The old versions from before the import then count as versions of a deleted file, so they're removed 90 days after the import.
@@ -299,7 +303,7 @@ The first run reads every note in scope, newest note first, and prints its progr
 claude mcp add notedown -- notedown mcp --data ~/notedown-data
 ```
 
-With more than one account in the data folder, add `--account me`. The server only reads the text and the bookmarks of the agents. It never runs OCR. Ask Claude "what changed in my notes since yesterday?" to try it.
+With more than one account in the data folder, add `--account me`. The server only reads the text and the bookmarks of the agents, and it keeps the time an agent last read the changes. It never runs OCR. Ask Claude "what changed in my notes since yesterday?" to try it.
 
 **Install the ingest skill.** The skill tells the agent how to put the changes into Crystalline: it plans, gives the notes of one folder to one sub-agent, and confirms only when all of them succeeded. Copy it from a source checkout of Notedown:
 

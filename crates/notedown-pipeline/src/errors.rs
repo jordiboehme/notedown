@@ -58,6 +58,15 @@ impl Errors {
     /// Reads `errors.jsonl` in the store folder `dir`. A missing file is empty; a line that
     /// does not parse is left out with a warning (it only costs a retry).
     pub fn load(dir: &Path) -> Result<Errors> {
+        Errors::read(dir, true)
+    }
+
+    /// [`load`](Self::load) without the warnings, for a reader that asks often (the status).
+    pub fn load_quietly(dir: &Path) -> Result<Errors> {
+        Errors::read(dir, false)
+    }
+
+    fn read(dir: &Path, warn: bool) -> Result<Errors> {
         let path = dir.join(ERRORS_FILE);
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
@@ -68,7 +77,10 @@ impl Errors {
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
             match serde_json::from_str::<ErrorEntry>(line) {
                 Ok(e) => entries.push(e),
-                Err(e) => eprintln!("warning: {}: a line cannot be read: {e}", path.display()),
+                Err(e) if warn => {
+                    eprintln!("warning: {}: a line cannot be read: {e}", path.display())
+                }
+                Err(_) => {}
             }
         }
         Ok(Errors { path, entries })

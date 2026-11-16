@@ -7,6 +7,7 @@
 //! - `notes/<key>.json`: the [`NoteState`] of a note, written atomically.
 //! - `consumers/<name>.json`: the [`Bookmark`] of a consumer, written under `.lock`.
 //! - `stats.json`: the [`Stats`] of the account.
+//! - `work.json`: the [`Work`] the writer is on now, removed at the end of each pass.
 //!
 //! One writer per data folder: the holder of `<data>/pipeline/.writer.lock` ([`WriterLock`]).
 //! Its write order per page version is binding: first the log line, then the note state. A
@@ -33,6 +34,15 @@ const LOG_FILE: &str = "log.jsonl";
 const NOTES_DIR: &str = "notes";
 const CONSUMERS_DIR: &str = "consumers";
 const STATS_FILE: &str = "stats.json";
+/// `<data>/pipeline/<slug>/work.json`: the page the writer reads now.
+pub const WORK_FILE: &str = "work.json";
+/// `<data>/pipeline/last_error.json`: the last error of the source as a whole (the account
+/// list failed, a token was refused), which no account store may hold.
+pub const LAST_ERROR_FILE: &str = "last_error.json";
+/// How long [`WriterLock::take`] tries before [`Error::WriterBusy`]: a status probe holds the
+/// lock for a moment and must not stop a starting writer.
+const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+const WRITER_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 /// `<local>/pipeline/<slug>/owner.json`: `{"userId":N}`, the server account the text is of.
 pub const OWNER_FILE: &str = "owner.json";
 /// The name start of a store on its way out: `<local>/pipeline/.removed-<slug>-<hex>`.
@@ -160,9 +170,14 @@ pub struct WriterLock {
 }
 
 impl WriterLock {
-    /// Takes `<data>/pipeline/.writer.lock` without waiting. A second writer gets
-    /// [`Error::WriterBusy`].
+    /// Takes `<data>/pipeline/.writer.lock`. A holder that does not let go within about one
+    /// second (another writer, not a [`held`](Self::held) probe) gives [`Error::WriterBusy`].
     pub fn take(data: &Path) -> Result<WriterLock> {
+        WriterLock::take_within(data, WRITER_WAIT)
+    }
+
+    /// [`take`](Self::take), trying for `wait`; `Duration::ZERO` tries once.
+    pub(crate) fn take_within(data: &Path, wait: std::time::Duration) -> Result<WriterLock> {
         let dir = data.join(PIPELINE_DIR);
         std::fs::create_dir_all(&dir).map_err(io_err(&dir))?;
         let path = dir.join(WRITER_LOCK_FILE);
@@ -172,36 +187,126 @@ impl WriterLock {
             .write(true)
             .open(&path)
             .map_err(io_err(&path))?;
-        match file.try_lock() {
-            Ok(()) => Ok(WriterLock { _file: file }),
-            Err(std::fs::TryLockError::WouldBlock) => Err(Error::WriterBusy),
+        let until = std::time::Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(WriterLock { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < until => {
+                    std::thread::sleep(WRITER_RETRY);
+                }
+                Err(std::fs::TryLockError::WouldBlock) => return Err(Error::WriterBusy),
+                Err(std::fs::TryLockError::Error(e)) => return Err(io_err(&path)(e)),
+            }
+        }
+    }
+
+    /// Whether a writer holds the lock of `data` now. Opens the lock file read-only and
+    /// creates nothing: no file means no writer. The probe takes a shared lock for a moment,
+    /// so two probes do not see each other as a writer; a writer that starts meanwhile waits
+    /// for it in [`take`](Self::take).
+    pub fn held(data: &Path) -> Result<bool> {
+        let path = data.join(PIPELINE_DIR).join(WRITER_LOCK_FILE);
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(io_err(&path)(e)),
+        };
+        match file.try_lock_shared() {
+            Ok(()) => Ok(false),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(true),
             Err(std::fs::TryLockError::Error(e)) => Err(io_err(&path)(e)),
         }
     }
 }
 
-/// `consumers/<name>.json`: `{seq, updatedAt}`.
+/// `consumers/<name>.json`: `{seq, updatedAt, readAt}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Bookmark {
     /// The last acknowledged `seq`.
     pub seq: u64,
-    /// Ms since the epoch.
+    /// The time of the last ack, ms since the epoch; 0 for a consumer that only read.
     pub updated_at: u64,
+    /// The time of the last `get_changes` of the consumer over MCP, ms since the epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<u64>,
+}
+
+/// A failure of the worker as a whole (a missing model, a refused token, an account that
+/// cannot be read), not of one page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastError {
+    pub text: String,
+    /// Ms since the epoch.
+    pub at_ms: u64,
 }
 
 /// `stats.json`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Stats {
     /// How often the safety net took a new reading of an untouched block (spec 3.3).
     pub region_missed: u64,
     /// When the last worker run ended, ms since the epoch.
     pub last_run_ms: u64,
+    /// Due pages of notes still within their settle time at the end of the last pass.
+    pub waiting: u64,
+    /// Pages of the due notes in the queue of the pass that are not read yet: set at the start
+    /// of a pass, lowered as its notes are read, 0 after a full pass.
+    pub queued: u64,
+    /// When the next settle time or retry ends (ms), as of the last pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_due_ms: Option<u64>,
+    /// The last failure of the worker; cleared by a good pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<LastError>,
 }
 
-/// The text store of one account. [`TextStore::open`] gives a read-only store (the MCP
-/// server: reads and bookmarks); the writer opens it with [`TextStore::open_writer`], which
+/// The last error of the source as a whole (`<data>/pipeline/last_error.json`), `None` when
+/// there is none.
+pub fn source_error(data: &Path) -> Result<Option<LastError>> {
+    read_json(&data.join(PIPELINE_DIR).join(LAST_ERROR_FILE))
+}
+
+/// Keeps `error` as the last error of the source. The same text again keeps the first time
+/// and writes nothing.
+pub fn set_source_error(data: &Path, _w: &WriterLock, error: LastError) -> Result<()> {
+    if source_error(data)?.is_some_and(|e| e.text == error.text) {
+        return Ok(());
+    }
+    let path = data.join(PIPELINE_DIR).join(LAST_ERROR_FILE);
+    notedown_cloud::fsutil::write_atomic(&path, &json_bytes(&error)?, false)?;
+    Ok(())
+}
+
+/// Removes the last error of the source; a missing one is fine.
+pub fn clear_source_error(data: &Path, _w: &WriterLock) -> Result<()> {
+    let path = data.join(PIPELINE_DIR).join(LAST_ERROR_FILE);
+    match std::fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(io_err(&path)(e)),
+        _ => Ok(()),
+    }
+}
+
+/// `work.json`: the page the writer reads now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Work {
+    /// The note key.
+    pub note: String,
+    pub path: String,
+    /// The page number in the note, from 1.
+    pub page: usize,
+    /// The pages of the note.
+    pub pages: usize,
+    /// When the reading of the page started, ms since the epoch.
+    pub started_ms: u64,
+}
+
+/// The text store of one account. [`TextStore::open`] gives a store for reads and bookmarks
+/// (the MCP server: `ack` and the read time of `get_changes`); [`TextStore::at`] one that
+/// creates nothing (the status). The writer opens it with [`TextStore::open_writer`], which
 /// repairs it first. The log, note states and stats are written only while the store is
 /// repaired: a failed append clears that until the next [`TextStore::repair`].
 #[derive(Debug)]
@@ -268,6 +373,16 @@ impl TextStore {
         std::fs::create_dir_all(&dir).map_err(io_err(&dir))?;
         Ok(TextStore {
             dir,
+            repaired: AtomicBool::new(false),
+        })
+    }
+
+    /// The store of account `slug` in `data` without creating anything: a missing store reads
+    /// as empty. For reads only.
+    pub fn at(data: &Path, slug: &str) -> Result<TextStore> {
+        notedown_cloud::auth::validate_slug(slug)?;
+        Ok(TextStore {
+            dir: data.join(PIPELINE_DIR).join(slug),
             repaired: AtomicBool::new(false),
         })
     }
@@ -663,11 +778,27 @@ impl TextStore {
     pub fn ack(&self, consumer: &str, up_to: u64) -> Result<Bookmark> {
         let path = self.bookmark_path(consumer)?;
         let _lock = self.lock()?;
-        let old = read_json::<Bookmark>(&path)?.map_or(0, |b| b.seq);
+        let old = read_json::<Bookmark>(&path)?;
         let bookmark = Bookmark {
-            seq: old.max(up_to.min(self.last_seq()?)),
+            seq: old.map_or(0, |b| b.seq).max(up_to.min(self.last_seq()?)),
             updated_at: now_ms(),
+            read_at: old.and_then(|b| b.read_at),
         };
+        notedown_cloud::fsutil::write_atomic(&path, &json_bytes(&bookmark)?, false)?;
+        Ok(bookmark)
+    }
+
+    /// Stamps the read time of `consumer` (an MCP `get_changes` with that consumer), under
+    /// `.lock`; seq and ack time stay. An unknown consumer gets `{seq: 0, updatedAt: 0}`.
+    pub fn mark_read(&self, consumer: &str, now_ms: u64) -> Result<Bookmark> {
+        let path = self.bookmark_path(consumer)?;
+        let _lock = self.lock()?;
+        let mut bookmark = read_json::<Bookmark>(&path)?.unwrap_or(Bookmark {
+            seq: 0,
+            updated_at: 0,
+            read_at: None,
+        });
+        bookmark.read_at = Some(now_ms);
         notedown_cloud::fsutil::write_atomic(&path, &json_bytes(&bookmark)?, false)?;
         Ok(bookmark)
     }
@@ -725,6 +856,92 @@ impl TextStore {
     /// Sets `last_run_ms`.
     pub fn set_last_run(&self, _w: &WriterLock, ms: u64) -> Result<Stats> {
         self.update_stats(|s| s.last_run_ms = ms)
+    }
+
+    /// The start of a pass: sets `queued`, `waiting` and `next_due_ms`. The last error stays
+    /// until the pass ends well.
+    pub fn set_pass_start(
+        &self,
+        _w: &WriterLock,
+        queued: u64,
+        waiting: u64,
+        next_due_ms: Option<u64>,
+    ) -> Result<Stats> {
+        self.update_stats(|s| {
+            s.queued = queued;
+            s.waiting = waiting;
+            s.next_due_ms = next_due_ms;
+        })
+    }
+
+    /// Sets `queued`, the pages of the pass not read yet.
+    pub fn set_queued(&self, _w: &WriterLock, queued: u64) -> Result<Stats> {
+        self.update_stats(|s| s.queued = queued)
+    }
+
+    /// The end of a good pass at `ms`: sets `last_run_ms`, `queued` (0 unless the pass was
+    /// stopped), `waiting` and `next_due_ms`, and clears `last_error`.
+    pub fn set_pass_end(
+        &self,
+        _w: &WriterLock,
+        ms: u64,
+        queued: u64,
+        waiting: u64,
+        next_due_ms: Option<u64>,
+    ) -> Result<Stats> {
+        self.update_stats(|s| {
+            s.last_run_ms = ms;
+            s.queued = queued;
+            s.waiting = waiting;
+            s.next_due_ms = next_due_ms;
+            s.last_error = None;
+        })
+    }
+
+    /// Sets `last_error`. The same text again keeps the first time and writes nothing, so a
+    /// failure that repeats every second shows since when it lasts. Unlike the other stats it
+    /// is written also while the store waits for a repair (the error may be why), but never
+    /// into a store folder that is gone.
+    pub fn set_last_error(&self, _w: &WriterLock, error: LastError) -> Result<Stats> {
+        let mut stats = self.stats()?;
+        if stats
+            .last_error
+            .as_ref()
+            .is_some_and(|e| e.text == error.text)
+        {
+            return Ok(stats);
+        }
+        stats.last_error = Some(error);
+        notedown_cloud::fsutil::write_atomic_in(
+            &self.dir.join(STATS_FILE),
+            &json_bytes(&stats)?,
+            false,
+        )?;
+        Ok(stats)
+    }
+
+    /// The page the writer reads now, `None` when there is no `work.json`.
+    pub fn work(&self) -> Result<Option<Work>> {
+        read_json(&self.dir.join(WORK_FILE))
+    }
+
+    /// Writes `work.json`, never into a store folder that is gone.
+    pub fn set_work(&self, _w: &WriterLock, work: &Work) -> Result<()> {
+        notedown_cloud::fsutil::write_atomic_in(
+            &self.dir.join(WORK_FILE),
+            &json_bytes(work)?,
+            false,
+        )?;
+        Ok(())
+    }
+
+    /// Removes `work.json`; a missing one is fine.
+    pub fn clear_work(&self, _w: &WriterLock) -> Result<()> {
+        let path = self.dir.join(WORK_FILE);
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(io_err(&path)(e)),
+            _ => Ok(()),
+        }
     }
 }
 

@@ -19,6 +19,7 @@ use crate::page::stroke_list;
 use crate::records::{self, Record};
 use crate::region::{Region, change_region};
 use crate::source::{NoteBytes, ServerData};
+use crate::store::Work;
 use crate::{Error, Result};
 
 /// How the pages of a note are read.
@@ -236,6 +237,17 @@ pub(super) fn process(
             errors.clear(w, key, Some(&fp.page_id))?;
             state.pages[i].state = PageOcrState::Pending;
         }
+        // For the status; it is only shown, so a failed write does not stop the reading.
+        let _ = text.set_work(
+            w,
+            &Work {
+                note: key.to_string(),
+                path: r.path.clone(),
+                page: fp.position + 1,
+                pages: r.pages.len(),
+                started_ms: now,
+            },
+        );
         let reading = {
             let engine = engine.get(now)?;
             read_page(&nb, index, engine)

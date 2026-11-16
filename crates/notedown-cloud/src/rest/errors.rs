@@ -17,7 +17,9 @@ pub const RETRY_AFTER_S: u64 = 5;
 /// The answer to a store error of a write (and of a read): 423 `scan_hold` while a scan holds
 /// the account, 423 `not_imported` while the protect gate is closed, 503 `store_damaged` for a
 /// damaged tree (the reason goes to the log and stderr), 409 `name_taken` with `existing` for a
-/// name collision, 412 `precondition_failed`; anything else is 500 `internal`.
+/// name collision, 412 `precondition_failed`, 404 `not_found` for an item of the recycle bin
+/// whose bytes are gone, 409 `slot_damaged` for one whose slot is or holds a symlink; anything
+/// else is 500 `internal`.
 pub(crate) fn write_error(e: Error) -> Response {
     match e {
         Error::ScanHold(_) => error(StatusCode::LOCKED, "scan_hold"),
@@ -33,6 +35,8 @@ pub(crate) fn write_error(e: Error) -> Response {
         Error::PreconditionFailed(_) => {
             error(StatusCode::PRECONDITION_FAILED, "precondition_failed")
         }
+        Error::NotFound(_) => error(StatusCode::NOT_FOUND, "not_found"),
+        Error::RecycleSlotDamaged(_) => error(StatusCode::CONFLICT, "slot_damaged"),
         e => internal(e),
     }
 }

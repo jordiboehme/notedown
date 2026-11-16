@@ -63,7 +63,7 @@ A refused token gets 401 `token_refused` with `WWW-Authenticate: Bearer`. A toke
 | --- | --- | --- |
 | `POST /login/code` | none | A random code for the login |
 | `POST /login` | none | A new token |
-| `GET /account` | read | `{"slug", "userId"}` |
+| `GET /account` | read | `{"slug", "userId", "devices"}` |
 | `GET /tree` | read | List a folder |
 | `GET /entries/{id}` | read | One file or folder |
 | `GET` and `HEAD /files/{id}` | read | Download a file |
@@ -76,8 +76,36 @@ A refused token gets 401 `token_refused` with `WWW-Authenticate: Bearer`. A toke
 | `POST /folders` | write | Create a folder |
 | `POST /move` | write | Rename or move a file or folder |
 | `DELETE /entries/{id}` | write | Delete a file or folder |
+| `GET /recycle` | read | List the recycle bin |
+| `POST /recycle/restore` | write | Bring an item of the recycle bin back |
+| `POST /recycle/empty` | write | Remove every deleted file and folder from the recycle bin |
 
 The routes for the records, the digests and the note by path are made for the pipeline. This page does not describe their bodies. The sections below are for an app that browses and manages files.
+
+## Account
+
+### `GET /account`
+
+Tells whose token this is and which devices the account has.
+
+```json
+{
+  "slug": "jordi",
+  "userId": 1000001,
+  "devices": [
+    {"serial": "SN078C10000000", "name": "Jordis Nomad", "bound": true,
+     "lastLoginMs": 1763290000000, "lastSyncMs": 1763290900000,
+     "syncing": false, "online": true}
+  ]
+}
+```
+
+- `lastSyncMs` is the time of the last sync that the device ended with success. It is `null` until then. Servers of an older version do not record it, so it stays `null` until the device syncs once on a server of this version. An app that talks to an older server gets no `devices` at all and treats that as an empty list.
+- `lastLoginMs` is the last login of the device. A device keeps its token across syncs, so this is not the time of a sync.
+- `syncing` is true while this device holds the sync lock of the account.
+- `online` is true while the device has an open auto-sync connection that is alive.
+- The list is sorted by `lastSyncMs`, newest first. Devices that never synced come last.
+- `name` is `null` for a device that never told its name.
 
 ## Browse
 
@@ -212,6 +240,8 @@ When `gap` is true, the app lists again and follows on from the `seq` of that li
 
 An event with a hidden path (a name that starts with a dot) is not shown. A move from a visible to a hidden path comes as a `file.deleted` or `folder.deleted` of the old path. A move from a hidden to a visible path sets `gap`.
 
+The recycle bin does not list an item with a hidden path either. Empty removes it all the same.
+
 ### Accounts
 
 An app never sees the events of another account. This includes an earlier account with the same name: its events are left out, and `gap` tells the app that it may have missed some.
@@ -307,6 +337,81 @@ Moves the file, or the folder with everything in it, to the recycle bin. Nothing
 
 `removed` lists the folders that the delete left empty, as for a move. An unknown id is 404 `not_found`. That includes a delete that is retried after it worked. A tree root is 403 `not_writable`.
 
+## Recycle bin
+
+A delete moves the file or folder to the recycle bin of the account. The bin lists each thing the user deleted once. A deleted folder is one item with everything that was in it.
+
+The bin also keeps the old versions of replaced files. They are not listed. When a delete leaves a folder with only dot-files, the server moves that folder to the bin as well. The user did not delete it, so it is not listed either. By default the server removes an item 90 days after the delete. The [getting started guide](getting-started.md) has the settings (`recycle_keep_deleted_days`, `recycle_prune`). Empty removes every deleted item at once.
+
+### `GET /recycle?limit=&after=`
+
+Lists the items of the bin, newest first. Items of the same time come in the order of their paths.
+
+```json
+{
+  "items": [
+    {"key": "1763290000000/NOTE/Note/b.note", "path": "NOTE/Note/b.note", "name": "b.note",
+     "kind": "file", "deletedAt": 1763290000000, "size": 20480,
+     "md5": "9e107d9d372bb6826bd81d3542a419d6"},
+    {"key": "1763280000000/NOTE/Note/projects", "path": "NOTE/Note/projects",
+     "name": "projects", "kind": "folder", "deletedAt": 1763280000000, "size": 81920,
+     "files": 4}
+  ],
+  "more": false
+}
+```
+
+- `key` names the item. It is `<deletedAt>/<path>`. It is not used for another path.
+- `path` is the path the item had before the delete. `name` is its last name.
+- `kind` is `file` or `folder`.
+- `deletedAt` is the time of the delete in milliseconds since 1970.
+- `size` is the number of bytes in the bin for the item. For a folder it is the sum of its files.
+- `md5` is only there for a file, when the server knows it. `files` is only there for a folder: the number of files that were in it.
+
+`limit` is at most 500, which is also the default. 0 counts as 1. When `more` is true, there are more items. Ask again with `after` set to the `key` of the last item of the page. The next page starts after that key, also when that item has left the bin since. A `limit` that is no number and an `after` that is no key are a 400.
+
+An item whose bytes are gone from the bin is not listed. A line of the bin index that the server cannot read is skipped. The list answers 423 `scan_hold` and `not_imported` like the other reads.
+
+### `POST /recycle/restore`
+
+Body `{"key": "1763290000000/NOTE/Note/b.note", "path": "NOTE/Note/b.note"}`. Brings the item `key` of the bin back at `path`. `path` is optional. Without it the item comes back at the path it had. The answer is:
+
+```json
+{"id": 52, "path": "NOTE/Note/b.note", "kind": "file", "seqs": [816]}
+```
+
+- The item gets a new id. A folder comes back with everything that was in it, and each file and folder in it gets a new id too.
+- The events are `file.created` and `folder.created` with the new ids, parents first. Missing folders on the way are created first. Dot-files in a folder come back without an event, as everywhere else.
+- The devices see a new file. They do not know that it was there before.
+- The old versions of a restored file stay in the bin and now belong to the new id.
+- A note comes back with its text. It is not read again.
+- The item leaves the bin. A key already restored is 404 `not_found`, as is a key that the server pruned or that Empty removed. Once an item has left the bin, a later delete of the same path in the same millisecond (the same `deletedAt`) gets its key again, so an old key can then name that newer delete.
+
+The rules for the target are those of a write:
+
+- Anything at `path`, also with a name that differs only in case or Unicode form, is 409 `name_taken` with `existing`. A folder is never merged into a folder that is there. Choose another `path` instead.
+- A file on the way is 409 `not_a_folder`.
+- A path outside the device trees or a tree root is 403 `not_writable`. A name that starts with a dot is 400 `bad_name`. A name with more than 255 bytes is 400 `name_too_long`. This also holds for the old path, when the body has none.
+- An item whose bytes in the bin are damaged (a symlink in them or on the way to them) is 409 `slot_damaged`. Nothing is changed.
+- The bytes of the item count against the quota as for an upload: 507 `quota_exceeded` for an account with `quota_bytes`.
+- A restore waits like every write: 423 `device_syncing` with `Retry-After`, `scan_hold` and `not_imported`. The item stays in the bin.
+
+### `POST /recycle/empty`
+
+No body. Removes every deleted file and folder from the bin for good. The answer is:
+
+```json
+{"removed": 2, "bytes": 102400, "kept": 0}
+```
+
+- `removed` is the number of items that left the bin. `bytes` is their size in the bin before Empty.
+- Empty also removes what a delete put in the bin but the bin does not list: hidden paths and folders that a delete left with only dot-files.
+- The old versions of replaced files stay. That includes the old versions of a file that was restored. The server prunes them by its rules as before. After Empty, the old versions of a deleted file are removed 90 days after the newest of them, which can be right away.
+- `kept` counts the lines of the bin index for deleted files and folders that Empty could not remove, for example because there is a symlink in their bytes or on the way to them. They stay in the bin. It is usually 0.
+- The journal gets one `recycle.pruned` event per removed line of the bin index, with `origin` `app`. `/events` does not show them.
+- An empty bin gives `{"removed": 0, "bytes": 0, "kept": 0}` and no event.
+- Empty waits like every write: 423 `device_syncing` with `Retry-After`, `scan_hold` and `not_imported`. A read token is 403 `read_only_token`.
+
 ## While a device syncs
 
 While a device holds the sync lock of the account, every write answers 423 `device_syncing` with a `Retry-After` header (5 seconds). The app waits that long and tries again. Device sync does not stop reads. A read can still answer 423 `scan_hold` while a scan holds the account and 423 `not_imported` while the import of the account is missing. It answers 503 `store_damaged` when the files of the account are damaged. A write also waits (423) while a scan holds the account (`scan_hold`) and while the import of the account is missing (`not_imported`). The device then has priority: the app never changes files in the middle of a sync.
@@ -325,12 +430,13 @@ While a device holds the sync lock of the account, every write answers 423 `devi
 | 401 | `token_refused` | No token, a wrong token or a revoked one. |
 | 403 | `read_only_token` | A write with a read token. |
 | 403 | `not_writable` | The path is outside the device trees or a tree root. |
-| 404 | `not_found` | No entry with this id or path. |
+| 404 | `not_found` | No entry with this id or path, or no item of the recycle bin with this key. |
 | 404 | `no_route` | No such route or method. |
 | 404 | `no_record` | No record for this key (`/records/{key}`). |
-| 409 | `name_taken` | Another entry has the name (also in another case or Unicode form), or a file is at the target of a new folder. `existing` is the name that is in the way. In rare cases, when the file system itself reports the clash, it is a short description instead of a name. |
+| 409 | `name_taken` | Another entry has the name (also in another case or Unicode form), a file is at the target of a new folder, or anything is at the target of a move or a restore. `existing` is the name that is in the way. In rare cases, when the file system itself reports the clash, it is a short description instead of a name. |
 | 409 | `not_a_folder` | A file is on the way, or the path of a listing is a file. |
 | 409 | `is_a_folder` | A folder is at the target of an upload, or a download is asked for a folder. |
+| 409 | `slot_damaged` | The bytes of a recycle bin item are damaged: there is a symlink in them or on the way to them. |
 | 409 | `sync_refused` | The server runs with `sync = "refuse"` and takes no files. |
 | 410 | `account_removed` | The token belongs to a removed account. |
 | 411 | `length_required` | An upload without `Content-Length`. |
@@ -342,7 +448,7 @@ While a device holds the sync lock of the account, every write answers 423 `devi
 | 429 | `too_many` | Too many logins or codes from one address. |
 | 500 | `internal` | A failure on the server. The detail is in its log, never in the answer. |
 | 503 | `store_damaged` | The files of the account are damaged. The reason is in the server log. |
-| 507 | `quota_exceeded` | The upload would take the account over its `quota_bytes`. Only for an account with a quota. |
+| 507 | `quota_exceeded` | The upload or the restore would take the account over its `quota_bytes`. Only for an account with a quota. |
 
 The server logs every write in the protocol log, with the path in the request line. The body of an upload is never logged. A JSON body is logged with its secrets masked.
 

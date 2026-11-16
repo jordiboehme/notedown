@@ -76,6 +76,14 @@ pub enum Error {
     /// at this wire path. The REST upload answers 412 `precondition_failed`.
     #[error("the file {0} is not what the upload expects (precondition failed)")]
     PreconditionFailed(String),
+    /// What a request names is not there: an item of the recycle bin whose slot is gone (it
+    /// was restored, pruned or removed by hand).
+    #[error("{0} is not there")]
+    NotFound(String),
+    /// The slot of an item of the recycle bin is a symlink, holds one, or lies below one. A
+    /// restore never follows or moves a symlink.
+    #[error("the recycle bin slot {0} is or holds a symlink")]
+    RecycleSlotDamaged(String),
     #[error("cannot listen on {addr}: {source}")]
     Bind {
         addr: std::net::SocketAddr,

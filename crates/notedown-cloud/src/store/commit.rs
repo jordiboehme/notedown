@@ -53,6 +53,7 @@ pub const STALE_TEMP_AGE: Duration = Duration::from_secs(60 * 60);
 ///   finished first, so the file never stays under the hidden temp name.
 /// - `delete`: the source is gone and `recycle/<recycle>` exists.
 /// - `createFolder`: the target is a folder.
+/// - `restore`: the slot `recycle/<recycle>` is gone and `to` exists.
 ///
 /// A `move` or `delete` that empties folders lists them in `prune` (deepest first). A folder
 /// whose only other entries are dot-files counts as empty (server temp names `.nd-*` do not).
@@ -136,6 +137,27 @@ pub enum PendingOp {
     /// Create the folder `path`.
     #[serde(rename_all = "camelCase")]
     CreateFolder { id: u64, path: String },
+    /// Bring an item of the recycle bin back: rename its slot `recycle/<recycle>` to `to`,
+    /// after creating the missing parent `folders` (parents first). `id` is the new id of `to`,
+    /// and `inside` lists the new ids of what a folder holds (parents first, from a walk of
+    /// the slot). After the apply step (also by recovery) the index loses the item's `lines`
+    /// (its own line and the lines of the files that were in it), and the old versions of each
+    /// restored file move from its old id to its new one (`reid`, pairs old id and new id), in
+    /// one atomic rewrite; then the emptied folders of the slot go.
+    #[serde(rename_all = "camelCase")]
+    Restore {
+        kind: Kind,
+        recycle: String,
+        to: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        folders: Vec<PlannedFolder>,
+        id: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        inside: Vec<PlannedEntry>,
+        lines: Vec<RecycleEntry>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reid: Vec<(u64, u64)>,
+    },
     /// Nothing to do: a put of the bytes the file already has. [`Store::commit`] writes no
     /// intent, no data and no event for it and returns no `seq`. Never in `pending.json`.
     #[serde(rename_all = "camelCase")]
@@ -147,6 +169,14 @@ pub enum PendingOp {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedFolder {
     pub id: u64,
+    pub path: String,
+}
+
+/// A file or folder a `restore` brings back inside a folder, with its new id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedEntry {
+    pub id: u64,
+    pub kind: Kind,
     pub path: String,
 }
 
@@ -339,8 +369,8 @@ pub(crate) struct WrittenFile {
 pub enum CrashPoint {
     /// After `pending.json` is written, before the data change.
     BeforeApply,
-    /// A `put`: after its new folders and its recycle copy, before the rename. A move through a
-    /// temp name: between its two renames.
+    /// A `put`: after its new folders and its recycle copy, before the rename. A `restore`: after
+    /// its new folders, before the rename. A move through a temp name: between its two renames.
     BeforeRename,
     /// After the data change, before the registry update and the journal append.
     BeforeAppend,
@@ -354,17 +384,18 @@ pub enum CrashPoint {
     BeforeClear,
 }
 
-/// Whether a [`CrashPoint::BeforeRename`] can stop `op`: a put, and a move through a temp name.
+/// Whether a [`CrashPoint::BeforeRename`] can stop `op`: a put, a restore (after their new
+/// folders), and a move through a temp name.
 fn has_rename_stop(op: &PendingOp) -> bool {
     matches!(
         op,
-        PendingOp::Put { .. } | PendingOp::Move { via: Some(_), .. }
+        PendingOp::Put { .. } | PendingOp::Restore { .. } | PendingOp::Move { via: Some(_), .. }
     )
 }
 
 /// A name a prune moves along with its folder: a dot-file or dot-folder that is not a server
 /// temp name (`.nd-*`: temp files, the temp name of a rename). Those are never swept.
-fn is_dot_entry(name: &str) -> bool {
+pub(super) fn is_dot_entry(name: &str) -> bool {
     name.starts_with('.') && !name.starts_with(".nd-")
 }
 
@@ -396,6 +427,7 @@ fn prune_entry(top: &PlannedFolder, ms: u64) -> RecycleEntry {
         md5: String::new(),
         deleted_at: ms,
         reason: RecycleReason::Deleted,
+        pruned: true,
     }
 }
 
@@ -431,6 +463,48 @@ fn safe_relative(text: &str, what: &'static str) -> Result<PathBuf> {
         out.push(seg);
     }
     Ok(out)
+}
+
+/// A file a restore brings back, as read from its slot before any row is planned.
+struct RestoredFile {
+    size: u64,
+    md5: String,
+    /// The id of its index line, whose old versions follow the file to its new id.
+    old_id: Option<u64>,
+}
+
+impl RestoredFile {
+    /// Its `file.created` with the new `id`; the pair of ids goes to `reid`.
+    fn event(self, id: u64, path: &str, reid: &mut Vec<(u64, u64)>) -> EventBody {
+        if let Some(old) = self.old_id {
+            reid.push((old, id));
+        }
+        EventBody::FileCreated {
+            id,
+            path: path.to_string(),
+            kind: FileKind::of(path.rsplit('/').next().unwrap_or_default()),
+            md5: self.md5,
+            size: self.size,
+            pages_changed: None,
+        }
+    }
+}
+
+/// The file at `fs_path` in a slot, with its index `line` if it has one: the size from a stat,
+/// the MD5 of the line when it has one, else the file is hashed.
+fn restored_file(fs_path: &Path, line: Option<&RecycleEntry>) -> Result<RestoredFile> {
+    let size = std::fs::symlink_metadata(fs_path)
+        .map_err(io_err(fs_path))?
+        .len();
+    let md5 = match line.map(|l| l.md5.as_str()).filter(|m| !m.is_empty()) {
+        Some(m) => m.to_string(),
+        None => super::hashes::md5_file(fs_path).map_err(io_err(fs_path))?,
+    };
+    Ok(RestoredFile {
+        size,
+        md5,
+        old_id: line.map(|l| l.id),
+    })
 }
 
 impl Store {
@@ -643,6 +717,7 @@ impl Store {
                 md5: prev_md5.clone(),
                 deleted_at: self.recycle_slot(guard, path, at)?,
                 reason: RecycleReason::Overwritten,
+                pruned: false,
             }),
             _ => None,
         };
@@ -1007,6 +1082,7 @@ impl Store {
                         md5: e.content_hash.clone().unwrap_or_default(),
                         deleted_at: ms,
                         reason: RecycleReason::Deleted,
+                        pruned: false,
                     });
                 }
                 events.push(match e.tag {
@@ -1028,6 +1104,7 @@ impl Store {
             md5,
             deleted_at: ms,
             reason: RecycleReason::Deleted,
+            pruned: false,
         };
         events.push(match found.kind {
             Kind::File => EventBody::FileDeleted {
@@ -1055,6 +1132,151 @@ impl Store {
             prune_at,
         };
         Ok(Commit::new(origin, device, op, events))
+    }
+
+    /// Plan bringing the recycle bin item `item` back at `target` (its old path or another
+    /// free one) with new ids: `folder.created` for each missing parent of `target` (parents
+    /// first), then `file.created` or `folder.created` for `target`, and for a folder the same
+    /// for everything in it, parents before children. `origin` is the origin of the events
+    /// (no device).
+    ///
+    /// The content comes from a walk of the slot, not from the index: a file taken out of the
+    /// slot by hand gets no event, and dot names, names the wire can't carry and special files
+    /// move along without one, as a listing skips them. The MD5 of a file is the one of its
+    /// line when it has one, else the file is hashed. Every file is read before the first
+    /// registry row is planned, so a file that can't be read refuses the restore without a
+    /// trace. `_now_ms` is the time of the restore; no part of the plan depends on it yet.
+    ///
+    /// Refused: a slot that is gone (`Error::NotFound`), a slot that is, holds or lies below a
+    /// symlink (`Error::RecycleSlotDamaged`), a target that exists (also in another spelling) or
+    /// lies below a file (`Error::Invalid`, `Error::NameCollision`), a hidden target and the
+    /// root. Plan the page records with [`crate::pages::plan_page_restore`] before the commit.
+    pub fn plan_restore(
+        &self,
+        guard: &WriteGuard,
+        item: &super::RecycleItem,
+        target: &WirePath,
+        _now_ms: u64,
+        origin: Origin,
+    ) -> Result<Commit> {
+        self.check_write(guard)?;
+        let slot = self.recycle_path(&item.entry)?;
+        let location = item.entry.location();
+        let damaged = || Error::RecycleSlotDamaged(location.clone());
+        if self.has_symlink(&slot) {
+            return Err(damaged());
+        }
+        let meta = match std::fs::symlink_metadata(&slot) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::NotFound(format!("recycle bin item {location}")));
+            }
+            Err(e) => return Err(io_err(&slot)(e)),
+        };
+        let kind = if meta.is_dir() {
+            if super::recycle::holds_symlink(&slot) {
+                return Err(damaged());
+            }
+            Kind::Folder
+        } else if meta.is_file() {
+            Kind::File
+        } else {
+            return Err(damaged());
+        };
+        if target.is_root() || target.is_hidden() {
+            return Err(invalid(
+                "path",
+                format!("{target} cannot be a restore target"),
+            ));
+        }
+        let parent = target
+            .parent()
+            .ok_or_else(|| invalid("path", "no parent".into()))?;
+        let missing = self.missing_folders(&parent)?;
+        self.require_free(guard, target)?;
+        // What the slot holds, as a listing would see it at the target, parents first.
+        let mut walked = Vec::new();
+        if kind == Kind::Folder {
+            let found = list::Found {
+                path: target.clone(),
+                fs_path: slot.clone(),
+                kind,
+                meta,
+            };
+            list::walk(&found, true, &mut walked, &|_| None)?;
+            walked.sort_by(|a, b| a.path.segments().cmp(b.path.segments()));
+        }
+        // The lines of the files that were in a folder, by their path below it.
+        let below = |path: &str, top: &str| -> Option<String> {
+            path.strip_prefix(top)?
+                .strip_prefix('/')
+                .map(str::to_string)
+        };
+        let owned: std::collections::HashMap<String, &RecycleEntry> = item
+            .owned
+            .iter()
+            .filter_map(|e| Some((below(&e.path, &item.entry.path)?, e)))
+            .collect();
+        let display = target.display();
+        // Every read of the slot comes first: a failure here plans no registry row.
+        let top = match kind {
+            Kind::File => Some(restored_file(&slot, Some(&item.entry))?),
+            Kind::Folder => None,
+        };
+        let mut facts = Vec::with_capacity(walked.len());
+        for found in &walked {
+            facts.push(match found.kind {
+                Kind::Folder => None,
+                Kind::File => {
+                    let path = found.path.display();
+                    let line = below(&path, &display).and_then(|rel| owned.get(&rel).copied());
+                    Some(restored_file(&found.fs_path, line)?)
+                }
+            });
+        }
+        // Then the rows and the events.
+        let (mut events, folders) = self.plan_folders(guard, &missing)?;
+        self.drop_stale_row(guard, target, None)?;
+        let id = self.assign(guard, target, kind)?;
+        let mut reid = Vec::new();
+        events.push(match top {
+            Some(file) => file.event(id, &display, &mut reid),
+            None => EventBody::FolderCreated {
+                id,
+                path: display.clone(),
+            },
+        });
+        let mut inside = Vec::with_capacity(walked.len());
+        for (found, file) in walked.iter().zip(facts) {
+            self.drop_stale_row(guard, &found.path, None)?;
+            let child = self.assign(guard, &found.path, found.kind)?;
+            let path = found.path.display();
+            events.push(match file {
+                Some(file) => file.event(child, &path, &mut reid),
+                None => EventBody::FolderCreated {
+                    id: child,
+                    path: path.clone(),
+                },
+            });
+            inside.push(PlannedEntry {
+                id: child,
+                kind: found.kind,
+                path,
+            });
+        }
+        let mut lines = vec![item.entry.clone()];
+        lines.extend(item.owned.iter().cloned());
+        let op = PendingOp::Restore {
+            kind,
+            recycle: location,
+            to: display,
+            folders,
+            id,
+            inside,
+            lines,
+            reid,
+        };
+        Ok(Commit::new(origin, None, op, events))
     }
 
     /// Plan creating the folder `path` (its parent must exist): `folder.created`.
@@ -1193,7 +1415,7 @@ impl Store {
                 Ok(false) => {
                     // The intent goes only when the old state is confirmed. An entry left under
                     // the temp name of a rename keeps it, and recovery finishes the rename.
-                    if self.undo_unapplied(&commit.op).is_ok() {
+                    if self.undo_unapplied(guard, &commit.op).is_ok() {
                         self.clear_pending()?;
                     }
                     return Err(e);
@@ -1429,8 +1651,33 @@ impl Store {
                 std::fs::create_dir(&target).map_err(io_err(&target))?;
                 crate::fsutil::fsync_dir(target.parent().unwrap_or(&self.files))
             }
+            PendingOp::Restore {
+                recycle,
+                to,
+                folders,
+                ..
+            } => {
+                let slot = self.restore_slot(recycle)?;
+                self.create_planned(folders)?;
+                if stop_before_rename {
+                    return Ok(());
+                }
+                let to = self.fs_path(&wire(to)?);
+                if std::fs::symlink_metadata(&to).is_ok() {
+                    return Err(invalid("restore", format!("{} exists", to.display())));
+                }
+                crate::fsutil::rename_durable(&slot, &to)
+            }
             PendingOp::Unchanged { .. } => Ok(()),
         }
+    }
+
+    /// The slot of a restore on disk; the path comes from the intent, so it is checked again.
+    fn restore_slot(&self, recycle: &str) -> Result<PathBuf> {
+        Ok(self
+            .account_dir
+            .join(RECYCLE_DIR)
+            .join(safe_relative(recycle, "recycle path")?))
     }
 
     /// `create_dir_all` below the account folder, with an fsync of each new folder's parent.
@@ -1487,6 +1734,10 @@ impl Store {
             PendingOp::CreateFolder { path, .. } => {
                 matches!(self.resolve(&wire(path)?)?, Some(f) if f.kind == Kind::Folder)
             }
+            PendingOp::Restore { recycle, to, .. } => {
+                std::fs::symlink_metadata(self.restore_slot(recycle)?).is_err()
+                    && self.resolve(&wire(to)?)?.is_some()
+            }
         })
     }
 
@@ -1507,8 +1758,11 @@ impl Store {
                 Some(w) => self.remember_md5(guard, &wire(path)?, w, md5),
                 None => self.forget_md5(guard, &wire(path)?),
             },
+            // A restore's rows were assigned while planning, and its paths have no cached MD5
+            // (the next listing or scan hashes them without an event).
             PendingOp::Copy { .. }
             | PendingOp::CreateFolder { .. }
+            | PendingOp::Restore { .. }
             | PendingOp::Unchanged { .. } => Ok(()),
             PendingOp::Move { id, to, prune, .. } => {
                 let to = wire(to)?;
@@ -1735,8 +1989,21 @@ impl Store {
     /// Write the recycle index lines of an applied change in one append (idempotent, see
     /// [`Store::record_recycled`]): the old version of a put; the files inside a deleted folder,
     /// then the deleted item; and the topmost pruned folder when it went to the recycle bin
-    /// (only if its slot is there).
+    /// (only if its slot is there). A restore instead drops its lines and moves the old
+    /// versions to the new ids in one rewrite, then removes the emptied folders of its slot
+    /// ([`Store::drop_recycled`], idempotent too).
     fn finish_recycle(&self, op: &PendingOp) -> Result<()> {
+        if let PendingOp::Restore {
+            recycle,
+            lines,
+            reid,
+            ..
+        } = op
+        {
+            self.drop_recycled(lines, reid)?;
+            self.remove_slot_parents(&self.restore_slot(recycle)?);
+            return Ok(());
+        }
         let mut lines = Vec::new();
         let (prune, prune_at) = match op {
             PendingOp::Put {
@@ -1774,12 +2041,39 @@ impl Store {
 
     /// Clean up after a change that was not applied: remove the recycle copy the change made and
     /// the folders it created while they are empty (deepest first). Their registry rows stay, as
-    /// for any discarded intent. Those failures are ignored (the leftovers are harmless: an extra
-    /// copy, an empty folder). An error when an entry is still under the temp name of a rename:
-    /// then the intent must stay, so that recovery finishes the rename (the entry would
-    /// otherwise stay hidden, and the device would delete its copy).
-    fn undo_unapplied(&self, op: &PendingOp) -> Result<()> {
+    /// for any discarded intent, except for a restore: it may have planned rows for a whole
+    /// tree, so the rows that still name its planned paths are dropped. An error there (the
+    /// registry can't be written) keeps the intent, so that recovery tries again. The other
+    /// failures are ignored (the leftovers are harmless: an extra copy, an empty folder). An
+    /// error when an entry is still under the temp name of a rename: then the intent must
+    /// stay, so that recovery finishes the rename (the entry would otherwise stay hidden, and
+    /// the device would delete its copy).
+    fn undo_unapplied(&self, guard: &StoreGuard, op: &PendingOp) -> Result<()> {
         match op {
+            PendingOp::Restore {
+                to,
+                folders,
+                id,
+                inside,
+                ..
+            } => {
+                self.remove_planned(folders);
+                // Every planned row that still names its path goes, also when something was
+                // made there by hand meanwhile: no event created it, so the next scan journals
+                // it as new. A folder row takes the rows below it along.
+                let planned = folders
+                    .iter()
+                    .map(|f| (f.id, f.path.as_str()))
+                    .chain(std::iter::once((*id, to.as_str())))
+                    .chain(inside.iter().map(|e| (e.id, e.path.as_str())));
+                for (row, path) in planned {
+                    if let Ok(path) = wire(path)
+                        && self.path_of(row)?.as_ref() == Some(&path)
+                    {
+                        self.removed(guard, row)?;
+                    }
+                }
+            }
             PendingOp::Put {
                 folders, recycle, ..
             } => {
@@ -1838,7 +2132,7 @@ impl Store {
                     via.as_deref().unwrap_or_default()
                 );
             }
-            self.undo_unapplied(&commit.op)?;
+            self.undo_unapplied(guard, &commit.op)?;
             self.clear_pending()?;
             return Ok(Recovery::Discarded {
                 op_id: commit.op_id,
@@ -1847,6 +2141,17 @@ impl Store {
         self.settle_prune(&mut commit.op, &mut commit.events)?;
         self.finish_registry(guard, &commit.op, None)?;
         self.finish_recycle(&commit.op)?;
+        if matches!(commit.op, PendingOp::Restore { .. }) {
+            // Side writes are not in the intent: the page records of the restored notes are
+            // made again from their live paths, so the pipeline knows them again.
+            let mut batch = SideBatch::default();
+            for w in crate::pages::restore_records(self, &commit) {
+                if let Err(e) = self.write_side(&w, &mut batch) {
+                    eprintln!("warning: account {}: {e}", self.slug);
+                }
+            }
+            self.sync_sides(batch);
+        }
         let seqs = {
             let lock = journal.lock()?;
             let have = lock.count_op_after(&commit.op_id, commit.journal_seq.unwrap_or(0))?;

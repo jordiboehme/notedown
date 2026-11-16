@@ -34,6 +34,25 @@ pub use journal::{journal, journal_until};
 pub struct ServerAccount {
     pub slug: String,
     pub user_id: u64,
+    /// The devices of the account (`GET /account`); empty from servers of an older version.
+    #[serde(default)]
+    pub devices: Vec<DeviceView>,
+}
+
+/// A device of an account as `GET /account` shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceView {
+    pub serial: String,
+    pub name: Option<String>,
+    pub bound: bool,
+    pub last_login_ms: u64,
+    /// The end of the last good sync; only servers of this version on record it.
+    pub last_sync_ms: Option<u64>,
+    /// This device holds the sync lock now.
+    pub syncing: bool,
+    /// The device has an open auto-sync socket that is alive.
+    pub online: bool,
 }
 
 /// A page record and the time of the note's last page change: the record file's mtime, in
@@ -393,6 +412,7 @@ mod tests {
         let a = ServerAccount {
             slug: "jordi".into(),
             user_id: 5,
+            devices: Vec::new(),
         };
         assert_eq!(serde_json::to_value(&a).unwrap()["userId"], 5);
     }

@@ -16,9 +16,9 @@ const SLUG: &str = "jordi";
 const A: &str = "F20240424175151947577oMie9HNQYnTa";
 const B: &str = "F20240424175151947577oMie9HNQYnTb";
 
-struct Data {
+pub(crate) struct Data {
     _dir: tempfile::TempDir,
-    data: PathBuf,
+    pub(crate) data: PathBuf,
 }
 
 fn block(id: &str, text: &str, replaces: &[&str]) -> Block {
@@ -48,7 +48,7 @@ const GARDEN: &str = "Notes/Home/Garden.note";
 /// - seq 2: Garden new (b1)
 /// - seq 3: Planview edited: b1 edited, b2 deleted, b3 replaced by b4
 /// - seq 4: Garden edited
-fn setup(accounts: &[&str]) -> Data {
+pub(crate) fn setup(accounts: &[&str]) -> Data {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().to_path_buf();
     for (i, slug) in accounts.iter().enumerate() {
@@ -100,9 +100,9 @@ fn setup(accounts: &[&str]) -> Data {
     Data { _dir: dir, data }
 }
 
-type Client = RunningService<RoleClient, ()>;
+pub(crate) type Client = RunningService<RoleClient, ()>;
 
-async fn connect(data: &Path, account: Option<&str>) -> Client {
+pub(crate) async fn connect(data: &Path, account: Option<&str>) -> Client {
     let server = NotesServer::new(data, account).unwrap();
     let (server_end, client_end) = tokio::io::duplex(1 << 16);
     tokio::spawn(async move {
@@ -131,7 +131,7 @@ fn text(result: &CallToolResult) -> String {
 }
 
 /// The text of a call that must succeed.
-async fn ok(client: &Client, tool: &'static str, args: Value) -> String {
+pub(crate) async fn ok(client: &Client, tool: &'static str, args: Value) -> String {
     let result = call(client, tool, args).await;
     assert_ne!(result.is_error, Some(true), "{tool}: {}", text(&result));
     text(&result)
@@ -176,7 +176,9 @@ async fn every_tool_answers() {
     );
     for t in &tools {
         let read_only = t.annotations.as_ref().and_then(|a| a.read_only_hint);
-        assert_eq!(read_only, Some(t.name != "ack"), "{}", t.name);
+        // ack moves a bookmark, get_changes with a consumer stamps its read time.
+        let writes = ["ack", "get_changes"].contains(&t.name.as_ref());
+        assert_eq!(read_only, Some(!writes), "{}", t.name);
         let description = t.description.as_deref().unwrap_or_default();
         assert!(!description.is_empty(), "{}", t.name);
         assert!(!description.contains('\u{2014}'), "{}", t.name);
@@ -252,9 +254,11 @@ async fn get_changes_with_summary_holds_no_text() {
     for t in ["Meeting", "tomatoes", "Flow"] {
         assert!(!manifest.contains(t), "{t} in {manifest}");
     }
-    // The manifest changes no bookmark.
+    // The manifest moves no bookmark; it only keeps the time of the read.
     let store = TextStore::open(&d.data, SLUG).unwrap();
-    assert_eq!(store.bookmark("crystalline").unwrap(), None);
+    let b = store.bookmark("crystalline").unwrap().unwrap();
+    assert_eq!((b.seq, b.updated_at), (0, 0));
+    assert!(b.read_at.is_some());
 }
 
 #[tokio::test]

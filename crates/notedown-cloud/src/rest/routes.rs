@@ -37,9 +37,15 @@ pub const NOTE_HEADER: &str = "x-notedown-note";
 pub fn router(state: Arc<AppState>) -> Router {
     let path = |p: &str| format!("{PREFIX}{p}");
     let get_only = |r: MethodRouter<Arc<AppState>>| r.fallback(no_route);
+    // A JSON body is read whole: up to the limit of the request log, whose JSON 413 answers a
+    // larger one (axum's own default of 2 MiB would answer plain text first).
+    let json_body = |r: MethodRouter<Arc<AppState>>| {
+        r.fallback(no_route)
+            .layer(DefaultBodyLimit::max(crate::server::MAX_REQUEST_BODY))
+    };
     Router::new()
-        .route(&path("/login/code"), post(login_code).fallback(no_route))
-        .route(&path("/login"), post(login).fallback(no_route))
+        .route(&path("/login/code"), json_body(post(login_code)))
+        .route(&path("/login"), json_body(post(login)))
         .route(&path("/account"), get_only(get(account)))
         .route(&path("/records"), get_only(get(records)))
         .route(&path("/records/{key}"), get_only(get(record)))
@@ -59,8 +65,8 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .fallback(no_route)
                 .layer(DefaultBodyLimit::disable()),
         )
-        .route(&path("/folders"), post(write::folder).fallback(no_route))
-        .route(&path("/move"), post(write::move_).fallback(no_route))
+        .route(&path("/folders"), json_body(post(write::folder)))
+        .route(&path("/move"), json_body(post(write::move_)))
         .route(PREFIX, any(no_route))
         .route(&path("/"), any(no_route))
         .route(&path("/{*rest}"), any(no_route))

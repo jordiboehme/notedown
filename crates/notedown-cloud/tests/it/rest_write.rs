@@ -2156,3 +2156,36 @@ fn a_refused_token_cannot_write() {
     }
     assert!(files(&s).join("NOTE/Note/a.txt").exists());
 }
+
+#[test]
+fn a_large_json_body_is_answered_in_json() {
+    let s = start_imported();
+    let t = writer(&s);
+    let post = |mib: usize| {
+        let body = format!(
+            "{{\"path\":\"NOTE/Note/{}\"}}",
+            "a".repeat(mib * 1024 * 1024)
+        );
+        json_of(
+            s.client
+                .post(s.url("/folders"))
+                .bearer_auth(&t)
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .unwrap(),
+        )
+    };
+    // Between axum's default 2 MiB and the 8 MiB limit: the handler reads it and refuses the
+    // name, in JSON (it was axum's plain text before).
+    let (status, answer) = post(3);
+    assert_eq!(
+        (status, &answer),
+        (400, &json!({"error": "name_too_long"})),
+        "{answer}"
+    );
+    // Over 8 MiB: the JSON 413 of the request log.
+    let (status, answer) = post(9);
+    assert_eq!(status, 413, "{answer}");
+    assert_eq!(answer, json!({"error": "too_large"}));
+}

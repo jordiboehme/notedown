@@ -868,7 +868,7 @@ fn read_body(stream: &mut TcpStream, head: &str) -> Vec<u8> {
 }
 
 #[test]
-fn connect_asks_for_a_read_token() {
+fn connect_leaves_the_scope_out() {
     // A server that gives a code, keeps the login body and refuses the login.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -912,5 +912,6 @@ fn connect_asks_for_a_read_token() {
     assert!(e.to_string().contains("refused"), "{e}");
     let logins = logins.lock().unwrap();
     assert_eq!(logins.len(), 1);
-    assert_eq!(logins[0]["scope"], "read", "{}", logins[0]);
+    // An older server refuses unknown fields; a login without scope gives a read token.
+    assert!(logins[0].get("scope").is_none(), "{}", logins[0]);
 }

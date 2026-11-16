@@ -80,6 +80,8 @@ The routes for the records, the digests and the note by path are made for the pi
 
 ## Browse
 
+Every read can also answer 423 `scan_hold` (a scan holds the account), 423 `not_imported` (the import of the account is missing) and 503 `store_damaged` (the files of the account are damaged).
+
 ### `GET /tree?path=&recursive=`
 
 Lists the children of the folder at `path` (the root by default). With `recursive=true` it lists all descendants. Anything else than `true` or `false` is a 400.
@@ -126,7 +128,7 @@ Tells what changed in the account since the `seq` in `from` (0 by default). `lim
 {"changed": true, "removed": [], "next": 813, "end": 812, "more": false}
 ```
 
-`changed` is true when the account has a new journal line in the range. `next` is one past the last `seq` read. Ask again from `next`. `more` means a page limit was hit: ask again at once. A number that does not parse is a 400.
+`changed` is true when the account has a new journal line in the range. That includes lines that are no file change (digests, tasks, devices and scans), so the app may list again and see nothing new. `next` is one past the last `seq` read. Ask again from `next`. `more` means a page limit was hit: ask again at once. A number that does not parse is a 400.
 
 Writes of the app have the origin `app` in the journal.
 
@@ -214,7 +216,7 @@ Moves the file, or the folder with everything in it, to the recycle bin. Nothing
 
 ## While a device syncs
 
-While a device holds the sync lock of the account, every write answers 423 `device_syncing` with a `Retry-After` header (5 seconds). The app waits that long and tries again. Reads always work. A write also waits (423) while a scan holds the account (`scan_hold`) and while the import of the account is missing (`not_imported`). The device then has priority: the app never changes files in the middle of a sync.
+While a device holds the sync lock of the account, every write answers 423 `device_syncing` with a `Retry-After` header (5 seconds). The app waits that long and tries again. Device sync does not stop reads. A read can still answer 423 `scan_hold` while a scan holds the account and 423 `not_imported` while the import of the account is missing. It answers 503 `store_damaged` when the files of the account are damaged. A write also waits (423) while a scan holds the account (`scan_hold`) and while the import of the account is missing (`not_imported`). The device then has priority: the app never changes files in the middle of a sync.
 
 ## Error codes
 
@@ -233,7 +235,7 @@ While a device holds the sync lock of the account, every write answers 423 `devi
 | 404 | `not_found` | No entry with this id or path. |
 | 404 | `no_route` | No such route or method. |
 | 404 | `no_record` | No record for this key (`/records/{key}`). |
-| 409 | `name_taken` | Another entry has the name (also in another case or Unicode form), or a file is at the target of a new folder. `existing` is the name that is in the way. |
+| 409 | `name_taken` | Another entry has the name (also in another case or Unicode form), or a file is at the target of a new folder. `existing` is the name that is in the way. In rare cases, when the file system itself reports the clash, it is a short description instead of a name. |
 | 409 | `not_a_folder` | A file is on the way, or the path of a listing is a file. |
 | 409 | `is_a_folder` | A folder is at the target of an upload, or a download is asked for a folder. |
 | 409 | `sync_refused` | The server runs with `sync = "refuse"` and takes no files. |
@@ -249,8 +251,8 @@ While a device holds the sync lock of the account, every write answers 423 `devi
 | 503 | `store_damaged` | The files of the account are damaged. The reason is in the server log. |
 | 507 | `quota_exceeded` | The upload would take the account over its `quota_bytes`. Only for an account with a quota. |
 
-The server logs every write in the protocol log, with the path in the request line. A body is never logged.
+The server logs every write in the protocol log, with the path in the request line. The body of an upload is never logged. A JSON body is logged with its secrets masked.
 
 ## Update order
 
-Update the Mac before the Pi. The new server writes journal lines with the origin `app`. An older pipeline does not know it and skips such lines, so it would miss the change. A new pipeline reads the origin as it should.
+Update the Mac before the Pi. The new server writes journal lines with the origin `app`. An older pipeline does not know it and skips such lines, so it would miss the change. A new pipeline reads the origin as it should. A pipeline that reads over REST works with either order, because `notedown connect` sends no scope. The Mac first is still the safe order.

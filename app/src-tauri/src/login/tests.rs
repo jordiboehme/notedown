@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::json;
 
 use super::*;
+use crate::commands::{ConfigAnswer, set_mode_then};
 use crate::config::{self, Mode};
 use crate::probe::test_server::free_port;
 use crate::rest::test_http::{Scripted, answer};
@@ -112,11 +113,12 @@ fn login_stores_a_write_token() {
 
     let token = store.get(&key(server.port, "jordi")).unwrap().unwrap();
     assert_eq!(token.expose(), "tok-123");
-    assert_eq!(saved.account.as_deref(), Some("jordi"));
-    assert_eq!(saved.email.as_deref(), Some("me@example.org"));
-    assert_eq!(state.current(), saved);
+    assert_eq!(saved.config.account.as_deref(), Some("jordi"));
+    assert_eq!(saved.config.email.as_deref(), Some("me@example.org"));
+    assert_eq!(state.current(), saved.config);
+    assert_eq!(saved.keychain, None);
     // On disk too.
-    assert_eq!(config::load(dir.path()), saved);
+    assert_eq!(config::load(dir.path()), saved.config);
 }
 
 #[test]
@@ -266,7 +268,7 @@ fn another_account_replaces_the_old_one() {
         &Password::new(PASSWORD),
     )
     .unwrap();
-    assert_eq!(saved.account.as_deref(), Some("jordi"));
+    assert_eq!(saved.config.account.as_deref(), Some("jordi"));
     assert_eq!(store.get(&key(server.port, "old")).unwrap(), None);
     assert!(store.get(&key(server.port, "jordi")).unwrap().is_some());
     // Only the old account of this server goes.
@@ -435,7 +437,7 @@ fn a_second_login_while_one_runs_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let gate = Arc::new(LoginGate::default());
     let slot: Arc<Mutex<Option<ConfigState>>> = Arc::default();
-    let second: Arc<Mutex<Option<Result<AppConfig, LoginError>>>> = Arc::default();
+    let second: Arc<Mutex<Option<Result<ConfigAnswer, LoginError>>>> = Arc::default();
     let (hook_gate, hook_slot, hook_second) = (gate.clone(), slot.clone(), second.clone());
     let server = Scripted::start_with(
         vec![code_answer(), token_answer("jordi"), code_answer()],
@@ -466,7 +468,7 @@ fn a_second_login_while_one_runs_is_refused() {
         &Password::new(PASSWORD),
     )
     .unwrap();
-    assert_eq!(saved.account.as_deref(), Some("jordi"));
+    assert_eq!(saved.config.account.as_deref(), Some("jordi"));
     let second = second.lock().unwrap().take().expect("the second login ran");
     let error = second.unwrap_err();
     assert_eq!(error, LoginError::Busy);
@@ -537,7 +539,7 @@ fn a_local_login_keeps_the_token_under_local_and_the_slug() {
         &Password::new(PASSWORD),
     )
     .unwrap();
-    assert_eq!(saved.account.as_deref(), Some("jordi"));
+    assert_eq!(saved.config.account.as_deref(), Some("jordi"));
     assert_eq!(
         store.get("local|jordi").unwrap().unwrap().expose(),
         "tok-123"
@@ -710,7 +712,7 @@ fn a_log_out_during_a_login_leaves_no_token() {
         &Password::new(PASSWORD),
     )
     .unwrap();
-    assert_eq!(saved.account.as_deref(), Some("jordi"));
+    assert_eq!(saved.config.account.as_deref(), Some("jordi"));
     let after = leaving
         .lock()
         .unwrap()
@@ -723,4 +725,185 @@ fn a_log_out_during_a_login_leaves_no_token() {
     assert_eq!(after.email, None);
     assert_eq!(store.get(&key(server.port, "jordi")).unwrap(), None);
     assert_eq!(state.current().account, None);
+}
+
+/// Logs in to a scripted server with `state`; the store keeps the token.
+fn logged_in(state: &ConfigState, serve_info: &ServeInfo, store: &dyn TokenStore) {
+    log_in(
+        &LoginGate::default(),
+        state,
+        serve_info,
+        store,
+        "me@example.org",
+        &Password::new(PASSWORD),
+    )
+    .unwrap();
+}
+
+fn set_mode_now(
+    state: &ConfigState,
+    store: Arc<dyn TokenStore>,
+    mode: Mode,
+    data_dir: Option<std::path::PathBuf>,
+    server_url: Option<&str>,
+) -> ConfigAnswer {
+    tauri::async_runtime::block_on(set_mode_then(
+        state,
+        Arc::new(LoginGate::default()),
+        store,
+        mode,
+        data_dir,
+        server_url.map(str::to_owned),
+        || {},
+    ))
+    .unwrap()
+}
+
+#[test]
+fn a_new_address_after_a_login_removes_its_token() {
+    let server = Scripted::start(vec![code_answer(), token_answer("jordi")]);
+    let dir = tempfile::tempdir().unwrap();
+    let state = remote_config(dir.path(), server.port, None);
+    let store = Arc::new(MemoryStore::new());
+    logged_in(&state, &ServeInfo::default(), &*store);
+    assert!(store.get(&key(server.port, "jordi")).unwrap().is_some());
+
+    let answer = set_mode_now(
+        &state,
+        store.clone(),
+        Mode::Remote,
+        None,
+        Some("http://other.example:19072"),
+    );
+    assert_eq!(answer.keychain, None);
+    assert_eq!(answer.config.account, None);
+    assert_eq!(answer.config.email, None);
+    assert_eq!(store.get(&key(server.port, "jordi")).unwrap(), None);
+    assert_eq!(state.current().account, None);
+}
+
+#[test]
+fn a_new_local_folder_after_a_login_removes_its_token() {
+    let server = Scripted::start(vec![code_answer(), token_answer("jordi")]);
+    let dir = tempfile::tempdir().unwrap();
+    let config = AppConfig {
+        mode: Mode::Local,
+        data_dir: dir.path().join("data"),
+        ..AppConfig::default()
+    };
+    config::save(dir.path(), &config).unwrap();
+    let state = ConfigState::load(dir.path().to_path_buf());
+    let serve_info = ServeInfo {
+        listen: vec![format!("127.0.0.1:{}", server.port).parse().unwrap()],
+        ..ServeInfo::default()
+    };
+    let store = Arc::new(MemoryStore::new());
+    logged_in(&state, &serve_info, &*store);
+    assert!(store.get("local|jordi").unwrap().is_some());
+
+    let answer = set_mode_now(
+        &state,
+        store.clone(),
+        Mode::Local,
+        Some(dir.path().join("other-data")),
+        None,
+    );
+    assert_eq!(answer.keychain, None);
+    assert_eq!(answer.config.account, None);
+    assert_eq!(store.get("local|jordi").unwrap(), None);
+    // The same place again keeps a login made after it.
+    store.set("local|jordi", &Token::new("t")).unwrap();
+    set_mode_now(
+        &state,
+        store.clone(),
+        Mode::Local,
+        Some(dir.path().join("other-data")),
+        None,
+    );
+    assert!(store.get("local|jordi").unwrap().is_some());
+}
+
+#[test]
+fn a_token_that_set_mode_cannot_remove_is_named() {
+    let server = Scripted::start(vec![code_answer(), token_answer("jordi")]);
+    let dir = tempfile::tempdir().unwrap();
+    let state = remote_config(dir.path(), server.port, None);
+    let store = Arc::new(NoDelete(MemoryStore::new()));
+    logged_in(&state, &ServeInfo::default(), &*store);
+    let answer = set_mode_now(
+        &state,
+        store.clone(),
+        Mode::Remote,
+        None,
+        Some("http://other.example:19072"),
+    );
+    // The new place is kept; the answer names what stayed.
+    assert_eq!(answer.config.account, None);
+    let text = answer.keychain.expect("the kept token is named");
+    assert!(
+        text.contains("The old login could not be removed from the Keychain"),
+        "{text}"
+    );
+    assert!(!text.contains("tok-123"), "{text}");
+}
+
+#[test]
+fn an_old_token_that_stays_after_a_login_is_named() {
+    let server = Scripted::start(vec![code_answer(), token_answer("jordi")]);
+    let dir = tempfile::tempdir().unwrap();
+    let state = remote_config(dir.path(), server.port, Some("old"));
+    let store = NoDelete(MemoryStore::new());
+    store
+        .set(&key(server.port, "old"), &Token::new("old-token"))
+        .unwrap();
+    let answer = log_in(
+        &LoginGate::default(),
+        &state,
+        &ServeInfo::default(),
+        &store,
+        "me@example.org",
+        &Password::new(PASSWORD),
+    )
+    .unwrap();
+    assert_eq!(answer.config.account.as_deref(), Some("jordi"));
+    let text = answer.keychain.expect("the old token is named");
+    assert!(
+        text.contains("The old login could not be removed from the Keychain"),
+        "{text}"
+    );
+    assert!(store.get(&key(server.port, "jordi")).unwrap().is_some());
+}
+
+#[test]
+fn a_failed_save_on_a_new_login_of_the_same_account_keeps_the_old_token() {
+    let server = Scripted::start(vec![code_answer(), token_answer("jordi")]);
+    let dir = tempfile::tempdir().unwrap();
+    let config = AppConfig {
+        mode: Mode::Remote,
+        server_url: Some(server_url(server.port)),
+        account: Some("jordi".into()),
+        ..AppConfig::default()
+    };
+    config::save(dir.path(), &config).unwrap();
+    let state = ConfigState::load_with(
+        dir.path().to_path_buf(),
+        Arc::new(|_: &Path, _: &AppConfig| Err(std::io::Error::other("the disk is full"))),
+    );
+    let store = MemoryStore::new();
+    store
+        .set(&key(server.port, "jordi"), &Token::new("old-token"))
+        .unwrap();
+    let error = log_in(
+        &LoginGate::default(),
+        &state,
+        &ServeInfo::default(),
+        &store,
+        "me@example.org",
+        &Password::new(PASSWORD),
+    )
+    .unwrap_err();
+    assert!(matches!(error, LoginError::Save(_)), "{error:?}");
+    let kept = store.get(&key(server.port, "jordi")).unwrap().unwrap();
+    assert_eq!(kept.expose(), "old-token");
+    assert_eq!(state.current().account.as_deref(), Some("jordi"));
 }

@@ -35,9 +35,15 @@ export const MODEL_READY_EVENT = "model-ready";
 export const MODEL_FAILED_EVENT = "model-failed";
 export const SETTINGS_PAGE_EVENT = "settings-page";
 
+/** The config after a change, and a sentence when an old login stayed in the Keychain. */
+export interface ConfigAnswer {
+  config: AppConfig;
+  keychain: string | null;
+}
+
 export const getConfig = () => invoke<AppConfig>("get_config");
 export const setMode = (mode: Mode, dataDir: string | null, serverUrl: string | null) =>
-  invoke<AppConfig>("set_mode", { mode, dataDir, serverUrl });
+  invoke<ConfigAnswer>("set_mode", { mode, dataDir, serverUrl });
 export const setStartView = (startView: StartView) => invoke<AppConfig>("set_start_view", { startView });
 export const startProcesses = () => invoke("start_processes");
 export const stopProcesses = () => invoke("stop_processes");
@@ -47,7 +53,7 @@ export const openLink = (url: string) => invoke("open_link", { url });
 export const getAutostart = () => invoke<boolean>("get_autostart");
 export const setAutostart = (on: boolean) => invoke<boolean>("set_autostart", { on });
 /** Logs in and keeps a write token in the Keychain; answers the config with the account. */
-export const logIn = (email: string, password: string) => invoke<AppConfig>("log_in", { email, password });
+export const logIn = (email: string, password: string) => invoke<ConfigAnswer>("log_in", { email, password });
 /** Whether the Keychain keeps a login for the account in the config. */
 export const hasLogin = () => invoke<boolean>("has_login");
 /** Deletes the login and forgets the account; answers the config without it. */

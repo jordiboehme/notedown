@@ -45,10 +45,13 @@
     busy = "logIn";
     loginNote = null;
     try {
-      config.current = await logIn(email, password);
+      const answer = await logIn(email, password);
+      config.current = answer.config;
       loggedIn = true;
       logoutNote = null;
-      loginNote = { text: `Logged in as ${config.current.account}.`, tone: "good" };
+      loginNote = answer.keychain
+        ? { text: `Logged in as ${answer.config.account}. ${answer.keychain}`, tone: "bad" }
+        : { text: `Logged in as ${answer.config.account}.`, tone: "good" };
     } catch (error) {
       loginNote = { text: failure(error), tone: "bad" };
     } finally {

@@ -6,7 +6,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::commands::{ConfigState, TryUpdateError};
+use crate::commands::{ConfigAnswer, ConfigState, TryUpdateError};
 use crate::config::AppConfig;
 use crate::poller::rest_base;
 use crate::rest::{Rest, RestError};
@@ -150,9 +150,24 @@ struct LoginAnswer {
     scope: String,
 }
 
-/// Deletes the new token again after a failed step; a delete that fails is named.
-fn undo(store: &dyn TokenStore, key: &str, error: LoginError) -> LoginError {
-    match store.delete(key) {
+/// The sentence for a token of an old login that the Keychain did not let go.
+pub fn old_login_kept(why: &str) -> String {
+    format!("The old login could not be removed from the Keychain ({why}).")
+}
+
+/// Takes the new token back after a failed step: the token that was there before (a new login
+/// of the same account) comes back, else the key is deleted. A failure is named.
+fn undo(
+    store: &dyn TokenStore,
+    key: &str,
+    previous: Option<&Token>,
+    error: LoginError,
+) -> LoginError {
+    let undone = match previous {
+        Some(token) => store.set(key, token),
+        None => store.delete(key),
+    };
+    match undone {
         Ok(()) => error,
         Err(e) => LoginError::Rollback {
             error: Box::new(error),
@@ -175,7 +190,7 @@ pub fn log_in(
     store: &dyn TokenStore,
     email: &str,
     password: &Password,
-) -> Result<AppConfig, LoginError> {
+) -> Result<ConfigAnswer, LoginError> {
     let _running = match gate.0.try_lock() {
         Ok(guard) => guard,
         Err(std::sync::TryLockError::WouldBlock) => return Err(LoginError::Busy),
@@ -206,6 +221,7 @@ pub fn log_in(
     let mut next = before.clone();
     next.account = Some(answer.slug.clone());
     let key = token_key(&next).ok_or(LoginError::NoMode)?;
+    let previous = store.get(&key).map_err(|e| LoginError::Keychain(e.0))?;
     store
         .set(&key, &Token::new(answer.token))
         .map_err(|e| LoginError::Keychain(e.0))?;
@@ -226,18 +242,25 @@ pub fn log_in(
     });
     let (replaced, saved) = match saved {
         Ok(both) => both,
-        Err(TryUpdateError::Refused(error)) => return Err(undo(store, &key, error)),
+        Err(TryUpdateError::Refused(error)) => {
+            return Err(undo(store, &key, previous.as_ref(), error));
+        }
         // Without the account in the config, nothing would find the token again.
         Err(TryUpdateError::NotSaved(why)) => {
-            return Err(undo(store, &key, LoginError::Save(why)));
+            return Err(undo(store, &key, previous.as_ref(), LoginError::Save(why)));
         }
     };
+    let mut keychain = None;
     if let Some(old) = token_key(&replaced)
         && old != key
+        && let Err(e) = store.delete(&old)
     {
-        let _ = store.delete(&old);
+        keychain = Some(old_login_kept(&e.0));
     }
-    Ok(saved)
+    Ok(ConfigAnswer {
+        config: saved,
+        keychain,
+    })
 }
 
 #[cfg(test)]

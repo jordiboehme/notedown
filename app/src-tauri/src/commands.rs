@@ -19,6 +19,15 @@ use crate::windows::{self, WindowKind};
 /// How the config is written to its folder: [`config::save`], or a slow one in tests.
 pub type SaveFn = Arc<dyn Fn(&Path, &AppConfig) -> std::io::Result<()> + Send + Sync>;
 
+/// The config after a change, and a Keychain problem that the change could not fix (an old
+/// login that could not be removed), as a sentence to show.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigAnswer {
+    pub config: AppConfig,
+    pub keychain: Option<String>,
+}
+
 /// Why [`ConfigState::try_update`] changed nothing.
 pub enum TryUpdateError<E> {
     /// The change refused.
@@ -139,6 +148,18 @@ impl ConfigState {
         data_dir: Option<PathBuf>,
         server_url: Option<String>,
     ) -> Result<AppConfig, String> {
+        self.set_mode_replacing(mode, data_dir, server_url)
+            .map(|(_, next)| next)
+    }
+
+    /// [`set_mode`](Self::set_mode) that also answers the config it replaced, read under the
+    /// same lock as the change.
+    pub fn set_mode_replacing(
+        &self,
+        mode: Mode,
+        data_dir: Option<PathBuf>,
+        server_url: Option<String>,
+    ) -> Result<(AppConfig, AppConfig), String> {
         let server_url = server_url
             .map(|u| u.trim().to_owned())
             .filter(|u| !u.is_empty());
@@ -146,7 +167,7 @@ impl ConfigState {
             return Err(NEEDS_ADDRESS.to_owned());
         }
         let data_dir = data_dir.map(|d| expand_home(&d)).transpose()?;
-        self.update(|c| {
+        self.try_update(|c| {
             let before = (c.mode, c.server_url.clone(), c.data_dir.clone());
             c.mode = mode;
             if let Some(dir) = data_dir {
@@ -160,6 +181,11 @@ impl ConfigState {
                 c.account = None;
                 c.email = None;
             }
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .map_err(|e| match e {
+            TryUpdateError::NotSaved(why) => why,
+            TryUpdateError::Refused(never) => match never {},
         })
     }
 
@@ -262,18 +288,25 @@ pub fn get_config(state: State<'_, ConfigState>) -> Result<AppConfig, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Saves the new place of the server; when the mode, the folder or the address changed, runs
-/// `restart` on a blocking thread of its own and waits for it. A refused change restarts
-/// nothing.
+/// Saves the new place of the server off the calling thread ([`change_place`]); when the
+/// mode, the folder or the address changed, runs `restart` on a blocking thread of its own and
+/// waits for it. A refused change restarts nothing.
 pub async fn set_mode_then(
     state: &ConfigState,
+    gate: Arc<LoginGate>,
+    store: Arc<dyn TokenStore>,
     mode: Mode,
     data_dir: Option<PathBuf>,
     server_url: Option<String>,
     restart: impl FnOnce() + Send + 'static,
-) -> Result<AppConfig, String> {
-    let before = state.current();
-    let config = state.set_mode(mode, data_dir, server_url)?;
+) -> Result<ConfigAnswer, String> {
+    let placing = state.clone();
+    let (before, answer) = tauri::async_runtime::spawn_blocking(move || {
+        change_place(&gate, &*store, &placing, mode, data_dir, server_url)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let config = &answer.config;
     let changed = (before.mode, &before.data_dir, &before.server_url)
         != (config.mode, &config.data_dir, &config.server_url);
     if changed {
@@ -281,7 +314,31 @@ pub async fn set_mode_then(
             .await
             .map_err(|e| e.to_string())?;
     }
-    Ok(config)
+    Ok(answer)
+}
+
+/// Saves the new place. When that forgets the account (another server), its token goes too,
+/// so no write token stays where Log out cannot reach it. It takes the login lock, so it never
+/// meets a running login half way. Answers the config it replaced and the new one.
+pub fn change_place(
+    gate: &LoginGate,
+    store: &dyn TokenStore,
+    state: &ConfigState,
+    mode: Mode,
+    data_dir: Option<PathBuf>,
+    server_url: Option<String>,
+) -> Result<(AppConfig, ConfigAnswer), String> {
+    let _no_login = gate.hold();
+    let (replaced, config) = state.set_mode_replacing(mode, data_dir, server_url)?;
+    let mut keychain = None;
+    if replaced.account.is_some()
+        && config.account.is_none()
+        && let Some(key) = token_key(&replaced)
+        && let Err(e) = store.delete(&key)
+    {
+        keychain = Some(login::old_login_kept(&e.0));
+    }
+    Ok((replaced, ConfigAnswer { config, keychain }))
 }
 
 /// Sets where the server runs (the mode control on the Server page). When the mode, the folder
@@ -291,16 +348,23 @@ pub async fn set_mode_then(
 pub async fn set_mode(
     state: State<'_, ConfigState>,
     processes: State<'_, Arc<Processes>>,
+    gate: State<'_, Arc<LoginGate>>,
     mode: Mode,
     data_dir: Option<PathBuf>,
     server_url: Option<String>,
-) -> Result<AppConfig, String> {
+) -> Result<ConfigAnswer, String> {
     let processes = processes.inner().clone();
     let reader = state.reader();
     // The start reads the config inside its lock: the newest place wins.
-    set_mode_then(&state, mode, data_dir, server_url, move || {
-        processes.start_with(|| reader.current())
-    })
+    set_mode_then(
+        &state,
+        gate.inner().clone(),
+        Arc::new(KeychainStore::new()),
+        mode,
+        data_dir,
+        server_url,
+        move || processes.start_with(|| reader.current()),
+    )
     .await
 }
 
@@ -391,7 +455,7 @@ pub async fn log_in(
     gate: State<'_, Arc<LoginGate>>,
     email: String,
     password: String,
-) -> Result<AppConfig, String> {
+) -> Result<ConfigAnswer, String> {
     let state = config.inner().clone();
     let gate = gate.inner().clone();
     let serve_info = processes.serve_info();
@@ -810,12 +874,15 @@ mod tests {
         let set = |mode, dir: &str| {
             tauri::async_runtime::block_on(set_mode_then(
                 &state,
+                Arc::new(LoginGate::default()),
+                Arc::new(crate::token::MemoryStore::new()),
                 mode,
                 Some(dir.into()),
                 None,
                 restart(&state),
             ))
             .unwrap()
+            .config
         };
         set(Mode::Local, "/data/a");
         // The same place again restarts nothing.
@@ -833,6 +900,8 @@ mod tests {
         assert!(
             tauri::async_runtime::block_on(set_mode_then(
                 &state,
+                Arc::new(LoginGate::default()),
+                Arc::new(crate::token::MemoryStore::new()),
                 Mode::Remote,
                 None,
                 None,

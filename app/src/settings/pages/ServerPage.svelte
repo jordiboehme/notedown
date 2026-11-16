@@ -75,9 +75,11 @@
   const save = () =>
     act(async () => {
       const mode: Mode = where;
-      config.current = await setMode(mode, folder, where === "remote" ? address : null);
-      folder = config.current.dataDir;
+      const answer = await setMode(mode, folder, where === "remote" ? address : null);
+      config.current = answer.config;
+      folder = answer.config.dataDir;
       saved = true;
+      problem = answer.keychain;
     });
 
   function level(state: ChildState | null): "good" | "warning" | "bad" | "unknown" {

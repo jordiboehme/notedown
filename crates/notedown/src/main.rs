@@ -524,8 +524,12 @@ struct RenderArgs {
 #[cfg(feature = "ocr")]
 #[derive(Subcommand)]
 enum ModelAction {
-    /// Download the model files into the cache
-    Pull,
+    /// Download the model files into the cache (continues a stopped download)
+    Pull {
+        /// Print one JSON line per progress update on stdout
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the cache folder and the model file paths
     Path,
     /// Check size and SHA-256 of the model files
@@ -738,10 +742,22 @@ fn render(args: RenderArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// One progress line of `model pull --json`.
+#[cfg(feature = "ocr")]
+fn progress_json(file: &str, done: u64, total: u64) -> String {
+    serde_json::json!({ "file": file, "done": done, "total": total }).to_string()
+}
+
+/// The last line of `model pull --json`.
+#[cfg(feature = "ocr")]
+fn ready_json(path: &Path) -> String {
+    serde_json::json!({ "ready": path.display().to_string() }).to_string()
+}
+
 #[cfg(feature = "ocr")]
 fn model_command(action: ModelAction) -> Result<ExitCode> {
     match action {
-        ModelAction::Pull => {
+        ModelAction::Pull { json } => {
             let mut last = Instant::now() - Duration::from_secs(10);
             let mut current = String::new();
             let mut progress = |file: &str, done: u64, total: u64| {
@@ -750,14 +766,26 @@ fn model_command(action: ModelAction) -> Result<ExitCode> {
                     current = file.to_string();
                 }
                 let finished = total > 0 && done >= total;
-                if new_file || finished || last.elapsed() >= Duration::from_secs(2) {
+                let wait = Duration::from_millis(if json { 250 } else { 2000 });
+                if new_file || finished || last.elapsed() >= wait {
                     last = Instant::now();
-                    let pct = (done * 100).checked_div(total).unwrap_or(0);
-                    eprintln!("downloading {file}: {pct}%");
+                    if json {
+                        use std::io::Write;
+                        let mut out = std::io::stdout().lock();
+                        let _ = writeln!(out, "{}", progress_json(file, done, total));
+                        let _ = out.flush();
+                    } else {
+                        let pct = (done * 100).checked_div(total).unwrap_or(0);
+                        eprintln!("downloading {file}: {pct}%");
+                    }
                 }
             };
             let paths = model::pull(&DEFAULT_MODEL, &mut progress)?;
-            eprintln!("model ready: {}", paths.model.display());
+            if json {
+                println!("{}", ready_json(&paths.model));
+            } else {
+                eprintln!("model ready: {}", paths.model.display());
+            }
             Ok(ExitCode::SUCCESS)
         }
         ModelAction::Path => {
@@ -2280,6 +2308,20 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn progress_json_has_file_done_and_total() {
+        let v: serde_json::Value =
+            serde_json::from_str(&super::progress_json("a.gguf", 5, 10)).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"file": "a.gguf", "done": 5, "total": 10})
+        );
+        let r: serde_json::Value =
+            serde_json::from_str(&super::ready_json(std::path::Path::new("/m/a.gguf"))).unwrap();
+        assert_eq!(r, serde_json::json!({"ready": "/m/a.gguf"}));
+    }
+
     use super::*;
     use std::net::Ipv4Addr;
 

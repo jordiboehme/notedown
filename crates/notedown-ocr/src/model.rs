@@ -167,24 +167,60 @@ fn download(
         "https://huggingface.co/{repo}/resolve/main/{}",
         file.file_name
     );
-    let mut resp = reqwest::blocking::Client::builder()
-        .timeout(None)
-        .build()
-        .and_then(|c| c.get(&url).send())
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| OcrError::Download(format!("{url}: {e}")))?;
-    let total = resp.content_length().unwrap_or(file.size);
+    download_from(&url, file, dest, progress)
+}
 
+/// Downloads `url` into `dest` through `dest.part`. A part left by an earlier run is
+/// continued with a `Range` request. The part stays on download and IO errors and is
+/// removed only when the complete file fails the size or SHA-256 check.
+/// `progress` reports the bytes on disk and the size of the whole file.
+pub fn download_from(
+    url: &str,
+    file: &ModelFile,
+    dest: &Path,
+    progress: &mut dyn FnMut(&str, u64, u64),
+) -> Result<(), OcrError> {
     let mut part_name = dest.as_os_str().to_owned();
     part_name.push(".part");
     let part = PathBuf::from(part_name);
+    let total = file.size;
+    let fail = |e: reqwest::Error| OcrError::Download(format!("{url}: {e}"));
 
-    let result = (|| -> Result<(), OcrError> {
-        let mut out = std::fs::File::create(&part)?;
-        let mut hasher = Sha256::new();
+    let mut have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    if have > total {
+        std::fs::remove_file(&part)?;
+        have = 0;
+    }
+
+    if have < total {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(None)
+            .build()
+            .map_err(fail)?;
+        let mut request = client.get(url);
+        if have > 0 {
+            request = request.header(reqwest::header::RANGE, format!("bytes={have}-"));
+        }
+        let mut resp = request
+            .send()
+            .and_then(|r| r.error_for_status())
+            .map_err(fail)?;
+        let resumes = have > 0
+            && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
+            && resp
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with(&format!("bytes {have}-")));
+        let mut out = if resumes {
+            std::fs::OpenOptions::new().append(true).open(&part)?
+        } else {
+            have = 0;
+            std::fs::File::create(&part)?
+        };
         let mut buf = vec![0u8; 1 << 20];
-        let mut done = 0u64;
-        progress(file.file_name, 0, total);
+        let mut done = have;
+        progress(file.file_name, done, total);
         loop {
             let n = resp
                 .read(&mut buf)
@@ -193,33 +229,26 @@ fn download(
                 break;
             }
             out.write_all(&buf[..n])?;
-            hasher.update(&buf[..n]);
             done += n as u64;
             progress(file.file_name, done, total);
         }
         out.flush()?;
         drop(out);
-        let actual = const_hex::encode(hasher.finalize());
-        if done != file.size {
-            return Err(OcrError::Checksum {
-                path: part.clone(),
-                expected: format!("{} bytes", file.size),
-                actual: format!("{done} bytes"),
-            });
+        if done < total {
+            return Err(OcrError::Download(format!(
+                "{url}: the connection ended after {done} of {total} bytes"
+            )));
         }
-        check_hash(&part, file, actual)
-    })();
-
-    match result {
-        Ok(()) => {
-            std::fs::rename(&part, dest)?;
-            Ok(())
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&part);
-            Err(e)
-        }
+    } else {
+        progress(file.file_name, total, total);
     }
+
+    if let Err(e) = verify_file(&part, file) {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    std::fs::rename(&part, dest)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -326,5 +355,173 @@ mod tests {
             &DEFAULT_MODEL.mmproj,
         )
         .unwrap();
+    }
+
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy)]
+    enum Serve {
+        /// Answers 206 for a Range request.
+        Ranges,
+        /// Answers 200 with the whole file whatever the request says.
+        Whole,
+        /// Sends only the first n bytes of the whole file, then closes.
+        Cut(usize),
+    }
+
+    /// Serves `body` to the next requests. Returns the URL and the Range headers seen.
+    fn serve(body: Vec<u8>, mode: Serve) -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/f.bin", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut range = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                        range = Some(v.trim().to_string());
+                    }
+                }
+                log.lock().unwrap().push(range.clone());
+                let start = range
+                    .as_ref()
+                    .and_then(|r| r.trim_end_matches('-').parse::<usize>().ok());
+                let head = match (mode, start) {
+                    (Serve::Ranges, Some(s)) => format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {s}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len() - 1,
+                        body.len(),
+                        body.len() - s
+                    ),
+                    _ => format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    ),
+                };
+                let payload = match (mode, start) {
+                    (Serve::Ranges, Some(s)) => &body[s..],
+                    (Serve::Cut(n), _) => &body[..n],
+                    _ => &body[..],
+                };
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(payload);
+            }
+        });
+        (url, seen)
+    }
+
+    fn model_file(body: &[u8]) -> ModelFile {
+        let hash = const_hex::encode(Sha256::digest(body));
+        ModelFile {
+            file_name: "f.bin",
+            size: body.len() as u64,
+            sha256: Box::leak(hash.into_boxed_str()),
+        }
+    }
+
+    fn body() -> Vec<u8> {
+        (0..4000u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn part_of(dest: &Path) -> PathBuf {
+        PathBuf::from(format!("{}.part", dest.display()))
+    }
+
+    #[test]
+    fn a_pull_resumes_from_the_part_file() {
+        let body = body();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f.bin");
+        std::fs::write(part_of(&dest), &body[..1500]).unwrap();
+        let (url, seen) = serve(body.clone(), Serve::Ranges);
+        download_from(&url, &model_file(&body), &dest, &mut |_, _, _| {}).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert!(!part_of(&dest).exists());
+        assert_eq!(seen.lock().unwrap().as_slice(), [Some("1500-".to_string())]);
+    }
+
+    #[test]
+    fn a_pull_restarts_when_the_server_ignores_the_range() {
+        let body = body();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f.bin");
+        std::fs::write(part_of(&dest), &body[..1500]).unwrap();
+        let (url, _) = serve(body.clone(), Serve::Whole);
+        download_from(&url, &model_file(&body), &dest, &mut |_, _, _| {}).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+    }
+
+    #[test]
+    fn a_complete_part_is_not_downloaded_again() {
+        let body = body();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f.bin");
+        std::fs::write(part_of(&dest), &body).unwrap();
+        let (url, seen) = serve(body.clone(), Serve::Ranges);
+        download_from(&url, &model_file(&body), &dest, &mut |_, _, _| {}).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_part_longer_than_the_file_starts_again() {
+        let body = body();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f.bin");
+        std::fs::write(part_of(&dest), vec![7u8; body.len() + 10]).unwrap();
+        let (url, seen) = serve(body.clone(), Serve::Ranges);
+        download_from(&url, &model_file(&body), &dest, &mut |_, _, _| {}).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert_eq!(seen.lock().unwrap().as_slice(), [None]);
+    }
+
+    #[test]
+    fn a_cut_download_keeps_the_part() {
+        let body = body();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f.bin");
+        let (url, _) = serve(body.clone(), Serve::Cut(1000));
+        let err = download_from(&url, &model_file(&body), &dest, &mut |_, _, _| {});
+        assert!(matches!(err, Err(OcrError::Download(_))), "{err:?}");
+        assert!(!dest.exists());
+        assert_eq!(std::fs::read(part_of(&dest)).unwrap(), &body[..1000]);
+    }
+
+    #[test]
+    fn a_resume_reports_the_full_total() {
+        let body = body();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f.bin");
+        std::fs::write(part_of(&dest), &body[..1500]).unwrap();
+        let (url, _) = serve(body.clone(), Serve::Ranges);
+        let mut seen = Vec::new();
+        download_from(&url, &model_file(&body), &dest, &mut |f, d, t| {
+            seen.push((f.to_string(), d, t))
+        })
+        .unwrap();
+        assert_eq!(seen.first().unwrap(), &("f.bin".to_string(), 1500, 4000));
+        assert_eq!(seen.last().unwrap(), &("f.bin".to_string(), 4000, 4000));
+    }
+
+    #[test]
+    fn a_resumed_file_with_wrong_bytes_fails_and_removes_the_part() {
+        let body = body();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f.bin");
+        std::fs::write(part_of(&dest), vec![9u8; 1500]).unwrap();
+        let (url, _) = serve(body.clone(), Serve::Ranges);
+        let err = download_from(&url, &model_file(&body), &dest, &mut |_, _, _| {});
+        assert!(matches!(err, Err(OcrError::Checksum { .. })), "{err:?}");
+        assert!(!part_of(&dest).exists());
+        assert!(!dest.exists());
     }
 }

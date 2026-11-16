@@ -2679,3 +2679,14 @@ fn connect_refuses_a_server_data_folder() {
     assert!(!data.path().join("pipeline.toml").exists());
     assert!(!data.path().join("tokens").exists());
 }
+
+#[cfg(feature = "ocr")]
+#[test]
+fn model_pull_offers_json_progress() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["model", "pull", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("--json"));
+}

@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,7 @@ use serde_json::{Value, json};
 
 use super::listing_tests::{MD5_A, NOTE, Time};
 use super::tests::{CountingStore, Events, Place, TOKEN, remote_key};
-use super::uploads::{DROP_GONE, MANY, ask_for, walk};
+use super::uploads::{DROP_GONE, MANY, WALK_CAP, ask_for, walk};
 use super::*;
 use crate::rest::test_http::{Act, Request, Routed, answer, answer_with};
 
@@ -304,7 +305,7 @@ fn a_dropped_folder_skips_dot_files_symlinks_and_packages() {
         d.join("alias"),
     ];
 
-    let plan = walk(&dropped, false);
+    let plan = walk(&dropped, false, None, &AtomicBool::new(false));
     let names: Vec<Vec<String>> = plan.items.iter().map(|p| p.names.clone()).collect();
     let n = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
     assert_eq!(
@@ -320,7 +321,7 @@ fn a_dropped_folder_skips_dot_files_symlinks_and_packages() {
     assert_eq!(plan.files, 3);
     assert_eq!(plan.packages, ["Foo.app"]);
     // Asked for, it goes into packages.
-    let all = walk(&dropped, true);
+    let all = walk(&dropped, true, None, &AtomicBool::new(false));
     assert_eq!(all.files, 4);
     assert!(
         all.items
@@ -376,7 +377,12 @@ fn a_symlink_loop_ends() {
     symlink("..", &d.join("loop/up"));
     symlink(d.join("loop"), &d.join("loop/again"));
     symlink(d.join("loop"), &d.join("into"));
-    let plan = walk(&[d.join("loop"), d.join("into")], true);
+    let plan = walk(
+        &[d.join("loop"), d.join("into")],
+        true,
+        None,
+        &AtomicBool::new(false),
+    );
     assert_eq!(plan.files, 1);
     assert_eq!(plan.items.len(), 1);
     assert_eq!(plan.items[0].names, ["loop", "a.txt"]);
@@ -472,7 +478,12 @@ fn more_than_500_files_asks() {
     );
 
     // 500 is fine; the count has thousands marked; packages are asked first.
-    let mut plan = walk(&[dir.path().join("Many")], false);
+    let mut plan = walk(
+        &[dir.path().join("Many")],
+        false,
+        None,
+        &AtomicBool::new(false),
+    );
     plan.files = MANY;
     assert_eq!(ask_for(&plan, false, None), None);
     plan.files = 1234;
@@ -1184,4 +1195,201 @@ fn a_new_binding_cancels_the_uploads_and_forgets_the_drops() {
         s.library.upload(kept, NOTE, false, None),
         Err(DROP_GONE.to_owned())
     );
+}
+
+/// Sets the mode of `path` (and puts it back when dropped, so the temp folder can go).
+struct Mode(PathBuf);
+
+impl Mode {
+    fn set(path: PathBuf, mode: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for Mode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[test]
+fn a_folder_that_cannot_be_read_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, "Trip/a.txt", b"a");
+    write(d, "Trip/Locked/b.txt", b"b");
+    let _locked = Mode::set(d.join("Trip/Locked"), 0o000);
+    let plan = walk(&[d.join("Trip")], false, None, &AtomicBool::new(false));
+    assert_eq!(plan.files, 1);
+    assert_eq!(plan.unreadable, 1);
+    let locked = plan
+        .items
+        .iter()
+        .find(|p| p.names == ["Trip", "Locked"])
+        .expect("the locked folder is planned");
+    assert!(locked.unreadable);
+
+    let s = setup(vec![
+        (look("NOTE/Note/Trip/a.txt"), not_found()),
+        (put("NOTE/Note/Trip/a.txt"), created("NOTE/Note/Trip/a.txt")),
+    ]);
+    let id = drop_paths(&s, vec![d.join("Trip")]);
+    assert_eq!(s.library.upload(id, NOTE, false, None), Ok(None));
+    s.library.join_uploads();
+    // No empty folder is made for it.
+    assert_eq!(
+        lines(&s.server.received()),
+        [look("NOTE/Note/Trip/a.txt"), put("NOTE/Note/Trip/a.txt")]
+    );
+    let ended = last(&job_events(&s));
+    assert_eq!(ended["Trip/a.txt"].state, JobState::Done);
+    assert_eq!(ended["Trip/Locked"].state, JobState::Failed);
+    assert_eq!(
+        ended["Trip/Locked"].text.as_deref(),
+        Some("This folder could not be read.")
+    );
+    // A retry fails again, without a request.
+    s.library.retry(ended["Trip/Locked"].id).unwrap();
+    s.library.join_uploads();
+    assert!(s.server.received().is_empty());
+    assert_eq!(last(&job_events(&s))["Trip/Locked"].state, JobState::Failed);
+}
+
+#[test]
+fn the_walk_stops_at_its_cap_and_on_cancel() {
+    let dir = tempfile::tempdir().unwrap();
+    for n in 0..10 {
+        write(dir.path(), &format!("Many/{n}.txt"), b"x");
+    }
+    let many = [dir.path().join("Many")];
+    let plan = walk(&many, false, Some(5), &AtomicBool::new(false));
+    assert!(plan.capped);
+    assert!(plan.items.len() < 10);
+    assert_eq!(
+        ask_for(&plan, false, None),
+        Some(UploadAsk {
+            ask: Ask::Many,
+            text: "This drop holds more than 10,000 items. Upload them all?".into(),
+        })
+    );
+    assert_eq!(ask_for(&plan, true, None), None);
+    let all = walk(&many, false, None, &AtomicBool::new(false));
+    assert!(!all.capped);
+    assert_eq!(all.files, 10);
+    // A cancelled drop stops the walk.
+    let stopped = walk(&many, false, None, &AtomicBool::new(true));
+    assert!(stopped.cancelled);
+    assert!(stopped.items.is_empty());
+    assert_eq!(WALK_CAP, 10_000);
+}
+
+#[test]
+fn a_keep_both_after_a_race_counts_from_the_first_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = write(dir.path(), "b.txt", b"b");
+    let s = setup(vec![
+        (look("NOTE/Note/b.txt"), found("NOTE/Note/b.txt", "file")),
+        (look("NOTE/Note/b (2).txt"), not_found()),
+        // Someone else took it meanwhile.
+        (
+            put("NOTE/Note/b (2).txt"),
+            error(
+                "412 Precondition Failed",
+                json!({"error": "precondition_failed"}),
+            ),
+        ),
+        (
+            look("NOTE/Note/b (2).txt"),
+            found("NOTE/Note/b (2).txt", "file"),
+        ),
+        (
+            look("NOTE/Note/b (2).txt"),
+            found("NOTE/Note/b (2).txt", "file"),
+        ),
+        (look("NOTE/Note/b (3).txt"), not_found()),
+        (put("NOTE/Note/b (3).txt"), created("NOTE/Note/b (3).txt")),
+    ]);
+    let id = drop_paths(&s, vec![b]);
+    assert_eq!(s.library.upload(id, NOTE, false, None), Ok(None));
+    s.library.join_uploads();
+    let asked = job_events(&s).pop().unwrap();
+    s.library.answer(asked.id, Choice::KeepBoth).unwrap();
+    s.library.join_uploads();
+    let again = job_events(&s).pop().unwrap();
+    assert_eq!(again.state, JobState::Asking, "{again:?}");
+    assert_eq!(again.question.as_ref().unwrap().name, "b (2).txt");
+    s.library.answer(again.id, Choice::KeepBoth).unwrap();
+    s.library.join_uploads();
+    let ended = job_events(&s).pop().unwrap();
+    assert_eq!(ended.result.as_deref(), Some("NOTE/Note/b (3).txt"));
+    assert_eq!(s.server.received().len(), 7);
+}
+
+#[test]
+fn a_cancel_during_keep_both_stops_the_looks() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = write(dir.path(), "b.txt", b"b");
+    let (arrived, came) = channel();
+    let (go, waits) = channel();
+    let s = setup(vec![
+        (look("NOTE/Note/b.txt"), found("NOTE/Note/b.txt", "file")),
+        (
+            look("NOTE/Note/b (2).txt"),
+            Act::Hold {
+                answer: answer(
+                    "200 OK",
+                    &json!({"id": 9, "path": "NOTE/Note/b (2).txt", "name": "b (2).txt",
+                            "kind": "file", "size": 3, "md5": MD5_A, "mtimeMs": 1,
+                            "writable": true})
+                    .to_string(),
+                ),
+                arrived,
+                go: waits,
+            },
+        ),
+        (look("NOTE/Note/b (3).txt"), not_found()),
+    ]);
+    let id = drop_paths(&s, vec![b]);
+    assert_eq!(s.library.upload(id, NOTE, false, None), Ok(None));
+    s.library.join_uploads();
+    let asked = job_events(&s).pop().unwrap();
+    s.library.answer(asked.id, Choice::KeepBoth).unwrap();
+    came.recv_timeout(Duration::from_secs(5)).unwrap();
+    s.library.cancel(asked.id);
+    go.send(()).unwrap();
+    s.library.join_uploads();
+    let requests = s.server.received();
+    assert!(
+        !lines(&requests).contains(&look("NOTE/Note/b (3).txt")),
+        "{:?}",
+        lines(&requests)
+    );
+}
+
+#[test]
+fn a_source_swapped_for_a_symlink_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = write(dir.path(), "a.txt", b"a");
+    write(dir.path(), "secret.txt", b"secret");
+    let s = setup(vec![(
+        look("NOTE/Note/a.txt"),
+        found("NOTE/Note/a.txt", "file"),
+    )]);
+    let id = drop_paths(&s, vec![a.clone()]);
+    assert_eq!(s.library.upload(id, NOTE, false, None), Ok(None));
+    s.library.join_uploads();
+    let asked = job_events(&s).pop().unwrap();
+    assert_eq!(lines(&s.server.received()), [look("NOTE/Note/a.txt")]);
+    // While the window asks, the dropped file becomes a symlink to another file.
+    std::fs::remove_file(&a).unwrap();
+    symlink(dir.path().join("secret.txt"), &a);
+    s.library.answer(asked.id, Choice::Replace).unwrap();
+    s.library.join_uploads();
+    let ended = job_events(&s).pop().unwrap();
+    assert_eq!(ended.state, JobState::Failed);
+    assert_eq!(ended.text.as_deref(), Some("This file could not be read."));
+    assert!(s.server.received().is_empty());
 }

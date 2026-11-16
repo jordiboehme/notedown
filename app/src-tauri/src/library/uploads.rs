@@ -60,8 +60,10 @@ pub const NOTHING: &str = "There is nothing in the drop to upload.";
 pub const JOB_GONE: &str = "This upload is not there anymore.";
 /// The text of a job that was skipped.
 pub const SKIPPED: &str = "Skipped.";
-/// A dropped file that cannot be read.
+/// A dropped file that cannot be read (or that became a symlink since the drop).
 pub const UNREADABLE: &str = "This file could not be read.";
+/// A dropped folder, or a part of it, that cannot be read (no permission, for example).
+pub const UNREADABLE_FOLDER: &str = "This folder could not be read.";
 
 /// Above this many files a drop asks first.
 pub const MANY: usize = 500;
@@ -69,6 +71,11 @@ pub const MANY: usize = 500;
 pub const FILE_MAX: u64 = 1 << 30;
 /// How many uploads run at a time.
 pub const AT_ONCE: usize = 2;
+/// The walk stops at this many entries and asks before it goes on, so a dropped home folder
+/// asks at once instead of being read for minutes.
+pub const WALK_CAP: usize = 10_000;
+/// A 423 later than this after the end of the last wait starts a new two minutes.
+const PAUSE_GAP: Duration = Duration::from_secs(30);
 /// How many drops are kept for `library_upload`.
 pub const KEEP_DROPS: usize = 16;
 /// Keep both tries `name (2).ext` up to `name (<this>).ext`.
@@ -106,7 +113,8 @@ pub enum Choice {
 /// The drops and the upload queue.
 #[derive(Default)]
 pub(super) struct Uploads {
-    drops: BTreeMap<u64, Vec<PathBuf>>,
+    /// The paths of each drop, and the flag that stops its walk (Cancel all).
+    drops: BTreeMap<u64, (Vec<PathBuf>, Arc<AtomicBool>)>,
     next_drop: u64,
     /// Every upload that has not ended well, by job id: queued, running, waiting, asking or
     /// failed (for Retry).
@@ -126,6 +134,32 @@ pub(super) struct Uploads {
 struct Pause {
     since: u64,
     until: u64,
+}
+
+fn ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The pause after a 423 at `now` that asks to wait `retry_after`, or none when the sync has
+/// lasted two minutes. A pause that ended more than [`PAUSE_GAP`] ago belongs to an earlier
+/// sync and does not count; one that ended just now goes on (the retry met the same sync).
+fn next_pause(pause: Option<Pause>, now: u64, retry_after: Duration) -> Option<Pause> {
+    let pause = match pause {
+        Some(p) if now <= p.until.saturating_add(ms(PAUSE_GAP)) => p,
+        _ => Pause {
+            since: now,
+            until: now,
+        },
+    };
+    let left = SYNC_WAIT.saturating_sub(Duration::from_millis(now.saturating_sub(pause.since)));
+    if left.is_zero() {
+        return None;
+    }
+    let wait = retry_after.max(Duration::from_secs(1)).min(left);
+    Some(Pause {
+        since: pause.since,
+        until: pause.until.max(now.saturating_add(ms(wait))),
+    })
 }
 
 /// What an upload does next.
@@ -148,6 +182,10 @@ struct Item {
     source: PathBuf,
     /// An empty folder, made with `POST /folders`.
     folder: bool,
+    /// A folder the walk could not read: it fails, also when tried again.
+    unreadable: bool,
+    /// The wire path it goes to first; Keep both counts its copies from this name.
+    base: String,
     /// The wire path it goes to.
     target: String,
     next: Next,
@@ -157,12 +195,14 @@ struct Item {
 }
 
 /// One planned item of a walk: a file, or a folder with nothing to upload below it (`size`
-/// none). `names` is the path below the target folder, in NFC.
+/// none). `names` is the path below the target folder, in NFC. An unreadable folder (or an
+/// entry of it that could not be read) is planned as a folder that fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Planned {
     pub source: PathBuf,
     pub names: Vec<String>,
     pub size: Option<u64>,
+    pub unreadable: bool,
 }
 
 #[derive(Debug, Default)]
@@ -171,6 +211,14 @@ pub(super) struct Walk {
     pub files: usize,
     /// The packages the walk did not go into.
     pub packages: Vec<String>,
+    /// Folders, or entries of folders, that could not be read.
+    pub unreadable: usize,
+    /// The walk stopped at its cap: there is more.
+    pub capped: bool,
+    /// The drop was cancelled while it was walked.
+    pub cancelled: bool,
+    /// Entries looked at so far.
+    seen: usize,
 }
 
 fn is_package(name: &str) -> bool {
@@ -178,29 +226,73 @@ fn is_package(name: &str) -> bool {
     PACKAGES.iter().any(|ext| name.ends_with(ext))
 }
 
-/// The files and folders of the dropped `paths`, by the rules of the module.
-pub(super) fn walk(paths: &[PathBuf], into_packages: bool) -> Walk {
+/// The files and folders of the dropped `paths`, by the rules of the module. With a `cap` the
+/// walk stops after that many entries (`capped`); a set `cancel` stops it (`cancelled`).
+pub(super) fn walk(
+    paths: &[PathBuf],
+    into_packages: bool,
+    cap: Option<usize>,
+    cancel: &AtomicBool,
+) -> Walk {
     let mut walk = Walk::default();
+    let rules = Rules {
+        into_packages,
+        cap,
+        cancel,
+    };
     for path in paths {
-        visit(path, &mut Vec::new(), into_packages, &mut walk);
+        if walk.capped || walk.cancelled {
+            break;
+        }
+        visit(path, &mut Vec::new(), &rules, &mut walk);
     }
     walk
 }
 
+struct Rules<'a> {
+    into_packages: bool,
+    cap: Option<usize>,
+    cancel: &'a AtomicBool,
+}
+
+/// The folder at `path` (`names` with its name last) as an item that fails: it could not be
+/// read, or not all of it.
+fn unreadable(walk: &mut Walk, path: &Path, names: &[String]) {
+    walk.unreadable += 1;
+    walk.items.push(Planned {
+        source: path.to_owned(),
+        names: names.to_vec(),
+        size: None,
+        unreadable: true,
+    });
+}
+
 /// Plans `path` with the names above it; answers whether anything was planned.
-fn visit(path: &Path, names: &mut Vec<String>, into_packages: bool, walk: &mut Walk) -> bool {
+fn visit(path: &Path, names: &mut Vec<String>, rules: &Rules<'_>, walk: &mut Walk) -> bool {
+    if rules.cancel.load(Ordering::SeqCst) {
+        walk.cancelled = true;
+        return false;
+    }
+    if rules.cap.is_some_and(|cap| walk.seen >= cap) {
+        walk.capped = true;
+        return false;
+    }
+    walk.seen += 1;
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
     if name.starts_with('.') {
         return false;
     }
+    let name: String = name.nfc().collect();
     // Never follows a symlink: no loop, nothing from outside the drop.
     let Ok(meta) = fs::symlink_metadata(path) else {
-        return false;
+        names.push(name);
+        unreadable(walk, path, names);
+        names.pop();
+        return true;
     };
     let kind = meta.file_type();
-    let name: String = name.nfc().collect();
     if kind.is_file() {
         names.push(name);
         walk.files += 1;
@@ -208,6 +300,7 @@ fn visit(path: &Path, names: &mut Vec<String>, into_packages: bool, walk: &mut W
             source: path.to_owned(),
             names: names.clone(),
             size: Some(meta.len()),
+            unreadable: false,
         });
         names.pop();
         return true;
@@ -215,24 +308,38 @@ fn visit(path: &Path, names: &mut Vec<String>, into_packages: bool, walk: &mut W
     if !kind.is_dir() {
         return false;
     }
-    if !into_packages && is_package(&name) {
+    if !rules.into_packages && is_package(&name) {
         walk.packages.push(name);
         return false;
     }
-    let mut children: Vec<PathBuf> = fs::read_dir(path)
-        .map(|dir| dir.filter_map(|e| e.ok().map(|e| e.path())).collect())
-        .unwrap_or_default();
-    children.sort();
     names.push(name);
+    let mut children = Vec::new();
+    let mut whole = true;
+    match fs::read_dir(path) {
+        Ok(dir) => {
+            for entry in dir {
+                match entry {
+                    Ok(entry) => children.push(entry.path()),
+                    Err(_) => whole = false,
+                }
+            }
+        }
+        Err(_) => whole = false,
+    }
+    children.sort();
     let mut any = false;
     for child in children {
-        any |= visit(&child, names, into_packages, walk);
+        any |= visit(&child, names, rules, walk);
     }
-    if !any {
+    if !whole {
+        // Never made as an empty folder: what could not be read would look uploaded.
+        unreadable(walk, path, names);
+    } else if !any && !walk.capped && !walk.cancelled {
         walk.items.push(Planned {
             source: path.to_owned(),
             names: names.clone(),
             size: None,
+            unreadable: false,
         });
     }
     names.pop();
@@ -267,6 +374,15 @@ pub(super) fn ask_for(walk: &Walk, many: bool, packages: Option<bool>) -> Option
         return Some(UploadAsk {
             ask: Ask::Packages,
             text,
+        });
+    }
+    if walk.capped && !many {
+        return Some(UploadAsk {
+            ask: Ask::Many,
+            text: format!(
+                "This drop holds more than {} items. Upload them all?",
+                thousands(WALK_CAP)
+            ),
         });
     }
     if walk.files > MANY && !many {
@@ -313,6 +429,8 @@ struct Work {
     generation: u64,
     source: PathBuf,
     folder: bool,
+    unreadable: bool,
+    base: String,
     target: String,
     next: Next,
     cancel: Arc<AtomicBool>,
@@ -399,7 +517,8 @@ impl Library {
         let mut up = lock(&self.inner.uploads);
         up.next_drop += 1;
         let drop_id = up.next_drop;
-        up.drops.insert(drop_id, paths);
+        up.drops
+            .insert(drop_id, (paths, Arc::new(AtomicBool::new(false))));
         while up.drops.len() > KEEP_DROPS {
             up.drops.pop_first();
         }
@@ -426,13 +545,17 @@ impl Library {
         many: bool,
         packages: Option<bool>,
     ) -> Result<Option<UploadAsk>, String> {
-        let paths = lock(&self.inner.uploads)
+        let (paths, cancel) = lock(&self.inner.uploads)
             .drops
             .get(&drop)
             .cloned()
             .ok_or_else(|| DROP_GONE.to_owned())?;
         let session = self.session().map_err(|e| e.to_string())?;
-        let walk = walk(&paths, packages == Some(true));
+        let cap = (!many).then_some(WALK_CAP);
+        let walk = walk(&paths, packages == Some(true), cap, &cancel);
+        if walk.cancelled {
+            return Err(DROP_GONE.to_owned());
+        }
         if let Some(ask) = ask_for(&walk, many, packages) {
             return Ok(Some(ask));
         }
@@ -449,19 +572,25 @@ impl Library {
         }
         for planned in walk.items {
             let id = self.inner.next_job.fetch_add(1, Ordering::SeqCst) + 1;
-            let too_large = planned.size.is_some_and(|size| size > FILE_MAX);
+            let refused = if planned.unreadable {
+                Some(UNREADABLE_FOLDER.to_owned())
+            } else if planned.size.is_some_and(|size| size > FILE_MAX) {
+                Some(RestError::TooLarge.to_string())
+            } else {
+                None
+            };
             let job = Job {
                 id,
                 kind: JobKind::Upload,
                 label: planned.names.join("/"),
                 done: 0,
                 total: planned.size,
-                state: if too_large {
+                state: if refused.is_some() {
                     JobState::Failed
                 } else {
                     JobState::Queued
                 },
-                text: too_large.then(|| RestError::TooLarge.to_string()),
+                text: refused.clone(),
                 question: None,
                 result: None,
             };
@@ -474,13 +603,15 @@ impl Library {
                     generation: session.generation(),
                     source: planned.source,
                     folder: planned.size.is_none(),
+                    unreadable: planned.unreadable,
+                    base: join(folder, &planned.names.join("/")),
                     target: join(folder, &planned.names.join("/")),
                     next: Next::Look,
                     in_the_way: None,
                     cancel: Arc::new(AtomicBool::new(false)),
                 },
             );
-            if !too_large {
+            if refused.is_none() {
                 up.queue.push_back(id);
             }
         }
@@ -559,7 +690,10 @@ impl Library {
     /// Cancel all of a drop: its jobs end, and an unused drop is forgotten.
     pub fn cancel_drop(&self, drop: u64) {
         let mut up = lock(&self.inner.uploads);
-        up.drops.remove(&drop);
+        if let Some((_, cancel)) = up.drops.remove(&drop) {
+            // A walk of this drop stops.
+            cancel.store(true, Ordering::SeqCst);
+        }
         let ids: Vec<u64> = up
             .items
             .iter()
@@ -574,7 +708,9 @@ impl Library {
     /// A new binding: every upload ends and the drops are forgotten.
     pub(super) fn cancel_uploads(&self) {
         let mut up = lock(&self.inner.uploads);
-        up.drops.clear();
+        for (_, cancel) in std::mem::take(&mut up.drops).into_values() {
+            cancel.store(true, Ordering::SeqCst);
+        }
         up.pause = None;
         let ids: Vec<u64> = up.items.keys().copied().collect();
         for id in ids {
@@ -616,6 +752,8 @@ impl Library {
                 generation: item.generation,
                 source: item.source.clone(),
                 folder: item.folder,
+                unreadable: item.unreadable,
+                base: item.base.clone(),
                 target: item.target.clone(),
                 next: item.next.clone(),
                 cancel: item.cancel.clone(),
@@ -679,12 +817,7 @@ impl Library {
                 up.cancel(self, id);
             }
             End::Wait(retry_after) => {
-                let pause = *up.pause.get_or_insert(Pause {
-                    since: now,
-                    until: now,
-                });
-                let left = SYNC_WAIT.saturating_sub(Duration::from_millis(now - pause.since));
-                if left.is_zero() {
+                let Some(pause) = next_pause(up.pause, now, retry_after) else {
                     // Two minutes of syncing: what waits and what is queued ends; the next
                     // answer of a running upload ends at once too (the pause stays).
                     let text = RestError::Syncing { retry_after }.to_string();
@@ -694,13 +827,8 @@ impl Library {
                         up.set(self, q, JobState::Failed, Some(text.clone()));
                     }
                     return;
-                }
-                let wait = retry_after.max(Duration::from_secs(1)).min(left);
-                let until = now.saturating_add(u64::try_from(wait.as_millis()).unwrap_or(0));
-                up.pause = Some(Pause {
-                    since: pause.since,
-                    until: pause.until.max(until),
-                });
+                };
+                up.pause = Some(pause);
                 up.set(self, id, JobState::Waiting, Some(WAITING.to_owned()));
                 up.queue.push_front(id);
             }
@@ -733,11 +861,20 @@ impl Library {
             Err(e) => return End::Failed(e.to_string()),
         };
         let stopped = || session.is_cancelled() || work.cancel.load(Ordering::SeqCst);
+        if work.unreadable {
+            return End::Failed(UNREADABLE_FOLDER.to_owned());
+        }
+        // Checked before any request, without following a symlink: the source can have grown,
+        // or been swapped for a symlink, since the walk.
+        let meta = fs::symlink_metadata(&work.source);
         if work.folder {
+            if !meta.is_ok_and(|m| m.is_dir()) {
+                return End::Failed(UNREADABLE_FOLDER.to_owned());
+            }
             return self.make_folder(&session, target);
         }
-        // Checked before any request: a file can have grown since the walk.
-        match fs::metadata(&work.source) {
+        match meta {
+            Ok(meta) if !meta.is_file() => return End::Failed(UNREADABLE.to_owned()),
             Ok(meta) if meta.len() > FILE_MAX => {
                 return End::Failed(RestError::TooLarge.to_string());
             }
@@ -750,7 +887,7 @@ impl Library {
                 return End::Cancelled;
             }
             if *next == Next::KeepBoth {
-                match self.free_name(&session, target) {
+                match self.free_name(&session, &work.base, &stopped) {
                     Ok(free) => {
                         *target = free;
                         *next = Next::Create;
@@ -775,11 +912,10 @@ impl Library {
             match self.put(&session, work, target, &precondition) {
                 Err(PutStop::Rest(RestError::PreconditionFailed)) => *next = Next::Look,
                 Err(stop) => return self.put_failed(&session, target, stop),
-                Ok(put) => {
+                Ok((put, done)) => {
                     if !session.is_cancelled() {
                         self.wrote(&put.seqs);
                     }
-                    let done = fs::metadata(&work.source).map_or(0, |m| m.len());
                     return End::Done {
                         result: put.path,
                         done,
@@ -864,11 +1000,17 @@ impl Library {
         }
     }
 
-    /// The first free `name (n).ext` next to `target`, by looks.
-    fn free_name(&self, session: &Session, target: &str) -> Result<String, End> {
-        let (parent, name) = target.rsplit_once('/').unwrap_or(("", target));
+    /// The first free `name (n).ext` next to `base` (the first target, so a second Keep both
+    /// does not make `name (2) (2).ext`), by looks.
+    fn free_name(
+        &self,
+        session: &Session,
+        base: &str,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<String, End> {
+        let (parent, name) = base.rsplit_once('/').unwrap_or(("", base));
         for n in 2..=MAX_COPY {
-            if session.is_cancelled() {
+            if stopped() {
                 return Err(End::Cancelled);
             }
             let candidate = join(parent, &copy_name(name, n));
@@ -922,8 +1064,14 @@ impl Library {
         work: &Work,
         target: &str,
         precondition: &Precondition,
-    ) -> Result<Put, PutStop> {
-        let file = fs::File::open(&work.source).map_err(|_| PutStop::Text(UNREADABLE.into()))?;
+    ) -> Result<(Put, u64), PutStop> {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A symlink put in place of the file since the walk is refused here.
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&work.source)
+            .map_err(|_| PutStop::Text(UNREADABLE.into()))?;
         let len = file
             .metadata()
             .map_err(|_| PutStop::Text(UNREADABLE.into()))?
@@ -947,6 +1095,7 @@ impl Library {
         let ended = watched(
             session.rest().put_file(target, body, precondition),
             &count,
+            len,
             &self.inner.clock,
             &cancelled,
             &mut |done| self.progress(work.id, done),
@@ -960,7 +1109,7 @@ impl Library {
                     return Err(PutStop::Text(UNREADABLE.into()));
                 }
                 self.settle(session, &result);
-                result.map_err(PutStop::Rest)
+                result.map(|put| (put, len)).map_err(PutStop::Rest)
             }
         }
     }
@@ -1032,6 +1181,29 @@ fn worker(weak: &Weak<Inner>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_423_long_after_the_last_pause_starts_a_new_one() {
+        let wait = Duration::from_secs(5);
+        let first = next_pause(None, 1_000, wait).unwrap();
+        assert_eq!((first.since, first.until), (1_000, 6_000));
+        // Still syncing right after the wait: the same pause goes on.
+        let on = next_pause(Some(first), 6_000, wait).unwrap();
+        assert_eq!((on.since, on.until), (1_000, 11_000));
+        // Two minutes of it: give up.
+        let long = Pause {
+            since: 0,
+            until: 120_000,
+        };
+        assert!(next_pause(Some(long), 120_000, wait).is_none());
+        // A pause that ended long ago does not count: a new sync starts its own two minutes.
+        let old = Pause {
+            since: 0,
+            until: 5_000,
+        };
+        let new = next_pause(Some(old), 200_000, wait).unwrap();
+        assert_eq!((new.since, new.until), (200_000, 205_000));
+    }
 
     #[test]
     fn names_of_copies_and_counts() {

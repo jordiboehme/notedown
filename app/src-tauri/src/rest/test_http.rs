@@ -202,7 +202,8 @@ pub enum Act {
     },
     /// Reads at least `after` bytes of the body and says `reached`; then reads nothing more
     /// until `release` (or the end of the server). Then it reads what is left and says on
-    /// `closed` whether the client had closed the connection. It never answers.
+    /// `closed` whether the client had closed or reset the connection (true), or the whole
+    /// body came or nothing came within the read timeout (false). It never answers.
     Stall {
         after: usize,
         reached: std::sync::mpsc::Sender<()>,
@@ -320,25 +321,45 @@ fn read_head(stream: &mut TcpStream) -> Option<(Request, usize)> {
     Some((request, length))
 }
 
+/// How a read of the body ended.
+#[derive(PartialEq, Eq)]
+enum BodyEnd {
+    /// It has the bytes it wanted.
+    Whole,
+    /// The client closed or reset the connection.
+    Closed,
+    /// Nothing came within the read timeout.
+    TimedOut,
+}
+
 /// Reads the body until it has `want` bytes (or the connection ends), running `each` after
-/// each piece. False when the connection ended first.
+/// each piece.
 fn read_body(
     stream: &mut TcpStream,
     body: &mut Vec<u8>,
     want: usize,
     each: &mut dyn FnMut(usize),
-) -> bool {
+) -> BodyEnd {
     let mut buf = vec![0u8; 64 * 1024];
     while body.len() < want {
         match stream.read(&mut buf) {
-            Ok(0) | Err(_) => return false,
+            Ok(0) => return BodyEnd::Closed,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return BodyEnd::TimedOut;
+            }
+            Err(_) => return BodyEnd::Closed,
             Ok(n) => {
                 body.extend_from_slice(&buf[..n]);
                 each(body.len());
             }
         }
     }
-    true
+    BodyEnd::Whole
 }
 
 fn serve(
@@ -416,10 +437,11 @@ fn serve(
                     break;
                 }
             }
-            // The client that went away ends the stream before the whole body came.
+            // The client that went away closes or resets the stream before the whole body
+            // came; a client that only stands still runs into the read timeout.
             let mut rest = request.body.clone();
-            let whole = read_body(&mut stream, &mut rest, length, &mut |_| {});
-            let _ = closed.send(!whole);
+            let end = read_body(&mut stream, &mut rest, length, &mut |_| {});
+            let _ = closed.send(end == BodyEnd::Closed);
             None
         }
         Some(Act::Cut { after }) => {

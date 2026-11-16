@@ -26,6 +26,8 @@ use crate::supervisor::Clock;
 
 /// A transfer whose byte counter stands still this long is ended.
 pub const STALL: Duration = Duration::from_secs(60);
+/// Once the whole body is sent, the answer may take this long (the server commits the file).
+pub const ANSWER_WAIT: Duration = Duration::from_secs(600);
 /// The progress of a transfer is shown at most this often.
 pub const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 /// How often the watch looks, in real time.
@@ -51,6 +53,8 @@ pub enum Look {
 /// The watch of one transfer: when its counter last moved and what was last shown.
 #[derive(Debug)]
 pub struct Watch {
+    /// The count of the whole body: from then on the answer may take [`ANSWER_WAIT`].
+    whole: u64,
     count: u64,
     moved_at: u64,
     shown: u64,
@@ -58,8 +62,9 @@ pub struct Watch {
 }
 
 impl Watch {
-    pub fn new(now: u64) -> Self {
+    pub fn new(now: u64, whole: u64) -> Self {
         Self {
+            whole,
             count: 0,
             moved_at: now,
             shown: 0,
@@ -72,7 +77,13 @@ impl Watch {
         if count != self.count {
             self.count = count;
             self.moved_at = now;
-        } else if now.saturating_sub(self.moved_at) >= as_ms(STALL) {
+        } else if now.saturating_sub(self.moved_at)
+            >= as_ms(if count >= self.whole {
+                ANSWER_WAIT
+            } else {
+                STALL
+            })
+        {
             return Look::Stalled;
         }
         if count != self.shown && now.saturating_sub(self.shown_at) >= as_ms(PROGRESS_EVERY) {
@@ -96,12 +107,13 @@ pub enum Watched<T> {
 }
 
 /// Runs `work` on a runtime of this thread and watches `count`: `progress` gets the count about
-/// four times a second while it moves, a counter that stands still for [`STALL`] ends the work,
-/// and so does `cancelled`. Blocking: run it on a job's own thread. Fails only when no runtime
+/// four times a second while it moves, a counter that stands still for [`STALL`] ends the work
+/// (once it reached `whole`, the answer may take [`ANSWER_WAIT`]), and so does `cancelled`. Blocking: run it on a job's own thread. Fails only when no runtime
 /// can be made.
 pub fn watched<T>(
     work: impl Future<Output = T>,
     count: &AtomicU64,
+    whole: u64,
     clock: &Clock,
     cancelled: &dyn Fn() -> bool,
     progress: &mut dyn FnMut(u64),
@@ -113,7 +125,7 @@ pub fn watched<T>(
     let ended = runtime.block_on(async {
         let mut work = std::pin::pin!(work);
         let mut tick = tokio::time::interval(TICK);
-        let mut watch = Watch::new(clock());
+        let mut watch = Watch::new(clock(), whole);
         loop {
             let answer = std::future::poll_fn(|cx| {
                 if let Poll::Ready(answer) = work.as_mut().poll(cx) {
@@ -223,10 +235,11 @@ impl Body for FileBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn progress_shows_about_four_times_a_second() {
-        let mut watch = Watch::new(1_000);
+        let mut watch = Watch::new(1_000, u64::MAX);
         assert_eq!(watch.look(1_000, 0), Look::Quiet);
         // Moves, but too soon to show.
         assert_eq!(watch.look(1_100, 10), Look::Quiet);
@@ -239,11 +252,81 @@ mod tests {
     }
 
     #[test]
+    fn once_the_body_is_sent_the_answer_may_take_ten_minutes() {
+        let mut watch = Watch::new(0, 10);
+        assert_eq!(watch.look(1_000, 10), Look::Progress(10));
+        assert_eq!(watch.look(61_000, 10), Look::Quiet);
+        assert_eq!(watch.look(600_999, 10), Look::Quiet);
+        assert_eq!(watch.look(601_000, 10), Look::Stalled);
+    }
+
+    fn poll(body: &mut FileBody) -> Option<Result<Bytes, std::io::Error>> {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        match Pin::new(body).poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => Some(Ok(frame.into_data().unwrap())),
+            Poll::Ready(Some(Err(e))) => Some(Err(e)),
+            Poll::Ready(None) => None,
+            Poll::Pending => panic!("pending"),
+        }
+    }
+
+    #[test]
+    fn a_file_that_shrinks_while_it_is_sent_ends_the_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.bin");
+        std::fs::write(&path, vec![1u8; 100_000]).unwrap();
+        let count = Arc::new(AtomicU64::new(0));
+        let unreadable = Arc::new(AtomicBool::new(false));
+        let file = File::open(&path).unwrap();
+        let mut body = FileBody::new(file, 100_000, count.clone(), unreadable.clone());
+        assert_eq!(poll(&mut body).unwrap().unwrap().len(), CHUNK);
+        // Cut to 70,000 bytes: the next read gets the rest of those, then nothing.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(70_000)
+            .unwrap();
+        assert_eq!(poll(&mut body).unwrap().unwrap().len(), 70_000 - CHUNK);
+        assert!(poll(&mut body).unwrap().is_err());
+        assert!(unreadable.load(Ordering::SeqCst));
+        assert_eq!(count.load(Ordering::SeqCst), 70_000);
+        assert!(!body.is_end_stream());
+    }
+
+    #[test]
+    fn a_file_that_grows_while_it_is_sent_sends_its_first_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.bin");
+        std::fs::write(&path, vec![1u8; 100]).unwrap();
+        let count = Arc::new(AtomicU64::new(0));
+        let unreadable = Arc::new(AtomicBool::new(false));
+        let mut body = FileBody::new(
+            File::open(&path).unwrap(),
+            100,
+            count.clone(),
+            unreadable.clone(),
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[2u8; 500])
+            .unwrap();
+        assert_eq!(body.size_hint().exact(), Some(100));
+        assert_eq!(poll(&mut body).unwrap().unwrap().len(), 100);
+        assert!(body.is_end_stream());
+        assert!(poll(&mut body).is_none());
+        assert_eq!(count.load(Ordering::SeqCst), 100);
+        assert!(!unreadable.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn a_counter_that_stands_still_for_a_minute_stalls() {
-        let mut watch = Watch::new(0);
+        let mut watch = Watch::new(0, u64::MAX);
         assert_eq!(watch.look(59_999, 0), Look::Quiet);
         assert_eq!(watch.look(60_000, 0), Look::Stalled);
-        let mut watch = Watch::new(0);
+        let mut watch = Watch::new(0, u64::MAX);
         assert_eq!(watch.look(30_000, 5), Look::Progress(5));
         // A minute from the last move, not from the start.
         assert_eq!(watch.look(89_999, 5), Look::Quiet);

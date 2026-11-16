@@ -27,7 +27,7 @@ On macOS the OCR model runs on the GPU (Metal). On Linux it runs on the CPU. The
 notedown model pull
 ```
 
-This is done once. The model is about 3.4 GB and every file is checked against a pinned SHA-256 sum. `notedown model path` shows where the files are and `notedown model verify` checks them again.
+This is done once. The model is about 3.4 GB and every file is checked against a pinned SHA-256 sum. If the download stops, run the command again: it continues where it stopped. `notedown model path` shows where the files are and `notedown model verify` checks them again.
 
 ### 3. Get your notes onto the computer
 
@@ -205,7 +205,7 @@ One safety stop: if a scan would delete files and leave fewer than `scan_min_fil
 
 An app can list the deleted files and folders, bring them back and empty the bin over the [REST API](rest-api.md) (`GET /recycle`, `POST /recycle/restore` and `POST /recycle/empty`). To restore, it needs a token for writing. Empty needs one too. A restored file comes back with a new id, and the device sees it as a new file. An old version of a replaced file can't be restored this way. Copy it out of `recycle/` by hand.
 
-Empty removes every deleted file and folder from `recycle/` at once, also those the app does not list. It keeps the old versions of replaced files, also of files that were restored. The server keeps pruning them by the rules above.
+Empty removes every deleted file and folder from `recycle/` at once, also those the app does not list. It does not remove the old versions of replaced files, also not of files that were restored. The server prunes them by the rules above, so they are not kept for good. After Empty, the old versions of a deleted file are removed 90 days after the newest of them, which can be right away.
 
 To see what a prune would remove, run `notedown cloud recycle prune --data ~/notedown-data --account me --dry-run`. It changes nothing. Without `--dry-run` it prunes right away, also when `recycle_prune` is off. Run the dry run before the first start of a new version. The server prunes about once an hour while it runs. The first prune runs one hour after it starts. A server that's restarted more often than that prunes less, so then run `notedown cloud recycle prune` by hand.
 

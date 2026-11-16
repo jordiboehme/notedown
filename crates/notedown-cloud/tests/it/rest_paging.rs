@@ -526,3 +526,87 @@ fn a_hand_change_on_a_continuation_page_is_journaled() {
         .unwrap();
     assert_eq!(created["id"], entries[1]["id"]);
 }
+
+#[test]
+fn a_hand_rename_on_a_continuation_page_is_a_move() {
+    let s = start_imported();
+    let t = s.token();
+    let dir = "NOTE/Note/renamed";
+    for i in 1..=4 {
+        hand(
+            &s,
+            &format!("{dir}/f{i}"),
+            format!("content {i}").as_bytes(),
+        );
+    }
+    let base = format!("/tree?path={}&limit=2", q(dir));
+    let first = page(&s, &t, &base);
+    let seq = first["seq"].as_u64().unwrap();
+    let old_id = s
+        .state
+        .store("jordi")
+        .unwrap()
+        .id_of(&WirePath::parse(&format!("{dir}/f3")).unwrap())
+        .unwrap()
+        .unwrap();
+    let d = files(&s).join(dir);
+    std::fs::rename(d.join("f3"), d.join("f5")).unwrap();
+    let next = first["next"].as_str().unwrap();
+    let second = page(&s, &t, &format!("{base}&cursor={next}"));
+    let entries = second["entries"].as_array().unwrap();
+    assert_eq!(paths(entries), [format!("{dir}/f4"), format!("{dir}/f5")]);
+    assert_eq!(entries[1]["id"], old_id);
+    let events = page(&s, &t, &format!("/events?from={}", seq + 1));
+    let events = events["events"].as_array().unwrap();
+    let types: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(types, ["file.moved"], "{events:?}");
+    assert_eq!(events[0]["id"], old_id);
+    assert_eq!(events[0]["path"], format!("{dir}/f5"));
+    assert_eq!(events[0]["oldPath"], format!("{dir}/f3"));
+}
+
+#[test]
+fn a_continuation_page_of_a_gone_or_replaced_folder_is_404_or_409() {
+    let s = start_imported();
+    let t = s.token();
+    for dir in ["NOTE/Note/gone", "NOTE/Note/replaced"] {
+        for i in 1..=3 {
+            hand(&s, &format!("{dir}/f{i}"), b"x");
+        }
+    }
+    let next_of = |dir: &str| {
+        let p = page(&s, &t, &format!("/tree?path={}&limit=1", q(dir)));
+        p["next"].as_str().unwrap().to_string()
+    };
+    let gone = next_of("NOTE/Note/gone");
+    let replaced = next_of("NOTE/Note/replaced");
+    let root = files(&s);
+    std::fs::remove_dir_all(root.join("NOTE/Note/gone")).unwrap();
+    std::fs::remove_dir_all(root.join("NOTE/Note/replaced")).unwrap();
+    std::fs::write(root.join("NOTE/Note/replaced"), b"a file now").unwrap();
+    let (status, answer) = s.get(
+        Some(&t),
+        &format!("/tree?path={}&limit=1&cursor={gone}", q("NOTE/Note/gone")),
+    );
+    assert_eq!((status, answer), (404, json!({"error": "not_found"})));
+    let (status, answer) = s.get(
+        Some(&t),
+        &format!(
+            "/tree?path={}&limit=1&cursor={replaced}",
+            q("NOTE/Note/replaced")
+        ),
+    );
+    assert_eq!((status, answer), (409, json!({"error": "not_a_folder"})));
+}
+
+#[test]
+fn the_old_after_of_recycle_is_refused() {
+    let s = start_imported();
+    let t = s.token();
+    let (status, answer) = s.get(Some(&t), "/recycle?after=1%2FNOTE%2Fx");
+    assert_eq!((status, &answer["error"]), (400, &json!("bad_request")));
+    assert!(
+        answer["message"].as_str().unwrap().contains("cursor"),
+        "{answer}"
+    );
+}

@@ -267,6 +267,15 @@ pub struct Store {
     counts: WalkCounts,
 }
 
+/// What [`Store::list_window`] found.
+#[derive(Debug)]
+pub(crate) enum Page {
+    /// The entries of the page and whether more follow.
+    Listed(Vec<Entry>, bool),
+    NotFound,
+    NotAFolder,
+}
+
 /// How many scans walked the disk and how many entries the walks stat'ed, for
 /// [`Store::walk_counts`]. Two relaxed counters, nothing else.
 #[derive(Debug, Default)]
@@ -1152,13 +1161,6 @@ impl Store {
         known && (f.kind == Kind::Folder || state.hashes.is_current(&f.path, &f.meta))
     }
 
-    /// The kind of the listable entry at `path` (exact names, nothing hidden; the root is a
-    /// folder), or `None`. Assigns no id and touches no cache.
-    pub(crate) fn kind_at(&self, guard: &StoreGuard, path: &WirePath) -> Result<Option<Kind>> {
-        self.check_guard(guard)?;
-        Ok(list::resolve(&self.files, path)?.map(|f| f.kind))
-    }
-
     /// One page of the listing of the folder `path` (direct children, or every descendant with
     /// `recursive`; only folders with `folders_only`): the up to `limit` entries that come after
     /// `after` in the order of [`Store::list`], and whether more follow. `after` must lie below
@@ -1167,12 +1169,14 @@ impl Store {
     ///
     /// It walks a window, not the folder ([`list::walk_window`]): the names of the folders on
     /// the anchor's way and after it, and a stat of the `limit + 1` entries it collects. It does
-    /// not scan, prune or write the MD5 cache. An entry that a scan has not seen as it is (no
-    /// id of its kind, or a file whose cache row is not current: made or changed by hand since
-    /// the last scan) goes through `scan` with its path first, so its id and its MD5 come with
-    /// the event of that change and no change goes unjournaled. One that the scan could not
-    /// journal (it is still changing) is left out of the page; its event brings it later. A
-    /// missing `path` or a file gives an empty page.
+    /// not prune or write the MD5 cache itself. When an entry of the page was not seen by a scan
+    /// as it is (no id of its kind, or a file whose cache row is not current: made, changed or
+    /// renamed by hand since the last scan), its folder goes through `scan` first: one scan of
+    /// the direct children per such folder and page. So its id and its MD5 come with the event
+    /// of that change, and a rename within the folder is a move that keeps the id. An entry
+    /// that the scan could not journal (it is still changing) is left out of the page; its
+    /// event brings it later. A missing `path` is [`Page::NotFound`], a file
+    /// [`Page::NotAFolder`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn list_window(
         &self,
@@ -1183,41 +1187,45 @@ impl Store {
         after: Option<&WirePath>,
         limit: usize,
         scan: &mut dyn FnMut(&WirePath) -> Result<()>,
-    ) -> Result<(Vec<Entry>, bool)> {
+    ) -> Result<Page> {
         self.check_guard(guard)?;
+        let top = match list::resolve(&self.files, path)? {
+            Some(top) if top.kind == Kind::Folder => top,
+            Some(_) => return Ok(Page::NotAFolder),
+            None => return Ok(Page::NotFound),
+        };
         let limit = limit.max(1);
         let mut anchor = after.cloned();
         loop {
             let before = self.check_tree(false)?;
             let mut found = Vec::new();
-            if let Some(top) = list::resolve(&self.files, path)?
-                && top.kind == Kind::Folder
-            {
-                let rest = anchor
-                    .as_ref()
-                    .and_then(|a| a.segments().get(path.segments().len()..))
-                    .unwrap_or_default();
-                let stated = |n: usize| self.counts.stated(n);
-                let window = list::Window {
-                    recursive,
-                    folders_only,
-                    want: limit + 1,
-                    stated: &stated,
-                };
-                list::walk_window(path, &top.fs_path, rest, &window, &mut found)?;
-            }
+            let rest = anchor
+                .as_ref()
+                .and_then(|a| a.segments().get(path.segments().len()..))
+                .unwrap_or_default();
+            let stated = |n: usize| self.counts.stated(n);
+            let window = list::Window {
+                recursive,
+                folders_only,
+                want: limit + 1,
+                stated: &stated,
+            };
+            list::walk_window(path, &top.fs_path, rest, &window, &mut found)?;
             let more = found.len() > limit;
             found.truncate(limit);
-            let unseen: Vec<WirePath> = found
-                .iter()
-                .filter(|f| !self.seen(f))
-                .map(|f| f.path.clone())
-                .collect();
-            for p in &unseen {
-                scan(p)?;
+            // The folders that hold an unseen entry, each once, in the order of the page.
+            let mut folders: Vec<WirePath> = Vec::new();
+            for f in found.iter().filter(|f| !self.seen(f)) {
+                let folder = f.path.parent().unwrap_or_else(WirePath::root);
+                if !folders.contains(&folder) {
+                    folders.push(folder);
+                }
+            }
+            for folder in &folders {
+                scan(folder)?;
             }
             let last = found.last().map(|f| f.path.clone());
-            if !unseen.is_empty() {
+            if !folders.is_empty() {
                 // One the scan could not journal yet (it changes right now) waits for its
                 // event: an id or a cache row given here would swallow that event.
                 found.retain(|f| self.seen(f));
@@ -1228,7 +1236,7 @@ impl Store {
             // Every entry of a full page vanished while it was built: the next ones.
             match last {
                 Some(last) if entries.is_empty() && more => anchor = Some(last),
-                _ => return Ok((entries, more)),
+                _ => return Ok(Page::Listed(entries, more)),
             }
         }
     }

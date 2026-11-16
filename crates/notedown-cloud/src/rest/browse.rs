@@ -4,8 +4,8 @@
 //! Each request works as a device listing does: the store lock with recovery, the gates
 //! ([`gate_locked`]: 423 `scan_hold` or `not_imported`), then a scan of what it shows, so a file
 //! made by hand is journaled (origin `scan`) and has its id before the app sees it. A
-//! continuation page of `/tree` does not scan the folder: it scans only an entry that was made
-//! or changed by hand since ([`Store::list_window`]). Names are
+//! continuation page of `/tree` does not scan the folder: it scans only the folder of an entry
+//! that was made, changed or renamed by hand since ([`Store::list_window`]). Names are
 //! exact: another spelling is no entry, and nothing hidden is listed or served. A download opens
 //! the file under the lock and streams it after the lock is dropped, so a replace while it
 //! streams never mixes old and new bytes. The one validator is the md5: `md5` in an entry, the
@@ -27,7 +27,7 @@ use crate::Error;
 use crate::api::files::gate_locked;
 use crate::api::oss::send_tagged;
 use crate::server::AppState;
-use crate::store::{Entry, Kind, ScanOptions, Store, WirePath, WriteGuard, trees};
+use crate::store::{Entry, Kind, Page, ScanOptions, Store, WirePath, WriteGuard, trees};
 
 /// One file or folder as the app sees it. `path` is the wire path (`NOTE/Note/a.note`), `md5`
 /// only for files, `writable` whether the app may change it ([`trees::writable`]).
@@ -217,9 +217,9 @@ fn tree_ask(uri: &Uri) -> Result<TreeAsk, Refusal> {
 
 /// One page of the tree. The first page (no cursor) scans the scope, lists it from the scan's
 /// walk and cuts the page; only a first page that is also the last prunes the MD5 cache of a
-/// whole-tree listing. A continuation page does not scan: it walks a window after the anchor
-/// ([`Store::list_window`]), and only an entry made or changed by hand since is scanned, by
-/// its path.
+/// whole-tree listing. A continuation page does not scan the scope: it walks a window after
+/// the anchor ([`Store::list_window`]), and only the folder of an entry made, changed or
+/// renamed by hand since is scanned (its direct children, once per page).
 fn tree_of(state: &AppState, slug: &str, ask: TreeAsk) -> crate::Result<Tree> {
     let TreeAsk {
         path,
@@ -253,24 +253,19 @@ fn tree_of(state: &AppState, slug: &str, ask: TreeAsk) -> crate::Result<Tree> {
             let page: Vec<Entry> = all.into_iter().filter(shown).take(limit).collect();
             (page, more)
         }
-        Some(anchor) => {
-            if !path.is_root() {
-                match store.kind_at(&guard, &path)? {
-                    Some(Kind::Folder) => {}
-                    Some(Kind::File) => return Ok(Tree::NotAFolder),
-                    None => return Ok(Tree::NotFound),
-                }
-            }
-            store.list_window(
-                &guard,
-                &path,
-                recursive,
-                folders_only,
-                Some(&anchor),
-                limit,
-                &mut |p| scan(state, &store, &guard, p, false).map(|_| ()),
-            )?
-        }
+        Some(anchor) => match store.list_window(
+            &guard,
+            &path,
+            recursive,
+            folders_only,
+            Some(&anchor),
+            limit,
+            &mut |folder| scan(state, &store, &guard, folder, false).map(|_| ()),
+        )? {
+            Page::Listed(entries, more) => (entries, more),
+            Page::NotFound => return Ok(Tree::NotFound),
+            Page::NotAFolder => return Ok(Tree::NotAFolder),
+        },
     };
     // After the scan, under the same guard: the page holds every event up to `seq`.
     let seq = state.journal.last_seq()?;

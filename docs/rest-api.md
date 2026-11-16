@@ -88,10 +88,10 @@ The routes for the records, the digests and the note by path are made for the pi
 
 - `limit` is the number of items in one page. Each route has a default and a largest value. A larger number counts as the largest, 0 counts as 1. A `limit` that is no number is 400 `bad_request`.
 - The answer has the list and `"next"`. `next` is the cursor of the next page, or `null` on the last page.
-- To get the next page, ask again with the same query and `cursor` set to `next`. Leave the other values as they were. A cursor is only valid with the same `path` and `recursive` (and `kind`) as the page it came from.
+- To get the next page, ask again with the same query and `cursor` set to `next`. Leave the other values as they were. A cursor is only valid with the same `path` and `recursive` as the page it came from.
 - A cursor is opaque. It starts with its route and version (`t1:` for the tree, `r1:` for the recycle bin) and is at most 8192 characters long. Never build one and never look inside.
 - A cursor that is garbled, that belongs to another route or that points outside the folder of the request is 400 `bad_cursor`. Start again from the first page.
-- A cursor names the last item of its page. When that item is gone since, the next page starts after its place in the order. An item that stays where it is comes once and is never left out. A change in the middle of the pages comes as an event (for the tree, see "Many pages" under `GET /tree`).
+- A cursor names the last item of its page. When that item is gone since, the next page starts after its place in the order. An item that stays where it is and does not change comes once. A change in the middle of the pages comes as an event (for the tree, see "Many pages" under `GET /tree`).
 
 Every route with a list:
 
@@ -156,7 +156,7 @@ Lists the children of the folder at `path` (the root by default), one page at a 
 
 **The order.** Entries come in the order of their paths, name by name. Each name is compared by its bytes. So a folder comes right before what is in it: `a`, `a/x`, `a b`. This is not the order of the paths as whole strings. Upper case comes before lower case (`Zebra` before `apple`), `a10` comes before `a2`, and files and folders are mixed. The app shows the entries in this order while it loads a folder. It can sort them in its own way once it has all pages. A sort by size or by time is only possible then.
 
-**The cost.** The first page (no `cursor`) scans the folder before it answers. A file that someone put into the folder by hand is journaled and has its id before the app sees it. The next pages do not scan the folder again. They read only the names of the folder (with `recursive=true`, of the folders on the way) and look only at the entries of the page. An entry that was made or changed by hand after the first page is scanned on its own when a page shows it, so its event is in the journal before the app sees it.
+**The cost.** The first page (no `cursor`) scans the folder before it answers. A file that someone put into the folder by hand is journaled and has its id before the app sees it. The next pages do not scan the folder again. They read only the names of the folder (with `recursive=true`, of the folders on the way) and look only at the entries of the page. When a page shows an entry that was made, changed or renamed by hand after the first page, the server scans the folder of that entry first (its direct children, once per page). So its event is in the journal before the app sees it, and a rename keeps the id. A file that is still being written at that moment is left out of the page. The app gets it later with its `file.created` or `file.modified` event.
 
 **List by folder.** Do not list the whole tree with `recursive=true` on a big account. List the folder the user opens. Keep the `seq` of that answer and poll `GET /events?from=<seq + 1>`. The server read `seq` under the same lock as the page, so the page holds every event up to `seq` and you miss nothing. See [Following changes](#following-changes) for what to do with the events.
 
@@ -395,7 +395,7 @@ Lists the items of the bin, newest first. Items of the same time come in the ord
 - `size` is the number of bytes in the bin for the item. For a folder it is the sum of its files.
 - `md5` is only there for a file, when the server knows it. `files` is only there for a folder: the number of files that were in it.
 
-`limit` is at most 500, which is also the default. 0 counts as 1. When `next` is not `null`, there are more items. Ask again with `cursor` set to `next`. The next page starts after the last item of the page, also when that item has left the bin since. See [Paging](#paging). A `limit` that is no number is 400 `bad_request`, a cursor that does not fit is 400 `bad_cursor`. The server cuts each page from the whole bin index. That is fine at the size of a bin.
+`limit` is at most 500, which is also the default. 0 counts as 1. When `next` is not `null`, there are more items. Ask again with `cursor` set to `next`. The next page starts after the last item of the page, also when that item has left the bin since. See [Paging](#paging). A `limit` that is no number is 400 `bad_request`, a cursor that does not fit is 400 `bad_cursor`. The old `after` is 400 `bad_request`: use `cursor`. The server cuts each page from the whole bin index. That is fine at the size of a bin.
 
 The bin is not in `/events`. List it again after a delete, a restore or Empty, and on a `file.deleted` or `folder.deleted` while the app shows it.
 

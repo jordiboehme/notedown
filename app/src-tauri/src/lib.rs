@@ -2,6 +2,8 @@
 
 pub mod commands;
 pub mod config;
+pub mod process;
+pub mod supervisor;
 pub mod token;
 
 /// The bundle identifier of the app, as `tauri.conf.json` names it. The app's config, data and

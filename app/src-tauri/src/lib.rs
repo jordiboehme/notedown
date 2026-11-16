@@ -154,7 +154,8 @@ pub fn run() {
             commands::library_state,
             commands::library_list,
             commands::library_entry,
-            commands::library_recycle
+            commands::library_recycle,
+            commands::library_shown
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
@@ -512,6 +513,7 @@ mod tests {
                 "library_list",
                 "library_entry",
                 "library_recycle",
+                "library_shown",
                 "open_settings"
             ])
         );
@@ -580,7 +582,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 27);
+        assert_eq!(handler_commands().len(), 28);
     }
 
     #[test]
@@ -613,6 +615,7 @@ mod tests {
             "library_list",
             "library_entry",
             "library_recycle",
+            "library_shown",
         ]);
         assert_eq!(manifest_commands(), all);
         // Every granted command is a real one.
@@ -629,6 +632,7 @@ mod tests {
                 "library_list",
                 "library_entry",
                 "library_recycle",
+                "library_shown",
             ] {
                 assert!(!granted(window).contains(command), "{window} has {command}");
             }

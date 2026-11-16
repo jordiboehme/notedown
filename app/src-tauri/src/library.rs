@@ -214,6 +214,8 @@ pub enum LibraryError {
     NotReady(LibraryState),
     /// The server answered with an error, or did not answer.
     Rest(RestError),
+    /// The library bound again while the call ran: its answer belongs to the old binding.
+    Changed,
 }
 
 impl fmt::Display for LibraryError {
@@ -226,6 +228,7 @@ impl fmt::Display for LibraryError {
                     .unwrap_or("The library is starting again. Try again in a moment."),
             ),
             Self::Rest(e) => e.fmt(f),
+            Self::Changed => f.write_str("The library changed. List again."),
         }
     }
 }

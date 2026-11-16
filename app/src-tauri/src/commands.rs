@@ -8,7 +8,7 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::config::{self, AppConfig, Mode, StartView};
-use crate::library::{Entry, Library, Listed, RecyclePage, StateView};
+use crate::library::{Entry, Key, Library, Listed, RecyclePage, StateView};
 use crate::login::{self, LoginError, LoginGate, Password};
 use crate::model::{ModelControl, ModelState};
 use crate::poller::Poller;
@@ -574,6 +574,31 @@ pub async fn library_list(
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())
+}
+
+/// A listing the library window shows: a folder, or only its folders (the tree).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShownListing {
+    pub path: String,
+    #[serde(default)]
+    pub folders_only: bool,
+}
+
+/// The listings the library window shows now. The library keeps and follows only these, and
+/// lists only these again after a gap or a long pause. Async, so it never waits on the main
+/// thread.
+#[tauri::command]
+pub async fn library_shown(
+    library: State<'_, Library>,
+    listings: Vec<ShownListing>,
+) -> Result<(), String> {
+    let keys: Vec<Key> = listings
+        .iter()
+        .map(|l| Key::new(&l.path, l.folders_only))
+        .collect();
+    library.set_shown(&keys);
+    Ok(())
 }
 
 /// One file or folder by its id.

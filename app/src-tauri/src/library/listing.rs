@@ -33,6 +33,8 @@ pub struct Follow {
     last_poll: Option<u64>,
     /// `account.removed` or a 410: no more reads until the next binding.
     stopped: bool,
+    /// The binding these values belong to: an answer of an older one stops nothing.
+    generation: u64,
 }
 
 /// An item of the recycle bin.
@@ -95,6 +97,16 @@ impl Library {
         follow.shown = false;
         follow.last_poll = None;
         follow.stopped = false;
+        follow.generation = generation;
+    }
+
+    /// The account is gone (`account.removed` or a 410): no more reads until the next
+    /// binding. An answer that reached an older binding stops nothing.
+    fn stop_following(&self, session: &Session) {
+        let mut follow = lock(&self.inner.follow);
+        if follow.generation == session.generation() {
+            follow.stopped = true;
+        }
     }
 
     /// One page of `GET /tree`.
@@ -130,14 +142,19 @@ impl Library {
         let generation = session.generation();
         let key = Key::new(path, folders_only);
         if let Some(cursor) = cursor {
-            match self.with_cache(|c, out| c.begin_next(generation, &key, cursor, out)) {
+            let next = self.with_cache(|c, out| {
+                (c.generation() == generation).then(|| c.begin_next(generation, &key, cursor, out))
+            });
+            match next.ok_or(LibraryError::Changed)? {
                 Continue::Current(listed) => return Ok(listed),
                 Continue::FirstPage => {}
                 Continue::Fetch(ticket) => match self.tree_page(&session, &key, Some(cursor)) {
                     Ok(page) => {
-                        let merged =
-                            self.with_cache(|c, out| c.merge_next(ticket, &key, cursor, page, out));
-                        if let Some(listed) = merged {
+                        let merged = self.with_cache(|c, out| {
+                            (c.generation() == generation)
+                                .then(|| c.merge_next(ticket, &key, cursor, page, out))
+                        });
+                        if let Some(listed) = merged.ok_or(LibraryError::Changed)? {
                             return Ok(listed);
                         }
                     }
@@ -151,14 +168,19 @@ impl Library {
                 },
             }
         }
-        self.first_page(&session, &key).map_err(LibraryError::Rest)
+        self.first_page(&session, &key)
     }
 
     /// Lists `key` from its first page. A folder that is not there is dropped and the window
-    /// hears it.
-    fn first_page(&self, session: &Session, key: &Key) -> Result<Listed, RestError> {
+    /// hears it. A binding that changes before or during the call answers
+    /// [`LibraryError::Changed`].
+    fn first_page(&self, session: &Session, key: &Key) -> Result<Listed, LibraryError> {
         let generation = session.generation();
-        let ticket = self.with_cache(|c, _| c.begin_first(generation, key));
+        let ticket = self
+            .with_cache(|c, _| {
+                (c.generation() == generation).then(|| c.begin_first(generation, key))
+            })
+            .ok_or(LibraryError::Changed)?;
         match self.tree_page(session, key, None) {
             Ok(page) => {
                 let fallback = Listed {
@@ -176,16 +198,18 @@ impl Library {
                     },
                     next: page.next.clone(),
                 };
-                // A page of a binding that is gone is answered, not kept.
-                Ok(self
-                    .with_cache(|c, out| c.merge_first(ticket, key, page, out))
-                    .unwrap_or(fallback))
+                let merged = self.with_cache(|c, out| {
+                    (c.generation() == generation).then(|| c.merge_first(ticket, key, page, out))
+                });
+                // A newer first page of the same listing won and was dropped since: this page
+                // is answered, not kept.
+                Ok(merged.ok_or(LibraryError::Changed)?.unwrap_or(fallback))
             }
             Err(e) => {
                 if not_there(&e) {
                     self.with_cache(|c, out| c.gone(generation, key, GONE, out));
                 }
-                Err(e)
+                Err(LibraryError::Rest(e))
             }
         }
     }
@@ -250,9 +274,12 @@ impl Library {
         let Ok(session) = self.session() else {
             return;
         };
+        let generation = session.generation();
+        // Dropped listings whose first page failed before.
+        let pending = lock(&self.inner.cache).pending();
+        self.relist(&session, pending);
         if relist {
-            let generation = session.generation();
-            let keys = self.with_cache(|c, _| c.drop_all(generation));
+            let keys = self.with_cache(|c, _| c.relist_keys(generation));
             self.relist(&session, keys);
             self.polled(now);
             return;
@@ -273,27 +300,31 @@ impl Library {
             let page = match result {
                 Ok(page) => page,
                 Err(RestError::AccountRemoved) => {
-                    lock(&self.inner.follow).stopped = true;
+                    self.stop_following(&session);
                     return;
                 }
                 Err(_) => return,
             };
             self.polled(now);
-            let generation = session.generation();
             if page.gap {
-                let keys = self.with_cache(|c, _| c.drop_all(generation));
+                // A listing that cannot be read now keeps its old seq: the next poll meets the
+                // gap again and tries again.
+                let keys = self.with_cache(|c, _| c.relist_keys(generation));
                 self.relist(&session, keys);
                 return;
             }
             let applied = self.with_cache(|c, out| c.apply(generation, seq + 1, &page, out));
             let mut fetched = Vec::new();
-            for id in &applied.wanted {
+            for (id, seq) in &applied.wanted {
+                if session.is_cancelled() {
+                    return;
+                }
                 let result = session
                     .rest()
                     .get_json::<Entry>(&format!("/entries/{id}"), &[]);
                 self.settle(&session, &result);
                 if let Ok(entry) = result {
-                    fetched.push(entry);
+                    fetched.push((entry, *seq));
                 }
             }
             if !fetched.is_empty() {
@@ -301,7 +332,7 @@ impl Library {
             }
             self.relist(&session, applied.relist);
             if applied.stop {
-                lock(&self.inner.follow).stopped = true;
+                self.stop_following(&session);
                 return;
             }
             if !page.more {
@@ -314,18 +345,23 @@ impl Library {
         lock(&self.inner.follow).last_poll = Some(now);
     }
 
-    /// Lists `keys` again from their first page; one that is not there anymore is dropped.
+    /// Lists `keys` again from their first page; the new page replaces the folder only when it
+    /// comes. One that is not there anymore is dropped; one that cannot be read now keeps its
+    /// folder with the error, or, when it was dropped, is tried again at the next step.
     fn relist(&self, session: &Session, keys: Vec<Key>) {
+        let generation = session.generation();
         for key in keys {
             if session.is_cancelled() {
                 return;
             }
-            if let Err(e) = self.first_page(session, &key)
-                && !not_there(&e)
-            {
-                let generation = session.generation();
-                let text = e.to_string();
-                self.with_cache(|c, out| c.gone(generation, &key, &text, out));
+            match self.first_page(session, &key) {
+                Ok(_) => {}
+                Err(LibraryError::Rest(e)) if !not_there(&e) => {
+                    let text = e.to_string();
+                    self.with_cache(|c, out| c.relist_failed(generation, &key, &text, out));
+                }
+                Err(LibraryError::Changed) => return,
+                Err(_) => {}
             }
         }
     }
@@ -333,12 +369,19 @@ impl Library {
     /// Starts the follower's thread: a step every `every` while the window is visible, and
     /// one at each wake (a show, a hide, a write). It holds only a weak handle, so it ends when
     /// the library is dropped.
-    pub fn start_following(&self, every: Duration) {
+    pub fn start_following(&self, every: Duration) -> std::thread::JoinHandle<()> {
         let (tx, rx) = channel::<()>();
         let visible = lock(&self.inner.follow).visible.clone();
         *lock(&self.inner.waker) = Some(tx);
         let weak = Arc::downgrade(&self.inner);
-        std::thread::spawn(move || follow_loop(&weak, &rx, &visible, every));
+        std::thread::spawn(move || follow_loop(&weak, &rx, &visible, every))
+    }
+
+    /// The listings the window shows (the folder in the main area and the open folders of the
+    /// tree). The others are dropped and no longer followed; a gap or a long pause lists only
+    /// these again.
+    pub fn set_shown(&self, keys: &[Key]) {
+        lock(&self.inner.cache).set_shown(keys);
     }
 }
 

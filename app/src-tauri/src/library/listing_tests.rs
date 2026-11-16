@@ -40,7 +40,23 @@ struct Setup {
 
 /// A library bound to a scripted server that answers `answers` in order.
 fn setup(answers: Vec<String>) -> Setup {
-    let server = Scripted::start(answers);
+    setup_hooked(answers, |_, _, _| {})
+}
+
+/// [`setup`], and `hook` runs with the number of each request and the library before the
+/// server answers it: a test changes the binding while a call waits.
+fn setup_hooked(
+    answers: Vec<String>,
+    mut hook: impl FnMut(usize, &crate::rest::test_http::Request, &Library) + Send + 'static,
+) -> Setup {
+    let slot: Arc<Mutex<Option<Library>>> = Arc::default();
+    let hooked = slot.clone();
+    let server = Scripted::start_with(answers, move |n, request| {
+        let library = hooked.lock().unwrap().clone();
+        if let Some(library) = library {
+            hook(n, request, &library);
+        }
+    });
     let store = CountingStore::with(&remote_key(server.port, "jordi"), TOKEN);
     let place = Place::remote(server.port, Some("jordi"));
     let events = Events::default();
@@ -49,6 +65,7 @@ fn setup(answers: Vec<String>) -> Setup {
         Library::with_timing(store, place.func(), events.emit(), time.clock(), no_sleep());
     library.refresh();
     assert_eq!(library.state().unwrap().state, LibraryState::Ready);
+    *slot.lock().unwrap() = Some(library.clone());
     Setup {
         server,
         library,
@@ -260,6 +277,10 @@ fn events_update_the_listed_folder() {
             19,
         ),
         entry(&file(7, "NOTE/Note/e.note", MD5_B)),
+        entry(&with(
+            file(1, "NOTE/Note/a.note", MD5_C),
+            json!({"size": 99}),
+        )),
         entry(&file(8, "NOTE/Note/c copy.note", MD5_A)),
         entry(&folder(9, "NOTE/Note/new")),
         entry(&file(10, "NOTE/Note/c.note", MD5_B)),
@@ -329,6 +350,7 @@ fn events_update_the_listed_folder() {
             "/tree?path=NOTE%2FNote%2Fsub",
             "/events?from=11",
             "/entries/7",
+            "/entries/1",
             "/entries/8",
             "/entries/9",
             "/entries/10",
@@ -382,14 +404,25 @@ fn a_foreign_change_before_an_own_write_is_kept() {
             ],
             13,
         ),
+        entry(&with(
+            file(1, "NOTE/Note/x.note", MD5_C),
+            json!({"size": 12, "mtimeMs": 1_763_290_099_000_i64}),
+        )),
     ]);
     s.list(NOTE, None);
+    s.folders();
     // The app replaced x.note; the answer said seq 12.
     s.library.wrote(&[12]);
     s.follow();
+    // The batch itself ends at the own write, before the fetch of the new mtime.
+    let sent = s.folders();
+    assert_eq!(sent.len(), 2, "{sent:#?}");
+    assert_eq!(sent[0].entries[0].md5.as_deref(), Some(MD5_C));
+    assert_eq!(sent[0].entries[0].size, Some(12));
     let x = &listed(&s, NOTE).entries[0];
     assert_eq!(x.md5.as_deref(), Some(MD5_C));
-    assert_eq!(x.size, Some(12));
+    assert_eq!(x.mtime_ms, 1_763_290_099_000);
+    assert_eq!(s.targets()[1..], ["/events?from=11", "/entries/1"]);
 }
 
 #[test]
@@ -790,11 +823,227 @@ fn an_entry_and_the_recycle_bin_are_read() {
 #[test]
 fn the_follower_thread_ends_with_the_library() {
     let s = setup(vec![]);
-    s.library.start_following(Duration::from_secs(3600));
+    let thread = s.library.start_following(Duration::from_secs(3600));
     let weak = Arc::downgrade(&s.library.inner);
     drop(s);
     assert!(
         weak.upgrade().is_none(),
         "the follower keeps the library alive"
+    );
+    // The thread sees its channel close and ends; a bounded look, no sleep decides it.
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    while !thread.is_finished() && std::time::Instant::now() < until {
+        std::thread::yield_now();
+    }
+    assert!(thread.is_finished(), "the follower thread still runs");
+    thread.join().unwrap();
+}
+
+fn unreachable() -> String {
+    answer("502 Bad Gateway", "")
+}
+
+fn gap(next: u64, end: u64) -> String {
+    answer(
+        "200 OK",
+        &json!({"events": [], "next": next, "end": end, "more": false, "gap": true}).to_string(),
+    )
+}
+
+#[test]
+fn a_gap_while_the_server_does_not_answer_keeps_the_folders() {
+    let s = setup(vec![
+        tree(10, &[file(1, "NOTE/Note/a.note", MD5_A)], None),
+        gap(500, 500),
+        unreachable(),
+        // The folder still has seq 10: the next poll meets the gap again and lists again.
+        gap(500, 500),
+        tree(500, &[file(1, "NOTE/Note/a.note", MD5_B)], None),
+    ]);
+    s.list(NOTE, None);
+    s.folders();
+    s.follow();
+    let kept = listed(&s, NOTE);
+    assert_eq!(names(&kept), ["a.note"]);
+    assert_eq!(kept.error.as_deref(), Some("The server does not answer."));
+    assert_eq!(s.folders(), [kept]);
+    s.follow();
+    let again = listed(&s, NOTE);
+    assert_eq!(again.entries[0].md5.as_deref(), Some(MD5_B));
+    assert_eq!(again.error, None);
+    assert_eq!(
+        s.targets(),
+        [
+            "/tree?path=NOTE%2FNote",
+            "/events?from=11",
+            "/tree?path=NOTE%2FNote",
+            "/events?from=11",
+            "/tree?path=NOTE%2FNote",
+        ]
+    );
+}
+
+#[test]
+fn a_show_after_a_minute_while_unreachable_keeps_the_folders() {
+    let s = setup(vec![
+        tree(10, &[file(1, "NOTE/Note/a.note", MD5_A)], None),
+        events(&[], 11),
+        unreachable(),
+        events(&[ev(11, "file.deleted", 1, "NOTE/Note/a.note")], 12),
+    ]);
+    s.list(NOTE, None);
+    s.follow();
+    s.library.set_visible(false);
+    s.time.pass(60_001);
+    s.library.set_visible(true);
+    s.library.follow_step();
+    let kept = listed(&s, NOTE);
+    assert_eq!(names(&kept), ["a.note"]);
+    assert_eq!(kept.error.as_deref(), Some("The server does not answer."));
+    // It follows on from where the folder was.
+    s.library.follow_step();
+    assert!(listed(&s, NOTE).entries.is_empty());
+    assert_eq!(
+        s.targets(),
+        [
+            "/tree?path=NOTE%2FNote",
+            "/events?from=11",
+            "/tree?path=NOTE%2FNote",
+            "/events?from=11",
+        ]
+    );
+}
+
+#[test]
+fn a_dropped_folder_that_cannot_be_listed_is_tried_again() {
+    let s = setup(vec![
+        tree(10, &[file(1, "NOTE/Note/sub/a.note", MD5_A)], Some("t1:a")),
+        events(
+            &[with(
+                ev(11, "folder.moved", 5, "NOTE/Note/sub2"),
+                json!({"oldPath": "NOTE/Note/sub"}),
+            )],
+            12,
+        ),
+        unreachable(),
+        tree(12, &[file(1, "NOTE/Note/sub2/a.note", MD5_A)], None),
+        events(&[], 13),
+    ]);
+    s.list("NOTE/Note/sub", None);
+    s.folders();
+    s.follow();
+    let sent = s.folders();
+    assert_eq!(sent.last().unwrap().path, "NOTE/Note/sub2");
+    assert_eq!(
+        sent.last().unwrap().error.as_deref(),
+        Some("The server does not answer.")
+    );
+    assert!(!is_listed(&s, "NOTE/Note/sub2", false));
+    s.follow();
+    assert_eq!(names(&listed(&s, "NOTE/Note/sub2")), ["a.note"]);
+    assert_eq!(
+        s.targets()[1..],
+        [
+            "/events?from=11",
+            "/tree?path=NOTE%2FNote%2Fsub2",
+            "/tree?path=NOTE%2FNote%2Fsub2",
+            "/events?from=13",
+        ]
+    );
+}
+
+#[test]
+fn a_410_of_the_old_binding_does_not_stop_the_new_one() {
+    let s = setup_hooked(
+        vec![
+            tree(10, &[file(1, "NOTE/Note/a.note", MD5_A)], None),
+            answer(
+                "410 Gone",
+                r#"{"error":"account_removed","userId":7,"seq":10}"#,
+            ),
+            tree(20, &[file(1, "NOTE/Note/a.note", MD5_A)], None),
+            events(&[], 21),
+        ],
+        |n, _, library| {
+            // A login while the old binding's poll waits for its answer.
+            if n == 1 {
+                library.relogin();
+            }
+        },
+    );
+    s.list(NOTE, None);
+    s.follow();
+    s.list(NOTE, None);
+    s.follow();
+    assert_eq!(
+        s.targets(),
+        [
+            "/tree?path=NOTE%2FNote",
+            "/events?from=11",
+            "/tree?path=NOTE%2FNote",
+            "/events?from=21",
+        ]
+    );
+}
+
+#[test]
+fn a_list_that_crosses_a_binding_says_so() {
+    let s = setup_hooked(
+        vec![
+            tree(10, &[file(1, "NOTE/Note/a.note", MD5_A)], Some("t1:a")),
+            tree(12, &[file(2, "NOTE/Note/b.note", MD5_A)], None),
+            tree(20, &[file(3, "NOTE/x/c.note", MD5_A)], None),
+        ],
+        |n, _, library| {
+            if n == 1 || n == 2 {
+                library.relogin();
+            }
+        },
+    );
+    s.list(NOTE, None);
+    let err = s.library.list(NOTE, Some("t1:a"), false).unwrap_err();
+    assert_eq!(err, LibraryError::Changed);
+    assert_eq!(err.to_string(), "The library changed. List again.");
+    assert!(!is_listed(&s, NOTE, false));
+    let err = s.library.list("NOTE/x", None, false).unwrap_err();
+    assert_eq!(err, LibraryError::Changed);
+    assert!(!is_listed(&s, "NOTE/x", false));
+    // One call each, no second one.
+    assert_eq!(
+        s.targets(),
+        [
+            "/tree?path=NOTE%2FNote",
+            "/tree?path=NOTE%2FNote&cursor=t1%3Aa",
+            "/tree?path=NOTE%2Fx",
+        ]
+    );
+}
+
+#[test]
+fn only_the_shown_folders_are_kept_and_listed_again() {
+    let s = setup(vec![
+        tree(10, &[file(1, "NOTE/Note/a.note", MD5_A)], None),
+        tree(10, &[folder(2, "NOTE/Note/sub")], None),
+        tree(10, &[file(3, "NOTE/Other/o.note", MD5_A)], None),
+        gap(500, 500),
+        tree(500, &[file(1, "NOTE/Note/a.note", MD5_B)], None),
+        tree(500, &[folder(2, "NOTE/Note/sub")], None),
+    ]);
+    s.list(NOTE, None);
+    s.library.list(NOTE, None, true).unwrap();
+    s.list("NOTE/Other", None);
+    s.library
+        .set_shown(&[Key::new(NOTE, false), Key::new(NOTE, true)]);
+    // The window does not show NOTE/Other any more: it is no longer kept.
+    assert!(!is_listed(&s, "NOTE/Other", false));
+    s.follow();
+    assert_eq!(listed(&s, NOTE).entries[0].md5.as_deref(), Some(MD5_B));
+    assert_eq!(
+        s.targets()[3..],
+        [
+            "/events?from=11",
+            "/tree?path=NOTE%2FNote",
+            "/tree?path=NOTE%2FNote&kind=folder",
+        ]
     );
 }

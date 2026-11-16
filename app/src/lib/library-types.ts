@@ -26,6 +26,12 @@ export type FolderState = {
  */
 export type Listing = { folder: FolderState; next: string | null };
 
+/**
+ * A listing the window shows, for `library_shown`: the library keeps and follows only these, and
+ * lists only these again after a gap or a long pause.
+ */
+export type ShownListing = { path: string; foldersOnly: boolean };
+
 export type RecycleItem = {
   key: string;
   path: string;

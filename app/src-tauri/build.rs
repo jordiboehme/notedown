@@ -32,6 +32,7 @@ const COMMANDS: &[&str] = &[
     "library_list",
     "library_entry",
     "library_recycle",
+    "library_shown",
 ];
 
 fn main() {

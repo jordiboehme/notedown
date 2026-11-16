@@ -16,7 +16,7 @@
 //!   (a late page lowers the `seq`) is never announced twice.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -104,9 +104,10 @@ pub enum Continue {
 /// What a batch of events left to do.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Applied {
-    /// Ids that came into a listed folder and that no listed folder knows: fetch them.
-    pub wanted: Vec<u64>,
-    /// Listings that were dropped: list them again from the first page.
+    /// Ids (with the `seq` of their first event) that came into a listed folder and that no
+    /// listed folder knows, or whose file changed: fetch them.
+    pub wanted: Vec<(u64, u64)>,
+    /// Listings that were dropped: they wait to be listed again from the first page.
     pub relist: Vec<Key>,
     /// Listings whose folder moved away: the window hears that their path is gone.
     pub gone: Vec<Key>,
@@ -185,6 +186,11 @@ pub struct Cache {
     /// The epoch of the newest first page asked for each listing.
     first: HashMap<Key, u64>,
     epochs: u64,
+    /// Dropped listings that wait to be listed again (a first page that failed is tried at
+    /// each step of the follower).
+    pending: BTreeSet<Key>,
+    /// The listings the window shows; `None` until it says so (then all are kept).
+    shown: Option<BTreeSet<Key>>,
 }
 
 /// The folder of `path`: everything before its last `/`, or the root.
@@ -228,6 +234,37 @@ impl Cache {
         self.generation = generation;
         self.folders.clear();
         self.first.clear();
+        self.pending.clear();
+        self.shown = None;
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The window shows `keys`: every other listing is dropped and no longer followed.
+    pub fn set_shown(&mut self, keys: &[Key]) {
+        let shown: BTreeSet<Key> = keys.iter().cloned().collect();
+        self.folders.retain(|k, _| shown.contains(k));
+        self.pending.retain(|k| shown.contains(k));
+        self.shown = Some(shown);
+    }
+
+    /// The listings to list again after a gap or a long pause: the shown ones (all of them
+    /// while the window has not said). The others are dropped.
+    pub fn relist_keys(&mut self, generation: u64) -> Vec<Key> {
+        if generation != self.generation {
+            return Vec::new();
+        }
+        if let Some(shown) = &self.shown {
+            self.folders.retain(|k, _| shown.contains(k));
+        }
+        self.keys()
+    }
+
+    /// The dropped listings that wait to be listed again.
+    pub fn pending(&self) -> Vec<Key> {
+        self.pending.iter().cloned().collect()
     }
 
     pub fn keys(&self) -> Vec<Key> {
@@ -317,6 +354,7 @@ impl Cache {
             return self.listed(key);
         }
         self.first.remove(key);
+        self.pending.remove(key);
         let before = self.folders.get(key).map(|f| f.state(&key.path));
         let mut folder = Folder {
             entries: Vec::new(),
@@ -400,14 +438,30 @@ impl Cache {
         }
     }
 
-    /// Drops every folder (a `gap`) and answers what was listed.
-    pub fn drop_all(&mut self, generation: u64) -> Vec<Key> {
+    /// Listing `key` again failed with `text`. A folder that is still listed is kept as it
+    /// was, with the error (its old `seq` makes the follower meet a gap again, or follow on).
+    /// A dropped one waits to be tried again and the window hears the error.
+    pub fn relist_failed(
+        &mut self,
+        generation: u64,
+        key: &Key,
+        text: &str,
+        out: &mut Vec<LibraryEvent>,
+    ) {
         if generation != self.generation {
-            return Vec::new();
+            return;
         }
-        let keys = self.keys();
-        self.folders.clear();
-        keys
+        match self.folders.get_mut(key) {
+            Some(folder) => {
+                let before = folder.state(&key.path);
+                folder.error = Some(text.to_owned());
+                self.announce(key, before, out);
+            }
+            None => {
+                self.pending.insert(key.clone());
+                out.push(gone_event(key, text));
+            }
+        }
     }
 
     /// Tells the window that `key` is not there anymore, or could not be listed.
@@ -416,6 +470,7 @@ impl Cache {
             return;
         }
         self.folders.remove(key);
+        self.pending.remove(key);
         out.push(gone_event(key, text));
     }
 
@@ -482,9 +537,10 @@ impl Cache {
                 out.push(gone_event(key, GONE));
             }
         }
+        self.pending.extend(applied.relist.iter().cloned());
         applied.wanted.retain({
             let mut seen = std::collections::HashSet::new();
-            move |id| seen.insert(*id)
+            move |(id, _)| seen.insert(*id)
         });
         applied
     }
@@ -529,6 +585,8 @@ impl Cache {
                         let entry = &mut folder.entries[at];
                         entry.md5 = event.md5.clone();
                         entry.size = event.size;
+                        // The new mtime comes with the entry.
+                        applied.wanted.push((id, seq));
                     }
                 }
             }
@@ -604,7 +662,7 @@ impl Cache {
                 None => {
                     // A different entry at this path is replaced; the fetch brings the new one.
                     folder.entries.retain(|e| e.id != id && e.name != name);
-                    applied.wanted.push(id);
+                    applied.wanted.push((id, seq));
                 }
             }
         }
@@ -644,24 +702,27 @@ impl Cache {
         }
     }
 
-    /// Puts entries fetched after a batch into the listed folders the batch covered (their
-    /// `seq` is its `end`). A folder listed since holds them as they are, or reads them up.
+    /// Puts entries fetched after a batch into the listings of their folder that are valid
+    /// between the entry's event and the end of the batch: the batch covered them, or a page
+    /// read after the event came in meanwhile. A listing below the event reads it up again; one
+    /// past the batch holds the entry as it is.
     pub fn insert_fetched(
         &mut self,
         generation: u64,
         end: u64,
-        entries: Vec<Entry>,
+        entries: Vec<(Entry, u64)>,
         out: &mut Vec<LibraryEvent>,
     ) {
         if generation != self.generation {
             return;
         }
         let mut before: Vec<(Key, FolderState)> = Vec::new();
-        for entry in entries {
+        for (entry, seq) in entries {
             let parent = parent_of(&entry.path).to_owned();
             for (key, folder) in self.folders.iter_mut().filter(|(k, f)| {
                 k.path == parent
-                    && f.seq == end
+                    && f.seq >= seq
+                    && f.seq <= end
                     && (!k.folders_only || entry.kind == EntryKind::Folder)
                     && f.admits(&entry.name)
             }) {
@@ -786,9 +847,44 @@ mod tests {
         // A fetched entry goes only into folders the batch covered.
         let t = cache.begin_first(1, &b);
         cache.merge_first(t, &b, page(12, vec![], None), out);
-        cache.insert_fetched(1, applied.end, vec![file(5, "B/y"), file(6, "A/y")], out);
+        cache.insert_fetched(
+            1,
+            applied.end,
+            vec![(file(5, "B/y"), 23), (file(6, "A/y"), 23)],
+            out,
+        );
         assert_eq!(names(&cache, &b), Vec::<String>::new());
         assert_eq!(names(&cache, &a), ["a", "y"]);
+    }
+
+    /// A page merged while the entries of a batch are fetched: the entry still comes into
+    /// that folder when the page was read at or after the event.
+    #[test]
+    fn a_page_merged_during_a_fetch_keeps_the_fetched_entry() {
+        let mut cache = Cache::default();
+        cache.clear(1);
+        let out = &mut Vec::new();
+        let c = Key::new("C", false);
+        let t = cache.begin_first(1, &c);
+        cache.merge_first(t, &c, page(10, vec![file(3, "C/c")], Some("t1:c")), out);
+        let Continue::Fetch(t) = cache.begin_next(1, &c, "t1:c", out) else {
+            panic!("no fetch");
+        };
+        let created = Event {
+            seq: 12,
+            kind: "file.created".to_owned(),
+            id: Some(5),
+            path: Some("C/b".to_owned()),
+            old_path: None,
+            md5: None,
+            size: None,
+        };
+        let applied = cache.apply(1, 11, &batch(vec![created], 21), out);
+        assert_eq!(applied.wanted, [(5, 12)]);
+        // Page 2 was read at 15: after the create, before the end of the batch.
+        cache.merge_next(t, &c, "t1:c", page(15, vec![file(4, "C/x")], None), out);
+        cache.insert_fetched(1, applied.end, vec![(file(5, "C/b"), 12)], out);
+        assert_eq!(names(&cache, &c), ["b", "c", "x"]);
     }
 
     #[test]

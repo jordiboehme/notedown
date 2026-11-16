@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "library",
-  "description": "The library window follows the library's events, reads the library's state when it opens, lists folders page by page, reads one entry and the recycle bin, and opens the settings at the page its state names. Every call to the server is made in Rust: the token never reaches the window.",
+  "description": "The library window follows the library's events, reads the library's state when it opens, lists folders page by page, reads one entry and the recycle bin, tells which folders it shows, and opens the settings at the page its state names. Every call to the server is made in Rust: the token never reaches the window.",
   "windows": ["library"],
   "permissions": [
     "core:event:allow-listen",
@@ -10,6 +10,7 @@
     "allow-library-list",
     "allow-library-entry",
     "allow-library-recycle",
+    "allow-library-shown",
     "allow-open-settings"
   ]
 }

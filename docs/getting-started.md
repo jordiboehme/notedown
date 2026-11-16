@@ -269,6 +269,10 @@ notedown cloud account --data ~/notedown-data tokens revoke me --all
 
 `tokens list` shows the id, the scope (`read` or `write`), the name and the creation time of each token, never the token itself. `notedown connect` makes a `read` token. A password change (`cloud account passwd`) revokes every token. A new `connect` leaves the old token valid until you revoke it. A restore of an old backup of the Pi brings back the tokens that you had revoked since. Revoke them again.
 
+The same API lets an app browse, upload, rename, move and delete the files of an account. It needs a token made for writing. See the [REST API](rest-api.md).
+
+**Update the Mac before the Pi.** The server writes journal lines with the origin `app` for the changes of an app. An older pipeline skips them.
+
 **When the Mac deletes note text.** Only when the account is gone on the Pi, or when its name now belongs to a new account. A refused token, a locked account or a Pi that can't be reached only stop the reading. The Mac keeps the text it has.
 
 **Both machines need the right time (NTP).** The Mac waits until a page has been quiet for a while. It measures that by the time the Pi wrote the page. If the clocks differ a lot, the Mac reads too early or too late.

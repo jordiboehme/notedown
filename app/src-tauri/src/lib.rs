@@ -5,6 +5,7 @@ pub mod config;
 pub mod library;
 pub mod login;
 pub mod model;
+pub mod notes;
 pub mod pidfile;
 pub mod poller;
 pub mod probe;
@@ -22,12 +23,14 @@ pub mod transfer;
 pub mod tray;
 pub mod windows;
 
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
 
 use library::{LIBRARY_EVENT, Library, LibraryEvent};
 use model::{ModelControl, ModelEvent};
+use notes::{NOTES_EVENT, NOTES_EVERY, Notes};
 use poller::{Inputs, Poller, RealSources, TICK_EVERY};
 use process::ChildKind;
 use processes::{Options, Processes, REPROBE_EVERY};
@@ -88,9 +91,13 @@ pub fn run() {
             tray::build(app.handle())?;
             app.manage(windows::PollerVisibility::start(app.handle()));
             let config_dir = app.path().app_config_dir()?;
-            let config = commands::ConfigState::load(config_dir);
+            let config = commands::ConfigState::load(config_dir.clone());
             let reader = config.reader();
             let library_reader = config.reader();
+            let notes = notes_for(app.handle().clone(), config.reader(), config_dir);
+            notes.start_scanning(NOTES_EVERY);
+            let library_notes = notes.clone();
+            app.manage(notes);
             app.manage(config);
             let sidecar = process::sidecar_path()?;
             let sidecar_spawn = process::spawn_program(sidecar.clone());
@@ -105,7 +112,12 @@ pub fn run() {
             }));
             app.manage(model_control(app.handle().clone(), sidecar_spawn.clone()));
             let poller = status_poller(sidecar_spawn, reader, processes.clone());
-            let library = library_for(app.handle().clone(), library_reader, processes.clone());
+            let library = library_for(
+                app.handle().clone(),
+                library_reader,
+                processes.clone(),
+                library_notes,
+            );
             let rebind = library_worker(library.clone());
             library.start_following(library::FOLLOW_EVERY);
             app.manage(library);
@@ -169,7 +181,10 @@ pub fn run() {
             commands::library_cancel,
             commands::library_cancel_drop,
             commands::library_download,
-            commands::library_reveal
+            commands::library_reveal,
+            commands::notes_new,
+            commands::notes_all,
+            commands::note_seen
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
@@ -356,11 +371,14 @@ fn report_status(app: AppHandle, poller: &Poller) {
 
 /// The library of the account in the config. It reads the config and the server's start lines
 /// through handles of their own, so it holds no handle to the app; its events go into a
-/// channel, and a thread of its own sends them to the library window.
+/// channel, and a thread of its own sends them to the library window. Each binding (the start,
+/// a login, a log out, a new place) also wakes a scan of the notes, so a new account gets its
+/// baseline at its login.
 fn library_for(
     app: AppHandle,
     config: commands::ConfigReader,
     processes: Arc<Processes>,
+    notes: Notes,
 ) -> Library {
     // The Downloads folder in the user's home. Nothing reads it before the first download.
     let downloads = app
@@ -371,6 +389,9 @@ fn library_for(
     let (tx, rx) = mpsc::channel::<LibraryEvent>();
     std::thread::spawn(move || {
         for event in rx {
+            if event == LibraryEvent::Relist {
+                notes.wake();
+            }
             let _ = app.emit_to(windows::WindowKind::Library.label(), LIBRARY_EVENT, event);
         }
     });
@@ -385,6 +406,29 @@ fn library_for(
         library.set_downloads(downloads);
     }
     library
+}
+
+/// The notes index of the account in the config. It reads the config through a handle of its
+/// own; its events go into a channel, and a thread of its own tells the panel and the library.
+fn notes_for(app: AppHandle, config: commands::ConfigReader, config_dir: PathBuf) -> Notes {
+    let (tx, rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        for () in rx {
+            for kind in [windows::WindowKind::Panel, windows::WindowKind::Library] {
+                let _ = app.emit_to(kind.label(), NOTES_EVENT, ());
+            }
+        }
+    });
+    Notes::new(
+        Arc::new(move || {
+            let config = config.current();
+            (config.data_dir, config.account)
+        }),
+        config_dir,
+        Arc::new(move || {
+            let _ = tx.send(());
+        }),
+    )
 }
 
 /// The thread that binds the library again when the server's address may have changed (a new
@@ -524,6 +568,7 @@ mod tests {
             granted("panel"),
             set(&[
                 "get_status",
+                "notes_new",
                 "open_library",
                 "open_settings",
                 "request_quit",
@@ -551,6 +596,9 @@ mod tests {
                 "library_cancel_drop",
                 "library_download",
                 "library_reveal",
+                "notes_new",
+                "notes_all",
+                "note_seen",
                 "open_settings"
             ])
         );
@@ -619,7 +667,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 41);
+        assert_eq!(handler_commands().len(), 44);
     }
 
     #[test]
@@ -666,6 +714,9 @@ mod tests {
             "library_cancel_drop",
             "library_download",
             "library_reveal",
+            "notes_new",
+            "notes_all",
+            "note_seen",
         ]);
         assert_eq!(manifest_commands(), all);
         // Every granted command is a real one.
@@ -697,6 +748,20 @@ mod tests {
                 "library_download",
                 "library_reveal",
             ] {
+                assert!(!granted(window).contains(command), "{window} has {command}");
+            }
+        }
+    }
+
+    #[test]
+    fn notes_new_is_the_panels_and_the_librarys_and_the_rest_only_the_librarys() {
+        for window in ["panel", "library"] {
+            assert!(granted(window).contains("notes_new"), "{window}");
+        }
+        assert!(!granted("settings").contains("notes_new"));
+        for command in ["notes_all", "note_seen"] {
+            assert!(granted("library").contains(command), "{command}");
+            for window in ["panel", "settings"] {
                 assert!(!granted(window).contains(command), "{window} has {command}");
             }
         }

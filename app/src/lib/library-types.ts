@@ -111,3 +111,22 @@ export type UploadChoice = "replace" | "keepBoth" | "skip";
 
 /** The name of the Tauri event that carries every `LibraryEvent`. */
 export const LIBRARY_EVENT = "library";
+
+/**
+ * A note of the pipeline's store (src-tauri/src/notes.rs), as `notes_new` and `notes_all` answer
+ * it. `changedMs` is the time its store file last changed.
+ */
+export type NoteSummary = {
+  key: string;
+  path: string;
+  title: string;
+  pages: number;
+  pagesWithText: number;
+  changedMs: number;
+};
+
+/**
+ * The name of the Tauri event that tells the panel and the library that the notes changed. It
+ * carries nothing: ask `notes_new` or `notes_all` again.
+ */
+export const NOTES_EVENT = "notes";

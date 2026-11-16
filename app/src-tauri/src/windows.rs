@@ -214,6 +214,7 @@ pub fn show_window(app: &AppHandle, kind: WindowKind, page: Option<String>) -> t
     shown.set(kind, true);
     tell_poller(app, false);
     tell_library(app, kind, true);
+    tell_notes(app);
     Ok(())
 }
 
@@ -251,6 +252,7 @@ pub fn hide_window(app: &AppHandle, kind: WindowKind) {
     apply_policy(app, &visible);
     tell_poller(app, false);
     tell_library(app, kind, false);
+    tell_notes(app);
 }
 
 /// Tells the library's follower that its window was shown or hidden: it follows the changes
@@ -260,6 +262,17 @@ fn tell_library(app: &AppHandle, kind: WindowKind, visible: bool) {
         && let Some(library) = app.try_state::<crate::library::Library>()
     {
         library.set_visible(visible);
+    }
+}
+
+/// Tells the notes index whether a window that shows notes (the panel, the library) is
+/// visible: it scans the store only then. It never blocks (a flag and a wake of its thread).
+fn tell_notes(app: &AppHandle) {
+    if let Some(notes) = app.try_state::<crate::notes::Notes>() {
+        let shown = app.state::<Shown>();
+        notes.set_visible(
+            shown.is_visible(WindowKind::Panel) || shown.is_visible(WindowKind::Library),
+        );
     }
 }
 
@@ -302,6 +315,7 @@ fn open_panel(app: &AppHandle, tray: Option<Area>, cursor: Option<(f64, f64)>) {
     let _ = panel.set_focus();
     app.state::<Shown>().set(WindowKind::Panel, true);
     tell_poller(app, true);
+    tell_notes(app);
     crate::reprobe_outside(app);
 }
 

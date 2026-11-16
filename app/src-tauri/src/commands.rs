@@ -11,6 +11,7 @@ use crate::config::{self, AppConfig, Mode, StartView};
 use crate::library::{Choice, Entry, Job, Key, Library, Listed, RecyclePage, StateView, UploadAsk};
 use crate::login::{self, LoginError, LoginGate, Password};
 use crate::model::{ModelControl, ModelState};
+use crate::notes::{NoteSummary, Notes};
 use crate::poller::Poller;
 use crate::processes::{ProcessStates, Processes};
 use crate::serve_info::ServeInfo;
@@ -768,6 +769,35 @@ pub async fn library_reveal(library: State<'_, Library>, path: String) -> Result
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// The notes with text the user has not opened since it came, newest first (the panel and the
+/// library). It scans the store first, off the main thread.
+#[tauri::command]
+pub async fn notes_new(notes: State<'_, Notes>) -> Result<Vec<NoteSummary>, String> {
+    let notes = notes.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || notes.new_notes())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Every note with text, newest first (the library's All notes). It scans the store first, off
+/// the main thread.
+#[tauri::command]
+pub async fn notes_all(notes: State<'_, Notes>) -> Result<Vec<NoteSummary>, String> {
+    let notes = notes.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || notes.all())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The library opened the note `key`: its text up to now is seen. Off the main thread.
+#[tauri::command]
+pub async fn note_seen(notes: State<'_, Notes>, key: String) -> Result<(), String> {
+    let notes = notes.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || notes.seen(&key))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// The last lines of both children's output, for the Server page.

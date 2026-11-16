@@ -171,7 +171,8 @@ fn download(
 }
 
 /// Downloads `url` into `dest` through `dest.part`. A part left by an earlier run is
-/// continued with a `Range` request. The part stays on download and IO errors and is
+/// continued with a `Range` request; a partial answer from another offset is asked for again
+/// without `Range`. The part stays on download and IO errors and is
 /// removed only when the complete file fails the size or SHA-256 check.
 /// `progress` reports the bytes on disk and the size of the whole file.
 pub fn download_from(
@@ -212,6 +213,21 @@ pub fn download_from(
                 .get(reqwest::header::CONTENT_RANGE)
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.starts_with(&format!("bytes {have}-")));
+        if have > 0 && !resumes && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+            // A part of the file from another offset: ask for the whole file instead of
+            // writing those bytes at the start.
+            drop(resp);
+            resp = client
+                .get(url)
+                .send()
+                .and_then(|r| r.error_for_status())
+                .map_err(fail)?;
+            if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+                return Err(OcrError::Download(format!(
+                    "{url}: the server answers with a part of the file to a request for all of it"
+                )));
+            }
+        }
         let mut out = if resumes {
             std::fs::OpenOptions::new().append(true).open(&part)?
         } else {
@@ -369,6 +385,9 @@ mod tests {
         Whole,
         /// Sends only the first n bytes of the whole file, then closes.
         Cut(usize),
+        /// Answers a Range request with 206 from byte n (not the asked start), and a request
+        /// without Range with 200 and the whole file.
+        WrongRange(usize),
     }
 
     /// Serves `body` to the next requests. Returns the URL and the Range headers seen.
@@ -402,6 +421,12 @@ mod tests {
                         body.len(),
                         body.len() - s
                     ),
+                    (Serve::WrongRange(n), Some(_)) => format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {n}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len() - 1,
+                        body.len(),
+                        body.len() - n
+                    ),
                     _ => format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
@@ -409,6 +434,7 @@ mod tests {
                 };
                 let payload = match (mode, start) {
                     (Serve::Ranges, Some(s)) => &body[s..],
+                    (Serve::WrongRange(n), Some(_)) => &body[n..],
                     (Serve::Cut(n), _) => &body[..n],
                     _ => &body[..],
                 };
@@ -523,5 +549,34 @@ mod tests {
         assert!(matches!(err, Err(OcrError::Checksum { .. })), "{err:?}");
         assert!(!part_of(&dest).exists());
         assert!(!dest.exists());
+    }
+
+    #[test]
+    fn a_complete_part_with_wrong_bytes_fails_without_a_request() {
+        let body = body();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f.bin");
+        std::fs::write(part_of(&dest), vec![9u8; body.len()]).unwrap();
+        let (url, seen) = serve(body.clone(), Serve::Ranges);
+        let err = download_from(&url, &model_file(&body), &dest, &mut |_, _, _| {});
+        assert!(matches!(err, Err(OcrError::Checksum { .. })), "{err:?}");
+        assert!(!part_of(&dest).exists());
+        assert!(!dest.exists());
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_partial_answer_from_another_offset_asks_again_without_a_range() {
+        let body = body();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f.bin");
+        std::fs::write(part_of(&dest), &body[..1500]).unwrap();
+        let (url, seen) = serve(body.clone(), Serve::WrongRange(1000));
+        download_from(&url, &model_file(&body), &dest, &mut |_, _, _| {}).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [Some("1500-".to_string()), None]
+        );
     }
 }

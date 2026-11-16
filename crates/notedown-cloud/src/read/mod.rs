@@ -25,7 +25,7 @@ use crate::pages::{PAGES_DIR, PageRecord, valid_file_id, valid_key};
 use crate::store::WirePath;
 use crate::{Result, io_err};
 
-pub use events::{EventPage, FileEvent, events};
+pub use events::{EventPage, FileEvent, OwnPage, events, events_of};
 pub use journal::{journal, journal_until};
 
 /// An account of the server.

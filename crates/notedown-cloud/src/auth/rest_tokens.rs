@@ -300,6 +300,20 @@ impl RestTokens {
             .is_some_and(|a| a.user_id == user_id))
     }
 
+    /// [`RestTokens::is_live`], asked under the store lock of the account. `Accounts::remove`
+    /// holds that lock from its `account.removed` record to the rename of the folder, so a
+    /// removal that has its record is over once the lock is free: an account that is still
+    /// live then has a record a crash left. Waits for a running change of the account.
+    pub fn is_live_settled(&self, slug: &str, user_id: u64) -> Result<bool> {
+        let dir = self.accounts.account_dir(slug);
+        let _store = match crate::store::take_store_lock(&dir, None) {
+            Ok(lock) => lock,
+            Err(Error::NoAccount(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        self.is_live(slug, user_id)
+    }
+
     /// The highest `account.removed` of `slug` with `user_id`, read from the journal now,
     /// without the cache.
     pub fn removal_now(&self, slug: &str, user_id: u64) -> Result<Option<u64>> {

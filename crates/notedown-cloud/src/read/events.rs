@@ -127,7 +127,41 @@ pub fn events(
     page(root, slug, from, limit, floor, until, &Probe::new(true))
 }
 
-/// The work of [`events`], with the walker's test seam.
+/// An events page of a live account's token, see [`events_of`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnPage {
+    pub page: EventPage,
+    /// The page read an `account.removed` of the slug with the caller's user id. Its account
+    /// is either gone (or about to go) or a crash left the record behind; only the caller can
+    /// tell, under the store lock.
+    pub own_removal: bool,
+}
+
+/// [`events`] for the caller `user_id` of `slug`, which also tells whether the page read an
+/// `account.removed` of the slug with that user id. Such a line is never an event of a live
+/// account's page (`until` is `None`), so without this flag the caller could not tell.
+pub fn events_of(
+    root: &Path,
+    slug: &str,
+    user_id: u64,
+    from: u64,
+    limit: usize,
+    floor: u64,
+    until: Option<u64>,
+) -> Result<OwnPage> {
+    read(
+        root,
+        slug,
+        Some(user_id),
+        from,
+        limit,
+        floor,
+        until,
+        &Probe::new(true),
+    )
+}
+
+/// [`events`] with the walker's test seam.
 fn page(
     root: &Path,
     slug: &str,
@@ -137,6 +171,21 @@ fn page(
     until: Option<u64>,
     probe: &Probe,
 ) -> Result<EventPage> {
+    Ok(read(root, slug, None, from, limit, floor, until, probe)?.page)
+}
+
+/// The work of [`events`] and [`events_of`]: `own_removal` is only looked for with a `user_id`.
+#[allow(clippy::too_many_arguments)]
+fn read(
+    root: &Path,
+    slug: &str,
+    user_id: Option<u64>,
+    from: u64,
+    limit: usize,
+    floor: u64,
+    until: Option<u64>,
+    probe: &Probe,
+) -> Result<OwnPage> {
     let limit = limit.max(1);
     let below_floor = floor > 0 && from <= floor;
     // Nothing at or below the floor is shown: start right after it.
@@ -145,6 +194,7 @@ fn page(
     let mut gap = below_floor;
     // A line without a `seq` that would be a gap once a real `seq` follows it.
     let mut pending = false;
+    let mut own_removal = false;
     let walked = walk(
         root,
         start,
@@ -157,6 +207,12 @@ fn page(
             }
             if line.seq.is_some() && pending {
                 gap = true;
+            }
+            if let Some(e) = &line.event
+                && e.account == slug
+                && matches!(e.body, EventBody::AccountRemoved { user_id: u } if Some(u) == user_id)
+            {
+                own_removal = true;
             }
             match visit(line, slug, until) {
                 Seen::Skip => {}
@@ -179,12 +235,15 @@ fn page(
     if walked.broken || from > walked.end.saturating_add(1) {
         gap = true;
     }
-    Ok(EventPage {
-        events,
-        next: walked.next,
-        end: walked.end,
-        more: walked.more,
-        gap,
+    Ok(OwnPage {
+        page: EventPage {
+            events,
+            next: walked.next,
+            end: walked.end,
+            more: walked.more,
+            gap,
+        },
+        own_removal,
     })
 }
 
@@ -857,5 +916,35 @@ mod tests {
         assert!(c.gap);
         // The public poll takes the fast path.
         assert_eq!(all(dir.path(), 50_001), a);
+    }
+
+    #[test]
+    fn a_page_tells_when_it_read_the_callers_own_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            &[
+                created(1, "a", "/x"),
+                removed(2, "a", 7),
+                removed(3, "b", 8),
+                created(4, "a", "/y"),
+            ],
+        );
+        let own = |user_id, from| {
+            events_of(dir.path(), "a", user_id, from, 1000, 0, None)
+                .unwrap()
+                .own_removal
+        };
+        assert!(own(7, 0));
+        assert!(own(7, 2));
+        // Past it, or another user id, or another slug's removal: no.
+        assert!(!own(7, 3));
+        assert!(!own(8, 0));
+        // The flag never changes the page.
+        let page = events_of(dir.path(), "a", 7, 0, 1000, 0, None)
+            .unwrap()
+            .page;
+        assert_eq!(page, all(dir.path(), 0));
+        assert_eq!(seqs(&page), vec![1, 4]);
     }
 }

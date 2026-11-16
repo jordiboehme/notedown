@@ -450,6 +450,11 @@ enum Followed {
 /// answered as a removed account's token: up to its removal, or refused when there is none.
 /// This is sound because the removal record is appended before the account folder goes, so a
 /// line of a later account can only exist once the caller's account is gone.
+///
+/// A page that read the caller's own `account.removed` asks under the store lock: the record
+/// may be of a removal that is still running (the folder goes later, under the same lock), and
+/// a live answer then would move the caller past its removal without it. Still live after the
+/// lock means a crash left the record, and the page stays as it is.
 fn follow(
     state: &AppState,
     slug: &str,
@@ -459,8 +464,17 @@ fn follow(
     limit: usize,
 ) -> crate::Result<Followed> {
     let floor = state.rest_tokens.floor(slug, user_id, until)?;
-    let page = read::events(&state.data_dir, slug, from, limit, floor, until)?;
-    if until.is_some() || state.rest_tokens.is_live(slug, user_id)? {
+    let read::OwnPage { page, own_removal } =
+        read::events_of(&state.data_dir, slug, user_id, from, limit, floor, until)?;
+    if until.is_some() {
+        return Ok(Followed::Page(page));
+    }
+    let live = if own_removal {
+        state.rest_tokens.is_live_settled(slug, user_id)?
+    } else {
+        state.rest_tokens.is_live(slug, user_id)?
+    };
+    if live {
         return Ok(Followed::Page(page));
     }
     let Some(until) = state.rest_tokens.removal_now(slug, user_id)? else {
@@ -654,6 +668,73 @@ mod tests {
             follow(&state, "jordi", 999, None, 0, 1_000).unwrap(),
             Followed::Refused
         ));
+    }
+
+    #[test]
+    fn a_live_poll_between_the_removal_record_and_the_removal_ends_with_the_removal() {
+        use crate::journal::{Event, EventBody, Origin, new_op_id};
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState::open(crate::Config::default(), dir.path()).unwrap());
+        let accounts = state.auth.accounts();
+        let old = accounts
+            .create("jordi", "j@example.org", "a password")
+            .unwrap();
+        created(&state, "NOTE/Note/a.txt");
+        // A second thread does what `Accounts::remove` does: it holds the store lock from the
+        // record to the rename of the folder. The poll runs between the two.
+        let (recorded, wait) = std::sync::mpsc::channel();
+        let remover = {
+            let state = state.clone();
+            let account_dir = accounts.account_dir("jordi");
+            let user_id = old.user_id;
+            std::thread::spawn(move || {
+                let store = crate::store::take_store_lock(&account_dir, None).unwrap();
+                let mut record = [Event::new(
+                    "jordi",
+                    Origin::Cli,
+                    None,
+                    &new_op_id(),
+                    EventBody::AccountRemoved { user_id },
+                )];
+                state.journal.append(&mut record).unwrap();
+                recorded.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let tomb = account_dir.with_file_name(".removed-jordi-test");
+                std::fs::rename(&account_dir, &tomb).unwrap();
+                drop(store);
+                std::fs::remove_dir_all(&tomb).unwrap();
+            })
+        };
+        wait.recv().unwrap();
+        let Followed::Page(first) = follow(&state, "jordi", old.user_id, None, 0, 1_000).unwrap()
+        else {
+            panic!("refused");
+        };
+        remover.join().unwrap();
+        let mut events = first.events.clone();
+        let mut gap = first.gap;
+        if events.last().is_none_or(|e| e.r#type != "account.removed") {
+            // The next poll comes with a removed account's token.
+            let until = state
+                .rest_tokens
+                .removal_now("jordi", old.user_id)
+                .unwrap()
+                .unwrap();
+            let Followed::Page(second) =
+                follow(&state, "jordi", old.user_id, Some(until), first.next, 1_000).unwrap()
+            else {
+                panic!("refused");
+            };
+            events.extend(second.events);
+            gap |= second.gap;
+        }
+        let removed = events.iter().any(|e| e.r#type == "account.removed");
+        assert!(removed || gap, "{first:?} {events:?}");
+        assert_eq!(
+            events.last().unwrap().r#type,
+            "account.removed",
+            "{events:?}"
+        );
     }
 
     #[test]

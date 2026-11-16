@@ -1,11 +1,12 @@
-//! The commands the webview calls for the config.
+//! The commands the webview calls for the config and the children.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tauri::State;
 
 use crate::config::{self, AppConfig, Mode, StartView};
+use crate::processes::{ProcessStates, Processes};
 
 /// The live config and the folder it is saved in.
 pub struct ConfigState {
@@ -17,6 +18,14 @@ impl ConfigState {
     pub fn load(dir: PathBuf) -> Self {
         let config = Mutex::new(config::load(&dir));
         Self { dir, config }
+    }
+
+    /// The config as it is now.
+    pub fn current(&self) -> AppConfig {
+        self.config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Changes the config and saves it; the change stays in memory only when the save worked.
@@ -74,6 +83,40 @@ pub fn set_start_view(
     start_view: StartView,
 ) -> Result<AppConfig, String> {
     state.set_start_view(start_view)
+}
+
+/// Starts both children afresh as the config asks (Start on the Server page). Off the main
+/// thread: a start first stops what runs, which can take the grace.
+#[tauri::command]
+pub async fn start_processes(
+    config: State<'_, ConfigState>,
+    processes: State<'_, Arc<Processes>>,
+) -> Result<ProcessStates, String> {
+    let config = config.current();
+    let processes = processes.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        processes.start_all(&config);
+        processes.states()
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Stops both children (Stop on the Server page), off the main thread.
+#[tauri::command]
+pub async fn stop_processes(processes: State<'_, Arc<Processes>>) -> Result<ProcessStates, String> {
+    let processes = processes.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        processes.stop_all();
+        processes.states()
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn process_states(processes: State<'_, Arc<Processes>>) -> ProcessStates {
+    processes.states()
 }
 
 #[cfg(test)]

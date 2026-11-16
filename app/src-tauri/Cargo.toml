@@ -27,6 +27,8 @@ serde_json = "=1.0.154"
 keyring = { version = "=3.6.3", default-features = false, features = ["apple-native"] }
 # Signals to process groups (killpg) for the supervised children.
 libc = "=0.2.191"
+# Reads the `listen` port from the server's `server.toml`.
+toml = "=1.2.1"
 
 [dev-dependencies]
 tempfile = "=3.27.0"

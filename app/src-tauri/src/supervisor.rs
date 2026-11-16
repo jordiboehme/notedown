@@ -9,6 +9,7 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -17,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use crate::pidfile::{self, PidFile};
 use crate::process::{self, ChildKind, Launch, SpawnFn};
 
 /// Milliseconds since the Unix epoch. Injected, so tests move time by hand.
@@ -91,6 +93,7 @@ pub fn backoff_ms(attempt: u32) -> u64 {
 }
 
 type Listener = Box<dyn Fn(&ChildState) + Send + Sync>;
+type LineListener = Box<dyn Fn(&str) + Send + Sync>;
 
 /// Runs one child. Dropping it stops the child.
 pub struct ProcessSupervisor {
@@ -111,7 +114,11 @@ struct Inner {
     current: Mutex<ChildState>,
     changed: Condvar,
     listeners: Mutex<Vec<Listener>>,
+    /// Called with every stdout line, on the reader thread.
+    line_listeners: Arc<Mutex<Vec<LineListener>>>,
     log: Arc<Mutex<VecDeque<String>>>,
+    /// The pid file and the program it names, while a child runs.
+    pid_file: Mutex<Option<(PathBuf, PathBuf)>>,
 }
 
 struct Shared {
@@ -157,7 +164,9 @@ impl ProcessSupervisor {
                 current: Mutex::new(ChildState::Stopped),
                 changed: Condvar::new(),
                 listeners: Mutex::new(Vec::new()),
+                line_listeners: Arc::new(Mutex::new(Vec::new())),
                 log: Arc::new(Mutex::new(VecDeque::new())),
+                pid_file: Mutex::new(None),
             }),
         }
     }
@@ -184,6 +193,32 @@ impl ProcessSupervisor {
     pub fn stop(&self) {
         let _control = lock(&self.inner.control);
         self.inner.stop();
+    }
+
+    /// Stops the child and shows that another Notedown process does its job (`what`).
+    pub fn outside(&self, what: &str) {
+        let _control = lock(&self.inner.control);
+        self.inner.stop();
+        let mut s = lock(&self.inner.shared);
+        s.generation += 1;
+        self.inner.set(
+            s,
+            ChildState::Outside {
+                what: what.to_string(),
+            },
+        );
+    }
+
+    /// Keeps a pid file at `path` while a child runs; `exe` is the program it names.
+    pub fn keep_pid_file(&self, path: PathBuf, exe: PathBuf) {
+        *lock(&self.inner.pid_file) = Some((path, exe));
+    }
+
+    /// Calls `cb` with every stdout line of every run, in order. The same rules as for
+    /// [`on_change`](Self::on_change) hold, and `cb` runs on a reader thread, so it must be
+    /// quick.
+    pub fn on_line(&self, cb: impl Fn(&str) + Send + Sync + 'static) {
+        lock(&self.inner.line_listeners).push(Box::new(cb));
     }
 
     /// Stops the child and shows that the pipeline is not set up yet.
@@ -296,10 +331,38 @@ impl Inner {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
+        // Only the file of this supervisor's own child: a pid file of an earlier run of the
+        // app stays for the start to find.
+        if pgid.is_some() {
+            self.remove_pid_file();
+        }
         let mut s = lock(&self.shared);
         s.pgid = None;
         s.alive = false;
         self.set(s, ChildState::Stopped);
+    }
+
+    /// Writes the pid file of a child that just started. A failure only goes to the log: the
+    /// child runs all the same, only a crash of the app would leave it unknown.
+    fn write_pid_file(&self, pid: u32, started_ms: u64) {
+        let Some((path, exe)) = lock(&self.pid_file).clone() else {
+            return;
+        };
+        let pf = PidFile {
+            pid,
+            pgid: pid,
+            started_ms,
+            exe,
+        };
+        if let Err(e) = pidfile::write(&path, &pf) {
+            push_line(&self.log, format!("the pid file was not written: {e}"));
+        }
+    }
+
+    fn remove_pid_file(&self) {
+        if let Some((path, _)) = lock(&self.pid_file).as_ref() {
+            pidfile::remove(path);
+        }
     }
 
     /// The supervising thread of one generation: spawn, reap, back off, again.
@@ -376,6 +439,8 @@ impl Inner {
         let pid = child.id();
         s.pgid = Some(pid);
         s.alive = true;
+        // Before the state says Running, so whoever sees the pid finds its pid file too.
+        self.write_pid_file(pid, started);
         self.set(
             s,
             ChildState::Running {
@@ -387,10 +452,10 @@ impl Inner {
         let last = Arc::new(Mutex::new(None::<String>));
         let (eof_tx, eof_rx) = mpsc::channel::<()>();
         if let Some(out) = child.stdout.take() {
-            self.read_lines(out, None, None);
+            self.read_lines(out, None, None, Some(self.line_listeners.clone()));
         }
         if let Some(err) = child.stderr.take() {
-            self.read_lines(err, Some(last.clone()), Some(eof_tx));
+            self.read_lines(err, Some(last.clone()), Some(eof_tx), None);
         }
 
         let status = child.wait();
@@ -405,6 +470,7 @@ impl Inner {
 
         // What the child left in its group goes with it, so it holds no lock or port.
         let _ = process::signal_group(pid, libc::SIGKILL);
+        self.remove_pid_file();
         let _ = eof_rx.recv_timeout(DRAIN);
         let mut s = lock(&self.shared);
         if s.generation == generation {
@@ -424,12 +490,13 @@ impl Inner {
     }
 
     /// A thread that puts each line into the log; for stderr it keeps the last non-blank line
-    /// and drops `eof` at the end of the pipe.
+    /// and drops `eof` at the end of the pipe; for stdout it hands each line to `lines`.
     fn read_lines(
         &self,
         pipe: impl Read + Send + 'static,
         last: Option<Arc<Mutex<Option<String>>>>,
         eof: Option<mpsc::Sender<()>>,
+        lines: Option<Arc<Mutex<Vec<LineListener>>>>,
     ) {
         let log = self.log.clone();
         std::thread::spawn(move || {
@@ -449,6 +516,11 @@ impl Inner {
                     && !line.trim().is_empty()
                 {
                     *lock(last) = Some(line.clone());
+                }
+                if let Some(lines) = &lines {
+                    for cb in lock(lines).iter() {
+                        cb(&line);
+                    }
                 }
                 push_line(&log, line);
             }

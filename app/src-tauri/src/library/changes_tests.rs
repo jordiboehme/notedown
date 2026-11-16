@@ -3,7 +3,9 @@
 
 use serde_json::{Value, json};
 
-use super::listing_tests::{MD5_A, NOTE, Setup, entry, ev, events, file, folder, gap, setup, tree};
+use super::listing_tests::{
+    MD5_A, NOTE, Setup, entry, ev, events, file, folder, gap, setup, setup_hooked, tree,
+};
 use super::*;
 use crate::rest::test_http::{answer, answer_with};
 
@@ -220,7 +222,7 @@ fn each_error_code_has_its_text() {
         error("423 Locked", json!({"error": "scan_hold"})),
         error("423 Locked", json!({"error": "not_imported"})),
         // A new folder that is there already.
-        ok(json!({"id": 7, "path": "NOTE/Note/projects", "seqs": []})),
+        ok(json!({"id": 7, "path": "NOTE/Note/Projects", "seqs": []})),
         // A Supernote that syncs: waited for by Retry-After, up to two minutes.
         syncing("60"),
         syncing("60"),
@@ -230,6 +232,9 @@ fn each_error_code_has_its_text() {
         created(json!({"id": 7, "path": "NOTE/Note/projects", "seqs": [30]})),
         // A delete of something that is gone.
         error("404 Not Found", json!({"error": "not_found"})),
+        // A move to the top level.
+        entry(&file(5, "NOTE/Note/b.note", MD5_A)),
+        error("403 Forbidden", json!({"error": "not_writable"})),
     ]);
     take(&s);
     for text in [
@@ -240,7 +245,7 @@ fn each_error_code_has_its_text() {
         "The account is full.",
         "The server is reading the files of the Supernote. Try again in a moment.",
         "The Supernote has not been imported yet.",
-        "There is already projects here.",
+        "There is already Projects here.",
     ] {
         failed(&s.library.new_folder(NOTE, "projects"), text);
     }
@@ -259,7 +264,6 @@ fn each_error_code_has_its_text() {
             JobState::Running,
             JobState::Waiting,
             JobState::Running,
-            JobState::Waiting,
             JobState::Failed,
         ]
     );
@@ -300,6 +304,68 @@ fn each_error_code_has_its_text() {
         }
     }
     assert!(s.server.received().is_empty());
+
+    // Labels without a name in them.
+    assert_eq!(s.library.new_folder(NOTE, "").label, "New folder");
+    assert_eq!(s.library.rename(5, "").label, "Rename");
+    let job = s.library.move_to(5, "");
+    failed(&job, "This folder cannot be changed.");
+    assert_eq!(job.label, "Move b.note to the top level");
+}
+
+#[test]
+fn a_new_binding_ends_a_waiting_change() {
+    let s = setup_hooked(vec![syncing("5")], |n, _, library| {
+        if n == 0 {
+            library.relogin();
+        }
+    });
+    take(&s);
+    let start = (s.time.clock())();
+    let job = s.library.new_folder(NOTE, "projects");
+    assert_eq!(job.state, JobState::Cancelled);
+    assert_eq!(job.text, None);
+    assert_eq!(
+        states(&jobs(&s)),
+        [JobState::Running, JobState::Waiting, JobState::Cancelled]
+    );
+    assert_eq!(s.server.received().len(), 1);
+    // The wait ended at once, not after Retry-After.
+    assert!((s.time.clock())() - start < 5_000);
+}
+
+#[test]
+fn a_write_answered_after_a_new_binding_is_not_the_apps_own() {
+    let s = setup_hooked(
+        vec![created(
+            json!({"id": 7, "path": "NOTE/Note/projects", "seqs": [20]}),
+        )],
+        |n, _, library| {
+            if n == 0 {
+                library.relogin();
+            }
+        },
+    );
+    let job = s.library.new_folder(NOTE, "projects");
+    assert_eq!(job.state, JobState::Done);
+    assert!(lock(&s.library.inner.follow).own.is_empty());
+}
+
+#[test]
+fn a_show_after_a_minute_lists_the_bin_again() {
+    let s = setup(vec![
+        tree(10, &[file(5, "NOTE/Note/a.note", MD5_A)], None),
+        events(&[], 11),
+        tree(20, &[file(5, "NOTE/Note/a.note", MD5_A)], None),
+    ]);
+    s.list(NOTE, None);
+    s.follow();
+    take(&s);
+    s.library.set_visible(false);
+    s.time.pass(61_000);
+    s.follow();
+    assert_eq!(recycles(&s), 1);
+    assert_eq!(s.targets().last().unwrap(), "/tree?path=NOTE%2FNote");
 }
 
 #[test]
@@ -308,6 +374,10 @@ fn restore_into_a_taken_path_asks_for_a_name() {
         error(
             "409 Conflict",
             json!({"error": "name_taken", "existing": "B.note"}),
+        ),
+        error(
+            "409 Conflict",
+            json!({"error": "name_taken", "existing": "c.note"}),
         ),
         ok(json!({"id": 52, "path": "NOTE/Note/b 2.note", "kind": "file", "seqs": [30]})),
         error(
@@ -346,6 +416,33 @@ fn restore_into_a_taken_path_asks_for_a_name() {
     let sent = take(&s);
     assert!(!sent.contains(&LibraryEvent::Recycle));
     assert_eq!(sent.last(), Some(&LibraryEvent::Job { job: asked.clone() }));
+
+    // A name that is not allowed: the job asks again, with the same clash.
+    let again = s.library.restore(KEY, Some("NOTE/Note/.b.note"));
+    assert_eq!(
+        again,
+        Job {
+            text: Some("This name is not allowed.".into()),
+            ..asked.clone()
+        }
+    );
+    assert!(s.server.received().is_empty());
+
+    // A name that is taken too: the job asks again for it.
+    let again = s.library.restore(KEY, Some("NOTE/Note/c.note"));
+    assert_eq!((again.id, again.state), (1, JobState::Asking));
+    assert_eq!(
+        again.question,
+        Some(Clash {
+            name: "c.note".into(),
+            existing: "c.note".into(),
+            can_replace: false,
+        })
+    );
+    assert_eq!(
+        json_body(&request(&s).2),
+        json!({"key": KEY, "path": "NOTE/Note/c.note"})
+    );
 
     // The window asks for a name and sends the path: the same job goes on.
     let job = s.library.restore(KEY, Some("NOTE/Note/b 2.note"));

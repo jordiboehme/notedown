@@ -13,9 +13,14 @@
 //!
 //! A restore into a taken path ends its job as `asking`, with the name in the way. The window
 //! asks for another name and calls the restore again with `path`; that call goes on with the
-//! same job. A new binding cancels a job that still asks.
+//! same job, also when the new name is not allowed or taken too (it asks again). A new binding
+//! cancels a job that still asks.
+//!
+//! While a Supernote syncs a write waits by `Retry-After`, up to two minutes in all, in steps of
+//! at most a quarter second: a new binding ends the wait (the job is cancelled) within a step.
 
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
@@ -23,10 +28,16 @@ use unicode_normalization::UnicodeNormalization;
 
 use super::cache::{name_of, parent_of};
 use super::{Clash, Entry, Job, JobKind, JobState, Library, LibraryEvent, Session, lock};
-use crate::rest::{Rest, RestError};
+use crate::rest::{Rest, RestError, SYNC_WAIT};
 
 /// The text of a change job while a Supernote syncs; it goes on when the sync ends.
 pub const WAITING: &str = "The Supernote is syncing. Notedown waits.";
+/// The longest single sleep of a wait: a new binding ends a wait within it.
+pub const WAIT_STEP: Duration = Duration::from_millis(250);
+
+fn as_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
 
 /// The parts of a write answer the app uses (`POST /folders`, `POST /move`, `DELETE
 /// /entries/{id}`, `POST /recycle/restore`).
@@ -186,6 +197,13 @@ impl Library {
         job
     }
 
+    /// The write's `seqs` are the app's own, unless the library bound again meanwhile.
+    fn wrote_for(&self, session: &Session, seqs: &[u64]) {
+        if !session.is_cancelled() {
+            self.wrote(seqs);
+        }
+    }
+
     fn change_session(&self) -> Result<Session, Stop> {
         let session = self.session().map_err(|e| Stop::Failed(e.to_string()))?;
         if session.is_cancelled() {
@@ -208,37 +226,55 @@ impl Library {
     }
 
     /// One write. While a Supernote syncs (423 `device_syncing`) the job waits by
-    /// `Retry-After` and tries again, up to two minutes; a new binding ends the wait.
+    /// `Retry-After` (at least a second) and tries again, up to two minutes in all. The wait is
+    /// slept in short steps, so a new binding ends it within [`WAIT_STEP`].
     fn write<T>(
         &self,
         run: &mut Run<'_>,
         session: &Session,
         call: impl Fn(&Rest) -> Result<T, RestError>,
     ) -> Result<T, Stop> {
-        let mut cancelled = false;
-        let result = session.rest().wait_while_syncing(|| {
+        let clock = &self.inner.clock;
+        let start = clock();
+        loop {
             if session.is_cancelled() {
-                cancelled = true;
-                return Err(RestError::Failed(String::new()));
+                return Err(Stop::Cancelled);
             }
             run.set(JobState::Running, None);
             let result = call(session.rest());
-            if matches!(result, Err(RestError::Syncing { .. })) {
-                run.set(JobState::Waiting, Some(WAITING));
+            let Err(RestError::Syncing { retry_after }) = result else {
+                self.settle(session, &result);
+                return result.map_err(Stop::Rest);
+            };
+            let waited = Duration::from_millis(clock().saturating_sub(start));
+            let left = SYNC_WAIT.saturating_sub(waited);
+            if left.is_zero() {
+                return Err(Stop::Rest(RestError::Syncing { retry_after }));
             }
-            result
-        });
-        if cancelled {
-            return Err(Stop::Cancelled);
+            run.set(JobState::Waiting, Some(WAITING));
+            let until =
+                clock().saturating_add(as_ms(retry_after.max(Duration::from_secs(1)).min(left)));
+            loop {
+                if session.is_cancelled() {
+                    return Err(Stop::Cancelled);
+                }
+                let now = clock();
+                if now >= until {
+                    break;
+                }
+                (self.inner.sleeper)(Duration::from_millis(until - now).min(WAIT_STEP));
+            }
         }
-        self.settle(session, &result);
-        result.map_err(Stop::Rest)
     }
 
     /// Makes the folder `name` in `parent`. A folder that is there already is a clash.
     /// Blocking: run it off the main thread.
     pub fn new_folder(&self, parent: &str, name: &str) -> Job {
-        let job = self.new_job(format!("New folder {}", name.nfc()));
+        let job = self.new_job(if name.is_empty() {
+            "New folder".to_owned()
+        } else {
+            format!("New folder {}", name.nfc())
+        });
         self.run_change(job, |run| {
             let name = typed_name(name)?;
             let session = self.change_session()?;
@@ -247,9 +283,11 @@ impl Library {
                 rest.post_json_once("/folders", &FolderBody { path: &path })
             })?;
             if made.seqs.is_empty() {
-                return Err(Stop::Rest(RestError::NameTaken { existing: name }));
+                // The folder that is there, in its own spelling.
+                let existing = name_of(&made.path).to_owned();
+                return Err(Stop::Rest(RestError::NameTaken { existing }));
             }
-            self.wrote(&made.seqs);
+            self.wrote_for(&session, &made.seqs);
             Ok(Ended {
                 result: Some(made.path),
                 recycle: false,
@@ -259,7 +297,11 @@ impl Library {
 
     /// Renames the file or folder `id` to `name` in its folder. Blocking.
     pub fn rename(&self, id: u64, name: &str) -> Job {
-        let job = self.new_job(format!("Rename to {}", name.nfc()));
+        let job = self.new_job(if name.is_empty() {
+            "Rename".to_owned()
+        } else {
+            format!("Rename to {}", name.nfc())
+        });
         self.run_change(job, |run| {
             let name = typed_name(name)?;
             let session = self.change_session()?;
@@ -273,7 +315,7 @@ impl Library {
     /// Moves the file or folder `id` into the folder `to_folder`, under its name. Blocking.
     pub fn move_to(&self, id: u64, to_folder: &str) -> Job {
         let folder = match name_of(to_folder) {
-            "" => to_folder,
+            "" => "the top level",
             name => name,
         };
         let job = self.new_job(format!("Move to {folder}"));
@@ -296,7 +338,7 @@ impl Library {
         let moved: Written = self.write(run, session, |rest| {
             rest.post_json_once("/move", &MoveBody { id, to })
         })?;
-        self.wrote(&moved.seqs);
+        self.wrote_for(session, &moved.seqs);
         Ok(Ended {
             result: Some(moved.path),
             recycle: false,
@@ -313,7 +355,7 @@ impl Library {
             let deleted: Written = self.write(run, &session, |rest| {
                 rest.delete_json_once(&format!("/entries/{id}"))
             })?;
-            self.wrote(&deleted.seqs);
+            self.wrote_for(&session, &deleted.seqs);
             Ok(Ended {
                 result: None,
                 recycle: true,
@@ -330,16 +372,26 @@ impl Library {
             Some(job) => job,
             None => self.new_job(format!("Restore {}", name_of(old_path))),
         };
+        // The question of a restore that goes on: a name that is not allowed asks it again.
+        let asked = job.question.clone();
         let mut session_of_job = None;
         let job = self.run_change(job, |run| {
+            let ask_again = |stop: Stop| match (stop, &asked) {
+                (Stop::Rest(e @ RestError::BadName), Some(clash)) => {
+                    Stop::Asking(clash.clone(), e.to_string())
+                }
+                (stop, _) => stop,
+            };
+            // The session first: an answer to a question belongs to the binding that asked.
+            let session = self.change_session()?;
+            session_of_job = Some(session.clone());
             let target = match path {
                 Some(path) => {
                     let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
-                    join(parent, &typed_name(name)?)
+                    join(parent, &typed_name(name).map_err(ask_again)?)
                 }
                 None => old_path.to_owned(),
             };
-            let session = self.change_session()?;
             let body = RestoreBody {
                 key,
                 path: path.map(|_| target.as_str()),
@@ -347,10 +399,9 @@ impl Library {
             let restored = self.write(run, &session, |rest| {
                 rest.post_json_once::<_, Written>("/recycle/restore", &body)
             });
-            session_of_job = Some(session.clone());
             match restored {
                 Ok(restored) => {
-                    self.wrote(&restored.seqs);
+                    self.wrote_for(&session, &restored.seqs);
                     Ok(Ended {
                         result: Some(restored.path),
                         recycle: true,
@@ -365,7 +416,7 @@ impl Library {
                     let text = RestError::NameTaken { existing }.to_string();
                     Err(Stop::Asking(clash, text))
                 }
-                Err(e) => Err(e),
+                Err(e) => Err(ask_again(e)),
             }
         });
         if job.state != JobState::Asking {

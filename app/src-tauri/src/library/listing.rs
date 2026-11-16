@@ -309,6 +309,10 @@ impl Library {
             let keys = self.with_cache(|c, _| c.relist_keys(generation));
             self.relist(&session, keys, false, now);
             self.polled(now);
+            // Deletes of the pause are not read, so the bin may have changed; the own seqs of
+            // the pause are not read either.
+            lock(&self.inner.follow).own.clear();
+            (self.inner.emit)(LibraryEvent::Recycle);
             return;
         }
         loop {

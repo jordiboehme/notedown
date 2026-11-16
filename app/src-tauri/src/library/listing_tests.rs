@@ -45,7 +45,7 @@ pub(super) fn setup(answers: Vec<String>) -> Setup {
 
 /// [`setup`], and `hook` runs with the number of each request and the library before the
 /// server answers it: a test changes the binding while a call waits.
-fn setup_hooked(
+pub(super) fn setup_hooked(
     answers: Vec<String>,
     mut hook: impl FnMut(usize, &crate::rest::test_http::Request, &Library) + Send + 'static,
 ) -> Setup {

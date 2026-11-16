@@ -389,7 +389,9 @@ fn below(path: &str, folder: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Applies one event with the documented rules.
+/// Applies one event with the documented rules. An id the view does not hold in
+/// `file.modified`, `file.moved` or as a copy source panics on purpose: in this fixed scenario
+/// every such id was listed first, so an unknown one is a bug (an app asks `GET /entries/{id}`).
 fn apply(view: &mut BTreeMap<u64, Kept>, e: &Value) {
     let id = e["id"].as_u64();
     let path = e["path"].as_str().map(str::to_string);
@@ -527,4 +529,50 @@ fn quiet_event_polls_are_not_logged() {
     // A bad request is logged.
     assert_eq!(s.get(Some(&token), "/events?from=x").0, 400);
     assert_eq!(s.log_lines().len(), before + 1);
+}
+
+/// Copies the folder `from` with everything in it to `to`.
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let target = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &target);
+        } else {
+            std::fs::copy(e.path(), target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn an_account_back_from_a_backup_sees_nothing_of_a_later_one() {
+    let s = start();
+    let token = s.token();
+    s.put("a.note", b"a");
+    // The first poll of the live account.
+    assert_eq!(page(&s, &token, 0)["gap"], false);
+    let dir = s.data.join("accounts/jordi");
+    let backup = s.data.parent().unwrap().join("backup");
+    copy_dir(&dir, &backup);
+    let (first, _) = remove_and_create(&s);
+    let b = s.put("b.note", b"b");
+    let accounts = s.state.auth.accounts();
+    let second = accounts.get("jordi").unwrap().unwrap().user_id;
+    accounts.remove("jordi", &s.state.journal).unwrap();
+    // The first account comes back from its backup, with its token.
+    copy_dir(&backup, &dir);
+    assert_eq!(
+        accounts.get("jordi").unwrap().unwrap().user_id,
+        first,
+        "restored"
+    );
+    let r2 = removal_of(&s, second);
+    let (events, last) = follow(&s, &token, 0);
+    assert!(at(&events, &b).is_empty(), "{events:?}");
+    assert!(
+        events.iter().all(|e| e["seq"].as_u64().unwrap() > r2),
+        "{events:?}"
+    );
+    assert_eq!(last["gap"], true);
 }

@@ -406,9 +406,10 @@ async fn journal(State(state): State<Arc<AppState>>, headers: HeaderMap, uri: Ur
 /// caller's account from `from` (default 0), at most `limit` (default and maximum
 /// [`EVENTS_LIMIT`], 0 is 1). Events of an earlier account with the same slug are at or below
 /// the caller's floor ([`crate::auth::RestTokens::floor`]) and never returned. A removed
-/// account's token reads up to its removal, which is its last event.
+/// account's token reads up to its removal, which is its last event; so does a live token whose
+/// account is removed while it polls ([`follow`]).
 async fn events(State(state): State<Arc<AppState>>, headers: HeaderMap, uri: Uri) -> Response {
-    let (caller, _) = match caller(&state, &headers).await {
+    let (caller, id) = match caller(&state, &headers).await {
         Ok(c) => c,
         Err(r) => return *r,
     };
@@ -427,15 +428,47 @@ async fn events(State(state): State<Arc<AppState>>, headers: HeaderMap, uri: Uri
         Caller::Removed { slug, user_id, seq } => (slug, user_id, Some(seq)),
     };
     let st = state.clone();
-    match blocking(move || {
-        let floor = st.rest_tokens.floor(&slug, user_id, until)?;
-        read::events(&st.data_dir, &slug, from, limit, floor, until)
-    })
-    .await
-    {
-        Ok(page) => Json(page).into_response(),
+    match blocking(move || follow(&st, &slug, user_id, until, from, limit)).await {
+        Ok(Followed::Page(page)) => Json(page).into_response(),
+        Ok(Followed::Refused) => refused(id),
         Err(r) => *r,
     }
+}
+
+/// What a poll of `/events` gives.
+#[derive(Debug)]
+enum Followed {
+    Page(read::EventPage),
+    Refused,
+}
+
+/// The events page of the caller `user_id` of `slug`, `until` its removal for a removed
+/// account's token.
+///
+/// A live caller was checked before the read. When its account is gone after the read, the
+/// page may hold events of a new account with the same slug, so it is dropped and the caller is
+/// answered as a removed account's token: up to its removal, or refused when there is none.
+/// This is sound because the removal record is appended before the account folder goes, so a
+/// line of a later account can only exist once the caller's account is gone.
+fn follow(
+    state: &AppState,
+    slug: &str,
+    user_id: u64,
+    until: Option<u64>,
+    from: u64,
+    limit: usize,
+) -> crate::Result<Followed> {
+    let floor = state.rest_tokens.floor(slug, user_id, until)?;
+    let page = read::events(&state.data_dir, slug, from, limit, floor, until)?;
+    if until.is_some() || state.rest_tokens.is_live(slug, user_id)? {
+        return Ok(Followed::Page(page));
+    }
+    let Some(until) = state.rest_tokens.removal_now(slug, user_id)? else {
+        return Ok(Followed::Refused);
+    };
+    let floor = state.rest_tokens.floor(slug, user_id, Some(until))?;
+    let page = read::events(&state.data_dir, slug, from, limit, floor, Some(until))?;
+    Ok(Followed::Page(page))
 }
 
 #[derive(Deserialize)]
@@ -567,6 +600,60 @@ mod tests {
         assert_eq!(bearer(&h), None);
         h.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer "));
         assert_eq!(bearer(&h), None);
+    }
+
+    /// Appends a `file.created` of `path` for the account `jordi`.
+    fn created(state: &AppState, path: &str) {
+        use crate::journal::{Event, EventBody, FileKind, Origin, new_op_id};
+        let mut e = [Event::new(
+            "jordi",
+            Origin::Cli,
+            None,
+            &new_op_id(),
+            EventBody::FileCreated {
+                id: 7,
+                path: path.to_string(),
+                kind: FileKind::Document,
+                md5: "0".repeat(32),
+                size: 1,
+                pages_changed: None,
+            },
+        )];
+        state.journal.append(&mut e).unwrap();
+    }
+
+    #[test]
+    fn a_live_caller_removed_during_the_poll_gets_only_its_own_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::open(crate::Config::default(), dir.path()).unwrap();
+        let accounts = state.auth.accounts();
+        let old = accounts
+            .create("jordi", "j@example.org", "a password")
+            .unwrap();
+        created(&state, "NOTE/Note/a.txt");
+        // The token check found the old account live; then it was removed and the slug made
+        // again and written to before the read.
+        accounts.remove("jordi", &state.journal).unwrap();
+        accounts
+            .create("jordi", "j@example.org", "a password")
+            .unwrap();
+        created(&state, "NOTE/Note/b.txt");
+        let Followed::Page(page) = follow(&state, "jordi", old.user_id, None, 0, 1_000).unwrap()
+        else {
+            panic!("refused");
+        };
+        let paths: Vec<_> = page.events.iter().filter_map(|e| e.path.clone()).collect();
+        assert_eq!(paths, ["NOTE/Note/a.txt"], "{page:?}");
+        let last = page.events.last().unwrap();
+        assert_eq!(last.r#type, "account.removed");
+        assert_eq!(last.user_id, Some(old.user_id));
+        assert_eq!(page.next, last.seq + 1);
+        assert!(!page.more);
+        // A user id that is neither live nor removed is refused.
+        assert!(matches!(
+            follow(&state, "jordi", 999, None, 0, 1_000).unwrap(),
+            Followed::Refused
+        ));
     }
 
     #[test]

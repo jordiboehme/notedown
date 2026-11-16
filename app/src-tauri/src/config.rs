@@ -35,6 +35,7 @@ pub enum StartView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AppConfig {
+    /// The file format, 1 for now. Nothing checks it yet; a later format change will.
     pub version: u32,
     pub mode: Mode,
     pub data_dir: PathBuf,
@@ -83,37 +84,82 @@ pub fn existing_setup(dir: &Path) -> ExistingSetup {
     }
 }
 
-/// Reads `<dir>/config.json`. A missing file gives the defaults. An unreadable one is renamed to
-/// `config.json.broken` (so it can be looked at) and the defaults are returned.
+/// What `load_checked` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Loaded {
+    pub config: AppConfig,
+    /// The file was unreadable as a config and was kept aside as `config.json.broken`.
+    pub reset: bool,
+}
+
 pub fn load(dir: &Path) -> AppConfig {
+    load_checked(dir).config
+}
+
+/// Reads `<dir>/config.json`. A missing file gives the defaults. A file that is not valid UTF-8
+/// or not a valid config is renamed to `config.json.broken` (an older one is replaced, so the
+/// newest wins), a line goes to stderr, and `reset` is set. Any other read error (permissions, a
+/// failing disk) gives the defaults and leaves the file alone.
+pub fn load_checked(dir: &Path) -> Loaded {
     let path = dir.join(FILE);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return AppConfig::default(),
-        Err(_) => return keep_aside(dir),
+    let parsed = match fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|e| e.to_string()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return not_reset(),
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => Err(e.to_string()),
+        Err(e) => {
+            eprintln!(
+                "notedown: the config {} could not be read, using defaults: {e}",
+                path.display()
+            );
+            return not_reset();
+        }
     };
-    match serde_json::from_str(&text) {
-        Ok(config) => config,
-        Err(_) => keep_aside(dir),
+    match parsed {
+        Ok(config) => Loaded {
+            config,
+            reset: false,
+        },
+        Err(why) => {
+            // Best effort: if the rename fails, the next save replaces the file anyway.
+            let _ = fs::rename(&path, dir.join(BROKEN));
+            eprintln!(
+                "notedown: the config {} is broken ({why}); kept as {BROKEN}, using defaults",
+                path.display()
+            );
+            Loaded {
+                config: AppConfig::default(),
+                reset: true,
+            }
+        }
     }
 }
 
-fn keep_aside(dir: &Path) -> AppConfig {
-    // Best effort: if the rename fails, the next save overwrites the file anyway.
-    let _ = fs::rename(dir.join(FILE), dir.join(BROKEN));
-    AppConfig::default()
+fn not_reset() -> Loaded {
+    Loaded {
+        config: AppConfig::default(),
+        reset: false,
+    }
 }
 
-/// Writes `<dir>/config.json` through a temp file and a rename, so a crash never leaves half a
-/// file.
+/// Writes `<dir>/config.json` durably: the new content goes to a temp file that is flushed to
+/// disk (`sync_all`, a full fsync on macOS), then renamed over the old file, then the folder is
+/// flushed too. A crash leaves the old file or the new one, never half of one.
 pub fn save(dir: &Path, config: &AppConfig) -> io::Result<()> {
+    use std::io::Write;
     fs::create_dir_all(dir)?;
     let temp = dir.join(TEMP);
     let json = serde_json::to_string_pretty(config).map_err(io::Error::other)?;
-    fs::write(&temp, json)?;
-    fs::rename(&temp, dir.join(FILE)).inspect_err(|_| {
+    let written = (|| {
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temp, dir.join(FILE))
+    })();
+    if let Err(e) = written {
         let _ = fs::remove_file(&temp);
-    })
+        return Err(e);
+    }
+    fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(test)]
@@ -196,5 +242,62 @@ mod tests {
         fs::write(dir.path().join("pipeline.toml"), "").unwrap();
         let both = existing_setup(dir.path());
         assert!(both.server && both.pipeline);
+    }
+
+    #[test]
+    fn a_partial_config_loads_through_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), r#"{"mode":"local"}"#).unwrap();
+        let loaded = load_checked(dir.path());
+        assert!(!loaded.reset);
+        assert_eq!(loaded.config.mode, Mode::Local);
+        assert_eq!(loaded.config.start_view, StartView::Tree);
+        assert!(loaded.config.data_dir.ends_with("notedown-data"));
+    }
+
+    #[test]
+    fn the_default_folder_is_absolute_under_home() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let dir = default_data_dir();
+        assert!(dir.is_absolute());
+        assert!(dir.starts_with(&home));
+        assert_eq!(dir, home.join("notedown-data"));
+    }
+
+    #[test]
+    fn a_read_error_keeps_the_file_and_gives_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        // A folder where the file should be: reading fails, but not with NotFound.
+        fs::create_dir(dir.path().join("config.json")).unwrap();
+        let loaded = load_checked(dir.path());
+        assert!(!loaded.reset);
+        assert_eq!(loaded.config.mode, Mode::NotSet);
+        assert!(dir.path().join("config.json").is_dir());
+        assert!(!dir.path().join("config.json.broken").exists());
+    }
+
+    #[test]
+    fn invalid_utf8_is_kept_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), [0xff, 0xfe, 0x00]).unwrap();
+        let loaded = load_checked(dir.path());
+        assert!(loaded.reset);
+        assert!(dir.path().join("config.json.broken").is_file());
+    }
+
+    #[test]
+    fn the_newest_broken_file_wins_and_reset_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json.broken"), "older").unwrap();
+        fs::write(dir.path().join("config.json"), "newer {").unwrap();
+        let loaded = load_checked(dir.path());
+        assert!(loaded.reset);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("config.json.broken")).unwrap(),
+            "newer {"
+        );
+        // A healthy file reports no reset.
+        save(dir.path(), &sample()).unwrap();
+        assert!(!load_checked(dir.path()).reset);
     }
 }

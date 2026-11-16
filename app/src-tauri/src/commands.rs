@@ -95,4 +95,18 @@ mod tests {
         assert_eq!(reloaded.mode, Mode::Local);
         assert_eq!(reloaded.start_view, StartView::Columns);
     }
+
+    #[test]
+    fn set_mode_without_a_folder_keeps_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        state
+            .set_mode(Mode::Local, Some("/data/x".into()), None)
+            .unwrap();
+        let cfg = state
+            .set_mode(Mode::Remote, None, Some("https://n.example.org".into()))
+            .unwrap();
+        assert_eq!(cfg.data_dir, PathBuf::from("/data/x"));
+        assert_eq!(cfg.server_url.as_deref(), Some("https://n.example.org"));
+    }
 }

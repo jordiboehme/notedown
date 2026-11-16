@@ -1,11 +1,11 @@
 ---
 name: ingest-notes
-description: Use when asked to ingest, import or sync handwritten Supernote notes from notedown into Crystalline, or to bring Crystalline up to date with new or changed notes. Reads the changes of the notedown MCP server and distills them into engrams with sub-agents.
+description: Use when asked to ingest, import or sync handwritten Supernote notes from Notedown into Crystalline, or to bring Crystalline up to date with new or changed notes. Reads the changes of the Notedown MCP server and distills them into engrams with sub-agents.
 ---
 
-# Ingest notes from notedown into Crystalline
+# Ingest notes from Notedown into Crystalline
 
-The notedown MCP server (`notedown mcp`, tools `mcp__notedown__*` when it was added as
+The Notedown MCP server (`notedown mcp`, tools `mcp__notedown__*` when it was added as
 `notedown`) gives the text of handwritten notes and what changed since the last run. This skill
 turns those changes into Crystalline engrams.
 

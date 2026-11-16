@@ -1,6 +1,6 @@
 # Getting started
 
-This guide takes you from zero to a Supernote that syncs with notedown. It has two parts. Part 1 turns notes into Markdown. Part 2 runs notedown as the Private Cloud of the device. You can stop after part 1.
+This guide takes you from zero to a Supernote that syncs with Notedown. It has two parts. Part 1 turns notes into Markdown. Part 2 runs Notedown as the Private Cloud of the device. You can stop after part 1.
 
 Take your time with part 2. A wrong step can make the device delete its own files. The steps say why they're there.
 
@@ -8,7 +8,7 @@ The examples use a Nomad. Other Supernote devices should work the same way, but 
 
 ## Part 1: notes to Markdown
 
-### 1. Install notedown
+### 1. Install Notedown
 
 There is no release yet, so build it from source. rustup installs the toolchain that
 `rust-toolchain.toml` names:
@@ -39,7 +39,7 @@ Any copy works: USB, "Browse & Access" on the device (a web page on port 8089) o
 notedown convert ~/Supernote/Note --out ~/notes-md
 ```
 
-notedown searches the folder, converts every `.note` file and writes one Markdown file per note. Run the same command again later: notes that didn't change are skipped, and the model isn't even loaded when nothing changed.
+Notedown searches the folder, converts every `.note` file and writes one Markdown file per note. Run the same command again later: notes that didn't change are skipped, and the model isn't even loaded when nothing changed.
 
 Useful options:
 
@@ -49,9 +49,9 @@ Useful options:
 
 The README has all options and the output format.
 
-## Part 2: notedown as Private Cloud
+## Part 2: Notedown as Private Cloud
 
-The device can sync with a "Private Cloud" instead of Ratta's cloud. notedown can be that cloud. Your files then live as real files in a folder on your computer, and every change is written to a journal.
+The device can sync with a "Private Cloud" instead of Ratta's cloud. Notedown can be that cloud. Your files then live as real files in a folder on your computer, and every change is written to a journal.
 
 Notes, documents and the other device folders sync. Digests and to-dos sync too (see "What to expect").
 
@@ -73,7 +73,7 @@ Anything you write after the backup in step 3 isn't in the backup. Leave the dev
 notedown cloud account --data ~/notedown-data add me --email you@example.org
 ```
 
-notedown asks for a password. The device logs in with this email and password. Use a password that you use nowhere else: the data folder stores a simple MD5 hash of it (the device protocol needs that).
+Notedown asks for a password. The device logs in with this email and password. Use a password that you use nowhere else: the data folder stores a simple MD5 hash of it (the device protocol needs that).
 
 ### 3. Back up the device
 
@@ -83,7 +83,7 @@ Turn on "Browse & Access" on the device. It shows an address like `http://192.16
 notedown cloud backup-device http://192.168.1.20:8089 ~/supernote-backup
 ```
 
-Use a new, empty folder. notedown copies every file and writes `backup.json` with the result. This backup is your safety net and the start of the cloud in step 4.
+Use a new, empty folder. Notedown copies every file and writes `backup.json` with the result. This backup is your safety net and the start of the cloud in step 4.
 
 Then make the device's own backup too. Use the backup function of the device. It writes one file with a name like `Supernote_<date>_<time>.snbak`. Copy that file to the computer. It holds your digests (with their handwritten comments), and step 4 puts them into the cloud.
 
@@ -107,7 +107,7 @@ notedown cloud import ~/supernote-backup --data ~/notedown-data --account me
 
 Why this matters: when the device syncs, it compares its files with the cloud. A file that's missing in the cloud looks like a file you deleted somewhere else, so the device deletes it too. The import makes the cloud hold exactly what the device holds.
 
-notedown protects you here. Until the import is done, the server refuses every file request of the device (protect mode). The import refuses a backup that looks wrong:
+Notedown protects you here. Until the import is done, the server refuses every file request of the device (protect mode). The import refuses a backup that looks wrong:
 
 - a `.part` file is left over (an interrupted download);
 - `backup.json` is missing or lists errors (a copy made over USB needs `--no-report`);
@@ -147,9 +147,9 @@ notedown serve --data ~/notedown-data --capture
 
 The first start writes `server.toml` with the defaults. Leave `protect = true` and `sync = "accept"`. `--capture` writes every request into `~/notedown-data/capture/` for this run. It helps if something goes wrong. Drop it once you trust the setup.
 
-If the device reaches the server through a reverse proxy, set `external_base_url` in `server.toml`, for example `external_base_url = "https://notes.example.org"`. The device gets the upload and download URLs from this base, so it must be an address the device can reach. Without it, notedown uses the host of the request. Restart the server after you change it.
+If the device reaches the server through a reverse proxy, set `external_base_url` in `server.toml`, for example `external_base_url = "https://notes.example.org"`. The device gets the upload and download URLs from this base, so it must be an address the device can reach. Without it, Notedown uses the host of the request. Restart the server after you change it.
 
-The output shows one or more lines like `device URL: http://192.168.1.10:19072`. Use the one of your home network. macOS may ask if notedown may accept incoming connections. Allow it.
+The output shows one or more lines like `device URL: http://192.168.1.10:19072`. Use the one of your home network. macOS may ask if Notedown may accept incoming connections. Allow it.
 
 ### 6. Log out of Ratta's cloud
 
@@ -189,15 +189,15 @@ Now you can turn "Auto Sync" on. Done.
 notedown cloud put report.pdf --data ~/notedown-data --account me --to DOCUMENT/Document/Inbox
 ```
 
-notedown makes the connected devices of the account sync (it closes their connection, and a device syncs when it connects again). With "Auto Sync" on, the device syncs a few seconds after the `put`. Without it, the device downloads the file at its next manual sync.
+Notedown makes the connected devices of the account sync (it closes their connection, and a device syncs when it connects again). With "Auto Sync" on, the device syncs a few seconds after the `put`. Without it, the device downloads the file at its next manual sync.
 
-If the device doesn't sync after a `put`, start a manual sync. The `push` setting in `server.toml` changes how notedown tells the device (see "What to expect").
+If the device doesn't sync after a `put`, start a manual sync. The `push` setting in `server.toml` changes how Notedown tells the device (see "What to expect").
 
-**Change files by hand.** You can add, change, rename and delete files in `accounts/me/files/` with Finder or any tool. notedown notices such changes within a few seconds: it watches the folder and scans what changed. It also looks every `scan_interval` seconds (300 by default), when a device starts a sync and before it answers a device's folder listing. The timer matters for network volumes, which often report no changes. If the data folder has no `accounts/` folder yet when the server starts, the watch starts within 30 seconds after it appears. Set `watch = false` in `server.toml` to turn the watch off, and restart the server after you change it, as for `scan_interval`. notedown writes each change to the journal and the device follows. A file you rename or move keeps its place in the device's list, as long as its content stays the same. A rename plus an edit counts as a delete and a new file. To see it at once, run `notedown cloud scan --data ~/notedown-data --account me`. Add `--dry-run` to only see what it would do. Without `--account` it scans every account. Set `scan_interval = 0` in `server.toml` to turn the timer off. That also skips the scan at server start. The scan at sync start and before listings stays. Restart the server after you change it.
+**Change files by hand.** You can add, change, rename and delete files in `accounts/me/files/` with Finder or any tool. Notedown notices such changes within a few seconds: it watches the folder and scans what changed. It also looks every `scan_interval` seconds (300 by default), when a device starts a sync and before it answers a device's folder listing. The timer matters for network volumes, which often report no changes. If the data folder has no `accounts/` folder yet when the server starts, the watch starts within 30 seconds after it appears. Set `watch = false` in `server.toml` to turn the watch off, and restart the server after you change it, as for `scan_interval`. Notedown writes each change to the journal and the device follows. A file you rename or move keeps its place in the device's list, as long as its content stays the same. A rename plus an edit counts as a delete and a new file. To see it at once, run `notedown cloud scan --data ~/notedown-data --account me`. Add `--dry-run` to only see what it would do. Without `--account` it scans every account. Set `scan_interval = 0` in `server.toml` to turn the timer off. That also skips the scan at server start. The scan at sync start and before listings stays. Restart the server after you change it.
 
-A delete by hand is a real delete. The old file isn't in the recycle bin, because notedown never sees its bytes. Move files out of the folder instead of deleting them if you want a copy.
+A delete by hand is a real delete. The old file isn't in the recycle bin, because Notedown never sees its bytes. Move files out of the folder instead of deleting them if you want a copy.
 
-One safety stop: if a scan would delete files and leave fewer than `scan_min_files` files in the account, notedown doesn't apply it. The default is 1, so an empty folder or an unmounted disk stops it. Device sync then waits, because the device would delete everything it has. Put the files back and the stop lifts by itself at the next scan. With the watch on, that takes a few seconds. If you really want those files gone, run `notedown cloud scan --data ~/notedown-data --account me --accept`. Deleting your last file on purpose needs `--accept` too. Set `scan_min_files = 0` to turn the stop off. `notedown serve` prints a warning when it stops.
+One safety stop: if a scan would delete files and leave fewer than `scan_min_files` files in the account, Notedown doesn't apply it. The default is 1, so an empty folder or an unmounted disk stops it. Device sync then waits, because the device would delete everything it has. Put the files back and the stop lifts by itself at the next scan. With the watch on, that takes a few seconds. If you really want those files gone, run `notedown cloud scan --data ~/notedown-data --account me --accept`. Deleting your last file on purpose needs `--accept` too. Set `scan_min_files = 0` to turn the stop off. `notedown serve` prints a warning when it stops.
 
 **Watch the changes.** `notedown cloud journal tail --data ~/notedown-data --follow` prints every change as a JSON line while it happens. Each line has a `seq` number. Start at a later one with `--from <seq>`.
 
@@ -213,36 +213,36 @@ After `notedown cloud import --replace` every file gets a new id. The old versio
 
 The server keeps a PDF of every note in `share/` in the data folder, for example `~/notedown-data/share/me/`. You don't need to set anything for it. To use another folder, set `render_dir` in `server.toml`, for example `render_dir = "~/Documents/Supernote PDFs"`. `~` alone is your home folder. The folder must exist. The path must start with `/` or `~` and point outside the data folder, or the server doesn't start. To turn the PDFs off, set `render_dir = ""`. There is one subfolder per account, with the same folders as on the device. Two notes that would get the same PDF name (for example `a.note` and `a.NOTE`) get two PDFs. The note that had its PDF first keeps `a.pdf`. The other one gets its full name, as `a.NOTE.pdf`. When both notes are new, the one whose name sorts first gets `a.pdf`. A changed note is rendered again a few seconds after the sync. A moved or deleted note moves or deletes its PDF. Other files in that folder are never touched. To render everything again, run `notedown cloud render --data <data folder> --all`. For one note without the server, run `notedown render <file.note> --pdf`.
 
-## The server on a Raspberry Pi
+## The server on another machine
 
-The sync server is small. It can run on a Raspberry Pi that stays on all day, so your computer doesn't have to.
+The sync server is small. It can run on any machine that stays on all day, so your computer doesn't have to. This can be a small machine, for example a Raspberry Pi or a NAS, or an Intel box or a Mac.
 
-Do step 1 of part 1 first (clone the repository and install rustup). Then build it on the Pi (64-bit Raspberry Pi OS, arm64) without the OCR part:
+Do step 1 of part 1 first (clone the repository and install rustup). Then build it on that machine without the OCR part. Any Linux machine works (64-bit Arm or x86_64). On a Raspberry Pi, use 64-bit Raspberry Pi OS (arm64):
 
 ```sh
 cargo install --path crates/notedown --no-default-features
 ```
 
-This build has `serve`, `cloud` and `render`. It has no OCR, so there is no `pipeline`, `convert`, `model` or `mcp`, and `serve` has no `--pipeline`. The build needs a C compiler (on Raspberry Pi OS: `sudo apt install build-essential`). It does not need the C++ toolchain for llama.cpp that the OCR build needs. There are no release binaries yet.
+This build has `serve`, `cloud` and `render`. It has no OCR, so there is no `pipeline`, `convert`, `model` or `mcp`, and `serve` has no `--pipeline`. The build needs a C compiler (on Debian and Raspberry Pi OS: `sudo apt install build-essential`). It does not need the C++ toolchain for llama.cpp that the OCR build needs. There are no release binaries yet.
 
 Set up the account, the import and the server as in part 2, with the installed `notedown`. Two things to know:
 
-- Most Pis have no clock that runs while they are off, so they need NTP after every start (Raspberry Pi OS does this by default). The server signs the upload and download URLs with the time. It refuses a URL that is more than 5 minutes in the future or older than its time limit (30 minutes for uploads and 24 hours for downloads).
-- The device keeps the address of its Private Cloud. If the address of the Pi changes, you have to log out of the cloud on the device and set it up again. Give the Pi a fixed address: a fixed lease in your router or a static address.
+- The machine needs the right time. Most Raspberry Pis have no clock that runs while they are off, so they need NTP after every start (Raspberry Pi OS does this by default). Check that NTP runs on your machine too. The server signs the upload and download URLs with the time. It refuses a URL that is more than 5 minutes in the future or older than its time limit (30 minutes for uploads and 24 hours for downloads).
+- The device keeps the address of its Private Cloud. If the address of the server changes, you have to log out of the cloud on the device and set it up again. Give the server a fixed address: a fixed lease in your router or a static address.
 
-Note text for an agent needs the OCR build, so it does not run on the Pi. Read the Pi from a Mac instead, as described in the next section.
+Note text for an agent needs the OCR build, so it does not run on this build. Read the server from a Mac instead, as described in the next section.
 
 ### A pipeline on a Mac
 
-The pipeline can run on a second machine (for example a Mac) and read the Pi over the network. The Pi keeps your files. The Mac keeps the note text.
+The pipeline can run on a second machine (for example a Mac) and read the server over the network. The server keeps your files. The Mac keeps the note text.
 
-**On the Pi.** Nothing to set up. `notedown serve` prints a line like this next to the device URL:
+**On the server.** Nothing to set up. `notedown serve` prints a line like this next to the device URL:
 
 ```
 REST API: http://192.168.1.10:19072/rest/v1 (connect a pipeline with notedown connect http://192.168.1.10:19072)
 ```
 
-**On the Mac.** Build notedown with the OCR part and get the model, as in part 1. Then log in once:
+**On the Mac.** Build Notedown with the OCR part and get the model, as in part 1. Then log in once:
 
 ```sh
 notedown connect http://192.168.1.10:19072 --data ~/notedown-mac --email you@example.org
@@ -259,7 +259,7 @@ claude mcp add notedown -- notedown mcp --data ~/notedown-mac
 
 For a second account, run `notedown connect` again with its email. The running pipeline picks it up. You don't need to restart it.
 
-**The token is like a password.** It lets whoever has it read the notes of the account. The file in `~/notedown-mac/tokens/` has mode 0600 and the folder has mode 0700. On the Pi you can see the tokens of an account and revoke them:
+**The token is like a password.** It lets whoever has it read the notes of the account. The file in `~/notedown-mac/tokens/` has mode 0600 and the folder has mode 0700. On the server you can see the tokens of an account and revoke them:
 
 ```sh
 notedown cloud account --data ~/notedown-data tokens list me
@@ -267,21 +267,21 @@ notedown cloud account --data ~/notedown-data tokens revoke me <id>
 notedown cloud account --data ~/notedown-data tokens revoke me --all
 ```
 
-`tokens list` shows the id, the scope (`read` or `write`), the name and the creation time of each token, never the token itself. `notedown connect` makes a `read` token. A password change (`cloud account passwd`) revokes every token. A new `connect` leaves the old token valid until you revoke it. A restore of an old backup of the Pi brings back the tokens that you had revoked since. Revoke them again.
+`tokens list` shows the id, the scope (`read` or `write`), the name and the creation time of each token, never the token itself. `notedown connect` makes a `read` token. A password change (`cloud account passwd`) revokes every token. A new `connect` leaves the old token valid until you revoke it. A restore of an old backup of the server brings back the tokens that you had revoked since. Revoke them again.
 
 The same API lets an app browse, upload, rename, move and delete the files of an account. It needs a token made for writing. See the [REST API](rest-api.md).
 
-**Update the Mac before the Pi.** The server writes journal lines with the origin `app` for the changes of an app. An older pipeline skips them.
+**Update the Mac before the server.** The server writes journal lines with the origin `app` for the changes of an app. An older pipeline skips them.
 
-**When the Mac deletes note text.** Only when the account is gone on the Pi, or when its name now belongs to a new account. A refused token, a locked account or a Pi that can't be reached only stop the reading. The Mac keeps the text it has.
+**When the Mac deletes note text.** Only when the account is gone on the server, or when its name now belongs to a new account. A refused token, a locked account or a server that can't be reached only stop the reading. The Mac keeps the text it has.
 
-**Both machines need the right time (NTP).** The Mac waits until a page has been quiet for a while. It measures that by the time the Pi wrote the page. If the clocks differ a lot, the Mac reads too early or too late.
+**Both machines need the right time (NTP).** The Mac waits until a page has been quiet for a while. It measures that by the time the server wrote the page. If the clocks differ a lot, the Mac reads too early or too late.
 
 **The API is plain HTTP**, like the sync of the device, and made for the home network. The login does not send the password itself. The token goes over the network as it is, so a reverse proxy with HTTPS is the way to reach the API from outside.
 
 ## Your notes as text for an agent
 
-notedown can read the pages of your notes as text (OCR) and keep that text for an agent such as Claude Code. The agent then sees what changed since its last run, page by page, and can put it into Crystalline.
+Notedown can read the pages of your notes as text (OCR) and keep that text for an agent such as Claude Code. The agent then sees what changed since its last run, page by page, and can put it into Crystalline.
 
 **Read the pages.** Run the pipeline next to the server:
 
@@ -301,7 +301,7 @@ claude mcp add notedown -- notedown mcp --data ~/notedown-data
 
 With more than one account in the data folder, add `--account me`. The server only reads the text and the bookmarks of the agents. It never runs OCR. Ask Claude "what changed in my notes since yesterday?" to try it.
 
-**Install the ingest skill.** The skill tells the agent how to put the changes into Crystalline: it plans, gives the notes of one folder to one sub-agent, and confirms only when all of them succeeded. Copy it from a source checkout of notedown:
+**Install the ingest skill.** The skill tells the agent how to put the changes into Crystalline: it plans, gives the notes of one folder to one sub-agent, and confirms only when all of them succeeded. Copy it from a source checkout of Notedown:
 
 ```sh
 cp -R skills/ingest-notes ~/.claude/skills/
@@ -347,9 +347,9 @@ Load it with `launchctl load ~/Library/LaunchAgents/de.notedown.ingest.plist`. `
 - Digests and to-dos sync with every sync of the device. Each change shows up in the journal (`digest.created`, `digest.updated`, `digest.deleted`, `task.created` and so on). The digests are in `accounts/me/digests/` and the to-dos in `accounts/me/tasks/`, as JSON files. A handwritten comment of a digest is a `.mark` file in `accounts/me/digests/marks/`.
 - If you import an old `.snbak` file, a digest can show up twice on the device. Always import a fresh one.
 - A digest you delete on one device can come back when a second device still has it and changes it.
-- A file you add with `put` arrives a few seconds later when "Auto Sync" is on. Without it, the file arrives at the next manual sync. notedown doesn't push while a sync runs or while protect mode is closed. A change you make while `notedown serve` is stopped isn't pushed later. The device gets it at its next sync.
+- A file you add with `put` arrives a few seconds later when "Auto Sync" is on. Without it, the file arrives at the next manual sync. Notedown doesn't push while a sync runs or while protect mode is closed. A change you make while `notedown serve` is stopped isn't pushed later. The device gets it at its next sync.
 - The `push` setting in `server.toml` has three values. `detail` (the default) sends the changed files and folders to the device after its next heartbeat, in the same form as Ratta's cloud. A file you add with `put` then downloads on the Nomad without a reconnect. `startsync` sends one sync message instead. The Nomad receives it but doesn't sync on it. `off` does nothing. An older `server.toml` may still say `push = "reconnect"`. That value is gone: the server uses `detail` and prints a warning at start. Remove the line or set `push = "detail"`. `notedown serve` prints the active value. Restart the server after you change it.
-- Export on the device (PDF or PNG) stays private. The device renders the file itself and puts it into `EXPORT/`, which syncs to notedown like any other file. "Share via QR Code" is different: it goes to Ratta's own service, not to notedown, even when you use the Private Cloud. The QR code holds a link on `viewer.supernote.com` that is valid for one day. Don't use it for notes that must stay on your own server.
+- Export on the device (PDF or PNG) stays private. The device renders the file itself and puts it into `EXPORT/`, which syncs to Notedown like any other file. "Share via QR Code" is different: it goes to Ratta's own service, not to Notedown, even when you use the Private Cloud. The QR code holds a link on `viewer.supernote.com` that is valid for one day. Don't use it for notes that must stay on your own server.
 - You can add, change, rename and delete files in the data folder by hand (see "Change files by hand"). A delete there is a real delete: the device removes its own copy too, and the file doesn't go to the recycle bin.
 - Don't move `files/` in the data folder and don't replace it with a symlink. If `files/` or a device folder is missing or is a symlink, the server refuses every file request, and the device keeps all of its files. The error message says how to repair it.
 
@@ -367,7 +367,7 @@ To come back later, never reuse the old backup: the device changed in the meanti
 
 **"No folders selected to sync".** See step 8.
 
-**The device can't reach the server.** Check that both are on the same network, that the URL has the port `19072` and that macOS allowed incoming connections for notedown (System Settings, Network, Firewall).
+**The device can't reach the server.** Check that both are on the same network, that the URL has the port `19072` and that macOS allowed incoming connections for Notedown (System Settings, Network, Firewall).
 
 **The server says the store is damaged.** Something changed `files/` from outside. The message names the case and the repair. The device keeps its files until the store is fine again.
 
@@ -383,7 +383,7 @@ notedown cloud diagnose --data ~/notedown-data
 
 It prints a short report: your devices, what they did in the last 3 days and a list of things that need a look. It also writes a zip with the report, the protocol log and the journal of that time, a summary of each account and a test scan. Attach the zip to a GitHub issue.
 
-The zip is safe to share. Note, folder and account names, device serials, IP addresses and the text of digests and to-dos are replaced by stand-ins such as `n-7f3a.note`, `acct-1` and `dev-1`. No file content and no password or token is in it. Before the zip is written, notedown checks it for every real name it knows. If one is left, it writes nothing and says so.
+The zip is safe to share. Note, folder and account names, device serials, IP addresses and the text of digests and to-dos are replaced by stand-ins such as `n-7f3a.note`, `acct-1` and `dev-1`. No file content and no password or token is in it. Before the zip is written, Notedown checks it for every real name it knows. If one is left, it writes nothing and says so.
 
 - `--since 12h` or `--since 2026-10-09` sets another start of the time span.
 - `--device <serial>` and `--account <name>` keep only the lines of one device or account.
@@ -393,7 +393,7 @@ The zip is safe to share. Note, folder and account names, device serials, IP add
 
 This is for people who want to help document the device protocol. The server refuses every sync, so **no files are exchanged** and the device keeps all of its files.
 
-Run it from a source checkout of notedown:
+Run it from a source checkout of Notedown:
 
 ```sh
 scripts/capture-session.sh ~/notedown-capture

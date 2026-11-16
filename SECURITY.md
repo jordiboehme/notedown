@@ -25,8 +25,8 @@ Only the latest release gets security fixes. Please check that the problem still
 
 A way to read or change the files of an account without its password, or to get past a sign-in, is a security problem.
 
-## How notedown treats .note files
+## How Notedown treats .note files
 
-notedown reads `.note` files from the device and from the sync, so it treats every `.note` file as untrusted input. A `.note` file that makes notedown crash, hang, use a lot of memory or write outside its own folders is a security problem.
+Notedown reads `.note` files from the device and from the sync, so it treats every `.note` file as untrusted input. A `.note` file that makes Notedown crash, hang, use a lot of memory or write outside its own folders is a security problem.
 
 Please report these problems as described above.

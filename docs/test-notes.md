@@ -1,4 +1,4 @@
-# Test notes to create for the notedown repository
+# Test notes to create for the Notedown repository
 
 These notes replace the private Bike and Content notes and fill the gaps listed in
 `docs/note-format.md` section 12. Everything in them becomes public: write only invented content

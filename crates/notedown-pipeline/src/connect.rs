@@ -163,6 +163,7 @@ pub fn connect(
     let hash = expected_login_hash(&md5_hex(password), &code.random_code);
     let (status, bytes) = post(
         "/login",
+        // No scope: the server gives a read token, and an older server refuses an unknown field.
         json!({ "email": email, "passwordHash": hash, "name": name }),
     )?;
     match status {

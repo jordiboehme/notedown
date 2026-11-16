@@ -335,7 +335,7 @@ fn scan_scope(
 /// [`scan_scope`] for every existing folder on the way to `target` (stored spelling,
 /// [`Store::way_scopes`]): the root, then each folder above `target` that is a real folder on
 /// disk, direct children only.
-fn scan_way(
+pub(crate) fn scan_way(
     state: &AppState,
     store: &Store,
     guard: &WriteGuard,
@@ -1530,14 +1530,17 @@ fn way_is_open(store: &Store, guard: &StoreGuard, parent: &WirePath) -> crate::R
 }
 
 /// Create the folder `path` and each missing folder above it, parents first, one commit each
-/// (`folder.created`). Existing folders are kept.
-fn create_folders(
+/// (`folder.created` with `origin` and `device`). Existing folders are kept. Returns the seqs
+/// of the events.
+pub(crate) fn create_folders(
     state: &AppState,
     store: &Store,
     guard: &crate::store::WriteGuard,
     path: &WirePath,
-    serial: &str,
-) -> crate::Result<()> {
+    origin: Origin,
+    device: Option<String>,
+) -> crate::Result<Vec<u64>> {
+    let mut seqs = Vec::new();
     let mut cur = WirePath::root();
     for segment in path.segments() {
         cur = cur.join(segment)?;
@@ -1547,10 +1550,10 @@ fn create_folders(
         {
             continue;
         }
-        let c = store.plan_create_folder(guard, &cur, Origin::Device, Some(serial.into()))?;
-        store.commit(guard, c, &state.journal)?;
+        let c = store.plan_create_folder(guard, &cur, origin, device.clone())?;
+        seqs.extend(store.commit(guard, c, &state.journal)?);
     }
-    Ok(())
+    Ok(seqs)
 }
 
 /// The listed entry at `path` after a commit.
@@ -1565,7 +1568,7 @@ fn entry_after(store: &Store, guard: &StoreGuard, path: &WirePath) -> crate::Res
 /// everything below it, a file through its parent folder (direct children only). So a hand
 /// change inside it is journaled before the write, and a source that is gone from disk is
 /// journaled as deleted by the scan and counts as unknown.
-fn source_of(
+pub(crate) fn source_of(
     state: &AppState,
     store: &Store,
     guard: &WriteGuard,
@@ -1659,7 +1662,14 @@ pub async fn create_folder_v2(
             return Outcome::too_long();
         }
         let target = parent.join(&name)?;
-        create_folders(st, &store, &guard, &target, serial)?;
+        create_folders(
+            st,
+            &store,
+            &guard,
+            &target,
+            Origin::Device,
+            Some(serial.to_string()),
+        )?;
         let e = entry_after(&store, &guard, &target)?;
         Ok(Outcome::Done(json!({"metadata": metadata_value(&e)})))
     })
@@ -1895,13 +1905,22 @@ pub async fn copy_v3(
             Kind::Folder => {
                 // What to copy is fixed before anything is created.
                 let inside = store.list(&guard, &src.path, true)?;
-                create_folders(st, &store, &guard, &to, serial)?;
+                create_folders(st, &store, &guard, &to, Origin::Device, device.clone())?;
                 for e in inside {
                     let Some(target) = e.path.rebase(&src.path, &to) else {
                         continue;
                     };
                     match e.tag {
-                        Kind::Folder => create_folders(st, &store, &guard, &target, serial)?,
+                        Kind::Folder => {
+                            create_folders(
+                                st,
+                                &store,
+                                &guard,
+                                &target,
+                                Origin::Device,
+                                device.clone(),
+                            )?;
+                        }
                         Kind::File => copy_file(&e.path, &target)?,
                     }
                 }

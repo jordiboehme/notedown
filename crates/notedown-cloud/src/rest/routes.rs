@@ -6,19 +6,20 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use axum::body::{Body, Bytes};
+use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{MethodRouter, any, get, post};
+use axum::routing::{MethodRouter, any, get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{PREFIX, RefusedToken};
+use super::{PREFIX, RefusedToken, browse, write};
 use crate::api::ClientAddr;
 use crate::api::envelope::{LogMessage, Streamed};
 use crate::api::oss::{Flow, stream_body};
-use crate::auth::{Account, AuthError, TokenCheck};
+use crate::auth::{Account, AuthError, Scope, TokenCheck};
 use crate::pages::valid_key;
 use crate::read::{self, NoteFile, ServerAccount};
 use crate::server::AppState;
@@ -36,15 +37,36 @@ pub const NOTE_HEADER: &str = "x-notedown-note";
 pub fn router(state: Arc<AppState>) -> Router {
     let path = |p: &str| format!("{PREFIX}{p}");
     let get_only = |r: MethodRouter<Arc<AppState>>| r.fallback(no_route);
+    // A JSON body is read whole: up to the limit of the request log, whose JSON 413 answers a
+    // larger one (axum's own default of 2 MiB would answer plain text first).
+    let json_body = |r: MethodRouter<Arc<AppState>>| {
+        r.fallback(no_route)
+            .layer(DefaultBodyLimit::max(crate::server::MAX_REQUEST_BODY))
+    };
     Router::new()
-        .route(&path("/login/code"), post(login_code).fallback(no_route))
-        .route(&path("/login"), post(login).fallback(no_route))
+        .route(&path("/login/code"), json_body(post(login_code)))
+        .route(&path("/login"), json_body(post(login)))
         .route(&path("/account"), get_only(get(account)))
         .route(&path("/records"), get_only(get(records)))
         .route(&path("/records/{key}"), get_only(get(record)))
         .route(&path("/note"), get_only(get(note)))
         .route(&path("/digests"), get_only(get(digests)))
         .route(&path("/journal"), get_only(get(journal)))
+        .route(&path("/tree"), get_only(get(browse::tree)))
+        .route(
+            &path("/entries/{id}"),
+            get(browse::entry).delete(write::delete).fallback(no_route),
+        )
+        .route(&path("/files/{id}"), get_only(get(browse::file)))
+        // The upload streams its body to staging and enforces its own limit.
+        .route(
+            &path("/files"),
+            put(write::upload)
+                .fallback(no_route)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route(&path("/folders"), json_body(post(write::folder)))
+        .route(&path("/move"), json_body(post(write::move_)))
         .route(PREFIX, any(no_route))
         .route(&path("/"), any(no_route))
         .route(&path("/{*rest}"), any(no_route))
@@ -52,11 +74,11 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 /// `{"error": code}` with `status`.
-fn error(status: StatusCode, code: &str) -> Response {
+pub(super) fn error(status: StatusCode, code: &str) -> Response {
     (status, Json(json!({ "error": code }))).into_response()
 }
 
-fn bad_request(message: &str) -> Response {
+pub(super) fn bad_request(message: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
         Json(json!({"error": "bad_request", "message": message})),
@@ -65,7 +87,7 @@ fn bad_request(message: &str) -> Response {
 }
 
 /// 500 `internal`; `detail` (never a secret) goes to the request log and stderr only.
-fn internal(detail: impl std::fmt::Display) -> Response {
+pub(super) fn internal(detail: impl std::fmt::Display) -> Response {
     let detail = detail.to_string();
     eprintln!("notedown cloud: rest: {detail}");
     let mut r = error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
@@ -89,11 +111,11 @@ async fn blocking<T: Send + 'static>(
 }
 
 /// An answer that ends a handler early (boxed: a `Response` is large).
-type Refusal = Box<Response>;
+pub(super) type Refusal = Box<Response>;
 
 /// Who a token speaks for.
 enum Caller {
-    Live(Box<Account>),
+    Live(Box<Account>, Scope),
     Removed {
         slug: String,
         user_id: u64,
@@ -143,16 +165,34 @@ async fn caller(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(Caller, S
     let st = state.clone();
     let now = state.now_ms();
     match blocking(move || st.rest_tokens.check(&token, now)).await? {
-        TokenCheck::Valid(account) => Ok((Caller::Live(Box::new(account)), id)),
+        // The scope is enforced by the write routes ([`writer_of`]).
+        TokenCheck::Valid(account, scope) => Ok((Caller::Live(Box::new(account), scope), id)),
         TokenCheck::Removed { user_id, seq } => Ok((Caller::Removed { slug, user_id, seq }, id)),
         TokenCheck::Refused => Err(Box::new(refused(id))),
     }
 }
 
 /// The live account of the caller; a removed one is 410.
-async fn account_of(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Account, Refusal> {
+pub(super) async fn account_of(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Result<Account, Refusal> {
     match caller(state, headers).await? {
-        (Caller::Live(account), _) => Ok(*account),
+        (Caller::Live(account, _), _) => Ok(*account),
+        (Caller::Removed { user_id, seq, .. }, id) => Err(Box::new(removed(id, user_id, seq))),
+    }
+}
+
+/// [`account_of`] for a write: a read token is 403 `read_only_token`.
+pub(super) async fn writer_of(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Result<Account, Refusal> {
+    match caller(state, headers).await? {
+        (Caller::Live(account, Scope::Write), _) => Ok(*account),
+        (Caller::Live(_, Scope::Read), _) => {
+            Err(Box::new(error(StatusCode::FORBIDDEN, "read_only_token")))
+        }
         (Caller::Removed { user_id, seq, .. }, id) => Err(Box::new(removed(id, user_id, seq))),
     }
 }
@@ -192,17 +232,19 @@ async fn login_code(
 }
 
 /// The login body: the password travels only as `sha256_hex(md5_hex(password) + randomCode)`;
-/// any other field (a clear `password`) is refused.
+/// any other field (a clear `password`) is refused. `scope` is `read` (the default) or `write`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LoginBody {
     email: String,
     password_hash: String,
     name: String,
+    #[serde(default)]
+    scope: Scope,
 }
 
-/// `POST /login`: 201 with a new token. A wrong email, password or code and a locked account
-/// are all 401 `login_failed`.
+/// `POST /login`: 201 with a new token of the asked scope. A wrong email, password or code and
+/// a locked account are all 401 `login_failed`.
 async fn login(
     State(state): State<Arc<AppState>>,
     addr: Option<Extension<ClientAddr>>,
@@ -213,12 +255,19 @@ async fn login(
         return error(StatusCode::TOO_MANY_REQUESTS, "too_many");
     }
     let Ok(body) = serde_json::from_slice::<LoginBody>(&body) else {
-        return bad_request("the body must be {\"email\",\"passwordHash\",\"name\"}");
+        return bad_request(
+            "the body must be {\"email\",\"passwordHash\",\"name\"} with an optional \"scope\" of \"read\" or \"write\"",
+        );
     };
     let st = state.clone();
     let result = tokio::task::spawn_blocking(move || {
-        st.auth
-            .rest_login(&body.email, &body.password_hash, &body.name, now)
+        st.auth.rest_login(
+            &body.email,
+            &body.password_hash,
+            &body.name,
+            body.scope,
+            now,
+        )
     })
     .await;
     match result {
@@ -229,6 +278,7 @@ async fn login(
                 "id": info.id,
                 "slug": account.slug,
                 "userId": account.user_id,
+                "scope": info.scope,
             })),
         )
             .into_response(),
@@ -298,7 +348,7 @@ async fn digests(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
 }
 
 /// The query of a route; a query that does not parse is a 400.
-fn query<T: serde::de::DeserializeOwned>(uri: &Uri) -> Result<T, Refusal> {
+pub(super) fn query<T: serde::de::DeserializeOwned>(uri: &Uri) -> Result<T, Refusal> {
     Query::<T>::try_from_uri(uri)
         .map(|Query(q)| q)
         .map_err(|e| Box::new(bad_request(&e.body_text())))
@@ -338,7 +388,7 @@ async fn journal(State(state): State<Arc<AppState>>, headers: HeaderMap, uri: Ur
     };
     let limit = usize::try_from(limit).map_or(JOURNAL_LIMIT, |l| l.min(JOURNAL_LIMIT));
     let (slug, until) = match caller {
-        Caller::Live(a) => (a.slug, u64::MAX),
+        Caller::Live(a, _) => (a.slug, u64::MAX),
         Caller::Removed { slug, seq, .. } => (slug, seq),
     };
     let data = state.data_dir.clone();
@@ -361,7 +411,7 @@ enum Opened {
 }
 
 /// Whether `If-None-Match` names `etag` (weak comparison) or is `*`.
-fn not_modified(headers: &HeaderMap, etag: &str) -> bool {
+pub(super) fn not_modified(headers: &HeaderMap, etag: &str) -> bool {
     let strip = |t: &str| t.trim().trim_start_matches("W/").to_string();
     headers
         .get_all(header::IF_NONE_MATCH)

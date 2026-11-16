@@ -1,3 +1,5 @@
+use notedown_cloud::auth::Scope;
+
 const NOTE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/notes/test2.note"
@@ -2194,12 +2196,18 @@ fn serve_prints_the_rest_api_line() {
 }
 
 /// Issues a REST token the way a login does: a code, then the hash of the password with it.
-fn issue_token(data: &std::path::Path, email: &str, password: &str, name: &str) -> String {
+fn issue_token(
+    data: &std::path::Path,
+    email: &str,
+    password: &str,
+    name: &str,
+    scope: notedown_cloud::auth::Scope,
+) -> String {
     use notedown_cloud::auth::{Auth, expected_login_hash, md5_hex};
     let auth = Auth::open(data).unwrap();
     let (code, _) = auth.challenge(email, 1_000).unwrap();
     let hash = expected_login_hash(&md5_hex(password), &code);
-    let (_, info, _) = auth.rest_login(email, &hash, name, 2_000).unwrap();
+    let (_, info, _) = auth.rest_login(email, &hash, name, scope, 2_000).unwrap();
     info.id
 }
 
@@ -2218,8 +2226,8 @@ fn account_with_tokens() -> (tempfile::TempDir, String, String) {
         Some("secret\n"),
     );
     assert!(out.status.success());
-    let first = issue_token(d, "j@example.org", "secret", "laptop");
-    let second = issue_token(d, "j@example.org", "secret", "studio");
+    let first = issue_token(d, "j@example.org", "secret", "laptop", Scope::Read);
+    let second = issue_token(d, "j@example.org", "secret", "studio", Scope::Read);
     (dir, first, second)
 }
 
@@ -2237,7 +2245,7 @@ fn tokens_list_and_revoke() {
     want.sort();
     for (line, (id, name)) in lines.iter().zip(want) {
         let rest = line
-            .strip_prefix(&format!("{id}  {name}  created "))
+            .strip_prefix(&format!("{id}  read  {name}  created "))
             .unwrap();
         assert!(rest.starts_with("1970-01-01T00:00:02"), "{line}");
     }
@@ -2250,12 +2258,36 @@ fn tokens_list_and_revoke() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let issued = issue_token(d, "j@example.org", "secret", "third");
+    let issued = issue_token(d, "j@example.org", "secret", "third", Scope::Read);
     assert_ne!(issued, second);
     let out = cloud(d, &["tokens", "revoke", "jordi", "--all"], None);
     assert_eq!(stdout(&out), "revoked 2 tokens\n");
     let out = cloud(d, &["tokens", "list", "jordi"], None);
     assert_eq!(stdout(&out), "no tokens\n");
+}
+
+#[test]
+fn tokens_list_shows_the_scope() {
+    let (dir, read, _) = account_with_tokens();
+    let d = dir.path();
+    let write = issue_token(d, "j@example.org", "secret", "mac app", Scope::Write);
+    let out = cloud(d, &["tokens", "list", "jordi"], None);
+    assert!(out.status.success());
+    let text = stdout(&out);
+    let line = |id: &str| {
+        text.lines()
+            .find(|l| l.starts_with(id))
+            .unwrap()
+            .to_string()
+    };
+    assert!(
+        line(&read).starts_with(&format!("{read}  read  laptop  created ")),
+        "{text}"
+    );
+    assert!(
+        line(&write).starts_with(&format!("{write}  write  mac app  created ")),
+        "{text}"
+    );
 }
 
 #[test]

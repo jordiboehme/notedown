@@ -210,6 +210,39 @@ impl AppState {
         Ok(used)
     }
 
+    /// The cached `usedCapacity` of `slug` while it is fresh ([`USAGE_CACHE_MS`]); never walks.
+    pub(crate) fn cached_usage(&self, slug: &str) -> Option<u64> {
+        let now = self.now_ms();
+        self.usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(slug)
+            .filter(|(at, _)| now.saturating_sub(*at) < USAGE_CACHE_MS)
+            .map(|(_, used)| *used)
+    }
+
+    /// Cache `used` as the `usedCapacity` of `slug` now (a walk under the store lock).
+    pub(crate) fn remember_usage(&self, slug: &str, used: u64) {
+        let now = self.now_ms();
+        self.usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(slug.to_string(), (now, used));
+    }
+
+    /// Keep the cached `usedCapacity` of `slug` right after a write that added `added` bytes
+    /// and removed `removed`; it keeps its age. Nothing is cached when nothing was.
+    pub(crate) fn adjust_usage(&self, slug: &str, added: u64, removed: u64) {
+        if let Some((_, used)) = self
+            .usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(slug)
+        {
+            *used = used.saturating_sub(removed).saturating_add(added);
+        }
+    }
+
     /// Forget the cached `usedCapacity` of `slug` (after an upload or another change).
     pub fn invalidate_usage(&self, slug: &str) {
         self.usage

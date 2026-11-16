@@ -1287,3 +1287,47 @@ fn digests_of_the_note_are_in_its_metadata() {
         .unwrap();
     assert_eq!(d.state(&key).unwrap().meta.digests, ["u7", "u8"]);
 }
+
+#[test]
+fn a_pipeline_skips_an_app_line_it_cannot_read() {
+    // A pipeline older than its server meets a line it cannot parse (an `app` line before it
+    // knew that origin, or a type it does not know): the cursor moves past it and nothing is
+    // deleted, the note keeps its text.
+    let d = setup();
+    let key = d.put("test1", "NOTE/Note");
+    let clock = TestClock::at(now_ms());
+    let mut w =
+        worker(&d, no_settle(), engine_reading("hello")).with_clock(Arc::new(clock.clone()));
+    w.run(stop_at(&clock, clock.now_ms() + 1)).unwrap();
+    let last = Journal::open(&d.data).unwrap().last_seq().unwrap();
+    assert_eq!(cursor::read(&d.data, SLUG).unwrap(), last);
+    let log = d.log();
+    assert_eq!(log.len(), 1);
+    let state = d.state(&key).unwrap();
+    let record = std::fs::read(d.record_path(&key)).unwrap();
+
+    let dir = d.data.join("journal");
+    let newest = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .max()
+        .unwrap();
+    let line = format!(
+        r#"{{"seq":{},"ts":1,"account":"{SLUG}","origin":"app","type":"file.teleported","id":1000,"path":"NOTE/Note/test1.note","opId":"op-x"}}"#,
+        last + 1
+    );
+    assert!(serde_json::from_str::<notedown_cloud::journal::Event>(&line).is_err());
+    let mut f = std::fs::File::options().append(true).open(&newest).unwrap();
+    std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()).unwrap();
+    drop(f);
+
+    clock.set(now_ms());
+    let mut w =
+        worker(&d, no_settle(), engine_reading("other")).with_clock(Arc::new(clock.clone()));
+    w.run(stop_at(&clock, clock.now_ms() + 1)).unwrap();
+    assert_eq!(cursor::read(&d.data, SLUG).unwrap(), last + 1);
+    assert_eq!(d.log(), log, "no line, no delete");
+    assert_eq!(d.state(&key).unwrap(), state);
+    assert_eq!(std::fs::read(d.record_path(&key)).unwrap(), record);
+}

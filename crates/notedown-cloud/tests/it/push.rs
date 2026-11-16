@@ -14,7 +14,7 @@ use axum::body::Body;
 use axum::extract::connect_info::MockConnectInfo;
 use axum::http::Request;
 use futures_util::{SinkExt, StreamExt};
-use notedown_cloud::auth::{Accounts, Imported, expected_login_hash, md5_hex};
+use notedown_cloud::auth::{Accounts, Imported, Scope, expected_login_hash, md5_hex};
 use notedown_cloud::journal::{Event, EventBody, FileKind, Origin, new_op_id};
 use notedown_cloud::push::{
     RETRY_MS, file_syn_message, follow_once, server_message_frame, start_seq, startsync_item, tick,
@@ -347,6 +347,171 @@ fn one_put_pushes_each_bound_device_once() {
     f.advance_ms(300);
     assert_eq!(f.ping(A), Some(startsync(None, t, t + 300)));
     assert_eq!(f.ping(B), Some(startsync(None, t, t + 300)));
+}
+
+#[tokio::test]
+async fn a_rest_upload_is_pushed_to_every_bound_device() {
+    let mut f = Fixture::new();
+    let now = f.state.now_ms();
+    let (code, _) = f.state.auth.challenge(EMAIL, now).unwrap();
+    let hash = expected_login_hash(&md5_hex("secret"), &code);
+    let (token, _, _) = f
+        .state
+        .auth
+        .rest_login(EMAIL, &hash, "mac", Scope::Write, now)
+        .unwrap();
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/rest/v1/files?path=NOTE%2FNote%2Fa.txt")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-length", "5")
+        .body(Body::from("hello"))
+        .unwrap();
+    let resp = notedown_cloud::rest::router(f.state.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 201);
+    assert!(f.follow() > 0);
+    f.advance_ms(2000);
+    let t = f.now();
+    assert_eq!(tick(&f.state, t), 2);
+    f.advance_ms(300);
+    // No device made the change: every bound device gets it (`equipmentNo` "null-null").
+    assert_eq!(f.ping(A), Some(startsync(None, t, t + 300)));
+    assert_eq!(f.ping(B), Some(startsync(None, t, t + 300)));
+}
+
+/// A write token of the test account for the REST routes.
+fn rest_writer(f: &Fixture) -> String {
+    let now = f.state.now_ms();
+    let (code, _) = f.state.auth.challenge(EMAIL, now).unwrap();
+    let hash = expected_login_hash(&md5_hex("secret"), &code);
+    let (token, _, _) = f
+        .state
+        .auth
+        .rest_login(EMAIL, &hash, "mac", Scope::Write, now)
+        .unwrap();
+    token
+}
+
+/// A REST request through the router: (status, answer, `Retry-After`). A `body` is sent as
+/// JSON, `upload` as the raw bytes of a `PUT`.
+async fn rest_call(
+    f: &Fixture,
+    token: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    upload: Option<&'static str>,
+) -> (u16, Value, Option<String>) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"));
+    let req = match (body, upload) {
+        (Some(body), _) => req
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string())),
+        (None, Some(bytes)) => req
+            .header("content-length", bytes.len().to_string())
+            .body(Body::from(bytes)),
+        (None, None) => req.body(Body::empty()),
+    }
+    .unwrap();
+    let resp = notedown_cloud::rest::router(f.state.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let retry = resp
+        .headers()
+        .get("retry-after")
+        .map(|v| v.to_str().unwrap().to_string());
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&body).unwrap(), retry)
+}
+
+/// Follows the journal, waits out the quiet time and checks that both devices get the push;
+/// then waits out the gap before the next push.
+fn both_get_the_push(f: &mut Fixture) {
+    assert!(f.follow() > 0);
+    f.advance_ms(2000);
+    let t = f.now();
+    assert_eq!(tick(&f.state, t), 2);
+    f.advance_ms(300);
+    assert_eq!(f.ping(A), Some(startsync(None, t, t + 300)));
+    assert_eq!(f.ping(B), Some(startsync(None, t, t + 300)));
+    f.received(A);
+    f.received(B);
+    f.advance_ms(5000);
+}
+
+#[tokio::test]
+async fn a_rest_move_and_delete_are_pushed() {
+    let mut f = Fixture::new();
+    let token = rest_writer(&f);
+    f.put("a.note");
+    both_get_the_push(&mut f);
+    let id = f
+        .state
+        .store("jordi")
+        .unwrap()
+        .id_of(&notedown_cloud::store::WirePath::parse("NOTE/Note/a.note").unwrap())
+        .unwrap()
+        .unwrap();
+    let (status, answer, _) = rest_call(
+        &f,
+        &token,
+        "POST",
+        "/rest/v1/move",
+        Some(json!({"id": id, "to": "NOTE/Note/Work/b.note"})),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{answer}");
+    both_get_the_push(&mut f);
+    let (status, answer, _) = rest_call(
+        &f,
+        &token,
+        "DELETE",
+        &format!("/rest/v1/entries/{id}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{answer}");
+    both_get_the_push(&mut f);
+}
+
+#[tokio::test]
+async fn a_push_follows_an_app_write_after_the_sync_ends() {
+    let mut f = Fixture::new();
+    let token = rest_writer(&f);
+    let uri = "/rest/v1/files?path=NOTE%2FNote%2Fa.txt";
+    f.state.sync_locks.start("jordi", A, f.now());
+    let (status, answer, retry) = rest_call(&f, &token, "PUT", uri, None, Some("hello")).await;
+    assert_eq!(status, 423, "{answer}");
+    assert_eq!(answer, json!({"error": "device_syncing"}));
+    assert_eq!(retry.as_deref(), Some("5"));
+    let (status, _, _) = rest_call(
+        &f,
+        &token,
+        "POST",
+        "/rest/v1/folders",
+        Some(json!({"path": "NOTE/Note/New"})),
+        None,
+    )
+    .await;
+    assert_eq!(status, 423);
+    assert_eq!(f.follow(), 0);
+    assert!(!f.pending(A) && !f.pending(B));
+    f.state.sync_locks.end("jordi", A, f.now());
+    let (status, answer, _) = rest_call(&f, &token, "PUT", uri, None, Some("hello")).await;
+    assert_eq!(status, 201, "{answer}");
+    both_get_the_push(&mut f);
 }
 
 #[test]

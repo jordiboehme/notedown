@@ -1533,3 +1533,171 @@ fn recovery_messages_count_events_in_plain_english() {
         "finished the change o and journaled 2 missing events"
     );
 }
+
+#[test]
+fn the_app_origin_round_trips() {
+    let mut e = Event::new(
+        "jordi",
+        Origin::App,
+        None,
+        "op-a",
+        EventBody::FolderCreated {
+            id: 2,
+            path: "INBOX/A".into(),
+        },
+    );
+    e.seq = 7;
+    e.ts = 8;
+    let line = e.to_line();
+    assert_eq!(
+        line,
+        r#"{"seq":7,"ts":8,"account":"jordi","origin":"app","type":"folder.created","id":2,"path":"INBOX/A","opId":"op-a"}"#
+    );
+    assert_eq!(serde_json::from_str::<Event>(&line).unwrap(), e);
+}
+
+#[test]
+fn an_unknown_origin_reads_as_unknown() {
+    // A newer writer's origin does not make this reader drop the line.
+    let line = r#"{"seq":5,"ts":6,"account":"jordi","origin":"robot","type":"folder.created","id":2,"path":"INBOX","opId":"op-d"}"#;
+    let e = serde_json::from_str::<Event>(line).unwrap();
+    assert_eq!(e.origin, Origin::Unknown);
+    assert_eq!(
+        e.body,
+        EventBody::FolderCreated {
+            id: 2,
+            path: "INBOX".into()
+        }
+    );
+    assert_eq!(e.seq, 5);
+}
+
+/// `commit_staged` of `bytes` (staged as `f`) to `path` with `precondition`, no way scan.
+fn commit_app(
+    f: &Fixture,
+    path: &str,
+    bytes: &[u8],
+    precondition: notedown_cloud::put::Precondition,
+) -> notedown_cloud::Result<notedown_cloud::put::PutResult> {
+    let staged = f.stage("f", bytes);
+    let md5 = notedown_cloud::auth::md5_hex(std::str::from_utf8(bytes).unwrap());
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    notedown_cloud::put::commit_staged(
+        &f.store,
+        &g,
+        &f.journal,
+        &wp(path),
+        &staged,
+        &md5,
+        Origin::App,
+        T0 as u64,
+        precondition,
+        &|_| Ok(()),
+    )
+}
+
+#[test]
+fn commit_staged_with_the_app_origin_journals_app() {
+    use notedown_cloud::put::{Precondition, PutOutcome, commit_staged};
+    let f = Fixture::new();
+    let staged = f.stage("f", b"hello");
+    let md5 = notedown_cloud::auth::md5_hex("hello");
+    let scanned = std::cell::RefCell::new(Vec::new());
+    let g = f.store.lock_recovered(&f.journal).unwrap();
+    let r = commit_staged(
+        &f.store,
+        &g,
+        &f.journal,
+        &wp("NOTE/Note/A/a.txt"),
+        &staged,
+        &md5,
+        Origin::App,
+        T0 as u64,
+        Precondition::None,
+        &|p| {
+            scanned.borrow_mut().push(p.display());
+            Ok(())
+        },
+    )
+    .unwrap();
+    drop(g);
+    assert_eq!(*scanned.borrow(), ["NOTE/Note/A/a.txt"]);
+    // The commit moved the staged file onto the target; its folder is left to the caller.
+    assert!(!staged.exists());
+    assert!(staged.parent().unwrap().is_dir());
+    assert_eq!(r.outcome, PutOutcome::Created);
+    assert_eq!(r.path, wp("NOTE/Note/A/a.txt"));
+    assert_eq!((r.md5.as_str(), r.size), (md5.as_str(), 5));
+    let disk = f.store.fs_path(&wp("NOTE/Note/A/a.txt"));
+    let mtime = std::fs::metadata(&disk)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert_eq!(r.mtime_ms, mtime);
+    let events = f.events();
+    assert_eq!(r.seqs, events.iter().map(|e| e.seq).collect::<Vec<_>>());
+    let kinds: Vec<&str> = events.iter().map(|e| e.body.type_name()).collect();
+    assert_eq!(kinds, ["folder.created", "file.created"]);
+    assert!(
+        events
+            .iter()
+            .all(|e| e.origin == Origin::App && e.device.is_none()),
+        "{events:?}"
+    );
+    match &events[1].body {
+        EventBody::FileCreated { id, .. } => assert_eq!(*id, r.id),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn commit_staged_checks_the_precondition_after_the_same_bytes() {
+    use notedown_cloud::put::{Precondition, PutOutcome};
+    let f = Fixture::new();
+    let first = commit_app(&f, "INBOX/a.txt", b"one", Precondition::Absent).unwrap();
+    assert_eq!(first.outcome, PutOutcome::Created);
+    // The same bytes are unchanged, whatever the precondition says.
+    for p in [
+        Precondition::Absent,
+        Precondition::Md5("0000".into()),
+        Precondition::None,
+    ] {
+        let r = commit_app(&f, "INBOX/a.txt", b"one", p).unwrap();
+        assert_eq!(r.outcome, PutOutcome::Unchanged);
+        assert_eq!(
+            (r.id, r.size, r.md5.as_str()),
+            (first.id, 3, first.md5.as_str())
+        );
+        assert!(r.seqs.is_empty());
+    }
+    let before = f.events().len();
+    // Other bytes: the precondition decides, and a refusal writes nothing.
+    for p in [Precondition::Absent, Precondition::Md5("0000".into())] {
+        match commit_app(&f, "INBOX/a.txt", b"two", p) {
+            Err(notedown_cloud::Error::PreconditionFailed(path)) => {
+                assert_eq!(path, "INBOX/a.txt")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    match commit_app(
+        &f,
+        "INBOX/b.txt",
+        b"two",
+        Precondition::Md5(first.md5.clone()),
+    ) {
+        Err(notedown_cloud::Error::PreconditionFailed(path)) => assert_eq!(path, "INBOX/b.txt"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(f.events().len(), before);
+    let upper = first.md5.to_ascii_uppercase();
+    let r = commit_app(&f, "INBOX/a.txt", b"two", Precondition::Md5(upper)).unwrap();
+    assert_eq!((r.outcome, r.id), (PutOutcome::Replaced, first.id));
+    let g = f.store.lock().unwrap();
+    let recycled = f.store.recycle_index(&g).unwrap();
+    assert_eq!(recycled.len(), 1);
+    assert_eq!(recycled[0].md5, first.md5);
+}

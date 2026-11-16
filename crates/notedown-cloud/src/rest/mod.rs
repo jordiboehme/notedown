@@ -1,16 +1,22 @@
-//! The read-only REST API under [`PREFIX`], for a pipeline on another machine.
+//! The REST API under [`PREFIX`], for a pipeline on another machine and for the Mac app, which
+//! browses and downloads the account's files ([`browse`]) and uploads them ([`write`]).
 //!
 //! Plain JSON with real HTTP status codes, not the device envelope; every error body is
 //! `{"error": "<code>", ...}`. The token in `Authorization: Bearer <token>` decides the account
 //! (see [`crate::auth::RestTokens`]); no path names one. The answers come from the same
 //! [`crate::read`] functions that the pipeline uses on a mounted folder, so they never depend
-//! on the transport.
+//! on the transport; the app's routes work on the store under its lock, as the device routes
+//! do.
 //!
 //! The routes ([`router`]) are merged next to the device routes (`serve_until_with`), so they
 //! pass the request log and its panic guard. The log keeps quiet about the polls
 //! ([`unlogged`]).
 
+mod browse;
+mod check;
+mod errors;
 mod routes;
+mod write;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -32,6 +38,19 @@ pub const REFUSAL_LOG_MS: u64 = 10 * 60 * 1000;
 /// At most this many (token id, path) pairs are remembered for [`REFUSAL_LOG_MS`]. When all
 /// are recent, a refusal is logged every time instead.
 const MAX_REMEMBERED: usize = 1024;
+
+/// Whether the request log passes this request's body on unread: the app's upload
+/// (`PUT /rest/v1/files`), in every sync mode. Its handler streams the body to staging, or
+/// refuses without reading it.
+pub(crate) fn is_streamed_write(method: &Method, path: &str) -> bool {
+    method == Method::PUT && path.strip_prefix(PREFIX) == Some("/files")
+}
+
+/// 413 `too_large`: a REST request body over [`crate::server::MAX_REQUEST_BODY`], which the
+/// request log does not read.
+pub(crate) fn body_too_large() -> Response {
+    routes::error(axum::http::StatusCode::PAYLOAD_TOO_LARGE, "too_large")
+}
 
 /// Whether `path` belongs to the REST API.
 pub fn is_rest_path(path: &str) -> bool {
@@ -71,14 +90,16 @@ impl RefusalLog {
 }
 
 /// Whether the request log leaves out this answer: a REST `GET` or `HEAD` that answered 200,
-/// 201 or 304 (the polls of the pipeline), and a 401 or 410 for a token id and path that was
-/// logged in the last [`REFUSAL_LOG_MS`]. Every other answer is logged, logins too.
+/// 201, 206 or 304 (the polls of the pipeline and the downloads of the app), and a 401 or 410
+/// for a token id and path that was logged in the last [`REFUSAL_LOG_MS`]. Every other answer
+/// is logged, logins too.
 pub(crate) fn unlogged(state: &AppState, method: &Method, path: &str, response: &Response) -> bool {
     if !is_rest_path(path) {
         return false;
     }
     let status = response.status().as_u16();
-    if (method == Method::GET || method == Method::HEAD) && matches!(status, 200 | 201 | 304) {
+    if (method == Method::GET || method == Method::HEAD) && matches!(status, 200 | 201 | 206 | 304)
+    {
         return true;
     }
     match response.extensions().get::<RefusedToken>() {

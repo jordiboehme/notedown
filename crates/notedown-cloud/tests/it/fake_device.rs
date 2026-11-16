@@ -17,7 +17,7 @@ use notedown_cloud::server::{AppState, bind, serve_until};
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
 
-const SERIAL: &str = "SN078C10000000";
+pub(crate) const SERIAL: &str = "SN078C10000000";
 const EMAIL: &str = "jordi@example.org";
 const PASSWORD: &str = "a-long-test-password";
 
@@ -55,7 +55,7 @@ fn backup(root: &Path) -> std::path::PathBuf {
     b
 }
 
-fn multipart(name: &str, bytes: &[u8]) -> (String, Vec<u8>) {
+pub(crate) fn multipart(name: &str, bytes: &[u8]) -> (String, Vec<u8>) {
     let b = "notedownFakeDeviceBoundary";
     let mut body = format!(
         "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n\
@@ -68,23 +68,23 @@ fn multipart(name: &str, bytes: &[u8]) -> (String, Vec<u8>) {
 }
 
 /// The device: one HTTP client that counts its requests and keeps every secret it saw.
-struct Device {
+pub(crate) struct Device {
     base: String,
-    http: Client,
+    pub(crate) http: Client,
     token: String,
     requests: usize,
     secrets: Vec<String>,
 }
 
 impl Device {
-    fn send(&mut self, req: reqwest::blocking::RequestBuilder) -> (u16, Vec<u8>) {
+    pub(crate) fn send(&mut self, req: reqwest::blocking::RequestBuilder) -> (u16, Vec<u8>) {
         self.requests += 1;
         let resp = req.send().unwrap();
         let status = resp.status().as_u16();
         (status, resp.bytes().unwrap().to_vec())
     }
 
-    fn post(&mut self, path: &str, body: Value) -> Value {
+    pub(crate) fn post(&mut self, path: &str, body: Value) -> Value {
         let mut req = self
             .http
             .post(format!("{}{path}", self.base))
@@ -98,7 +98,7 @@ impl Device {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    fn ok(&mut self, path: &str, body: Value) -> Value {
+    pub(crate) fn ok(&mut self, path: &str, body: Value) -> Value {
         let v = self.post(path, body);
         assert_eq!(v["success"], true, "{path}: {v}");
         v
@@ -142,8 +142,9 @@ fn refused_routes(d: &mut Device) {
     }
 }
 
-/// The login of variant A, then the sync of `docs/sync-protocol.md` 3.4. Returns the device.
-fn run_device(base: String) -> Device {
+/// The login of variant A with `email` and `password` against `base`, and the bind of the
+/// device ([`SERIAL`]): a device ready for `synchronous/start`.
+pub(crate) fn sign_in(base: String, email: &str, password: &str) -> Device {
     let mut d = Device {
         base,
         http: Client::new(),
@@ -157,34 +158,40 @@ fn run_device(base: String) -> Device {
     );
     d.ok(
         "/api/official/user/check/exists/server",
-        json!({"email": EMAIL, "version": "202407"}),
+        json!({"email": email, "version": "202407"}),
     );
     let ch = d.ok(
         "/api/official/user/query/random/code",
-        json!({"account": EMAIL, "version": "202407"}),
+        json!({"account": email, "version": "202407"}),
     );
     let code = ch["randomCode"].as_str().unwrap().to_string();
     // the real hash: sha256_hex(md5(password) + randomCode)
-    let hash = expected_login_hash(&md5_hex(PASSWORD), &code);
+    let hash = expected_login_hash(&md5_hex(password), &code);
     let login = d.ok(
         "/api/official/user/account/login/equipment",
-        json!({"account": EMAIL, "password": hash, "equipmentNo": SERIAL, "equipment": 3,
+        json!({"account": email, "password": hash, "equipmentNo": SERIAL, "equipment": 3,
                "loginMethod": "2", "timestamp": ch["timestamp"], "version": "202407"}),
     );
     d.token = login["token"].as_str().unwrap().to_string();
     d.secrets.push(d.token.clone());
     d.secrets.push(hash);
     d.secrets.push(code.clone());
-    d.secrets.push(md5_hex(PASSWORD));
+    d.secrets.push(md5_hex(password));
     d.ok(
         "/api/terminal/user/bindEquipment",
-        json!({"account": EMAIL, "equipmentNo": SERIAL, "flag": "1", "name": "Supernote Nomad",
+        json!({"account": email, "equipmentNo": SERIAL, "flag": "1", "name": "Supernote Nomad",
                "totalCapacity": "25485312", "version": "202407",
                "label": ["DOCUMENT/Document", "NOTE/Note", "NOTE/MyStyle", "EXPORT",
                          "SCREENSHOT", "INBOX"]}),
     );
     d.ok("/api/user/query", json!({"equipmentNo": SERIAL}));
+    d
+}
 
+/// [`sign_in`] with the test account, then the sync of `docs/sync-protocol.md` 3.4. Returns
+/// the device.
+fn run_device(base: String) -> Device {
+    let mut d = sign_in(base, EMAIL, PASSWORD);
     d.ok(
         "/api/file/2/files/synchronous/start",
         json!({"equipmentNo": SERIAL}),

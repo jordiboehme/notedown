@@ -72,6 +72,10 @@ pub enum Error {
     /// from the data folder. Device file routes answer `E0079` with `scan_hold`.
     #[error("device sync of account {0} is on hold: files are gone from the data folder")]
     ScanHold(String),
+    /// An upload's precondition (`If-None-Match: *`, `If-Match`) does not hold for the file
+    /// at this wire path. The REST upload answers 412 `precondition_failed`.
+    #[error("the file {0} is not what the upload expects (precondition failed)")]
+    PreconditionFailed(String),
     #[error("cannot listen on {addr}: {source}")]
     Bind {
         addr: std::net::SocketAddr,

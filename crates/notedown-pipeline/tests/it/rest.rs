@@ -851,3 +851,67 @@ fn a_flapping_network_is_said_once() {
     assert!(fake.requests() > 10, "{}", fake.requests());
     assert_eq!(said.count(&fake.url()), 1, "{:?}", said.lines());
 }
+
+/// The body of a request whose head is `head`, read from `stream` by its `Content-Length`.
+fn read_body(stream: &mut TcpStream, head: &str) -> Vec<u8> {
+    let len = head
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body).unwrap();
+    body
+}
+
+#[test]
+fn connect_leaves_the_scope_out() {
+    // A server that gives a code, keeps the login body and refuses the login.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let logins: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
+    let seen = logins.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let Some(head) = read_head(&mut stream) else {
+                continue;
+            };
+            let body = read_body(&mut stream, &head);
+            let reply = match target(&head) {
+                "/rest/v1/login/code" => json_answer(
+                    "200 OK",
+                    serde_json::json!({ "randomCode": "1234", "timestamp": 1 }),
+                ),
+                "/rest/v1/login" => {
+                    seen.lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(&body).unwrap());
+                    json_answer(
+                        "401 Unauthorized",
+                        serde_json::json!({ "error": "login_failed" }),
+                    )
+                }
+                _ => json_answer("404 Not Found", serde_json::json!({ "error": "no_route" })),
+            };
+            let _ = stream.write_all(&reply);
+        }
+    });
+    let local = tempfile::tempdir().unwrap();
+    let e = notedown_pipeline::connect::connect(
+        &url,
+        local.path(),
+        "jordi@example.org",
+        "secret",
+        "test",
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("refused"), "{e}");
+    let logins = logins.lock().unwrap();
+    assert_eq!(logins.len(), 1);
+    // An older server refuses unknown fields; a login without scope gives a read token.
+    assert!(logins[0].get("scope").is_none(), "{}", logins[0]);
+}

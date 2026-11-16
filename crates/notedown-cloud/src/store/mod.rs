@@ -19,6 +19,7 @@ mod path;
 pub mod recycle;
 pub mod retention;
 mod scan;
+pub mod trees;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -43,6 +44,7 @@ pub use recycle::{
 pub use scan::{SCAN_HOLD_FILE, ScanHold, ScanOptions, ScanReport};
 
 use hashes::HashCache;
+pub(crate) use hashes::mtime_ms;
 use ids::{Op, Registry};
 use list::Found;
 

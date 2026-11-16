@@ -37,6 +37,8 @@ The sync server also builds for a Raspberry Pi without the OCR part (see the [ge
 
 A pipeline on a Mac can read the server on the Pi over the network (`notedown connect`, see the [getting started guide](docs/getting-started.md#a-pipeline-on-a-mac)).
 
+An app can browse and manage the files of an account over the REST API (see the [REST API](docs/rest-api.md)).
+
 What comes next: a new vision engine that reads layout and content in two steps. There is no release yet, so you build it from source.
 Star the repo if you want to see where this goes.
 

@@ -460,12 +460,12 @@ mod tests {
         let key = ("jordi".to_string(), "BROKEN-1".to_string());
 
         assert!(d.list_readable("jordi").unwrap().is_empty());
-        assert_eq!(broken_keys(&d), [key.clone()]);
+        assert_eq!(broken_keys(&d), std::slice::from_ref(&key));
         // The same file again: no new warning.
         let stamp = d.broken.lock().unwrap()[&key];
         assert!(!d.warn_broken(&key.0, &key.1, stamp));
         assert!(d.list_readable("jordi").unwrap().is_empty());
-        assert_eq!(broken_keys(&d), [key.clone()]);
+        assert_eq!(broken_keys(&d), std::slice::from_ref(&key));
         // A clone (the shared state of the server) knows it too.
         assert!(!d.clone().warn_broken(&key.0, &key.1, stamp));
 

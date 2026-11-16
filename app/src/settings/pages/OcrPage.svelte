@@ -141,7 +141,8 @@
     {#if asking}
       <div class="confirm" role="alertdialog" aria-labelledby="remove-question">
         <p id="remove-question">
-          Remove the OCR model? Notedown deletes it from your Mac. OCR stops until you download it again.
+          Remove the OCR model? Notedown deletes it from your Mac. An OCR that runs now keeps the model it
+          loaded until it starts again. After that, OCR waits until you download the model again.
         </p>
         <div class="answers">
           <button type="button" class="button" onclick={() => (asking = false)}>Cancel</button>
@@ -161,7 +162,7 @@
 <style>
   .bar {
     width: 120px;
-    accent-color: var(--accent);
+    accent-color: var(--brand);
   }
 
   .confirm {

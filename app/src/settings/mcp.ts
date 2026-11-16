@@ -16,7 +16,11 @@ export function mcpConfig(sidecar: string, dataDir: string): string {
  * Downloads from a temporary place (translocation), and an app outside Applications may move.
  */
 export function pathWarning(sidecar: string): string | null {
-  if (sidecar.startsWith("/private/var/folders/")) {
+  const translocated =
+    sidecar.startsWith("/private/var/folders/") ||
+    sidecar.startsWith("/var/folders/") ||
+    sidecar.includes("/AppTranslocation/");
+  if (translocated) {
     return "Notedown runs from a temporary place, so this path will not work for long. Move Notedown to Applications, open it from there and copy the config again.";
   }
   if (!sidecar.startsWith("/Applications/")) {

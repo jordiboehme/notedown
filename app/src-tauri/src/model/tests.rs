@@ -21,11 +21,13 @@ fn sidecar(dir: &Path, pull: &str) -> SpawnFn {
 echo "$*" >> "{d}/calls"
 case "$1 $2" in
 "model path")
+  if [ -f "{d}/slow-path" ]; then sleep 0.315; fi
   echo "cache: {d}"
   echo "model: {d}/m.gguf"
   echo "mmproj: {d}/p.gguf"
   ;;
 "model verify")
+  if [ -f "{d}/slow-verify" ]; then exec sleep 310; fi
   if [ -f "{d}/m.gguf" ]; then echo "m.gguf: ok"; exit 0; fi
   echo "m.gguf: the model file is missing"; exit 1
   ;;
@@ -299,4 +301,79 @@ fn a_sidecar_that_cannot_answer_is_a_problem() {
     assert!(!state.installed);
     assert!(state.problem.is_some());
     assert!(control.pull().is_err());
+}
+
+/// Waits until the fake sidecar was called with `what`.
+fn called(dir: &Path, what: &str) {
+    let start = Instant::now();
+    while !fs::read_to_string(dir.join("calls")).is_ok_and(|c| c.contains(what)) {
+        assert!(start.elapsed() < WAIT, "no call of {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn no_pull_starts_while_the_model_is_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (control, _) = control(sidecar(dir.path(), "  exit 0"));
+    fs::write(dir.path().join("slow-path"), "").unwrap();
+    fs::write(dir.path().join("m.gguf"), "x").unwrap();
+    let remover = control.clone();
+    let removing = std::thread::spawn(move || remover.remove());
+    called(dir.path(), "model path");
+    assert_eq!(control.pull(), Err(REMOVE_RUNS.to_owned()));
+    assert_eq!(control.remove().unwrap_err(), REMOVE_RUNS);
+    let state = removing.join().unwrap().unwrap();
+    assert!(!state.installed);
+    assert!(!dir.path().join("m.gguf").exists());
+}
+
+#[test]
+fn progress_after_a_pause_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    // The pull still says something while it ends.
+    let pull = r#"  trap 'echo "{\"file\":\"m.gguf\",\"done\":2,\"total\":100}"; exit 0' TERM
+  sleep 310 &
+  echo '{"file":"m.gguf","done":1,"total":100}'
+  wait"#;
+    let (control, events) = control(sidecar(dir.path(), pull));
+    control.pull().unwrap();
+    wait_for(&events, is_progress);
+    control.pause();
+    std::thread::sleep(Duration::from_millis(100));
+    let progress = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| is_progress(e))
+        .count();
+    assert_eq!(progress, 1, "{:?}", events.lock().unwrap());
+    let state = control.state();
+    assert!(!state.pulling);
+    assert_eq!(state.progress, None);
+    assert!(gone("sleep 310"));
+}
+
+#[test]
+fn quit_stops_a_running_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let (control, _) = control(sidecar(dir.path(), "  exit 0"));
+    fs::write(dir.path().join("slow-verify"), "").unwrap();
+    let checker = control.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(checker.state());
+    });
+    called(dir.path(), "model verify");
+    control.quit();
+    let ended = rx.recv_timeout(Duration::from_secs(3));
+    // Never leave the fake behind, also when the check fails.
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "sleep 310"])
+        .status();
+    let state = ended.expect("the check still runs after Quit");
+    assert!(!state.installed);
+    assert!(state.problem.is_some());
+    // After Quit no check starts.
+    assert!(control.state().problem.is_some());
 }

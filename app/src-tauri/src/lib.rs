@@ -200,7 +200,8 @@ pub fn reprobe_outside(app: &AppHandle) {
             app.try_state::<commands::ConfigState>(),
             app.try_state::<Arc<Processes>>(),
         ) {
-            processes.reprobe(&config.current());
+            let config = config.reader();
+            processes.reprobe_with(|| config.current());
         }
     });
 }
@@ -249,11 +250,11 @@ fn model_control(app: AppHandle, spawn: process::SpawnFn) -> ModelControl {
 fn supervise(app: AppHandle) {
     std::thread::spawn(move || {
         let processes = app.state::<Arc<Processes>>().inner().clone();
-        let config = || app.state::<commands::ConfigState>().current();
-        processes.start_all(&config());
+        let config = app.state::<commands::ConfigState>().reader();
+        processes.start_with(|| config.current());
         loop {
             std::thread::sleep(REPROBE_EVERY);
-            processes.reprobe(&config());
+            processes.reprobe_with(|| config.current());
         }
     });
 }
@@ -335,6 +336,127 @@ fn report_states(app: AppHandle, processes: &Processes, poller: Poller) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    /// The app commands a window may call, from all capability files that name it.
+    fn granted(window: &str) -> BTreeSet<String> {
+        let files = [
+            include_str!("../capabilities/default.json"),
+            include_str!("../capabilities/panel.json"),
+            include_str!("../capabilities/settings.json"),
+        ];
+        let mut commands = BTreeSet::new();
+        for text in files {
+            let cap: serde_json::Value = serde_json::from_str(text).unwrap();
+            let windows = cap["windows"].as_array().unwrap();
+            if !windows.iter().any(|w| w == window) {
+                continue;
+            }
+            for permission in cap["permissions"].as_array().unwrap() {
+                let name = permission.as_str().unwrap();
+                // App permissions have no plugin prefix: `allow-get-status`.
+                if let Some(command) = name.strip_prefix("allow-") {
+                    commands.insert(command.replace('-', "_"));
+                }
+            }
+        }
+        commands
+    }
+
+    /// The commands build.rs gives permissions to, in its `COMMANDS` list.
+    fn manifest_commands() -> BTreeSet<String> {
+        let build = include_str!("../build.rs");
+        let start = build
+            .find("const COMMANDS")
+            .expect("no COMMANDS in build.rs");
+        let list = &build[start..build[start..].find("];").unwrap() + start];
+        list.split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn set(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    const SETTINGS_ONLY: [&str; 16] = [
+        "get_config",
+        "set_mode",
+        "set_start_view",
+        "start_processes",
+        "stop_processes",
+        "set_autostart",
+        "get_autostart",
+        "log_out",
+        "model_pull",
+        "model_pause",
+        "model_remove",
+        "model_state",
+        "mcp_info",
+        "process_logs",
+        "open_link",
+        "process_states",
+    ];
+
+    #[test]
+    fn each_window_may_call_only_its_commands() {
+        assert_eq!(
+            granted("panel"),
+            set(&[
+                "get_status",
+                "open_library",
+                "open_settings",
+                "request_quit",
+                "quit_app"
+            ])
+        );
+        assert_eq!(granted("library"), set(&[]));
+        let mut settings = set(&SETTINGS_ONLY);
+        settings.remove("process_states");
+        settings.insert("get_status".into());
+        assert_eq!(granted("settings"), settings);
+        for command in SETTINGS_ONLY {
+            assert!(!granted("panel").contains(command), "panel has {command}");
+            assert!(
+                !granted("library").contains(command),
+                "library has {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_app_command_is_in_the_manifest() {
+        let all = set(&[
+            "get_config",
+            "set_mode",
+            "set_start_view",
+            "start_processes",
+            "stop_processes",
+            "process_states",
+            "get_status",
+            "open_library",
+            "open_settings",
+            "quit_app",
+            "request_quit",
+            "log_out",
+            "process_logs",
+            "mcp_info",
+            "open_link",
+            "get_autostart",
+            "set_autostart",
+            "model_state",
+            "model_pull",
+            "model_pause",
+            "model_remove",
+        ]);
+        assert_eq!(manifest_commands(), all);
+        // Every granted command is a real one.
+        for window in ["panel", "library", "settings"] {
+            assert!(granted(window).is_subset(&all), "{window}");
+        }
+    }
 
     #[test]
     fn the_identifier_is_notedowns() {

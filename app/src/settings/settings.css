@@ -10,7 +10,9 @@
   --secondary: rgba(0, 0, 0, 0.5);
   --tertiary: rgba(0, 0, 0, 0.3);
   --accent: #007aff;
-  --selected: #0064e1;
+  /* Notedown's own accents (app.css), as in the panel: ink on paper in light mode. */
+  --brand: var(--color-ink);
+  --on-brand: var(--color-paper);
   --good: #34c759;
   --warning: #ff9500;
   --bad: #ff3b30;
@@ -37,7 +39,8 @@
     --secondary: rgba(255, 255, 255, 0.55);
     --tertiary: rgba(255, 255, 255, 0.25);
     --accent: #0a84ff;
-    --selected: #0a5fcc;
+    --brand: var(--color-paper);
+    --on-brand: var(--color-ink);
     --good: #30d158;
     --warning: #ff9f0a;
     --bad: #ff453a;
@@ -73,8 +76,8 @@
 }
 
 .settings .button.strong {
-  color: #fff;
-  background: var(--accent);
+  color: var(--on-brand);
+  background: var(--brand);
   border-color: transparent;
 }
 

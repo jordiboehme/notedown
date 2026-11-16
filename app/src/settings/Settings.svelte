@@ -167,8 +167,8 @@
   }
 
   .entry[aria-current="page"] {
-    color: #fff;
-    background: var(--selected);
+    color: var(--on-brand);
+    background: var(--brand);
   }
 
   .entry:focus-visible {

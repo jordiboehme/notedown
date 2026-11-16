@@ -334,3 +334,30 @@ fn remote_mode_reclaims_and_runs_no_server() {
     assert_eq!(p.server().state(), ChildState::Stopped);
     assert_eq!(p.pipeline().state(), ChildState::NotConnected);
 }
+
+#[test]
+fn a_start_reads_the_config_inside_its_lock() {
+    let rig = Rig::new();
+    rig.listen_on(free_port());
+    let p = rig.processes(Path::new("/bin/sleep"));
+    // The config is read only after the start holds the lock, so an older snapshot cannot
+    // win against a newer start or a stop.
+    let mut held = None;
+    p.start_with(|| {
+        held = Some(p.ops.try_lock().is_err());
+        rig.config()
+    });
+    assert_eq!(held, Some(true), "the config was read outside the lock");
+    running_pid(p.server());
+    let mut held = None;
+    p.reprobe_with(|| {
+        held = Some(p.ops.try_lock().is_err());
+        rig.config()
+    });
+    assert_eq!(
+        held,
+        Some(true),
+        "the probe read the config outside the lock"
+    );
+    p.stop_all();
+}

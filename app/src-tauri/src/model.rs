@@ -10,7 +10,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdout, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Output, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -24,6 +24,11 @@ pub const MODEL_FAILED_EVENT: &str = "model-failed";
 
 /// What a second Download or a Remove during a download hears.
 pub const PULL_RUNS: &str = "A download runs already.";
+
+/// What Download or a second Remove hears while the model is removed.
+pub const REMOVE_RUNS: &str = "The model is being removed.";
+
+const QUITTING: &str = "Notedown is quitting.";
 
 /// One progress line of `model pull --json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -103,6 +108,11 @@ struct Run {
     progress: Option<Progress>,
     /// After Quit nothing starts.
     quitting: bool,
+    /// Remove runs: no download starts meanwhile.
+    removing: bool,
+    /// The process groups of the running `model path` and `model verify` calls, until each is
+    /// reaped. Quit ends them.
+    checks: Vec<u32>,
 }
 
 /// What a model file looks like on disk: a change means it must be verified again.
@@ -170,10 +180,13 @@ impl ModelControl {
     pub fn pull(&self) -> Result<(), String> {
         let mut run = lock(&self.inner.run);
         if run.quitting {
-            return Err("Notedown is quitting.".to_owned());
+            return Err(QUITTING.to_owned());
         }
         if run.busy {
             return Err(PULL_RUNS.to_owned());
+        }
+        if run.removing {
+            return Err(REMOVE_RUNS.to_owned());
         }
         let mut command = (self.inner.spawn)(&args(&["model", "pull", "--json"]));
         command
@@ -184,13 +197,10 @@ impl ModelControl {
         let mut child = command
             .spawn()
             .map_err(|e| format!("notedown could not start: {e}"))?;
-        *run = Run {
-            busy: true,
-            pgid: Some(child.id()),
-            stop_requested: false,
-            progress: None,
-            quitting: false,
-        };
+        run.busy = true;
+        run.pgid = Some(child.id());
+        run.stop_requested = false;
+        run.progress = None;
         drop(run);
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -204,17 +214,39 @@ impl ModelControl {
         self.inner.stop();
     }
 
-    /// Stops a running download for good: nothing starts after it.
+    /// Stops a running download and the running checks for good: nothing starts after it.
     pub fn quit(&self) {
-        lock(&self.inner.run).quitting = true;
+        {
+            let mut run = lock(&self.inner.run);
+            run.quitting = true;
+            // A check has nothing to save. Each group is still unreaped while it is listed.
+            for pgid in &run.checks {
+                let _ = process::signal_group(*pgid, libc::SIGKILL);
+            }
+        }
         self.inner.stop();
     }
 
-    /// Deletes the model files and the parts of a download. Refused while a download runs.
+    /// Deletes the model files and the parts of a download. Refused while a download runs;
+    /// no download starts until it is over.
     pub fn remove(&self) -> Result<ModelState, String> {
-        if lock(&self.inner.run).busy {
-            return Err(PULL_RUNS.to_owned());
+        {
+            let mut run = lock(&self.inner.run);
+            if run.busy {
+                return Err(PULL_RUNS.to_owned());
+            }
+            if run.removing {
+                return Err(REMOVE_RUNS.to_owned());
+            }
+            run.removing = true;
         }
+        let removed = self.delete_files();
+        lock(&self.inner.run).removing = false;
+        removed?;
+        Ok(self.inner.state())
+    }
+
+    fn delete_files(&self) -> Result<(), String> {
         let paths = self.inner.paths()?;
         for path in paths.all() {
             match fs::remove_file(&path) {
@@ -224,7 +256,7 @@ impl ModelControl {
             }
         }
         *lock(&self.inner.verified) = None;
-        Ok(self.inner.state())
+        Ok(())
     }
 }
 
@@ -267,27 +299,72 @@ impl Inner {
             .map(|(_, ok)| *ok);
         state.installed = match known {
             Some(ok) => ok,
-            None => {
-                match process::run_bounded(&self.spawn, &args(&["model", "verify"]), CHECK_TIMEOUT)
-                {
-                    Ok(output) => {
-                        let ok = output.status.success();
-                        *lock(&self.verified) = Some((marks, ok));
-                        ok
-                    }
-                    Err(why) => {
-                        state.problem = Some(format!("The model could not be checked: {why}"));
-                        false
-                    }
+            None => match self.check(&["model", "verify"]) {
+                Ok(output) => {
+                    let ok = output.status.success();
+                    *lock(&self.verified) = Some((marks, ok));
+                    ok
                 }
-            }
+                Err(why) => {
+                    state.problem = Some(format!("The model could not be checked: {why}"));
+                    false
+                }
+            },
         };
         state
     }
 
+    /// Runs `model path` or `model verify` in a process group of its own that Quit can end.
+    /// Refused after Quit; a call that Quit ended is an error, never an answer.
+    fn check(&self, list: &[&str]) -> Result<Output, String> {
+        let mut command = (self.spawn)(&args(list));
+        command
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = {
+            let mut run = lock(&self.run);
+            if run.quitting {
+                return Err(QUITTING.to_owned());
+            }
+            let child = command
+                .spawn()
+                .map_err(|e| format!("notedown could not start: {e}"))?;
+            run.checks.push(child.id());
+            child
+        };
+        let pid = child.id();
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                let output = child.wait_with_output();
+                // Reaped: no signal to this group from now on.
+                lock(&self.run).checks.retain(|p| *p != pid);
+                let _ = tx.send(output);
+            });
+            let output = match rx.recv_timeout(CHECK_TIMEOUT) {
+                Ok(output) => output.map_err(|e| format!("notedown could not be read: {e}")),
+                Err(_) => {
+                    let run = lock(&self.run);
+                    if run.checks.contains(&pid) {
+                        let _ = process::signal_group(pid, libc::SIGKILL);
+                    }
+                    drop(run);
+                    Err("it did not answer in time".to_owned())
+                }
+            };
+            if lock(&self.run).quitting {
+                return Err(QUITTING.to_owned());
+            }
+            output
+        })
+    }
+
     /// The model files, from `model path`.
     fn paths(&self) -> Result<Paths, String> {
-        let output = process::run_bounded(&self.spawn, &args(&["model", "path"]), CHECK_TIMEOUT)
+        let output = self
+            .check(&["model", "path"])
             .map_err(|why| format!("The model folder is not known: {why}"))?;
         if !output.status.success() {
             return Err(format!(
@@ -404,13 +481,23 @@ impl Inner {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             return;
         };
-        if let Some(path) = value.get("ready").and_then(|v| v.as_str()) {
-            *lock(ready) = Some(path.to_owned());
+        if value.get("ready").is_none() {
+            let Ok(progress) = serde_json::from_value::<Progress>(value) else {
+                return;
+            };
+            {
+                let mut run = lock(&self.run);
+                if run.stop_requested {
+                    // Paused: what it says while it ends is no progress.
+                    return;
+                }
+                run.progress = Some(progress.clone());
+            }
+            (self.sink)(&ModelEvent::Progress(progress));
             return;
         }
-        if let Ok(progress) = serde_json::from_value::<Progress>(value) {
-            lock(&self.run).progress = Some(progress.clone());
-            (self.sink)(&ModelEvent::Progress(progress));
+        if let Some(path) = value.get("ready").and_then(|v| v.as_str()) {
+            *lock(ready) = Some(path.to_owned());
         }
     }
 

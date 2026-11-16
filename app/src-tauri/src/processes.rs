@@ -125,10 +125,18 @@ impl Processes {
     /// 2. stops what an earlier run of the app left behind (its pid files);
     /// 3. per child, probes for another Notedown: found, the child is `Outside`; else it starts.
     pub fn start_all(&self, config: &AppConfig) {
+        self.start_with(|| config.clone());
+    }
+
+    /// [`start_all`](Self::start_all) with the config read once the start holds the lock, so
+    /// an older snapshot cannot win against a newer start or a stop. The app passes the live
+    /// config.
+    pub fn start_with(&self, read: impl FnOnce() -> AppConfig) {
         let _ops = lock(&self.ops);
         if self.quitting.load(Ordering::SeqCst) {
             return;
         }
+        let config = &read();
         self.stop_both();
         std::thread::scope(|s| {
             for sup in [&self.server, &self.pipeline] {
@@ -143,12 +151,18 @@ impl Processes {
     /// Probes again what is `Outside` and starts it when the other process is gone. Skipped
     /// while a start or a stop runs.
     pub fn reprobe(&self, config: &AppConfig) {
+        self.reprobe_with(|| config.clone());
+    }
+
+    /// [`reprobe`](Self::reprobe) with the config read inside the lock.
+    pub fn reprobe_with(&self, read: impl FnOnce() -> AppConfig) {
         let Ok(_ops) = self.ops.try_lock() else {
             return;
         };
         if self.quitting.load(Ordering::SeqCst) {
             return;
         }
+        let config = &read();
         let plan = process::plan(config, self.parent);
         for (sup, launch) in [
             (&self.server, &plan.server),

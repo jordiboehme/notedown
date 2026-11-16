@@ -24,6 +24,11 @@ describe("the MCP config", () => {
       "/private/var/folders/xy/abc/T/AppTranslocation/1234/d/Notedown.app/Contents/MacOS/notedown";
     expect(pathWarning(translocated)).toMatch(/Applications/);
     expect(pathWarning(translocated)).toMatch(/temporary/);
+    // The same place without /private, and a translocated mount elsewhere.
+    expect(pathWarning("/var/folders/xy/abc/T/AppTranslocation/1234/d/Notedown.app/Contents/MacOS/notedown")).toMatch(
+      /temporary/,
+    );
+    expect(pathWarning("/Volumes/x/AppTranslocation/1234/d/Notedown.app/Contents/MacOS/notedown")).toMatch(/temporary/);
     expect(pathWarning("/Users/me/Downloads/Notedown.app/Contents/MacOS/notedown")).toMatch(/not in Applications/);
     expect(pathWarning("/Applications/Notedown.app/Contents/MacOS/notedown")).toBeNull();
   });

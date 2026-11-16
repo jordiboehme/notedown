@@ -97,11 +97,7 @@ impl ConfigState {
         let server_url = server_url
             .map(|u| u.trim().to_owned())
             .filter(|u| !u.is_empty());
-        if mode == Mode::Remote
-            && !server_url
-                .as_deref()
-                .is_some_and(|u| u.starts_with("http://") || u.starts_with("https://"))
-        {
+        if mode == Mode::Remote && !server_url.as_deref().is_some_and(is_web_address) {
             return Err(NEEDS_ADDRESS.to_owned());
         }
         let data_dir = data_dir.map(|d| expand_home(&d)).transpose()?;
@@ -141,6 +137,21 @@ pub const ABOUT_LINKS: [&str; 2] = [
 
 /// How many lines of each child's log the Server page shows.
 pub const LOG_SHOWN: usize = 30;
+
+/// An `http://` or `https://` address with a host.
+fn is_web_address(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    // The URL parser reads `http:///x` as the host `x`; the text must name the host itself.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or("");
+    let named = !host.is_empty() && !host.starts_with(':');
+    named && reqwest::Url::parse(url).is_ok_and(|u| u.host_str().is_some_and(|h| !h.is_empty()))
+}
 
 /// `~` and `~/...` are under the home folder; the result must be absolute.
 fn expand_home(dir: &Path) -> Result<PathBuf, String> {
@@ -188,6 +199,28 @@ pub fn get_config(state: State<'_, ConfigState>) -> Result<AppConfig, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Saves the new place of the server; when the mode, the folder or the address changed, runs
+/// `restart` on a blocking thread of its own and waits for it. A refused change restarts
+/// nothing.
+pub async fn set_mode_then(
+    state: &ConfigState,
+    mode: Mode,
+    data_dir: Option<PathBuf>,
+    server_url: Option<String>,
+    restart: impl FnOnce() + Send + 'static,
+) -> Result<AppConfig, String> {
+    let before = state.current();
+    let config = state.set_mode(mode, data_dir, server_url)?;
+    let changed = (before.mode, &before.data_dir, &before.server_url)
+        != (config.mode, &config.data_dir, &config.server_url);
+    if changed {
+        tauri::async_runtime::spawn_blocking(restart)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(config)
+}
+
 /// Sets where the server runs (the mode control on the Server page). When the mode, the folder
 /// or the address changed, both children start afresh for it, off the main thread: the start
 /// first stops what runs.
@@ -199,18 +232,13 @@ pub async fn set_mode(
     data_dir: Option<PathBuf>,
     server_url: Option<String>,
 ) -> Result<AppConfig, String> {
-    let before = state.current();
-    let config = state.set_mode(mode, data_dir, server_url)?;
-    let changed = (before.mode, &before.data_dir, &before.server_url)
-        != (config.mode, &config.data_dir, &config.server_url);
-    if changed {
-        let processes = processes.inner().clone();
-        let next = config.clone();
-        tauri::async_runtime::spawn_blocking(move || processes.start_all(&next))
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(config)
+    let processes = processes.inner().clone();
+    let reader = state.reader();
+    // The start reads the config inside its lock: the newest place wins.
+    set_mode_then(&state, mode, data_dir, server_url, move || {
+        processes.start_with(|| reader.current())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -228,10 +256,10 @@ pub async fn start_processes(
     config: State<'_, ConfigState>,
     processes: State<'_, Arc<Processes>>,
 ) -> Result<ProcessStates, String> {
-    let config = config.current();
+    let config = config.reader();
     let processes = processes.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        processes.start_all(&config);
+        processes.start_with(|| config.current());
         processes.states()
     })
     .await
@@ -529,6 +557,76 @@ mod tests {
             .set_mode(Mode::Local, Some("/data/y".into()), None)
             .unwrap();
         assert_eq!((cfg.account, cfg.email), (None, None));
+    }
+
+    #[test]
+    fn an_address_needs_a_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        for url in ["http://", "https://", "http:///rest/v1", "https://:19072"] {
+            assert_eq!(
+                state
+                    .set_mode(Mode::Remote, None, Some(url.to_owned()))
+                    .unwrap_err(),
+                NEEDS_ADDRESS,
+                "{url}"
+            );
+        }
+        assert!(
+            state
+                .set_mode(Mode::Remote, None, Some("http://pi.local:19072".into()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_new_place_restarts_the_children_off_the_calling_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        let caller = std::thread::current().id();
+        let runs: Arc<Mutex<Vec<(std::thread::ThreadId, AppConfig)>>> = Arc::default();
+        let restart = |state: &ConfigState| {
+            let runs = runs.clone();
+            let reader = state.reader();
+            move || {
+                runs.lock()
+                    .unwrap()
+                    .push((std::thread::current().id(), reader.current()))
+            }
+        };
+        let set = |mode, dir: &str| {
+            tauri::async_runtime::block_on(set_mode_then(
+                &state,
+                mode,
+                Some(dir.into()),
+                None,
+                restart(&state),
+            ))
+            .unwrap()
+        };
+        set(Mode::Local, "/data/a");
+        // The same place again restarts nothing.
+        set(Mode::Local, "/data/a");
+        set(Mode::Local, "/data/b");
+        let runs = runs.lock().unwrap();
+        assert_eq!(runs.len(), 2);
+        for (thread, _) in runs.iter() {
+            assert_ne!(*thread, caller);
+        }
+        // The restart reads the config as it is then.
+        assert_eq!(runs[1].1.data_dir, PathBuf::from("/data/b"));
+        // A refused change restarts nothing.
+        drop(runs);
+        assert!(
+            tauri::async_runtime::block_on(set_mode_then(
+                &state,
+                Mode::Remote,
+                None,
+                None,
+                restart(&state)
+            ))
+            .is_err()
+        );
     }
 
     #[test]

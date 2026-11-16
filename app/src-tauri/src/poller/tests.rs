@@ -566,10 +566,37 @@ fn the_account_call_reads_the_answer() {
         sources.account(&base(&removed), Some(&token)),
         AccountAnswer::Failed("the account was removed".into())
     );
-    let down = TestServer::start(Some(http("503 Service Unavailable", "{}")));
+    // A proxy whose server is down: the server does not answer.
+    for (status, code) in [
+        ("502 Bad Gateway", 502),
+        ("503 Service Unavailable", 503),
+        ("504 Gateway Timeout", 504),
+    ] {
+        let proxy = TestServer::start(Some(http(status, "<html>down</html>")));
+        let b = base(&proxy);
+        assert_eq!(
+            sources.account(&b, Some(&token)),
+            AccountAnswer::Unreachable(format!("the server behind {b} does not answer ({code})"))
+        );
+    }
+    let empty = TestServer::start(Some(http("503 Service Unavailable", "{}")));
+    assert!(matches!(
+        sources.account(&base(&empty), Some(&token)),
+        AccountAnswer::Unreachable(_)
+    ));
+    // A Notedown server that answers 503 itself is there.
+    let damaged = TestServer::start(Some(http(
+        "503 Service Unavailable",
+        r#"{"error": "store_damaged"}"#,
+    )));
     assert_eq!(
-        sources.account(&base(&down), Some(&token)),
+        sources.account(&base(&damaged), Some(&token)),
         AccountAnswer::Failed("the server answered 503".into())
+    );
+    let teapot = TestServer::start(Some(http("500 Internal Server Error", "{}")));
+    assert_eq!(
+        sources.account(&base(&teapot), Some(&token)),
+        AccountAnswer::Failed("the server answered 500".into())
     );
     let garbage = TestServer::start(Some(http("200 OK", "[1,2")));
     let AccountAnswer::Failed(text) = sources.account(&base(&garbage), Some(&token)) else {
@@ -631,4 +658,69 @@ fn the_token_goes_only_into_the_header() {
         heads[0]
     );
     assert!(!heads[1].contains("authorization"), "{}", heads[1]);
+}
+
+#[test]
+fn a_failed_request_shows_no_credentials_of_the_address() {
+    // A server that sends the client round in circles until it gives up.
+    let looping = TestServer::start(Some(
+        "HTTP/1.1 302 Found\r\nlocation: /rest/v1/account\r\ncontent-length: 0\r\n\
+         connection: close\r\n\r\n"
+            .to_owned(),
+    ));
+    let sources = RealSources::new(crate::process::spawn_program("/bin/false".into()));
+    let base = format!("http://user:hunter2@127.0.0.1:{}/rest/v1", looping.port);
+    let answer = sources.account(&base, None);
+    let AccountAnswer::Failed(text) = &answer else {
+        panic!("{answer:?}")
+    };
+    assert!(text.starts_with("the request failed"), "{text}");
+    assert!(!text.contains("hunter2"), "{text}");
+    assert!(!text.contains("127.0.0.1"), "no address at all: {text}");
+}
+
+#[test]
+fn the_existing_setup_is_looked_at_per_poll() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = local_config(None);
+    config.data_dir = dir.path().to_owned();
+    let rig = Rig::new(config);
+    rig.tick();
+    assert!(!rig.poller.status().existing.server);
+    std::fs::write(dir.path().join("server.toml"), "").unwrap();
+    rig.advance(SEC);
+    rig.tick();
+    assert!(
+        !rig.poller.status().existing.server,
+        "no new look between two polls"
+    );
+    rig.advance(60 * SEC);
+    rig.tick();
+    assert!(
+        rig.poller.status().existing.server,
+        "the next poll looks again"
+    );
+
+    // Without a mode nothing is polled, but the setup still needs to know what is there.
+    let empty = tempfile::tempdir().unwrap();
+    std::fs::write(empty.path().join("pipeline.toml"), "").unwrap();
+    let rig = Rig::new(AppConfig {
+        data_dir: empty.path().to_owned(),
+        ..AppConfig::default()
+    });
+    rig.tick();
+    assert!(rig.poller.status().existing.pipeline);
+}
+
+#[test]
+fn an_address_in_a_line_has_no_credentials() {
+    assert_eq!(
+        shown("https://user:hunter2@notes.example.org/rest/v1"),
+        "https://notes.example.org/rest/v1"
+    );
+    assert_eq!(
+        shown("http://127.0.0.1:19072/rest/v1"),
+        "http://127.0.0.1:19072/rest/v1"
+    );
+    assert_eq!(shown("not a url"), "the server");
 }

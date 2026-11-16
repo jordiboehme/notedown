@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::Duration;
 
-use crate::config::{self, AppConfig, Mode};
+use crate::config::{self, AppConfig, ExistingSetup, Mode};
 use crate::process::SpawnFn;
 use crate::processes::ProcessStates;
 use crate::serve_info::{self, ServeInfo};
@@ -129,7 +129,18 @@ struct State {
     pipeline: Slot<PipelineCall>,
     account: Slot<AccountPoll>,
     status: Option<Status>,
+    existing: Option<Existing>,
 }
+
+/// What the data folder held when it was last looked at.
+struct Existing {
+    dir: std::path::PathBuf,
+    setup: ExistingSetup,
+    at_ms: u64,
+}
+
+/// Without a mode nothing is polled; the setup still sees a new folder within this time.
+const EXISTING_EVERY_MS: u64 = 15_000;
 
 /// One kind of poll: its last result, whether a call runs and when the last one ended.
 struct Slot<T> {
@@ -297,6 +308,25 @@ impl Inner {
                 polling && base.is_some() && state.account.due(now, account_every(visible));
             state.pipeline.busy |= pipeline;
             state.account.busy |= account;
+            // The data folder is looked at once per `pipeline status` call, and now and then
+            // while there is no mode; never on each tick.
+            let dir = &inputs.config.data_dir;
+            let stale = match &state.existing {
+                None => true,
+                Some(e) if &e.dir != dir => true,
+                Some(e) => {
+                    pipeline
+                        || (inputs.config.mode == Mode::NotSet
+                            && now >= e.at_ms.saturating_add(EXISTING_EVERY_MS))
+                }
+            };
+            if stale {
+                state.existing = Some(Existing {
+                    dir: dir.clone(),
+                    setup: config::existing_setup(dir),
+                    at_ms: now,
+                });
+            }
             (pipeline, account)
         };
         if pipeline {
@@ -378,7 +408,11 @@ impl Inner {
             Parts {
                 config: inputs.config.clone(),
                 config_reset: inputs.config_reset,
-                existing: config::existing_setup(&inputs.config.data_dir),
+                existing: match &state.existing {
+                    Some(e) if e.dir == inputs.config.data_dir => e.setup,
+                    // Only before the first tick after a new folder.
+                    _ => config::existing_setup(&inputs.config.data_dir),
+                },
                 server: inputs.processes.server.clone(),
                 pipeline: inputs.processes.pipeline.clone(),
                 device_urls: inputs.serve_info.device_urls.clone(),
@@ -449,9 +483,12 @@ impl Sources for RealSources {
                 return AccountAnswer::Unreachable("no answer in time".to_owned());
             }
             Err(e) if e.is_connect() => {
-                return AccountAnswer::Unreachable(format!("no connection to {base}"));
+                return AccountAnswer::Unreachable(format!("no connection to {}", shown(base)));
             }
-            Err(e) => return AccountAnswer::Failed(format!("the request failed: {e}")),
+            // Without the address: it could carry a user and a password.
+            Err(e) => {
+                return AccountAnswer::Failed(format!("the request failed: {}", e.without_url()));
+            }
         };
         match response.status().as_u16() {
             200 => match response.bytes() {
@@ -466,8 +503,38 @@ impl Sources for RealSources {
             },
             401 => AccountAnswer::Refused,
             410 => AccountAnswer::Failed("the account was removed".to_owned()),
+            // A proxy in front of a server that is down. A Notedown server that answers 503
+            // itself (store_damaged) sends its JSON error and is there.
+            code @ (502..=504) => {
+                let own_error = code == 503
+                    && response
+                        .bytes()
+                        .ok()
+                        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                        .is_some_and(|v| v.get("error").is_some());
+                if own_error {
+                    AccountAnswer::Failed(format!("the server answered {code}"))
+                } else {
+                    AccountAnswer::Unreachable(format!(
+                        "the server behind {} does not answer ({code})",
+                        shown(base)
+                    ))
+                }
+            }
             code => AccountAnswer::Failed(format!("the server answered {code}")),
         }
+    }
+}
+
+/// The address for a line of text, without a user or a password in it.
+fn shown(base: &str) -> String {
+    match reqwest::Url::parse(base) {
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.as_str().trim_end_matches('/').to_owned()
+        }
+        Err(_) => "the server".to_owned(),
     }
 }
 

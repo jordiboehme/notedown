@@ -366,6 +366,23 @@ fn status_of_an_unreachable_server() {
         vec![Attention::ServerUnreachable]
     );
 
+    // A proxy in front of a server that is down answers 502: the server does not answer.
+    remote.account = Some(AccountPoll {
+        had_token: true,
+        answer: AccountAnswer::Unreachable(
+            "the server behind https://notes.example.org/rest/v1 does not answer (502)".into(),
+        ),
+        unreachable_since_ms: Some(NOW - MIN),
+    });
+    let s = status_from(&remote, NOW);
+    assert_eq!(s.server.line, "https://notes.example.org does not answer");
+    assert!(s.attention.is_empty());
+    remote.account.as_mut().unwrap().unreachable_since_ms = Some(NOW - 2 * MIN - 1);
+    assert_eq!(
+        status_from(&remote, NOW).attention,
+        vec![Attention::ServerUnreachable]
+    );
+
     // Remote and answering, and before the first poll.
     remote.account = Some(AccountPoll {
         had_token: true,

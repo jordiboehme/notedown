@@ -670,6 +670,31 @@ impl Worker {
         }
     }
 
+    /// Says once (while the list stays the same) the accounts that have a Markdown folder but
+    /// are not served: a typo in a slug, or an account that is gone.
+    fn say_unserved(&self, served: &[String]) {
+        let unserved: Vec<&str> = self
+            .setup
+            .cfg
+            .markdown_dirs
+            .keys()
+            .filter(|slug| !served.contains(slug))
+            .map(String::as_str)
+            .collect();
+        if unserved.is_empty() {
+            self.settled("markdown:unserved");
+            return;
+        }
+        self.say_once(
+            "markdown:unserved",
+            format!(
+                "notedown pipeline: a Markdown folder is given for {}, but this pipeline does \
+                 not serve that account; it gets no files",
+                unserved.join(", ")
+            ),
+        );
+    }
+
     /// Before the store of account `slug` is deleted: drops its writer and removes the
     /// Markdown files its manifest lists, with the folders the writer made. They hold text of
     /// a store that is gone. Best effort: a failure is said and the store goes all the same.
@@ -704,7 +729,15 @@ impl Worker {
         let lock = self.take_lock()?;
         self.source_seen(&lock, None);
         let mut stores = BTreeMap::new();
-        let (progress, _) = self.pass(&lock, &mut stores, &accounts, ignore_settle, &|| false)?;
+        let served: Vec<String> = accounts.iter().map(|a| a.slug.clone()).collect();
+        let (progress, _) = self.pass(
+            &lock,
+            &mut stores,
+            &accounts,
+            &served,
+            ignore_settle,
+            &|| false,
+        )?;
         Ok(progress)
     }
 
@@ -713,6 +746,8 @@ impl Worker {
     pub fn reocr(&mut self, note: Option<&str>) -> Result<Progress> {
         let served = self.followed()?.served;
         let served_count = served.len();
+        let served_slugs: Vec<String> = served.iter().map(|a| a.slug.clone()).collect();
+        self.say_unserved(&served_slugs);
         let lock = self.take_lock()?;
         self.source_seen(&lock, None);
         let source = self.setup.source.clone();
@@ -874,6 +909,10 @@ impl Worker {
                         }
                     }
                     look |= self.removals(&lock, &mut stores, &mut pending, &followed.all);
+                    // Every served account, also one with a removal not done yet: it counts
+                    // for the Markdown folder given without an account.
+                    let served: Vec<String> =
+                        followed.served.iter().map(|a| a.slug.clone()).collect();
                     // An account with a removal not done yet is not read.
                     let accounts: Vec<ServerAccount> = followed
                         .served
@@ -898,7 +937,8 @@ impl Worker {
                                 Some((slug.clone(), held))
                             })
                             .collect();
-                        let result = self.pass(&lock, &mut stores, &accounts, false, &stop);
+                        let result =
+                            self.pass(&lock, &mut stores, &accounts, &served, false, &stop);
                         let now = self.clock.now_ms();
                         next_wake = now + RESCAN_MS;
                         match result {
@@ -1084,9 +1124,11 @@ impl Worker {
         lock: &WriterLock,
         stores: &mut BTreeMap<String, TextStore>,
         accounts: &[ServerAccount],
+        served: &[String],
         ignore_settle: bool,
         stop: &dyn Fn() -> bool,
     ) -> Result<(Progress, BTreeSet<String>)> {
+        self.say_unserved(served);
         let now = self.clock.now_ms();
         let settle = self.setup.cfg.ocr_settle.as_millis() as u64;
         let source: Arc<dyn ServerData> = self.setup.source.clone();
@@ -1153,7 +1195,7 @@ impl Worker {
                     // A failed write blocks the store until a repair: open it again next time.
                     // The notes written before the failure keep their Markdown files current.
                     if let Some(text) = stores.remove(&slug) {
-                        self.write_markdown(&slug, &text, accounts.len());
+                        self.write_markdown(&slug, &text, served.len());
                     }
                     unsure.insert(slug);
                     continue;
@@ -1259,7 +1301,7 @@ impl Worker {
                     // Moves, deletes and scope changes are done, and notes with text need no
                     // model: their files are kept also while the model is missing.
                     for (slug, text) in stores.iter() {
-                        self.write_markdown(slug, text, accounts.len());
+                        self.write_markdown(slug, text, served.len());
                     }
                     return Err(Error::ModelMissing);
                 }
@@ -1283,7 +1325,7 @@ impl Worker {
         // cursor.
         for slug in broken {
             if let Some(text) = stores.remove(&slug) {
-                self.write_markdown(&slug, &text, accounts.len());
+                self.write_markdown(&slug, &text, served.len());
             }
             unsure.insert(slug);
         }
@@ -1300,7 +1342,7 @@ impl Worker {
             text.set_pass_end(lock, end, left, pages, due)?;
         }
         for (slug, text) in stores.iter() {
-            self.write_markdown(slug, text, accounts.len());
+            self.write_markdown(slug, text, served.len());
         }
         progress.next_due = next_due;
         Ok((progress, unsure))

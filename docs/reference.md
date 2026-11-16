@@ -257,7 +257,8 @@ reached at the start, it says so later and writes no files). A relative folder i
 current folder. The Mac app passes `~/Documents/Markdown` or the folder you chose.
 
 You can also set the folders in the config, in `pipeline.toml` (two machines) or `server.toml` (one
-machine). A flag wins over the config for its account. A relative path in the file is below the data
+machine). A flag wins over the config for its account. A folder for an account the pipeline does not
+serve is reported once and gets no files. A relative path in the file is below the data
 folder; `~` is not expanded, so use a full path.
 
 ```toml
@@ -272,8 +273,8 @@ that both use gets `(2)` for one of them.
 - Do not edit these files. Notedown overwrites them when the note changes.
 - Layout: the note's folder as on the device, then `<title>.md`. `Note/Work/Meeting.note` gives
   `Work/Meeting.md`, a note in `MyStyle` goes to `MyStyle/...`, a note in another folder keeps its
-  path (`Document/Books/a.note` gives `Document/Books/a.md`). A very long title is cut, so that the
-  file name fits in 255 bytes.
+  path (`Document/Books/a.note` gives `Document/Books/a.md`). A very long title is cut to about 200
+  bytes, so that every file name (and the temp file of its write) fits in 255 bytes.
 - Content: the same document the MCP server's `get_note` gives: frontmatter, the text of each page and
   the anchor of every block as an HTML comment.
 - A note gets its file once a page has text. Files are written at the end of each pass of the pipeline,

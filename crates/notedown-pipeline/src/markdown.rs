@@ -35,9 +35,13 @@ use crate::{Error, Result};
 pub const MANIFEST_FILE: &str = "markdown.json";
 /// The most numbered names tried for one note.
 const MAX_NUMBER: usize = 10_000;
-/// The longest file name stem in bytes: the highest numbered name, `<stem> (10000).md`, fits
-/// in the 255 bytes most file systems allow.
-const MAX_STEM: usize = 255 - " (10000).md".len();
+/// What the temp file of an atomic write adds to a name: `.<name>.<pid>.<n>.tmp`, with the
+/// longest pid (u32) and count (u64).
+const TEMP_EXTRA: usize =
+    ".".len() + ".4294967295".len() + ".18446744073709551615".len() + ".tmp".len();
+/// The longest file name stem in bytes: the temp file of the highest numbered name,
+/// `.<stem> (10000).md.<pid>.<n>.tmp`, fits in the 255 bytes (or characters) file systems allow.
+const MAX_STEM: usize = 255 - " (10000).md".len() - TEMP_EXTRA;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Manifest {
@@ -228,9 +232,18 @@ impl Writer {
     }
 
     /// Removes the temp files a crash in a write left (`.<name>.md.<pid>.<n>.tmp`) in the
-    /// folder and in the folders the writer made. Best effort.
+    /// folder, the folders the writer made and the folders of its files. Best effort.
     fn remove_temp_files(&self) {
-        let folders = std::iter::once(String::new()).chain(self.manifest.folders.iter().cloned());
+        let parents = self.manifest.files.values().filter_map(|f| {
+            Path::new(f)
+                .parent()
+                .map(rel_string)
+                .filter(|p| !p.is_empty())
+        });
+        let folders: BTreeSet<String> = std::iter::once(String::new())
+            .chain(self.manifest.folders.iter().cloned())
+            .chain(parents)
+            .collect();
         for folder in folders {
             let Ok(entries) = std::fs::read_dir(self.dir.join(&folder)) else {
                 continue;

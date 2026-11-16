@@ -828,37 +828,121 @@ fn a_removed_account_loses_its_files() {
 
 #[test]
 fn a_long_name_is_cut() {
-    for stem in ["a".repeat(300), "ä".repeat(200)] {
+    for stem in ["a".repeat(300), "ä".repeat(300), "😀".repeat(100)] {
         let rel = markdown::relative_path(&format!("NOTE/Note/{stem}.note")).unwrap();
         let name = rel.to_str().unwrap();
         let cut = name.strip_suffix(".md").unwrap();
         assert!(stem.starts_with(cut));
-        // The highest numbered name fits too.
-        assert!(format!("{cut} (10000).md").len() <= 255, "{}", name.len());
+        // The highest numbered name fits too, also as the temp file of its write.
+        let temp = format!(".{cut} (10000).md.{}.{}.tmp", u32::MAX, u64::MAX);
+        assert!(temp.len() <= 255, "{}", temp.len());
     }
-    // A note with such a name gets its file, and a second one its numbered file.
+    // Real files on disk: each long title gets its file, a second note its numbered one.
     let h = Hand::new();
-    let long = "ö".repeat(200);
-    h.save(&note_state(LOW, &format!("NOTE/Note/{long}.note"), "one"));
-    h.save(&note_state(HIGH, &format!("NOTE/Note/{long}x.note"), "two"));
+    let titles = ["a".repeat(300), "ä".repeat(300)];
+    let keys = [[LOW, MID], [HIGH, "path:44444444444444444444444444444444"]];
+    for (title, [first, second]) in titles.iter().zip(keys) {
+        h.save(&note_state(
+            first,
+            &format!("NOTE/Note/{title}.note"),
+            "one",
+        ));
+        h.save(&note_state(
+            second,
+            &format!("NOTE/Note/{title}x.note"),
+            "two",
+        ));
+    }
     h.writer().sync(&h.store, SLUG, &[]).unwrap();
     let names = files(&h.out);
-    assert_eq!(names.len(), 2, "{names:?}");
+    assert_eq!(names.len(), 4, "{names:?}");
     assert!(names.iter().all(|n| n.len() <= 255), "{names:?}");
+    assert_eq!(
+        names.iter().filter(|n| n.ends_with(" (2).md")).count(),
+        2,
+        "{names:?}"
+    );
+    for name in &names {
+        assert!(read(&h.out.join(name)).contains("<!-- notedown://"));
+    }
+}
+
+#[test]
+fn a_flag_without_an_account_counts_an_account_being_removed() {
+    use notedown_cloud::journal::{Event, EventBody, Journal, Origin, new_op_id};
+    let d = setup();
+    let local = tempfile::tempdir().unwrap();
+    point_at(local.path(), &d.data);
+    create_account(&d.data, "anna");
+    d.put("test1", "NOTE/Note");
+    let out = tempfile::tempdir().unwrap();
+    let s = load(local.path())
+        .with_markdown_dirs(vec![(None, out.path().to_path_buf())])
+        .unwrap();
+    let said = Said::default();
+    let (mut w, clock) = continuous(&s, &said);
+    w.run(stop_at(&clock, clock.now_ms() + 1)).unwrap();
+    assert!(files(out.path()).is_empty());
+    // A removal record of a live account (a crash between the record and the removal): the
+    // account waits a turn, but it is still served.
+    Journal::open(&d.data)
+        .unwrap()
+        .append(&mut [Event::new(
+            "anna",
+            Origin::Cli,
+            None,
+            &new_op_id(),
+            EventBody::AccountRemoved {
+                user_id: crate::split::SECOND_ID,
+            },
+        )])
+        .unwrap();
+    w.run(stop_at(&clock, clock.now_ms() + 1)).unwrap();
+    assert!(files(out.path()).is_empty(), "{:?}", said.lines());
+}
+
+#[test]
+fn a_folder_for_an_account_not_served_is_said_once() {
+    let d = setup();
+    d.put("test1", "NOTE/Note");
+    let mine = tempfile::tempdir().unwrap();
+    let ghost = tempfile::tempdir().unwrap();
+    let cfg = PipelineConfig {
+        markdown_dirs: [
+            (SLUG.to_string(), mine.path().to_path_buf()),
+            ("ghost".to_string(), ghost.path().to_path_buf()),
+        ]
+        .into(),
+        ..no_settle()
+    };
+    let said = Said::default();
+    let mut w = worker(&d, cfg, engine_reading("hello")).with_messages(said.sink());
+    w.run_once(true).unwrap();
+    w.run_once(true).unwrap();
+    assert_eq!(files(mine.path()), ["test1.md"]);
+    assert!(files(ghost.path()).is_empty());
+    assert_eq!(said.count("ghost"), 1, "{:?}", said.lines());
 }
 
 #[test]
 fn leftover_temp_files_are_removed() {
     let h = Hand::new();
     h.save(&note_state(LOW, "NOTE/Note/Sub/a.note", "hello"));
+    // A folder the user made: the writer did not create it, but its own file is in it.
+    std::fs::create_dir_all(h.out.join("Mine")).unwrap();
+    h.save(&note_state(MID, "NOTE/Note/Mine/b.note", "hello"));
     h.writer().sync(&h.store, SLUG, &[]).unwrap();
     // A crash in a write leaves its temp file; a user's own files stay.
     std::fs::write(h.out.join(".a.md.123.4.tmp"), "x").unwrap();
     std::fs::write(h.out.join("Sub/.a.md.99.0.tmp"), "x").unwrap();
+    std::fs::write(h.out.join("Mine/.b.md.7.8.tmp"), "x").unwrap();
     std::fs::write(h.out.join(".notes.tmp"), "mine").unwrap();
     std::fs::write(h.out.join("Sub/.a.md.tmp"), "mine").unwrap();
     h.writer().sync(&h.store, SLUG, &[]).unwrap();
-    assert_eq!(files(&h.out), [".notes.tmp", "Sub/.a.md.tmp", "Sub/a.md"]);
+    assert_eq!(
+        files(&h.out),
+        [".notes.tmp", "Mine/b.md", "Sub/.a.md.tmp", "Sub/a.md"]
+    );
 }
 
 #[test]

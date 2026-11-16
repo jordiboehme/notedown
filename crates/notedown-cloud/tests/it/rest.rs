@@ -3,192 +3,17 @@
 //! in other threads, and router-level checks with `oneshot`.
 
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use notedown_cloud::api::envelope::Streamed;
-use notedown_cloud::auth::{Accounts, expected_login_hash, md5_hex, revoke_token};
-use notedown_cloud::put;
+use notedown_cloud::auth::{Accounts, Scope, TokenCheck, list_tokens, md5_hex, revoke_token};
 use notedown_cloud::read;
 use notedown_cloud::rest;
-use notedown_cloud::server::{AppState, bind, serve_until_with};
-use notedown_cloud::{Config, SyncMode};
-use reqwest::blocking::{Client, Response};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-const EMAIL: &str = "jordi@example.org";
-const PASSWORD: &str = "a secret password";
-
-/// A running server with the device routes and the REST routes, and its data folder.
-struct Server {
-    base: String,
-    state: Arc<AppState>,
-    data: PathBuf,
-    client: Client,
-    rt: Option<tokio::runtime::Runtime>,
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
-    _dir: tempfile::TempDir,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        if let Some(tx) = self.stop.take() {
-            let _ = tx.send(());
-        }
-        if let Some(rt) = self.rt.take() {
-            rt.shutdown_timeout(std::time::Duration::from_secs(5));
-        }
-    }
-}
-
-fn start() -> Server {
-    let dir = tempfile::tempdir().unwrap();
-    let data = dir.path().join("data");
-    std::fs::create_dir_all(&data).unwrap();
-    Accounts::new(&data)
-        .create("jordi", EMAIL, PASSWORD)
-        .unwrap();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let config = Config {
-        listen: vec!["127.0.0.1:0".parse().unwrap()],
-        sync: SyncMode::Accept,
-        ..Config::default()
-    };
-    let listeners = rt.block_on(bind(&config)).unwrap();
-    let addr = listeners[0].local_addr().unwrap();
-    let state = AppState::open(config, &data).unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    rt.spawn(serve_until_with(
-        listeners,
-        state.clone(),
-        rest::router(state.clone()),
-        async {
-            let _ = rx.await;
-        },
-    ));
-    Server {
-        base: format!("http://{addr}"),
-        state,
-        data,
-        client: Client::new(),
-        rt: Some(rt),
-        stop: Some(tx),
-        _dir: dir,
-    }
-}
-
-impl Server {
-    fn url(&self, path: &str) -> String {
-        format!("{}{}{path}", self.base, rest::PREFIX)
-    }
-
-    fn post(&self, path: &str, body: &Value) -> (u16, Value) {
-        json_of(
-            self.client
-                .post(self.url(path))
-                .header("Content-Type", "application/json")
-                .body(body.to_string())
-                .send()
-                .unwrap(),
-        )
-    }
-
-    fn get(&self, token: Option<&str>, path: &str) -> (u16, Value) {
-        json_of(self.request("GET", token, path))
-    }
-
-    fn request(&self, method: &str, token: Option<&str>, path: &str) -> Response {
-        let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
-        let mut req = self.client.request(method, self.url(path));
-        if let Some(t) = token {
-            req = req.bearer_auth(t);
-        }
-        req.send().unwrap()
-    }
-
-    /// A random code and the login with it: (status, answer, hash sent).
-    fn login_with(&self, email: &str, password: &str) -> (u16, Value, String) {
-        let (status, code) = self.post("/login/code", &json!({"email": email}));
-        assert_eq!(status, 200, "{code}");
-        let hash = expected_login_hash(&md5_hex(password), code["randomCode"].as_str().unwrap());
-        let (status, answer) = self.post(
-            "/login",
-            &json!({"email": email, "passwordHash": hash, "name": "mac"}),
-        );
-        (status, answer, hash)
-    }
-
-    fn token(&self) -> String {
-        let (status, answer, _) = self.login_with(EMAIL, PASSWORD);
-        assert_eq!(status, 201, "{answer}");
-        answer["token"].as_str().unwrap().to_string()
-    }
-
-    /// Writes a page record file by hand, as the indexer would.
-    fn record(&self, key: &str, path: &str) {
-        let dir = self.data.join("accounts/jordi/pages");
-        std::fs::create_dir_all(&dir).unwrap();
-        let name = match key.strip_prefix("path:") {
-            Some(md5) => format!("path-{md5}.json"),
-            None => format!("{key}.json"),
-        };
-        let record = json!({"fileId": key, "path": path, "size": 3, "md5": "x", "pages": []});
-        std::fs::write(dir.join(name), record.to_string()).unwrap();
-    }
-
-    /// Puts `bytes` as `NOTE/Note/<name>` the way `notedown cloud put` does.
-    fn put(&self, name: &str, bytes: &[u8]) -> String {
-        let src = self.data.parent().unwrap().join(name);
-        std::fs::write(&src, bytes).unwrap();
-        put::put(
-            &self.data,
-            "jordi",
-            &self.state.journal,
-            &src,
-            "NOTE/Note",
-            None,
-        )
-        .unwrap();
-        format!("NOTE/Note/{name}")
-    }
-
-    /// The lines of every protocol log file.
-    fn log_lines(&self) -> Vec<String> {
-        log_text(self.state.log.logs_dir())
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
-}
-
-fn log_text(dir: &Path) -> String {
-    let mut text = String::new();
-    for e in std::fs::read_dir(dir).unwrap() {
-        let p = e.unwrap().path();
-        if p.is_file() {
-            text.push_str(&String::from_utf8_lossy(&std::fs::read(&p).unwrap()));
-        }
-    }
-    text
-}
-
-fn json_of(r: Response) -> (u16, Value) {
-    let status = r.status().as_u16();
-    let text = r.text().unwrap();
-    let value = serde_json::from_str(&text).unwrap_or(Value::String(text));
-    (status, value)
-}
-
-fn q(s: &str) -> String {
-    s.replace('/', "%2F").replace(' ', "%20")
-}
+use crate::rest_server::{EMAIL, PASSWORD, json_of, log_text, q, start};
 
 #[test]
 fn login_gives_a_token_that_reads_the_account() {
@@ -667,4 +492,70 @@ fn quiet_polls_are_not_logged() {
     assert_eq!(s.get(Some(&fresh), "/journal?from=x").0, 400);
     assert_eq!(s.get(Some(&fresh), "/journal?from=x").0, 400);
     assert_eq!(s.log_lines().len(), lines + 2);
+}
+
+#[test]
+fn a_token_is_read_only_unless_made_for_writing() {
+    let s = start();
+    let (status, plain) = s.login_extra(json!({}));
+    assert_eq!((status, &plain["scope"]), (201, &json!("read")), "{plain}");
+    let (status, read) = s.login_extra(json!({"scope": "read"}));
+    assert_eq!((status, &read["scope"]), (201, &json!("read")), "{read}");
+    let (status, write) = s.login_extra(json!({"scope": "write"}));
+    assert_eq!((status, &write["scope"]), (201, &json!("write")), "{write}");
+    for bad in [
+        json!({"scope": "admin"}),
+        json!({"scope": null}),
+        json!({"scope": 1}),
+    ] {
+        let (status, answer) = s.login_extra(bad);
+        assert_eq!(
+            (status, &answer["error"]),
+            (400, &json!("bad_request")),
+            "{answer}"
+        );
+    }
+
+    let listed = |answer: &Value| {
+        list_tokens(&s.data, "jordi")
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == answer["id"].as_str().unwrap())
+            .unwrap()
+            .scope
+    };
+    let checked = |answer: &Value| {
+        let token = answer["token"].as_str().unwrap();
+        match s.state.rest_tokens.check(token, s.state.now_ms()).unwrap() {
+            TokenCheck::Valid(_, scope) => scope,
+            other => panic!("{other:?}"),
+        }
+    };
+    for (answer, scope) in [
+        (&plain, Scope::Read),
+        (&read, Scope::Read),
+        (&write, Scope::Write),
+    ] {
+        assert_eq!(
+            (listed(answer), checked(answer)),
+            (scope, scope),
+            "{answer}"
+        );
+    }
+
+    // A token record written before scopes existed is a read token.
+    let file = s.data.join(format!(
+        "accounts/jordi/tokens/{}.json",
+        write["id"].as_str().unwrap()
+    ));
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(record["scope"], "write");
+    record.as_object_mut().unwrap().remove("scope");
+    std::fs::write(&file, record.to_string()).unwrap();
+    assert_eq!(
+        (listed(&write), checked(&write)),
+        (Scope::Read, Scope::Read)
+    );
+    let (status, me) = s.get(write["token"].as_str(), "/account");
+    assert_eq!(status, 200, "{me}");
 }

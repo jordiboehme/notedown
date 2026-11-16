@@ -16,7 +16,7 @@ pub use accounts::{
 };
 pub use codes::{CODE_LEN, CODE_TTL_MS, LoginCodes, MAX_PENDING_CODES};
 pub use rest_tokens::{
-    REST_KEY_FILE, RestKey, RestTokens, TOKENS_DIR, TokenCheck, TokenInfo, list_tokens,
+    REST_KEY_FILE, RestKey, RestTokens, Scope, TOKENS_DIR, TokenCheck, TokenInfo, list_tokens,
     revoke_all_tokens, revoke_token, token_id, token_slug,
 };
 pub use token::{Claims, Device, Devices, KEY_FILE, TokenKey};
@@ -170,13 +170,14 @@ impl Auth {
 
     /// The REST login: checks the hash against a random code and issues a token, all under one
     /// account lock, with the checks and the failure counting of the device login
-    /// (`check_login`). Returns the token (shown once, never stored), its stored info
-    /// and the account.
+    /// (`check_login`). The token gets `scope`. Returns the token (shown once, never stored),
+    /// its stored info and the account.
     pub fn rest_login(
         &self,
         email: &str,
         password_hash: &str,
         name: &str,
+        scope: Scope,
         now_ms: u64,
     ) -> Result<(String, TokenInfo, Account), AuthError> {
         let ((token, info), account, _) =
@@ -186,6 +187,7 @@ impl Auth {
                     &self.rest_key,
                     account,
                     name,
+                    scope,
                     now_ms,
                 )?)
             })?;

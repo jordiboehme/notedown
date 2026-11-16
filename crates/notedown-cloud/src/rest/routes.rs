@@ -18,7 +18,7 @@ use super::{PREFIX, RefusedToken};
 use crate::api::ClientAddr;
 use crate::api::envelope::{LogMessage, Streamed};
 use crate::api::oss::{Flow, stream_body};
-use crate::auth::{Account, AuthError, TokenCheck};
+use crate::auth::{Account, AuthError, Scope, TokenCheck};
 use crate::pages::valid_key;
 use crate::read::{self, NoteFile, ServerAccount};
 use crate::server::AppState;
@@ -143,7 +143,8 @@ async fn caller(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(Caller, S
     let st = state.clone();
     let now = state.now_ms();
     match blocking(move || st.rest_tokens.check(&token, now)).await? {
-        TokenCheck::Valid(account) => Ok((Caller::Live(Box::new(account)), id)),
+        // The scope is enforced by the write routes.
+        TokenCheck::Valid(account, _scope) => Ok((Caller::Live(Box::new(account)), id)),
         TokenCheck::Removed { user_id, seq } => Ok((Caller::Removed { slug, user_id, seq }, id)),
         TokenCheck::Refused => Err(Box::new(refused(id))),
     }
@@ -192,17 +193,19 @@ async fn login_code(
 }
 
 /// The login body: the password travels only as `sha256_hex(md5_hex(password) + randomCode)`;
-/// any other field (a clear `password`) is refused.
+/// any other field (a clear `password`) is refused. `scope` is `read` (the default) or `write`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LoginBody {
     email: String,
     password_hash: String,
     name: String,
+    #[serde(default)]
+    scope: Scope,
 }
 
-/// `POST /login`: 201 with a new token. A wrong email, password or code and a locked account
-/// are all 401 `login_failed`.
+/// `POST /login`: 201 with a new token of the asked scope. A wrong email, password or code and
+/// a locked account are all 401 `login_failed`.
 async fn login(
     State(state): State<Arc<AppState>>,
     addr: Option<Extension<ClientAddr>>,
@@ -213,12 +216,19 @@ async fn login(
         return error(StatusCode::TOO_MANY_REQUESTS, "too_many");
     }
     let Ok(body) = serde_json::from_slice::<LoginBody>(&body) else {
-        return bad_request("the body must be {\"email\",\"passwordHash\",\"name\"}");
+        return bad_request(
+            "the body must be {\"email\",\"passwordHash\",\"name\"} with an optional \"scope\" of \"read\" or \"write\"",
+        );
     };
     let st = state.clone();
     let result = tokio::task::spawn_blocking(move || {
-        st.auth
-            .rest_login(&body.email, &body.password_hash, &body.name, now)
+        st.auth.rest_login(
+            &body.email,
+            &body.password_hash,
+            &body.name,
+            body.scope,
+            now,
+        )
     })
     .await;
     match result {
@@ -229,6 +239,7 @@ async fn login(
                 "id": info.id,
                 "slug": account.slug,
                 "userId": account.user_id,
+                "scope": info.scope,
             })),
         )
             .into_response(),

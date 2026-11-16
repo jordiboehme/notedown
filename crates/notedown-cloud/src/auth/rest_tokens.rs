@@ -5,6 +5,8 @@
 //! `mac` is base64url of HMAC-SHA256 of the payload text with the key `keys/rest.key`. The server
 //! keeps `accounts/<slug>/tokens/<id>.json` with the SHA-256 of the whole token, never the token.
 //! A password change deletes `tokens/`, and the account removal deletes it with the account.
+//! A token is made for reading or for writing ([`Scope`]); a record without a scope is a read
+//! token.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -102,6 +104,32 @@ struct Payload {
     nonce: String,
 }
 
+/// What a token may do: read only (the default, also for a record written before scopes
+/// existed), or also write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    #[default]
+    Read,
+    Write,
+}
+
+impl Scope {
+    /// `read` or `write`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scope::Read => "read",
+            Scope::Write => "write",
+        }
+    }
+}
+
+impl std::fmt::Display for Scope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// `accounts/<slug>/tokens/<id>.json`. Field order is the file order.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -112,6 +140,8 @@ struct TokenFile {
     /// Hex SHA-256 of the whole token.
     sha256: String,
     created_ms: u64,
+    #[serde(default)]
+    scope: Scope,
 }
 
 /// A stored token as `tokens list` shows it: never the token or its hash.
@@ -122,6 +152,8 @@ pub struct TokenInfo {
     pub name: String,
     pub user_id: u64,
     pub created_ms: u64,
+    #[serde(default)]
+    pub scope: Scope,
 }
 
 impl From<TokenFile> for TokenInfo {
@@ -131,6 +163,7 @@ impl From<TokenFile> for TokenInfo {
             name: f.name,
             user_id: f.user_id,
             created_ms: f.created_ms,
+            scope: f.scope,
         }
     }
 }
@@ -139,8 +172,8 @@ impl From<TokenFile> for TokenInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)] // one value per request, never stored in bulk
 pub enum TokenCheck {
-    /// A token of this live account.
-    Valid(Account),
+    /// A token of this live account, with what it may do.
+    Valid(Account, Scope),
     /// The token's account was removed; `seq` is its last `account.removed` event.
     Removed { user_id: u64, seq: u64 },
     /// Anything else: a bad token, a revoked one, a password change, an unknown user id.
@@ -200,7 +233,7 @@ impl RestTokens {
             let same: bool = hash.as_bytes().ct_eq(stored.sha256.as_bytes()).into();
             return Ok(
                 if same && stored.user_id == payload.user_id && stored.id == payload.id {
-                    TokenCheck::Valid(account)
+                    TokenCheck::Valid(account, stored.scope)
                 } else {
                     TokenCheck::Refused
                 },
@@ -274,13 +307,15 @@ fn find_removal(data: &Path, slug: &str, user_id: u64) -> Result<Option<u64>> {
     }
 }
 
-/// Creates a token for `account` and its file, which holds only the token's hash. The caller
-/// holds the account lock. `tokens/` is created with mode 0700, never the account folder.
+/// Creates a token for `account` with `scope` and its file, which holds only the token's hash.
+/// The caller holds the account lock. `tokens/` is created with mode 0700, never the account
+/// folder.
 pub(crate) fn issue(
     accounts: &Accounts,
     key: &RestKey,
     account: &Account,
     name: &str,
+    scope: Scope,
     now_ms: u64,
 ) -> Result<(String, TokenInfo)> {
     let account_dir = accounts.account_dir(&account.slug);
@@ -315,6 +350,7 @@ pub(crate) fn issue(
             user_id: account.user_id,
             sha256: sha256_hex(&token),
             created_ms: now_ms,
+            scope,
         };
         let path = token_file(&account_dir, &id);
         match write_new_private(&path, &json_bytes(&file)) {

@@ -768,7 +768,7 @@ fn a_failed_journal_append_removes_nothing() {
 // REST tokens
 
 use notedown_cloud::auth::{
-    Account, RestKey, RestTokens, TokenCheck, TokenInfo, list_tokens, revoke_all_tokens,
+    Account, RestKey, RestTokens, Scope, TokenCheck, TokenInfo, list_tokens, revoke_all_tokens,
     revoke_token,
 };
 
@@ -780,8 +780,14 @@ fn rest() -> (tempfile::TempDir, Auth, RestTokens) {
 
 fn rest_login(auth: &Auth, name: &str) -> (String, TokenInfo, Account) {
     let (code, _) = auth.challenge("jordi@example.org", NOW).unwrap();
-    auth.rest_login("jordi@example.org", &hash_for(&code, "secret"), name, NOW)
-        .unwrap()
+    auth.rest_login(
+        "jordi@example.org",
+        &hash_for(&code, "secret"),
+        name,
+        Scope::Read,
+        NOW,
+    )
+    .unwrap()
 }
 
 fn removed_by_hand(d: &tempfile::TempDir, slug: &str, user_id: u64) -> u64 {
@@ -809,9 +815,10 @@ fn a_token_checks_as_its_account() {
     assert_eq!(info.name, "mac mini");
     assert_eq!(info.user_id, account.user_id);
     assert_eq!(info.created_ms, NOW);
+    assert_eq!(info.scope, Scope::Read);
     assert_eq!(info.id.len(), 8);
     match tokens.check(&token, NOW).unwrap() {
-        TokenCheck::Valid(a) => assert_eq!(a.slug, "jordi"),
+        TokenCheck::Valid(a, Scope::Read) => assert_eq!(a.slug, "jordi"),
         other => panic!("{other:?}"),
     }
     assert_eq!(list_tokens(d.path(), "jordi").unwrap(), [info]);
@@ -831,7 +838,7 @@ fn a_revoked_token_is_refused() {
     assert!(is_refused(tokens.check(&one, NOW).unwrap()));
     assert!(matches!(
         tokens.check(&two, NOW).unwrap(),
-        TokenCheck::Valid(_)
+        TokenCheck::Valid(_, Scope::Read)
     ));
     assert_eq!(revoke_all_tokens(d.path(), "jordi").unwrap(), 1);
     assert!(is_refused(tokens.check(&two, NOW).unwrap()));
@@ -892,7 +899,7 @@ fn a_refused_token_of_a_live_account_with_a_removal_record_is_refused() {
     removed_by_hand(&d, "jordi", account.user_id);
     assert!(matches!(
         tokens.check(&token, NOW).unwrap(),
-        TokenCheck::Valid(_)
+        TokenCheck::Valid(_, Scope::Read)
     ));
     assert!(revoke_token(d.path(), "jordi", &info.id).unwrap());
     assert!(is_refused(tokens.check(&token, NOW).unwrap()));
@@ -917,7 +924,7 @@ fn a_token_of_a_reused_slug_is_removed_not_valid() {
         other => panic!("{other:?}"),
     }
     match tokens.check(&fresh, NOW).unwrap() {
-        TokenCheck::Valid(a) => assert_eq!(a.user_id, new.user_id),
+        TokenCheck::Valid(a, Scope::Read) => assert_eq!(a.user_id, new.user_id),
         other => panic!("{other:?}"),
     }
 }
@@ -969,8 +976,8 @@ fn issuing_never_stores_the_token() {
     let stored: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     let keys: Vec<_> = stored.as_object().unwrap().keys().cloned().collect();
-    assert_eq!(keys.len(), 5);
-    for k in ["id", "name", "userId", "sha256", "createdMs"] {
+    assert_eq!(keys.len(), 6);
+    for k in ["id", "name", "userId", "sha256", "createdMs", "scope"] {
         assert!(stored.get(k).is_some(), "{k}");
     }
     use sha2::Digest;
@@ -993,19 +1000,25 @@ fn rest_login_counts_failures_like_the_device_login() {
     let failed = |auth: &Auth| auth.accounts().get("jordi").unwrap().unwrap().failed_logins;
     // A missing code does not count.
     let err = auth
-        .rest_login("jordi@example.org", &hash_for("nocode", "secret"), "x", NOW)
+        .rest_login(
+            "jordi@example.org",
+            &hash_for("nocode", "secret"),
+            "x",
+            Scope::Read,
+            NOW,
+        )
         .unwrap_err();
     assert_eq!(err.code(), "E0019");
     assert_eq!(failed(&auth), 0);
     let err = auth
-        .rest_login("ghost@example.org", "00", "x", NOW)
+        .rest_login("ghost@example.org", "00", "x", Scope::Read, NOW)
         .unwrap_err();
     assert_eq!(err.code(), "E0018");
     for i in 1..=6 {
         let (code, _) = auth.challenge("jordi@example.org", NOW).unwrap();
         let wrong = hash_for(&code, "bad");
         let err = if i % 2 == 0 {
-            auth.rest_login("jordi@example.org", &wrong, "x", NOW)
+            auth.rest_login("jordi@example.org", &wrong, "x", Scope::Read, NOW)
                 .unwrap_err()
         } else {
             auth.login("jordi@example.org", &wrong, "SN1", NOW)
@@ -1017,7 +1030,13 @@ fn rest_login_counts_failures_like_the_device_login() {
     // Locked for both logins, also with the right password.
     let (code, _) = auth.challenge("jordi@example.org", NOW).unwrap();
     let err = auth
-        .rest_login("jordi@example.org", &hash_for(&code, "secret"), "x", NOW)
+        .rest_login(
+            "jordi@example.org",
+            &hash_for(&code, "secret"),
+            "x",
+            Scope::Read,
+            NOW,
+        )
         .unwrap_err();
     assert_eq!(err.code(), "E0045");
     let (code, _) = auth.challenge("jordi@example.org", NOW).unwrap();
@@ -1028,8 +1047,14 @@ fn rest_login_counts_failures_like_the_device_login() {
     // After the cooldown a good REST login resets the counter.
     let later = NOW + notedown_cloud::auth::LOCK_COOLDOWN_MS;
     let (code, _) = auth.challenge("jordi@example.org", later).unwrap();
-    auth.rest_login("jordi@example.org", &hash_for(&code, "secret"), "x", later)
-        .unwrap();
+    auth.rest_login(
+        "jordi@example.org",
+        &hash_for(&code, "secret"),
+        "x",
+        Scope::Read,
+        later,
+    )
+    .unwrap();
     let a = auth.accounts().get("jordi").unwrap().unwrap();
     assert!(!a.locked);
     assert_eq!(a.failed_logins, 0);
@@ -1041,12 +1066,18 @@ fn a_locked_account_keeps_its_tokens() {
     let (token, _, _) = rest_login(&auth, "one");
     for _ in 0..6 {
         let (code, _) = auth.challenge("jordi@example.org", NOW).unwrap();
-        let _ = auth.rest_login("jordi@example.org", &hash_for(&code, "bad"), "x", NOW);
+        let _ = auth.rest_login(
+            "jordi@example.org",
+            &hash_for(&code, "bad"),
+            "x",
+            Scope::Read,
+            NOW,
+        );
     }
     assert!(auth.accounts().get("jordi").unwrap().unwrap().locked);
     assert!(matches!(
         tokens.check(&token, NOW).unwrap(),
-        TokenCheck::Valid(_)
+        TokenCheck::Valid(_, Scope::Read)
     ));
 }
 
@@ -1119,7 +1150,7 @@ fn a_restored_and_removed_again_account_gives_the_new_seq() {
     std::fs::write(dir.join(&token_file), &token_json).unwrap();
     assert!(matches!(
         tokens.check(&token, NOW).unwrap(),
-        TokenCheck::Valid(_)
+        TokenCheck::Valid(_, Scope::Read)
     ));
     auth.accounts().remove("jordi", &journal).unwrap();
     match tokens.check(&token, NOW).unwrap() {

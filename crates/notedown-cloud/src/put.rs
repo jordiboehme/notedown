@@ -11,11 +11,19 @@
 //! - First the folders on the way to the target are scanned for changes made by hand, as for a
 //!   device upload (`docs/sync-protocol.md` 8.3). While a scan holds the account
 //!   (`scan-hold.json`), `put` refuses with `Error::ScanHold`.
+//!
+//! [`commit_staged`] is the commit of such an upload under the store lock, shared by `put`
+//! (origin `cli`) and the REST upload (origin `app`).
 
+use std::io::{Read, Write};
 use std::path::Path;
 
+use md5::{Digest, Md5};
+
 use crate::journal::{Journal, Origin};
-use crate::store::{PendingOp, PutOptions, ScanOptions, Store, WirePath, WriteGuard, create_temp};
+use crate::store::{
+    Kind, PendingOp, PutOptions, ScanOptions, Store, WirePath, WriteGuard, create_temp,
+};
 use crate::{Error, Result, io_err};
 
 /// What [`put`] did.
@@ -29,7 +37,7 @@ pub enum PutOutcome {
     Unchanged,
 }
 
-/// The result of [`put`].
+/// The result of [`put`] and [`commit_staged`].
 #[derive(Debug, Clone)]
 pub struct PutResult {
     pub id: u64,
@@ -37,6 +45,23 @@ pub struct PutResult {
     pub outcome: PutOutcome,
     /// The journal `seq` values of the commit (empty when unchanged).
     pub seqs: Vec<u64>,
+    /// The MD5 of the file now there (lowercase hex).
+    pub md5: String,
+    pub size: u64,
+    /// The modification time of the file now there, in ms (the listing's `lastUpdateTime`).
+    pub mtime_ms: u64,
+}
+
+/// What the file at the target must be before [`commit_staged`] writes. A file that already
+/// has the staged bytes is [`PutOutcome::Unchanged`] whatever the precondition says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Precondition {
+    /// No condition.
+    None,
+    /// Nothing is at the target (`If-None-Match: *`).
+    Absent,
+    /// A file with this MD5 is at the target, compared case-insensitive (`If-Match`).
+    Md5(String),
 }
 
 fn invalid(what: &'static str, message: String) -> Error {
@@ -47,9 +72,7 @@ fn invalid(what: &'static str, message: String) -> Error {
 /// inside a device folder tree (byte-exact, segment-aware).
 pub fn target_folder(to: &str) -> Result<WirePath> {
     let folder = WirePath::parse(to)?;
-    let inside = crate::import::device_folders()
-        .any(|root| WirePath::parse_named(root).is_ok_and(|root| folder.starts_with(&root)));
-    if folder.is_root() || !inside {
+    if crate::store::trees::device_tree_of(&folder).is_none() {
         let roots: Vec<&str> = crate::import::device_folders().collect();
         return Err(invalid(
             "target folder",
@@ -117,51 +140,138 @@ fn stage_and_commit(
     min_files: u64,
 ) -> Result<PutResult> {
     let (tmp, mut out) = create_temp(staging).map_err(io_err(staging))?;
-    let copied = (|| -> std::io::Result<()> {
+    let copied = (|| -> std::io::Result<String> {
         let mut input = std::fs::File::open(source)?;
-        std::io::copy(&mut input, &mut out)?;
-        out.sync_all()
+        let mut hasher = Md5::new();
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = input.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            out.write_all(&buf[..n])?;
+        }
+        out.sync_all()?;
+        Ok(const_hex::encode(hasher.finalize()))
     })();
     drop(out);
-    copied.map_err(io_err(source))?;
+    let md5 = copied.map_err(io_err(source))?;
 
     let guard = store.lock_recovered(journal)?;
-    scan_way(store, &guard, journal, path, min_files)?;
-    let mut commit = store.plan_put_with(
+    commit_staged(
+        store,
         &guard,
+        journal,
         path,
         &tmp,
+        &md5,
         Origin::Cli,
+        journal.now_ms(),
+        Precondition::None,
+        &|path| scan_way(store, &guard, journal, path, min_files),
+    )
+}
+
+/// Commits the staged file `staged` (inside the account, with MD5 `md5`) to `path` under
+/// `guard`, with the rules of `cloud put` (module docs): missing folders created, collisions
+/// refused, a replace keeps the id and recycles the old bytes at `now_ms`. In this order:
+/// `way_scan(path)` (the scans of the folders on the way, which also refuse a scan hold), then
+/// a file at `path` with these bytes is [`PutOutcome::Unchanged`], then `precondition`
+/// (`Error::PreconditionFailed`), then the plan, the page events and the commit. It never
+/// removes the staged file; the caller does.
+#[allow(clippy::too_many_arguments)] // one call per caller; the decisions file names them all
+pub fn commit_staged(
+    store: &Store,
+    guard: &WriteGuard,
+    journal: &Journal,
+    path: &WirePath,
+    staged: &Path,
+    md5: &str,
+    origin: Origin,
+    now_ms: u64,
+    precondition: Precondition,
+    way_scan: &dyn Fn(&WirePath) -> Result<()>,
+) -> Result<PutResult> {
+    way_scan(path)?;
+    if precondition != Precondition::None {
+        check_precondition(store, guard, path, md5, &precondition)?;
+    }
+    let mut commit = store.plan_put_with(
+        guard,
+        path,
+        staged,
+        origin,
         None,
         PutOptions {
             create_parents: true,
-            recycle_at_ms: Some(journal.now_ms()),
+            recycle_at_ms: Some(now_ms),
+            expect_md5: Some(md5.to_string()),
             ..PutOptions::default()
         },
     )?;
-    let (id, outcome) = match &commit.op {
-        PendingOp::Unchanged { id, .. } => (*id, PutOutcome::Unchanged),
-        PendingOp::Put { id, recycle, .. } => (
+    let (id, outcome, md5) = match &commit.op {
+        PendingOp::Unchanged { id, md5, .. } => (*id, PutOutcome::Unchanged, md5.clone()),
+        PendingOp::Put {
+            id, recycle, md5, ..
+        } => (
             *id,
             if recycle.is_some() {
                 PutOutcome::Replaced
             } else {
                 PutOutcome::Created
             },
+            md5.clone(),
         ),
         other => {
             return Err(invalid("put", format!("unexpected plan {other:?}")));
         }
     };
-    crate::pages::plan_page_events(store, &guard, &mut commit);
-    let seqs = store.commit(&guard, commit, journal)?;
-    store.flush_cache(&guard)?;
+    crate::pages::plan_page_events(store, guard, &mut commit);
+    let seqs = store.commit(guard, commit, journal)?;
+    store.flush_cache(guard)?;
+    let fs = store.fs_path(path);
+    let meta = std::fs::metadata(&fs).map_err(io_err(&fs))?;
     Ok(PutResult {
         id,
         path: path.clone(),
         outcome,
         seqs,
+        md5,
+        size: meta.len(),
+        mtime_ms: crate::store::mtime_ms(&meta),
     })
+}
+
+/// `Ok` when the file at `path` already has the bytes `md5` (an unchanged put) or meets
+/// `precondition`; else `Error::PreconditionFailed`. A folder at `path` meets no precondition
+/// but [`Precondition::None`].
+fn check_precondition(
+    store: &Store,
+    guard: &WriteGuard,
+    path: &WirePath,
+    md5: &str,
+    precondition: &Precondition,
+) -> Result<()> {
+    let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+    let (exists, current) = match store.entry(guard, path)? {
+        None => (false, None),
+        Some(e) if e.tag == Kind::File => (true, Some(store.md5_of(guard, path)?)),
+        Some(_) => (true, None),
+    };
+    if current.as_deref().is_some_and(|c| same(c, md5)) {
+        return Ok(());
+    }
+    let met = match precondition {
+        Precondition::None => true,
+        Precondition::Absent => !exists,
+        Precondition::Md5(want) => current.as_deref().is_some_and(|c| same(c, want)),
+    };
+    if met {
+        Ok(())
+    } else {
+        Err(Error::PreconditionFailed(path.display()))
+    }
 }
 
 /// The scans of a device upload to `path` ([`Store::way_scopes`]), so the put never gives a

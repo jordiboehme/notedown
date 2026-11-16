@@ -1644,7 +1644,13 @@ fn tokens_command(data: &Path, action: TokensAction) -> Result<()> {
                 println!("no tokens");
             }
             for t in tokens {
-                println!("{}  {}  created {}", t.id, t.name, rfc3339_ms(t.created_ms));
+                println!(
+                    "{}  {}  {}  created {}",
+                    t.id,
+                    t.scope,
+                    t.name,
+                    rfc3339_ms(t.created_ms)
+                );
             }
         }
         TokensAction::Revoke {

@@ -19,6 +19,7 @@ mod push;
 mod recycle;
 mod render;
 mod rest;
+mod rest_server;
 mod scan;
 mod serve;
 mod socket;

@@ -163,7 +163,8 @@ pub fn connect(
     let hash = expected_login_hash(&md5_hex(password), &code.random_code);
     let (status, bytes) = post(
         "/login",
-        json!({ "email": email, "passwordHash": hash, "name": name }),
+        // A pipeline only reads: it asks for a read token, never relying on the default.
+        json!({ "email": email, "passwordHash": hash, "name": name, "scope": "read" }),
     )?;
     match status {
         StatusCode::UNAUTHORIZED => {

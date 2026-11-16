@@ -1530,13 +1530,14 @@ fn way_is_open(store: &Store, guard: &StoreGuard, parent: &WirePath) -> crate::R
 }
 
 /// Create the folder `path` and each missing folder above it, parents first, one commit each
-/// (`folder.created`). Existing folders are kept.
-fn create_folders(
+/// (`folder.created` with `origin` and `device`). Existing folders are kept.
+pub(crate) fn create_folders(
     state: &AppState,
     store: &Store,
     guard: &crate::store::WriteGuard,
     path: &WirePath,
-    serial: &str,
+    origin: Origin,
+    device: Option<String>,
 ) -> crate::Result<()> {
     let mut cur = WirePath::root();
     for segment in path.segments() {
@@ -1547,7 +1548,7 @@ fn create_folders(
         {
             continue;
         }
-        let c = store.plan_create_folder(guard, &cur, Origin::Device, Some(serial.into()))?;
+        let c = store.plan_create_folder(guard, &cur, origin, device.clone())?;
         store.commit(guard, c, &state.journal)?;
     }
     Ok(())
@@ -1659,7 +1660,14 @@ pub async fn create_folder_v2(
             return Outcome::too_long();
         }
         let target = parent.join(&name)?;
-        create_folders(st, &store, &guard, &target, serial)?;
+        create_folders(
+            st,
+            &store,
+            &guard,
+            &target,
+            Origin::Device,
+            Some(serial.to_string()),
+        )?;
         let e = entry_after(&store, &guard, &target)?;
         Ok(Outcome::Done(json!({"metadata": metadata_value(&e)})))
     })
@@ -1895,13 +1903,20 @@ pub async fn copy_v3(
             Kind::Folder => {
                 // What to copy is fixed before anything is created.
                 let inside = store.list(&guard, &src.path, true)?;
-                create_folders(st, &store, &guard, &to, serial)?;
+                create_folders(st, &store, &guard, &to, Origin::Device, device.clone())?;
                 for e in inside {
                     let Some(target) = e.path.rebase(&src.path, &to) else {
                         continue;
                     };
                     match e.tag {
-                        Kind::Folder => create_folders(st, &store, &guard, &target, serial)?,
+                        Kind::Folder => create_folders(
+                            st,
+                            &store,
+                            &guard,
+                            &target,
+                            Origin::Device,
+                            device.clone(),
+                        )?,
                         Kind::File => copy_file(&e.path, &target)?,
                     }
                 }

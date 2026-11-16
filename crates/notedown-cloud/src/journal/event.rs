@@ -24,6 +24,12 @@ pub enum Origin {
     Snapshot,
     /// The hourly prune of the recycle bin by the server.
     Retention,
+    /// A write over the REST API, by the Mac app.
+    App,
+    /// An origin this reader does not know: a newer writer's. notedown never writes it; it
+    /// keeps a reader from dropping such a line.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The kind of a file, by its extension (case-insensitive).

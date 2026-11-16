@@ -1,5 +1,6 @@
 //! The `[pipeline]` section of `<data>/server.toml`. The server ignores it.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -22,9 +23,10 @@ pub struct PipelineConfig {
     pub ingest_exclude: Vec<String>,
     /// Only notes with this keyword on the device are ingested. `None`: off.
     pub ingest_keyword: Option<String>,
-    /// The folder that keeps one Markdown file per note (see [`crate::markdown`]). `None`: no
-    /// Markdown files. A relative path in the file is below the folder of the file.
-    pub markdown_dir: Option<PathBuf>,
+    /// Per account (slug), the folder that keeps one Markdown file per note of that account
+    /// (see [`crate::markdown`]). An account without one gets no files. A relative path in the
+    /// file is below the folder of the file.
+    pub markdown_dirs: BTreeMap<String, PathBuf>,
 }
 
 impl Default for PipelineConfig {
@@ -36,7 +38,7 @@ impl Default for PipelineConfig {
             ingest_folders: vec!["NOTE/Note/**".to_string()],
             ingest_exclude: Vec::new(),
             ingest_keyword: None,
-            markdown_dir: None,
+            markdown_dirs: BTreeMap::new(),
         }
     }
 }
@@ -50,7 +52,7 @@ pub(crate) struct Raw {
     ingest_folders: Option<Vec<String>>,
     ingest_exclude: Option<Vec<String>>,
     ingest_keyword: Option<String>,
-    markdown_dir: Option<PathBuf>,
+    markdown_dirs: Option<BTreeMap<String, PathBuf>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -103,13 +105,18 @@ impl PipelineConfig {
             c.ingest_exclude = v;
         }
         c.ingest_keyword = raw.ingest_keyword.filter(|k| !k.trim().is_empty());
-        c.markdown_dir = raw
-            .markdown_dir
-            .filter(|d| !d.as_os_str().is_empty())
-            .map(|d| match path.parent() {
-                Some(base) if d.is_relative() => base.join(d),
-                _ => d,
-            });
+        for (slug, dir) in raw.markdown_dirs.unwrap_or_default() {
+            notedown_cloud::auth::validate_slug(&slug)
+                .map_err(|e| bad(format!("markdown_dirs: {slug:?}: {e}")))?;
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let dir = match path.parent() {
+                Some(base) if dir.is_relative() => base.join(dir),
+                _ => dir,
+            };
+            c.markdown_dirs.insert(slug, dir);
+        }
         Ok(c)
     }
 }

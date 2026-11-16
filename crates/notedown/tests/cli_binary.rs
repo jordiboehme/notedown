@@ -2348,42 +2348,76 @@ mod pipeline_and_mcp {
             .create("jordi", "jordi@example.org", "secret")
             .unwrap();
         let manifest = data.join("pipeline/jordi/markdown.json");
-        // Without the flag and without markdown_dir: no Markdown files.
-        let out = pipeline_cmd(data, &["--once"]);
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let manifest_dir = || -> serde_json::Value {
+            let m: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+            m["dir"].clone()
+        };
+        let ok = |out: &std::process::Output| {
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        };
+        // Without the flag and without markdown_dirs: no Markdown files.
+        ok(&pipeline_cmd(data, &["--once"]));
         assert!(!manifest.exists());
 
         let from_config = data.join("from-config");
         std::fs::write(
             data.join("server.toml"),
-            format!("[pipeline]\nmarkdown_dir = {:?}\n", from_config),
+            format!("[pipeline.markdown_dirs]\njordi = {from_config:?}\n"),
         )
         .unwrap();
-        let out = pipeline_cmd(data, &["--once"]);
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let m: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
-        assert_eq!(m["dir"], from_config.to_str().unwrap());
+        ok(&pipeline_cmd(data, &["--once"]));
+        assert_eq!(manifest_dir(), from_config.to_str().unwrap());
 
-        let flag = data.join("from-flag");
-        let flag_arg = flag.to_str().unwrap();
-        let out = pipeline_cmd(data, &["--once", "--markdown-dir", flag_arg]);
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
+        // The flag wins, with or without the account.
+        for flag in ["jordi=", ""] {
+            let target = data.join(format!("from-flag-{}", flag.len()));
+            let arg = format!("{flag}{}", target.display());
+            ok(&pipeline_cmd(data, &["--once", "--markdown-dir", &arg]));
+            assert_eq!(manifest_dir(), target.to_str().unwrap());
+        }
+
+        // A relative folder is below the current folder, made absolute.
+        let cwd = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+            .args([
+                "pipeline",
+                "--once",
+                "--markdown-dir",
+                "jordi=rel/md",
+                "--data",
+            ])
+            .arg(data)
+            .current_dir(cwd.path())
+            .env("NOTEDOWN_MODEL_DIR", data.join("no-model"))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        ok(&out);
+        let dir = manifest_dir();
+        let dir = std::path::Path::new(dir.as_str().unwrap());
+        assert!(dir.is_absolute(), "{dir:?}");
+        assert!(dir.ends_with("rel/md"), "{dir:?}");
+        assert_eq!(
+            std::fs::canonicalize(dir.parent().unwrap().parent().unwrap()).unwrap(),
+            std::fs::canonicalize(cwd.path()).unwrap()
         );
-        let m: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
-        assert_eq!(m["dir"], flag_arg);
+
+        // Two accounts: a flag without the account is refused, naming both.
+        notedown_cloud::auth::Accounts::new(data)
+            .create("anna", "anna@example.org", "secret")
+            .unwrap();
+        let never = data.join("never");
+        let out = pipeline_cmd(data, &["--once", "--markdown-dir", never.to_str().unwrap()]);
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("anna") && err.contains("jordi"), "{err}");
+        assert!(err.contains("SLUG=DIR"), "{err}");
+        assert!(!never.exists());
     }
 
     #[test]

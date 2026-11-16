@@ -1,8 +1,10 @@
-//! One Markdown file per note in a folder the user picks (`markdown_dir`, `--markdown-dir`).
+//! One Markdown file per note in a folder the user picks per account (`markdown_dirs`,
+//! `--markdown-dir`). One [`Writer`] per account.
 //!
 //! - Layout: the note's folder as on the device, then `<title>.md`: `NOTE/Note/Work/Meeting.note`
 //!   gives `Work/Meeting.md`, `NOTE/MyStyle/a.note` gives `MyStyle/a.md`, a note of another tree
-//!   keeps its device path (`DOCUMENT/Document/x/b.note` gives `Document/x/b.md`).
+//!   keeps its device path (`DOCUMENT/Document/x/b.note` gives `Document/x/b.md`). A long
+//!   title is cut so that every numbered name fits in 255 bytes.
 //! - Content: [`format::note_document`], the document the MCP server's `get_note` gives.
 //! - A note has a file while it has a page with text and is neither deleted nor unscoped.
 //! - The manifest (`<store>/markdown.json`) names every file the writer made and the folders it
@@ -15,7 +17,9 @@
 //! - A file whose text is the same (all but the `generated:` line of the frontmatter, which
 //!   holds the time of the render) is not written again, so sync tools see no change.
 //! - The first sync of a [`Writer`] looks at every note (a restart, a new folder, a crash that
-//!   lost the changes of a pass); later syncs only at the notes they are given.
+//!   lost the changes of a pass) and removes the temp files a crash left; later syncs only at
+//!   the notes they are given.
+//! - A deleted store takes its files along ([`remove_files`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -31,6 +35,9 @@ use crate::{Error, Result};
 pub const MANIFEST_FILE: &str = "markdown.json";
 /// The most numbered names tried for one note.
 const MAX_NUMBER: usize = 10_000;
+/// The longest file name stem in bytes: the highest numbered name, `<stem> (10000).md`, fits
+/// in the 255 bytes most file systems allow.
+const MAX_STEM: usize = 255 - " (10000).md".len();
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Manifest {
@@ -101,9 +108,16 @@ impl Writer {
         })
     }
 
+    /// The folder the files go to.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Brings the files of the notes `changed` (and, on the first sync, of every note) up to
-    /// date with `store`, then writes the manifest if it changed. A note that fails is tried
-    /// again by the next sync; the first error is returned after the others were done.
+    /// date with `store`, then writes the manifest if it changed. Names are freed first (the
+    /// files of notes that lose theirs or move), then the notes are placed, so a name freed in
+    /// this sync can be taken in it. A note that fails is tried again by the next sync; the
+    /// first error is returned after the others were done.
     pub fn sync(&mut self, store: &TextStore, slug: &str, changed: &[String]) -> Result<()> {
         self.pending.extend(changed.iter().cloned());
         let mut states: BTreeMap<String, NoteState> = BTreeMap::new();
@@ -113,14 +127,16 @@ impl Writer {
                 states.insert(note.key.clone(), note);
             }
             self.pending.extend(self.manifest.files.keys().cloned());
+            self.remove_temp_files();
             self.full = false;
         }
-        let keys: Vec<String> = self.pending.iter().cloned().collect();
         let mut first_error = None;
-        for key in keys {
-            let state = match states.remove(&key) {
+        // What each note wants: a file at a path, or none.
+        let mut plans: Vec<(String, Option<(PathBuf, NoteState)>)> = Vec::new();
+        for key in self.pending.iter() {
+            let state = match states.remove(key) {
                 Some(s) => Some(s),
-                None if notedown_cloud::pages::valid_key(&key) => match store.note(&key) {
+                None if notedown_cloud::pages::valid_key(key) => match store.note(key) {
                     Ok(s) => s,
                     Err(e) => {
                         first_error.get_or_insert(e);
@@ -129,7 +145,43 @@ impl Writer {
                 },
                 None => None,
             };
-            match self.place(&key, state.as_ref(), slug) {
+            let want = state
+                .filter(|s| !s.deleted && !s.unscoped && has_text(s))
+                .and_then(|s| relative_path(&s.path).map(|rel| (rel, s)));
+            plans.push((key.clone(), want));
+        }
+        // Free the names first.
+        let mut failed: BTreeSet<String> = BTreeSet::new();
+        for (key, want) in &plans {
+            let Some(current) = self.manifest.files.get(key).cloned() else {
+                continue;
+            };
+            let stays = want
+                .as_ref()
+                .is_some_and(|(rel, _)| numbered_of(&current, rel));
+            if stays {
+                continue;
+            }
+            match self.remove(&current) {
+                Ok(()) => {
+                    self.manifest.files.remove(key);
+                    self.held.remove(&current);
+                }
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                    failed.insert(key.clone());
+                }
+            }
+        }
+        for (key, want) in plans {
+            if failed.contains(&key) {
+                continue;
+            }
+            let placed = match &want {
+                Some((rel, note)) => self.place(&key, rel, note, slug),
+                None => Ok(()),
+            };
+            match placed {
                 Ok(()) => {
                     self.pending.remove(&key);
                 }
@@ -156,51 +208,41 @@ impl Writer {
         Ok(())
     }
 
-    /// Brings the file of note `key` in line with its state.
-    fn place(&mut self, key: &str, state: Option<&NoteState>, slug: &str) -> Result<()> {
-        let want = state
-            .filter(|s| !s.deleted && !s.unscoped && has_text(s))
-            .and_then(|s| relative_path(&s.path).map(|rel| (rel, s)));
-        let current = self.manifest.files.get(key).cloned();
-        let Some((rel, note)) = want else {
-            if let Some(old) = current {
-                self.remove(&old)?;
-                self.manifest.files.remove(key);
-                self.held.remove(&old);
-            }
-            return Ok(());
-        };
+    /// Writes the file of note `key` at `rel` (or a numbered name of it). Its current file,
+    /// if it still has one, has that name already.
+    fn place(&mut self, key: &str, rel: &Path, note: &NoteState, slug: &str) -> Result<()> {
         let content = format::note_document(note, slug);
-        let target = self.choose(key, &rel, current.as_deref(), &content)?;
+        let current = self.manifest.files.get(key).cloned();
+        let target = self.choose(key, rel, current.as_deref(), &content)?;
         let target_path = self.dir.join(&target);
-        let mut renamed = false;
-        if let Some(old) = current.as_deref().filter(|old| *old != target) {
-            let old_path = self.dir.join(old);
-            // A name that differs only in case on a disk that ignores case is the same file:
-            // it is renamed, never written and then removed.
-            if same_file(&old_path, &target_path) {
-                self.make_parents(&target)?;
-                notedown_cloud::fsutil::rename_durable(&old_path, &target_path)?;
-                renamed = true;
-            }
-        }
         self.make_parents(&target)?;
         let up_to_date = read_text(&target_path)?.is_some_and(|t| same_document(&t, &content));
         if !up_to_date {
             notedown_cloud::fsutil::write_atomic_in(&target_path, content.as_bytes(), false)?;
-        }
-        if let Some(old) = current.filter(|old| *old != target) {
-            if renamed {
-                self.prune(&old);
-            } else {
-                self.remove(&old)?;
-            }
         }
         if let Some(old) = self.manifest.files.insert(key.to_string(), target.clone()) {
             self.held.remove(&old);
         }
         self.held.insert(target, key.to_string());
         Ok(())
+    }
+
+    /// Removes the temp files a crash in a write left (`.<name>.md.<pid>.<n>.tmp`) in the
+    /// folder and in the folders the writer made. Best effort.
+    fn remove_temp_files(&self) {
+        let folders = std::iter::once(String::new()).chain(self.manifest.folders.iter().cloned());
+        for folder in folders {
+            let Ok(entries) = std::fs::read_dir(self.dir.join(&folder)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if entry.file_name().to_str().is_some_and(is_temp_name)
+                    && entry.file_type().is_ok_and(|t| t.is_file())
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
     }
 
     /// The file name for note `key` at `rel`: its current file when that has the same name
@@ -219,10 +261,9 @@ impl Writer {
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string();
-        if let Some(c) = current.filter(|c| numbered_of(c, parent, &stem)) {
+        if let Some(c) = current.filter(|c| numbered_of(c, rel)) {
             return Ok(c.to_string());
         }
-        let current_path = current.map(|c| self.dir.join(c));
         for n in 1..=MAX_NUMBER {
             let name = if n == 1 {
                 format!("{stem}.md")
@@ -241,10 +282,7 @@ impl Writer {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
                 Err(source) => return Err(Error::Io { path, source }),
                 Ok(m) if !m.is_file() => false,
-                Ok(_) => {
-                    current_path.as_deref().is_some_and(|c| same_file(c, &path))
-                        || read_text(&path)?.is_some_and(|t| same_document(&t, content))
-                }
+                Ok(_) => read_text(&path)?.is_some_and(|t| same_document(&t, content)),
             };
             if free {
                 return Ok(candidate);
@@ -341,7 +379,7 @@ pub fn relative_path(wire: &str) -> Option<PathBuf> {
         }
     }
     let (last, folders) = device.split_last()?;
-    let stem = last.strip_suffix(".note").unwrap_or(last);
+    let stem = cut(last.strip_suffix(".note").unwrap_or(last), MAX_STEM);
     if stem.is_empty() {
         return None;
     }
@@ -350,13 +388,25 @@ pub fn relative_path(wire: &str) -> Option<PathBuf> {
     safe_rel(&rel_string(&out))
 }
 
-/// Whether `rel` is `<parent>/<stem>.md` or `<parent>/<stem> (N).md`.
-fn numbered_of(rel: &str, parent: &Path, stem: &str) -> bool {
-    let rel = Path::new(rel);
-    if rel.parent().unwrap_or(Path::new("")) != parent {
+/// `text` cut to at most `max` bytes at a character boundary.
+fn cut(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Whether `file` is `want` (`<parent>/<stem>.md`) or `<parent>/<stem> (N).md`.
+fn numbered_of(file: &str, want: &Path) -> bool {
+    let file = Path::new(file);
+    if file.parent() != want.parent() {
         return false;
     }
-    let Some(name) = rel.file_name().and_then(|n| n.to_str()) else {
+    let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(stem) = want.file_stem().and_then(|s| s.to_str()) else {
         return false;
     };
     if name == format!("{stem}.md") {
@@ -366,6 +416,66 @@ fn numbered_of(rel: &str, parent: &Path, stem: &str) -> bool {
         .and_then(|r| r.strip_prefix(" ("))
         .and_then(|r| r.strip_suffix(").md"))
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether `name` is a temp file of an atomic write of a Markdown file:
+/// `.<name>.md.<pid>.<n>.tmp`.
+fn is_temp_name(name: &str) -> bool {
+    let Some(inner) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")) else {
+        return false;
+    };
+    let mut parts = inner.rsplitn(3, '.');
+    let digits =
+        |p: Option<&str>| p.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    digits(parts.next())
+        && digits(parts.next())
+        && parts
+            .next()
+            .is_some_and(|n| n.len() > 3 && n.ends_with(".md"))
+}
+
+/// Removes the files the manifest at `manifest_path` lists and then the folders the writer
+/// made, when empty: for a store that is deleted. Paths that are not below the manifest's
+/// folder are left alone. A missing manifest removes nothing.
+pub fn remove_files(manifest_path: &Path) -> Result<()> {
+    let manifest: Manifest = match std::fs::read(manifest_path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(Error::Io {
+                path: manifest_path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let mut first_error = None;
+    for rel in manifest.files.values().filter(|r| safe_rel(r).is_some()) {
+        let path = manifest.dir.join(rel);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                first_error.get_or_insert(Error::Io { path, source });
+            }
+        }
+    }
+    // The deepest folders first; one that is not empty stays.
+    let mut folders: Vec<&String> = manifest
+        .folders
+        .iter()
+        .filter(|r| safe_rel(r).is_some())
+        .collect();
+    folders.sort_by_key(|f| std::cmp::Reverse(Path::new(f).components().count()));
+    for folder in folders {
+        let _ = std::fs::remove_dir(manifest.dir.join(folder));
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// `rel` as a path below the folder, when it is one: relative, no `.` or `..`.
@@ -421,24 +531,6 @@ fn same_document(a: &str, b: &str) -> bool {
         })
     }
     lines(a).eq(lines(b))
-}
-
-/// Whether `a` and `b` are the same file (also under two spellings on a disk that ignores
-/// case).
-fn same_file(a: &Path, b: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        match (std::fs::metadata(a), std::fs::metadata(b)) {
-            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
-            _ => false,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (a, b);
-        false
-    }
 }
 
 #[cfg(test)]

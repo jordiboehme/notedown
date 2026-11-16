@@ -6,16 +6,20 @@ use std::time::{Duration, SystemTime};
 
 use notedown_pipeline::PipelineConfig;
 use notedown_pipeline::markdown::{self, Writer};
-use notedown_pipeline::setup::Setup;
-use notedown_pipeline::store::WriterLock;
-use notedown_pipeline::worker::Worker;
+use notedown_pipeline::model::{Block, NoteState, PageOcrState, PageState};
+use notedown_pipeline::setup::{self, Setup};
+use notedown_pipeline::store::{TextStore, WriterLock};
+use notedown_pipeline::worker::{Clock, Worker};
 
 use crate::fake_engine::FakeEngine;
-use crate::worker::{Data, SLUG, engine_reading, no_settle, setup};
+use crate::split::{
+    Said, continuous, create_account, load, point_at, put_into, remove_account, store_dir,
+};
+use crate::worker::{Data, SLUG, engine_reading, no_settle, setup, stop_at};
 
 fn with_dir(dir: &Path) -> PipelineConfig {
     PipelineConfig {
-        markdown_dir: Some(dir.to_path_buf()),
+        markdown_dirs: [(SLUG.to_string(), dir.to_path_buf())].into(),
         ..no_settle()
     }
 }
@@ -395,7 +399,7 @@ fn only_the_changed_notes_are_looked_at() {
     let two = d.put("test2", "NOTE/Note");
     run(&d, no_settle(), "hello");
     let lock = WriterLock::take(&d.data).unwrap();
-    let store = notedown_pipeline::store::TextStore::open_writer(&d.data, SLUG, &lock).unwrap();
+    let store = TextStore::open_writer(&d.data, SLUG, &lock).unwrap();
     let mut writer = Writer::new(out.path(), &manifest_path(&d)).unwrap();
     // The first sync of a writer writes every note.
     writer.sync(&store, SLUG, &[]).unwrap();
@@ -419,10 +423,18 @@ fn two_machines(d: &Data, markdown_dir: Option<&Path>) -> tempfile::TempDir {
         d.data
     );
     if let Some(m) = markdown_dir {
-        toml.push_str(&format!("markdown_dir = {m:?}\n"));
+        toml.push_str(&format!("[pipeline.markdown_dirs]\n{SLUG} = {m:?}\n"));
     }
     std::fs::write(local.path().join("pipeline.toml"), toml).unwrap();
     local
+}
+
+fn store_manifest(local: &Path, slug: &str) -> serde_json::Value {
+    let path = local
+        .join("pipeline")
+        .join(slug)
+        .join(markdown::MANIFEST_FILE);
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
 #[test]
@@ -433,40 +445,68 @@ fn the_flag_wins_over_pipeline_toml() {
     let key = d.put("test1", "NOTE/Note");
     let local = two_machines(&d, Some(toml_dir.path()));
     let s = Setup::load(local.path()).unwrap();
-    assert_eq!(s.cfg.markdown_dir.as_deref(), Some(toml_dir.path()));
-    let s = s.with_markdown_dir(Some(flag_dir.path().to_path_buf()));
-    assert_eq!(s.cfg.markdown_dir.as_deref(), Some(flag_dir.path()));
+    assert_eq!(
+        s.cfg.markdown_dirs.get(SLUG).map(PathBuf::as_path),
+        Some(toml_dir.path())
+    );
+    let flag = setup::parse_markdown_flag(&format!("{SLUG}={}", flag_dir.path().display()));
+    assert_eq!(
+        flag,
+        (Some(SLUG.to_string()), flag_dir.path().to_path_buf())
+    );
+    let s = s.with_markdown_dirs(vec![flag]).unwrap();
+    assert_eq!(s.markdown_dir(SLUG, 1), Some(flag_dir.path().to_path_buf()));
     Worker::new(&s, Box::new(engine_reading("hello")))
         .run_once(true)
         .unwrap();
     assert_eq!(files(flag_dir.path()), ["test1.md"]);
     assert!(files(toml_dir.path()).is_empty());
-    let m: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(
-            local
-                .path()
-                .join("pipeline")
-                .join(SLUG)
-                .join(markdown::MANIFEST_FILE),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(m["files"][&key], "test1.md");
+    assert_eq!(
+        store_manifest(local.path(), SLUG)["files"][&key],
+        "test1.md"
+    );
+
+    // A flag without an account is for the one account served; it wins too.
+    let other = tempfile::tempdir().unwrap();
+    let flag = setup::parse_markdown_flag(other.path().to_str().unwrap());
+    assert_eq!(flag, (None, other.path().to_path_buf()));
+    let s = Setup::load(local.path())
+        .unwrap()
+        .with_markdown_dirs(vec![flag])
+        .unwrap();
+    assert_eq!(s.markdown_dir(SLUG, 1), Some(other.path().to_path_buf()));
+    Worker::new(&s, Box::new(engine_reading("hello")))
+        .run_once(true)
+        .unwrap();
+    assert_eq!(files(other.path()), ["test1.md"]);
 
     // Without the flag, pipeline.toml counts; a relative path is below the local folder.
-    let s = Setup::load(local.path()).unwrap().with_markdown_dir(None);
-    assert_eq!(s.cfg.markdown_dir.as_deref(), Some(toml_dir.path()));
+    let s = Setup::load(local.path())
+        .unwrap()
+        .with_markdown_dirs(Vec::new())
+        .unwrap();
+    assert_eq!(s.markdown_dir(SLUG, 1), Some(toml_dir.path().to_path_buf()));
     std::fs::write(
         local.path().join("pipeline.toml"),
         format!(
-            "[server]\nfolder = {:?}\n[pipeline]\nmarkdown_dir = \"md\"\n",
+            "[server]\nfolder = {:?}\n[pipeline.markdown_dirs]\n{SLUG} = \"md\"\n",
             d.data
         ),
     )
     .unwrap();
     let s = Setup::load(local.path()).unwrap();
-    assert_eq!(s.cfg.markdown_dir, Some(local.path().join("md")));
+    assert_eq!(s.markdown_dir(SLUG, 1), Some(local.path().join("md")));
+    // An account name that is no slug is refused.
+    std::fs::write(
+        local.path().join("pipeline.toml"),
+        format!(
+            "[server]\nfolder = {:?}\n[pipeline.markdown_dirs]\n\"a/b\" = \"md\"\n",
+            d.data
+        ),
+    )
+    .unwrap();
+    let e = Setup::load(local.path()).err().unwrap().to_string();
+    assert!(e.contains("markdown_dirs"), "{e}");
 }
 
 #[test]
@@ -474,8 +514,11 @@ fn no_flag_no_files() {
     let d = setup();
     d.put("test1", "NOTE/Note");
     let local = two_machines(&d, None);
-    let s = Setup::load(local.path()).unwrap().with_markdown_dir(None);
-    assert_eq!(s.cfg.markdown_dir, None);
+    let s = Setup::load(local.path())
+        .unwrap()
+        .with_markdown_dirs(Vec::new())
+        .unwrap();
+    assert_eq!(s.markdown_dir(SLUG, 1), None);
     Worker::new(&s, Box::new(engine_reading("hello")))
         .run_once(true)
         .unwrap();
@@ -485,7 +528,78 @@ fn no_flag_no_files() {
     // One machine, the default config: the same.
     run(&d, no_settle(), "hello");
     assert!(!manifest_path(&d).exists());
-    assert_eq!(PipelineConfig::default().markdown_dir, None);
+    assert!(PipelineConfig::default().markdown_dirs.is_empty());
+}
+
+#[test]
+fn each_account_has_its_own_folder() {
+    let d = setup();
+    create_account(&d.data, "anna");
+    put_into(&d.data, "anna", "test2", "NOTE/Note");
+    d.put("test1", "NOTE/Note");
+    let mine = tempfile::tempdir().unwrap();
+    let hers = tempfile::tempdir().unwrap();
+    // Only one account has a folder: the other gets no files.
+    run(&d, with_dir(mine.path()), "hello");
+    assert_eq!(files(mine.path()), ["test1.md"]);
+    assert!(
+        !d.data
+            .join("pipeline/anna")
+            .join(markdown::MANIFEST_FILE)
+            .exists()
+    );
+    let both = PipelineConfig {
+        markdown_dirs: [
+            (SLUG.to_string(), mine.path().to_path_buf()),
+            ("anna".to_string(), hers.path().to_path_buf()),
+        ]
+        .into(),
+        ..no_settle()
+    };
+    run(&d, both, "hello");
+    assert_eq!(files(mine.path()), ["test1.md"]);
+    assert_eq!(files(hers.path()), ["test2.md"]);
+    assert!(read(&hers.path().join("test2.md")).contains("notedown://anna/"));
+}
+
+#[test]
+fn a_flag_without_an_account_needs_exactly_one() {
+    let d = setup();
+    create_account(&d.data, "anna");
+    d.put("test1", "NOTE/Note");
+    let out = tempfile::tempdir().unwrap();
+    let s = crate::worker::one_machine(&d, no_settle());
+    let flag = || setup::parse_markdown_flag(out.path().to_str().unwrap());
+    // Two flags without an account, or one mixed with named ones, are refused.
+    assert!(s.clone().with_markdown_dirs(vec![flag(), flag()]).is_err());
+    let named = (Some(SLUG.to_string()), out.path().to_path_buf());
+    assert!(
+        s.clone()
+            .with_markdown_dirs(vec![flag(), named.clone()])
+            .is_err()
+    );
+    assert!(
+        s.clone()
+            .with_markdown_dirs(vec![named.clone(), named])
+            .is_err()
+    );
+    let s = s.with_markdown_dirs(vec![flag()]).unwrap();
+    let e = s
+        .check_markdown(&["anna".to_string(), SLUG.to_string()])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("anna") && e.contains(SLUG) && e.contains("SLUG=DIR"),
+        "{e}"
+    );
+    assert!(s.check_markdown(&[SLUG.to_string()]).is_ok());
+    // A worker that serves two accounts writes nothing and says why, once.
+    let said = Said::default();
+    let mut w = Worker::new(&s, Box::new(engine_reading("hello"))).with_messages(said.sink());
+    w.run_once(true).unwrap();
+    w.run_once(true).unwrap();
+    assert!(files(out.path()).is_empty());
+    assert_eq!(said.count("SLUG=DIR"), 1, "{:?}", said.lines());
 }
 
 #[test]
@@ -509,4 +623,257 @@ fn the_files_are_kept_while_the_model_is_missing() {
     );
     assert_eq!(files(out.path()), ["test1.md"]);
     assert_eq!(manifest(&d)["files"][&read], "test1.md");
+}
+
+/// A note state with one page of `text`, as the worker leaves it.
+fn note_state(key: &str, path: &str, text: &str) -> NoteState {
+    NoteState {
+        key: key.into(),
+        path: path.into(),
+        title: notedown_pipeline::model::title_of(path),
+        pages: vec![PageState {
+            page_id: "P1".into(),
+            seq: Some(1),
+            state: PageOcrState::Done,
+            blocks: vec![Block {
+                id: "b1".into(),
+                label: "text".into(),
+                bbox: [0, 0, 10, 10],
+                text: text.into(),
+                replaces: Vec::new(),
+            }],
+            ..PageState::default()
+        }],
+        ..NoteState::default()
+    }
+}
+
+const LOW: &str = "path:00000000000000000000000000000001";
+const HIGH: &str = "path:ffffffffffffffffffffffffffffffff";
+const MID: &str = "path:88888888888888888888888888888888";
+
+/// A store of its own (no server) and a folder for the writer.
+struct Hand {
+    _dir: tempfile::TempDir,
+    data: PathBuf,
+    out: PathBuf,
+    lock: WriterLock,
+    store: TextStore,
+}
+
+impl Hand {
+    fn new() -> Hand {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().to_path_buf();
+        let out = data.join("md");
+        let lock = WriterLock::take(&data).unwrap();
+        let store = TextStore::open_writer(&data, SLUG, &lock).unwrap();
+        Hand {
+            _dir: dir,
+            data,
+            out,
+            lock,
+            store,
+        }
+    }
+    fn save(&self, note: &NoteState) {
+        self.store.save_note(&self.lock, note).unwrap();
+    }
+    fn writer(&self) -> Writer {
+        Writer::new(&self.out, &self.store.dir().join(markdown::MANIFEST_FILE)).unwrap()
+    }
+    fn manifest(&self) -> serde_json::Value {
+        let path = self
+            .data
+            .join("pipeline")
+            .join(SLUG)
+            .join(markdown::MANIFEST_FILE);
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+}
+
+#[test]
+fn a_rekeyed_note_keeps_its_name() {
+    // A note keyed by its path gets a new key that sorts before the old one, at a path that
+    // gives the same file name.
+    let h = Hand::new();
+    h.save(&note_state(HIGH, "NOTE/Note/MyStyle/x.note", "hello"));
+    let mut w = h.writer();
+    w.sync(&h.store, SLUG, &[]).unwrap();
+    assert_eq!(files(&h.out), ["MyStyle/x.md"]);
+    h.save(&note_state(LOW, "NOTE/MyStyle/x.note", "hello"));
+    h.store.remove_note(&h.lock, HIGH).unwrap();
+    w.sync(&h.store, SLUG, &h.store.take_touched()).unwrap();
+    assert_eq!(files(&h.out), ["MyStyle/x.md"]);
+    assert_eq!(h.manifest()["files"][LOW], "MyStyle/x.md");
+    assert!(h.manifest()["files"].get(HIGH).is_none());
+}
+
+#[test]
+fn a_name_freed_in_the_same_pass_is_taken() {
+    for restart in [false, true] {
+        let h = Hand::new();
+        h.save(&note_state(LOW, "NOTE/Note/a.note", "note a"));
+        h.save(&note_state(MID, "NOTE/Note/b.note", "note b"));
+        h.save(&note_state(HIGH, "NOTE/Note/c.note", "note c"));
+        let mut w = h.writer();
+        w.sync(&h.store, SLUG, &[]).unwrap();
+        assert_eq!(files(&h.out), ["a.md", "b.md", "c.md"]);
+        // B is deleted and A is renamed onto B's name.
+        let mut b = note_state(MID, "NOTE/Note/b.note", "note b");
+        b.deleted = true;
+        h.save(&b);
+        h.save(&note_state(LOW, "NOTE/Note/b.note", "note a"));
+        let changed = h.store.take_touched();
+        if restart {
+            w = h.writer();
+            w.sync(&h.store, SLUG, &[]).unwrap();
+        } else {
+            w.sync(&h.store, SLUG, &changed).unwrap();
+        }
+        assert_eq!(files(&h.out), ["b.md", "c.md"], "restart {restart}");
+        assert!(read(&h.out.join("b.md")).contains("note a"));
+        assert_eq!(h.manifest()["files"][LOW], "b.md");
+
+        // A swap: A takes C's name and C takes A's.
+        h.save(&note_state(LOW, "NOTE/Note/c.note", "note a"));
+        h.save(&note_state(HIGH, "NOTE/Note/b.note", "note c"));
+        let changed = h.store.take_touched();
+        if restart {
+            w = h.writer();
+            w.sync(&h.store, SLUG, &[]).unwrap();
+        } else {
+            w.sync(&h.store, SLUG, &changed).unwrap();
+        }
+        assert_eq!(files(&h.out), ["b.md", "c.md"], "restart {restart}");
+        assert!(read(&h.out.join("c.md")).contains("note a"));
+        assert!(read(&h.out.join("b.md")).contains("note c"));
+    }
+}
+
+#[test]
+fn reocr_skips_a_store_that_fails_the_owner_check() {
+    let d = setup();
+    let local = tempfile::tempdir().unwrap();
+    point_at(local.path(), &d.data);
+    d.put("test1", "NOTE/Note");
+    Worker::new(&load(local.path()), Box::new(engine_reading("hello")))
+        .run_once(true)
+        .unwrap();
+    // Text without an owner on two machines: the account is not read, nor written.
+    std::fs::remove_file(store_dir(local.path(), SLUG).join("owner.json")).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let mut s = load(local.path());
+    s.cfg = with_dir(out.path());
+    let _ = Worker::new(&s, Box::new(engine_reading("hello")))
+        .with_messages(Said::default().sink())
+        .reocr(None);
+    assert!(files(out.path()).is_empty());
+    assert!(
+        !store_dir(local.path(), SLUG)
+            .join(markdown::MANIFEST_FILE)
+            .exists()
+    );
+}
+
+#[test]
+fn a_new_owner_removes_the_old_files() {
+    let d = setup();
+    let local = tempfile::tempdir().unwrap();
+    point_at(local.path(), &d.data);
+    d.put("test1", "NOTE/Note/Sub");
+    let out = tempfile::tempdir().unwrap();
+    std::fs::write(out.path().join("mine.md"), "mine").unwrap();
+    let mut s = load(local.path());
+    s.cfg = with_dir(out.path());
+    Worker::new(&s, Box::new(engine_reading("hello")))
+        .run_once(true)
+        .unwrap();
+    assert_eq!(files(out.path()), ["Sub/test1.md", "mine.md"]);
+    // The slug is given to a new account: the old text and its files go.
+    remove_account(&d.data, SLUG);
+    create_account(&d.data, SLUG);
+    Worker::new(&s, Box::new(engine_reading("hello")))
+        .with_messages(Said::default().sink())
+        .run_once(true)
+        .unwrap();
+    assert_eq!(files(out.path()), ["mine.md"]);
+    assert!(!out.path().join("Sub").exists());
+}
+
+#[test]
+fn a_removed_account_loses_its_files() {
+    let d = setup();
+    let local = tempfile::tempdir().unwrap();
+    point_at(local.path(), &d.data);
+    d.put("test1", "NOTE/Note/Sub");
+    let out = tempfile::tempdir().unwrap();
+    let mut s = load(local.path());
+    s.cfg = with_dir(out.path());
+    let said = Said::default();
+    let (mut w, clock) = continuous(&s, &said);
+    w.run(stop_at(&clock, clock.now_ms() + 1)).unwrap();
+    assert_eq!(files(out.path()), ["Sub/test1.md"]);
+    remove_account(&d.data, SLUG);
+    w.run(stop_at(&clock, clock.now_ms() + 5_000)).unwrap();
+    assert!(
+        !store_dir(local.path(), SLUG).exists(),
+        "{:?}",
+        said.lines()
+    );
+    assert!(files(out.path()).is_empty());
+    assert!(!out.path().join("Sub").exists());
+    assert!(out.path().is_dir(), "the folder itself stays");
+}
+
+#[test]
+fn a_long_name_is_cut() {
+    for stem in ["a".repeat(300), "ä".repeat(200)] {
+        let rel = markdown::relative_path(&format!("NOTE/Note/{stem}.note")).unwrap();
+        let name = rel.to_str().unwrap();
+        let cut = name.strip_suffix(".md").unwrap();
+        assert!(stem.starts_with(cut));
+        // The highest numbered name fits too.
+        assert!(format!("{cut} (10000).md").len() <= 255, "{}", name.len());
+    }
+    // A note with such a name gets its file, and a second one its numbered file.
+    let h = Hand::new();
+    let long = "ö".repeat(200);
+    h.save(&note_state(LOW, &format!("NOTE/Note/{long}.note"), "one"));
+    h.save(&note_state(HIGH, &format!("NOTE/Note/{long}x.note"), "two"));
+    h.writer().sync(&h.store, SLUG, &[]).unwrap();
+    let names = files(&h.out);
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(names.iter().all(|n| n.len() <= 255), "{names:?}");
+}
+
+#[test]
+fn leftover_temp_files_are_removed() {
+    let h = Hand::new();
+    h.save(&note_state(LOW, "NOTE/Note/Sub/a.note", "hello"));
+    h.writer().sync(&h.store, SLUG, &[]).unwrap();
+    // A crash in a write leaves its temp file; a user's own files stay.
+    std::fs::write(h.out.join(".a.md.123.4.tmp"), "x").unwrap();
+    std::fs::write(h.out.join("Sub/.a.md.99.0.tmp"), "x").unwrap();
+    std::fs::write(h.out.join(".notes.tmp"), "mine").unwrap();
+    std::fs::write(h.out.join("Sub/.a.md.tmp"), "mine").unwrap();
+    h.writer().sync(&h.store, SLUG, &[]).unwrap();
+    assert_eq!(files(&h.out), [".notes.tmp", "Sub/.a.md.tmp", "Sub/a.md"]);
+}
+
+#[test]
+fn a_note_back_in_scope_gets_its_file_again() {
+    let d = setup();
+    let out = tempfile::tempdir().unwrap();
+    d.put("test1", "NOTE/Note");
+    run(&d, with_dir(out.path()), "hello");
+    let narrow = PipelineConfig {
+        ingest_exclude: vec!["NOTE/Note/test1.note".into()],
+        ..with_dir(out.path())
+    };
+    let mut w = worker(&d, narrow, engine_reading("hello"));
+    w.run_once(true).unwrap();
+    assert!(files(out.path()).is_empty());
+    run(&d, with_dir(out.path()), "hello");
+    assert_eq!(files(out.path()), ["test1.md"]);
 }

@@ -246,30 +246,48 @@ seconds. The fields:
 
 ## Markdown files
 
-The pipeline can keep the text of each note as a Markdown file in a folder you pick. It is off by
-default. Turn it on with `notedown pipeline --data DIR --markdown-dir <DIR>`, or with `markdown_dir`
-in the `[pipeline]` section of `pipeline.toml` (two machines) or `server.toml` (one machine). The flag
-wins over the config. A relative `markdown_dir` is below the data folder; `~` is not expanded, so use a
-full path. The Mac app passes `~/Documents/Markdown` or the folder you chose.
+The pipeline can keep the text of each note as a Markdown file in a folder you pick. The folder
+belongs to one account: each account has its own folder, and an account without one gets no files.
+It is off by default.
+
+Turn it on with `notedown pipeline --data DIR --markdown-dir SLUG=FOLDER`. Repeat the flag for more
+accounts. `--markdown-dir FOLDER` without `SLUG=` is only allowed when the pipeline serves exactly one
+account; with more, Notedown stops with an error that names them (when the server cannot be
+reached at the start, it says so later and writes no files). A relative folder is taken from the
+current folder. The Mac app passes `~/Documents/Markdown` or the folder you chose.
+
+You can also set the folders in the config, in `pipeline.toml` (two machines) or `server.toml` (one
+machine). A flag wins over the config for its account. A relative path in the file is below the data
+folder; `~` is not expanded, so use a full path.
 
 ```toml
-[pipeline]
-markdown_dir = "/Users/me/Documents/Markdown"
+[pipeline.markdown_dirs]
+jordi = "/Users/jordi/Documents/Markdown"
+anna = "/Users/anna/Documents/Markdown"
 ```
 
+Two accounts can be given the same folder, but that is at your own risk: their notes mix, and a name
+that both use gets `(2)` for one of them.
+
+- Do not edit these files. Notedown overwrites them when the note changes.
 - Layout: the note's folder as on the device, then `<title>.md`. `Note/Work/Meeting.note` gives
   `Work/Meeting.md`, a note in `MyStyle` goes to `MyStyle/...`, a note in another folder keeps its
-  path (`Document/Books/a.note` gives `Document/Books/a.md`).
+  path (`Document/Books/a.note` gives `Document/Books/a.md`). A very long title is cut, so that the
+  file name fits in 255 bytes.
 - Content: the same document the MCP server's `get_note` gives: frontmatter, the text of each page and
   the anchor of every block as an HTML comment.
-- A note gets its file once a page has text. The file is written again after a pass that changed its
-  text, its path or its scope. A file whose text is the same is not written again, so sync tools see no
-  change. A moved note moves its file, a deleted note or a note that leaves the scope loses it.
+- A note gets its file once a page has text. Files are written at the end of each pass of the pipeline,
+  for the notes whose text, path or scope changed. A file whose text is the same is not written again,
+  so sync tools see no change. A moved note moves its file, a deleted note or a note that leaves the
+  scope loses it.
 - Notedown changes only files it wrote. They are listed in `pipeline/<account>/markdown.json`. When a
   name is taken by another file, the note gets `<title> (2).md` (then 3, and so on). Folders it made
   go again when a move or delete leaves them empty.
 - With another folder, every note is written to the new folder. The files in the old folder stay.
-- Files are written through a temp file and a rename, so a reader never sees half a file.
+- When the note text of an account is deleted (the account was removed on the server, or its name
+  now belongs to a new account), its Markdown files are removed too.
+- Files are written through a temp file and a rename, so a reader never sees half a file. A temp file
+  left by a crash is removed at the next start.
 
 ## Format documentation and tests
 

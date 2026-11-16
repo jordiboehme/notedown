@@ -86,10 +86,11 @@ struct PipelineArgs {
     /// Stop when the process PID is no longer the parent (for the Mac app)
     #[arg(long, value_name = "PID", hide = true, conflicts_with_all = ["once", "reocr"])]
     exit_with_parent: Option<u32>,
-    /// Keep each note with text as a Markdown file in this folder (wins over markdown_dir in
-    /// the config)
-    #[arg(long, value_name = "DIR")]
-    markdown_dir: Option<PathBuf>,
+    /// Keep each note with text of account SLUG as a Markdown file in DIR (wins over
+    /// [pipeline.markdown_dirs] in the config). Repeat it for more accounts. DIR alone is for
+    /// the only account the pipeline serves
+    #[arg(long, value_name = "[SLUG=]DIR")]
+    markdown_dir: Vec<String>,
 }
 
 #[cfg(feature = "ocr")]
@@ -2157,14 +2158,21 @@ fn pipeline_command(args: PipelineArgs) -> Result<ExitCode> {
     }
     // Without <data>/pipeline.toml the server's data is this folder; with it, the folder named
     // there, and this one keeps only the pipeline's own data.
-    let markdown_dir = match args.markdown_dir {
-        Some(dir) => Some(
-            std::path::absolute(&dir)
-                .with_context(|| format!("--markdown-dir {}", dir.display()))?,
-        ),
-        None => None,
-    };
-    let setup = notedown_pipeline::setup::Setup::load(&data)?.with_markdown_dir(markdown_dir);
+    let mut flags = Vec::new();
+    for text in &args.markdown_dir {
+        let (slug, dir) = notedown_pipeline::setup::parse_markdown_flag(text);
+        let dir = std::path::absolute(&dir).with_context(|| format!("--markdown-dir {text}"))?;
+        flags.push((slug, dir));
+    }
+    let setup = notedown_pipeline::setup::Setup::load(&data)?.with_markdown_dirs(flags)?;
+    // A folder without an account needs exactly one served account. Checked now when the
+    // account list can be read; the worker checks it again on every pass.
+    if setup.markdown_only.is_some()
+        && let Ok(served) = setup.served()
+    {
+        let slugs: Vec<String> = served.into_iter().map(|a| a.slug).collect();
+        setup.check_markdown(&slugs)?;
+    }
     // The model is loaded when a page is due, as `notedown convert` loads it.
     let loader: EngineLoader = Box::new(|| {
         let paths = model::resolve(&DEFAULT_MODEL, None, None)?;

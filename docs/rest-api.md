@@ -1,6 +1,6 @@
 # The REST API
 
-The Notedown server has a REST API under `/rest/v1`. It is for programs that work with an account's files over the network. Two programs use it today. The pipeline on a Mac reads notes and the journal with it (`notedown connect`). A Mac app browses the files of the account and manages them: it uploads, creates folders, renames, moves and deletes.
+The Notedown server has a REST API under `/rest/v1`. It is for programs that work with an account's files over the network. Two programs use it today. The pipeline on a Mac reads notes and the journal with it (`notedown connect`). A Mac app browses the files of the account, follows their changes and manages them: it uploads, creates folders, renames, moves and deletes.
 
 This page is for people who build such a client. It lists every route, its answers and its error codes. For the setup of a server, see the [getting started guide](getting-started.md). For the files and the journal on disk, see the [sync protocol](sync-protocol.md).
 
@@ -68,6 +68,7 @@ A refused token gets 401 `token_refused` with `WWW-Authenticate: Bearer`. A toke
 | `GET /entries/{id}` | read | One file or folder |
 | `GET` and `HEAD /files/{id}` | read | Download a file |
 | `GET /journal` | read | What changed since a `seq` |
+| `GET /events` | read | The file and folder changes since a `seq` |
 | `GET /records`, `GET /records/{key}` | read | The page records of the pipeline |
 | `GET /digests` | read | The digests |
 | `GET` and `HEAD /note?path=` | read | One note file by its path |
@@ -104,7 +105,7 @@ Lists the children of the folder at `path` (the root by default). With `recursiv
 
 Before it answers, the server scans what it shows. A file that someone put into the folder by hand is journaled and has its id before the app sees it.
 
-**List by folder.** Do not list the whole tree with `recursive=true` on a big account. List the folder the user opens. Keep the `seq` of that answer and poll `GET /journal?from=<seq + 1>`. The server read `seq` under the same lock as the listing, so the listing holds every event up to `seq` and you miss nothing. When the journal answer says `changed`, list the open folder again.
+**List by folder.** Do not list the whole tree with `recursive=true` on a big account. List the folder the user opens. Keep the `seq` of that answer and poll `GET /events?from=<seq + 1>`. The server read `seq` under the same lock as the listing, so the listing holds every event up to `seq` and you miss nothing. See [Following changes](#following-changes) for what to do with the events.
 
 ### `GET /entries/{id}`
 
@@ -128,9 +129,101 @@ Tells what changed in the account since the `seq` in `from` (0 by default). `lim
 {"changed": true, "removed": [], "next": 813, "end": 812, "more": false}
 ```
 
-`changed` is true when the account has a new journal line in the range. That includes lines that are no file change (digests, tasks, devices and scans), so the app may list again and see nothing new. `next` is one past the last `seq` read. Ask again from `next`. `more` means a page limit was hit: ask again at once. A number that does not parse is a 400.
+`changed` is true when the account has a new journal line in the range. That includes lines that are no file change (digests, tasks, devices and scans). An app that follows files uses `GET /events` instead. `next` is one past the last `seq` read. Ask again from `next`. `more` means a page limit was hit: ask again at once. A number that does not parse is a 400.
 
 Writes of the app have the origin `app` in the journal.
+
+## Following changes
+
+### `GET /events?from=&limit=`
+
+Gives the file and folder changes of the account since the `seq` in `from` (0 by default). An app lists once, keeps the `seq` of that listing and follows on from `seq + 1`. It does not need to list again, except after a `gap`.
+
+`limit` is the number of events in one page. The default and the largest is 1000. A larger number is 1000 and 0 is 1. A number that does not parse is a 400. Any valid token can read it, a read token too.
+
+```json
+{
+  "events": [
+    {"seq": 813, "ts": 1763290000123, "type": "file.created", "origin": "app",
+     "opId": "3f2c1d7a-8b4e-4c2a-9d1f-6e5a7b8c9d0e",
+     "id": 41, "path": "NOTE/Note/a.note", "fileKind": "note",
+     "md5": "9e107d9d372bb6826bd81d3542a419d6", "size": 20480}
+  ],
+  "next": 814, "end": 813, "more": false, "gap": false
+}
+```
+
+- `next` is one past the last `seq` read. Ask again from `next`. A page without events for the account can still move `next`.
+- `end` is the highest `seq` of the journal as far as the server can tell. It is 0 for an empty journal. For a token of a removed account it is at most the `seq` of the removal.
+- `more` means the page stopped at its limit: ask again at once. Then `next` is larger than `from`. A page also stops after 10000 journal lines, whoever they belong to, so a page can be short or empty and still have `more`.
+- `gap` means events may be missing between `from` and `next`. See below.
+
+Each event has these fields. A field that does not apply is left out.
+
+| Field | Meaning |
+| --- | --- |
+| `seq` | The journal number. |
+| `ts` | The time of the change in milliseconds since 1970. It is not the time of the file. Take `mtimeMs` from `GET /entries/{id}`. |
+| `type` | One of the types below. |
+| `origin` | Who made the change: `device`, `cli`, `scan`, `repair`, `snapshot`, `retention`, `app` or `unknown`. |
+| `device` | The device, when there is one. |
+| `opId` | The same for all events of one change. |
+| `id` and `path` | The entry. Not for `account.removed`. |
+| `oldPath` | For a move: the path before. |
+| `sourceId` | For a copy: the id of the file that was copied. |
+| `fileKind` | For a created or modified file: `note`, `document`, `mark`, `image` or `other`. This is the kind of the journal, not the `kind` of the tree. |
+| `md5` and `size` | For a created or modified file. |
+| `prevMd5` | For a modified file: the MD5 before. |
+| `userId` | For `account.removed`. |
+
+The types are `file.created`, `file.modified`, `file.moved`, `file.copied`, `file.deleted`, `folder.created`, `folder.moved` and `folder.deleted`. Other journal lines (pages, digests, tasks, devices and the recycle bin) are not shown. The place of a deleted file in the recycle bin is not shown either.
+
+The origins are the same as in the journal. A scan or a snapshot can create an entry that the app already has, so a create must not fail when the id is known. The app sees its own writes again, with the `seqs` that the write answered.
+
+### What the app does with each event
+
+| Event | What the app does |
+| --- | --- |
+| `file.created`, `folder.created` | Set the entry with this `id`. Take `path` from the event. For a file also take `md5`, `size` and `fileKind`. A folder has none of these. A different entry at the same `path` is replaced. |
+| `file.modified` | Set `md5` and `size` of the entry. |
+| `file.moved` | Set the new `path`. |
+| `folder.moved` | Set the new `path` of the folder. Change the `oldPath` prefix of every entry below it to the new path. |
+| `file.copied` | Add the entry `id` at `path`. Take `md5` and `size` from the entry `sourceId`, or ask `GET /entries/{id}`. `/tree` and `/entries` have no `fileKind`: the app has it only from an earlier event of the source. |
+| `file.deleted` | Remove the entry. |
+| `folder.deleted` | Remove the folder and every entry below it. |
+| `account.removed` | The account is gone. Stop. |
+
+- An app that listed several folders follows on from the lowest of their `seq` numbers plus one. It applies the events in order and treats each create as an upsert, so an event that a later listing already holds does no harm.
+- An event can name an id that the app does not hold, for example in a folder it never listed. Ask `GET /entries/{id}` for it, or ignore it when it is outside what the app shows.
+- A copy whose source is in a hidden path has a `sourceId` that the app cannot read. Ask `GET /entries/{id}` for the new id.
+
+### Gap
+
+When `gap` is true, the app lists again and follows on from the `seq` of that listing. The server sets `gap` when events may be missing:
+
+- `from` is past the end of the journal.
+- A journal file was removed, so the `seq` numbers do not follow on.
+- A journal line of the account is of a type this version does not know, or does not parse.
+- A journal line does not parse and the server cannot read its account.
+- `from` is at or below the removal of an earlier account that had the same name.
+- A move came from a hidden path into sight. The app has nothing of what came in.
+
+### Hidden paths
+
+An event with a hidden path (a name that starts with a dot) is not shown. A move from a visible to a hidden path comes as a `file.deleted` or `folder.deleted` of the old path. A move from a hidden to a visible path sets `gap`.
+
+### Accounts
+
+An app never sees the events of another account. This includes an earlier account with the same name: its events are left out, and `gap` tells the app that it may have missed some.
+
+A token of a removed account reads up to the removal. The last event is then `account.removed` with `userId`. A token that is still valid while its account is removed gets the same: the page ends with the removal.
+
+A removal by an older server, from before the journal had the `account.removed` record, sets no such limit: a name used again since then can show events of the old account.
+
+### Limits
+
+- The first call for an account name after each server start reads the whole journal once. The server keeps what it found in memory, so the next calls read only what is new. The whole journal is also read when a token's account is removed while it polls. That is fine, but it is slow on a very large journal.
+- When the server fails to write a batch of journal lines, it cuts the batch. A poll that read a part of it before the cut has moved past numbers that are given out again. `/journal` has the same limit. A listing fixes it.
 
 ## Write
 

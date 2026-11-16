@@ -44,32 +44,133 @@ fn read(
     fast: bool,
     bytes: &Cell<u64>,
 ) -> Result<JournalBatch> {
+    let probe = Probe::new(fast);
+    let mut changed = false;
+    let mut removed = Vec::new();
+    let walked = walk(root, from, until, limit.max(1), &probe, |line| {
+        if line.account.as_deref().is_none_or(|a| a == slug) {
+            changed = true;
+        }
+        if line.account.as_deref() == Some(slug)
+            && let Some(Event {
+                body: EventBody::AccountRemoved { user_id },
+                ..
+            }) = line.event
+        {
+            removed.push(Removal {
+                seq: line.est,
+                user_id,
+            });
+        }
+        Flow::Go
+    });
+    bytes.set(bytes.get() + probe.bytes.get());
+    let walked = walked?;
+    Ok(JournalBatch {
+        changed,
+        removed,
+        next: walked.next,
+        end: walked.end,
+        more: walked.more,
+    })
+}
+
+/// How a visitor of [`walk`] goes on after a line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Flow {
+    /// Show the next line.
+    Go,
+    /// The visitor has taken all it wants: the walk stops at the next line with a real `seq`,
+    /// which it only looks at (`more` is then true).
+    Full,
+}
+
+/// The settings and counters of one [`walk`]: the test seams.
+pub(super) struct Probe {
+    /// Allows the answer from the tail alone for a position past the end.
+    pub(super) fast: bool,
+    /// The bytes taken from the journal files.
+    pub(super) bytes: Cell<u64>,
+    /// The lines parsed as JSON in full (the tail line of [`last_seq`] not counted).
+    pub(super) parsed: Cell<u64>,
+}
+
+impl Probe {
+    pub(super) fn new(fast: bool) -> Self {
+        Probe {
+            fast,
+            bytes: Cell::new(0),
+            parsed: Cell::new(0),
+        }
+    }
+}
+
+/// The outcome of a [`walk`], already bounded by its `until`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Walked {
+    /// One past the last real `seq` taken, at least `from`, at most `until + 1`.
+    pub(super) next: u64,
+    /// The highest `seq` of the journal, raised by what was taken (never to `from`), at most
+    /// `until`. 0 for no journal.
+    pub(super) end: u64,
+    /// The walk stopped at a line with a real `seq` that it did not take: the cap was reached
+    /// or the visitor was full. Then `next > from`.
+    pub(super) more: bool,
+    /// Lines with a real `seq` at or after `from` that were taken (they count toward `cap`).
+    pub(super) taken: usize,
+    /// The real `seq`s taken do not follow on each other from `max(from, 1)`: a taken `seq`
+    /// was above the one expected (the first expected is `max(from, 1)`, then one past the
+    /// last taken). A journal file that was removed shows so. A line without a real `seq` is
+    /// not looked at here. Only the lines taken count: `false` on a walk with `more` says
+    /// nothing about the lines from `next` on (the next walk checks those).
+    pub(super) broken: bool,
+}
+
+/// Walks the journal from `from` to `until` (both inclusive) and shows every line in between
+/// to `visit`, in order, also lines without a real `seq` (placed by their `est`). Never
+/// creates anything; a missing `journal/` is an empty walk with `end == 0`.
+///
+/// Lines below `from` are not parsed: only the `seq` after the fixed `{"seq":` prefix is
+/// read, the full parse is the fallback for a line without that prefix. The walk ends at the
+/// end of the journal, at the first line past `until`, or at a line with a real `seq` once
+/// `cap` such lines were taken or the visitor said [`Flow::Full`] (after at least one was
+/// taken, so `more` always means progress); that line is only looked
+/// at, not shown, and `more` is set. With `probe.fast`, a `from` past the last line (which
+/// has a real `seq`) is answered from the tail of the newest file alone.
+pub(super) fn walk(
+    root: &Path,
+    from: u64,
+    until: u64,
+    cap: usize,
+    probe: &Probe,
+    mut visit: impl FnMut(&Line) -> Flow,
+) -> Result<Walked> {
     let journal = Journal::open_no_create(root);
-    let mut batch = JournalBatch {
-        changed: false,
-        removed: Vec::new(),
+    let mut walked = Walked {
         next: from,
         end: 0,
         more: false,
+        taken: 0,
+        broken: false,
     };
-    let bound = |mut b: JournalBatch| {
-        b.next = b.next.min(until.saturating_add(1));
-        b.end = b.end.min(until);
-        b
+    let bound = |mut w: Walked| {
+        w.next = w.next.min(until.saturating_add(1));
+        w.end = w.end.min(until);
+        w
     };
     // Only a folder that is certainly not there is "no journal"; any other error is no answer.
     match std::fs::metadata(journal.dir()) {
         Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(bound(batch)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(bound(walked)),
         Err(e) => return Err(io_err(journal.dir())(e)),
     }
     let files = journal.files()?;
-    let last = last_seq(&files, bytes)?;
-    batch.end = last.end;
+    let last = last_seq(&files, &probe.bytes)?;
+    walked.end = last.end;
     // A position past the last line, which has a real `seq`: every line is before it, so the
     // full read would find nothing either.
-    if fast && last.exact && from > last.end {
-        return Ok(bound(batch));
+    if probe.fast && last.exact && from > last.end {
+        return Ok(bound(walked));
     }
     // The newest file whose first `seq` is at or below `from`, else the first.
     let start = files
@@ -80,10 +181,11 @@ fn read(
         files: files.into_iter().skip(start).collect(),
         current: None,
         last: 0,
-        bytes,
+        from,
+        probe,
     };
-    let limit = limit.max(1);
-    let mut read = 0usize;
+    let mut expected = from.max(1);
+    let mut full = false;
     while let Some(line) = lines.next_line()? {
         if line.est < from {
             continue;
@@ -91,38 +193,31 @@ fn read(
         if line.est > until {
             break;
         }
-        // The line after the limit is only looked at, not taken. Only lines with a real
-        // `seq` count toward the limit and move `next`: a line without one is not a place
-        // to put the cursor behind, since the event that follows may still be unread.
-        if line.seq.is_some() && read >= limit {
-            batch.more = true;
+        // The line after the cap is only looked at, not taken. Only lines with a real `seq`
+        // count toward the cap and move `next`: a line without one is not a place to put the
+        // cursor behind, since the event that follows may still be unread.
+        if line.seq.is_some() && (walked.taken >= cap || (full && walked.taken > 0)) {
+            walked.more = true;
             break;
         }
         if let Some(seq) = line.seq {
-            read += 1;
-            batch.next = batch.next.max(seq + 1);
+            walked.taken += 1;
+            walked.next = walked.next.max(seq + 1);
+            if seq > expected {
+                walked.broken = true;
+            }
+            expected = expected.max(seq + 1);
         }
-        if line.account.as_deref().is_none_or(|a| a == slug) {
-            batch.changed = true;
-        }
-        if line.account.as_deref() == Some(slug)
-            && let Some(Event {
-                body: EventBody::AccountRemoved { user_id },
-                ..
-            }) = line.event
-        {
-            batch.removed.push(Removal {
-                seq: line.est,
-                user_id,
-            });
+        if visit(&line) == Flow::Full {
+            full = true;
         }
     }
-    // Only a `seq` that was read raises the end, never the position asked for: a cursor
+    // Only a `seq` that was taken raises the end, never the position asked for: a cursor
     // ahead of the journal must be seen as such.
-    if read > 0 {
-        batch.end = batch.end.max(batch.next.saturating_sub(1));
+    if walked.taken > 0 {
+        walked.end = walked.end.max(walked.next.saturating_sub(1));
     }
-    Ok(bound(batch))
+    Ok(bound(walked))
 }
 
 /// A journal file that counts the bytes read from it.
@@ -149,13 +244,15 @@ impl Seek for Counted<'_> {
 /// `account` is read from the line when it is still JSON with one, else it is `None`, and the
 /// line counts for every account (the safe side). Its `seq` is read the same way, else it is
 /// taken to follow the last real one, and it never moves a cursor.
-struct Line {
+pub(super) struct Line {
     /// The `seq` the line carries, `None` when none can be read.
-    seq: Option<u64>,
-    /// The `seq`, else the one after the last real one: only for placing the line before `from`.
-    est: u64,
-    account: Option<String>,
-    event: Option<Event>,
+    pub(super) seq: Option<u64>,
+    /// The `seq`, else the one after the last real one. It places the line against `from`,
+    /// `until` and an events floor, and it is the `seq` a visitor reports for the line (as
+    /// [`Removal::seq`]); for a line without a real `seq` it is only an estimate.
+    pub(super) est: u64,
+    pub(super) account: Option<String>,
+    pub(super) event: Option<Event>,
 }
 
 struct Lines<'a> {
@@ -163,7 +260,9 @@ struct Lines<'a> {
     current: Option<(PathBuf, BufReader<Counted<'a>>)>,
     /// The `seq` of the line before.
     last: u64,
-    bytes: &'a Cell<u64>,
+    /// Lines below it are not parsed: they are never shown.
+    from: u64,
+    probe: &'a Probe,
 }
 
 impl Lines<'_> {
@@ -178,7 +277,7 @@ impl Lines<'_> {
                         self.last = self.last.max(first.saturating_sub(1));
                         let file = Counted {
                             file,
-                            bytes: self.bytes,
+                            bytes: &self.probe.bytes,
                         };
                         self.current = Some((path, BufReader::new(file)));
                     }
@@ -196,6 +295,14 @@ impl Lines<'_> {
                 continue;
             }
             buf.pop();
+            // A line below `from` is never shown: its `seq` is all that is needed.
+            if let Some(seq) = prefix_seq(&buf)
+                && seq < self.from
+            {
+                self.last = seq;
+                continue;
+            }
+            self.probe.parsed.set(self.probe.parsed.get() + 1);
             let value: Option<serde_json::Value> = serde_json::from_slice(&buf).ok();
             let event: Option<Event> = serde_json::from_slice(&buf).ok();
             let seq = event
@@ -218,6 +325,21 @@ impl Lines<'_> {
             }));
         }
     }
+}
+
+/// The `seq` of a line as the journal writes it: a whole number right after the fixed
+/// `{"seq":` prefix, ended by `,` or `}`. `None` when the line does not start so; the full
+/// parse decides then.
+fn prefix_seq(line: &[u8]) -> Option<u64> {
+    let rest = line.strip_prefix(br#"{"seq":"#)?;
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 || (digits > 1 && rest[0] == b'0') {
+        return None;
+    }
+    if !matches!(rest.get(digits), Some(b',' | b'}')) {
+        return None;
+    }
+    std::str::from_utf8(&rest[..digits]).ok()?.parse().ok()
 }
 
 /// The end of the journal, see [`last_seq`].
@@ -366,5 +488,159 @@ mod tests {
         assert!(fast_bytes.get() <= 64 * 1024, "{}", fast_bytes.get());
         // The public poll takes the same path.
         assert_eq!(journal(dir.path(), "a", 50_001, 10_000).unwrap(), fast);
+    }
+
+    fn write_lines(root: &Path, name: &str, lines: &[String]) {
+        let dir = root.join("journal");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut text = String::new();
+        for l in lines {
+            text.push_str(l);
+            text.push('\n');
+        }
+        std::fs::write(dir.join(name), text).unwrap();
+    }
+
+    /// The `seq`s (or `est` for a line without one) that a walk shows, and its outcome.
+    fn walk_seqs(root: &Path, from: u64, until: u64, cap: usize) -> (Vec<u64>, Walked, u64) {
+        let probe = Probe::new(true);
+        let mut seen = Vec::new();
+        let w = walk(root, from, until, cap, &probe, |l| {
+            seen.push(l.seq.unwrap_or(l.est));
+            Flow::Go
+        })
+        .unwrap();
+        (seen, w, probe.parsed.get())
+    }
+
+    #[test]
+    fn lines_below_from_are_not_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), 1..=50_000);
+        let (seen, w, parsed) = walk_seqs(dir.path(), 25_001, u64::MAX, 10);
+        assert_eq!(seen, (25_001..=25_010).collect::<Vec<_>>());
+        assert_eq!((w.next, w.end, w.more, w.taken), (25_011, 50_000, true, 10));
+        assert!(!w.broken);
+        // The ten lines taken and the one looked at after them, none of the 25000 before.
+        assert_eq!(parsed, 11);
+        // The public reader gives what it gave before.
+        let b = journal(dir.path(), "a", 25_001, 10).unwrap();
+        assert_eq!(b.removed.len(), 10);
+        assert_eq!((b.next, b.end, b.more), (25_011, 50_000, true));
+    }
+
+    #[test]
+    fn a_line_without_the_seq_prefix_is_parsed_in_full() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lines(
+            dir.path(),
+            "journal-000000000001.jsonl",
+            &[
+                line(1, "a"),
+                // Another field order: no `{"seq":` prefix, the seq is still read.
+                r#"{"account":"a","seq":2}"#.to_string(),
+                // No seq at all: placed after the last real one.
+                "not json".to_string(),
+                // The prefix, but not a whole number: the full parse decides.
+                r#"{"seq":4.5,"account":"a"}"#.to_string(),
+                line(5, "a"),
+                line(6, "a"),
+            ],
+        );
+        let (seen, w, parsed) = walk_seqs(dir.path(), 6, u64::MAX, 100);
+        assert_eq!(seen, vec![6]);
+        assert_eq!((w.next, w.end, w.more), (7, 6, false));
+        // The three lines without a readable prefix seq, and line 6.
+        assert_eq!(parsed, 4);
+        let (seen, ..) = walk_seqs(dir.path(), 3, u64::MAX, 100);
+        assert_eq!(seen, vec![3, 3, 5, 6]);
+        let (seen, ..) = walk_seqs(dir.path(), 2, u64::MAX, 100);
+        assert_eq!(seen, vec![2, 3, 3, 5, 6]);
+    }
+
+    #[test]
+    fn a_visitor_that_is_full_stops_the_walk_at_the_next_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), 1..=20);
+        let probe = Probe::new(true);
+        let mut seen = Vec::new();
+        let w = walk(dir.path(), 5, u64::MAX, 100, &probe, |l| {
+            seen.push(l.est);
+            if seen.len() == 3 {
+                Flow::Full
+            } else {
+                Flow::Go
+            }
+        })
+        .unwrap();
+        assert_eq!(seen, vec![5, 6, 7]);
+        assert_eq!((w.next, w.end, w.more, w.taken), (8, 20, true, 3));
+        // The `until` break comes before the stop: nothing follows inside the bound.
+        let w = walk(dir.path(), 5, 7, 100, &probe, |l| {
+            if l.est == 7 { Flow::Full } else { Flow::Go }
+        })
+        .unwrap();
+        assert_eq!((w.next, w.end, w.more), (8, 7, false));
+    }
+
+    #[test]
+    fn the_walk_reports_seqs_that_do_not_follow_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lines: Vec<String> = (1..=10).map(|s| line(s, "a")).collect();
+        lines.extend((15..=20).map(|s| line(s, "a")));
+        write_lines(dir.path(), "journal-000000000001.jsonl", &lines);
+        assert!(walk_seqs(dir.path(), 1, u64::MAX, 100).1.broken);
+        assert!(walk_seqs(dir.path(), 0, u64::MAX, 100).1.broken);
+        assert!(walk_seqs(dir.path(), 12, u64::MAX, 100).1.broken);
+        assert!(!walk_seqs(dir.path(), 15, u64::MAX, 100).1.broken);
+        assert!(!walk_seqs(dir.path(), 3, 10, 100).1.broken);
+        // A page that stops before the jump does not see it; the next page does.
+        let (_, w, _) = walk_seqs(dir.path(), 1, u64::MAX, 10);
+        assert!(!w.broken && w.more && w.next == 11);
+        assert!(walk_seqs(dir.path(), w.next, u64::MAX, 10).1.broken);
+    }
+
+    #[test]
+    fn a_removed_first_file_is_a_break() {
+        let dir = tempfile::tempdir().unwrap();
+        let lines: Vec<String> = (100..=110).map(|s| line(s, "a")).collect();
+        write_lines(dir.path(), "journal-000000000100.jsonl", &lines);
+        assert!(walk_seqs(dir.path(), 50, u64::MAX, 100).1.broken);
+        assert!(walk_seqs(dir.path(), 0, u64::MAX, 100).1.broken);
+        assert!(!walk_seqs(dir.path(), 100, u64::MAX, 100).1.broken);
+        assert!(!walk_seqs(dir.path(), 105, u64::MAX, 100).1.broken);
+    }
+
+    #[test]
+    fn no_journal_is_an_empty_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (seen, w, _) = walk_seqs(dir.path(), 7, 3, 100);
+        assert!(seen.is_empty());
+        assert_eq!(
+            w,
+            Walked {
+                next: 4,
+                end: 0,
+                more: false,
+                taken: 0,
+                broken: false
+            }
+        );
+    }
+
+    #[test]
+    fn the_seq_prefix_is_read_only_when_it_is_a_whole_number() {
+        assert_eq!(prefix_seq(br#"{"seq":0,"ts":1}"#), Some(0));
+        assert_eq!(prefix_seq(br#"{"seq":123,"ts":1}"#), Some(123));
+        assert_eq!(prefix_seq(br#"{"seq":7}"#), Some(7));
+        assert_eq!(prefix_seq(br#"{"seq":07,"ts":1}"#), None);
+        assert_eq!(prefix_seq(br#"{"seq":-1,"ts":1}"#), None);
+        assert_eq!(prefix_seq(br#"{"seq":1.5,"ts":1}"#), None);
+        assert_eq!(prefix_seq(br#"{"seq":1e3,"ts":1}"#), None);
+        assert_eq!(prefix_seq(br#"{"seq": 1,"ts":1}"#), None);
+        assert_eq!(prefix_seq(br#"{"seq":"1","ts":1}"#), None);
+        assert_eq!(prefix_seq(br#"{"seq":99999999999999999999,"ts":1}"#), None);
+        assert_eq!(prefix_seq(br#"{"seq":12"#), None);
+        assert_eq!(prefix_seq(br#"{"ts":1,"seq":2}"#), None);
     }
 }

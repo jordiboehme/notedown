@@ -168,7 +168,7 @@ fn tree_of(state: &AppState, slug: &str, path: &WirePath, recursive: bool) -> cr
 
 /// `GET /tree?path=&recursive=`: `{"seq", "entries"}`, the children of the folder at `path`
 /// (default the root), or all its descendants with `recursive=true`. `seq` is the journal's last
-/// seq, read under the same lock: following `/journal` from `seq + 1` misses nothing. 404
+/// seq, read under the same lock: following `/events` from `seq + 1` misses nothing. 404
 /// `not_found`, 409 `not_a_folder`.
 pub(super) async fn tree(
     State(state): State<Arc<AppState>>,

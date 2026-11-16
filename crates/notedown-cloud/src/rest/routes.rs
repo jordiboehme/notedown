@@ -28,6 +28,9 @@ use crate::store::WirePath;
 /// The default and the largest `limit` of `GET /journal`.
 pub const JOURNAL_LIMIT: usize = 10_000;
 
+/// The default and the largest `limit` of `GET /events`.
+pub const EVENTS_LIMIT: usize = 1_000;
+
 /// The header of a note answer: `found`, `missing` or `not_a_file`.
 pub const NOTE_HEADER: &str = "x-notedown-note";
 
@@ -52,6 +55,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(&path("/note"), get_only(get(note)))
         .route(&path("/digests"), get_only(get(digests)))
         .route(&path("/journal"), get_only(get(journal)))
+        .route(&path("/events"), get_only(get(events)))
         .route(&path("/tree"), get_only(get(browse::tree)))
         .route(
             &path("/entries/{id}"),
@@ -398,6 +402,89 @@ async fn journal(State(state): State<Arc<AppState>>, headers: HeaderMap, uri: Ur
     }
 }
 
+/// `GET /events?from=&limit=`: [`read::EventPage`], the file and folder events of the
+/// caller's account from `from` (default 0), at most `limit` (default and maximum
+/// [`EVENTS_LIMIT`], 0 is 1). Events of an earlier account with the same slug are at or below
+/// the caller's floor ([`crate::auth::RestTokens::floor`]) and never returned. A removed
+/// account's token reads up to its removal, which is its last event; so does a live token whose
+/// account is removed while it polls ([`follow`]).
+async fn events(State(state): State<Arc<AppState>>, headers: HeaderMap, uri: Uri) -> Response {
+    let (caller, id) = match caller(&state, &headers).await {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    let (from, limit) = match query::<JournalQuery>(&uri).and_then(|q| {
+        Ok((
+            number(q.from.as_deref(), "from", 0)?,
+            number(q.limit.as_deref(), "limit", EVENTS_LIMIT as u64)?,
+        ))
+    }) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let limit = usize::try_from(limit).map_or(EVENTS_LIMIT, |l| l.clamp(1, EVENTS_LIMIT));
+    let (slug, user_id, until) = match caller {
+        Caller::Live(a, _) => (a.slug, a.user_id, None),
+        Caller::Removed { slug, user_id, seq } => (slug, user_id, Some(seq)),
+    };
+    let st = state.clone();
+    match blocking(move || follow(&st, &slug, user_id, until, from, limit)).await {
+        Ok(Followed::Page(page)) => Json(page).into_response(),
+        Ok(Followed::Refused) => refused(id),
+        Err(r) => *r,
+    }
+}
+
+/// What a poll of `/events` gives.
+#[derive(Debug)]
+enum Followed {
+    Page(read::EventPage),
+    Refused,
+}
+
+/// The events page of the caller `user_id` of `slug`, `until` its removal for a removed
+/// account's token.
+///
+/// A live caller was checked before the read. When its account is gone after the read, the
+/// page may hold events of a new account with the same slug, so it is dropped and the caller is
+/// answered as a removed account's token: up to its removal, or refused when there is none.
+/// This is sound because the removal record is appended before the account folder goes, so a
+/// line of a later account can only exist once the caller's account is gone.
+///
+/// A page that read the caller's own `account.removed` asks under the store lock: the record
+/// may be of a removal that is still running (the folder goes later, under the same lock), and
+/// a live answer then would move the caller past its removal without it. Still live after the
+/// lock means a crash left the record, and the page stays as it is.
+fn follow(
+    state: &AppState,
+    slug: &str,
+    user_id: u64,
+    until: Option<u64>,
+    from: u64,
+    limit: usize,
+) -> crate::Result<Followed> {
+    let floor = state.rest_tokens.floor(slug, user_id, until)?;
+    let read::OwnPage { page, own_removal } =
+        read::events_of(&state.data_dir, slug, user_id, from, limit, floor, until)?;
+    if until.is_some() {
+        return Ok(Followed::Page(page));
+    }
+    let live = if own_removal {
+        state.rest_tokens.is_live_settled(slug, user_id)?
+    } else {
+        state.rest_tokens.is_live(slug, user_id)?
+    };
+    if live {
+        return Ok(Followed::Page(page));
+    }
+    let Some(until) = state.rest_tokens.removal_now(slug, user_id)? else {
+        return Ok(Followed::Refused);
+    };
+    let floor = state.rest_tokens.floor(slug, user_id, Some(until))?;
+    let page = read::events(&state.data_dir, slug, from, limit, floor, Some(until))?;
+    Ok(Followed::Page(page))
+}
+
 #[derive(Deserialize)]
 struct NoteQuery {
     path: Option<String>,
@@ -527,6 +614,127 @@ mod tests {
         assert_eq!(bearer(&h), None);
         h.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer "));
         assert_eq!(bearer(&h), None);
+    }
+
+    /// Appends a `file.created` of `path` for the account `jordi`.
+    fn created(state: &AppState, path: &str) {
+        use crate::journal::{Event, EventBody, FileKind, Origin, new_op_id};
+        let mut e = [Event::new(
+            "jordi",
+            Origin::Cli,
+            None,
+            &new_op_id(),
+            EventBody::FileCreated {
+                id: 7,
+                path: path.to_string(),
+                kind: FileKind::Document,
+                md5: "0".repeat(32),
+                size: 1,
+                pages_changed: None,
+            },
+        )];
+        state.journal.append(&mut e).unwrap();
+    }
+
+    #[test]
+    fn a_live_caller_removed_during_the_poll_gets_only_its_own_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::open(crate::Config::default(), dir.path()).unwrap();
+        let accounts = state.auth.accounts();
+        let old = accounts
+            .create("jordi", "j@example.org", "a password")
+            .unwrap();
+        created(&state, "NOTE/Note/a.txt");
+        // The token check found the old account live; then it was removed and the slug made
+        // again and written to before the read.
+        accounts.remove("jordi", &state.journal).unwrap();
+        accounts
+            .create("jordi", "j@example.org", "a password")
+            .unwrap();
+        created(&state, "NOTE/Note/b.txt");
+        let Followed::Page(page) = follow(&state, "jordi", old.user_id, None, 0, 1_000).unwrap()
+        else {
+            panic!("refused");
+        };
+        let paths: Vec<_> = page.events.iter().filter_map(|e| e.path.clone()).collect();
+        assert_eq!(paths, ["NOTE/Note/a.txt"], "{page:?}");
+        let last = page.events.last().unwrap();
+        assert_eq!(last.r#type, "account.removed");
+        assert_eq!(last.user_id, Some(old.user_id));
+        assert_eq!(page.next, last.seq + 1);
+        assert!(!page.more);
+        // A user id that is neither live nor removed is refused.
+        assert!(matches!(
+            follow(&state, "jordi", 999, None, 0, 1_000).unwrap(),
+            Followed::Refused
+        ));
+    }
+
+    #[test]
+    fn a_live_poll_between_the_removal_record_and_the_removal_ends_with_the_removal() {
+        use crate::journal::{Event, EventBody, Origin, new_op_id};
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState::open(crate::Config::default(), dir.path()).unwrap());
+        let accounts = state.auth.accounts();
+        let old = accounts
+            .create("jordi", "j@example.org", "a password")
+            .unwrap();
+        created(&state, "NOTE/Note/a.txt");
+        // A second thread does what `Accounts::remove` does: it holds the store lock from the
+        // record to the rename of the folder. The poll runs between the two.
+        let (recorded, wait) = std::sync::mpsc::channel();
+        let remover = {
+            let state = state.clone();
+            let account_dir = accounts.account_dir("jordi");
+            let user_id = old.user_id;
+            std::thread::spawn(move || {
+                let store = crate::store::take_store_lock(&account_dir, None).unwrap();
+                let mut record = [Event::new(
+                    "jordi",
+                    Origin::Cli,
+                    None,
+                    &new_op_id(),
+                    EventBody::AccountRemoved { user_id },
+                )];
+                state.journal.append(&mut record).unwrap();
+                recorded.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let tomb = account_dir.with_file_name(".removed-jordi-test");
+                std::fs::rename(&account_dir, &tomb).unwrap();
+                drop(store);
+                std::fs::remove_dir_all(&tomb).unwrap();
+            })
+        };
+        wait.recv().unwrap();
+        let Followed::Page(first) = follow(&state, "jordi", old.user_id, None, 0, 1_000).unwrap()
+        else {
+            panic!("refused");
+        };
+        remover.join().unwrap();
+        let mut events = first.events.clone();
+        let mut gap = first.gap;
+        if events.last().is_none_or(|e| e.r#type != "account.removed") {
+            // The next poll comes with a removed account's token.
+            let until = state
+                .rest_tokens
+                .removal_now("jordi", old.user_id)
+                .unwrap()
+                .unwrap();
+            let Followed::Page(second) =
+                follow(&state, "jordi", old.user_id, Some(until), first.next, 1_000).unwrap()
+            else {
+                panic!("refused");
+            };
+            events.extend(second.events);
+            gap |= second.gap;
+        }
+        let removed = events.iter().any(|e| e.r#type == "account.removed");
+        assert!(removed || gap, "{first:?} {events:?}");
+        assert_eq!(
+            events.last().unwrap().r#type,
+            "account.removed",
+            "{events:?}"
+        );
     }
 
     #[test]

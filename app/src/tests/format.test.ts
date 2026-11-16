@@ -20,3 +20,20 @@ describe("relativeTime", () => {
     expect(relativeTime(now - 3 * 86_400_000, now)).toBe("3 days ago");
   });
 });
+
+describe("relativeTime beyond a few days", () => {
+  const now = Date.UTC(2026, 10, 16, 12, 0, 0);
+
+  it("counts days up to six", () => {
+    expect(relativeTime(now - 6 * 86_400_000, now)).toBe("6 days ago");
+  });
+
+  it("shows the date after that", () => {
+    for (const days of [7, 10, 400]) {
+      const ms = now - days * 86_400_000;
+      const text = relativeTime(ms, now);
+      expect(text).toBe(new Date(ms).toLocaleDateString());
+      expect(text).not.toContain("ago");
+    }
+  });
+});

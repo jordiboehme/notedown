@@ -28,6 +28,9 @@ use crate::store::WirePath;
 /// The default and the largest `limit` of `GET /journal`.
 pub const JOURNAL_LIMIT: usize = 10_000;
 
+/// The default and the largest `limit` of `GET /events`.
+pub const EVENTS_LIMIT: usize = 1_000;
+
 /// The header of a note answer: `found`, `missing` or `not_a_file`.
 pub const NOTE_HEADER: &str = "x-notedown-note";
 
@@ -52,6 +55,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(&path("/note"), get_only(get(note)))
         .route(&path("/digests"), get_only(get(digests)))
         .route(&path("/journal"), get_only(get(journal)))
+        .route(&path("/events"), get_only(get(events)))
         .route(&path("/tree"), get_only(get(browse::tree)))
         .route(
             &path("/entries/{id}"),
@@ -394,6 +398,42 @@ async fn journal(State(state): State<Arc<AppState>>, headers: HeaderMap, uri: Ur
     let data = state.data_dir.clone();
     match blocking(move || read::journal_until(&data, &slug, from, limit, until)).await {
         Ok(batch) => Json(batch).into_response(),
+        Err(r) => *r,
+    }
+}
+
+/// `GET /events?from=&limit=`: [`read::EventPage`], the file and folder events of the
+/// caller's account from `from` (default 0), at most `limit` (default and maximum
+/// [`EVENTS_LIMIT`], 0 is 1). Events of an earlier account with the same slug are at or below
+/// the caller's floor ([`crate::auth::RestTokens::floor`]) and never returned. A removed
+/// account's token reads up to its removal, which is its last event.
+async fn events(State(state): State<Arc<AppState>>, headers: HeaderMap, uri: Uri) -> Response {
+    let (caller, _) = match caller(&state, &headers).await {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    let (from, limit) = match query::<JournalQuery>(&uri).and_then(|q| {
+        Ok((
+            number(q.from.as_deref(), "from", 0)?,
+            number(q.limit.as_deref(), "limit", EVENTS_LIMIT as u64)?,
+        ))
+    }) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let limit = usize::try_from(limit).map_or(EVENTS_LIMIT, |l| l.clamp(1, EVENTS_LIMIT));
+    let (slug, user_id, until) = match caller {
+        Caller::Live(a, _) => (a.slug, a.user_id, None),
+        Caller::Removed { slug, user_id, seq } => (slug, user_id, Some(seq)),
+    };
+    let st = state.clone();
+    match blocking(move || {
+        let floor = st.rest_tokens.floor(&slug, user_id, until)?;
+        read::events(&st.data_dir, &slug, from, limit, floor, until)
+    })
+    .await
+    {
+        Ok(page) => Json(page).into_response(),
         Err(r) => *r,
     }
 }

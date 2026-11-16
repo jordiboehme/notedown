@@ -23,6 +23,7 @@ use subtle::ConstantTimeEq;
 use super::accounts::{Account, Accounts, validate_slug};
 use super::token::load_or_create_key;
 use crate::fsutil::{fsync_dir, json_bytes};
+use crate::read::Removal;
 use crate::{Error, Result, io_err};
 
 /// `<data>/keys/rest.key`.
@@ -180,6 +181,9 @@ pub enum TokenCheck {
     Refused,
 }
 
+/// The key of a cached floor: slug, user id and the removal seq of a removed account.
+type FloorKey = (String, u64, Option<u64>);
+
 /// A cached removal lookup.
 #[derive(Debug, Clone, Copy)]
 enum Lookup {
@@ -194,6 +198,8 @@ pub struct RestTokens {
     key: RestKey,
     /// The removal lookup by (slug, user id).
     removals: Mutex<HashMap<(String, u64), Lookup>>,
+    /// The events floor by (slug, user id, the caller's removal seq), see [`RestTokens::floor`].
+    floors: Mutex<HashMap<FloorKey, u64>>,
 }
 
 impl RestTokens {
@@ -203,6 +209,7 @@ impl RestTokens {
             accounts: Accounts::new(data),
             key,
             removals: Mutex::new(HashMap::new()),
+            floors: Mutex::new(HashMap::new()),
         }
     }
 
@@ -256,6 +263,32 @@ impl RestTokens {
         self.key.open(token).map(|p| (p.slug, p.id))
     }
 
+    /// The events floor of a caller: the highest `account.removed` of `slug` by another user id
+    /// than `user_id`, and below `until` (the caller's own removal) for a removed account's
+    /// token; 0 when there is none. Events at or below it belong to an earlier account with the
+    /// same slug. Cached for good: no other account of the slug can be removed while the
+    /// caller's account lives, and below `until` the journal does not change. (An account that
+    /// comes back from a backup after a later account of its slug was removed keeps the floor
+    /// it had.)
+    pub fn floor(&self, slug: &str, user_id: u64, until: Option<u64>) -> Result<u64> {
+        let key = (slug.to_string(), user_id, until);
+        let cached = self
+            .floors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied();
+        if let Some(floor) = cached {
+            return Ok(floor);
+        }
+        let floor = floor_of(&removals_of(&self.data, slug)?, user_id, until);
+        self.floors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, floor);
+        Ok(floor)
+    }
+
     /// The highest `seq` of an `account.removed` of `slug` with `user_id`, cached: a found one
     /// forever, none for [`NO_REMOVAL_TTL_MS`].
     fn removal(&self, slug: &str, user_id: u64, now_ms: u64) -> Result<Option<u64>> {
@@ -284,16 +317,37 @@ impl RestTokens {
     }
 }
 
-/// Reads the whole journal of `slug`, page by page. A page that asks for more but does not
-/// move on is an error: a partial answer must never count (or be cached) as "no removal".
+/// The highest `account.removed` of `slug` with `user_id`, from [`removals_of`].
 fn find_removal(data: &Path, slug: &str, user_id: u64) -> Result<Option<u64>> {
+    Ok(removals_of(data, slug)?
+        .iter()
+        .filter(|r| r.user_id == user_id)
+        .map(|r| r.seq)
+        .max())
+}
+
+/// The events floor among `removals` of one slug: the highest seq of a removal by another user
+/// id than `user_id`, below `until` when it is set; 0 when there is none. The caller's own
+/// removals never count: a crash between the record and the removal leaves a live account with
+/// its own record.
+fn floor_of(removals: &[Removal], user_id: u64, until: Option<u64>) -> u64 {
+    removals
+        .iter()
+        .filter(|r| r.user_id != user_id && until.is_none_or(|u| r.seq < u))
+        .map(|r| r.seq)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Every `account.removed` of `slug`: the whole journal, page by page. A page that asks for
+/// more but does not move on is an error: a partial answer must never count (or be cached) as
+/// "no removal".
+fn removals_of(data: &Path, slug: &str) -> Result<Vec<Removal>> {
     let mut from = 0;
-    let mut found: Option<u64> = None;
+    let mut found = Vec::new();
     loop {
         let batch = crate::read::journal(data, slug, from, JOURNAL_PAGE)?;
-        for r in batch.removed.iter().filter(|r| r.user_id == user_id) {
-            found = Some(found.map_or(r.seq, |f| f.max(r.seq)));
-        }
+        found.extend(batch.removed);
         if !batch.more {
             return Ok(found);
         }
@@ -659,6 +713,21 @@ mod tests {
         }
         let long = format!("{}.{}", signed(&key(), GOOD), "a".repeat(MAX_TOKEN_LEN));
         assert_eq!(tokens.check(&long, 0).unwrap(), TokenCheck::Refused);
+    }
+
+    #[test]
+    fn the_floor_is_the_last_removal_of_another_user_id_below_until() {
+        let r = |seq, user_id| Removal { seq, user_id };
+        // Accounts 1, 2 and 3 of one slug were removed in turn; 2 also has a crash record.
+        let removals = [r(10, 1), r(15, 2), r(20, 2), r(30, 3)];
+        assert_eq!(floor_of(&[], 1, None), 0);
+        // A live account: the last removal of another id, never its own.
+        assert_eq!(floor_of(&removals, 4, None), 30);
+        assert_eq!(floor_of(&removals, 3, None), 20);
+        // A removed account: the last removal of another id below its own.
+        assert_eq!(floor_of(&removals, 1, Some(10)), 0);
+        assert_eq!(floor_of(&removals, 2, Some(20)), 10);
+        assert_eq!(floor_of(&removals, 3, Some(30)), 20);
     }
 
     #[test]

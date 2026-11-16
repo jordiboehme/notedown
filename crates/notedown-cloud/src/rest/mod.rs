@@ -1,5 +1,7 @@
 //! The REST API under [`PREFIX`], for a pipeline on another machine and for the Mac app, which
-//! browses and downloads the account's files ([`browse`]) and uploads them ([`write`]).
+//! browses and downloads the account's files ([`browse`]), uploads them ([`write`]) and follows
+//! their changes with `GET /events` from the `seq` of a listing (the pipeline follows
+//! `/journal`).
 //!
 //! Plain JSON with real HTTP status codes, not the device envelope; every error body is
 //! `{"error": "<code>", ...}`. The token in `Authorization: Bearer <token>` decides the account

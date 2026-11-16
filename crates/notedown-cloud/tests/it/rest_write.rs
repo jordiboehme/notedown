@@ -12,7 +12,10 @@ use notedown_cloud::put;
 use notedown_cloud::store::WirePath;
 use serde_json::{Value, json};
 
-use crate::rest_server::{EMAIL, PASSWORD, Server, json_of, q, start, start_imported};
+use crate::rest_server::{
+    EMAIL, PASSWORD, Server, delete, header, json_of, mkdir, mv, q, send_json, start,
+    start_imported, upload, upload_with, uploaded, writer,
+};
 
 fn md5_hex(bytes: &[u8]) -> String {
     const_hex::encode(Md5::digest(bytes))
@@ -78,12 +81,6 @@ fn get_with(
         req = req.header(*k, *v);
     }
     req.send().unwrap()
-}
-
-fn header(r: &reqwest::blocking::Response, name: &str) -> Option<String> {
-    r.headers()
-        .get(name)
-        .map(|v| v.to_str().unwrap().to_string())
 }
 
 #[test]
@@ -574,36 +571,6 @@ fn a_read_token_can_browse() {
 }
 
 // ------------------------------------------------------------------ upload
-
-/// A write token of the test account.
-fn writer(s: &Server) -> String {
-    let (status, login) = s.login_extra(json!({"scope": "write"}));
-    assert_eq!(status, 201, "{login}");
-    login["token"].as_str().unwrap().to_string()
-}
-
-/// `PUT /files?path=` with `bytes` and `headers`: (status, answer).
-fn upload_with(
-    s: &Server,
-    token: &str,
-    path: &str,
-    bytes: &[u8],
-    headers: &[(&str, &str)],
-) -> (u16, Value) {
-    let mut req = s
-        .client
-        .put(s.url(&format!("/files?path={}", q(path))))
-        .bearer_auth(token)
-        .body(bytes.to_vec());
-    for (k, v) in headers {
-        req = req.header(*k, *v);
-    }
-    json_of(req.send().unwrap())
-}
-
-fn upload(s: &Server, token: &str, path: &str, bytes: &[u8]) -> (u16, Value) {
-    upload_with(s, token, path, bytes, &[])
-}
 
 /// The events after the first `n`.
 fn events_after(s: &Server, n: usize) -> Vec<Value> {
@@ -1401,53 +1368,6 @@ fn without_quota_bytes_there_is_no_quota_check() {
 }
 
 // ------------------------------------------------------- folders, move, delete
-
-/// A JSON write with the token: (status, answer, `Retry-After`).
-fn send_json(
-    s: &Server,
-    token: &str,
-    method: &str,
-    path: &str,
-    body: Option<Value>,
-) -> (u16, Value, Option<String>) {
-    let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
-    let mut req = s.client.request(method, s.url(path)).bearer_auth(token);
-    if let Some(body) = body {
-        req = req
-            .header("Content-Type", "application/json")
-            .body(body.to_string());
-    }
-    let r = req.send().unwrap();
-    let retry = header(&r, "retry-after");
-    let (status, answer) = json_of(r);
-    (status, answer, retry)
-}
-
-/// `POST /folders {"path"}`.
-fn mkdir(s: &Server, token: &str, path: &str) -> (u16, Value) {
-    let (status, answer, _) = send_json(s, token, "POST", "/folders", Some(json!({"path": path})));
-    (status, answer)
-}
-
-/// `POST /move {"id", "to"}`.
-fn mv(s: &Server, token: &str, id: u64, to: &str) -> (u16, Value) {
-    let (status, answer, _) =
-        send_json(s, token, "POST", "/move", Some(json!({"id": id, "to": to})));
-    (status, answer)
-}
-
-/// `DELETE /entries/{id}`.
-fn delete(s: &Server, token: &str, id: u64) -> (u16, Value) {
-    let (status, answer, _) = send_json(s, token, "DELETE", &format!("/entries/{id}"), None);
-    (status, answer)
-}
-
-/// Uploads `bytes` to `path` (201) and returns the new id.
-fn uploaded(s: &Server, token: &str, path: &str, bytes: &[u8]) -> u64 {
-    let (status, answer) = upload(s, token, path, bytes);
-    assert_eq!(status, 201, "{path}: {answer}");
-    answer["id"].as_u64().unwrap()
-}
 
 /// The seqs of `events`.
 fn seqs(events: &[Value]) -> Value {

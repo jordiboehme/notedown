@@ -343,6 +343,35 @@ fn a_path_that_does_not_parse_is_bad_name() {
 }
 
 #[test]
+fn a_missing_or_root_path_is_bad_name() {
+    let s = start_imported();
+    let token = s.token();
+    for url in ["/entries", "/entries?path=", "/entries?path=%2F", "/entries?other=1"] {
+        let (status, answer) = s.get(Some(&token), url);
+        assert_eq!(
+            (status, &answer["error"]),
+            (400, &json!("bad_name")),
+            "{url}"
+        );
+    }
+}
+
+#[test]
+fn a_path_through_a_hidden_folder_is_not_found() {
+    let s = start_imported();
+    let token = s.token();
+    hand(&s, "NOTE/Note/.secret/a.note", b"x");
+    for p in ["NOTE/Note/.secret", "NOTE/Note/.secret/a.note"] {
+        let (status, answer) = s.get(Some(&token), &format!("/entries?path={}", q(p)));
+        assert_eq!(
+            (status, answer),
+            (404, json!({"error": "not_found"})),
+            "{p}"
+        );
+    }
+}
+
+#[test]
 fn a_file_made_by_hand_is_found_after_the_scan() {
     let s = start_imported();
     let token = s.token();

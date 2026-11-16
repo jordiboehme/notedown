@@ -664,7 +664,8 @@ fn reading_the_local_offset_never_holds_the_writer_lock() {
         .collect();
     let mut busy = 0;
     for _ in 0..2000 {
-        match WriterLock::take(tmp.path()) {
+        // No wait: a child that holds the lock for a moment must show.
+        match WriterLock::take_within(tmp.path(), std::time::Duration::ZERO) {
             Ok(w) => drop(w),
             Err(crate::Error::WriterBusy) => busy += 1,
             Err(e) => panic!("{e}"),

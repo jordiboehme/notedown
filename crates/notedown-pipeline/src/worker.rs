@@ -46,7 +46,7 @@ use crate::retention;
 use crate::scope::in_scope;
 use crate::setup::Setup;
 use crate::source::{Removal, ServerAccount, ServerData};
-use crate::store::{TextStore, WriterLock};
+use crate::store::{LastError, TextStore, WriterLock};
 use crate::{Error, Result};
 use note::{Mode, NoteJob};
 
@@ -364,11 +364,40 @@ impl Worker {
         }
     }
 
-    /// Takes the writer lock and sweeps the tombstones a crash or a failed delete left.
+    /// Takes the writer lock, sweeps the tombstones a crash or a failed delete left and
+    /// removes the work files a killed worker left.
     fn take_lock(&self) -> Result<WriterLock> {
         let lock = WriterLock::take(&self.setup.local)?;
         self.sweep(&lock);
+        self.clear_work(&lock);
         Ok(lock)
+    }
+
+    /// Removes `work.json` of every store in the local folder. Creates nothing; a file that
+    /// cannot be removed only shows an old page while the worker runs.
+    fn clear_work(&self, lock: &WriterLock) {
+        let Ok(slugs) = crate::setup::local_stores(&self.setup.local, false) else {
+            return;
+        };
+        for slug in slugs {
+            if let Ok(text) = TextStore::at(&self.setup.local, &slug) {
+                let _ = text.clear_work(lock);
+            }
+        }
+    }
+
+    /// Keeps `text` as the last error of account `slug` for the status, in a store that
+    /// exists. Best effort: the error was said already.
+    fn keep_error(&self, lock: &WriterLock, slug: &str, text: String) {
+        if let Ok(store) = TextStore::at(&self.setup.local, slug) {
+            let _ = store.set_last_error(
+                lock,
+                LastError {
+                    text,
+                    at_ms: self.clock.now_ms(),
+                },
+            );
+        }
     }
 
     /// Deletes the tombstones under `<local>/pipeline`; the ones that stay are said once.
@@ -638,17 +667,22 @@ impl Worker {
                     mode: Mode::Reocr,
                     told_missing: &self.told_missing,
                 };
-                note::process(
+                let read = note::process(
                     &job,
                     &mut self.engine,
                     &d,
                     &mut progress,
                     &mut |_| {},
                     &|| false,
-                )?;
+                );
+                if let Err(e) = read {
+                    self.clear_work(&lock);
+                    return Err(e);
+                }
             }
             text.set_last_run(&lock, self.clock.now_ms())?;
         }
+        self.clear_work(&lock);
         if let Some(n) = note
             && !found
         {
@@ -689,10 +723,15 @@ impl Worker {
         loop {
             match self.followed() {
                 // Nothing known: no pass, no cursor moves; asked again at the next poll.
-                Err(e) => self.say_once(
-                    "accounts",
-                    format!("notedown pipeline: {}: {e}", self.setup.source.describe()),
-                ),
+                Err(e) => {
+                    let message = format!("{}: {e}", self.setup.source.describe());
+                    if let Ok(slugs) = crate::setup::local_stores(&self.setup.local, false) {
+                        for slug in slugs {
+                            self.keep_error(&lock, &slug, message.clone());
+                        }
+                    }
+                    self.say_once("accounts", format!("notedown pipeline: {message}"));
+                }
                 Ok(followed) => {
                     self.settled("accounts");
                     for slug in &followed.journals {
@@ -930,7 +969,13 @@ impl Worker {
         let mut queue: Vec<(String, DueNote)> = Vec::new();
         let mut recs: BTreeMap<String, (records::Records, Vec<Digest>)> = BTreeMap::new();
         let mut next_due: Option<u64> = None;
+        // Per account for its stats: the waiting pages and the next due time.
+        let mut waiting: BTreeMap<String, (u64, Option<u64>)> = BTreeMap::new();
         let mut unsure: BTreeSet<String> = BTreeSet::new();
+        // A refused token leaves its account out of the pass: its store keeps the refusal.
+        for (slug, message) in self.setup.source.refusals() {
+            self.keep_error(lock, &slug, message);
+        }
         // Only the stores of this pass stay open: no stamp or prune touches another one, and a
         // removed account's folder is never made again.
         stores.retain(|slug, _| accounts.iter().any(|a| &a.slug == slug));
@@ -956,6 +1001,7 @@ impl Worker {
                 )?;
                 if let Some(t) = Errors::load(text.dir())?.next_try(now) {
                     next_due = Some(next_due.map_or(t, |n| n.min(t)));
+                    waiting.entry(slug.clone()).or_default().1 = Some(t);
                 }
                 recs.insert(
                     slug.clone(),
@@ -978,6 +1024,7 @@ impl Worker {
                 }
                 Err(e) => {
                     self.say_once(&topic, format!("notedown pipeline: account {slug}: {e}"));
+                    self.keep_error(lock, &slug, e.to_string());
                     // A failed write blocks the store until a repair: open it again next time.
                     stores.remove(&slug);
                     unsure.insert(slug);
@@ -991,6 +1038,9 @@ impl Worker {
                 } else {
                     progress.waiting += d.pages.len();
                     next_due = Some(next_due.map_or(ends, |n| n.min(ends)));
+                    let w = waiting.entry(slug.clone()).or_default();
+                    w.0 += d.pages.len() as u64;
+                    w.1 = Some(w.1.map_or(ends, |n| n.min(ends)));
                 }
             }
         }
@@ -1044,12 +1094,19 @@ impl Worker {
             };
             match note::process(&job, &mut self.engine, d, &mut progress, &mut report, stop) {
                 Ok(()) => {}
-                Err(Error::ModelMissing) => return Err(Error::ModelMissing),
+                Err(Error::ModelMissing) => {
+                    self.clear_work(lock);
+                    for slug in stores.keys() {
+                        self.keep_error(lock, slug, Error::ModelMissing.to_string());
+                    }
+                    return Err(Error::ModelMissing);
+                }
                 Err(e) => {
                     self.say_once(
                         &format!("note:{slug}"),
                         format!("notedown pipeline: {}: {e}", d.path),
                     );
+                    self.keep_error(lock, slug, format!("{}: {e}", d.path));
                     broken.push(slug.clone());
                 }
             }
@@ -1066,9 +1123,11 @@ impl Worker {
             stores.remove(&slug);
             unsure.insert(slug);
         }
+        self.clear_work(lock);
         let end = self.clock.now_ms();
-        for text in stores.values() {
-            text.set_last_run(lock, end)?;
+        for (slug, text) in stores.iter() {
+            let (pages, due) = waiting.get(slug).copied().unwrap_or_default();
+            text.set_pass_end(lock, end, pages, due)?;
         }
         progress.next_due = next_due;
         Ok((progress, unsure))

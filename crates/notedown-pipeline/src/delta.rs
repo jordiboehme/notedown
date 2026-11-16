@@ -474,7 +474,8 @@ pub fn delta(
     };
     let more = lines.iter().any(|l| l.seq > up_to);
     let range_text = match start {
-        Start::Bookmark(_) => match confirmed {
+        // A consumer that only read has a bookmark without an ack (`updatedAt` 0).
+        Start::Bookmark(_) => match confirmed.filter(|b| b.updated_at > 0) {
             Some(b) => format!(
                 "since your last confirm on {} (seq {from}) up to seq {up_to}",
                 stamp(b.updated_at, local)

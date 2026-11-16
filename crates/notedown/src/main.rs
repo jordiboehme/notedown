@@ -103,6 +103,18 @@ enum PipelineAction {
     /// Print the changes of the text store as JSON: the same answers as get_changes of the MCP
     /// server. A consumer's bookmark does not move, use ack for that
     Changes(ChangesArgs),
+    /// Print the status of one account as JSON: whether the pipeline runs and the page it
+    /// reads, the pages with text, pending, waiting and failed, the last error and the
+    /// consumers with their last ack, last read and notes behind. Creates and changes nothing.
+    /// Each call reads the whole text log, so do not ask more often than every few seconds
+    Status {
+        /// The data folder
+        #[arg(long, value_name = "DIR")]
+        data: PathBuf,
+        /// The account slug (can be left out when the data folder has only one account)
+        #[arg(long)]
+        account: Option<String>,
+    },
     /// Move the bookmark of a consumer to --up-to, never backwards, and print it as JSON
     Ack {
         /// The data folder
@@ -2113,10 +2125,13 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
                     .join(&slug);
                 if dir.is_dir() {
                     for (name, b) in TextStore::open(&data, &slug)?.consumers()? {
+                        // A consumer that only read has no ack yet: no time.
+                        let at = |ms: u64| (ms > 0).then(|| delta::stamp(ms, local));
                         list.push(serde_json::json!({
                             "consumer": name,
                             "seq": b.seq,
-                            "updatedAt": delta::stamp(b.updated_at, local),
+                            "updatedAt": at(b.updated_at),
+                            "readAt": b.read_at.and_then(at),
                         }));
                     }
                 }
@@ -2145,6 +2160,14 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
                 let d = delta::delta(&store, &start, a.notes.as_deref(), MAX_CHARS, local)?;
                 println!("{}", to_json(&d));
             }
+        }
+        PipelineAction::Status { data, account } => {
+            let slug = resolve_account(&data, account.as_deref())?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            let facts = notedown_pipeline::status::status_facts(&data, &slug, now)?;
+            println!("{}", to_json(&facts));
         }
         PipelineAction::Ack {
             data,

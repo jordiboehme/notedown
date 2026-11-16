@@ -20,6 +20,7 @@ pub mod scope;
 pub mod search;
 pub mod setup;
 pub mod source;
+pub mod status;
 pub mod store;
 pub mod text;
 pub mod toon;

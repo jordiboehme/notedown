@@ -339,7 +339,7 @@ Lists the items of the bin, newest first. Items of the same time come in the ord
 - `kind` is `file` or `folder`.
 - `deletedAt` is the time of the delete in milliseconds since 1970.
 - `size` is the number of bytes in the bin for the item. For a folder it is the sum of its files.
-- `md5` is only there for a file. `files` is only there for a folder: the number of files that were in it.
+- `md5` is only there for a file, when the server knows it. `files` is only there for a folder: the number of files that were in it.
 
 `limit` is at most 500, which is also the default. 0 counts as 1. When `more` is true, there are more items. Ask again with `after` set to the `key` of the last item of the page. The next page starts after that key, also when that item has left the bin since. A `limit` that is no number and an `after` that is no key are a 400.
 

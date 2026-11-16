@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 
 use super::commit::{RECYCLE_DIR, is_dot_entry};
 use super::retention::Retention;
-use super::{Store, StoreGuard, WirePath};
+use super::{Store, StoreGuard, WirePath, is_native_folder};
 use crate::journal::{Event, EventBody, Journal, Origin, new_op_id};
 use crate::{Error, Result, io_err};
 
@@ -254,18 +254,22 @@ impl Store {
         Ok(path.to_fs(&self.recycle_dir().join(entry.deleted_at.to_string())))
     }
 
-    /// The first ms at or after `at_ms` whose slot `recycle/<ms>/<path>` is free and is not
-    /// the slot of an index line with that ms or inside one (a folder deleted in the same ms),
-    /// so a later delete never lands inside an item of the bin and a key is never used twice.
+    /// The first ms at or after `at_ms` whose slot `recycle/<ms>/<path>` is free and does not
+    /// lie inside the slot of an index line with that ms (a folder deleted in the same ms), so
+    /// a later delete never lands inside an item of the bin.
+    ///
+    /// The index is read only when a folder above the slot is there that a line could name (no
+    /// native folder or parent of one), so a batch of deletes in one ms (`import --replace`)
+    /// of what lies right in the native folders never reads it.
     pub fn recycle_slot(&self, guard: &StoreGuard, path: &WirePath, at_ms: u64) -> Result<u64> {
         self.check_guard(guard)?;
-        // The slots of the index, read only when a `recycle/<ms>` is there.
+        // The slots of the index, read once when needed.
         let mut slots: Option<Vec<(u64, WirePath)>> = None;
         let mut ms = at_ms;
         loop {
             let base = self.recycle_dir().join(ms.to_string());
             let taken = std::fs::symlink_metadata(path.to_fs(&base)).is_ok()
-                || (std::fs::symlink_metadata(&base).is_ok() && {
+                || (folder_above(&base, path) && {
                     if slots.is_none() {
                         slots = Some(
                             self.read_index_lines()?
@@ -763,6 +767,23 @@ fn holds_symlink(dir: &Path) -> bool {
     })
 }
 
+/// Whether a folder above `path` is in `base` (`recycle/<ms>`) that is no native folder or
+/// parent of one, so it may be the slot of a line.
+fn folder_above(base: &Path, path: &WirePath) -> bool {
+    let names = path.segments();
+    let mut dir = base.to_path_buf();
+    for n in 1..names.len() {
+        dir.push(&names[n - 1]);
+        if std::fs::symlink_metadata(&dir).is_err() {
+            return false;
+        }
+        if WirePath::from_segments(names[..n].to_vec()).is_ok_and(|a| !is_native_folder(&a)) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether the folder `dir` holds only dot entries ([`is_dot_entry`]) and folders of that
 /// kind: `None` when it holds anything else, otherwise whether there is a dot entry. No
 /// symlink is followed.
@@ -1083,13 +1104,12 @@ mod tests {
                 .unwrap(),
             T + 7
         );
-        // The slot of a line is never used again, also when it is gone.
-        let gone = entry("NOTE/Note/G", "", T, RecycleReason::Deleted);
-        store.append_recycled(&gone).unwrap();
-        assert_eq!(
-            store.recycle_slot(&g, &wp("NOTE/Note/G"), T).unwrap(),
-            T + 1
-        );
+        // Right in a native folder no line can lie above: the index is not read (here it
+        // could not be).
+        std::fs::remove_file(store.recycle_dir().join(RECYCLE_INDEX)).unwrap();
+        std::fs::create_dir(store.recycle_dir().join(RECYCLE_INDEX)).unwrap();
+        assert_eq!(store.recycle_slot(&g, &wp("NOTE/Note/D"), T).unwrap(), T);
+        assert!(store.recycle_slot(&g, &wp("NOTE/Note/A/E"), T).is_err());
     }
 
     #[test]

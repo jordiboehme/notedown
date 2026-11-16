@@ -1152,7 +1152,8 @@ impl Worker {
                 told_missing: &self.told_missing,
             };
             match note::process(&job, &mut self.engine, d, &mut progress, &mut report, stop) {
-                // A stop between its pages leaves the note in the queue.
+                // A stop between its pages leaves the note in the queue. A stop right after a
+                // note that was read to its end also keeps its pages counted until the next pass.
                 Ok(()) if !stop() => {
                     if let Some(left) = queued.get_mut(slug) {
                         *left = left.saturating_sub(d.pages.len() as u64);

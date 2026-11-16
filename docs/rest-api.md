@@ -406,7 +406,7 @@ No body. Removes every deleted file and folder from the bin for good. The answer
 
 - `removed` is the number of items that left the bin. `bytes` is their size in the bin before Empty.
 - Empty also removes what a delete put in the bin but the bin does not list: hidden paths and folders that a delete left with only dot-files.
-- The old versions of replaced files stay. That includes the old versions of a file that was restored. The server prunes them by its rules as before.
+- The old versions of replaced files stay. That includes the old versions of a file that was restored. The server prunes them by its rules as before. After Empty, the old versions of a deleted file are removed 90 days after the newest of them, which can be right away.
 - `kept` counts the lines of the bin index for deleted files and folders that Empty could not remove, for example because there is a symlink in their bytes or on the way to them. They stay in the bin. It is usually 0.
 - The journal gets one `recycle.pruned` event per removed line of the bin index, with `origin` `app`. `/events` does not show them.
 - An empty bin gives `{"removed": 0, "bytes": 0, "kept": 0}` and no event.

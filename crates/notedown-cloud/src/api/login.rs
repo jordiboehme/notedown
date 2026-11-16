@@ -172,7 +172,7 @@ pub async fn login_equipment(
         Ok(d) => d,
         Err(e) => return device_error(e).device(&serial),
     };
-    let any_bound = match state.auth.devices().list(&slug) {
+    let any_bound = match state.auth.devices().list_readable(&slug) {
         Ok(list) => list.iter().any(|d| d.bound),
         Err(e) => return internal(e).device(&serial),
     };

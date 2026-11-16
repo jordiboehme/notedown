@@ -197,6 +197,15 @@ pub struct Devices {
     write_lock: Arc<Mutex<()>>,
 }
 
+/// A device file whose bytes are there but do not parse: bad JSON or not UTF-8.
+fn unparsable(e: &Error) -> bool {
+    match e {
+        Error::Config { .. } => true,
+        Error::Io { source, .. } => source.kind() == std::io::ErrorKind::InvalidData,
+        _ => false,
+    }
+}
+
 fn valid_serial(serial: &str) -> bool {
     !serial.is_empty()
         && serial.len() <= 64
@@ -257,8 +266,19 @@ impl Devices {
         }
     }
 
-    /// All devices of one account, sorted by serial.
+    /// All devices of one account, sorted by serial. A device file that cannot be read fails
+    /// the call; [`list_readable`](Self::list_readable) skips it instead.
     pub fn list(&self, slug: &str) -> Result<Vec<Device>> {
+        self.list_inner(slug, false)
+    }
+
+    /// [`list`](Self::list), but a device file that is not valid JSON (or not UTF-8) is skipped
+    /// with a warning on stderr, so one broken file does not hide the other devices.
+    pub fn list_readable(&self, slug: &str) -> Result<Vec<Device>> {
+        self.list_inner(slug, true)
+    }
+
+    fn list_inner(&self, slug: &str, skip_broken: bool) -> Result<Vec<Device>> {
         super::accounts::validate_slug(slug)?;
         let dir = self.data_dir.join("accounts").join(slug).join("devices");
         let entries = match std::fs::read_dir(&dir) {
@@ -276,8 +296,13 @@ impl Devices {
             if !valid_serial(serial) {
                 continue;
             }
-            if let Some(d) = self.get(slug, serial)? {
-                out.push(d);
+            match self.get(slug, serial) {
+                Ok(Some(d)) => out.push(d),
+                Ok(None) => {}
+                Err(e) if skip_broken && unparsable(&e) => {
+                    eprintln!("notedown cloud: device {serial} of account {slug} skipped: {e}");
+                }
+                Err(e) => return Err(e),
             }
         }
         out.sort_by(|a, b| a.serial.cmp(&b.serial));

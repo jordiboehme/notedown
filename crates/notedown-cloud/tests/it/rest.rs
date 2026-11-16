@@ -597,3 +597,25 @@ fn the_account_lists_its_devices() {
     assert_eq!(me["devices"][0]["syncing"], false, "{me}");
     assert!(me["devices"][0]["lastSyncMs"].as_u64().unwrap() > 0, "{me}");
 }
+
+#[test]
+fn a_broken_device_file_does_not_fail_the_account() {
+    use notedown_cloud::auth::Devices;
+    let s = start_imported();
+    let token = s.token();
+    Devices::new(&s.data)
+        .update("jordi", "GOOD-1", |d| d.bound = true)
+        .unwrap();
+    let dir = s.data.join("accounts/jordi/devices");
+    std::fs::write(dir.join("BROKEN-1.json"), "{not json").unwrap();
+    std::fs::write(dir.join("BROKEN-2.json"), [0xff, 0xfe, 0x00]).unwrap();
+    let (status, me) = s.get(Some(&token), "/account");
+    assert_eq!(status, 200, "{me}");
+    let serials: Vec<&str> = me["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["serial"].as_str().unwrap())
+        .collect();
+    assert_eq!(serials, ["GOOD-1"], "{me}");
+}

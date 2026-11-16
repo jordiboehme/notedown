@@ -303,7 +303,7 @@ async fn account(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
     };
     let st = state.clone();
     let slug = a.slug.clone();
-    let list = blocking(move || st.auth.devices().list(&slug)).await;
+    let list = blocking(move || st.auth.devices().list_readable(&slug)).await;
     let list = match list {
         Ok(l) => l,
         Err(r) => return *r,

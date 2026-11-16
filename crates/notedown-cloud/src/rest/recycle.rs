@@ -43,7 +43,8 @@ use serde_json::{Value, json};
 
 use super::browse::run;
 use super::check::{Want, check_target, parse_target};
-use super::routes::{Refusal, account_of, bad_request, number, query};
+use super::paging::{self, BadCursor, CursorKind};
+use super::routes::{account_of, bad_request, query};
 use super::write::{Stop, json_body, locked, quota_locked, writer};
 use crate::api::files::{gate_locked, scan_way};
 use crate::auth::Account;
@@ -91,25 +92,30 @@ impl From<RecycleItem> for AppItem {
 #[derive(Deserialize)]
 struct ListQuery {
     limit: Option<String>,
+    cursor: Option<String>,
+    /// The parameter before `cursor`: refused, so an old client does not get page 1 forever.
     after: Option<String>,
 }
 
-/// The place of an item in the list: newest first, then by path.
+/// The place of an item in the list: newest first, then by path (compared as strings).
 fn order(deleted_at: u64, path: &str) -> (Reverse<u64>, &str) {
     (Reverse(deleted_at), path)
 }
 
-/// `after` as `(deletedAt, path)`: a key, `<deletedAt>/<path>`.
-fn after_arg(text: &str) -> Result<(u64, String), Refusal> {
-    text.split_once('/')
+/// The place of a recycle cursor's anchor, a key (`<deletedAt>/<path>`): `(deletedAt, path)`.
+fn cursor_arg(cursor: &str) -> Result<(u64, String), BadCursor> {
+    let key = paging::decode(CursorKind::Recycle, cursor)?;
+    key.split_once('/')
         .and_then(|(ms, path)| Some((ms.parse().ok()?, path.to_string())))
-        .ok_or_else(|| Box::new(bad_request("after is not a key")))
+        .ok_or(BadCursor)
 }
 
-/// `GET /recycle?limit=&after=`: `{"items", "more"}`, at most `limit` items (default and
-/// maximum [`RECYCLE_LIMIT`], 0 is 1), newest first. `after` is the key of the last item of
-/// the previous page: the page starts with the item that comes after it in this order, also
-/// when that item is gone since. `more` tells that there are more items.
+/// `GET /recycle?limit=&cursor=`: `{"items", "next"}`, at most `limit` items (default and
+/// maximum [`RECYCLE_LIMIT`], 0 is 1), newest first. `cursor` is the `next` of the previous
+/// page, which names its last item: the page starts with the item that comes after it in this
+/// order, also when that item is gone since. `next` is `null` on the last page. Each page is cut
+/// from the whole bin index (fine at the size of a bin). 400 `bad_cursor` for a cursor that is
+/// garbled or of another route, 400 `bad_request` for the old `after`.
 pub(super) async fn list(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -120,14 +126,23 @@ pub(super) async fn list(
         Err(r) => return *r,
     };
     let (limit, after) = match query::<ListQuery>(&uri).and_then(|q| {
-        let limit = number(q.limit.as_deref(), "limit", RECYCLE_LIMIT as u64)?;
-        let after = q.after.as_deref().map(after_arg).transpose()?;
+        if q.after.is_some() {
+            return Err(Box::new(bad_request(
+                "after is gone: ask with cursor set to the next of the page before",
+            )));
+        }
+        let limit = paging::limit(q.limit.as_deref(), RECYCLE_LIMIT, RECYCLE_LIMIT)?;
+        let after = q
+            .cursor
+            .as_deref()
+            .map(cursor_arg)
+            .transpose()
+            .map_err(|_| Box::new(paging::bad_cursor()))?;
         Ok((limit, after))
     }) {
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let limit = usize::try_from(limit).map_or(RECYCLE_LIMIT, |l| l.clamp(1, RECYCLE_LIMIT));
     let st = state.clone();
     let items = match run(move || items_of(&st, &account.slug)).await {
         Ok(items) => items,
@@ -145,7 +160,11 @@ pub(super) async fn list(
         .collect();
     let more = page.len() > limit;
     page.truncate(limit);
-    Json(serde_json::json!({"items": page, "more": more})).into_response()
+    let next = match page.last() {
+        Some(last) if more => Some(paging::encode(CursorKind::Recycle, &last.key)),
+        _ => None,
+    };
+    Json(serde_json::json!({"items": page, "next": next})).into_response()
 }
 
 fn items_of(state: &AppState, slug: &str) -> crate::Result<Vec<RecycleItem>> {

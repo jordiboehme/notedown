@@ -41,6 +41,7 @@ pub use due::{AccountStore, DueNote, KeywordCache, due};
 
 use crate::cursor;
 use crate::errors::Errors;
+use crate::markdown;
 use crate::records;
 use crate::retention;
 use crate::scope::in_scope;
@@ -243,6 +244,8 @@ pub struct Worker {
     say: Messages,
     /// The last message said per topic, so a failure that repeats is said once.
     said: RefCell<BTreeMap<String, String>>,
+    /// The Markdown writer of each account, when `markdown_dir` is set.
+    markdown: RefCell<BTreeMap<String, markdown::Writer>>,
 }
 
 impl Worker {
@@ -276,6 +279,7 @@ impl Worker {
             keywords: RefCell::default(),
             say: Arc::new(|m: &str| eprintln!("{m}")),
             said: RefCell::default(),
+            markdown: RefCell::default(),
         }
     }
 
@@ -471,6 +475,7 @@ impl Worker {
             Some(id) if id == account.user_id => {}
             Some(old) => {
                 stores.remove(slug);
+                self.remove_markdown(slug);
                 TextStore::destroy(&self.setup.local, slug, lock)?;
                 self.sweep(lock);
                 self.say(&format!(
@@ -496,6 +501,9 @@ impl Worker {
                     );
                     return Ok(false);
                 }
+                // A writer of this slug is of a store that is gone (a store gets its first
+                // owner before any writer): its files and its manifest are not of this one.
+                self.remove_stale_writer(slug);
                 text.set_owner(account.user_id, lock)?;
             }
         }
@@ -575,7 +583,12 @@ impl Worker {
         let dir = self.setup.local.join(crate::store::PIPELINE_DIR).join(slug);
         match std::fs::symlink_metadata(&dir) {
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Outcome::Done),
+            // On one machine the server deletes the store itself (account removed, or its
+            // slug given again). The writer still knows the files of that store.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.remove_stale_writer(slug);
+                return Ok(Outcome::Done);
+            }
             Err(source) => return Err(Error::Io { path: dir, source }),
         }
         let owner = match stores.get(slug) {
@@ -601,6 +614,7 @@ impl Worker {
             return Ok(Outcome::Wait);
         }
         stores.remove(slug);
+        self.remove_markdown(slug);
         let destroyed = TextStore::destroy(&self.setup.local, slug, lock)?;
         self.sweep(lock);
         if destroyed {
@@ -610,6 +624,125 @@ impl Worker {
             ));
         }
         Ok(Outcome::Done)
+    }
+
+    /// Brings the Markdown files of account `slug` up to date with the notes written since
+    /// the last call; the worker serves `served` accounts. A failure is said once and the
+    /// notes are tried again after the next pass; it never fails the pass. An account without
+    /// a Markdown folder gets no files (its written notes are let go all the same).
+    fn write_markdown(&self, slug: &str, text: &TextStore, served: usize) {
+        let changed = text.take_touched();
+        if self.setup.markdown_only.is_some() && served > 1 {
+            self.say_once(
+                "markdown",
+                format!(
+                    "notedown pipeline: --markdown-dir without an account needs exactly one \
+                     account, but this pipeline serves {served}; give --markdown-dir SLUG=DIR \
+                     for each account. No Markdown files are written"
+                ),
+            );
+            return;
+        }
+        let topic = format!("markdown:{slug}");
+        let mut writers = self.markdown.borrow_mut();
+        let Some(dir) = self.setup.markdown_dir(slug, served) else {
+            writers.remove(slug);
+            return;
+        };
+        if writers.get(slug).is_some_and(|w| w.dir() != dir) {
+            writers.remove(slug);
+        }
+        let writer = match writers.entry(slug.to_string()) {
+            std::collections::btree_map::Entry::Occupied(o) => o.into_mut(),
+            std::collections::btree_map::Entry::Vacant(v) => {
+                match markdown::Writer::new(&dir, &text.dir().join(markdown::MANIFEST_FILE)) {
+                    Ok(w) => v.insert(w),
+                    Err(e) => {
+                        // The notes of this call are looked at by the first sync of the
+                        // writer, which looks at every note.
+                        self.say_once(
+                            &topic,
+                            format!("notedown pipeline: account {slug}: Markdown files: {e}"),
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+        match writer.sync(text, slug, &changed) {
+            Ok(()) => self.settled(&topic),
+            Err(e) => self.say_once(
+                &topic,
+                format!("notedown pipeline: account {slug}: Markdown files: {e}"),
+            ),
+        }
+    }
+
+    /// [`write_markdown`](Self::write_markdown) right after a note of a pass is read. While
+    /// the Markdown files of the account fail, it waits for the end of the pass: each try
+    /// reads every pending note again. The changed notes stay in the store's touched set.
+    fn write_note_markdown(&self, slug: &str, text: &TextStore, served: usize) {
+        if self.said.borrow().contains_key(&format!("markdown:{slug}")) {
+            return;
+        }
+        self.write_markdown(slug, text, served);
+    }
+
+    /// Says once (while the list stays the same) the accounts that have a Markdown folder but
+    /// are not served: a typo in a slug, or an account that is gone.
+    fn say_unserved(&self, served: &[String]) {
+        let unserved: Vec<&str> = self
+            .setup
+            .cfg
+            .markdown_dirs
+            .keys()
+            .filter(|slug| !served.contains(slug))
+            .map(String::as_str)
+            .collect();
+        if unserved.is_empty() {
+            self.settled("markdown:unserved");
+            return;
+        }
+        self.say_once(
+            "markdown:unserved",
+            format!(
+                "notedown pipeline: a Markdown folder is given for {}, but this pipeline does \
+                 not serve that account; it gets no files",
+                unserved.join(", ")
+            ),
+        );
+    }
+
+    /// The store of account `slug` is gone without [`remove_markdown`](Self::remove_markdown)
+    /// (the server deleted it): drops its writer and removes the files the writer holds, with
+    /// the folders it made. Best effort: a failure is said.
+    fn remove_stale_writer(&self, slug: &str) {
+        let Some(writer) = self.markdown.borrow_mut().remove(slug) else {
+            return;
+        };
+        if let Err(e) = writer.remove_files() {
+            self.say(&format!(
+                "notedown pipeline: account {slug}: its Markdown files cannot all be removed: {e}"
+            ));
+        }
+    }
+
+    /// Before the store of account `slug` is deleted: drops its writer and removes the
+    /// Markdown files its manifest lists, with the folders the writer made. They hold text of
+    /// a store that is gone. Best effort: a failure is said and the store goes all the same.
+    fn remove_markdown(&self, slug: &str) {
+        self.markdown.borrow_mut().remove(slug);
+        let manifest = self
+            .setup
+            .local
+            .join(crate::store::PIPELINE_DIR)
+            .join(slug)
+            .join(markdown::MANIFEST_FILE);
+        if let Err(e) = markdown::remove_files(&manifest) {
+            self.say(&format!(
+                "notedown pipeline: account {slug}: its Markdown files cannot all be removed: {e}"
+            ));
+        }
     }
 
     /// One pass over all accounts: the due notes whose settle time is over (all of them with
@@ -628,7 +761,15 @@ impl Worker {
         let lock = self.take_lock()?;
         self.source_seen(&lock, None);
         let mut stores = BTreeMap::new();
-        let (progress, _) = self.pass(&lock, &mut stores, &accounts, ignore_settle, &|| false)?;
+        let served: Vec<String> = accounts.iter().map(|a| a.slug.clone()).collect();
+        let (progress, _) = self.pass(
+            &lock,
+            &mut stores,
+            &accounts,
+            &served,
+            ignore_settle,
+            &|| false,
+        )?;
         Ok(progress)
     }
 
@@ -636,6 +777,9 @@ impl Worker {
     /// with the whole page as the change region. Changed text gives normal versions.
     pub fn reocr(&mut self, note: Option<&str>) -> Result<Progress> {
         let served = self.followed()?.served;
+        let served_count = served.len();
+        let served_slugs: Vec<String> = served.iter().map(|a| a.slug.clone()).collect();
+        self.say_unserved(&served_slugs);
         let lock = self.take_lock()?;
         self.source_seen(&lock, None);
         let source = self.setup.source.clone();
@@ -649,6 +793,8 @@ impl Worker {
                 TextStore::open_writer(&self.setup.local, &slug, &lock)?,
             );
             if !self.owner_check(&lock, &mut stores, &account)? {
+                // Not read, so not written either.
+                stores.remove(&slug);
                 continue;
             }
             let text = &stores[&slug];
@@ -711,6 +857,9 @@ impl Worker {
                 }
             }
             text.set_last_run(&lock, self.clock.now_ms())?;
+        }
+        for (slug, text) in stores.iter() {
+            self.write_markdown(slug, text, served_count);
         }
         self.clear_work(&lock);
         if let Some(n) = note
@@ -791,6 +940,10 @@ impl Worker {
                         }
                     }
                     look |= self.removals(&lock, &mut stores, &mut pending, &followed.all);
+                    // Every served account, also one with a removal not done yet: it counts
+                    // for the Markdown folder given without an account.
+                    let served: Vec<String> =
+                        followed.served.iter().map(|a| a.slug.clone()).collect();
                     // An account with a removal not done yet is not read.
                     let accounts: Vec<ServerAccount> = followed
                         .served
@@ -815,7 +968,8 @@ impl Worker {
                                 Some((slug.clone(), held))
                             })
                             .collect();
-                        let result = self.pass(&lock, &mut stores, &accounts, false, &stop);
+                        let result =
+                            self.pass(&lock, &mut stores, &accounts, &served, false, &stop);
                         let now = self.clock.now_ms();
                         next_wake = now + RESCAN_MS;
                         match result {
@@ -1001,9 +1155,11 @@ impl Worker {
         lock: &WriterLock,
         stores: &mut BTreeMap<String, TextStore>,
         accounts: &[ServerAccount],
+        served: &[String],
         ignore_settle: bool,
         stop: &dyn Fn() -> bool,
     ) -> Result<(Progress, BTreeSet<String>)> {
+        self.say_unserved(served);
         let now = self.clock.now_ms();
         let settle = self.setup.cfg.ocr_settle.as_millis() as u64;
         let source: Arc<dyn ServerData> = self.setup.source.clone();
@@ -1017,6 +1173,9 @@ impl Worker {
         // Only the stores of this pass stay open: no stamp or prune touches another one, and a
         // removed account's folder is never made again.
         stores.retain(|slug, _| accounts.iter().any(|a| &a.slug == slug));
+        // The Markdown writers stay: an account left out of one list (a source error, a
+        // removal that waits) keeps its writer, so it needs no new full look. A writer goes
+        // only with its store (`remove_markdown`) or its folder (`write_markdown`).
         for account in accounts {
             let slug = account.slug.clone();
             let found = (|| -> Result<Option<Vec<DueNote>>> {
@@ -1053,7 +1212,8 @@ impl Worker {
                     self.settled(&topic);
                     n
                 }
-                // Skipped by the owner check (said there): its cursor stays.
+                // Skipped by the owner check (said there): its cursor stays, and so does its
+                // Markdown writer.
                 Ok(None) => {
                     self.settled(&topic);
                     stores.remove(&slug);
@@ -1064,7 +1224,10 @@ impl Worker {
                     self.say_once(&topic, format!("notedown pipeline: account {slug}: {e}"));
                     self.keep_error(lock, &slug, e.to_string());
                     // A failed write blocks the store until a repair: open it again next time.
-                    stores.remove(&slug);
+                    // The notes written before the failure keep their Markdown files current.
+                    if let Some(text) = stores.remove(&slug) {
+                        self.write_markdown(&slug, &text, served.len());
+                    }
                     unsure.insert(slug);
                     continue;
                 }
@@ -1154,17 +1317,25 @@ impl Worker {
             match note::process(&job, &mut self.engine, d, &mut progress, &mut report, stop) {
                 // A stop between its pages leaves the note in the queue. A stop right after a
                 // note that was read to its end also keeps its pages counted until the next pass.
+                // The note's Markdown file is written as soon as the note is done, so a stop or
+                // a kill later in the pass keeps it. Moves and deletes of the pass go with it.
                 Ok(()) if !stop() => {
                     if let Some(left) = queued.get_mut(slug) {
                         *left = left.saturating_sub(d.pages.len() as u64);
                         let _ = text.set_queued(lock, *left);
                     }
+                    self.write_note_markdown(slug, text, served.len());
                 }
-                Ok(()) => {}
+                Ok(()) => self.write_note_markdown(slug, text, served.len()),
                 Err(Error::ModelMissing) => {
                     self.clear_work(lock);
                     for slug in stores.keys() {
                         self.keep_error(lock, slug, Error::ModelMissing.to_string());
+                    }
+                    // Moves, deletes and scope changes are done, and notes with text need no
+                    // model: their files are kept also while the model is missing.
+                    for (slug, text) in stores.iter() {
+                        self.write_markdown(slug, text, served.len());
                     }
                     return Err(Error::ModelMissing);
                 }
@@ -1187,7 +1358,9 @@ impl Worker {
         // account (or one whose record or note bytes the source could not give) keeps its
         // cursor.
         for slug in broken {
-            stores.remove(&slug);
+            if let Some(text) = stores.remove(&slug) {
+                self.write_markdown(&slug, &text, served.len());
+            }
             unsure.insert(slug);
         }
         self.clear_work(lock);
@@ -1201,6 +1374,9 @@ impl Worker {
                 0
             };
             text.set_pass_end(lock, end, left, pages, due)?;
+        }
+        for (slug, text) in stores.iter() {
+            self.write_markdown(slug, text, served.len());
         }
         progress.next_due = next_due;
         Ok((progress, unsure))

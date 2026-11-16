@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::rest_server::{
     EMAIL, PASSWORD, Server, delete, header, json_of, mkdir, mv, q, send_json, start,
-    start_imported, upload, upload_with, uploaded, writer,
+    start_imported, tree_all, upload, upload_with, uploaded, writer,
 };
 
 fn md5_hex(bytes: &[u8]) -> String {
@@ -87,8 +87,8 @@ fn get_with(
 fn tree_lists_the_children_of_the_root() {
     let s = start_imported();
     let token = s.token();
-    let (status, answer) = s.get(Some(&token), "/tree");
-    assert_eq!(status, 200, "{answer}");
+    let (_, entries) = tree_all(&s, &token, "");
+    let answer = json!({ "entries": entries });
     let got: BTreeSet<String> = paths(&answer).into_iter().collect();
     let want: BTreeSet<String> = ["DOCUMENT", "EXPORT", "INBOX", "NOTE", "SCREENSHOT"]
         .into_iter()
@@ -296,6 +296,104 @@ fn an_entry_by_id() {
     // An id that is no number.
     let (status, answer) = s.get(Some(&token), "/entries/abc");
     assert_eq!((status, &answer["error"]), (400, &json!("bad_request")));
+}
+
+#[test]
+fn an_entry_is_found_by_path() {
+    let s = start_imported();
+    let token = s.token();
+    let path = s.put("a.note", b"abc");
+    let id = id_of(&s, &path);
+    let (status, by_path) = s.get(Some(&token), &format!("/entries?path={}", q(&path)));
+    assert_eq!(status, 200, "{by_path}");
+    let (_, by_id) = s.get(Some(&token), &format!("/entries/{id}"));
+    assert_eq!(by_path, by_id);
+    // A folder too.
+    let (status, folder) = s.get(Some(&token), &format!("/entries?path={}", q("NOTE/Note")));
+    assert_eq!(status, 200, "{folder}");
+    assert_eq!(folder["kind"], "folder");
+    // The token is needed.
+    let (status, _) = s.get(None, &format!("/entries?path={}", q(&path)));
+    assert_eq!(status, 401);
+}
+
+#[test]
+fn an_unknown_or_hidden_path_is_not_found() {
+    let s = start_imported();
+    let token = s.token();
+    hand(&s, "NOTE/Note/.hidden.note", b"x");
+    for p in ["NOTE/Note/none.note", "NOTE/Note/.hidden.note", "note/Note"] {
+        let (status, answer) = s.get(Some(&token), &format!("/entries?path={}", q(p)));
+        assert_eq!(
+            (status, answer),
+            (404, json!({"error": "not_found"})),
+            "{p}"
+        );
+    }
+}
+
+#[test]
+fn a_path_that_does_not_parse_is_bad_name() {
+    let s = start_imported();
+    let token = s.token();
+    for p in ["NOTE/../NOTE", "NOTE/./Note", ""] {
+        let (status, answer) = s.get(Some(&token), &format!("/entries?path={}", q(p)));
+        assert_eq!((status, &answer["error"]), (400, &json!("bad_name")), "{p}");
+    }
+}
+
+#[test]
+fn a_missing_or_root_path_is_bad_name() {
+    let s = start_imported();
+    let token = s.token();
+    for url in [
+        "/entries",
+        "/entries?path=",
+        "/entries?path=%2F",
+        "/entries?other=1",
+    ] {
+        let (status, answer) = s.get(Some(&token), url);
+        assert_eq!(
+            (status, &answer["error"]),
+            (400, &json!("bad_name")),
+            "{url}"
+        );
+    }
+}
+
+#[test]
+fn a_path_through_a_hidden_folder_is_not_found() {
+    let s = start_imported();
+    let token = s.token();
+    hand(&s, "NOTE/Note/.secret/a.note", b"x");
+    for p in ["NOTE/Note/.secret", "NOTE/Note/.secret/a.note"] {
+        let (status, answer) = s.get(Some(&token), &format!("/entries?path={}", q(p)));
+        assert_eq!(
+            (status, answer),
+            (404, json!({"error": "not_found"})),
+            "{p}"
+        );
+    }
+}
+
+#[test]
+fn a_file_made_by_hand_is_found_after_the_scan() {
+    let s = start_imported();
+    let token = s.token();
+    hand(&s, "NOTE/Note/hand.note", b"by hand");
+    let (status, entry) = s.get(
+        Some(&token),
+        &format!("/entries?path={}", q("NOTE/Note/hand.note")),
+    );
+    assert_eq!(status, 200, "{entry}");
+    let id = entry["id"].as_u64().unwrap();
+    assert_eq!(entry["md5"], md5_hex(b"by hand"));
+    let created = events(&s)
+        .into_iter()
+        .find(|e| e["type"] == "file.created" && e["path"] == "NOTE/Note/hand.note")
+        .expect("the scan journals the file");
+    assert_eq!(created["origin"], "scan");
+    assert_eq!(created["id"], json!(id));
 }
 
 #[test]
@@ -524,8 +622,8 @@ fn a_hidden_file_is_never_listed_or_served() {
     s.put("keep.note", b"k");
     let path = s.put("a.note", b"a");
     let id = id_of(&s, &path);
-    let (status, answer) = s.get(Some(&token), "/tree?recursive=true");
-    assert_eq!(status, 200);
+    let (_, entries) = tree_all(&s, &token, "recursive=true");
+    let answer = json!({ "entries": entries });
     assert!(paths(&answer).iter().all(|p| !p.contains("/.")), "{answer}");
     for p in ["NOTE/Note/.dir", "NOTE/Note/.hidden.note"] {
         let (status, answer) = s.get(Some(&token), &format!("/tree?path={}", q(p)));

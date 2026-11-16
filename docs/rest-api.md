@@ -66,6 +66,7 @@ A refused token gets 401 `token_refused` with `WWW-Authenticate: Bearer`. A toke
 | `GET /account` | read | `{"slug", "userId", "devices"}` |
 | `GET /tree` | read | List a folder |
 | `GET /entries/{id}` | read | One file or folder |
+| `GET /entries?path=` | read | One file or folder, found by its path |
 | `GET` and `HEAD /files/{id}` | read | Download a file |
 | `GET /journal` | read | What changed since a `seq` |
 | `GET /events` | read | The file and folder changes since a `seq` |
@@ -81,6 +82,28 @@ A refused token gets 401 `token_refused` with `WWW-Authenticate: Bearer`. A toke
 | `POST /recycle/empty` | write | Remove every deleted file and folder from the recycle bin |
 
 The routes for the records, the digests and the note by path are made for the pipeline. This page does not describe their bodies. The sections below are for an app that browses and manages files.
+
+## Paging
+
+`GET /tree` and `GET /recycle` answer in pages. Ask with `limit` and `cursor`:
+
+- `limit` is the number of items in one page. Each route has a default and a largest value. A larger number counts as the largest, 0 counts as 1. A `limit` that is no number is 400 `bad_request`.
+- The answer has the list and `"next"`. `next` is the cursor of the next page, or `null` on the last page.
+- To get the next page, ask again with the same query and `cursor` set to `next`. Leave the other values as they were. A cursor is only valid with the same `path` and `recursive` as the page it came from.
+- A cursor is opaque. It starts with its route and version (`t1:` for the tree, `r1:` for the recycle bin) and is at most 8192 characters long. Never build one and never look inside.
+- A cursor that is garbled, that belongs to another route or that points outside the folder of the request is 400 `bad_cursor`. Start again from the first page.
+- A cursor names the last item of its page. When that item is gone since, the next page starts after its place in the order. An item that stays where it is and does not change comes once. A change in the middle of the pages comes as an event (for the tree, see "Many pages" under `GET /tree`).
+
+Every route with a list:
+
+| Route | Limit | Default | Why |
+| --- | --- | --- | --- |
+| `GET /tree` | 1000 | 500 | Paged with `cursor` |
+| `GET /recycle` | 500 | 500 | Paged with `cursor` |
+| `GET /events` | 1000 | 1000 | Its own cursor: `from` and `next` are journal numbers |
+| `GET /journal` | 10000 | 10000 | Its own cursor: `from` and `next` are journal numbers |
+| `GET /account` | none | none | Not paged: an account has a handful of devices |
+| `GET /records`, `GET /digests` | none | none | Not paged yet: routes of the pipeline. Paging them is planned for later |
 
 ## Account
 
@@ -111,9 +134,9 @@ Tells whose token this is and which devices the account has.
 
 Every read can also answer 423 `scan_hold` (a scan holds the account), 423 `not_imported` (the import of the account is missing) and 503 `store_damaged` (the files of the account are damaged).
 
-### `GET /tree?path=&recursive=`
+### `GET /tree?path=&recursive=&kind=&limit=&cursor=`
 
-Lists the children of the folder at `path` (the root by default). With `recursive=true` it lists all descendants. Anything else than `true` or `false` is a 400.
+Lists the children of the folder at `path` (the root by default), one page at a time. With `recursive=true` it lists all descendants. Anything else than `true` or `false` is a 400. With `kind=folder` it lists only folders, for example for a sidebar with the folder tree. Any other `kind` is a 400. `limit` is at most 1000. The default is 500. See [Paging](#paging).
 
 ```json
 {
@@ -122,22 +145,31 @@ Lists the children of the folder at `path` (the root by default). With `recursiv
     {"id": 41, "path": "NOTE/Note/a.note", "name": "a.note", "kind": "file",
      "size": 20480, "md5": "9e107d9d372bb6826bd81d3542a419d6",
      "mtimeMs": 1763290000000, "writable": true}
-  ]
+  ],
+  "next": "t1:Tk9URS9Ob3RlL2Eubm90ZQ"
 }
 ```
 
 - `kind` is `file` or `folder`. A folder has no `md5`.
 - `mtimeMs` is the time of the last change in milliseconds since 1970.
 - `writable` says whether the app may rename, move or delete the entry. The tree roots (`NOTE/Note`, `NOTE/MyStyle`, `DOCUMENT/Document`, `EXPORT`, `SCREENSHOT` and `INBOX`) show `writable: false`: they cannot be renamed, moved or deleted. An upload or a new folder inside a root is allowed. Anything outside the trees is not writable either.
-- 404 `not_found` for a path that is not there. 409 `not_a_folder` for a path that is a file.
+- 404 `not_found` for a path that is not there. 409 `not_a_folder` for a path that is a file. 400 `bad_cursor` for a cursor that does not fit (see [Paging](#paging)).
 
-Before it answers, the server scans what it shows. A file that someone put into the folder by hand is journaled and has its id before the app sees it.
+**The order.** Entries come in the order of their paths, name by name. Each name is compared by its bytes. So a folder comes right before what is in it: `a`, `a/x`, `a b`. This is not the order of the paths as whole strings. Upper case comes before lower case (`Zebra` before `apple`), `a10` comes before `a2`, and files and folders are mixed. The app shows the entries in this order while it loads a folder. It can sort them in its own way once it has all pages. A sort by size or by time is only possible then.
 
-**List by folder.** Do not list the whole tree with `recursive=true` on a big account. List the folder the user opens. Keep the `seq` of that answer and poll `GET /events?from=<seq + 1>`. The server read `seq` under the same lock as the listing, so the listing holds every event up to `seq` and you miss nothing. See [Following changes](#following-changes) for what to do with the events.
+**The cost.** The first page (no `cursor`) scans the folder before it answers. A file that someone put into the folder by hand is journaled and has its id before the app sees it. The next pages do not scan the folder again. They read only the names of the folder (with `recursive=true`, of the folders on the way) and look only at the entries of the page. When a page shows an entry that was made, changed or renamed by hand after the first page, the server scans the folder of that entry first (its direct children, once per page). So its event is in the journal before the app sees it. A rename within that folder keeps the id. A move from another folder, and with `recursive=true` the rename of a folder, comes as a delete and a create with a new id. A file that is still being written at that moment is left out of the page. The app gets it later with its `file.created` or `file.modified` event.
+
+**List by folder.** Do not list the whole tree with `recursive=true` on a big account. List the folder the user opens. Keep the `seq` of that answer and poll `GET /events?from=<seq + 1>`. The server read `seq` under the same lock as the page, so the page holds every event up to `seq` and you miss nothing. See [Following changes](#following-changes) for what to do with the events.
+
+**Many pages.** Each page has its own `seq`. Follow the events of a folder from the lowest `seq` of its pages, plus one. When a later page answers 404 `not_found` or 409 `not_a_folder`, the folder was removed or replaced while the app read it. Drop the pages and list the folder again from the first page.
 
 ### `GET /entries/{id}`
 
 The same entry object as in `/tree`. 404 `not_found` for an unknown id, a file that is gone from disk and a hidden name. An id that is no number is a 400.
+
+### `GET /entries?path=`
+
+The same entry object as `GET /entries/{id}`, found by its path. The server scans the parent folder first, as it does for the id. So a file that someone put there by hand is journaled and has its id before the app sees it. 404 `not_found` for an unknown path, a file that is gone from disk and a hidden name. 400 `bad_name` for a path that does not parse, a path with a `.` or `..` segment, `/`, and a missing or empty path. A path through a hidden folder is 404 `not_found`.
 
 ### `GET /files/{id}` and `HEAD /files/{id}`
 
@@ -343,7 +375,7 @@ A delete moves the file or folder to the recycle bin of the account. The bin lis
 
 The bin also keeps the old versions of replaced files. They are not listed. When a delete leaves a folder with only dot-files, the server moves that folder to the bin as well. The user did not delete it, so it is not listed either. By default the server removes an item 90 days after the delete. The [getting started guide](getting-started.md) has the settings (`recycle_keep_deleted_days`, `recycle_prune`). Empty removes every deleted item at once.
 
-### `GET /recycle?limit=&after=`
+### `GET /recycle?limit=&cursor=`
 
 Lists the items of the bin, newest first. Items of the same time come in the order of their paths.
 
@@ -357,7 +389,7 @@ Lists the items of the bin, newest first. Items of the same time come in the ord
      "name": "projects", "kind": "folder", "deletedAt": 1763280000000, "size": 81920,
      "files": 4}
   ],
-  "more": false
+  "next": null
 }
 ```
 
@@ -368,7 +400,9 @@ Lists the items of the bin, newest first. Items of the same time come in the ord
 - `size` is the number of bytes in the bin for the item. For a folder it is the sum of its files.
 - `md5` is only there for a file, when the server knows it. `files` is only there for a folder: the number of files that were in it.
 
-`limit` is at most 500, which is also the default. 0 counts as 1. When `more` is true, there are more items. Ask again with `after` set to the `key` of the last item of the page. The next page starts after that key, also when that item has left the bin since. A `limit` that is no number and an `after` that is no key are a 400.
+`limit` is at most 500, which is also the default. 0 counts as 1. When `next` is not `null`, there are more items. Ask again with `cursor` set to `next`. The next page starts after the last item of the page, also when that item has left the bin since. See [Paging](#paging). A `limit` that is no number is 400 `bad_request`, a cursor that does not fit is 400 `bad_cursor`. The old `after` is 400 `bad_request`: use `cursor`. The server cuts each page from the whole bin index. That is fine at the size of a bin.
+
+The bin is not in `/events`. List it again after a delete, a restore or Empty, and on a `file.deleted` or `folder.deleted` while the app shows it.
 
 An item whose bytes are gone from the bin is not listed. A line of the bin index that the server cannot read is skipped. The list answers 423 `scan_hold` and `not_imported` like the other reads.
 
@@ -421,6 +455,7 @@ While a device holds the sync lock of the account, every write answers 423 `devi
 | Status | Code | When |
 | --- | --- | --- |
 | 400 | `bad_request` | A body, a query or a header that does not parse. `message` says what is wrong. |
+| 400 | `bad_cursor` | A cursor that is garbled, of another route, or outside the folder of the request. Start again from the first page. |
 | 400 | `bad_name` | The path is no valid path, a name starts with a dot, or the path is the root. |
 | 400 | `name_too_long` | A name has more than 255 bytes. |
 | 400 | `into_itself` | A folder is moved into itself. |

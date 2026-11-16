@@ -3,7 +3,9 @@
 //!
 //! Each request works as a device listing does: the store lock with recovery, the gates
 //! ([`gate_locked`]: 423 `scan_hold` or `not_imported`), then a scan of what it shows, so a file
-//! made by hand is journaled (origin `scan`) and has its id before the app sees it. Names are
+//! made by hand is journaled (origin `scan`) and has its id before the app sees it. A
+//! continuation page of `/tree` does not scan the folder: it scans only the folder of an entry
+//! that was made, changed or renamed by hand since ([`Store::list_window`]). Names are
 //! exact: another spelling is no entry, and nothing hidden is listed or served. A download opens
 //! the file under the lock and streams it after the lock is dropped, so a replace while it
 //! streams never mixes old and new bytes. The one validator is the md5: `md5` in an entry, the
@@ -18,13 +20,15 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
+use super::check::WriteRefusal;
 use super::errors::write_error;
+use super::paging::{self, BadCursor, CursorKind};
 use super::routes::{Refusal, account_of, bad_request, error, internal, not_modified, query};
 use crate::Error;
 use crate::api::files::gate_locked;
 use crate::api::oss::send_tagged;
 use crate::server::AppState;
-use crate::store::{Entry, Kind, ScanOptions, Store, WirePath, WriteGuard, trees};
+use crate::store::{Entry, Kind, Page, ScanOptions, Store, WirePath, WriteGuard, trees};
 
 /// One file or folder as the app sees it. `path` is the wire path (`NOTE/Note/a.note`), `md5`
 /// only for files, `writable` whether the app may change it ([`trees::writable`]).
@@ -107,6 +111,18 @@ fn entry_of(
     let Some((_, path)) = store.kind_and_path_of(id)? else {
         return Ok(None);
     };
+    entry_scanned(state, store, guard, &path, Some(id))
+}
+
+/// The entry at `path` after a scan of its parent folder (direct children); `None` when
+/// nothing is there or the path is hidden. With `id`, an entry of another id is none.
+fn entry_scanned(
+    state: &AppState,
+    store: &Store,
+    guard: &WriteGuard,
+    path: &WirePath,
+    id: Option<u64>,
+) -> crate::Result<Option<Entry>> {
     if path.is_hidden() {
         return Ok(None);
     }
@@ -117,6 +133,9 @@ fn entry_of(
         &path.parent().unwrap_or_else(WirePath::root),
         false,
     )?;
+    let Some(id) = id else {
+        return store.entry(guard, path);
+    };
     let Some(path) = store.path_of(id)? else {
         return Ok(None);
     };
@@ -129,47 +148,163 @@ pub(super) fn id_arg(text: &str) -> Result<u64, Refusal> {
         .map_err(|_| Box::new(bad_request("the id is not a number")))
 }
 
+/// The default `limit` of `GET /tree`.
+pub const TREE_LIMIT: usize = 500;
+
+/// The largest `limit` of `GET /tree`.
+pub const TREE_LIMIT_MAX: usize = 1000;
+
 #[derive(Deserialize)]
 struct TreeQuery {
     path: Option<String>,
     recursive: Option<String>,
+    kind: Option<String>,
+    limit: Option<String>,
+    cursor: Option<String>,
+}
+
+/// What a tree request asks for.
+struct TreeAsk {
+    path: WirePath,
+    recursive: bool,
+    folders_only: bool,
+    limit: usize,
+    /// The last entry of the page before.
+    after: Option<WirePath>,
 }
 
 /// What a tree request found.
 enum Tree {
-    Listed { seq: u64, entries: Vec<AppEntry> },
+    Listed {
+        seq: u64,
+        entries: Vec<AppEntry>,
+        next: Option<String>,
+    },
     NotFound,
     NotAFolder,
 }
 
-fn tree_of(state: &AppState, slug: &str, path: &WirePath, recursive: bool) -> crate::Result<Tree> {
+/// The anchor of a tree cursor, which must lie in the scope of the request: a wire path, not
+/// hidden, below `path`, and without `recursive` a direct child of it.
+fn tree_anchor(cursor: &str, path: &WirePath, recursive: bool) -> Result<WirePath, BadCursor> {
+    let text = paging::decode(CursorKind::Tree, cursor)?;
+    let anchor = WirePath::parse(&text).map_err(|_| BadCursor)?;
+    let inside = if recursive {
+        anchor.starts_with(path) && anchor != *path
+    } else {
+        anchor.parent().as_ref() == Some(path)
+    };
+    if anchor.is_hidden() || !inside {
+        return Err(BadCursor);
+    }
+    Ok(anchor)
+}
+
+/// The query of `GET /tree`.
+fn tree_ask(uri: &Uri) -> Result<TreeAsk, Refusal> {
+    let q = query::<TreeQuery>(uri)?;
+    let path = WirePath::parse(q.path.as_deref().unwrap_or(""))
+        .map_err(|_| Box::new(bad_request("path is not a valid path")))?;
+    let recursive = match q.recursive.as_deref() {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return Err(Box::new(bad_request("recursive is true or false"))),
+    };
+    let folders_only = match q.kind.as_deref() {
+        None => false,
+        Some("folder") => true,
+        Some(_) => return Err(Box::new(bad_request("kind is folder"))),
+    };
+    let limit = paging::limit(q.limit.as_deref(), TREE_LIMIT, TREE_LIMIT_MAX)?;
+    let after = q
+        .cursor
+        .as_deref()
+        .map(|c| tree_anchor(c, &path, recursive))
+        .transpose()
+        .map_err(|_| Box::new(paging::bad_cursor()))?;
+    Ok(TreeAsk {
+        path,
+        recursive,
+        folders_only,
+        limit,
+        after,
+    })
+}
+
+/// One page of the tree. The first page (no cursor) scans the scope, lists it from the scan's
+/// walk and cuts the page; only a first page that is also the last prunes the MD5 cache of a
+/// whole-tree listing. A continuation page does not scan the scope: it walks a window after
+/// the anchor ([`Store::list_window`]), and only the folder of an entry made, changed or
+/// renamed by hand since is scanned (its direct children, once per page).
+fn tree_of(state: &AppState, slug: &str, ask: TreeAsk) -> crate::Result<Tree> {
+    let TreeAsk {
+        path,
+        recursive,
+        folders_only,
+        limit,
+        after,
+    } = ask;
     if path.is_hidden() {
         return Ok(Tree::NotFound);
     }
     let store = state.store(slug)?;
     let guard = store.lock_recovered(&state.journal)?;
     gate_locked(state, &store)?;
-    let walk = scan(state, &store, &guard, path, recursive)?;
-    if !path.is_root() {
-        match store.entry(&guard, path)? {
-            Some(e) if e.tag == Kind::Folder => {}
-            Some(_) => return Ok(Tree::NotAFolder),
-            None => return Ok(Tree::NotFound),
+    let (entries, more) = match after {
+        None => {
+            let walk = scan(state, &store, &guard, &path, recursive)?;
+            if !path.is_root() {
+                match store.entry(&guard, &path)? {
+                    Some(e) if e.tag == Kind::Folder => {}
+                    Some(_) => return Ok(Tree::NotAFolder),
+                    None => return Ok(Tree::NotFound),
+                }
+            }
+            let all = store.list_unpruned(&guard, &path, recursive, walk)?;
+            let shown = |e: &Entry| !folders_only || e.tag == Kind::Folder;
+            let more = all.iter().filter(|e| shown(e)).count() > limit;
+            if !more && path.is_root() && recursive {
+                store.prune_hashes(&guard, &all)?;
+            }
+            let page: Vec<Entry> = all.into_iter().filter(shown).take(limit).collect();
+            (page, more)
         }
-    }
-    let entries = store.list_walked(&guard, path, recursive, walk)?;
-    // After the scan, under the same guard: the listing holds every event up to `seq`.
+        Some(anchor) => match store.list_window(
+            &guard,
+            &path,
+            recursive,
+            folders_only,
+            Some(&anchor),
+            limit,
+            &mut |folder| scan(state, &store, &guard, folder, false).map(|_| ()),
+        )? {
+            Page::Listed(entries, more) => (entries, more),
+            Page::NotFound => return Ok(Tree::NotFound),
+            Page::NotAFolder => return Ok(Tree::NotAFolder),
+        },
+    };
+    // After the scan, under the same guard: the page holds every event up to `seq`.
     let seq = state.journal.last_seq()?;
+    let next = match entries.last() {
+        Some(last) if more => Some(paging::encode(CursorKind::Tree, &last.path.display())),
+        _ => None,
+    };
     Ok(Tree::Listed {
         seq,
         entries: entries.iter().map(AppEntry::from).collect(),
+        next,
     })
 }
 
-/// `GET /tree?path=&recursive=`: `{"seq", "entries"}`, the children of the folder at `path`
-/// (default the root), or all its descendants with `recursive=true`. `seq` is the journal's last
-/// seq, read under the same lock: following `/events` from `seq + 1` misses nothing. 404
-/// `not_found`, 409 `not_a_folder`.
+/// `GET /tree?path=&recursive=&kind=&limit=&cursor=`: `{"seq", "entries", "next"}`, one page of
+/// the children of the folder at `path` (default the root), or of all its descendants with
+/// `recursive=true`, in the order of their paths (segment by segment, each by its bytes; a
+/// pre-order walk). `kind=folder` lists only folders. `limit` is [`TREE_LIMIT`] by default and
+/// at most [`TREE_LIMIT_MAX`], 0 is 1. `next` is the cursor of the next page, `null` on the
+/// last. `seq` is the journal's last seq, read under the same lock as the page: following
+/// `/events` from `seq + 1` misses nothing of what the page shows. 404 `not_found`, 409
+/// `not_a_folder`, 400 `bad_cursor` for a cursor that is garbled, of another route or outside
+/// the scope.
 pub(super) async fn tree(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -179,23 +314,14 @@ pub(super) async fn tree(
         Ok(a) => a,
         Err(r) => return *r,
     };
-    let (path, recursive) = match query::<TreeQuery>(&uri).and_then(|q| {
-        let path = WirePath::parse(q.path.as_deref().unwrap_or(""))
-            .map_err(|_| Box::new(bad_request("path is not a valid path")))?;
-        let recursive = match q.recursive.as_deref() {
-            None | Some("false") => false,
-            Some("true") => true,
-            Some(_) => return Err(Box::new(bad_request("recursive is true or false"))),
-        };
-        Ok((path, recursive))
-    }) {
+    let ask = match tree_ask(&uri) {
         Ok(v) => v,
         Err(r) => return *r,
     };
     let st = state.clone();
-    match run(move || tree_of(&st, &account.slug, &path, recursive)).await {
-        Ok(Tree::Listed { seq, entries }) => {
-            Json(serde_json::json!({"seq": seq, "entries": entries})).into_response()
+    match run(move || tree_of(&st, &account.slug, ask)).await {
+        Ok(Tree::Listed { seq, entries, next }) => {
+            Json(serde_json::json!({"seq": seq, "entries": entries, "next": next})).into_response()
         }
         Ok(Tree::NotFound) => error(StatusCode::NOT_FOUND, "not_found"),
         Ok(Tree::NotAFolder) => error(StatusCode::CONFLICT, "not_a_folder"),
@@ -223,6 +349,45 @@ pub(super) async fn entry(
         let guard = store.lock_recovered(&st.journal)?;
         gate_locked(&st, &store)?;
         entry_of(&st, &store, &guard, id)
+    })
+    .await;
+    match found {
+        Ok(Some(e)) => Json(AppEntry::from(&e)).into_response(),
+        Ok(None) => error(StatusCode::NOT_FOUND, "not_found"),
+        Err(r) => *r,
+    }
+}
+
+#[derive(Deserialize)]
+struct EntryQuery {
+    path: Option<String>,
+}
+
+/// `GET /entries?path=`: the entry object of `/entries/{id}` for the entry at `path`, after a
+/// scan of its parent folder. 404 `not_found` for an unknown, hidden or gone path, 400
+/// `bad_name` for a path that does not parse (or is missing).
+pub(super) async fn entry_by_path(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let account = match account_of(&state, &headers).await {
+        Ok(a) => a,
+        Err(r) => return *r,
+    };
+    let path = match query::<EntryQuery>(&uri) {
+        Ok(q) => q.path.as_deref().map(WirePath::parse_named),
+        Err(r) => return *r,
+    };
+    let Some(Ok(path)) = path else {
+        return WriteRefusal::BadName.response();
+    };
+    let st = state.clone();
+    let found = run(move || {
+        let store = st.store(&account.slug)?;
+        let guard = store.lock_recovered(&st.journal)?;
+        gate_locked(&st, &store)?;
+        entry_scanned(&st, &store, &guard, &path, None)
     })
     .await;
     match found {

@@ -86,6 +86,11 @@ struct PipelineArgs {
     /// Stop when the process PID is no longer the parent (for the Mac app)
     #[arg(long, value_name = "PID", hide = true, conflicts_with_all = ["once", "reocr"])]
     exit_with_parent: Option<u32>,
+    /// Keep each note with text of account SLUG as a Markdown file in DIR (wins over
+    /// [pipeline.markdown_dirs] in the config). Repeat it for more accounts. DIR alone is for
+    /// the only account the pipeline serves
+    #[arg(long, value_name = "[SLUG=]DIR")]
+    markdown_dir: Vec<String>,
 }
 
 #[cfg(feature = "ocr")]
@@ -525,6 +530,13 @@ struct RenderArgs {
     /// Write one PDF with all pages instead of one PNG per page
     #[arg(long)]
     pdf: bool,
+    /// Render only this page (1-based, can be repeated); a page that fails is
+    /// reported on stderr and the others still run
+    #[arg(long, value_name = "N", conflicts_with = "pdf")]
+    page: Vec<usize>,
+    /// Accept .note files with an unknown format version
+    #[arg(long)]
+    allow_unknown_version: bool,
 }
 
 #[cfg(feature = "ocr")]
@@ -704,14 +716,13 @@ fn convert(args: ConvertArgs) -> Result<ExitCode> {
 }
 
 fn render(args: RenderArgs) -> Result<ExitCode> {
-    let kind_ok = args
-        .file
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("note"));
-    if !kind_ok {
-        return Err(anyhow!("{} is not a .note file", args.file.display()));
-    }
-    let nb = Notebook::open(&args.file, VersionPolicy::Strict)
+    // The format is read from the bytes, so the file name does not matter.
+    let policy = if args.allow_unknown_version {
+        VersionPolicy::AllowUnknown
+    } else {
+        VersionPolicy::Strict
+    };
+    let nb = Notebook::open(&args.file, policy)
         .with_context(|| format!("cannot read {}", args.file.display()))?;
     let dir = match &args.out {
         Some(d) => d.clone(),
@@ -739,16 +750,48 @@ fn render(args: RenderArgs) -> Result<ExitCode> {
         println!("{}", path.display());
         return Ok(ExitCode::SUCCESS);
     }
-    for i in 0..nb.pages.len() {
-        let img = nb
-            .render_page(i, &opts)
-            .with_context(|| format!("page {}", i + 1))?;
-        let path = dir.join(format!("{stem}-page-{:03}.png", i + 1));
-        std::fs::write(&path, encode_png(&img)?)
-            .with_context(|| format!("cannot write {}", path.display()))?;
-        println!("{}", path.display());
+    let pages: Vec<usize> = if args.page.is_empty() {
+        (1..=nb.pages.len()).collect()
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        args.page
+            .iter()
+            .copied()
+            .filter(|n| seen.insert(*n))
+            .collect()
+    };
+    let mut failed = false;
+    for n in pages {
+        let result = (|| -> Result<PathBuf> {
+            if n == 0 || n > nb.pages.len() {
+                return Err(anyhow!(
+                    "the note has {} and pages count from 1",
+                    plural(nb.pages.len(), "page")
+                ));
+            }
+            let img = nb.render_page(n - 1, &opts)?;
+            let path = dir.join(format!("{stem}-page-{n:03}.png"));
+            std::fs::write(&path, encode_png(&img)?)
+                .with_context(|| format!("cannot write {}", path.display()))?;
+            Ok(path)
+        })();
+        match result {
+            Ok(path) => {
+                let mut out = std::io::stdout().lock();
+                writeln!(out, "{}", path.display())?;
+                out.flush()?;
+            }
+            Err(e) => {
+                eprintln!("error: page {n}: {e:#}");
+                failed = true;
+            }
+        }
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 /// One progress line of `model pull --json`.
@@ -2115,7 +2158,21 @@ fn pipeline_command(args: PipelineArgs) -> Result<ExitCode> {
     }
     // Without <data>/pipeline.toml the server's data is this folder; with it, the folder named
     // there, and this one keeps only the pipeline's own data.
-    let setup = notedown_pipeline::setup::Setup::load(&data)?;
+    let mut flags = Vec::new();
+    for text in &args.markdown_dir {
+        let (slug, dir) = notedown_pipeline::setup::parse_markdown_flag(text);
+        let dir = std::path::absolute(&dir).with_context(|| format!("--markdown-dir {text}"))?;
+        flags.push((slug, dir));
+    }
+    let setup = notedown_pipeline::setup::Setup::load(&data)?.with_markdown_dirs(flags)?;
+    // A folder without an account needs exactly one served account. Checked now when the
+    // account list can be read; the worker checks it again on every pass.
+    if setup.markdown_only.is_some()
+        && let Ok(served) = setup.served()
+    {
+        let slugs: Vec<String> = served.into_iter().map(|a| a.slug).collect();
+        setup.check_markdown(&slugs)?;
+    }
     // The model is loaded when a page is due, as `notedown convert` loads it.
     let loader: EngineLoader = Box::new(|| {
         let paths = model::resolve(&DEFAULT_MODEL, None, None)?;

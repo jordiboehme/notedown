@@ -63,6 +63,16 @@ notedown render "Test 2.note" --out pages
 grid) is left out because it confuses OCR; add `--keep-template` to keep it, in `render` and in
 `convert`.
 
+`render` takes more options:
+
+- `--page N` renders only page N (1-based). Repeat it for more pages; a page given twice is rendered
+  once. `--page` cannot be combined with `--pdf`.
+- With or without `--page`, each path is printed on its own line as soon as the PNG is written. A page
+  that fails (for example a number past the end) prints `error: page N: <reason>` on stderr and the
+  run goes on with the next page. The exit code is 1 at the end if any page failed.
+- `--allow-unknown-version` opens a note of a newer format version, as `convert` does.
+- The file name does not need the `.note` extension, because the format is read from the file itself.
+
 Other `convert` options: `--force`, `--model GGUF`, `--mmproj GGUF`, `--max-tokens N` (default 4096),
 `--threads N` and `--allow-unknown-version`.
 
@@ -234,6 +244,60 @@ seconds. The fields:
 - `inWork`: `{"note", "path", "page", "pages", "startedMs"}` of the page it reads now, or `null`.
 - `consumers`: one entry per consumer of the changes, `{"name", "seq", "ackedAt", "readAt",
   "notesBehind", "more"}`.
+
+## Markdown files
+
+The pipeline can keep the text of each note as a Markdown file in a folder you pick. The folder
+belongs to one account: each account has its own folder, and an account without one gets no files.
+It is off by default.
+
+Turn it on with `notedown pipeline --data DIR --markdown-dir SLUG=FOLDER`. Repeat the flag for more
+accounts. `--markdown-dir FOLDER` without `SLUG=` is only allowed when the pipeline serves exactly one
+account; with more, Notedown stops with an error that names them (when the server cannot be
+reached at the start, it says so later and writes no files). A relative folder is taken from the
+current folder. For a folder whose name contains `=`, write `./name=x`, so the part before `=` is
+not taken as an account. The Mac app passes `~/Documents/Markdown` or the folder you chose.
+
+You can also set the folders in the config, in `pipeline.toml` (two machines) or `server.toml` (one
+machine). A flag wins over the config for its account. A folder for an account the pipeline does not
+serve is reported once and gets no files. A relative path in `pipeline.toml` is below the folder
+of that file; `~` is not expanded, so use a full path.
+
+The folder must lie outside the server's data folder and outside the pipeline's own `pipeline/`
+folder. Notedown refuses to start with such a folder and names it. So in `server.toml`, where the
+data folder holds the file, give a full path to a folder outside of it.
+
+```toml
+[pipeline.markdown_dirs]
+jordi = "/Users/jordi/Documents/Markdown"
+anna = "/Users/anna/Documents/Markdown"
+```
+
+Two accounts can be given the same folder, but that is at your own risk: their notes mix, and a name
+that both use gets `(2)` for one of them.
+
+- Do not edit these files. Notedown overwrites them when the note changes.
+- Layout: the note's folder as on the device, then `<title>.md`. `Note/Work/Meeting.note` gives
+  `Work/Meeting.md`, a note in `MyStyle` goes to `MyStyle/...`, a note in another folder keeps its
+  path (`Document/Books/a.note` gives `Document/Books/a.md`). A very long note name is cut to about 200
+  bytes, so that every file name (and the temp file of its write) fits in 255 bytes.
+- Content: the same document the MCP server's `get_note` gives: frontmatter, the text of each page and
+  the anchor of every block as an HTML comment.
+- A note gets its file once a page has text. The file of a note is written as soon as the pipeline has
+  read the note, so a long first run shows the files one by one. Moves, deletes and scope changes
+  follow with the next written note or at the end of the pass. Only the notes whose text, path or
+  scope changed are looked at; the first pass after a start looks at every note. While the folder
+  cannot be written, the error is said once and the files are tried again at the end of each pass. A file whose text is the same is not written again,
+  so sync tools see no change. A moved note moves its file, a deleted note or a note that leaves the
+  scope loses it.
+- Notedown changes only files it wrote. They are listed in `pipeline/<account>/markdown.json`. When a
+  name is taken by another file, the note gets `<title> (2).md` (then 3, and so on). Folders it made
+  go again when a move or delete leaves them empty.
+- With another folder, every note is written to the new folder. The files in the old folder stay.
+- When the note text of an account is deleted (the account was removed on the server, or its name
+  now belongs to a new account), its Markdown files are removed too.
+- Files are written through a temp file and a rename, so a reader never sees half a file. A temp file
+  left by a crash is removed at the next start.
 
 ## Format documentation and tests
 

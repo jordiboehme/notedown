@@ -57,6 +57,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(&path("/journal"), get_only(get(journal)))
         .route(&path("/events"), get_only(get(events)))
         .route(&path("/tree"), get_only(get(browse::tree)))
+        .route(&path("/entries"), get_only(get(browse::entry_by_path)))
         .route(
             &path("/entries/{id}"),
             get(browse::entry).delete(write::delete).fallback(no_route),

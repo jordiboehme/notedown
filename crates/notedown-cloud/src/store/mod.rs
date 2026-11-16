@@ -263,6 +263,35 @@ pub struct Store {
     names_preserved: bool,
     /// Test hook: runs right before a scan hashes a file ([`Store::set_scan_hash_hook`]).
     hash_hook: Mutex<Option<HashHook>>,
+    /// What the walks cost ([`Store::walk_counts`]).
+    counts: WalkCounts,
+}
+
+/// What [`Store::list_window`] found.
+#[derive(Debug)]
+pub(crate) enum Page {
+    /// The entries of the page and whether more follow.
+    Listed(Vec<Entry>, bool),
+    NotFound,
+    NotAFolder,
+}
+
+/// How many scans walked the disk and how many entries the walks stat'ed, for
+/// [`Store::walk_counts`]. Two relaxed counters, nothing else.
+#[derive(Debug, Default)]
+struct WalkCounts {
+    scans: AtomicU64,
+    stats: AtomicU64,
+}
+
+impl WalkCounts {
+    fn scanned(&self) {
+        self.scans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn stated(&self, n: usize) {
+        self.stats.fetch_add(n as u64, Ordering::Relaxed);
+    }
 }
 
 /// See [`Store::set_scan_hash_hook`].
@@ -489,6 +518,7 @@ impl Store {
             announce_wait,
             names_preserved: true,
             hash_hook: Mutex::new(None),
+            counts: WalkCounts::default(),
         };
         store.names_preserved = probe_names_preserved(&store.account_dir);
         if !store.names_preserved {
@@ -958,6 +988,17 @@ impl Store {
         Ok(self.state().hashes.cached(path).map(str::to_string))
     }
 
+    /// The number of scans that walked the disk and of the entries that the walks of scans,
+    /// listings and windows stat'ed, since the store was opened. Test hook only: the paging
+    /// tests measure what a page costs with it.
+    #[doc(hidden)]
+    pub fn walk_counts(&self) -> (u64, u64) {
+        (
+            self.counts.scans.load(Ordering::Relaxed),
+            self.counts.stats.load(Ordering::Relaxed),
+        )
+    }
+
     /// Write the MD5 cache if a commit or a listing changed it (a put of a new file keeps its
     /// row in memory only). A put or a copy calls this before it answers, so the row of the
     /// file it wrote survives a stop and a cache write by another process.
@@ -1036,6 +1077,23 @@ impl Store {
         recursive: bool,
         walk: Option<Walk>,
     ) -> Result<Vec<Entry>> {
+        let entries = self.list_unpruned(guard, path, recursive, walk)?;
+        if path.is_root() && recursive {
+            self.prune_hashes(guard, &entries)?;
+        }
+        Ok(entries)
+    }
+
+    /// [`Store::list_walked`] without the prune of the MD5 cache that a listing of the whole
+    /// tree does. A paged listing of the whole tree prunes ([`Store::prune_hashes`]) only when
+    /// its first page is also its last.
+    pub(crate) fn list_unpruned(
+        &self,
+        guard: &StoreGuard,
+        path: &WirePath,
+        recursive: bool,
+        walk: Option<Walk>,
+    ) -> Result<Vec<Entry>> {
         self.check_guard(guard)?;
         // `files/` or a native folder may vanish or be swapped by another process after the
         // lock checked the tree: an empty or partial listing would make the device delete its
@@ -1065,25 +1123,125 @@ impl Store {
                         &self.vanished_damage(before.imported),
                     )?;
                 }
+                self.counts.stated(all.len());
                 (before, all)
             }
         };
         all.sort_by(|a, b| a.path.cmp(&b.path));
-        let full = path.is_root() && recursive;
         let entries = self.entries(all)?;
         let after = self.check_tree(false)?;
         self.check_same_tree(&before, &after)?;
-        if full {
-            let seen: HashSet<String> = entries
-                .iter()
-                .filter(|e| e.tag == Kind::File)
-                .map(|e| e.path_display.clone())
-                .collect();
-            let mut state = self.state();
-            state.hashes.retain(&seen);
-            self.flush_hashes(&mut state)?;
-        }
         Ok(entries)
+    }
+
+    /// Keep only the MD5 cache rows of the files in `entries`, the listing of the whole tree,
+    /// and write the cache. Never with a part of the tree: the rows of every other file would
+    /// be lost, and the next listing would hash them all again.
+    pub(crate) fn prune_hashes(&self, guard: &StoreGuard, entries: &[Entry]) -> Result<()> {
+        self.check_guard(guard)?;
+        let seen: HashSet<String> = entries
+            .iter()
+            .filter(|e| e.tag == Kind::File)
+            .map(|e| e.path_display.clone())
+            .collect();
+        let mut state = self.state();
+        state.hashes.retain(&seen);
+        self.flush_hashes(&mut state)
+    }
+
+    /// Whether a scan saw `f` as it is: it has an id of its kind, and a file has a current
+    /// cache row. Else it was made or changed by hand since.
+    fn seen(&self, f: &Found) -> bool {
+        let state = self.state();
+        let known = state
+            .ids
+            .id_of(&f.path)
+            .and_then(|id| state.ids.get(id))
+            .is_some_and(|(k, _)| *k == f.kind);
+        known && (f.kind == Kind::Folder || state.hashes.is_current(&f.path, &f.meta))
+    }
+
+    /// One page of the listing of the folder `path` (direct children, or every descendant with
+    /// `recursive`; only folders with `folders_only`): the up to `limit` entries that come after
+    /// `after` in the order of [`Store::list`], and whether more follow. `after` must lie below
+    /// `path` (a direct child without `recursive`); it need not exist any more. `None` starts
+    /// at the beginning.
+    ///
+    /// It walks a window, not the folder ([`list::walk_window`]): the names of the folders on
+    /// the anchor's way and after it, and a stat of the `limit + 1` entries it collects. It does
+    /// not prune or write the MD5 cache itself. When an entry of the page was not seen by a scan
+    /// as it is (no id of its kind, or a file whose cache row is not current: made, changed or
+    /// renamed by hand since the last scan), its folder goes through `scan` first: one scan of
+    /// the direct children per such folder and request. So its id and its MD5 come with the event
+    /// of that change, and a rename within the folder is a move that keeps the id. An entry
+    /// that the scan could not journal (it is still changing) is left out of the page; its
+    /// event brings it later. A missing `path` is [`Page::NotFound`], a file
+    /// [`Page::NotAFolder`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn list_window(
+        &self,
+        guard: &StoreGuard,
+        path: &WirePath,
+        recursive: bool,
+        folders_only: bool,
+        after: Option<&WirePath>,
+        limit: usize,
+        scan: &mut dyn FnMut(&WirePath) -> Result<()>,
+    ) -> Result<Page> {
+        self.check_guard(guard)?;
+        let top = match list::resolve(&self.files, path)? {
+            Some(top) if top.kind == Kind::Folder => top,
+            Some(_) => return Ok(Page::NotAFolder),
+            None => return Ok(Page::NotFound),
+        };
+        let limit = limit.max(1);
+        let mut anchor = after.cloned();
+        // The folders scanned in this request: a retry after a page that vanished does not
+        // scan them again.
+        let mut scanned: Vec<WirePath> = Vec::new();
+        loop {
+            let before = self.check_tree(false)?;
+            let mut found = Vec::new();
+            let rest = anchor
+                .as_ref()
+                .and_then(|a| a.segments().get(path.segments().len()..))
+                .unwrap_or_default();
+            let stated = |n: usize| self.counts.stated(n);
+            let window = list::Window {
+                recursive,
+                folders_only,
+                want: limit + 1,
+                stated: &stated,
+            };
+            list::walk_window(path, &top.fs_path, rest, &window, &mut found)?;
+            let more = found.len() > limit;
+            found.truncate(limit);
+            // The folders that hold an unseen entry, each once in this request, in the order
+            // of the page.
+            let mut unseen = false;
+            for f in found.iter().filter(|f| !self.seen(f)) {
+                unseen = true;
+                let folder = f.path.parent().unwrap_or_else(WirePath::root);
+                if !scanned.contains(&folder) {
+                    scan(&folder)?;
+                    scanned.push(folder);
+                }
+            }
+            let last = found.last().map(|f| f.path.clone());
+            if unseen {
+                // One the scan could not journal yet (it changes right now) waits for its
+                // event: an id or a cache row given here would swallow that event.
+                found.retain(|f| self.seen(f));
+            }
+            let entries = self.entries(found)?;
+            let after = self.check_tree(false)?;
+            self.check_same_tree(&before, &after)?;
+            // Every entry of a full page vanished while it was built: the next ones.
+            match last {
+                Some(last) if entries.is_empty() && more => anchor = Some(last),
+                _ => return Ok(Page::Listed(entries, more)),
+            }
+        }
     }
 
     /// The bytes of every file a recursive listing of the root would show, from a walk that

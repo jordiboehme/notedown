@@ -313,6 +313,9 @@ pub struct Work {
 pub struct TextStore {
     dir: PathBuf,
     repaired: AtomicBool,
+    /// The keys of the notes whose state was written or removed since the last
+    /// [`take_touched`](Self::take_touched): what the Markdown files look at after a pass.
+    touched: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 /// What a sweep did.
@@ -374,6 +377,7 @@ impl TextStore {
         Ok(TextStore {
             dir,
             repaired: AtomicBool::new(false),
+            touched: Default::default(),
         })
     }
 
@@ -384,6 +388,7 @@ impl TextStore {
         Ok(TextStore {
             dir: data.join(PIPELINE_DIR).join(slug),
             repaired: AtomicBool::new(false),
+            touched: Default::default(),
         })
     }
 
@@ -596,6 +601,7 @@ impl TextStore {
 
     fn delete_note_file(&self, key: &str) -> Result<()> {
         let path = self.note_path(key)?;
+        self.touch(key);
         match std::fs::remove_file(&path) {
             Ok(()) => notedown_cloud::fsutil::fsync_dir(&self.dir.join(NOTES_DIR))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -660,10 +666,26 @@ impl TextStore {
 
     fn write_note(&self, note: &NoteState) -> Result<()> {
         let path = self.note_path(&note.key)?;
+        self.touch(&note.key);
         let mut note = note.clone();
         note.log_seq = self.last_seq()?;
         notedown_cloud::fsutil::write_atomic(&path, &json_bytes(&note)?, false)?;
         Ok(())
+    }
+
+    fn touch(&self, key: &str) {
+        self.touched
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string());
+    }
+
+    /// The keys of the notes whose state was written or removed since the last call, sorted;
+    /// the set is empty afterwards.
+    pub fn take_touched(&self) -> Vec<String> {
+        std::mem::take(&mut *self.touched.lock().unwrap_or_else(|e| e.into_inner()))
+            .into_iter()
+            .collect()
     }
 
     /// Calls `each` for every complete log line with `from_exclusive < seq <= up_to`, in

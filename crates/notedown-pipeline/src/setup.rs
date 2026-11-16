@@ -1,6 +1,7 @@
 //! What a pipeline needs to start: where the server's data is, where its own data lives and
 //! which accounts it serves. `<local>/pipeline.toml` exists only on a second machine.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -116,6 +117,11 @@ pub struct Setup {
     pub cfg: PipelineConfig,
     pub two_machines: bool,
     accounts: Option<Vec<String>>,
+    /// The `--markdown-dir` folder given without an account.
+    pub markdown_only: Option<PathBuf>,
+    /// The server's data folder when the pipeline reads it as a folder (one machine, or
+    /// `[server] folder`); `None` with a URL.
+    server_folder: Option<PathBuf>,
 }
 
 impl Setup {
@@ -125,6 +131,10 @@ impl Setup {
     pub fn load(data: &Path) -> Result<Setup> {
         match LocalConfig::load(data)? {
             Some(c) => {
+                let server_folder = match &c.server {
+                    ServerAt::Folder(f) => Some(f.clone()),
+                    ServerAt::Url(_) => None,
+                };
                 let source: Arc<dyn ServerData> = match &c.server {
                     ServerAt::Folder(f) => Arc::new(FolderSource::shared(f)),
                     ServerAt::Url(url) => {
@@ -137,6 +147,8 @@ impl Setup {
                     cfg: c.pipeline,
                     two_machines: true,
                     accounts: c.accounts,
+                    markdown_only: None,
+                    server_folder,
                 })
             }
             None => Ok(Setup {
@@ -145,8 +157,103 @@ impl Setup {
                 cfg: PipelineConfig::load(data)?,
                 two_machines: false,
                 accounts: None,
+                markdown_only: None,
+                server_folder: Some(data.to_path_buf()),
             }),
         }
+    }
+
+    /// The setup with the `--markdown-dir` flags ([`parse_markdown_flag`]): a flag with an
+    /// account wins over `markdown_dirs` of the config for that account. A flag without one is
+    /// for the only account served (see [`markdown_dir`](Self::markdown_dir)); it cannot be
+    /// given twice or with flags that name an account, and no account can be named twice.
+    /// A folder (from a flag or the config) that is the server's data folder, lies inside it
+    /// or inside the pipeline's own `<local>/pipeline` is refused.
+    pub fn with_markdown_dirs(mut self, flags: Vec<(Option<String>, PathBuf)>) -> Result<Setup> {
+        for dir in self.cfg.markdown_dirs.values() {
+            self.check_markdown_place("markdown_dirs", dir)?;
+        }
+        for (_, dir) in &flags {
+            self.check_markdown_place("--markdown-dir", dir)?;
+        }
+        let bad = |message: &str| Error::Invalid {
+            what: "--markdown-dir",
+            message: message.to_string(),
+        };
+        let unnamed = flags.iter().filter(|(s, _)| s.is_none()).count();
+        if unnamed > 1 || (unnamed == 1 && flags.len() > 1) {
+            return Err(bad(
+                "a folder without an account is for the only account; with several, give \
+                 SLUG=DIR for each",
+            ));
+        }
+        let mut named = BTreeMap::new();
+        for (slug, dir) in flags {
+            match slug {
+                None => self.markdown_only = Some(dir),
+                Some(slug) => {
+                    validate_slug(&slug).map_err(|e| bad(&format!("{slug}: {e}")))?;
+                    if named.insert(slug.clone(), dir).is_some() {
+                        return Err(bad(&format!("account {slug} is given twice")));
+                    }
+                }
+            }
+        }
+        self.cfg.markdown_dirs.extend(named);
+        Ok(self)
+    }
+
+    /// An error when `dir` is the server's data folder or lies inside it, or inside the
+    /// pipeline's own folder: the writer would put files among the server's or its own.
+    fn check_markdown_place(&self, what: &'static str, dir: &Path) -> Result<()> {
+        let dir = clean_absolute(dir);
+        let places = [
+            self.server_folder
+                .as_deref()
+                .map(|f| ("the server's data folder", clean_absolute(f))),
+            Some((
+                "the pipeline's own folder",
+                clean_absolute(&self.local.join(PIPELINE_DIR)),
+            )),
+        ];
+        for (name, place) in places.into_iter().flatten() {
+            if dir.starts_with(&place) {
+                return Err(Error::Invalid {
+                    what,
+                    message: format!(
+                        "the Markdown folder {} is inside {name} {}; pick a folder outside it",
+                        dir.display(),
+                        place.display()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The Markdown folder of account `slug` when the worker serves `served` accounts: the
+    /// flag without an account when exactly one is served, else the account's own folder.
+    pub fn markdown_dir(&self, slug: &str, served: usize) -> Option<PathBuf> {
+        match &self.markdown_only {
+            Some(dir) if served == 1 => Some(dir.clone()),
+            _ => self.cfg.markdown_dirs.get(slug).cloned(),
+        }
+    }
+
+    /// An error when a `--markdown-dir` without an account meets more than one served account
+    /// (`served`, their slugs); the text names them.
+    pub fn check_markdown(&self, served: &[String]) -> Result<()> {
+        if self.markdown_only.is_none() || served.len() <= 1 {
+            return Ok(());
+        }
+        Err(Error::Invalid {
+            what: "--markdown-dir",
+            message: format!(
+                "a folder without an account needs exactly one account, but this pipeline \
+                 serves {}; give --markdown-dir SLUG=DIR for each account",
+                served.join(", ")
+            ),
+        })
     }
 
     /// The accounts the worker serves: the configured list, else every account the server
@@ -166,6 +273,34 @@ impl Setup {
             None => all.to_vec(),
         }
     }
+}
+
+/// `path` made absolute ([`std::path::absolute`]) with its `.` and `..` parts taken out by
+/// name; symlinks are not followed.
+fn clean_absolute(path: &Path) -> PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out = PathBuf::new();
+    for part in abs.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// A `--markdown-dir` value: `SLUG=DIR` for one account, or `DIR` alone. The text before
+/// the first `=` counts as an account only when it is a valid slug, so `/a=b` is a folder.
+pub fn parse_markdown_flag(text: &str) -> (Option<String>, PathBuf) {
+    if let Some((slug, dir)) = text.split_once('=')
+        && validate_slug(slug).is_ok()
+    {
+        return (Some(slug.to_string()), PathBuf::from(dir));
+    }
+    (None, PathBuf::from(text))
 }
 
 /// Accounts for MCP and the pipeline subcommands, offline-safe.

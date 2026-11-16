@@ -7,6 +7,7 @@ pub mod cursor;
 pub mod delta;
 pub mod errors;
 pub mod format;
+pub mod markdown;
 pub mod mcp;
 pub mod meta;
 pub mod model;

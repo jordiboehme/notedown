@@ -17,6 +17,176 @@ fn render_command_writes_pngs() {
     assert!(dir.path().join("test2-page-001.png").exists());
 }
 
+/// A small note of `pages` blank pages (the container layout of docs/note-format.md 1, 2).
+fn blank_note(pages: usize, signature: &str) -> Vec<u8> {
+    fn block(data: &mut Vec<u8>, payload: &[u8]) -> usize {
+        let address = data.len();
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(payload);
+        address
+    }
+    let mut data = b"note".to_vec();
+    data.extend_from_slice(signature.as_bytes());
+    let header = block(&mut data, b"<FILE_TYPE:NOTE>");
+    let mut footer = format!("<FILE_FEATURE:{header}>");
+    for n in 1..=pages {
+        let page = block(&mut data, format!("<PAGEID:id-{n}>").as_bytes());
+        footer.push_str(&format!("<PAGE{n}:{page}>"));
+    }
+    let address = block(&mut data, footer.as_bytes());
+    data.extend_from_slice(b"tail");
+    data.extend_from_slice(&(address as u32).to_le_bytes());
+    data
+}
+
+fn render_run(
+    file: &std::path::Path,
+    out: &std::path::Path,
+    extra: &[&str],
+) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .arg("render")
+        .arg(file)
+        .args(extra)
+        .arg("--out")
+        .arg(out)
+        .output()
+        .unwrap()
+}
+
+fn png_names(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn render_one_page_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("three.note");
+    std::fs::write(&note, blank_note(3, "SN_FILE_VER_20230015")).unwrap();
+    let out_dir = dir.path().join("o");
+    let out = render_run(&note, &out_dir, &["--page", "2"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(png_names(&out_dir), vec!["three-page-002.png"]);
+}
+
+#[test]
+fn render_prints_each_page_when_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("three.note");
+    std::fs::write(&note, blank_note(3, "SN_FILE_VER_20230015")).unwrap();
+    let out_dir = dir.path().join("o");
+    let out = render_run(&note, &out_dir, &["--page", "3", "--page", "1"]);
+    assert!(out.status.success(), "{out:?}");
+    let lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            out_dir.join("three-page-003.png").display().to_string(),
+            out_dir.join("three-page-001.png").display().to_string(),
+        ]
+    );
+    for l in lines {
+        assert!(std::path::Path::new(&l).exists());
+    }
+}
+
+#[test]
+fn a_failed_page_does_not_stop_the_others() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("two.note");
+    std::fs::write(&note, blank_note(2, "SN_FILE_VER_20230015")).unwrap();
+    let out_dir = dir.path().join("o");
+    let out = render_run(
+        &note,
+        &out_dir,
+        &["--page", "1", "--page", "9", "--page", "2"],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("error: page 9: "), "{err}");
+    assert_eq!(
+        png_names(&out_dir),
+        vec!["two-page-001.png", "two-page-002.png"]
+    );
+}
+
+#[test]
+fn a_page_past_the_end_of_a_one_page_note_is_said_in_the_singular() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("one.note");
+    std::fs::write(&note, blank_note(1, "SN_FILE_VER_20230015")).unwrap();
+    let out_dir = dir.path().join("o");
+    let out = render_run(&note, &out_dir, &["--page", "2"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("the note has 1 page "), "{err}");
+}
+
+#[test]
+fn a_page_given_twice_is_written_and_printed_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("three.note");
+    std::fs::write(&note, blank_note(3, "SN_FILE_VER_20230015")).unwrap();
+    let out_dir = dir.path().join("o");
+    let out = render_run(&note, &out_dir, &["--page", "2", "--page", "2"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(png_names(&out_dir), vec!["three-page-002.png"]);
+    let lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        lines,
+        vec![out_dir.join("three-page-002.png").display().to_string()]
+    );
+}
+
+#[test]
+fn page_with_pdf_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("two.note");
+    std::fs::write(&note, blank_note(2, "SN_FILE_VER_20230015")).unwrap();
+    let out_dir = dir.path().join("o");
+    let out = render_run(&note, &out_dir, &["--page", "1", "--pdf"]);
+    assert!(!out.status.success(), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--pdf"), "{err}");
+    assert!(!out_dir.exists(), "nothing is written");
+}
+
+#[test]
+fn allow_unknown_version_opens_a_newer_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("newer.note");
+    std::fs::write(&note, blank_note(1, "SN_FILE_VER_29990001")).unwrap();
+    let out_dir = dir.path().join("o");
+    let out = render_run(&note, &out_dir, &[]);
+    assert!(!out.status.success(), "strict by default");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown .note version"));
+    let out = render_run(&note, &out_dir, &["--allow-unknown-version"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(png_names(&out_dir), vec!["newer-page-001.png"]);
+}
+
+#[test]
+fn render_reads_the_format_from_the_bytes_not_the_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("blob.bin");
+    std::fs::write(&note, blank_note(1, "SN_FILE_VER_20230015")).unwrap();
+    let out_dir = dir.path().join("o");
+    let out = render_run(&note, &out_dir, &[]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(png_names(&out_dir), vec!["blob-page-001.png"]);
+}
+
 #[cfg(feature = "ocr")]
 #[test]
 fn convert_reports_missing_model_with_hint() {
@@ -2212,6 +2382,101 @@ mod pipeline_and_mcp {
         assert!(status.success(), "{status:?}");
         assert!(!alive(&pid), "the pipeline child still runs");
         notedown_pipeline::store::WriterLock::take(data).unwrap();
+    }
+
+    #[test]
+    fn pipeline_markdown_dir_flag_wins_over_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        notedown_cloud::auth::Accounts::new(data)
+            .create("jordi", "jordi@example.org", "secret")
+            .unwrap();
+        let manifest = data.join("pipeline/jordi/markdown.json");
+        let manifest_dir = || -> serde_json::Value {
+            let m: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+            m["dir"].clone()
+        };
+        let ok = |out: &std::process::Output| {
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        };
+        // Without the flag and without markdown_dirs: no Markdown files.
+        ok(&pipeline_cmd(data, &["--once"]));
+        assert!(!manifest.exists());
+
+        // The Markdown folders lie outside the data folder; one inside is refused.
+        let md = tempfile::tempdir().unwrap();
+        let inside = data.join("inside");
+        let out = pipeline_cmd(
+            data,
+            &[
+                "--once",
+                "--markdown-dir",
+                &format!("jordi={}", inside.display()),
+            ],
+        );
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("inside the server's data folder"), "{err}");
+        assert!(!inside.exists());
+        let from_config = md.path().join("from-config");
+        std::fs::write(
+            data.join("server.toml"),
+            format!("[pipeline.markdown_dirs]\njordi = {from_config:?}\n"),
+        )
+        .unwrap();
+        ok(&pipeline_cmd(data, &["--once"]));
+        assert_eq!(manifest_dir(), from_config.to_str().unwrap());
+
+        // The flag wins, with or without the account.
+        for flag in ["jordi=", ""] {
+            let target = md.path().join(format!("from-flag-{}", flag.len()));
+            let arg = format!("{flag}{}", target.display());
+            ok(&pipeline_cmd(data, &["--once", "--markdown-dir", &arg]));
+            assert_eq!(manifest_dir(), target.to_str().unwrap());
+        }
+
+        // A relative folder is below the current folder, made absolute.
+        let cwd = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+            .args([
+                "pipeline",
+                "--once",
+                "--markdown-dir",
+                "jordi=rel/md",
+                "--data",
+            ])
+            .arg(data)
+            .current_dir(cwd.path())
+            .env("NOTEDOWN_MODEL_DIR", data.join("no-model"))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        ok(&out);
+        let dir = manifest_dir();
+        let dir = std::path::Path::new(dir.as_str().unwrap());
+        assert!(dir.is_absolute(), "{dir:?}");
+        assert!(dir.ends_with("rel/md"), "{dir:?}");
+        assert_eq!(
+            std::fs::canonicalize(dir.parent().unwrap().parent().unwrap()).unwrap(),
+            std::fs::canonicalize(cwd.path()).unwrap()
+        );
+
+        // Two accounts: a flag without the account is refused, naming both.
+        notedown_cloud::auth::Accounts::new(data)
+            .create("anna", "anna@example.org", "secret")
+            .unwrap();
+        let never = md.path().join("never");
+        let out = pipeline_cmd(data, &["--once", "--markdown-dir", never.to_str().unwrap()]);
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("anna") && err.contains("jordi"), "{err}");
+        assert!(err.contains("SLUG=DIR"), "{err}");
+        assert!(!never.exists());
     }
 
     #[test]

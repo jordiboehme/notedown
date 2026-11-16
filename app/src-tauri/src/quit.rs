@@ -3,6 +3,18 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use crate::config::Mode;
+use crate::supervisor::ChildState;
+
+/// The event that asks the panel to put the Quit question.
+pub const CONFIRM_QUIT_EVENT: &str = "confirm-quit";
+
+/// Whether Quit asks first: only in Local mode while the app's own server runs, because the
+/// Supernote cannot sync once it stops. The panel's `needsQuitWarning` keeps the same rule.
+pub fn quit_needs_question(mode: Mode, server: &ChildState) -> bool {
+    mode == Mode::Local && matches!(server, ChildState::Running { .. })
+}
+
 /// What to do with an exit request of the event loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitDecision {
@@ -154,6 +166,34 @@ mod tests {
         ));
         done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(flow.on_exit_request(Some(0)), ExitDecision::Allow);
+    }
+
+    #[test]
+    fn quit_asks_only_in_local_mode_while_the_server_runs() {
+        let running = ChildState::Running {
+            pid: 7,
+            since_ms: 1,
+        };
+        assert!(quit_needs_question(Mode::Local, &running));
+        assert!(!quit_needs_question(Mode::Remote, &running));
+        assert!(!quit_needs_question(Mode::NotSet, &running));
+        let others = [
+            ChildState::Stopped,
+            ChildState::NotConnected,
+            ChildState::Starting,
+            ChildState::Stopping,
+            ChildState::Backoff {
+                until_ms: 5,
+                last_error: "boom".into(),
+            },
+            // Another Notedown keeps serving after the app quits.
+            ChildState::Outside {
+                what: "server".into(),
+            },
+        ];
+        for state in &others {
+            assert!(!quit_needs_question(Mode::Local, state), "{state:?}");
+        }
     }
 
     #[test]

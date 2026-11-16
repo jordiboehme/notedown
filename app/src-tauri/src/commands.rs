@@ -186,6 +186,12 @@ pub fn quit_app(app: AppHandle) {
     crate::quit_app(&app);
 }
 
+/// Quit, but ask first in the panel while the Supernote needs the server.
+#[tauri::command]
+pub fn request_quit(app: AppHandle) {
+    crate::request_quit(&app);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

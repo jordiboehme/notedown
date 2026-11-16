@@ -156,7 +156,7 @@ pub fn on_menu_event(app: &AppHandle, id: &str) {
         SETTINGS_ID => {
             let _ = windows::show_window(app, windows::WindowKind::Settings, None);
         }
-        QUIT_ID => crate::quit_app(app),
+        QUIT_ID => crate::request_quit(app),
         _ => {}
     }
 }

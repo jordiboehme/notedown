@@ -100,7 +100,8 @@ pub fn run() {
             commands::get_status,
             commands::open_library,
             commands::open_settings,
-            commands::quit_app
+            commands::quit_app,
+            commands::request_quit
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
@@ -124,15 +125,45 @@ pub fn run() {
     });
 }
 
-/// Quit: hides the windows, stops every child off the main thread, then ends the app. The
-/// Quit items, Cmd+Q, the panel and every exit request run this; a second call while it runs
-/// does nothing.
+/// Quit: hides the windows, stops every child off the main thread, then ends the app.
+/// [`request_quit`], the Quit of the panel's question and every exit request run this; a
+/// second call while it runs does nothing.
 pub fn quit_app(app: &AppHandle) {
     let flow = app.state::<Arc<QuitFlow>>().inner().clone();
     let stop_app = app.clone();
     let exit_app = app.clone();
     windows::hide_all(app);
     flow.quit_with(move || stop_for_good(&stop_app), move || exit_app.exit(0));
+}
+
+/// Quit as the user asks for it (the Quit items, Cmd+Q, the panel's Quit): while the app's own
+/// server runs in Local mode, the panel opens and asks first; otherwise the app quits at once.
+/// The decision reads the supervisors, so it runs off the main thread.
+pub fn request_quit(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let ask = match (
+            app.try_state::<commands::ConfigState>(),
+            app.try_state::<Arc<Processes>>(),
+        ) {
+            (Some(config), Some(processes)) => {
+                quit::quit_needs_question(config.current().mode, &processes.states().server)
+            }
+            _ => false,
+        };
+        if ask {
+            if !app.state::<Shown>().is_visible(windows::WindowKind::Panel) {
+                windows::show_panel(&app);
+            }
+            let _ = app.emit_to(
+                windows::WindowKind::Panel.label(),
+                quit::CONFIRM_QUIT_EVENT,
+                (),
+            );
+        } else {
+            quit_app(&app);
+        }
+    });
 }
 
 /// Probes again what runs outside the app (when the panel opens), off the main thread: a probe

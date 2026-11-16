@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "panel",
+  "description": "The panel fits its window to its content.",
+  "windows": ["panel"],
+  "permissions": ["core:window:allow-set-size"]
+}

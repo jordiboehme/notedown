@@ -2693,10 +2693,14 @@ fn model_pull_offers_json_progress() {
 }
 
 /// A process that a test started and that is killed when the test ends, also on a failure.
+/// Only while it is still there: a pid that is gone may belong to another process soon.
 struct Orphan(String);
 
 impl Drop for Orphan {
     fn drop(&mut self) {
+        if gone(&self.0) {
+            return;
+        }
         let _ = std::process::Command::new("kill")
             .args(["-KILL", &self.0])
             .stderr(std::process::Stdio::null())

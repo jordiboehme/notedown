@@ -12,6 +12,8 @@ pub mod quit;
 pub mod serve_info;
 pub mod status;
 pub mod supervisor;
+#[cfg(test)]
+mod test_procs;
 pub mod token;
 pub mod tray;
 pub mod windows;

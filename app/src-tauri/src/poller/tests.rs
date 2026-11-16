@@ -5,13 +5,12 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::Instant;
 
 use super::*;
-use crate::probe::test_server::{TestServer, free_port, http};
+use crate::probe::test_server::{TestServer, accept_within, free_port, http};
 use crate::status::Attention;
 use crate::supervisor::ChildState;
 use crate::token::MemoryStore;
@@ -523,9 +522,9 @@ fn the_status_call_reads_its_answer() {
 #[test]
 fn a_hanging_status_call_is_ended() {
     let dir = tempfile::tempdir().unwrap();
-    // Each test that starts a sleep uses its own length (301-305, 307, 311-314),
-    // so a pgrep here never sees the sleep of a test running next to it.
-    let spawn = sidecar(dir.path(), "exec /bin/sleep 314");
+    // The sleep runs from this test's folder, so only its own processes are looked for.
+    let sleep = crate::test_procs::tagged_sleep(dir.path());
+    let spawn = sidecar(dir.path(), &format!("exec \"{}\" 314", sleep.display()));
     let start = Instant::now();
     let answer = run_status(&spawn, &[], Duration::from_millis(300));
     assert_eq!(
@@ -533,11 +532,9 @@ fn a_hanging_status_call_is_ended() {
         PipelineCall::Failed("it did not answer in time".into())
     );
     assert!(start.elapsed() < Duration::from_secs(5));
-    let left = Command::new("pgrep")
-        .args(["-f", "sleep 314"])
-        .output()
-        .unwrap();
-    assert!(left.stdout.is_empty(), "the call was ended");
+    let ended = crate::test_procs::gone(dir.path());
+    crate::test_procs::kill_in(dir.path());
+    assert!(ended, "the call was ended");
 }
 
 #[test]
@@ -619,19 +616,22 @@ fn the_account_call_reads_the_answer() {
 #[test]
 fn the_token_goes_only_into_the_header() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
-    let seen = std::thread::spawn(move || {
-        let mut heads = Vec::new();
+    let (heads_tx, heads_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         for _ in 0..2 {
-            let (mut stream, _) = listener.accept().unwrap();
+            // Gives up after 10 s, so a request that never comes cannot hold the test.
+            let Some(mut stream) = accept_within(&listener, Duration::from_secs(10)) else {
+                return;
+            };
             let mut head = Vec::new();
             let mut buf = [0u8; 1024];
             while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                let n = stream.read(&mut buf).unwrap();
-                if n == 0 {
-                    break;
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
                 }
-                head.extend_from_slice(&buf[..n]);
             }
             let body = r#"{"error":"token_refused"}"#;
             let _ = stream.write_all(
@@ -641,15 +641,20 @@ fn the_token_goes_only_into_the_header() {
                 )
                 .as_bytes(),
             );
-            heads.push(String::from_utf8_lossy(&head).to_lowercase());
+            let _ = heads_tx.send(String::from_utf8_lossy(&head).to_lowercase());
         }
-        heads
     });
     let sources = RealSources::new(crate::process::spawn_program("/bin/false".into()));
     let base = format!("http://127.0.0.1:{port}/rest/v1");
     sources.account(&base, Some(&Token::new("Secret-1")));
     sources.account(&base, None);
-    let heads = seen.join().unwrap();
+    let heads: Vec<String> = (0..2)
+        .map(|_| {
+            heads_rx
+                .recv_timeout(Duration::from_secs(15))
+                .expect("no request came")
+        })
+        .collect();
     assert!(
         heads[0].starts_with("get /rest/v1/account http/1.1"),
         "{}",

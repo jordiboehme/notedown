@@ -158,6 +158,24 @@ pub(crate) mod test_server {
         )
     }
 
+    /// Waits up to `deadline` for a connection on a nonblocking `listener`. The stream it gives
+    /// blocks again and has a read timeout of 5 s, so a test that reads from it cannot hang.
+    pub fn accept_within(listener: &TcpListener, deadline: Duration) -> Option<TcpStream> {
+        let until = std::time::Instant::now() + deadline;
+        while std::time::Instant::now() < until {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    // An accepted socket keeps the listener's nonblocking flag on macOS.
+                    stream.set_nonblocking(false).ok()?;
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+                    return Some(stream);
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        None
+    }
+
     pub fn http(status: &str, body: &str) -> String {
         format!(
             "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
@@ -281,11 +299,16 @@ mod tests {
     fn a_dripping_listener_does_not_hold_the_probe() {
         // Answers one byte every 200 ms, for much longer than the probe may take.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = stop.clone();
-        let drip = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _done = done_tx;
+            let Some(mut stream) = accept_within(&listener, Duration::from_secs(10)) else {
+                return;
+            };
             let answer = notedown_401();
             for b in answer.as_bytes().iter().cycle().take(100) {
                 if flag.load(std::sync::atomic::Ordering::SeqCst) {
@@ -301,7 +324,11 @@ mod tests {
         let got = server(port);
         let took = started.elapsed();
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        drip.join().unwrap();
+        // The sender drops when the drip ends; a drip that does not end fails the test.
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(15)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        );
         assert_eq!(got, ServerProbe::Other);
         assert!(took < Duration::from_secs(5), "the probe took {took:?}");
     }

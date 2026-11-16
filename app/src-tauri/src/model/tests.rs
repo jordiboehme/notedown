@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::process::spawn_program;
+use crate::test_procs::{gone, kill_in, tagged_sleep};
 
 /// How long a test waits for an event before it fails.
 const WAIT: Duration = Duration::from_secs(10);
@@ -13,21 +14,29 @@ const WAIT: Duration = Duration::from_secs(10);
 const GRACE: Duration = Duration::from_millis(200);
 
 /// A fake sidecar: `model path` names files in `dir`, `model verify` is ok when the model file
-/// is there, `model pull --json` runs `pull`. Every call is written to `dir/calls`.
+/// is there, `model pull --json` runs `pull`. Every call is written to `dir/calls`. `$S` is
+/// this test's own sleep (see [`tagged_sleep`]). With `dir/hold-path`, `model path` waits for
+/// `dir/release` (10 s at most).
 fn sidecar(dir: &Path, pull: &str) -> SpawnFn {
     let d = dir.display();
+    let s = tagged_sleep(dir);
+    let s = s.display();
     let script = format!(
         r#"#!/bin/sh
+S="{s}"
 echo "$*" >> "{d}/calls"
 case "$1 $2" in
 "model path")
-  if [ -f "{d}/slow-path" ]; then sleep 0.315; fi
+  if [ -f "{d}/hold-path" ]; then
+    i=0
+    while [ ! -f "{d}/release" ] && [ "$i" -lt 1000 ]; do sleep 0.01; i=$((i + 1)); done
+  fi
   echo "cache: {d}"
   echo "model: {d}/m.gguf"
   echo "mmproj: {d}/p.gguf"
   ;;
 "model verify")
-  if [ -f "{d}/slow-verify" ]; then exec sleep 310; fi
+  if [ -f "{d}/slow-verify" ]; then exec "$S" 316; fi
   if [ -f "{d}/m.gguf" ]; then echo "m.gguf: ok"; exit 0; fi
   echo "m.gguf: the model file is missing"; exit 1
   ;;
@@ -69,27 +78,6 @@ fn wait_for(events: &Events, what: impl Fn(&ModelEvent) -> bool) -> ModelEvent {
             events.lock().unwrap()
         );
         std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// Whether a process with this command line is still there, after a short wait for the
-/// system to reap it.
-fn gone(pattern: &str) -> bool {
-    let start = Instant::now();
-    loop {
-        let found = std::process::Command::new("pgrep")
-            .args(["-f", pattern])
-            .output()
-            .unwrap()
-            .status
-            .success();
-        if !found {
-            return true;
-        }
-        if start.elapsed() > Duration::from_secs(3) {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -142,7 +130,7 @@ fn model_progress_lines_are_events() {
 fn a_second_pull_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let pull = r#"  echo '{"file":"m.gguf","done":1,"total":100}'
-  exec sleep 309"#;
+  exec "$S" 309"#;
     let (control, events) = control(sidecar(dir.path(), pull));
     control.pull().unwrap();
     wait_for(&events, is_progress);
@@ -159,19 +147,19 @@ fn a_second_pull_is_refused() {
     assert_eq!(control.pull(), Err(PULL_RUNS.to_owned()));
     assert_eq!(control.remove().unwrap_err(), PULL_RUNS);
     control.pause();
-    assert!(gone("sleep 309"));
+    assert!(gone(dir.path()));
 }
 
 #[test]
 fn pause_stops_the_pull() {
     let dir = tempfile::tempdir().unwrap();
     let pull = r#"  echo '{"file":"m.gguf","done":1,"total":100}'
-  exec sleep 306"#;
+  exec "$S" 306"#;
     let (control, events) = control(sidecar(dir.path(), pull));
     control.pull().unwrap();
     wait_for(&events, is_progress);
     control.pause();
-    assert!(gone("sleep 306"), "the pull still runs");
+    assert!(gone(dir.path()), "the pull still runs");
     assert!(!control.state().pulling);
     // A pause is no failure.
     std::thread::sleep(Duration::from_millis(100));
@@ -189,23 +177,23 @@ fn pause_stops_the_pull() {
     control.pull().unwrap();
     wait_for(&events, is_progress);
     control.pause();
-    assert!(gone("sleep 306"));
+    assert!(gone(dir.path()));
 }
 
 #[test]
 fn quit_stops_the_pull() {
     let dir = tempfile::tempdir().unwrap();
     let pull = r#"  echo '{"file":"m.gguf","done":1,"total":100}'
-  exec sleep 308"#;
+  exec "$S" 308"#;
     let (control, events) = control(sidecar(dir.path(), pull));
     control.pull().unwrap();
     wait_for(&events, is_progress);
     control.quit();
-    assert!(gone("sleep 308"), "the pull still runs");
+    assert!(gone(dir.path()), "the pull still runs");
     assert!(!control.state().pulling);
     // Nothing starts after Quit.
     assert!(control.pull().is_err());
-    assert!(gone("sleep 308"));
+    assert!(gone(dir.path()));
 }
 
 #[test]
@@ -316,13 +304,15 @@ fn called(dir: &Path, what: &str) {
 fn no_pull_starts_while_the_model_is_removed() {
     let dir = tempfile::tempdir().unwrap();
     let (control, _) = control(sidecar(dir.path(), "  exit 0"));
-    fs::write(dir.path().join("slow-path"), "").unwrap();
+    fs::write(dir.path().join("hold-path"), "").unwrap();
     fs::write(dir.path().join("m.gguf"), "x").unwrap();
     let remover = control.clone();
     let removing = std::thread::spawn(move || remover.remove());
     called(dir.path(), "model path");
+    // The remove waits in `model path` until the release.
     assert_eq!(control.pull(), Err(REMOVE_RUNS.to_owned()));
     assert_eq!(control.remove().unwrap_err(), REMOVE_RUNS);
+    fs::write(dir.path().join("release"), "").unwrap();
     let state = removing.join().unwrap().unwrap();
     assert!(!state.installed);
     assert!(!dir.path().join("m.gguf").exists());
@@ -333,7 +323,7 @@ fn progress_after_a_pause_is_dropped() {
     let dir = tempfile::tempdir().unwrap();
     // The pull still says something while it ends.
     let pull = r#"  trap 'echo "{\"file\":\"m.gguf\",\"done\":2,\"total\":100}"; exit 0' TERM
-  sleep 310 &
+  "$S" 317 &
   echo '{"file":"m.gguf","done":1,"total":100}'
   wait"#;
     let (control, events) = control(sidecar(dir.path(), pull));
@@ -351,7 +341,7 @@ fn progress_after_a_pause_is_dropped() {
     let state = control.state();
     assert!(!state.pulling);
     assert_eq!(state.progress, None);
-    assert!(gone("sleep 310"));
+    assert!(gone(dir.path()));
 }
 
 #[test]
@@ -368,9 +358,7 @@ fn quit_stops_a_running_check() {
     control.quit();
     let ended = rx.recv_timeout(Duration::from_secs(3));
     // Never leave the fake behind, also when the check fails.
-    let _ = std::process::Command::new("pkill")
-        .args(["-f", "sleep 310"])
-        .status();
+    kill_in(dir.path());
     let state = ended.expect("the check still runs after Quit");
     assert!(!state.installed);
     assert!(state.problem.is_some());

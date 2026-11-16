@@ -17,6 +17,7 @@
 mod browse;
 mod check;
 mod errors;
+mod recycle;
 mod routes;
 mod write;
 

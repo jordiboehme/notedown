@@ -557,6 +557,7 @@ async fn a_deleted_file_goes_to_the_recycle_bin_with_an_index_line() {
             md5: md5_of(b"hello"),
             deleted_at: T0 as u64,
             reason: RecycleReason::Deleted,
+            pruned: false,
         }]
     );
     assert_eq!(entries[0].location(), format!("{T0}/NOTE/Note/a.note"));

@@ -133,6 +133,7 @@ mod tests {
             md5: "m".into(),
             deleted_at,
             reason,
+            pruned: false,
         }
     }
 

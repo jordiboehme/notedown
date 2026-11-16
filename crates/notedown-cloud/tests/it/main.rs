@@ -20,6 +20,7 @@ mod recycle;
 mod render;
 mod rest;
 mod rest_events;
+mod rest_recycle;
 mod rest_server;
 mod rest_write;
 mod scan;

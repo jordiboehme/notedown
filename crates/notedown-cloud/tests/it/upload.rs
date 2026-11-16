@@ -2064,6 +2064,7 @@ fn the_recycle_index_is_idempotent_and_cuts_a_torn_line() {
         md5: "abc".into(),
         deleted_at: ms,
         reason: RecycleReason::Deleted,
+        pruned: false,
     };
     assert!(f.store.record_recycled(&g, &e(1)).unwrap());
     assert!(!f.store.record_recycled(&g, &e(1)).unwrap());
@@ -2094,6 +2095,7 @@ fn the_recycle_index_is_idempotent_and_cuts_a_torn_line() {
         md5: md5_of(b"m"),
         deleted_at: 9,
         reason: RecycleReason::Deleted,
+        pruned: false,
     };
     f.store.move_to_recycle(&g, &src, &m).unwrap();
     assert!(!src.exists());

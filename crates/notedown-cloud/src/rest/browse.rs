@@ -65,7 +65,7 @@ fn store_error(e: Error) -> Response {
 }
 
 /// Runs store work off the runtime; an error is [`store_error`], a panic a 500.
-async fn run<T: Send + 'static>(
+pub(super) async fn run<T: Send + 'static>(
     work: impl FnOnce() -> crate::Result<T> + Send + 'static,
 ) -> Result<T, Refusal> {
     match tokio::task::spawn_blocking(work).await {

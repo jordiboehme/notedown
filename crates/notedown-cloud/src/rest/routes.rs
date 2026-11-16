@@ -15,7 +15,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{PREFIX, RefusedToken, browse, write};
+use super::{PREFIX, RefusedToken, browse, recycle, write};
 use crate::api::ClientAddr;
 use crate::api::envelope::{LogMessage, Streamed};
 use crate::api::oss::{Flow, stream_body};
@@ -71,6 +71,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(&path("/folders"), json_body(post(write::folder)))
         .route(&path("/move"), json_body(post(write::move_)))
+        .route(&path("/recycle"), get_only(get(recycle::list)))
         .route(PREFIX, any(no_route))
         .route(&path("/"), any(no_route))
         .route(&path("/{*rest}"), any(no_route))
@@ -364,7 +365,7 @@ struct JournalQuery {
     limit: Option<String>,
 }
 
-fn number(text: Option<&str>, name: &str, default: u64) -> Result<u64, Refusal> {
+pub(super) fn number(text: Option<&str>, name: &str, default: u64) -> Result<u64, Refusal> {
     match text {
         None => Ok(default),
         Some(t) => t

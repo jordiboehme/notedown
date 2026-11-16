@@ -47,6 +47,7 @@ fn entry(id: u64, path: &str, deleted_at: u64, reason: RecycleReason) -> Recycle
         md5: format!("{:032x}", deleted_at),
         deleted_at,
         reason,
+        pruned: false,
     }
 }
 
@@ -269,6 +270,7 @@ fn a_prune_removes_the_planned_slots_and_lines_and_journals_one_batch() {
                 md5: md5.clone(),
                 deleted_at: *deleted_at,
                 reason: *reason,
+                pruned: false,
             },
             other => panic!("{other:?}"),
         })

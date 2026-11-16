@@ -7,8 +7,12 @@
 //!   ms since the epoch; [`Store::recycle_slot`] picks a later ms when that path is taken, so a
 //!   slot is never reused.
 //! - `recycle/index.jsonl`: one line per recycled item, [`RecycleEntry`]
-//!   `{"id","path","md5","deletedAt","reason"}`. The slot of a line is
+//!   `{"id","path","md5","deletedAt","reason"}`, and `"pruned": true` for a folder that a
+//!   delete or a move left with only dot-files. The slot of a line is
 //!   `recycle/<deletedAt>/<path>` ([`RecycleEntry::location`]).
+//!
+//! The bin as the user sees it is a list of items ([`recycle_items`], [`Store::recycle_items`]):
+//! each deleted file, and each deleted folder with the lines of the files that were in it.
 //!
 //! Use inside the commit protocol ([`super::commit`]), under the store lock:
 //!
@@ -28,13 +32,13 @@
 //! `recycle.pruned` event per removed line, rewrites the index atomically and then removes the
 //! slots. A line it can't read stays as it is.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::commit::RECYCLE_DIR;
+use super::commit::{RECYCLE_DIR, is_dot_entry};
 use super::retention::Retention;
 use super::{Store, StoreGuard, WirePath};
 use crate::journal::{Event, EventBody, Journal, Origin, new_op_id};
@@ -104,6 +108,10 @@ pub struct RecycleEntry {
     /// ms since the epoch; also the first segment of the slot.
     pub deleted_at: u64,
     pub reason: RecycleReason,
+    /// A folder that a delete or a move left with only dot-files, not one the user deleted
+    /// (written only when true). Such a line is no item of the bin.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pruned: bool,
 }
 
 impl RecycleEntry {
@@ -119,6 +127,120 @@ impl RecycleEntry {
     }
 }
 
+/// Whether an item of the bin was a file or a folder (from its slot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ItemKind {
+    File,
+    Folder,
+}
+
+/// One thing the user deleted, as the bin lists it: a file, or a folder with the files that
+/// were in it ([`recycle_items`], [`Store::recycle_items`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecycleItem {
+    /// [`RecycleEntry::location`] of `entry`: `<deletedAt>/<path>`.
+    pub key: String,
+    /// The wire path it had.
+    pub path: String,
+    /// The last name of `path`.
+    pub name: String,
+    pub kind: ItemKind,
+    pub deleted_at: u64,
+    /// The bytes in the slot (0 before [`Store::recycle_items`] looked).
+    pub size: u64,
+    /// The MD5 of a file, when its line has one.
+    pub md5: Option<String>,
+    /// For a folder: how many lines it owns.
+    pub files: Option<u64>,
+    /// The line of the item itself.
+    pub entry: RecycleEntry,
+    /// The lines of the files that were in a folder, in index order.
+    pub owned: Vec<RecycleEntry>,
+}
+
+impl RecycleItem {
+    fn set_kind(&mut self, kind: ItemKind) {
+        self.kind = kind;
+        (self.md5, self.files) = match kind {
+            ItemKind::File => (Some(self.entry.md5.clone()).filter(|m| !m.is_empty()), None),
+            ItemKind::Folder => (None, Some(self.owned.len() as u64)),
+        };
+    }
+}
+
+/// The items of the bin in the lines of the index, newest first (then by path). Pure: no
+/// slot is looked at, so `size` is 0 and `kind` is a guess (a folder when it owns lines) that
+/// [`Store::recycle_items`] corrects.
+///
+/// Only `deleted` lines that are no pruned parent and name a slot inside `recycle/` count;
+/// lines that can't be read and old versions (`overwritten`) are never items. Lines of the
+/// same `deletedAt` whose path lies below the path of another such line (by whole names) are
+/// owned by the topmost of them: a folder delete writes a line per file and one for the
+/// folder, the folder last. A line not owned is an item, unless its path is hidden.
+pub fn recycle_items(lines: &[IndexLine]) -> Vec<RecycleItem> {
+    let mut groups: BTreeMap<u64, Vec<(WirePath, &RecycleEntry)>> = BTreeMap::new();
+    for line in lines {
+        let IndexLine::Entry(e) = line else {
+            continue;
+        };
+        if e.reason != RecycleReason::Deleted || e.pruned {
+            continue;
+        }
+        if let Ok(path) = WirePath::parse_named(&e.path) {
+            groups.entry(e.deleted_at).or_default().push((path, e));
+        }
+    }
+    let mut items = Vec::new();
+    for group in groups.values() {
+        let paths: HashSet<&[String]> = group.iter().map(|(p, _)| p.segments()).collect();
+        let mut owned: HashMap<&[String], Vec<RecycleEntry>> = HashMap::new();
+        let mut heads = Vec::new();
+        for (path, e) in group {
+            let names = path.segments();
+            match (1..names.len())
+                .map(|n| &names[..n])
+                .find(|top| paths.contains(top))
+            {
+                Some(top) => owned.entry(top).or_default().push((*e).clone()),
+                None => heads.push((path, *e)),
+            }
+        }
+        let mut seen = HashSet::new();
+        for (path, e) in heads {
+            if path.is_hidden() || !seen.insert(path.segments()) {
+                continue;
+            }
+            let owned = owned.remove(path.segments()).unwrap_or_default();
+            let mut item = RecycleItem {
+                key: e.location(),
+                path: e.path.clone(),
+                name: path.name().unwrap_or_default().to_string(),
+                kind: ItemKind::File,
+                deleted_at: e.deleted_at,
+                size: 0,
+                md5: None,
+                files: None,
+                entry: e.clone(),
+                owned,
+            };
+            let kind = if item.owned.is_empty() {
+                ItemKind::File
+            } else {
+                ItemKind::Folder
+            };
+            item.set_kind(kind);
+            items.push(item);
+        }
+    }
+    items.sort_by(|a, b| {
+        b.deleted_at
+            .cmp(&a.deleted_at)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    items
+}
+
 impl Store {
     /// `accounts/<slug>/recycle`.
     pub fn recycle_dir(&self) -> PathBuf {
@@ -132,13 +254,35 @@ impl Store {
         Ok(path.to_fs(&self.recycle_dir().join(entry.deleted_at.to_string())))
     }
 
-    /// The first ms at or after `at_ms` whose slot `recycle/<ms>/<path>` is free.
+    /// The first ms at or after `at_ms` whose slot `recycle/<ms>/<path>` is free and is not
+    /// the slot of an index line with that ms or inside one (a folder deleted in the same ms),
+    /// so a later delete never lands inside an item of the bin and a key is never used twice.
     pub fn recycle_slot(&self, guard: &StoreGuard, path: &WirePath, at_ms: u64) -> Result<u64> {
         self.check_guard(guard)?;
+        // The slots of the index, read only when a `recycle/<ms>` is there.
+        let mut slots: Option<Vec<(u64, WirePath)>> = None;
         let mut ms = at_ms;
         loop {
-            let slot = path.to_fs(&self.recycle_dir().join(ms.to_string()));
-            if std::fs::symlink_metadata(&slot).is_err() {
+            let base = self.recycle_dir().join(ms.to_string());
+            let taken = std::fs::symlink_metadata(path.to_fs(&base)).is_ok()
+                || (std::fs::symlink_metadata(&base).is_ok() && {
+                    if slots.is_none() {
+                        slots = Some(
+                            self.read_index_lines()?
+                                .into_iter()
+                                .filter_map(|(_, e)| {
+                                    let e = e?;
+                                    Some((e.deleted_at, WirePath::parse_named(&e.path).ok()?))
+                                })
+                                .collect(),
+                        );
+                    }
+                    slots
+                        .iter()
+                        .flatten()
+                        .any(|(at, slot)| *at == ms && path.starts_with(slot))
+                });
+            if !taken {
                 return Ok(ms);
             }
             ms += 1;
@@ -531,6 +675,41 @@ impl Store {
         Ok(report)
     }
 
+    /// The items of the bin ([`recycle_items`]) as they are on disk, newest first: the kind
+    /// from the slot, `size` the bytes in it (no symlink followed). An item whose slot is gone
+    /// is left out, and so is a folder that owns no line and holds only dot-files (in folders
+    /// too): a pruned parent written before lines had `pruned`. An item with a symlink in its
+    /// slot path is listed as found in the index, with size 0.
+    pub fn recycle_items(&self, guard: &StoreGuard) -> Result<Vec<RecycleItem>> {
+        let lines = self.recycle_lines(guard)?;
+        let mut items = recycle_items(&lines);
+        items.retain_mut(|item| {
+            let Ok(slot) = self.recycle_path(&item.entry) else {
+                return false;
+            };
+            if self.has_symlink(&slot) {
+                return true;
+            }
+            match std::fs::symlink_metadata(&slot) {
+                Err(_) => false,
+                Ok(m) if m.is_dir() => {
+                    item.set_kind(ItemKind::Folder);
+                    if item.owned.is_empty() && only_dots(&slot) == Some(true) {
+                        return false;
+                    }
+                    item.size = bytes_in(&slot);
+                    true
+                }
+                Ok(m) => {
+                    item.set_kind(ItemKind::File);
+                    item.size = if m.is_file() { m.len() } else { 0 };
+                    true
+                }
+            }
+        });
+        Ok(items)
+    }
+
     /// Whether `recycle/` or any part of `slot` below it is a symlink. A missing part ends the
     /// check (nothing below it exists).
     fn has_symlink(&self, slot: &Path) -> bool {
@@ -584,6 +763,40 @@ fn holds_symlink(dir: &Path) -> bool {
     })
 }
 
+/// Whether the folder `dir` holds only dot entries ([`is_dot_entry`]) and folders of that
+/// kind: `None` when it holds anything else, otherwise whether there is a dot entry. No
+/// symlink is followed.
+fn only_dots(dir: &Path) -> Option<bool> {
+    let mut found = false;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        if is_dot_entry(&name.to_string_lossy()) {
+            found = true;
+        } else if entry.file_type().ok()?.is_dir() {
+            found |= only_dots(&entry.path())?;
+        } else {
+            return None;
+        }
+    }
+    Some(found)
+}
+
+/// The bytes of the files below `dir`; no symlink is followed.
+fn bytes_in(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(t) if t.is_dir() => bytes_in(&entry.path()),
+            Ok(t) if t.is_file() => entry.metadata().map_or(0, |m| m.len()),
+            _ => 0,
+        })
+        .sum()
+}
+
 /// Remove the empty folders in `dir` bottom-up, `dir` last. Files and symlinks stay, and a
 /// symlink is never followed.
 fn remove_empty_folders(dir: &Path) {
@@ -627,4 +840,334 @@ fn tail(
         .map(|l| serde_json::from_slice(l).ok())
         .collect();
     Ok((complete, last))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::Accounts;
+
+    const T: u64 = 1_763_290_000_000;
+
+    fn entry(path: &str, md5: &str, ms: u64, reason: RecycleReason) -> RecycleEntry {
+        RecycleEntry {
+            id: 1000 + path.len() as u64,
+            path: path.into(),
+            md5: md5.into(),
+            deleted_at: ms,
+            reason,
+            pruned: false,
+        }
+    }
+
+    fn deleted(path: &str, md5: &str, ms: u64) -> IndexLine {
+        IndexLine::Entry(entry(path, md5, ms, RecycleReason::Deleted))
+    }
+
+    /// The line of a folder that a delete left with only dot-files.
+    fn pruned(path: &str, ms: u64) -> IndexLine {
+        IndexLine::Entry(RecycleEntry {
+            pruned: true,
+            ..entry(path, "", ms, RecycleReason::Deleted)
+        })
+    }
+
+    fn keys(items: &[RecycleItem]) -> Vec<&str> {
+        items.iter().map(|i| i.key.as_str()).collect()
+    }
+
+    #[test]
+    fn a_deleted_file_is_one_item() {
+        let lines = [deleted("NOTE/Note/a.note", "m1", T)];
+        let items = recycle_items(&lines);
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.key, format!("{T}/NOTE/Note/a.note"));
+        assert_eq!(item.path, "NOTE/Note/a.note");
+        assert_eq!(item.name, "a.note");
+        assert_eq!(item.kind, ItemKind::File);
+        assert_eq!(item.deleted_at, T);
+        assert_eq!(item.md5.as_deref(), Some("m1"));
+        assert_eq!(item.files, None);
+        assert_eq!(item.size, 0);
+        assert_eq!(IndexLine::Entry(item.entry.clone()), lines[0]);
+        assert!(item.owned.is_empty());
+    }
+
+    /// As a delete writes it: the file lines, then the folder line, then the emptied parent
+    /// (with a dot-file) at the next ms.
+    #[test]
+    fn a_folder_delete_is_one_item_with_its_files() {
+        let lines = [
+            deleted("NOTE/Note/P/W/S/b.txt", "mb", T),
+            deleted("NOTE/Note/P/W/a.txt", "ma", T),
+            deleted("NOTE/Note/P/W", "", T),
+            pruned("NOTE/Note/P", T + 1),
+        ];
+        let items = recycle_items(&lines);
+        assert_eq!(keys(&items), [format!("{T}/NOTE/Note/P/W")]);
+        let item = &items[0];
+        assert_eq!(item.kind, ItemKind::Folder);
+        assert_eq!(item.files, Some(2));
+        assert_eq!(item.md5, None);
+        assert_eq!(item.owned.len(), 2);
+        let owned: Vec<IndexLine> = item.owned.iter().cloned().map(IndexLine::Entry).collect();
+        assert_eq!(owned, lines[..2]);
+    }
+
+    #[test]
+    fn overwritten_lines_are_no_items() {
+        let over =
+            |path: &str, ms| IndexLine::Entry(entry(path, "old", ms, RecycleReason::Overwritten));
+        let lines = [
+            over("NOTE/Note/a.note", T),
+            over("NOTE/Note/W/x.txt", T + 5),
+            deleted("NOTE/Note/W", "", T + 5),
+        ];
+        let items = recycle_items(&lines);
+        assert_eq!(keys(&items), [format!("{}/NOTE/Note/W", T + 5)]);
+        // An old version is never part of an item.
+        assert!(items[0].owned.is_empty());
+        assert!(recycle_items(&lines[..1]).is_empty());
+    }
+
+    #[test]
+    fn a_hidden_path_is_no_item() {
+        let lines = [
+            deleted("NOTE/Note/.hidden", "m", T),
+            deleted("NOTE/.x/a.note", "m", T + 1),
+            deleted("NOTE/.y/b.note", "m", T + 2),
+            deleted("NOTE/.y", "", T + 2),
+        ];
+        assert!(recycle_items(&lines).is_empty());
+    }
+
+    #[test]
+    fn a_pruned_parent_is_no_item() {
+        let lines = [
+            deleted("NOTE/Note/P/a.note", "m", T),
+            pruned("NOTE/Note/P", T + 1),
+        ];
+        let items = recycle_items(&lines);
+        assert_eq!(keys(&items), [format!("{T}/NOTE/Note/P/a.note")]);
+        assert!(recycle_items(&lines[1..]).is_empty());
+    }
+
+    #[test]
+    fn a_line_that_cannot_be_read_is_no_item() {
+        let lines = [
+            IndexLine::Raw("not json".into()),
+            deleted("../outside", "m", T),
+            deleted("", "", T + 1),
+            deleted("NOTE/Note/a.note", "m", T + 2),
+        ];
+        let items = recycle_items(&lines);
+        assert_eq!(keys(&items), [format!("{}/NOTE/Note/a.note", T + 2)]);
+    }
+
+    #[test]
+    fn a_file_line_with_an_empty_md5_inside_a_folder_is_owned() {
+        let lines = [
+            deleted("NOTE/Note/W/a.txt", "", T),
+            deleted("NOTE/Note/W", "", T),
+        ];
+        let items = recycle_items(&lines);
+        assert_eq!(keys(&items), [format!("{T}/NOTE/Note/W")]);
+        assert_eq!(items[0].files, Some(1));
+        assert_eq!(items[0].owned[0].path, "NOTE/Note/W/a.txt");
+    }
+
+    /// Paths are compared by whole names: `W.txt` is no part of the folder `W`.
+    #[test]
+    fn a_sibling_with_a_longer_name_is_its_own_item() {
+        let lines = [
+            deleted("NOTE/Note/W.txt", "m", T),
+            deleted("NOTE/Note/W/a.txt", "m", T),
+            deleted("NOTE/Note/W", "", T),
+        ];
+        let items = recycle_items(&lines);
+        assert_eq!(
+            keys(&items),
+            [format!("{T}/NOTE/Note/W"), format!("{T}/NOTE/Note/W.txt")]
+        );
+        assert_eq!(items[0].files, Some(1));
+    }
+
+    #[test]
+    fn items_are_newest_first() {
+        let lines = [
+            deleted("NOTE/Note/old.note", "m", T),
+            deleted("NOTE/Note/b.note", "m", T + 2),
+            deleted("NOTE/Note/mid.note", "m", T + 1),
+            deleted("NOTE/Note/a.note", "m", T + 2),
+        ];
+        let items = recycle_items(&lines);
+        assert_eq!(
+            keys(&items),
+            [
+                format!("{}/NOTE/Note/a.note", T + 2),
+                format!("{}/NOTE/Note/b.note", T + 2),
+                format!("{}/NOTE/Note/mid.note", T + 1),
+                format!("{T}/NOTE/Note/old.note"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_old_entry_without_pruned_still_reads() {
+        let old = r#"{"id":7,"path":"NOTE/Note/P","md5":"","deletedAt":5,"reason":"deleted"}"#;
+        let e: RecycleEntry = serde_json::from_str(old).unwrap();
+        assert!(!e.pruned);
+        // A line that is no pruned parent is written as before, byte for byte.
+        assert_eq!(e.line(), format!("{old}\n"));
+        let p = RecycleEntry { pruned: true, ..e };
+        assert_eq!(
+            p.line(),
+            "{\"id\":7,\"path\":\"NOTE/Note/P\",\"md5\":\"\",\"deletedAt\":5,\"reason\":\"deleted\",\"pruned\":true}\n"
+        );
+    }
+
+    fn store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        Accounts::new(dir.path())
+            .create("jordi", "jordi@example.org", "secret")
+            .unwrap();
+        let store = Store::open(dir.path(), "jordi").unwrap();
+        (dir, store)
+    }
+
+    fn wp(p: &str) -> WirePath {
+        WirePath::parse(p).unwrap()
+    }
+
+    /// A slot with its line: a folder slot (with `files` in it) or a file slot.
+    fn slot(store: &Store, e: &RecycleEntry, files: &[(&str, &[u8])]) {
+        let p = store.recycle_path(e).unwrap();
+        if files.is_empty() && !e.md5.is_empty() {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"bytes").unwrap();
+        } else {
+            std::fs::create_dir_all(&p).unwrap();
+            for (name, bytes) in files {
+                let f = p.join(name);
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(f, bytes).unwrap();
+            }
+        }
+        store.append_recycled(e).unwrap();
+    }
+
+    #[test]
+    fn a_slot_inside_a_folder_slot_of_the_same_ms_is_bumped() {
+        let (_dir, store) = store();
+        let g = store.lock().unwrap();
+        let folder = entry("NOTE/Note/A", "", T, RecycleReason::Deleted);
+        slot(&store, &folder, &[]);
+        // Inside the folder slot of a line with that ms: the next ms.
+        assert_eq!(
+            store.recycle_slot(&g, &wp("NOTE/Note/A/B"), T).unwrap(),
+            T + 1
+        );
+        assert_eq!(
+            store.recycle_slot(&g, &wp("NOTE/Note/A/B/c"), T).unwrap(),
+            T + 1
+        );
+        // A sibling shares the ms.
+        assert_eq!(store.recycle_slot(&g, &wp("NOTE/Note/C"), T).unwrap(), T);
+        // A folder that only holds slots of that ms is no slot itself.
+        let file = entry("NOTE/Note/F/x.txt", "m", T + 7, RecycleReason::Deleted);
+        slot(&store, &file, &[]);
+        assert_eq!(
+            store
+                .recycle_slot(&g, &wp("NOTE/Note/F/y.txt"), T + 7)
+                .unwrap(),
+            T + 7
+        );
+        // The slot of a line is never used again, also when it is gone.
+        let gone = entry("NOTE/Note/G", "", T, RecycleReason::Deleted);
+        store.append_recycled(&gone).unwrap();
+        assert_eq!(
+            store.recycle_slot(&g, &wp("NOTE/Note/G"), T).unwrap(),
+            T + 1
+        );
+    }
+
+    #[test]
+    fn the_store_items_take_kind_and_size_from_the_slots() {
+        let (_dir, store) = store();
+        let g = store.lock().unwrap();
+        let file = entry("NOTE/Note/a.txt", "m", T, RecycleReason::Deleted);
+        slot(&store, &file, &[]);
+        let inside = entry("NOTE/Note/W/x.txt", "", T + 1, RecycleReason::Deleted);
+        let folder = entry("NOTE/Note/W", "", T + 1, RecycleReason::Deleted);
+        slot(
+            &store,
+            &folder,
+            &[
+                ("x.txt", b"12345"),
+                ("S/y.txt", b"123"),
+                (".DS_Store", b"d"),
+            ],
+        );
+        store.append_recycled(&inside).unwrap();
+        let gone = entry("NOTE/Note/gone.txt", "m", T + 2, RecycleReason::Deleted);
+        store.append_recycled(&gone).unwrap();
+        let empty = entry("NOTE/Note/E", "", T + 3, RecycleReason::Deleted);
+        slot(&store, &empty, &[]);
+        let items = store.recycle_items(&g).unwrap();
+        assert_eq!(
+            keys(&items),
+            [
+                format!("{}/NOTE/Note/E", T + 3),
+                format!("{}/NOTE/Note/W", T + 1),
+                format!("{T}/NOTE/Note/a.txt"),
+            ]
+        );
+        assert_eq!(
+            (items[0].kind, items[0].size, items[0].files),
+            (ItemKind::Folder, 0, Some(0))
+        );
+        assert_eq!(
+            (items[1].kind, items[1].size, items[1].files),
+            (ItemKind::Folder, 9, Some(1))
+        );
+        assert_eq!(items[1].md5, None);
+        assert_eq!(
+            (items[2].kind, items[2].size, items[2].files),
+            (ItemKind::File, 5, None)
+        );
+    }
+
+    /// A pruned parent written before lines had `pruned`: a folder line that owns nothing and
+    /// whose slot holds only dot-files (in folders too).
+    #[test]
+    fn an_old_pruned_parent_of_dot_files_is_no_item() {
+        let (_dir, store) = store();
+        let g = store.lock().unwrap();
+        let old = entry("NOTE/Note/P", "", T, RecycleReason::Deleted);
+        slot(&store, &old, &[(".DS_Store", b"d"), ("Q/.keep", b"")]);
+        assert!(store.recycle_items(&g).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_line_twice_is_one_item() {
+        let lines = [
+            deleted("NOTE/Note/a.note", "m", T),
+            deleted("NOTE/Note/a.note", "m", T),
+        ];
+        assert_eq!(recycle_items(&lines).len(), 1);
+    }
+
+    #[test]
+    fn a_folder_inside_a_folder_of_the_same_ms_is_owned_by_the_top() {
+        let lines = [
+            deleted("NOTE/Note/A/x.txt", "m", T),
+            deleted("NOTE/Note/A", "", T),
+            deleted("NOTE/Note/A/B/y.txt", "m", T),
+            deleted("NOTE/Note/A/B", "", T),
+        ];
+        let items = recycle_items(&lines);
+        assert_eq!(keys(&items), [format!("{T}/NOTE/Note/A")]);
+        assert_eq!(items[0].owned.len(), 3);
+    }
 }

@@ -76,6 +76,7 @@ A refused token gets 401 `token_refused` with `WWW-Authenticate: Bearer`. A toke
 | `POST /folders` | write | Create a folder |
 | `POST /move` | write | Rename or move a file or folder |
 | `DELETE /entries/{id}` | write | Delete a file or folder |
+| `GET /recycle` | read | List the recycle bin |
 
 The routes for the records, the digests and the note by path are made for the pipeline. This page does not describe their bodies. The sections below are for an app that browses and manages files.
 
@@ -212,6 +213,8 @@ When `gap` is true, the app lists again and follows on from the `seq` of that li
 
 An event with a hidden path (a name that starts with a dot) is not shown. A move from a visible to a hidden path comes as a `file.deleted` or `folder.deleted` of the old path. A move from a hidden to a visible path sets `gap`.
 
+The recycle bin does not list an item with a hidden path either.
+
 ### Accounts
 
 An app never sees the events of another account. This includes an earlier account with the same name: its events are left out, and `gap` tells the app that it may have missed some.
@@ -306,6 +309,41 @@ Moves the file, or the folder with everything in it, to the recycle bin. Nothing
 ```
 
 `removed` lists the folders that the delete left empty, as for a move. An unknown id is 404 `not_found`. That includes a delete that is retried after it worked. A tree root is 403 `not_writable`.
+
+## Recycle bin
+
+A delete moves the file or folder to the recycle bin of the account. The bin lists each thing the user deleted once. A deleted folder is one item with everything that was in it.
+
+The bin also keeps the old versions of replaced files. They are not listed. When a delete leaves a folder with only dot-files, the server moves that folder to the bin as well. The user did not delete it, so it is not listed either. By default the server removes an item 90 days after the delete. The [getting started guide](getting-started.md) has the settings (`recycle_keep_deleted_days`, `recycle_prune`).
+
+### `GET /recycle?limit=&after=`
+
+Lists the items of the bin, newest first. Items of the same time come in the order of their paths.
+
+```json
+{
+  "items": [
+    {"key": "1763290000000/NOTE/Note/b.note", "path": "NOTE/Note/b.note", "name": "b.note",
+     "kind": "file", "deletedAt": 1763290000000, "size": 20480,
+     "md5": "9e107d9d372bb6826bd81d3542a419d6"},
+    {"key": "1763280000000/NOTE/Note/projects", "path": "NOTE/Note/projects",
+     "name": "projects", "kind": "folder", "deletedAt": 1763280000000, "size": 81920,
+     "files": 4}
+  ],
+  "more": false
+}
+```
+
+- `key` names the item. It is `<deletedAt>/<path>` and never used again for another item.
+- `path` is the path the item had before the delete. `name` is its last name.
+- `kind` is `file` or `folder`.
+- `deletedAt` is the time of the delete in milliseconds since 1970.
+- `size` is the number of bytes in the bin for the item. For a folder it is the sum of its files.
+- `md5` is only there for a file. `files` is only there for a folder: the number of files that were in it.
+
+`limit` is at most 500, which is also the default. 0 counts as 1. When `more` is true, there are more items. Ask again with `after` set to the `key` of the last item of the page. The next page starts after that key, also when that item has left the bin since. A `limit` that is no number and an `after` that is no key are a 400.
+
+An item whose bytes are gone from the bin is not listed. A line of the bin index that the server cannot read is skipped. The list answers 423 `scan_hold` and `not_imported` like the other reads.
 
 ## While a device syncs
 

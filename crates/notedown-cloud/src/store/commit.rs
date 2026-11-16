@@ -364,7 +364,7 @@ fn has_rename_stop(op: &PendingOp) -> bool {
 
 /// A name a prune moves along with its folder: a dot-file or dot-folder that is not a server
 /// temp name (`.nd-*`: temp files, the temp name of a rename). Those are never swept.
-fn is_dot_entry(name: &str) -> bool {
+pub(super) fn is_dot_entry(name: &str) -> bool {
     name.starts_with('.') && !name.starts_with(".nd-")
 }
 
@@ -396,6 +396,7 @@ fn prune_entry(top: &PlannedFolder, ms: u64) -> RecycleEntry {
         md5: String::new(),
         deleted_at: ms,
         reason: RecycleReason::Deleted,
+        pruned: true,
     }
 }
 
@@ -643,6 +644,7 @@ impl Store {
                 md5: prev_md5.clone(),
                 deleted_at: self.recycle_slot(guard, path, at)?,
                 reason: RecycleReason::Overwritten,
+                pruned: false,
             }),
             _ => None,
         };
@@ -1007,6 +1009,7 @@ impl Store {
                         md5: e.content_hash.clone().unwrap_or_default(),
                         deleted_at: ms,
                         reason: RecycleReason::Deleted,
+                        pruned: false,
                     });
                 }
                 events.push(match e.tag {
@@ -1028,6 +1031,7 @@ impl Store {
             md5,
             deleted_at: ms,
             reason: RecycleReason::Deleted,
+            pruned: false,
         };
         events.push(match found.kind {
             Kind::File => EventBody::FileDeleted {

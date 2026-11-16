@@ -314,6 +314,29 @@ fn the_serve_info_follows_the_server() {
 }
 
 #[test]
+fn a_new_serve_address_is_told() {
+    let rig = Rig::new();
+    rig.listen_on(free_port());
+    let p = rig.processes(Path::new("/bin/sleep"));
+    let told = Arc::new(AtomicUsize::new(0));
+    let count = told.clone();
+    p.on_serve_info(move || {
+        count.fetch_add(1, Ordering::SeqCst);
+    });
+    p.start_all(&rig.config());
+    running_pid(p.server());
+    let data = rig.data();
+    assert!(wait_until(
+        || p.serve_info().data_dir.as_deref() == Some(data.as_path())
+    ));
+    // The address, the device URL, the REST line and the folder each change it; the header
+    // of a fresh start changes nothing.
+    assert!(wait_until(|| told.load(Ordering::SeqCst) >= 4));
+    assert_eq!(told.load(Ordering::SeqCst), 4);
+    p.stop_all();
+}
+
+#[test]
 fn remote_mode_reclaims_and_runs_no_server() {
     let rig = Rig::new();
     let o = orphan_sleep();

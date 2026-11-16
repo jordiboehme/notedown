@@ -50,10 +50,14 @@ pub struct Processes {
     server_grace: Duration,
     pipeline_grace: Duration,
     serve_info: Arc<Mutex<ServeInfo>>,
+    /// Told when a start line changed the serve info.
+    serve_listeners: Arc<Mutex<Vec<ServeListener>>>,
     /// Serializes start, probe and stop, so a probe never undoes a stop.
     ops: Mutex<()>,
     quitting: AtomicBool,
 }
+
+type ServeListener = Box<dyn Fn() + Send + Sync>;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -80,8 +84,21 @@ impl Processes {
             );
         }
         let serve_info = Arc::new(Mutex::new(ServeInfo::default()));
-        let info = serve_info.clone();
-        server.on_line(move |line| serve_info::parse_line(&mut lock(&info), line));
+        let serve_listeners: Arc<Mutex<Vec<ServeListener>>> = Arc::default();
+        let (info, listeners) = (serve_info.clone(), serve_listeners.clone());
+        server.on_line(move |line| {
+            let changed = {
+                let mut info = lock(&info);
+                let before = info.clone();
+                serve_info::parse_line(&mut info, line);
+                *info != before
+            };
+            if changed {
+                for listener in lock(&listeners).iter() {
+                    listener();
+                }
+            }
+        });
         Self {
             server,
             pipeline,
@@ -91,6 +108,7 @@ impl Processes {
             server_grace: options.server_grace,
             pipeline_grace: options.pipeline_grace,
             serve_info,
+            serve_listeners,
             ops: Mutex::new(()),
             quitting: AtomicBool::new(false),
         }
@@ -109,6 +127,12 @@ impl Processes {
             server: self.server.state(),
             pipeline: self.pipeline.state(),
         }
+    }
+
+    /// Runs `cb` whenever a start line of the server changed what [`serve_info`](Self::serve_info)
+    /// knows (a new address). It runs on the server's output thread, so it must not block.
+    pub fn on_serve_info(&self, cb: impl Fn() + Send + Sync + 'static) {
+        lock(&self.serve_listeners).push(Box::new(cb));
     }
 
     /// The start lines of the running server; empty while it does not run.

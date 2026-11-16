@@ -8,10 +8,12 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::config::{self, AppConfig, Mode, StartView};
-use crate::login::{self, LoginGate, Password};
+use crate::library::{Library, StateView};
+use crate::login::{self, LoginError, LoginGate, Password};
 use crate::model::{ModelControl, ModelState};
 use crate::poller::Poller;
 use crate::processes::{ProcessStates, Processes};
+use crate::serve_info::ServeInfo;
 use crate::status::Status;
 use crate::token::{KeychainStore, TokenStore, token_key};
 use crate::windows::{self, WindowKind};
@@ -257,16 +259,36 @@ fn expand_home(dir: &Path) -> Result<PathBuf, String> {
 /// Log out: deletes the token of the account in the config, then forgets the account and
 /// the e-mail. The answer is the config without them. It takes the login lock: a log out
 /// during a login waits for it and then removes the token it left, so none stays behind.
+/// The library binds again: its jobs end and it is logged out.
 pub fn log_out_of(
     gate: &LoginGate,
     store: &dyn TokenStore,
     state: &ConfigState,
+    library: &Library,
 ) -> Result<AppConfig, String> {
     let _no_login = gate.hold();
     if let Some(key) = token_key(&state.current()) {
         store.delete(&key).map_err(|e| e.to_string())?;
     }
-    state.forget_login()
+    let forgotten = state.forget_login();
+    // The token is gone also when the config was not saved.
+    library.relogin();
+    forgotten
+}
+
+/// Log in ([`login::log_in`]), then bind the library to the new login.
+pub fn log_in_to(
+    gate: &LoginGate,
+    state: &ConfigState,
+    serve_info: &ServeInfo,
+    store: &dyn TokenStore,
+    library: &Library,
+    email: &str,
+    password: &Password,
+) -> Result<ConfigAnswer, LoginError> {
+    let answer = login::log_in(gate, state, serve_info, store, email, password)?;
+    library.relogin();
+    Ok(answer)
 }
 
 pub fn allowed_link(url: &str) -> bool {
@@ -291,10 +313,12 @@ pub fn get_config(state: State<'_, ConfigState>) -> Result<AppConfig, String> {
 /// Saves the new place of the server off the calling thread ([`change_place`]); when the
 /// mode, the folder or the address changed, runs `restart` on a blocking thread of its own and
 /// waits for it. A refused change restarts nothing.
+#[allow(clippy::too_many_arguments)]
 pub async fn set_mode_then(
     state: &ConfigState,
     gate: Arc<LoginGate>,
     store: Arc<dyn TokenStore>,
+    library: Library,
     mode: Mode,
     data_dir: Option<PathBuf>,
     server_url: Option<String>,
@@ -302,7 +326,9 @@ pub async fn set_mode_then(
 ) -> Result<ConfigAnswer, String> {
     let placing = state.clone();
     let (before, answer) = tauri::async_runtime::spawn_blocking(move || {
-        change_place(&gate, &*store, &placing, mode, data_dir, server_url)
+        change_place(
+            &gate, &*store, &placing, &library, mode, data_dir, server_url,
+        )
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -319,11 +345,13 @@ pub async fn set_mode_then(
 
 /// Saves the new place. When that forgets the account (another server), its token goes too,
 /// so no write token stays where Log out cannot reach it. It takes the login lock, so it never
-/// meets a running login half way. Answers the config it replaced and the new one.
+/// meets a running login half way. Answers the config it replaced and the new one. The library
+/// binds again when its server or its account changed.
 pub fn change_place(
     gate: &LoginGate,
     store: &dyn TokenStore,
     state: &ConfigState,
+    library: &Library,
     mode: Mode,
     data_dir: Option<PathBuf>,
     server_url: Option<String>,
@@ -338,6 +366,7 @@ pub fn change_place(
     {
         keychain = Some(login::old_login_kept(&e.0));
     }
+    library.refresh();
     Ok((replaced, ConfigAnswer { config, keychain }))
 }
 
@@ -349,6 +378,7 @@ pub async fn set_mode(
     state: State<'_, ConfigState>,
     processes: State<'_, Arc<Processes>>,
     gate: State<'_, Arc<LoginGate>>,
+    library: State<'_, Library>,
     mode: Mode,
     data_dir: Option<PathBuf>,
     server_url: Option<String>,
@@ -360,6 +390,7 @@ pub async fn set_mode(
         &state,
         gate.inner().clone(),
         Arc::new(KeychainStore::new()),
+        library.inner().clone(),
         mode,
         data_dir,
         server_url,
@@ -446,26 +477,30 @@ pub fn request_quit(app: AppHandle) {
 
 /// Log in with an e-mail and a password, off the main thread: the client is made, used and
 /// dropped on a blocking thread. The answer is the config with the new account; the password
-/// and the token never come back. Then the status polls again.
+/// and the token never come back. Then the library binds to the new login and the status polls
+/// again.
 #[tauri::command]
 pub async fn log_in(
     config: State<'_, ConfigState>,
     processes: State<'_, Arc<Processes>>,
     poller: State<'_, Poller>,
     gate: State<'_, Arc<LoginGate>>,
+    library: State<'_, Library>,
     email: String,
     password: String,
 ) -> Result<ConfigAnswer, String> {
     let state = config.inner().clone();
     let gate = gate.inner().clone();
+    let library = library.inner().clone();
     let serve_info = processes.serve_info();
     let password = Password::new(password);
     let saved = tauri::async_runtime::spawn_blocking(move || {
-        login::log_in(
+        log_in_to(
             &gate,
             &state,
             &serve_info,
             &KeychainStore::new(),
+            &library,
             &email,
             &password,
         )
@@ -486,23 +521,32 @@ pub async fn has_login(config: State<'_, ConfigState>) -> Result<bool, String> {
         .map_err(|e| e.to_string())?
 }
 
-/// Log out: deletes the token from the Keychain and forgets the account, off the main thread
-/// (where it may wait for a running login), then polls again.
+/// Log out: deletes the token from the Keychain, forgets the account and stops the library,
+/// off the main thread (where it may wait for a running login), then polls again.
 #[tauri::command]
 pub async fn log_out(
     config: State<'_, ConfigState>,
     poller: State<'_, Poller>,
     gate: State<'_, Arc<LoginGate>>,
+    library: State<'_, Library>,
 ) -> Result<AppConfig, String> {
     let state = config.inner().clone();
     let gate = gate.inner().clone();
+    let library = library.inner().clone();
     let after = tauri::async_runtime::spawn_blocking(move || {
-        log_out_of(&gate, &KeychainStore::new(), &state)
+        log_out_of(&gate, &KeychainStore::new(), &state, &library)
     })
     .await
     .map_err(|e| e.to_string())??;
     poller.poll_now();
     Ok(after)
+}
+
+/// The state of the library and its text, for the library window when it opens. It reads only
+/// what the library keeps: no call and no Keychain read.
+#[tauri::command]
+pub fn library_state(library: State<'_, Library>) -> StateView {
+    library.state()
 }
 
 /// The last lines of both children's output, for the Server page.
@@ -876,6 +920,7 @@ mod tests {
                 &state,
                 Arc::new(LoginGate::default()),
                 Arc::new(crate::token::MemoryStore::new()),
+                crate::library::idle(),
                 mode,
                 Some(dir.into()),
                 None,
@@ -902,6 +947,7 @@ mod tests {
                 &state,
                 Arc::new(LoginGate::default()),
                 Arc::new(crate::token::MemoryStore::new()),
+                crate::library::idle(),
                 Mode::Remote,
                 None,
                 None,
@@ -927,7 +973,7 @@ mod tests {
         store.set("local|jordi", &Token::new("secret")).unwrap();
         store.set("local|other", &Token::new("other")).unwrap();
         let gate = LoginGate::default();
-        let after = log_out_of(&gate, &store, &state).unwrap();
+        let after = log_out_of(&gate, &store, &state, &crate::library::idle()).unwrap();
         assert_eq!(store.get("local|jordi").unwrap(), None);
         assert!(store.get("local|other").unwrap().is_some());
         assert_eq!(after.account, None);
@@ -936,7 +982,7 @@ mod tests {
         assert_eq!(state.current(), after);
         assert_eq!(config::load(dir.path()), after);
         // Without an account there is nothing to delete.
-        log_out_of(&gate, &store, &state).unwrap();
+        log_out_of(&gate, &store, &state, &crate::library::idle()).unwrap();
     }
 
     #[test]

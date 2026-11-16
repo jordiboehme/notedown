@@ -2,6 +2,7 @@
 
 pub mod commands;
 pub mod config;
+pub mod library;
 pub mod login;
 pub mod model;
 pub mod pidfile;
@@ -24,6 +25,7 @@ use std::sync::{Arc, mpsc};
 
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
 
+use library::{LIBRARY_EVENT, Library, LibraryEvent};
 use model::{ModelControl, ModelEvent};
 use poller::{Inputs, Poller, RealSources, TICK_EVERY};
 use process::ChildKind;
@@ -87,6 +89,7 @@ pub fn run() {
             let config_dir = app.path().app_config_dir()?;
             let config = commands::ConfigState::load(config_dir);
             let reader = config.reader();
+            let library_reader = config.reader();
             app.manage(config);
             let sidecar = process::sidecar_path()?;
             let sidecar_spawn = process::spawn_program(sidecar.clone());
@@ -101,7 +104,21 @@ pub fn run() {
             }));
             app.manage(model_control(app.handle().clone(), sidecar_spawn.clone()));
             let poller = status_poller(sidecar_spawn, reader, processes.clone());
-            report_states(app.handle().clone(), &processes, poller.clone());
+            let library = library_for(app.handle().clone(), library_reader, processes.clone());
+            let rebind = library_worker(library.clone());
+            app.manage(library);
+            let serve_rebind = rebind.clone();
+            processes.on_serve_info(move || {
+                let _ = serve_rebind.send(());
+            });
+            report_states(
+                app.handle().clone(),
+                &processes,
+                poller.clone(),
+                rebind.clone(),
+            );
+            // The first binding reads the Keychain: on the library's own thread.
+            let _ = rebind.send(());
             report_status(app.handle().clone(), &poller);
             app.manage(processes);
             app.manage(poller.clone());
@@ -132,7 +149,8 @@ pub fn run() {
             commands::model_state,
             commands::model_pull,
             commands::model_pause,
-            commands::model_remove
+            commands::model_remove,
+            commands::library_state
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
@@ -317,10 +335,47 @@ fn report_status(app: AppHandle, poller: &Poller) {
     });
 }
 
-/// Sends every state change to the webview and makes the status again. The supervisors'
-/// listeners only put the change into a channel, which never blocks; a thread of its own emits
-/// the events.
-fn report_states(app: AppHandle, processes: &Processes, poller: Poller) {
+/// The library of the account in the config. It reads the config and the server's start lines
+/// through handles of their own, so it holds no handle to the app; its events go into a
+/// channel, and a thread of its own sends them to the library window.
+fn library_for(
+    app: AppHandle,
+    config: commands::ConfigReader,
+    processes: Arc<Processes>,
+) -> Library {
+    let (tx, rx) = mpsc::channel::<LibraryEvent>();
+    std::thread::spawn(move || {
+        for event in rx {
+            let _ = app.emit_to(windows::WindowKind::Library.label(), LIBRARY_EVENT, event);
+        }
+    });
+    Library::new(
+        Arc::new(KeychainStore::new()),
+        Arc::new(move || (config.current(), processes.serve_info())),
+        Arc::new(move |event| {
+            let _ = tx.send(event);
+        }),
+    )
+}
+
+/// The thread that binds the library again when the server's address may have changed (a new
+/// start line, a new state of the server) and once at start. A send never blocks; sends that
+/// pile up while it binds make one binding.
+fn library_worker(library: Library) -> mpsc::Sender<()> {
+    let (tx, rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        while rx.recv().is_ok() {
+            while rx.try_recv().is_ok() {}
+            library.refresh();
+        }
+    });
+    tx
+}
+
+/// Sends every state change to the webview, makes the status again and tells the library,
+/// whose address may have changed with the server. The supervisors' listeners only put the
+/// change into a channel, which never blocks; a thread of its own emits the events.
+fn report_states(app: AppHandle, processes: &Processes, poller: Poller, rebind: mpsc::Sender<()>) {
     let (tx, rx) = mpsc::channel::<ProcessStateEvent>();
     for sup in [processes.server(), processes.pipeline()] {
         let tx = tx.clone();
@@ -336,6 +391,7 @@ fn report_states(app: AppHandle, processes: &Processes, poller: Poller) {
         for event in rx {
             let _ = app.emit(PROCESS_STATE_EVENT, event);
             poller.refresh();
+            let _ = rebind.send(());
         }
     });
 }
@@ -445,7 +501,7 @@ mod tests {
                 "quit_app"
             ])
         );
-        assert_eq!(granted("library"), set(&[]));
+        assert_eq!(granted("library"), set(&["library_state", "open_settings"]));
         let mut settings = set(&SETTINGS_ONLY);
         settings.remove("process_states");
         settings.insert("get_status".into());
@@ -462,7 +518,7 @@ mod tests {
     #[test]
     fn the_capabilities_are_one_file_per_window_that_calls_tauri() {
         let names: Vec<String> = capability_files().into_iter().map(|(n, _)| n).collect();
-        assert_eq!(names, ["panel.json", "settings.json"]);
+        assert_eq!(names, ["library.json", "panel.json", "settings.json"]);
     }
 
     #[test]
@@ -486,8 +542,11 @@ mod tests {
                 "core:window:allow-set-title",
             ])
         );
-        // The library placeholder calls nothing.
-        assert_eq!(permissions("library"), set(&[]));
+        // The library follows its events.
+        assert_eq!(
+            core("library"),
+            set(&["core:event:allow-listen", "core:event:allow-unlisten"])
+        );
     }
 
     /// The commands of `generate_handler!` in this file.
@@ -508,7 +567,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 23);
+        assert_eq!(handler_commands().len(), 24);
     }
 
     #[test]
@@ -537,11 +596,19 @@ mod tests {
             "model_pull",
             "model_pause",
             "model_remove",
+            "library_state",
         ]);
         assert_eq!(manifest_commands(), all);
         // Every granted command is a real one.
         for window in ["panel", "library", "settings"] {
             assert!(granted(window).is_subset(&all), "{window}");
+        }
+    }
+
+    #[test]
+    fn library_state_is_only_the_librarys() {
+        for window in ["panel", "settings"] {
+            assert!(!granted(window).contains("library_state"), "{window}");
         }
     }
 

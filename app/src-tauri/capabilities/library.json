@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "library",
+  "description": "The library window follows the library's events, reads the library's state when it opens and opens the settings at the page its state names. Every call to the server is made in Rust: the token never reaches the window.",
+  "windows": ["library"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-library-state",
+    "allow-open-settings"
+  ]
+}

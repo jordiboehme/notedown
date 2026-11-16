@@ -697,7 +697,7 @@ fn a_log_out_during_a_login_leaves_no_token() {
             let (gate, store) = (hook_gate.clone(), hook_store.clone());
             let state = hook_slot.lock().unwrap().clone().unwrap();
             *hook_leaving.lock().unwrap() = Some(std::thread::spawn(move || {
-                crate::commands::log_out_of(&gate, &*store, &state)
+                crate::commands::log_out_of(&gate, &*store, &state, &crate::library::idle())
             }));
         }
     });
@@ -751,6 +751,7 @@ fn set_mode_now(
         state,
         Arc::new(LoginGate::default()),
         store,
+        crate::library::idle(),
         mode,
         data_dir,
         server_url.map(str::to_owned),

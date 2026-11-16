@@ -28,6 +28,7 @@ const COMMANDS: &[&str] = &[
     "model_pull",
     "model_pause",
     "model_remove",
+    "library_state",
 ];
 
 fn main() {

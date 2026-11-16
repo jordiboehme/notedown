@@ -111,7 +111,7 @@ impl Device {
         bytes
     }
 
-    fn listing(&mut self) -> Vec<Value> {
+    pub(crate) fn listing(&mut self) -> Vec<Value> {
         let v = self.ok(
             "/api/file/2/files/list_folder",
             json!({"equipmentNo": SERIAL, "path": "/", "recursive": true}),
@@ -119,7 +119,7 @@ impl Device {
         v["entries"].as_array().unwrap().clone()
     }
 
-    fn id_of(entries: &[Value], path: &str) -> String {
+    pub(crate) fn id_of(entries: &[Value], path: &str) -> String {
         entries
             .iter()
             .find(|e| e["path_display"] == path)

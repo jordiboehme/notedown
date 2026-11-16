@@ -1,26 +1,44 @@
-//! The recycle bin for the Mac app: `GET /recycle` lists what the user deleted, newest first.
-//! Any valid token reads, a read token too.
+//! The recycle bin for the Mac app: `GET /recycle` lists what the user deleted, newest first,
+//! and `POST /recycle/restore` brings one item back. Any valid token reads, a read token too;
+//! a restore needs a write token.
 //!
 //! An item is a deleted file, or a deleted folder with what was in it, as
 //! [`Store::recycle_items`] finds it: old versions of replaced files, the folders a delete left
 //! with only dot-files, hidden paths, lines that can't be read and slots that are gone are no
 //! items. A list takes the store lock with recovery and the gates (423 `not_imported` and
 //! `scan_hold`), like the other reads, and does not scan.
+//!
+//! A restore is a write like those of [`super::write`]: before the store lock the token (403
+//! `read_only_token`), the sync mode, the body (400 `bad_request`) and a `path` it names
+//! ([`parse_target`]). Then in one blocking task under one store lock: the gates and the device
+//! sync lock ([`locked`]), the item by its key (404 `not_found` when the bin has no such item:
+//! a key already restored or pruned), the item's old path when the body names none, the scans
+//! of the folders on the way, [`check_target`] with nothing allowed at the target (a folder is
+//! never merged into another one), the quota ([`quota_locked`], the bytes of the item), the
+//! plan ([`Store::plan_restore`](crate::store::Store::plan_restore)) with its page changes and
+//! the commit. Origin `app`, no device. The restored entry gets a new id, as does everything in
+//! a restored folder.
 
 use std::cmp::Reverse;
 use std::sync::Arc;
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, Uri};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use super::browse::run;
+use super::check::{Want, check_target, parse_target};
 use super::routes::{Refusal, account_of, bad_request, number, query};
-use crate::api::files::gate_locked;
+use super::write::{Stop, json_body, locked, quota_locked, writer};
+use crate::api::files::{gate_locked, scan_way};
+use crate::auth::Account;
+use crate::journal::Origin;
 use crate::server::AppState;
-use crate::store::{ItemKind, RecycleItem};
+use crate::store::{ItemKind, Kind, PendingOp, RecycleItem, WirePath};
 
 /// The default and the largest `limit` of `GET /recycle`.
 pub const RECYCLE_LIMIT: usize = 500;
@@ -122,4 +140,93 @@ fn items_of(state: &AppState, slug: &str) -> crate::Result<Vec<RecycleItem>> {
     let guard = store.lock_recovered(&state.journal)?;
     gate_locked(state, &store)?;
     store.recycle_items(&guard)
+}
+
+#[derive(Deserialize)]
+struct RestoreBody {
+    key: String,
+    path: Option<String>,
+}
+
+/// `POST /recycle/restore` under the store lock (module docs).
+fn restore_item(
+    state: &AppState,
+    account: &Account,
+    key: &str,
+    path: Option<WirePath>,
+) -> crate::Result<Result<Value, Stop>> {
+    let slug = &account.slug;
+    let (store, guard) = match locked(state, slug)? {
+        Ok(v) => v,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let Some(item) = store
+        .recycle_items(&guard)?
+        .into_iter()
+        .find(|i| i.key == key)
+    else {
+        return Ok(Err(Stop::NotFound));
+    };
+    let target = match path {
+        Some(p) => p,
+        None => match parse_target(&item.path) {
+            Ok(p) => p,
+            Err(r) => return Ok(Err(Stop::Target(r))),
+        },
+    };
+    scan_way(state, &store, &guard, &target)?;
+    if let Err(r) = check_target(&store, &guard, &target, Want::Absent)? {
+        return Ok(Err(Stop::Target(r)));
+    }
+    if quota_locked(state, &store, &guard, account, 0, item.size)? {
+        return Ok(Err(Stop::Quota));
+    }
+    let mut c = store.plan_restore(&guard, &item, &target, state.now_ms(), Origin::App)?;
+    crate::pages::plan_page_restore(&store, &guard, &mut c)?;
+    let PendingOp::Restore { id, kind, .. } = c.op else {
+        return Err(crate::Error::Invalid {
+            what: "restore",
+            message: "the plan is no restore".into(),
+        });
+    };
+    let seqs = store.commit(&guard, c, &state.journal)?;
+    // The bytes came back to `files/`; under the lock, so the cache stays right.
+    let kind = match kind {
+        Kind::File => {
+            state.adjust_usage(slug, item.size, 0);
+            ItemKind::File
+        }
+        Kind::Folder => {
+            state.invalidate_usage(slug);
+            ItemKind::Folder
+        }
+    };
+    Ok(Ok(
+        json!({"id": id, "path": target.display(), "kind": kind, "seqs": seqs}),
+    ))
+}
+
+/// `POST /recycle/restore {"key", "path"}`: brings the item `key` of the bin back at `path`,
+/// by default the path it had (module docs). 200 `{"id", "path", "kind", "seqs"}`.
+pub(super) async fn restore(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let restored = async {
+        let account = writer(&state, &headers).await?;
+        let body: RestoreBody = json_body(&body, "{\"key\", \"path\"}")?;
+        let path = body
+            .path
+            .as_deref()
+            .map(parse_target)
+            .transpose()
+            .map_err(|r| Box::new(r.response()))?;
+        let st = state.clone();
+        super::write::run(move || restore_item(&st, &account, &body.key, path)).await
+    };
+    match restored.await {
+        Ok(answer) => Json(answer).into_response(),
+        Err(r) => *r,
+    }
 }

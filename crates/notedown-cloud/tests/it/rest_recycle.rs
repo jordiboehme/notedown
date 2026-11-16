@@ -1,13 +1,19 @@
-//! The recycle bin of the Mac app: `GET /recycle` lists what the user deleted, on a real socket
-//! next to the device routes.
+//! The recycle bin of the Mac app: `GET /recycle` lists what the user deleted and `POST
+//! /recycle/restore` brings an item back, on a real socket next to the device routes.
 
 use std::io::Write;
 
 use md5::{Digest, Md5};
 use serde_json::{Value, json};
 
+use notedown_cloud::auth::Accounts;
+use notedown_cloud::journal::Origin;
+use notedown_cloud::store::retention::Retention;
+use time::UtcOffset;
+
 use crate::rest_server::{
-    Server, delete, mkdir, q, start, start_imported, upload, uploaded, writer,
+    EMAIL, PASSWORD, Server, delete, mkdir, q, send_json, start, start_imported, upload, uploaded,
+    writer,
 };
 
 fn md5_hex(bytes: &[u8]) -> String {
@@ -207,4 +213,343 @@ fn the_bin_pages() {
             "{bad}"
         );
     }
+}
+
+// ------------------------------------------------------------------------------- restore
+
+/// `POST /recycle/restore` with `body`: (status, answer, `Retry-After`).
+fn restore(s: &Server, token: &str, body: Value) -> (u16, Value, Option<String>) {
+    send_json(s, token, "POST", "/recycle/restore", Some(body))
+}
+
+/// The key of the only item of the bin.
+fn only_key(s: &Server, token: &str) -> String {
+    let (items, _) = bin(s, token, "");
+    assert_eq!(items.len(), 1, "{items:?}");
+    items[0]["key"].as_str().unwrap().to_string()
+}
+
+/// Every journal event as its JSON line.
+fn events(s: &Server) -> Vec<Value> {
+    s.state
+        .journal
+        .read_from(1)
+        .unwrap()
+        .map(|e| serde_json::from_str(&e.unwrap().to_line()).unwrap())
+        .collect()
+}
+
+fn files(s: &Server) -> std::path::PathBuf {
+    s.data.join("accounts/jordi/files")
+}
+
+/// Uploads `bytes` to `path` and deletes it: the key of its item.
+fn deleted(s: &Server, token: &str, path: &str, bytes: &[u8]) -> (u64, String) {
+    let id = uploaded(s, token, path, bytes);
+    assert_eq!(delete(s, token, id).0, 200);
+    let (items, _) = bin(s, token, "");
+    let item = items.iter().find(|i| i["path"] == path).unwrap();
+    (id, item["key"].as_str().unwrap().to_string())
+}
+
+#[test]
+fn a_restore_answers_the_new_id() {
+    let s = start_imported();
+    let t = writer(&s);
+    let (old, key) = deleted(&s, &t, "NOTE/Note/a.txt", b"bytes");
+    let n = events(&s).len();
+    let (status, answer, _) = restore(&s, &t, json!({"key": key}));
+    assert_eq!(status, 200, "{answer}");
+    let id = answer["id"].as_u64().unwrap();
+    assert_ne!(id, old);
+    let seqs = answer["seqs"].as_array().unwrap().clone();
+    assert_eq!(seqs.len(), 1, "{answer}");
+    assert_eq!(
+        answer,
+        json!({"id": id, "path": "NOTE/Note/a.txt", "kind": "file", "seqs": seqs})
+    );
+    let r = s.request("GET", Some(&t), &format!("/files/{id}"));
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(r.bytes().unwrap().as_ref(), b"bytes");
+    let new = events(&s)[n..].to_vec();
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert_eq!(new[0]["type"], "file.created");
+    assert_eq!(new[0]["origin"], "app");
+    assert_eq!(new[0]["id"], id);
+    assert_eq!(new[0]["seq"], seqs[0]);
+    assert!(
+        new[0].get("device").is_none_or(Value::is_null),
+        "{}",
+        new[0]
+    );
+    assert_eq!(bin(&s, &t, "").0, Vec::<Value>::new());
+}
+
+#[test]
+fn a_taken_path_is_name_taken_and_another_path_works() {
+    let s = start_imported();
+    let t = writer(&s);
+    let (_, key) = deleted(&s, &t, "NOTE/Note/a.txt", b"old");
+    // Another spelling of the name is taken too.
+    uploaded(&s, &t, "NOTE/Note/A.txt", b"new");
+    let n = events(&s).len();
+    let (status, answer, _) = restore(&s, &t, json!({"key": key}));
+    assert_eq!(status, 409, "{answer}");
+    assert_eq!(answer, json!({"error": "name_taken", "existing": "A.txt"}));
+    assert_eq!(events(&s).len(), n);
+    assert_eq!(keys(&bin(&s, &t, "").0), std::slice::from_ref(&key));
+
+    let (status, answer, _) = restore(&s, &t, json!({"key": key, "path": "NOTE/Note/Old/b.txt"}));
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["path"], "NOTE/Note/Old/b.txt");
+    assert_eq!(
+        std::fs::read(files(&s).join("NOTE/Note/Old/b.txt")).unwrap(),
+        b"old"
+    );
+    // The missing folder came first.
+    let new = events(&s)[n..].to_vec();
+    let types: Vec<&str> = new.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(types, ["folder.created", "file.created"], "{new:?}");
+}
+
+#[test]
+fn a_folder_restore_into_a_taken_path_is_name_taken() {
+    let s = start_imported();
+    let t = writer(&s);
+    uploaded(&s, &t, "NOTE/Note/W/a.txt", b"aa");
+    uploaded(&s, &t, "NOTE/Note/W/S/b.txt", b"bbb");
+    let (_, folder) = mkdir(&s, &t, "NOTE/Note/W");
+    assert_eq!(delete(&s, &t, folder["id"].as_u64().unwrap()).0, 200);
+    let key = only_key(&s, &t);
+    // A folder is never merged into a folder that is there.
+    assert_eq!(mkdir(&s, &t, "NOTE/Note/W").0, 201);
+    let (status, answer, _) = restore(&s, &t, json!({"key": key}));
+    assert_eq!(status, 409, "{answer}");
+    assert_eq!(answer, json!({"error": "name_taken", "existing": "W"}));
+
+    let (status, answer, _) = restore(&s, &t, json!({"key": key, "path": "NOTE/Note/W2"}));
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["kind"], "folder");
+    assert_eq!(answer["path"], "NOTE/Note/W2");
+    assert_eq!(
+        std::fs::read(files(&s).join("NOTE/Note/W2/S/b.txt")).unwrap(),
+        b"bbb"
+    );
+    assert!(bin(&s, &t, "").0.is_empty());
+}
+
+#[test]
+fn a_restore_under_a_file_is_not_a_folder() {
+    let s = start_imported();
+    let t = writer(&s);
+    let (_, key) = deleted(&s, &t, "NOTE/Note/a.txt", b"a");
+    uploaded(&s, &t, "NOTE/Note/f.txt", b"f");
+    let (status, answer, _) = restore(&s, &t, json!({"key": key, "path": "NOTE/Note/f.txt/a.txt"}));
+    assert_eq!(status, 409, "{answer}");
+    assert_eq!(answer, json!({"error": "not_a_folder"}));
+    assert_eq!(keys(&bin(&s, &t, "").0), [key]);
+}
+
+#[test]
+fn a_restore_outside_the_device_trees_is_not_writable() {
+    let s = start_imported();
+    let t = writer(&s);
+    let (_, key) = deleted(&s, &t, "NOTE/Note/a.txt", b"a");
+    for path in ["NOTE/a.txt", "NOTE/Note", "other/a.txt"] {
+        let (status, answer, _) = restore(&s, &t, json!({"key": key, "path": path}));
+        assert_eq!(
+            (status, answer),
+            (403, json!({"error": "not_writable"})),
+            "{path}"
+        );
+    }
+    let (status, answer, _) = restore(&s, &t, json!({"key": key, "path": "NOTE/Note/.a"}));
+    assert_eq!((status, answer), (400, json!({"error": "bad_name"})));
+    for body in [
+        json!({"path": "NOTE/Note/a.txt"}),
+        json!({"key": 5}),
+        json!([]),
+    ] {
+        let (status, answer, _) = restore(&s, &t, body.clone());
+        assert_eq!(
+            (status, &answer["error"]),
+            (400, &json!("bad_request")),
+            "{body}"
+        );
+    }
+    assert_eq!(keys(&bin(&s, &t, "").0), [key]);
+}
+
+#[test]
+fn a_restore_waits_while_a_device_syncs() {
+    let s = start_imported();
+    let t = writer(&s);
+    let (_, key) = deleted(&s, &t, "NOTE/Note/a.txt", b"a");
+    s.state
+        .sync_locks
+        .start("jordi", "SN078C10000000", s.state.now_ms());
+    let n = events(&s).len();
+    let (status, answer, retry) = restore(&s, &t, json!({"key": key}));
+    assert_eq!(status, 423, "{answer}");
+    assert_eq!(answer, json!({"error": "device_syncing"}));
+    assert_eq!(retry.as_deref(), Some("5"));
+    assert_eq!(events(&s).len(), n);
+    // Reads go on: the item is still listed.
+    assert_eq!(keys(&bin(&s, &t, "").0), [key]);
+}
+
+#[test]
+fn restore_answers_scan_hold() {
+    let s = start();
+    assert!(s.state.config.protect);
+    let t = writer(&s);
+    // Any key: the gate comes before the lookup.
+    let (status, answer, _) = restore(&s, &t, json!({"key": "1/NOTE/Note/a.txt"}));
+    assert_eq!((status, answer), (423, json!({"error": "not_imported"})));
+
+    let s = start_imported();
+    let t = writer(&s);
+    let (_, key) = deleted(&s, &t, "NOTE/Note/a.txt", b"a");
+    let gone = s.put("gone.note", b"g");
+    std::fs::remove_file(files(&s).join(&gone)).unwrap();
+    assert_eq!(
+        s.get(Some(&t), &format!("/tree?path={}", q("NOTE/Note"))).0,
+        423
+    );
+    let (status, answer, _) = restore(&s, &t, json!({"key": key}));
+    assert_eq!((status, answer), (423, json!({"error": "scan_hold"})));
+    assert!(!files(&s).join("NOTE/Note/a.txt").exists());
+}
+
+#[test]
+fn a_restore_needs_a_write_token() {
+    let s = start_imported();
+    let t = writer(&s);
+    let (_, key) = deleted(&s, &t, "NOTE/Note/a.txt", b"a");
+    let (status, answer, _) = restore(&s, &s.token(), json!({"key": key}));
+    assert_eq!((status, answer), (403, json!({"error": "read_only_token"})));
+    let (status, answer, _) = restore(&s, "no-token", json!({"key": key}));
+    assert_eq!((status, answer), (401, json!({"error": "token_refused"})));
+    assert_eq!(keys(&bin(&s, &t, "").0), [key]);
+}
+
+#[test]
+fn a_second_restore_of_the_same_item_is_not_found() {
+    let s = start_imported();
+    let t = writer(&s);
+    let (_, key) = deleted(&s, &t, "NOTE/Note/a.txt", b"a");
+    assert_eq!(restore(&s, &t, json!({"key": key})).0, 200);
+    let n = events(&s).len();
+    let (status, answer, _) = restore(&s, &t, json!({"key": key}));
+    assert_eq!((status, answer), (404, json!({"error": "not_found"})));
+    let (status, answer, _) = restore(&s, &t, json!({"key": "1/NOTE/Note/none.txt"}));
+    assert_eq!((status, answer), (404, json!({"error": "not_found"})));
+    assert_eq!(events(&s).len(), n);
+}
+
+#[test]
+fn a_restore_of_an_item_the_prune_removed_is_not_found() {
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    let s = start_imported();
+    let t = writer(&s);
+    let (_, key) = deleted(&s, &t, "NOTE/Note/a.txt", b"a");
+    let retention = Retention {
+        keep_latest: 3,
+        keep_daily: 7,
+        keep_monthly: 12,
+        keep_deleted_days: 90,
+    };
+    let report = s
+        .state
+        .store("jordi")
+        .unwrap()
+        .prune_recycle(
+            &s.state.journal,
+            &retention,
+            s.state.now_ms() + 100 * DAY,
+            UtcOffset::UTC,
+            Origin::Cli,
+            false,
+        )
+        .unwrap();
+    assert_eq!(report.removed.len(), 1, "{report:?}");
+    let (status, answer, _) = restore(&s, &t, json!({"key": key}));
+    assert_eq!((status, answer), (404, json!({"error": "not_found"})));
+    assert!(!files(&s).join("NOTE/Note/a.txt").exists());
+}
+
+#[test]
+fn a_restore_counts_against_the_quota() {
+    let s = start_imported();
+    let t = writer(&s);
+    let accounts = Accounts::new(&s.data);
+    let mut a = accounts.get("jordi").unwrap().unwrap();
+    a.quota_bytes = Some(10);
+    accounts.save(&a).unwrap();
+    let (_, key) = deleted(&s, &t, "NOTE/Note/a.txt", b"12345678");
+    let b = uploaded(&s, &t, "NOTE/Note/b.txt", b"12345");
+    let n = events(&s).len();
+    let (status, answer, _) = restore(&s, &t, json!({"key": key}));
+    assert_eq!((status, answer), (507, json!({"error": "quota_exceeded"})));
+    assert_eq!(events(&s).len(), n);
+    assert_eq!(keys(&bin(&s, &t, "").0), std::slice::from_ref(&key));
+
+    assert_eq!(delete(&s, &t, b).0, 200);
+    let (status, answer, _) = restore(&s, &t, json!({"key": key}));
+    assert_eq!(status, 200, "{answer}");
+    // The cached usage learned the 8 bytes: 3 more are too many.
+    let (status, answer) = upload(&s, &t, "NOTE/Note/c.txt", b"123");
+    assert_eq!((status, answer), (507, json!({"error": "quota_exceeded"})));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_restore_of_a_damaged_slot_is_slot_damaged() {
+    let s = start_imported();
+    let t = writer(&s);
+    uploaded(&s, &t, "NOTE/Note/W/a.txt", b"a");
+    let (_, folder) = mkdir(&s, &t, "NOTE/Note/W");
+    assert_eq!(delete(&s, &t, folder["id"].as_u64().unwrap()).0, 200);
+    let key = only_key(&s, &t);
+    let slot = s.data.join("accounts/jordi/recycle").join(&key);
+    std::os::unix::fs::symlink("/etc", slot.join("link")).unwrap();
+    let n = events(&s).len();
+    let (status, answer, _) = restore(&s, &t, json!({"key": key}));
+    assert_eq!((status, answer), (409, json!({"error": "slot_damaged"})));
+    assert_eq!(events(&s).len(), n);
+    assert!(!files(&s).join("NOTE/Note/W").exists());
+}
+
+#[test]
+fn a_restore_after_a_device_delete_shows_the_file_to_the_device() {
+    use crate::fake_device::{Device, SERIAL, sign_in};
+    let s = start_imported();
+    let t = writer(&s);
+    let old = uploaded(&s, &t, "NOTE/Note/a.txt", b"bytes");
+    let mut d = sign_in(s.base.clone(), EMAIL, PASSWORD);
+    let start = json!({"equipmentNo": SERIAL});
+    let end = json!({"equipmentNo": SERIAL, "flag": "Y"});
+    d.ok("/api/file/2/files/synchronous/start", start.clone());
+    let id = Device::id_of(&d.listing(), "NOTE/Note/a.txt");
+    assert_eq!(id, old.to_string());
+    d.ok(
+        "/api/file/3/files/query_v3",
+        json!({"equipmentNo": SERIAL, "id": id}),
+    );
+    d.ok(
+        "/api/file/3/files/delete_folder_v3",
+        json!({"equipmentNo": SERIAL, "id": id}),
+    );
+    d.ok("/api/file/2/files/synchronous/end", end.clone());
+
+    let key = only_key(&s, &t);
+    let (status, answer, _) = restore(&s, &t, json!({"key": key}));
+    assert_eq!(status, 200, "{answer}");
+    let new = answer["id"].as_u64().unwrap();
+    assert_ne!(new, old);
+
+    d.ok("/api/file/2/files/synchronous/start", start);
+    let entries = d.listing();
+    assert_eq!(Device::id_of(&entries, "NOTE/Note/a.txt"), new.to_string());
+    d.ok("/api/file/2/files/synchronous/end", end);
 }

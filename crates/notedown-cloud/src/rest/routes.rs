@@ -72,6 +72,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(&path("/folders"), json_body(post(write::folder)))
         .route(&path("/move"), json_body(post(write::move_)))
         .route(&path("/recycle"), get_only(get(recycle::list)))
+        .route(&path("/recycle/restore"), json_body(post(recycle::restore)))
         .route(PREFIX, any(no_route))
         .route(&path("/"), any(no_route))
         .route(&path("/{*rest}"), any(no_route))

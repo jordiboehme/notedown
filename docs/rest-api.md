@@ -66,6 +66,7 @@ A refused token gets 401 `token_refused` with `WWW-Authenticate: Bearer`. A toke
 | `GET /account` | read | `{"slug", "userId", "devices"}` |
 | `GET /tree` | read | List a folder |
 | `GET /entries/{id}` | read | One file or folder |
+| `GET /entries?path=` | read | One file or folder, found by its path |
 | `GET` and `HEAD /files/{id}` | read | Download a file |
 | `GET /journal` | read | What changed since a `seq` |
 | `GET /events` | read | The file and folder changes since a `seq` |
@@ -165,6 +166,10 @@ Lists the children of the folder at `path` (the root by default), one page at a 
 ### `GET /entries/{id}`
 
 The same entry object as in `/tree`. 404 `not_found` for an unknown id, a file that is gone from disk and a hidden name. An id that is no number is a 400.
+
+### `GET /entries?path=`
+
+The same entry object as `GET /entries/{id}`, found by its path. The server scans the parent folder first, as it does for the id. So a file that someone put there by hand is journaled and has its id before the app sees it. 404 `not_found` for an unknown path, a file that is gone from disk and a hidden name. 400 `bad_name` for a path that does not parse, a path with a dot segment, and a missing or empty path.
 
 ### `GET /files/{id}` and `HEAD /files/{id}`
 

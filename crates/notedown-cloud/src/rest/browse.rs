@@ -20,6 +20,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
+use super::check::WriteRefusal;
 use super::errors::write_error;
 use super::paging::{self, BadCursor, CursorKind};
 use super::routes::{Refusal, account_of, bad_request, error, internal, not_modified, query};
@@ -110,6 +111,18 @@ fn entry_of(
     let Some((_, path)) = store.kind_and_path_of(id)? else {
         return Ok(None);
     };
+    entry_scanned(state, store, guard, &path, Some(id))
+}
+
+/// The entry at `path` after a scan of its parent folder (direct children); `None` when
+/// nothing is there or the path is hidden. With `id`, an entry of another id is none.
+fn entry_scanned(
+    state: &AppState,
+    store: &Store,
+    guard: &WriteGuard,
+    path: &WirePath,
+    id: Option<u64>,
+) -> crate::Result<Option<Entry>> {
     if path.is_hidden() {
         return Ok(None);
     }
@@ -120,6 +133,9 @@ fn entry_of(
         &path.parent().unwrap_or_else(WirePath::root),
         false,
     )?;
+    let Some(id) = id else {
+        return store.entry(guard, path);
+    };
     let Some(path) = store.path_of(id)? else {
         return Ok(None);
     };
@@ -333,6 +349,45 @@ pub(super) async fn entry(
         let guard = store.lock_recovered(&st.journal)?;
         gate_locked(&st, &store)?;
         entry_of(&st, &store, &guard, id)
+    })
+    .await;
+    match found {
+        Ok(Some(e)) => Json(AppEntry::from(&e)).into_response(),
+        Ok(None) => error(StatusCode::NOT_FOUND, "not_found"),
+        Err(r) => *r,
+    }
+}
+
+#[derive(Deserialize)]
+struct EntryQuery {
+    path: Option<String>,
+}
+
+/// `GET /entries?path=`: the entry object of `/entries/{id}` for the entry at `path`, after a
+/// scan of its parent folder. 404 `not_found` for an unknown, hidden or gone path, 400
+/// `bad_name` for a path that does not parse (or is missing).
+pub(super) async fn entry_by_path(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let account = match account_of(&state, &headers).await {
+        Ok(a) => a,
+        Err(r) => return *r,
+    };
+    let path = match query::<EntryQuery>(&uri) {
+        Ok(q) => q.path.as_deref().map(WirePath::parse_named),
+        Err(r) => return *r,
+    };
+    let Some(Ok(path)) = path else {
+        return WriteRefusal::BadName.response();
+    };
+    let st = state.clone();
+    let found = run(move || {
+        let store = st.store(&account.slug)?;
+        let guard = store.lock_recovered(&st.journal)?;
+        gate_locked(&st, &store)?;
+        entry_scanned(&st, &store, &guard, &path, None)
     })
     .await;
     match found {

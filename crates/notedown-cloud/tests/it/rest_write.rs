@@ -299,6 +299,70 @@ fn an_entry_by_id() {
 }
 
 #[test]
+fn an_entry_is_found_by_path() {
+    let s = start_imported();
+    let token = s.token();
+    let path = s.put("a.note", b"abc");
+    let id = id_of(&s, &path);
+    let (status, by_path) = s.get(Some(&token), &format!("/entries?path={}", q(&path)));
+    assert_eq!(status, 200, "{by_path}");
+    let (_, by_id) = s.get(Some(&token), &format!("/entries/{id}"));
+    assert_eq!(by_path, by_id);
+    // A folder too.
+    let (status, folder) = s.get(Some(&token), &format!("/entries?path={}", q("NOTE/Note")));
+    assert_eq!(status, 200, "{folder}");
+    assert_eq!(folder["kind"], "folder");
+    // The token is needed.
+    let (status, _) = s.get(None, &format!("/entries?path={}", q(&path)));
+    assert_eq!(status, 401);
+}
+
+#[test]
+fn an_unknown_or_hidden_path_is_not_found() {
+    let s = start_imported();
+    let token = s.token();
+    hand(&s, "NOTE/Note/.hidden.note", b"x");
+    for p in ["NOTE/Note/none.note", "NOTE/Note/.hidden.note", "note/Note"] {
+        let (status, answer) = s.get(Some(&token), &format!("/entries?path={}", q(p)));
+        assert_eq!(
+            (status, answer),
+            (404, json!({"error": "not_found"})),
+            "{p}"
+        );
+    }
+}
+
+#[test]
+fn a_path_that_does_not_parse_is_bad_name() {
+    let s = start_imported();
+    let token = s.token();
+    for p in ["NOTE/../NOTE", "NOTE/./Note", ""] {
+        let (status, answer) = s.get(Some(&token), &format!("/entries?path={}", q(p)));
+        assert_eq!((status, &answer["error"]), (400, &json!("bad_name")), "{p}");
+    }
+}
+
+#[test]
+fn a_file_made_by_hand_is_found_after_the_scan() {
+    let s = start_imported();
+    let token = s.token();
+    hand(&s, "NOTE/Note/hand.note", b"by hand");
+    let (status, entry) = s.get(
+        Some(&token),
+        &format!("/entries?path={}", q("NOTE/Note/hand.note")),
+    );
+    assert_eq!(status, 200, "{entry}");
+    let id = entry["id"].as_u64().unwrap();
+    assert_eq!(entry["md5"], md5_hex(b"by hand"));
+    let created = events(&s)
+        .into_iter()
+        .find(|e| e["type"] == "file.created" && e["path"] == "NOTE/Note/hand.note")
+        .expect("the scan journals the file");
+    assert_eq!(created["origin"], "scan");
+    assert_eq!(created["id"], json!(id));
+}
+
+#[test]
 fn a_download_gives_the_bytes_and_a_strong_etag() {
     let s = start_imported();
     let token = s.token();

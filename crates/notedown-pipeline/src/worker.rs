@@ -41,6 +41,7 @@ pub use due::{AccountStore, DueNote, KeywordCache, due};
 
 use crate::cursor;
 use crate::errors::Errors;
+use crate::markdown;
 use crate::records;
 use crate::retention;
 use crate::scope::in_scope;
@@ -243,6 +244,8 @@ pub struct Worker {
     say: Messages,
     /// The last message said per topic, so a failure that repeats is said once.
     said: RefCell<BTreeMap<String, String>>,
+    /// The Markdown writer of each account, when `markdown_dir` is set.
+    markdown: BTreeMap<String, markdown::Writer>,
 }
 
 impl Worker {
@@ -276,6 +279,7 @@ impl Worker {
             keywords: RefCell::default(),
             say: Arc::new(|m: &str| eprintln!("{m}")),
             said: RefCell::default(),
+            markdown: BTreeMap::new(),
         }
     }
 
@@ -612,6 +616,41 @@ impl Worker {
         Ok(Outcome::Done)
     }
 
+    /// Brings the Markdown files of account `slug` up to date with the notes written since
+    /// the last call. A failure is said once and the notes are tried again after the next
+    /// pass; it never fails the pass. Does nothing without `markdown_dir`.
+    fn write_markdown(&mut self, slug: &str, text: &TextStore) {
+        let Some(dir) = self.setup.cfg.markdown_dir.clone() else {
+            return;
+        };
+        let topic = format!("markdown:{slug}");
+        let changed = text.take_touched();
+        let writer = match self.markdown.entry(slug.to_string()) {
+            std::collections::btree_map::Entry::Occupied(o) => o.into_mut(),
+            std::collections::btree_map::Entry::Vacant(v) => {
+                match markdown::Writer::new(&dir, &text.dir().join(markdown::MANIFEST_FILE)) {
+                    Ok(w) => v.insert(w),
+                    Err(e) => {
+                        // The notes of this call are looked at by the first sync of the
+                        // writer, which looks at every note.
+                        self.say_once(
+                            &topic,
+                            format!("notedown pipeline: account {slug}: Markdown files: {e}"),
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+        match writer.sync(text, slug, &changed) {
+            Ok(()) => self.settled(&topic),
+            Err(e) => self.say_once(
+                &topic,
+                format!("notedown pipeline: account {slug}: Markdown files: {e}"),
+            ),
+        }
+    }
+
     /// One pass over all accounts: the due notes whose settle time is over (all of them with
     /// `ignore_settle`), page by page, each page written at once.
     pub fn run_once(&mut self, ignore_settle: bool) -> Result<Progress> {
@@ -711,6 +750,9 @@ impl Worker {
                 }
             }
             text.set_last_run(&lock, self.clock.now_ms())?;
+        }
+        for (slug, text) in stores.iter() {
+            self.write_markdown(slug, text);
         }
         self.clear_work(&lock);
         if let Some(n) = note
@@ -1017,6 +1059,8 @@ impl Worker {
         // Only the stores of this pass stay open: no stamp or prune touches another one, and a
         // removed account's folder is never made again.
         stores.retain(|slug, _| accounts.iter().any(|a| &a.slug == slug));
+        self.markdown
+            .retain(|slug, _| accounts.iter().any(|a| &a.slug == slug));
         for account in accounts {
             let slug = account.slug.clone();
             let found = (|| -> Result<Option<Vec<DueNote>>> {
@@ -1057,6 +1101,7 @@ impl Worker {
                 Ok(None) => {
                     self.settled(&topic);
                     stores.remove(&slug);
+                    self.markdown.remove(&slug);
                     unsure.insert(slug);
                     continue;
                 }
@@ -1064,7 +1109,10 @@ impl Worker {
                     self.say_once(&topic, format!("notedown pipeline: account {slug}: {e}"));
                     self.keep_error(lock, &slug, e.to_string());
                     // A failed write blocks the store until a repair: open it again next time.
-                    stores.remove(&slug);
+                    // The notes written before the failure keep their Markdown files current.
+                    if let Some(text) = stores.remove(&slug) {
+                        self.write_markdown(&slug, &text);
+                    }
                     unsure.insert(slug);
                     continue;
                 }
@@ -1166,6 +1214,11 @@ impl Worker {
                     for slug in stores.keys() {
                         self.keep_error(lock, slug, Error::ModelMissing.to_string());
                     }
+                    // Moves, deletes and scope changes are done, and notes with text need no
+                    // model: their files are kept also while the model is missing.
+                    for (slug, text) in stores.iter() {
+                        self.write_markdown(slug, text);
+                    }
                     return Err(Error::ModelMissing);
                 }
                 Err(e) => {
@@ -1187,7 +1240,9 @@ impl Worker {
         // account (or one whose record or note bytes the source could not give) keeps its
         // cursor.
         for slug in broken {
-            stores.remove(&slug);
+            if let Some(text) = stores.remove(&slug) {
+                self.write_markdown(&slug, &text);
+            }
             unsure.insert(slug);
         }
         self.clear_work(lock);
@@ -1201,6 +1256,9 @@ impl Worker {
                 0
             };
             text.set_pass_end(lock, end, left, pages, due)?;
+        }
+        for (slug, text) in stores.iter() {
+            self.write_markdown(slug, text);
         }
         progress.next_due = next_due;
         Ok((progress, unsure))

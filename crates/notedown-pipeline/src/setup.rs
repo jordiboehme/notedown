@@ -149,6 +149,15 @@ impl Setup {
         }
     }
 
+    /// The setup with the Markdown folder of the `--markdown-dir` flag: a given flag wins over
+    /// `markdown_dir` of the config, `None` keeps the config's.
+    pub fn with_markdown_dir(mut self, flag: Option<PathBuf>) -> Setup {
+        if let Some(dir) = flag {
+            self.cfg.markdown_dir = Some(dir);
+        }
+        self
+    }
+
     /// The accounts the worker serves: the configured list, else every account the server
     /// lists (with a URL: every account that has a token file). The only place this filter lives.
     pub fn served(&self) -> Result<Vec<ServerAccount>> {

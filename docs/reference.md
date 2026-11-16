@@ -244,6 +244,33 @@ seconds. The fields:
 - `consumers`: one entry per consumer of the changes, `{"name", "seq", "ackedAt", "readAt",
   "notesBehind", "more"}`.
 
+## Markdown files
+
+The pipeline can keep the text of each note as a Markdown file in a folder you pick. It is off by
+default. Turn it on with `notedown pipeline --data DIR --markdown-dir <DIR>`, or with `markdown_dir`
+in the `[pipeline]` section of `pipeline.toml` (two machines) or `server.toml` (one machine). The flag
+wins over the config. A relative `markdown_dir` is below the data folder; `~` is not expanded, so use a
+full path. The Mac app passes `~/Documents/Markdown` or the folder you chose.
+
+```toml
+[pipeline]
+markdown_dir = "/Users/me/Documents/Markdown"
+```
+
+- Layout: the note's folder as on the device, then `<title>.md`. `Note/Work/Meeting.note` gives
+  `Work/Meeting.md`, a note in `MyStyle` goes to `MyStyle/...`, a note in another folder keeps its
+  path (`Document/Books/a.note` gives `Document/Books/a.md`).
+- Content: the same document the MCP server's `get_note` gives: frontmatter, the text of each page and
+  the anchor of every block as an HTML comment.
+- A note gets its file once a page has text. The file is written again after a pass that changed its
+  text, its path or its scope. A file whose text is the same is not written again, so sync tools see no
+  change. A moved note moves its file, a deleted note or a note that leaves the scope loses it.
+- Notedown changes only files it wrote. They are listed in `pipeline/<account>/markdown.json`. When a
+  name is taken by another file, the note gets `<title> (2).md` (then 3, and so on). Folders it made
+  go again when a move or delete leaves them empty.
+- With another folder, every note is written to the new folder. The files in the old folder stay.
+- Files are written through a temp file and a rename, so a reader never sees half a file.
+
 ## Format documentation and tests
 
 The `.note` format is documented in the [note format](note-format.md). The parser in `crates/notedown-note` is a

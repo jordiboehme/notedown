@@ -2341,6 +2341,52 @@ mod pipeline_and_mcp {
     }
 
     #[test]
+    fn pipeline_markdown_dir_flag_wins_over_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        notedown_cloud::auth::Accounts::new(data)
+            .create("jordi", "jordi@example.org", "secret")
+            .unwrap();
+        let manifest = data.join("pipeline/jordi/markdown.json");
+        // Without the flag and without markdown_dir: no Markdown files.
+        let out = pipeline_cmd(data, &["--once"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!manifest.exists());
+
+        let from_config = data.join("from-config");
+        std::fs::write(
+            data.join("server.toml"),
+            format!("[pipeline]\nmarkdown_dir = {:?}\n", from_config),
+        )
+        .unwrap();
+        let out = pipeline_cmd(data, &["--once"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let m: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        assert_eq!(m["dir"], from_config.to_str().unwrap());
+
+        let flag = data.join("from-flag");
+        let flag_arg = flag.to_str().unwrap();
+        let out = pipeline_cmd(data, &["--once", "--markdown-dir", flag_arg]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let m: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        assert_eq!(m["dir"], flag_arg);
+    }
+
+    #[test]
     fn pipeline_once_without_the_model_says_so_once() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path();

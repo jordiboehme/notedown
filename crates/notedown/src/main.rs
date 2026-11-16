@@ -86,6 +86,10 @@ struct PipelineArgs {
     /// Stop when the process PID is no longer the parent (for the Mac app)
     #[arg(long, value_name = "PID", hide = true, conflicts_with_all = ["once", "reocr"])]
     exit_with_parent: Option<u32>,
+    /// Keep each note with text as a Markdown file in this folder (wins over markdown_dir in
+    /// the config)
+    #[arg(long, value_name = "DIR")]
+    markdown_dir: Option<PathBuf>,
 }
 
 #[cfg(feature = "ocr")]
@@ -2153,7 +2157,14 @@ fn pipeline_command(args: PipelineArgs) -> Result<ExitCode> {
     }
     // Without <data>/pipeline.toml the server's data is this folder; with it, the folder named
     // there, and this one keeps only the pipeline's own data.
-    let setup = notedown_pipeline::setup::Setup::load(&data)?;
+    let markdown_dir = match args.markdown_dir {
+        Some(dir) => Some(
+            std::path::absolute(&dir)
+                .with_context(|| format!("--markdown-dir {}", dir.display()))?,
+        ),
+        None => None,
+    };
+    let setup = notedown_pipeline::setup::Setup::load(&data)?.with_markdown_dir(markdown_dir);
     // The model is loaded when a page is due, as `notedown convert` loads it.
     let loader: EngineLoader = Box::new(|| {
         let paths = model::resolve(&DEFAULT_MODEL, None, None)?;

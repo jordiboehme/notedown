@@ -333,6 +333,12 @@ fn a_new_serve_address_is_told() {
     // of a fresh start changes nothing.
     assert!(wait_until(|| told.load(Ordering::SeqCst) >= 4));
     assert_eq!(told.load(Ordering::SeqCst), 4);
+    // A short, bounded look that no more come.
+    let until = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < until {
+        assert_eq!(told.load(Ordering::SeqCst), 4);
+        std::thread::sleep(Duration::from_millis(20));
+    }
     p.stop_all();
 }
 

@@ -157,8 +157,12 @@ fn the_library_is_bound_to_base_account_and_token() {
     let (library, events) = make(store.clone(), place.func());
 
     library.refresh();
-    assert_eq!(library.state(), StateView::of(LibraryState::Ready));
-    assert_eq!(events.all(), vec![state_event(LibraryState::Ready)]);
+    assert_eq!(library.state().unwrap(), StateView::of(LibraryState::Ready));
+    // A binding says its state, then has the window list again.
+    assert_eq!(
+        events.all(),
+        vec![state_event(LibraryState::Ready), LibraryEvent::Relist]
+    );
     assert_eq!(store.gets(), 1);
     let first = library.session().unwrap();
     assert_eq!(first.rest().base(), server.base());
@@ -174,7 +178,7 @@ fn the_library_is_bound_to_base_account_and_token() {
     library.refresh();
     assert_eq!(store.gets(), 1);
     assert_eq!(library.generation(), generation);
-    assert_eq!(events.all().len(), 1);
+    assert_eq!(events.all().len(), 2);
     assert!(!first.is_cancelled());
 
     // A new token of the same account (a login): read once more, the old binding ends.
@@ -197,8 +201,8 @@ fn the_library_is_bound_to_base_account_and_token() {
         Some(LibraryError::NotReady(LibraryState::LoggedOut))
     );
     assert_eq!(
-        events.all().last(),
-        Some(&state_event(LibraryState::LoggedOut))
+        events.all()[events.all().len() - 2..],
+        [state_event(LibraryState::LoggedOut), LibraryEvent::Relist]
     );
 
     // Another base with the same key: the app's own server on a new port.
@@ -257,17 +261,20 @@ fn log_out_stops_the_library() {
 
     assert!(session.is_cancelled(), "the jobs of the login end");
     assert_eq!(
-        library.state(),
+        library.state().unwrap(),
         StateView {
             state: LibraryState::LoggedOut,
             text: Some("Log in to see your library.".into()),
+            page: Some("account".into()),
         }
     );
     assert_eq!(
         events.all(),
         vec![
             state_event(LibraryState::Ready),
-            state_event(LibraryState::LoggedOut)
+            LibraryEvent::Relist,
+            state_event(LibraryState::LoggedOut),
+            LibraryEvent::Relist,
         ]
     );
     assert_eq!(
@@ -351,7 +358,7 @@ fn a_login_binds_the_library() {
     let store = Arc::new(MemoryStore::new());
     let (library, events) = library_of(&state, store.clone());
     library.refresh();
-    assert_eq!(library.state().state, LibraryState::LoggedOut);
+    assert_eq!(library.state().unwrap().state, LibraryState::LoggedOut);
 
     log_in_to(
         &LoginGate::default(),
@@ -418,7 +425,7 @@ fn each_state_has_its_text_and_settings_page() {
         assert_eq!(state.settings_page(), page, "{name}");
         assert_eq!(
             serde_json::to_value(state_event(state)).unwrap(),
-            json!({ "type": "state", "state": name, "text": text }),
+            json!({ "type": "state", "state": name, "text": text, "page": page }),
         );
     }
     // Every page is one of the settings window.
@@ -436,7 +443,7 @@ fn each_state_has_its_text_and_settings_page() {
         place.0.lock().unwrap().1.listen = vec!["127.0.0.1:41004".parse().unwrap()];
         let (library, _) = make(store, place.func());
         library.refresh();
-        library.state().state
+        library.state().unwrap().state
     };
     let local = |account: Option<&str>| AppConfig {
         mode: Mode::Local,
@@ -481,10 +488,11 @@ fn a_401_drops_the_token_and_says_so() {
     );
     server.next();
     assert_eq!(
-        library.state(),
+        library.state().unwrap(),
         StateView {
             state: LibraryState::Refused,
             text: Some("The server refused the login. Log in again.".into()),
+            page: Some("account".into()),
         }
     );
     assert_eq!(
@@ -502,17 +510,17 @@ fn a_401_drops_the_token_and_says_so() {
     // A new address of the same server does not bring the refused token back.
     place.listen_on(41005);
     library.refresh();
-    assert_eq!(library.state().state, LibraryState::Refused);
+    assert_eq!(library.state().unwrap().state, LibraryState::Refused);
     assert_eq!(store.gets(), 1);
 
     // A login reads the token again.
     store.set("local|jordi", &Token::new("tok-new")).unwrap();
     library.relogin();
-    assert_eq!(library.state().state, LibraryState::Ready);
+    assert_eq!(library.state().unwrap().state, LibraryState::Ready);
 
     // A 401 of a call made under the old login does not drop the new one.
     library.settle(&session, &Err::<(), _>(RestError::TokenRefused));
-    assert_eq!(library.state().state, LibraryState::Ready);
+    assert_eq!(library.state().unwrap().state, LibraryState::Ready);
     assert!(library.session().is_ok());
 }
 
@@ -526,26 +534,28 @@ fn the_state_follows_the_answers() {
     let session = library.session().unwrap();
 
     library.settle(&session, &Err::<(), _>(RestError::Unreachable));
-    assert_eq!(library.state().state, LibraryState::Unreachable);
+    assert_eq!(library.state().unwrap().state, LibraryState::Unreachable);
     // Still bound: the next call may find the server.
     assert!(!session.is_cancelled());
     library.settle(&session, &Ok(()));
-    assert_eq!(library.state().state, LibraryState::Ready);
+    assert_eq!(library.state().unwrap().state, LibraryState::Ready);
     library.settle(&session, &Err::<(), _>(RestError::NotImported));
-    assert_eq!(library.state().state, LibraryState::NotImported);
+    assert_eq!(library.state().unwrap().state, LibraryState::NotImported);
     // Other errors belong to the call, not to the library.
     library.settle(&session, &Err::<(), _>(RestError::NotFound));
-    assert_eq!(library.state().state, LibraryState::NotImported);
+    assert_eq!(library.state().unwrap().state, LibraryState::NotImported);
     library.settle(&session, &Ok(()));
     library.settle(&session, &Ok(()));
+    // Only a binding lists again; a settled call only says the state.
     assert_eq!(
-        events.states(),
+        events.all(),
         [
-            LibraryState::Ready,
-            LibraryState::Unreachable,
-            LibraryState::Ready,
-            LibraryState::NotImported,
-            LibraryState::Ready
+            state_event(LibraryState::Ready),
+            LibraryEvent::Relist,
+            state_event(LibraryState::Unreachable),
+            state_event(LibraryState::Ready),
+            state_event(LibraryState::NotImported),
+            state_event(LibraryState::Ready)
         ]
     );
 }
@@ -638,10 +648,81 @@ fn no_library_event_holds_the_token() {
         assert!(!format!("{event:#?}").contains(token));
     }
     for shown in [
-        serde_json::to_string(&library.state()).unwrap(),
+        serde_json::to_string(&library.state().unwrap()).unwrap(),
         refused.to_string(),
         format!("{refused:?}"),
     ] {
         assert!(!shown.contains(token), "{shown}");
     }
+}
+
+/// A store whose reads fail until `fixed` is set.
+#[derive(Default)]
+struct BrokenStore {
+    inner: MemoryStore,
+    fixed: AtomicBool,
+    gets: AtomicUsize,
+}
+
+impl TokenStore for BrokenStore {
+    fn get(&self, key: &str) -> Result<Option<Token>, TokenError> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        if self.fixed.load(Ordering::SeqCst) {
+            self.inner.get(key)
+        } else {
+            Err(TokenError("locked".into()))
+        }
+    }
+
+    fn set(&self, key: &str, token: &Token) -> Result<(), TokenError> {
+        self.inner.set(key, token)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), TokenError> {
+        self.inner.delete(key)
+    }
+}
+
+#[test]
+fn a_keychain_that_cannot_be_read_says_so_and_is_tried_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let place = Place::local(dir.path(), 41007, Some("jordi"));
+    let store = Arc::new(BrokenStore::default());
+    store.inner.set("local|jordi", &Token::new(TOKEN)).unwrap();
+    let (library, events) = make(store.clone(), place.func());
+
+    library.refresh();
+    let view = library.state().unwrap();
+    assert_eq!(
+        view,
+        StateView {
+            state: LibraryState::LoggedOut,
+            text: Some("The Keychain could not be read.".into()),
+            page: Some("account".into()),
+        }
+    );
+    assert!(library.session().is_err());
+
+    // The next nudge for the same place reads again.
+    store.fixed.store(true, Ordering::SeqCst);
+    library.refresh();
+    assert_eq!(store.gets.load(Ordering::SeqCst), 2);
+    assert_eq!(library.state().unwrap().state, LibraryState::Ready);
+    assert_eq!(
+        events.states(),
+        [LibraryState::LoggedOut, LibraryState::Ready]
+    );
+    for event in events.all() {
+        assert!(!serde_json::to_string(&event).unwrap().contains(TOKEN));
+    }
+}
+
+#[test]
+fn before_the_first_binding_the_state_is_not_known() {
+    let place = Place::new(AppConfig::default());
+    let (library, events) = make(Arc::new(MemoryStore::new()), place.func());
+    assert_eq!(library.state(), None);
+    assert!(events.all().is_empty());
+    library.refresh();
+    assert_eq!(library.state(), Some(StateView::of(LibraryState::NotSetUp)));
 }

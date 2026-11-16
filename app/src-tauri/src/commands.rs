@@ -266,12 +266,15 @@ pub fn log_out_of(
     state: &ConfigState,
     library: &Library,
 ) -> Result<AppConfig, String> {
-    let _no_login = gate.hold();
-    if let Some(key) = token_key(&state.current()) {
-        store.delete(&key).map_err(|e| e.to_string())?;
-    }
-    let forgotten = state.forget_login();
-    // The token is gone also when the config was not saved.
+    let forgotten = {
+        let _no_login = gate.hold();
+        if let Some(key) = token_key(&state.current()) {
+            store.delete(&key).map_err(|e| e.to_string())?;
+        }
+        state.forget_login()
+    };
+    // The token is gone also when the config was not saved. After the login lock, as after a
+    // login: the binding reads the Keychain.
     library.relogin();
     forgotten
 }
@@ -356,16 +359,20 @@ pub fn change_place(
     data_dir: Option<PathBuf>,
     server_url: Option<String>,
 ) -> Result<(AppConfig, ConfigAnswer), String> {
-    let _no_login = gate.hold();
-    let (replaced, config) = state.set_mode_replacing(mode, data_dir, server_url)?;
-    let mut keychain = None;
-    if replaced.account.is_some()
-        && config.account.is_none()
-        && let Some(key) = token_key(&replaced)
-        && let Err(e) = store.delete(&key)
-    {
-        keychain = Some(login::old_login_kept(&e.0));
-    }
+    let (replaced, config, keychain) = {
+        let _no_login = gate.hold();
+        let (replaced, config) = state.set_mode_replacing(mode, data_dir, server_url)?;
+        let mut keychain = None;
+        if replaced.account.is_some()
+            && config.account.is_none()
+            && let Some(key) = token_key(&replaced)
+            && let Err(e) = store.delete(&key)
+        {
+            keychain = Some(login::old_login_kept(&e.0));
+        }
+        (replaced, config, keychain)
+    };
+    // After the login lock, as after a login: the binding reads the Keychain.
     library.refresh();
     Ok((replaced, ConfigAnswer { config, keychain }))
 }
@@ -542,10 +549,11 @@ pub async fn log_out(
     Ok(after)
 }
 
-/// The state of the library and its text, for the library window when it opens. It reads only
-/// what the library keeps: no call and no Keychain read.
+/// The state of the library, its text and its Settings page, for the library window when it
+/// opens; `null` before the first binding (a `state` event follows). It reads only what the
+/// library keeps: no call and no Keychain read.
 #[tauri::command]
-pub fn library_state(library: State<'_, Library>) -> StateView {
+pub fn library_state(library: State<'_, Library>) -> Option<StateView> {
     library.state()
 }
 

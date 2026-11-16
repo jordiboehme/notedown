@@ -22,8 +22,11 @@ export type FolderState = {
 
 export type LibraryState = "loggedOut" | "notSetUp" | "unreachable" | "notImported" | "refused" | "ready";
 
-/** The answer of `library_state`, and the body of a `state` event. */
-export type LibraryStateView = { state: LibraryState; text: string | null };
+/**
+ * The body of a `state` event, and the answer of `library_state` (which is null before the
+ * first binding). `page` is the Settings page its button opens.
+ */
+export type LibraryStateView = { state: LibraryState; text: string | null; page: string | null };
 
 export type Clash = { name: string; existing: string; canReplace: boolean };
 
@@ -39,8 +42,12 @@ export type Job = {
   result: string | null;
 };
 
+/**
+ * A binding sends `state` and then `relist` (drop what is shown and list again); the answer of a
+ * call sends `state` alone.
+ */
 export type LibraryEvent =
-  | { type: "state"; state: LibraryState; text: string | null }
+  | { type: "state"; state: LibraryState; text: string | null; page: string | null }
   | { type: "folder"; folder: FolderState }
   | { type: "job"; job: Job }
   | { type: "relist" };

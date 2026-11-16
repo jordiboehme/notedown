@@ -5,7 +5,11 @@
 //! the address, the account or the token changes (a login, a log out, a new place of the
 //! server, a new address of the app's own server), the library binds again: the jobs and the
 //! follower of the old binding are cancelled, the cache is dropped, and the window gets a
-//! `state` event.
+//! `state` event followed by `relist`.
+//!
+//! A refused token stays in the Keychain until the next login. So after the key changes back
+//! (the same server and account again) or after a restart of the app, the library shows Ready
+//! until the next call answers 401.
 //!
 //! Every event of the library is a [`LibraryEvent`]; none of them holds the token.
 
@@ -68,12 +72,19 @@ impl LibraryState {
     }
 }
 
-/// The state with its text: the `state` event and the answer of `library_state`.
+/// The text of a binding whose Keychain read failed (state `loggedOut`, page "account").
+pub const KEYCHAIN_UNREADABLE: &str = "The Keychain could not be read.";
+/// The text of a binding whose client could not be made (state `unreachable`, page "server").
+pub const NO_CLIENT: &str = "The app could not set up the connection.";
+
+/// The state with its text and the Settings page its button opens: the `state` event and the
+/// answer of `library_state`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StateView {
     pub state: LibraryState,
     pub text: Option<String>,
+    pub page: Option<String>,
 }
 
 impl StateView {
@@ -81,6 +92,15 @@ impl StateView {
         Self {
             state,
             text: state.text().map(str::to_owned),
+            page: state.settings_page().map(str::to_owned),
+        }
+    }
+
+    /// `state` with another text than its own.
+    pub fn with_text(state: LibraryState, text: &str) -> Self {
+        Self {
+            text: Some(text.to_owned()),
+            ..Self::of(state)
         }
     }
 }
@@ -165,13 +185,15 @@ pub struct Clash {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum LibraryEvent {
-    /// The library bound again or its state changed: the window drops what it shows.
+    /// The state, its text or its Settings page changed. A binding sends it, then `Relist`; a
+    /// call's answer (unreachable, not imported, refused, ready again) sends it alone.
     State(StateView),
     /// A folder was listed or changed.
     Folder { folder: FolderState },
     /// A job moved on.
     Job { job: Job },
-    /// The window lists its folders again.
+    /// The library bound again (or must list again): the window drops what it shows and lists
+    /// its folders again.
     Relist,
 }
 
@@ -258,6 +280,8 @@ struct Bound {
     rest: Option<Arc<Rest>>,
     cancelled: Arc<AtomicBool>,
     state: LibraryState,
+    /// What the window is told; `None` before the first binding.
+    view: Option<StateView>,
     /// The server refused the token of this binding; it was dropped.
     refused: bool,
 }
@@ -301,15 +325,17 @@ impl Library {
                     rest: None,
                     cancelled: Arc::new(AtomicBool::new(false)),
                     state: LibraryState::NotSetUp,
+                    view: None,
                     refused: false,
                 }),
             }),
         }
     }
 
-    /// The state as it is now. It waits for no call and no Keychain read.
-    pub fn state(&self) -> StateView {
-        StateView::of(lock(&self.inner.bound).state)
+    /// The state as it is now; `None` before the first binding. It waits for no call and no
+    /// Keychain read.
+    pub fn state(&self) -> Option<StateView> {
+        lock(&self.inner.bound).view.clone()
     }
 
     /// Counts the bindings.
@@ -354,10 +380,14 @@ impl Library {
         // The client goes outside the lock: its end waits for its thread.
         drop(old);
         // Task 3: the follower stops and the cache is dropped here.
-        let (state, rest) = match (base, key) {
-            (None, _) => (LibraryState::NotSetUp, None),
-            (Some(_), None) => (LibraryState::LoggedOut, None),
-            (Some(_), Some(_)) if still_refused => (LibraryState::Refused, None),
+        // A binding that failed on this Mac (the Keychain, the client) records no place: the
+        // next nudge tries again.
+        let (view, rest, failed) = match (base, key) {
+            (None, _) => (StateView::of(LibraryState::NotSetUp), None, false),
+            (Some(_), None) => (StateView::of(LibraryState::LoggedOut), None, false),
+            (Some(_), Some(_)) if still_refused => {
+                (StateView::of(LibraryState::Refused), None, false)
+            }
             (Some(base), Some(key)) => match inner.store.get(&key) {
                 Ok(Some(token)) => match Rest::with_timing(
                     &base,
@@ -365,18 +395,36 @@ impl Library {
                     inner.clock.clone(),
                     inner.sleeper.clone(),
                 ) {
-                    Ok(rest) => (LibraryState::Ready, Some(Arc::new(rest))),
-                    Err(_) => (LibraryState::Unreachable, None),
+                    Ok(rest) => (
+                        StateView::of(LibraryState::Ready),
+                        Some(Arc::new(rest)),
+                        false,
+                    ),
+                    Err(_) => (
+                        StateView::with_text(LibraryState::Unreachable, NO_CLIENT),
+                        None,
+                        true,
+                    ),
                 },
-                // A Keychain that cannot be read keeps no login either.
-                Ok(None) | Err(_) => (LibraryState::LoggedOut, None),
+                Ok(None) => (StateView::of(LibraryState::LoggedOut), None, false),
+                Err(_) => (
+                    StateView::with_text(LibraryState::LoggedOut, KEYCHAIN_UNREADABLE),
+                    None,
+                    true,
+                ),
             },
         };
         let mut bound = lock(&inner.bound);
+        if failed {
+            bound.place = None;
+        }
         bound.rest = rest;
-        bound.state = state;
-        bound.refused = state == LibraryState::Refused;
-        (inner.emit)(LibraryEvent::State(StateView::of(state)));
+        bound.state = view.state;
+        bound.refused = view.state == LibraryState::Refused;
+        bound.view = Some(view.clone());
+        // Under the same guard: no settled state comes between the two.
+        (inner.emit)(LibraryEvent::State(view));
+        (inner.emit)(LibraryEvent::Relist);
     }
 
     /// The client of the binding, for a call made outside the library.
@@ -416,6 +464,7 @@ impl Library {
         };
         let changed = bound.state != next;
         bound.state = next;
+        bound.view = Some(StateView::of(next));
         if changed {
             (self.inner.emit)(LibraryEvent::State(StateView::of(next)));
         }

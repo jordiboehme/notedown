@@ -763,7 +763,6 @@ impl Worker {
             if !self.owner_check(&lock, &mut stores, &account)? {
                 // Not read, so not written either.
                 stores.remove(&slug);
-                self.markdown.borrow_mut().remove(&slug);
                 continue;
             }
             let text = &stores[&slug];
@@ -1142,9 +1141,9 @@ impl Worker {
         // Only the stores of this pass stay open: no stamp or prune touches another one, and a
         // removed account's folder is never made again.
         stores.retain(|slug, _| accounts.iter().any(|a| &a.slug == slug));
-        self.markdown
-            .borrow_mut()
-            .retain(|slug, _| accounts.iter().any(|a| &a.slug == slug));
+        // The Markdown writers stay: an account left out of one list (a source error, a
+        // removal that waits) keeps its writer, so it needs no new full look. A writer goes
+        // only with its store (`remove_markdown`) or its folder (`write_markdown`).
         for account in accounts {
             let slug = account.slug.clone();
             let found = (|| -> Result<Option<Vec<DueNote>>> {
@@ -1181,11 +1180,11 @@ impl Worker {
                     self.settled(&topic);
                     n
                 }
-                // Skipped by the owner check (said there): its cursor stays.
+                // Skipped by the owner check (said there): its cursor stays, and so does its
+                // Markdown writer.
                 Ok(None) => {
                     self.settled(&topic);
                     stores.remove(&slug);
-                    self.markdown.borrow_mut().remove(&slug);
                     unsure.insert(slug);
                     continue;
                 }
@@ -1286,13 +1285,16 @@ impl Worker {
             match note::process(&job, &mut self.engine, d, &mut progress, &mut report, stop) {
                 // A stop between its pages leaves the note in the queue. A stop right after a
                 // note that was read to its end also keeps its pages counted until the next pass.
+                // The note's Markdown file is written as soon as the note is done, so a stop or
+                // a kill later in the pass keeps it. Moves and deletes of the pass go with it.
                 Ok(()) if !stop() => {
                     if let Some(left) = queued.get_mut(slug) {
                         *left = left.saturating_sub(d.pages.len() as u64);
                         let _ = text.set_queued(lock, *left);
                     }
+                    self.write_markdown(slug, text, served.len());
                 }
-                Ok(()) => {}
+                Ok(()) => self.write_markdown(slug, text, served.len()),
                 Err(Error::ModelMissing) => {
                     self.clear_work(lock);
                     for slug in stores.keys() {

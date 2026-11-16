@@ -978,10 +978,16 @@ fn a_folder_inside_the_data_folder_is_refused() {
         d.data.join("md"),
         d.data.join("pipeline"),
         d.data.join("accounts").join(SLUG).join("files"),
-        d.data.join("..").join(d.data.file_name().unwrap()).join("x"),
+        d.data
+            .join("..")
+            .join(d.data.file_name().unwrap())
+            .join("x"),
     ] {
         let e = refused(&s, named(dir.clone()));
-        assert!(e.contains("inside") && e.contains("--markdown-dir"), "{dir:?}: {e}");
+        assert!(
+            e.contains("inside") && e.contains("--markdown-dir"),
+            "{dir:?}: {e}"
+        );
     }
     let e = refused(&s, vec![(None, d.data.join("md"))]);
     assert!(e.contains("inside"), "{e}");
@@ -994,7 +1000,10 @@ fn a_folder_inside_the_data_folder_is_refused() {
     let mut next_to = d.data.clone().into_os_string();
     next_to.push("-md");
     assert!(s.clone().with_markdown_dirs(named(next_to.into())).is_ok());
-    assert!(s.with_markdown_dirs(named(out.path().to_path_buf())).is_ok());
+    assert!(
+        s.with_markdown_dirs(named(out.path().to_path_buf()))
+            .is_ok()
+    );
 
     // Two machines: the server's folder and the pipeline's own `pipeline/` are refused, the
     // local folder itself is not the server's.
@@ -1004,8 +1013,114 @@ fn a_folder_inside_the_data_folder_is_refused() {
         let e = refused(&s, named(dir.clone()));
         assert!(e.contains("inside"), "{dir:?}: {e}");
     }
-    assert!(
-        s.with_markdown_dirs(named(local.path().join("md")))
-            .is_ok()
-    );
+    assert!(s.with_markdown_dirs(named(local.path().join("md"))).is_ok());
+}
+
+/// A folder source that leaves account `SLUG` out of its list while `out` is set, like a REST
+/// source whose probe of that account's token failed while the others answered.
+struct LeavesOut {
+    inner: notedown_pipeline::source::FolderSource,
+    out: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl notedown_pipeline::source::ServerData for LeavesOut {
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+    fn accounts(&self) -> notedown_pipeline::Result<Vec<notedown_pipeline::source::ServerAccount>> {
+        let mut all = self.inner.accounts()?;
+        if self.out.load(std::sync::atomic::Ordering::SeqCst) {
+            all.retain(|a| a.slug != SLUG);
+        }
+        Ok(all)
+    }
+    fn records(
+        &self,
+        slug: &str,
+    ) -> notedown_pipeline::Result<notedown_pipeline::records::Records> {
+        self.inner.records(slug)
+    }
+    fn record(
+        &self,
+        slug: &str,
+        key: &str,
+    ) -> notedown_pipeline::Result<Option<notedown_pipeline::records::Record>> {
+        self.inner.record(slug, key)
+    }
+    fn note(
+        &self,
+        slug: &str,
+        path: &str,
+    ) -> notedown_pipeline::Result<notedown_pipeline::source::NoteBytes> {
+        self.inner.note(slug, path)
+    }
+    fn note_exists(&self, slug: &str, path: &str) -> notedown_pipeline::Result<Option<bool>> {
+        self.inner.note_exists(slug, path)
+    }
+    fn digests(
+        &self,
+        slug: &str,
+    ) -> notedown_pipeline::Result<Vec<notedown_cloud::appdata::Digest>> {
+        self.inner.digests(slug)
+    }
+    fn journal(
+        &self,
+        slug: &str,
+        from: u64,
+        limit: usize,
+    ) -> notedown_pipeline::Result<notedown_pipeline::source::JournalBatch> {
+        self.inner.journal(slug, from, limit)
+    }
+    fn knows_gone(&self, slug: &str) -> bool {
+        self.inner.knows_gone(slug)
+    }
+}
+
+/// Only the first sync of a writer looks at every note: a file removed by hand comes back
+/// only then. A source error and its recovery keep the writer, so the file stays away.
+#[test]
+fn a_source_error_does_not_cause_a_second_full_look() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let d = setup();
+    create_account(&d.data, "anna");
+    d.put("test1", "NOTE/Note");
+    let out = tempfile::tempdir().unwrap();
+    let left_out = Arc::new(AtomicBool::new(false));
+    let mut s = crate::worker::one_machine(&d, with_dir(out.path()));
+    s.source = Arc::new(LeavesOut {
+        inner: notedown_pipeline::source::FolderSource::new(&d.data),
+        out: left_out.clone(),
+    });
+    let said = Said::default();
+    let (mut w, clock) = continuous(&s, &said);
+    w.run(stop_at(&clock, clock.now_ms() + 1)).unwrap();
+    assert_eq!(files(out.path()), ["test1.md"]);
+    std::fs::remove_file(out.path().join("test1.md")).unwrap();
+    // The account is left out of one list, then back.
+    left_out.store(true, Ordering::SeqCst);
+    w.run(stop_at(&clock, clock.now_ms() + 1)).unwrap();
+    left_out.store(false, Ordering::SeqCst);
+    d.put("test2", "NOTE/Note");
+    // The test clock started before the note was put: past its change time, so it is due.
+    clock.sleep(Duration::from_secs(60));
+    w.run(stop_at(&clock, clock.now_ms() + 1)).unwrap();
+    assert_eq!(files(out.path()), ["test2.md"], "{:?}", said.lines());
+}
+
+/// A pass writes the file of each note as soon as the note is read, so a pass that stops
+/// (or a process that is killed) already left the files of the notes it finished.
+#[test]
+fn a_stopped_pass_has_the_files_of_the_notes_it_finished() {
+    let d = setup();
+    d.put("test1", "NOTE/Note");
+    d.put("test2", "NOTE/Note");
+    let out = tempfile::tempdir().unwrap();
+    let s = crate::worker::one_machine(&d, with_dir(out.path()));
+    let said = Said::default();
+    let (mut w, _clock) = continuous(&s, &said);
+    let dir = out.path().to_path_buf();
+    // Stops as soon as the first file is there: before the second note is read.
+    w.run(move || !files(&dir).is_empty()).unwrap();
+    assert_eq!(files(out.path()).len(), 1, "{:?}", files(out.path()));
 }

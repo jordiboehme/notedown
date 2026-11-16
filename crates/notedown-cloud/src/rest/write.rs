@@ -453,6 +453,8 @@ async fn writer(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Account, R
 fn removed(op: &PendingOp) -> Value {
     let prune = match op {
         PendingOp::Move { prune, .. } | PendingOp::Delete { prune, .. } => prune.as_slice(),
+        // A restore leaves no folder empty.
+        PendingOp::Restore { .. } => &[],
         _ => &[],
     };
     json!(

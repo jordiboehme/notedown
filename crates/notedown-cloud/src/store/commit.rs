@@ -465,6 +465,48 @@ fn safe_relative(text: &str, what: &'static str) -> Result<PathBuf> {
     Ok(out)
 }
 
+/// A file a restore brings back, as read from its slot before any row is planned.
+struct RestoredFile {
+    size: u64,
+    md5: String,
+    /// The id of its index line, whose old versions follow the file to its new id.
+    old_id: Option<u64>,
+}
+
+impl RestoredFile {
+    /// Its `file.created` with the new `id`; the pair of ids goes to `reid`.
+    fn event(self, id: u64, path: &str, reid: &mut Vec<(u64, u64)>) -> EventBody {
+        if let Some(old) = self.old_id {
+            reid.push((old, id));
+        }
+        EventBody::FileCreated {
+            id,
+            path: path.to_string(),
+            kind: FileKind::of(path.rsplit('/').next().unwrap_or_default()),
+            md5: self.md5,
+            size: self.size,
+            pages_changed: None,
+        }
+    }
+}
+
+/// The file at `fs_path` in a slot, with its index `line` if it has one: the size from a stat,
+/// the MD5 of the line when it has one, else the file is hashed.
+fn restored_file(fs_path: &Path, line: Option<&RecycleEntry>) -> Result<RestoredFile> {
+    let size = std::fs::symlink_metadata(fs_path)
+        .map_err(io_err(fs_path))?
+        .len();
+    let md5 = match line.map(|l| l.md5.as_str()).filter(|m| !m.is_empty()) {
+        Some(m) => m.to_string(),
+        None => super::hashes::md5_file(fs_path).map_err(io_err(fs_path))?,
+    };
+    Ok(RestoredFile {
+        size,
+        md5,
+        old_id: line.map(|l| l.id),
+    })
+}
+
 impl Store {
     fn pending_path(&self) -> PathBuf {
         self.account_dir.join(PENDING_FILE)
@@ -1101,8 +1143,9 @@ impl Store {
     /// The content comes from a walk of the slot, not from the index: a file taken out of the
     /// slot by hand gets no event, and dot names, names the wire can't carry and special files
     /// move along without one, as a listing skips them. The MD5 of a file is the one of its
-    /// line when it has one, else the file is hashed. `now_ms` is the time of the restore; no
-    /// part of the plan depends on it yet.
+    /// line when it has one, else the file is hashed. Every file is read before the first
+    /// registry row is planned, so a file that can't be read refuses the restore without a
+    /// trace. `_now_ms` is the time of the restore; no part of the plan depends on it yet.
     ///
     /// Refused: a slot that is gone (`Error::NotFound`), a slot that is, holds or lies below a
     /// symlink (`Error::RecycleSlotDamaged`), a target that exists (also in another spelling) or
@@ -1113,10 +1156,9 @@ impl Store {
         guard: &WriteGuard,
         item: &super::RecycleItem,
         target: &WirePath,
-        now_ms: u64,
+        _now_ms: u64,
         origin: Origin,
     ) -> Result<Commit> {
-        let _ = now_ms;
         self.check_write(guard)?;
         let slot = self.recycle_path(&item.entry)?;
         let location = item.entry.location();
@@ -1175,40 +1217,46 @@ impl Store {
             .iter()
             .filter_map(|e| Some((below(&e.path, &item.entry.path)?, e)))
             .collect();
+        let display = target.display();
+        // Every read of the slot comes first: a failure here plans no registry row.
+        let top = match kind {
+            Kind::File => Some(restored_file(&slot, Some(&item.entry))?),
+            Kind::Folder => None,
+        };
+        let mut facts = Vec::with_capacity(walked.len());
+        for found in &walked {
+            facts.push(match found.kind {
+                Kind::Folder => None,
+                Kind::File => {
+                    let path = found.path.display();
+                    let line = below(&path, &display).and_then(|rel| owned.get(&rel).copied());
+                    Some(restored_file(&found.fs_path, line)?)
+                }
+            });
+        }
+        // Then the rows and the events.
         let (mut events, folders) = self.plan_folders(guard, &missing)?;
         self.drop_stale_row(guard, target, None)?;
         let id = self.assign(guard, target, kind)?;
-        let display = target.display();
         let mut reid = Vec::new();
-        match kind {
-            Kind::File => {
-                let md5 = Some(item.entry.md5.as_str());
-                events.push(self.restored_file(&slot, id, &display, md5)?);
-                reid.push((item.entry.id, id));
-            }
-            Kind::Folder => events.push(EventBody::FolderCreated {
+        events.push(match top {
+            Some(file) => file.event(id, &display, &mut reid),
+            None => EventBody::FolderCreated {
                 id,
                 path: display.clone(),
-            }),
-        }
-        let mut inside = Vec::new();
-        for found in &walked {
+            },
+        });
+        let mut inside = Vec::with_capacity(walked.len());
+        for (found, file) in walked.iter().zip(facts) {
             self.drop_stale_row(guard, &found.path, None)?;
             let child = self.assign(guard, &found.path, found.kind)?;
             let path = found.path.display();
-            let line = below(&path, &display).and_then(|rel| owned.get(&rel).copied());
-            events.push(match found.kind {
-                Kind::Folder => EventBody::FolderCreated {
+            events.push(match file {
+                Some(file) => file.event(child, &path, &mut reid),
+                None => EventBody::FolderCreated {
                     id: child,
                     path: path.clone(),
                 },
-                Kind::File => {
-                    if let Some(line) = line {
-                        reid.push((line.id, child));
-                    }
-                    let md5 = line.map(|l| l.md5.as_str());
-                    self.restored_file(&found.fs_path, child, &path, md5)?
-                }
             });
             inside.push(PlannedEntry {
                 id: child,
@@ -1229,32 +1277,6 @@ impl Store {
             reid,
         };
         Ok(Commit::new(origin, None, op, events))
-    }
-
-    /// `file.created` for a file a restore brings back from `fs_path` in the slot: the MD5 of
-    /// its line when that has one (`md5`), else the file is hashed; the size from a stat.
-    fn restored_file(
-        &self,
-        fs_path: &Path,
-        id: u64,
-        path: &str,
-        md5: Option<&str>,
-    ) -> Result<EventBody> {
-        let size = std::fs::symlink_metadata(fs_path)
-            .map_err(io_err(fs_path))?
-            .len();
-        let md5 = match md5.filter(|m| !m.is_empty()) {
-            Some(m) => m.to_string(),
-            None => super::hashes::md5_file(fs_path).map_err(io_err(fs_path))?,
-        };
-        Ok(EventBody::FileCreated {
-            id,
-            path: path.to_string(),
-            kind: FileKind::of(path.rsplit('/').next().unwrap_or_default()),
-            md5,
-            size,
-            pages_changed: None,
-        })
     }
 
     /// Plan creating the folder `path` (its parent must exist): `folder.created`.
@@ -2020,27 +2042,36 @@ impl Store {
     /// Clean up after a change that was not applied: remove the recycle copy the change made and
     /// the folders it created while they are empty (deepest first). Their registry rows stay, as
     /// for any discarded intent, except for a restore: it may have planned rows for a whole
-    /// tree, so the rows that still name its planned paths are dropped. Those failures are
-    /// ignored (the leftovers are harmless: an extra copy, an empty folder). An error when an
-    /// entry is still under the temp name of a rename: then the intent must stay, so that
-    /// recovery finishes the rename (the entry would otherwise stay hidden, and the device
-    /// would delete its copy).
+    /// tree, so the rows that still name its planned paths are dropped. An error there (the
+    /// registry can't be written) keeps the intent, so that recovery tries again. The other
+    /// failures are ignored (the leftovers are harmless: an extra copy, an empty folder). An
+    /// error when an entry is still under the temp name of a rename: then the intent must
+    /// stay, so that recovery finishes the rename (the entry would otherwise stay hidden, and
+    /// the device would delete its copy).
     fn undo_unapplied(&self, guard: &StoreGuard, op: &PendingOp) -> Result<()> {
         match op {
             PendingOp::Restore {
-                to, folders, id, ..
+                to,
+                folders,
+                id,
+                inside,
+                ..
             } => {
                 self.remove_planned(folders);
-                // The topmost planned row; dropping it drops the rows below it too.
-                let (top, path) = match folders.first() {
-                    Some(f) => (f.id, &f.path),
-                    None => (*id, to),
-                };
-                if let Ok(path) = wire(path)
-                    && self.path_of(top)?.as_ref() == Some(&path)
-                    && std::fs::symlink_metadata(self.fs_path(&path)).is_err()
-                {
-                    self.removed(guard, top)?;
+                // Every planned row that still names its path goes, also when something was
+                // made there by hand meanwhile: no event created it, so the next scan journals
+                // it as new. A folder row takes the rows below it along.
+                let planned = folders
+                    .iter()
+                    .map(|f| (f.id, f.path.as_str()))
+                    .chain(std::iter::once((*id, to.as_str())))
+                    .chain(inside.iter().map(|e| (e.id, e.path.as_str())));
+                for (row, path) in planned {
+                    if let Ok(path) = wire(path)
+                        && self.path_of(row)?.as_ref() == Some(&path)
+                    {
+                        self.removed(guard, row)?;
+                    }
                 }
             }
             PendingOp::Put {

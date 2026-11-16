@@ -91,7 +91,7 @@ pub struct PruneFailure {
 }
 
 /// Why something is in the recycle bin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RecycleReason {
     /// An older version replaced by an upload (protect mode).
@@ -101,7 +101,7 @@ pub enum RecycleReason {
 }
 
 /// One line of `recycle/index.jsonl`. Field order is the line order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecycleEntry {
     /// The store id the item had.
@@ -419,6 +419,8 @@ impl Store {
         lines: &[RecycleEntry],
         reid: &[(u64, u64)],
     ) -> Result<bool> {
+        let lines: HashSet<&RecycleEntry> = lines.iter().collect();
+        let reid: HashMap<u64, u64> = reid.iter().copied().collect();
         let mut changed = false;
         let mut text = Vec::new();
         for (bytes, entry) in self.read_index_lines()? {
@@ -428,7 +430,7 @@ impl Store {
                     continue;
                 }
                 Some(e) if e.reason == RecycleReason::Overwritten => {
-                    if let Some(&(_, new)) = reid.iter().find(|(old, _)| *old == e.id) {
+                    if let Some(&new) = reid.get(&e.id) {
                         changed = true;
                         text.extend_from_slice(RecycleEntry { id: new, ..e }.line().as_bytes());
                         continue;

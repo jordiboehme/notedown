@@ -1534,6 +1534,7 @@ fn a_restored_folder_indexes_every_note() {
         .unwrap();
     assert_eq!(rec.path, "NOTE/Note/W/b.note");
     assert_eq!(rec.md5, md5_hex(&bytes));
+    assert!(f.scan_events().is_empty());
 }
 
 #[test]
@@ -1601,4 +1602,129 @@ fn a_restored_file_can_be_deleted_and_restored_again() {
     assert_eq!(f.bytes("NOTE/Note/x.txt"), b"hello");
     assert!(f.items().is_empty());
     assert!(f.index_lines().is_empty());
+}
+
+/// A file the plan can't read (here one with no index line, so it must be hashed) fails the
+/// plan before any registry row is planned: the next scan finds nothing gone.
+#[test]
+fn a_restore_that_cant_read_a_file_plans_no_row() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    f.put("NOTE/Note/W/a.txt", b"aaa", None);
+    f.delete("NOTE/Note/W", NOW);
+    let item = f.item("NOTE/Note/W");
+    let extra = f.slot_path(&item.entry).join("extra.txt");
+    std::fs::write(&extra, b"by hand").unwrap();
+    std::fs::set_permissions(&extra, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let before = f.journal.last_seq().unwrap();
+    let r = f.try_restore(&item, None);
+    std::fs::set_permissions(&extra, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(f.id("NOTE/Note/W"), None);
+    assert_eq!(f.id("NOTE/Note/W/a.txt"), None);
+    assert!(!f.store.account_dir().join(PENDING_FILE).exists());
+    assert_eq!(f.journal.last_seq().unwrap(), before);
+    assert!(f.scan_events().is_empty());
+    assert_eq!(f.item("NOTE/Note/W").key, item.key);
+    assert!(extra.is_file());
+}
+
+/// A discarded folder restore drops every row it planned, also when something was made by
+/// hand at the target meanwhile: the scan then journals what is really there, and nothing
+/// that never was.
+#[test]
+fn a_discarded_folder_restore_drops_its_rows() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/W/a.txt", b"aaa", None);
+    f.put("NOTE/Note/W/S/b.txt", b"bb", None);
+    f.delete("NOTE/Note/W", NOW);
+    f.put("NOTE/Note/V/c.txt", b"c", None);
+    f.delete("NOTE/Note/V", NOW + 1);
+    // Nothing at the target: every row goes.
+    f.try_restore(&f.item("NOTE/Note/W"), Some(CrashPoint::BeforeApply))
+        .unwrap();
+    assert!(matches!(
+        f.restart_and_recover(),
+        Recovery::Discarded { .. }
+    ));
+    for p in [
+        "NOTE/Note/W",
+        "NOTE/Note/W/a.txt",
+        "NOTE/Note/W/S",
+        "NOTE/Note/W/S/b.txt",
+    ] {
+        assert_eq!(f.id(p), None, "{p}");
+    }
+    assert!(f.scan_events().is_empty());
+    // A folder made by hand at the target before the recovery.
+    f.try_restore(&f.item("NOTE/Note/V"), Some(CrashPoint::BeforeApply))
+        .unwrap();
+    let hand = f.store.fs_path(&wp("NOTE/Note/V/x.txt"));
+    std::fs::create_dir_all(hand.parent().unwrap()).unwrap();
+    std::fs::write(&hand, b"x").unwrap();
+    assert!(matches!(
+        f.restart_and_recover(),
+        Recovery::Discarded { .. }
+    ));
+    assert_eq!(f.id("NOTE/Note/V/c.txt"), None);
+    assert_eq!(
+        shape(&f.scan_events()),
+        [
+            ev("folder.created", "NOTE/Note/V"),
+            ev("file.created", "NOTE/Note/V/x.txt"),
+        ]
+    );
+}
+
+/// Recovery keys two copies of one note as the commit would have: the first in path order
+/// gets the FILE_ID, the other its path key.
+#[test]
+fn a_recovered_folder_restore_keys_copies_like_the_commit() {
+    let f = Fixture::new();
+    let bytes = note(FID, &["PA"]);
+    f.put("NOTE/Note/W/a.note", &bytes, None);
+    f.put("NOTE/Note/W/b.note", &bytes, None);
+    f.delete("NOTE/Note/W", NOW);
+    let before = f.journal.last_seq().unwrap();
+    f.try_restore(&f.item("NOTE/Note/W"), Some(CrashPoint::BeforeAppend))
+        .unwrap();
+    assert!(matches!(f.restart_and_recover(), Recovery::Repaired { .. }));
+    let path_key = format!("path:{}", md5_hex(b"NOTE/Note/W/b.note"));
+    assert_eq!(
+        shape(&f.since(before)),
+        [
+            ev("folder.created", "NOTE/Note/W"),
+            ev("file.created", "NOTE/Note/W/a.note"),
+            ev("page.added", FID),
+            ev("file.created", "NOTE/Note/W/b.note"),
+            ev("page.added", &path_key),
+        ]
+    );
+    assert_eq!(f.record(FID).unwrap().path, "NOTE/Note/W/a.note");
+    let rec = f
+        .record(&format!("path-{}", md5_hex(b"NOTE/Note/W/b.note")))
+        .unwrap();
+    assert_eq!(rec.path, "NOTE/Note/W/b.note");
+    assert!(f.scan_events().is_empty());
+}
+
+/// The rewrite of the index keeps every other line byte for byte: a line it can't read and
+/// the old versions of other files.
+#[test]
+fn a_restore_keeps_the_other_lines_byte_for_byte() {
+    let f = Fixture::new();
+    f.put("NOTE/Note/o.txt", b"one", None);
+    f.put("NOTE/Note/o.txt", b"two", Some(NOW - 2 * HOUR));
+    f.raw_line("not json at all");
+    f.put("NOTE/Note/x.txt", b"hello", None);
+    f.delete("NOTE/Note/x.txt", NOW);
+    f.put("NOTE/Note/o.txt", b"three", Some(NOW + 1));
+    let text = f.index_text();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 4);
+    f.restore(&f.item("NOTE/Note/x.txt"));
+    assert_eq!(
+        f.index_text(),
+        format!("{}\n{}\n{}\n", lines[0], lines[1], lines[3])
+    );
 }

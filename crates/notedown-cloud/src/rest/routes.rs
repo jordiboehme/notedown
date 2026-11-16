@@ -21,7 +21,7 @@ use crate::api::envelope::{LogMessage, Streamed};
 use crate::api::oss::{Flow, stream_body};
 use crate::auth::{Account, AuthError, Scope, TokenCheck};
 use crate::pages::valid_key;
-use crate::read::{self, NoteFile, ServerAccount};
+use crate::read::{self, DeviceView, NoteFile, ServerAccount};
 use crate::server::AppState;
 use crate::store::WirePath;
 
@@ -295,16 +295,41 @@ async fn login(
     }
 }
 
-/// `GET /account`: `{"slug","userId"}`.
+/// `GET /account`: [`ServerAccount`], the devices newest sync first.
 async fn account(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match account_of(&state, &headers).await {
-        Ok(a) => Json(ServerAccount {
-            slug: a.slug,
-            user_id: a.user_id,
+    let a = match account_of(&state, &headers).await {
+        Ok(a) => a,
+        Err(r) => return *r,
+    };
+    let st = state.clone();
+    let slug = a.slug.clone();
+    let list = blocking(move || st.auth.devices().list(&slug)).await;
+    let list = match list {
+        Ok(l) => l,
+        Err(r) => return *r,
+    };
+    let now = state.now_ms();
+    let holder = state.sync_locks.holder(&a.slug, now);
+    let mut devices: Vec<DeviceView> = list
+        .into_iter()
+        .map(|d| DeviceView {
+            syncing: holder.as_deref() == Some(d.serial.as_str()),
+            online: state.sockets.is_connected(&a.slug, &d.serial, now),
+            serial: d.serial,
+            name: d.name,
+            bound: d.bound,
+            last_login_ms: d.last_login_ms,
+            last_sync_ms: d.last_sync_ms,
         })
-        .into_response(),
-        Err(r) => *r,
-    }
+        .collect();
+    // Newest sync first, never synced last; `sort_by` is stable, so ties stay by serial.
+    devices.sort_by_key(|x| std::cmp::Reverse(x.last_sync_ms));
+    Json(ServerAccount {
+        slug: a.slug,
+        user_id: a.user_id,
+        devices,
+    })
+    .into_response()
 }
 
 /// `GET /records`: [`read::Records`].

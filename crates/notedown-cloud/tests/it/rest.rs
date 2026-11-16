@@ -13,7 +13,7 @@ use notedown_cloud::rest;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use crate::rest_server::{EMAIL, PASSWORD, json_of, log_text, q, start};
+use crate::rest_server::{EMAIL, PASSWORD, json_of, log_text, q, start, start_imported};
 
 #[test]
 fn login_gives_a_token_that_reads_the_account() {
@@ -32,7 +32,8 @@ fn login_gives_a_token_that_reads_the_account() {
     assert!(token.starts_with("ndt1."), "{token}");
     let (status, me) = s.get(Some(token), "/account");
     assert_eq!(status, 200, "{me}");
-    assert_eq!(me, json!({"slug": "jordi", "userId": account.user_id}));
+    assert_eq!(me["slug"], "jordi");
+    assert_eq!(me["userId"], account.user_id);
     // Without a token, or with another scheme, nothing is read.
     let (status, body) = s.get(None, "/account");
     assert_eq!((status, &body["error"]), (401, &json!("token_refused")));
@@ -356,9 +357,10 @@ fn a_removed_account_token_sees_only_its_removal() {
     // The new account's token reads the new account.
     let fresh = s.token();
     let (status, me) = s.get(Some(&fresh), "/account");
+    assert_eq!(status, 200, "{me}");
     assert_eq!(
-        (status, me),
-        (200, json!({"slug": "jordi", "userId": new.user_id}))
+        (&me["slug"], &me["userId"]),
+        (&json!("jordi"), &json!(new.user_id))
     );
 }
 
@@ -558,4 +560,40 @@ fn a_token_is_read_only_unless_made_for_writing() {
     );
     let (status, me) = s.get(write["token"].as_str(), "/account");
     assert_eq!(status, 200, "{me}");
+}
+
+#[test]
+fn the_account_lists_its_devices() {
+    use crate::fake_device::{SERIAL, sign_in};
+    let s = start_imported();
+    let token = s.token();
+    let (status, me) = s.get(Some(&token), "/account");
+    assert_eq!(status, 200, "{me}");
+    assert_eq!(me["devices"], json!([]));
+    let mut d = sign_in(s.base.clone(), EMAIL, PASSWORD);
+    let (_, me) = s.get(Some(&token), "/account");
+    let list = me["devices"].as_array().unwrap();
+    assert_eq!(list.len(), 1, "{me}");
+    assert_eq!(list[0]["serial"], SERIAL);
+    assert!(list[0]["bound"].is_boolean(), "{me}");
+    assert_eq!(list[0]["syncing"], false);
+    assert_eq!(list[0]["online"], false);
+    assert!(list[0]["lastSyncMs"].is_null(), "{me}");
+    assert!(list[0]["lastLoginMs"].as_u64().unwrap() > 0, "{me}");
+    d.ok(
+        "/api/file/2/files/synchronous/start",
+        json!({"equipmentNo": SERIAL}),
+    );
+    let (_, me) = s.get(Some(&token), "/account");
+    assert_eq!(me["devices"][0]["syncing"], true, "{me}");
+    d.ok(
+        "/api/file/2/files/synchronous/end",
+        json!({"equipmentNo": SERIAL, "flag": "Y"}),
+    );
+    let (status, me) = s.get(Some(&token), "/account");
+    assert_eq!(status, 200, "{me}");
+    assert_eq!(me["slug"], "jordi");
+    assert!(me["userId"].is_u64(), "{me}");
+    assert_eq!(me["devices"][0]["syncing"], false, "{me}");
+    assert!(me["devices"][0]["lastSyncMs"].as_u64().unwrap() > 0, "{me}");
 }

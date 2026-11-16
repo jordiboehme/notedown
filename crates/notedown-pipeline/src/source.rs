@@ -123,6 +123,7 @@ impl ServerData for FolderSource {
             .map(|a| ServerAccount {
                 slug: a.slug,
                 user_id: a.user_id,
+                devices: Vec::new(),
             })
             .collect())
     }

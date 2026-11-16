@@ -915,3 +915,29 @@ fn connect_leaves_the_scope_out() {
     // An older server refuses unknown fields; a login without scope gives a read token.
     assert!(logins[0].get("scope").is_none(), "{}", logins[0]);
 }
+
+#[test]
+fn an_old_account_answer_still_reads() {
+    let token = fake_token(SLUG, "n");
+    // A server of an older version answers `{slug, userId}` alone.
+    let old = Fake::start(|_| account_json(SLUG));
+    let (src, _local) = fake_source(&old, &[(SLUG, &token)]);
+    let accounts = src.accounts().unwrap();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].slug, SLUG);
+    assert!(accounts[0].devices.is_empty());
+    // A newer one adds its devices.
+    let new = Fake::start(|_| {
+        json_answer(
+            "200 OK",
+            serde_json::json!({"slug": SLUG, "userId": 1_000_001, "devices": [
+                {"serial": "SN1", "name": null, "bound": true, "lastLoginMs": 5,
+                 "lastSyncMs": null, "syncing": false, "online": true}]}),
+        )
+    });
+    let (src, _local) = fake_source(&new, &[(SLUG, &token)]);
+    let accounts = src.accounts().unwrap();
+    assert_eq!(accounts[0].devices.len(), 1);
+    assert_eq!(accounts[0].devices[0].serial, "SN1");
+    assert_eq!(accounts[0].devices[0].last_sync_ms, None);
+}

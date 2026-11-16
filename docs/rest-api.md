@@ -63,7 +63,7 @@ A refused token gets 401 `token_refused` with `WWW-Authenticate: Bearer`. A toke
 | --- | --- | --- |
 | `POST /login/code` | none | A random code for the login |
 | `POST /login` | none | A new token |
-| `GET /account` | read | `{"slug", "userId"}` |
+| `GET /account` | read | `{"slug", "userId", "devices"}` |
 | `GET /tree` | read | List a folder |
 | `GET /entries/{id}` | read | One file or folder |
 | `GET` and `HEAD /files/{id}` | read | Download a file |
@@ -81,6 +81,31 @@ A refused token gets 401 `token_refused` with `WWW-Authenticate: Bearer`. A toke
 | `POST /recycle/empty` | write | Remove every deleted file and folder from the recycle bin |
 
 The routes for the records, the digests and the note by path are made for the pipeline. This page does not describe their bodies. The sections below are for an app that browses and manages files.
+
+## Account
+
+### `GET /account`
+
+Tells whose token this is and which devices the account has.
+
+```json
+{
+  "slug": "jordi",
+  "userId": 1000001,
+  "devices": [
+    {"serial": "SN078C10000000", "name": "Jordis Nomad", "bound": true,
+     "lastLoginMs": 1763290000000, "lastSyncMs": 1763290900000,
+     "syncing": false, "online": true}
+  ]
+}
+```
+
+- `lastSyncMs` is the time of the last sync that the device ended with success. It is `null` until then. Servers of an older version do not record it, so it stays `null` until the device syncs once on a server of this version. An app that talks to an older server gets no `devices` at all and treats that as an empty list.
+- `lastLoginMs` is the last login of the device. A device keeps its token across syncs, so this is not the time of a sync.
+- `syncing` is true while this device holds the sync lock of the account.
+- `online` is true while the device has an open auto-sync connection that is alive.
+- The list is sorted by `lastSyncMs`, newest first. Devices that never synced come last.
+- `name` is `null` for a device that never told its name.
 
 ## Browse
 

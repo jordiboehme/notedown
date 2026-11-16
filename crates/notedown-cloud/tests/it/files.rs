@@ -354,6 +354,70 @@ async fn end_releases_only_the_owner_and_logs_the_flag() {
     assert!(!flags1.contains("sync_lock_not_held"), "{flags1}");
 }
 
+/// What the device file of `serial` says about the last sync.
+fn last_sync(s: &Server, serial: &str) -> Option<u64> {
+    notedown_cloud::auth::Devices::new(s.data())
+        .get("jordi", serial)
+        .unwrap()
+        .unwrap()
+        .last_sync_ms
+}
+
+#[tokio::test]
+async fn a_finished_sync_records_the_time() {
+    let s = Server::new();
+    let a = s.login(SERIAL).await;
+    assert_eq!(last_sync(&s, SERIAL), None);
+    assert_ok(&s.post(START, &a, json!({"equipmentNo": SERIAL})).await);
+    s.advance_ms(5_000);
+    assert_ok(
+        &s.post(END, &a, json!({"equipmentNo": SERIAL, "flag": "Y"}))
+            .await,
+    );
+    assert_eq!(last_sync(&s, SERIAL), Some(T0 as u64 + 5_000));
+}
+
+#[tokio::test]
+async fn a_sync_end_after_the_lock_lapsed_still_records_the_time() {
+    let s = Server::new();
+    let a = s.login(SERIAL).await;
+    assert_ok(&s.post(START, &a, json!({"equipmentNo": SERIAL})).await);
+    s.advance_ms(60_000);
+    assert_ok(
+        &s.post(END, &a, json!({"equipmentNo": SERIAL, "flag": "Y"}))
+            .await,
+    );
+    assert_eq!(last_sync(&s, SERIAL), Some(T0 as u64 + 60_000));
+}
+
+#[tokio::test]
+async fn a_failed_sync_end_does_not_record_the_time() {
+    let s = Server::new();
+    let a = s.login(SERIAL).await;
+    for flag in ["N", "?"] {
+        assert_ok(&s.post(START, &a, json!({"equipmentNo": SERIAL})).await);
+        assert_ok(
+            &s.post(END, &a, json!({"equipmentNo": SERIAL, "flag": flag}))
+                .await,
+        );
+    }
+    assert_eq!(last_sync(&s, SERIAL), None);
+}
+
+#[tokio::test]
+async fn an_old_device_file_still_reads() {
+    let s = Server::new();
+    let a = s.login(SERIAL).await;
+    assert_ok(&s.post(START, &a, json!({"equipmentNo": SERIAL})).await);
+    let file = s
+        .data()
+        .join("accounts/jordi/devices")
+        .join(format!("{SERIAL}.json"));
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(!text.contains("last_sync_ms"), "{text}");
+    assert_eq!(last_sync(&s, SERIAL), None);
+}
+
 #[tokio::test]
 async fn every_file_call_of_the_owner_extends_the_lock() {
     let s = Server::new();

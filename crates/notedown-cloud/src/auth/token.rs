@@ -169,6 +169,10 @@ pub struct Device {
     pub token_generation: u64,
     /// Milliseconds since the epoch of the last login.
     pub last_login_ms: u64,
+    /// Milliseconds since the epoch of the last `synchronous/end` with the flag `Y`. Missing
+    /// in files of older versions and until the first finished sync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync_ms: Option<u64>,
 }
 
 impl Device {
@@ -181,6 +185,7 @@ impl Device {
             total_capacity: None,
             token_generation: 0,
             last_login_ms: 0,
+            last_sync_ms: None,
         }
     }
 }
@@ -348,6 +353,13 @@ impl Devices {
     /// Creates the record on the first call. Returns the new generation.
     pub fn bump(&self, slug: &str, serial: &str, now_ms: u64) -> Result<u64> {
         self.bump_inner(slug, serial, Some(now_ms))
+    }
+
+    /// Record the end of a good sync (`synchronous/end` with the flag `Y`). Creates the record
+    /// when missing, like the other changes; [`Error::NoAccount`] for a removed account.
+    pub fn mark_synced(&self, slug: &str, serial: &str, now_ms: u64) -> Result<()> {
+        self.update(slug, serial, |d| d.last_sync_ms = Some(now_ms))
+            .map(|_| ())
     }
 
     /// Like [`bump`](Self::bump) for logout and unbinding: `last_login_ms` stays as it was.

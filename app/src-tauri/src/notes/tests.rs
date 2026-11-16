@@ -96,6 +96,12 @@ impl Fixture {
         serde_json::from_slice(&fs::read(self.config.path().join("seen.json")).unwrap()).unwrap()
     }
 
+    /// The markers of the account in the current data folder, `null` when it has none.
+    fn marks(&self) -> Value {
+        let dir = lock(&self.data_dir).clone();
+        marks_in(&self.seen_file(), &dir)
+    }
+
     fn new_keys(&self) -> Vec<String> {
         self.notes.new_notes().into_iter().map(|n| n.key).collect()
     }
@@ -107,6 +113,16 @@ impl Fixture {
     fn events(&self) -> usize {
         self.events.load(Ordering::SeqCst)
     }
+}
+
+/// The markers of the account in `dir` in a seen.json, `null` when it has none.
+fn marks_in(seen: &Value, dir: &Path) -> Value {
+    seen[ACCOUNT]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|folder| folder["dataDir"] == json!(dir))
+        .map_or(Value::Null, |folder| folder["seen"].clone())
 }
 
 fn at(secs: u64) -> SystemTime {
@@ -315,7 +331,7 @@ fn all_notes_lists_notes_with_text() {
 fn after_baseline() -> Fixture {
     let f = Fixture::new();
     assert!(f.new_keys().is_empty());
-    assert_eq!(f.seen_file(), json!({ACCOUNT: {}}));
+    assert_eq!(f.marks(), json!({}));
     f
 }
 
@@ -327,7 +343,7 @@ fn a_note_is_new_until_opened() {
     assert_eq!(f.new_keys(), [A]);
     f.notes.seen(A).unwrap();
     assert!(f.new_keys().is_empty());
-    assert_eq!(f.seen_file(), json!({ACCOUNT: {A: 4}}));
+    assert_eq!(f.marks(), json!({A: 4}));
     // A new page with text: new again.
     f.write(
         &note(
@@ -418,13 +434,14 @@ fn a_deleted_or_unscoped_note_is_not_new() {
     assert!(f.new_keys().is_empty());
     // Their state files are still there: their markers stay.
     f.notes.seen(A).unwrap();
-    assert_eq!(f.seen_file(), json!({ACCOUNT: {A: 4}}));
+    assert_eq!(f.marks(), json!({A: 4}));
 }
 
 #[test]
 fn the_first_login_sets_the_baseline() {
     // Another account's markers are left alone.
-    let f = Fixture::with_seen(Some(json!({"other": {"X": 3}})));
+    let other = json!({"other": [{"dataDir": "/x", "seen": {"X": 3}}]});
+    let f = Fixture::with_seen(Some(other.clone()));
     f.write(
         &note(
             A,
@@ -438,10 +455,8 @@ fn the_first_login_sets_the_baseline() {
     deleted["deleted"] = json!(true);
     f.write(&deleted, 10);
     assert!(f.new_keys().is_empty());
-    assert_eq!(
-        f.seen_file(),
-        json!({"other": {"X": 3}, ACCOUNT: {A: 4, C: 2}})
-    );
+    assert_eq!(f.marks(), json!({A: 4, C: 2}));
+    assert_eq!(f.seen_file()["other"], other["other"]);
     // Notes still in the backlog become new when their text arrives.
     f.write(
         &note(
@@ -454,26 +469,30 @@ fn the_first_login_sets_the_baseline() {
     f.write(&note(B, "NOTE/Note/b.note", &[("P1", Some(9), true)]), 20);
     assert_eq!(f.new_keys(), [A, B]);
 
-    // A new account whose store the pipeline has not made yet: the baseline is empty, so
-    // every note becomes new when its text arrives.
+    // A new account whose store the pipeline has made, still without notes: the baseline is
+    // empty, so every note becomes new when its text arrives.
     let g = Fixture::new();
-    fs::remove_dir_all(g.data.path().join("pipeline")).unwrap();
+    fs::remove_dir_all(g.notes_dir()).unwrap();
     assert!(g.new_keys().is_empty());
-    assert_eq!(g.seen_file(), json!({ACCOUNT: {}}));
+    assert_eq!(g.marks(), json!({}));
     fs::create_dir_all(g.notes_dir()).unwrap();
     g.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 10);
     assert_eq!(g.new_keys(), [A]);
 
-    // A data folder that is not there (a disk that is not mounted) sets no baseline.
+    // A data folder that is not there (a disk that is not mounted), or one without a store of
+    // the account, sets no baseline.
     let h = Fixture::new();
     let away = h.data.path().join("away");
     *lock(&h.data_dir) = away.clone();
     assert!(h.new_keys().is_empty());
     assert!(!h.config.path().join("seen.json").exists());
+    fs::create_dir_all(away.join("pipeline").join("someone")).unwrap();
+    assert!(h.new_keys().is_empty());
+    assert!(!h.config.path().join("seen.json").exists());
     fs::create_dir_all(away.join("pipeline").join(ACCOUNT).join("notes")).unwrap();
     h.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 10);
     assert!(h.new_keys().is_empty());
-    assert_eq!(h.seen_file(), json!({ACCOUNT: {A: 4}}));
+    assert_eq!(h.marks(), json!({A: 4}));
 }
 
 #[test]
@@ -489,13 +508,17 @@ fn a_path_keyed_note_keeps_its_marker_on_a_move() {
     f.write(&note(NEW, "NOTE/Note/b/a.note", pages), 20);
     f.remove(OLD);
     assert!(f.new_keys().is_empty());
-    assert_eq!(f.seen_file(), json!({ACCOUNT: {NEW: 6}}));
+    assert_eq!(f.marks(), json!({NEW: 6}));
     // A scan between the two writes sees both; the next one carries the marker over.
     f.write(&note(NEXT, "NOTE/Note/c/a.note", pages), 30);
-    f.notes.refresh();
+    assert!(
+        f.new_keys().is_empty(),
+        "not new while both files are there"
+    );
+    assert_eq!(f.marks(), json!({NEW: 6, NEXT: 6}));
     f.remove(NEW);
     assert!(f.new_keys().is_empty());
-    assert_eq!(f.seen_file(), json!({ACCOUNT: {NEXT: 6}}));
+    assert_eq!(f.marks(), json!({NEXT: 6}));
     // A move while the app did not run: the seq of its newest text names the note.
     let later = Notes::new(
         f.notes.inner.place.clone(),
@@ -505,7 +528,7 @@ fn a_path_keyed_note_keeps_its_marker_on_a_move() {
     f.write(&note(OLD, "NOTE/Note/a.note", pages), 40);
     f.remove(NEXT);
     assert!(later.new_notes().is_empty());
-    assert_eq!(f.seen_file(), json!({ACCOUNT: {OLD: 6}}));
+    assert_eq!(f.marks(), json!({OLD: 6}));
     // A note keyed by its FILE_ID keeps its key; a new one is not given a marker.
     f.write(&note(A, "NOTE/Note/x.note", &[("P9", Some(20), true)]), 50);
     assert_eq!(
@@ -525,16 +548,16 @@ fn seen_keys_of_gone_notes_are_pruned() {
     f.write(&note(B, "NOTE/Note/b.note", &[("P1", Some(5), true)]), 10);
     f.notes.seen(A).unwrap();
     f.notes.seen(B).unwrap();
-    assert_eq!(f.seen_file(), json!({ACCOUNT: {A: 4, B: 5}}));
+    assert_eq!(f.marks(), json!({A: 4, B: 5}));
     f.remove(A);
     // A file that does not parse keeps its marker: its key is still there.
     fs::write(f.file_of(B), "{").unwrap();
     f.notes.refresh();
-    assert_eq!(f.seen_file(), json!({ACCOUNT: {B: 5}}));
+    assert_eq!(f.marks(), json!({B: 5}));
     // A store that cannot be read (a data folder on a disk that is not there) prunes nothing.
     fs::remove_dir_all(f.notes_dir()).unwrap();
     f.notes.refresh();
-    assert_eq!(f.seen_file(), json!({ACCOUNT: {B: 5}}));
+    assert_eq!(f.marks(), json!({B: 5}));
 }
 
 #[test]
@@ -584,4 +607,157 @@ fn an_account_that_is_no_plain_name_reads_nothing() {
         *lock(&f.account) = Some(bad.to_owned());
         assert!(f.notes.all().is_empty(), "{bad}");
     }
+}
+
+#[test]
+fn markers_belong_to_the_data_folder() {
+    let f = Fixture::new();
+    // A folder that is there but holds no store of the account sets no baseline.
+    let bare = tempfile::tempdir().unwrap();
+    let real = lock(&f.data_dir).clone();
+    *lock(&f.data_dir) = bare.path().to_path_buf();
+    assert!(f.new_keys().is_empty());
+    assert!(!f.config.path().join("seen.json").exists());
+    // Then the real store: its notes with text are the baseline, nothing is new.
+    *lock(&f.data_dir) = real.clone();
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 10);
+    f.write(&note(B, "NOTE/Note/b.note", &[("P1", Some(5), true)]), 10);
+    assert!(f.new_keys().is_empty());
+    assert_eq!(f.marks(), json!({A: 4, B: 5}));
+    // A new note, then a second store: it gets its own baseline, the first keeps its markers.
+    f.write(&note(C, "NOTE/Note/c.note", &[("P1", Some(7), true)]), 20);
+    assert_eq!(f.new_keys(), [C]);
+    let second = tempfile::tempdir().unwrap();
+    *lock(&f.data_dir) = second.path().to_path_buf();
+    fs::create_dir_all(f.notes_dir()).unwrap();
+    f.write(&note(B, "NOTE/Note/b.note", &[("P1", Some(9), true)]), 10);
+    assert!(f.new_keys().is_empty());
+    assert_eq!(f.marks(), json!({B: 9}));
+    assert_eq!(marks_in(&f.seen_file(), &real), json!({A: 4, B: 5}));
+    // Back: the old markers are intact, and C is still new.
+    *lock(&f.data_dir) = real.clone();
+    assert_eq!(f.new_keys(), [C]);
+    assert_eq!(f.marks(), json!({A: 4, B: 5}));
+    // At most three folders per account are kept: the one used longest ago goes.
+    let (third, fourth) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    for dir in [third.path(), fourth.path()] {
+        *lock(&f.data_dir) = dir.to_path_buf();
+        fs::create_dir_all(f.notes_dir()).unwrap();
+        f.notes.refresh();
+    }
+    let seen = f.seen_file();
+    assert_eq!(seen[ACCOUNT].as_array().unwrap().len(), 3);
+    assert_eq!(marks_in(&seen, second.path()), Value::Null);
+    assert_eq!(marks_in(&seen, &real), json!({A: 4, B: 5}));
+}
+
+#[test]
+fn a_note_that_comes_back_is_not_new_for_seen_text() {
+    let f = after_baseline();
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 10);
+    f.write(&note(B, "NOTE/Note/b.note", &[("P1", Some(5), true)]), 10);
+    f.notes.seen(A).unwrap();
+    f.notes.seen(B).unwrap();
+    // A goes to the bin, B leaves the scope.
+    let mut deleted = note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]);
+    deleted["deleted"] = json!(true);
+    f.write(&deleted, 20);
+    let mut unscoped = note(B, "NOTE/Note/b.note", &[("P1", Some(5), true)]);
+    unscoped["unscoped"] = json!(true);
+    f.write(&unscoped, 20);
+    f.notes.refresh();
+    // Both come back, read again with new seqs and the same text.
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(11), true)]), 30);
+    f.write(&note(B, "NOTE/Note/b.note", &[("P1", Some(12), true)]), 30);
+    assert!(f.new_keys().is_empty());
+    assert_eq!(f.marks(), json!({A: 11, B: 12}));
+    // New text after the return is new.
+    f.write(
+        &note(
+            A,
+            "NOTE/Note/a.note",
+            &[("P1", Some(11), true), ("P2", Some(13), true)],
+        ),
+        40,
+    );
+    assert_eq!(f.new_keys(), [A]);
+    // A note whose text was not seen before it went stays new when it comes back.
+    f.write(&note(C, "NOTE/Note/c.note", &[("P1", Some(14), true)]), 50);
+    let mut gone = note(C, "NOTE/Note/c.note", &[("P1", Some(14), true)]);
+    gone["deleted"] = json!(true);
+    f.write(&gone, 60);
+    f.notes.refresh();
+    f.write(&note(C, "NOTE/Note/c.note", &[("P1", Some(15), true)]), 70);
+    assert_eq!(f.new_keys(), [C, A]);
+}
+
+/// Makes a file unreadable for this user; `None` when the tests run as root, which reads it
+/// anyway.
+fn unreadable(path: &Path) -> Option<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::read(path).is_err().then_some(())
+}
+
+fn readable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+#[test]
+fn a_seen_file_that_cannot_be_read_is_never_overwritten() {
+    let mine = json!({ACCOUNT: [{"dataDir": "/x", "seen": {"X": 3}}]});
+    let f = Fixture::with_seen(Some(mine.clone()));
+    let path = f.config.path().join("seen.json");
+    if unreadable(&path).is_none() {
+        return;
+    }
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 10);
+    assert!(f.new_keys().is_empty());
+    assert_eq!(f.notes.seen(A), Err(SEEN_NOT_READ.to_owned()));
+    f.notes.refresh();
+    readable(&path);
+    assert_eq!(f.seen_file(), mine);
+    assert!(!f.config.path().join("seen.json.tmp").exists());
+    // Once it can be read, the markers load and the baseline is set.
+    assert!(f.new_keys().is_empty());
+    assert_eq!(f.marks(), json!({A: 4}));
+    assert_eq!(marks_in(&f.seen_file(), Path::new("/x")), json!({"X": 3}));
+}
+
+#[test]
+fn a_store_that_disappears_empties_the_index() {
+    let f = after_baseline();
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 10);
+    f.notes.seen(A).unwrap();
+    assert_eq!(f.all_keys(), [A]);
+    let events = f.events();
+    fs::remove_dir_all(f.notes_dir()).unwrap();
+    assert!(f.notes.all().is_empty());
+    assert!(f.notes.at_path("NOTE/Note/a.note").is_none());
+    assert_eq!(f.events(), events + 1);
+    // No pruning: the store comes back as it was.
+    assert_eq!(f.marks(), json!({A: 4}));
+    fs::create_dir_all(f.notes_dir()).unwrap();
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 10);
+    assert_eq!(f.all_keys(), [A]);
+    assert!(f.new_keys().is_empty());
+}
+
+#[test]
+fn a_file_that_cannot_be_read_for_a_moment_is_not_gone() {
+    let f = after_baseline();
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 10);
+    f.notes.seen(A).unwrap();
+    // The pipeline wrote it again, and it cannot be read for now.
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 20);
+    let path = f.file_of(A);
+    if unreadable(&path).is_none() {
+        return;
+    }
+    assert_eq!(f.all_keys(), [A]);
+    assert_eq!(f.marks(), json!({A: 4}));
+    // It is read again once it can be.
+    readable(&path);
+    assert_eq!(f.notes.all()[0].changed_ms, ms(20));
 }

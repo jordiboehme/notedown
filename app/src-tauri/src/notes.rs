@@ -8,10 +8,14 @@
 //!
 //! A note is new when it has a page with text, is not deleted or unscoped, and the highest
 //! `seq` of its pages (the seq of its newest text) is above the seen marker of its key. The
-//! markers live in `<app config dir>/seen.json` as `{"<account>": {"<key>": <seq>}}`. When
-//! the first scan of an account finds no markers for it, every note with text gets one at its
-//! current seq (the baseline); notes still waiting for their text become new when it arrives.
-//! The app wakes a scan at each binding of the library, so this first scan comes at the login.
+//! markers belong to the account and its data folder: `<app config dir>/seen.json` holds
+//! `{"<account>": [{"dataDir": "<folder>", "seen": {"<key>": <seq>}}]}`, the folder used last
+//! first, at most [`FOLDERS_KEPT`] per account. When the first scan of a store (an existing
+//! `<data_dir>/pipeline/<account>/`) finds no markers for it, every note with text gets one at
+//! its current seq (the baseline); notes still waiting for their text become new when it
+//! arrives. The app wakes a scan at each binding of the library, so this first scan comes at
+//! the login. A note that comes back (from the bin, into the scope) while the app runs is not
+//! new for text the user had seen.
 //!
 //! The index follows the store by polling: a scan every [`NOTES_EVERY`] while the panel or the
 //! library window is visible, one at each show, and one before every answer of `notes_new` and
@@ -44,6 +48,11 @@ const SEEN_BROKEN: &str = "seen.json.broken";
 
 /// What `note_seen` says for a key that is not in the index.
 pub const NOTE_GONE: &str = "This note is not there anymore.";
+/// What `note_seen` says while the markers cannot be read.
+pub const SEEN_NOT_READ: &str = "Notedown could not read which notes you have seen.";
+/// How many data folders of one account keep their markers.
+pub const FOLDERS_KEPT: usize = 3;
+
 /// What `note_seen` says when the markers could not be saved.
 pub const SEEN_NOT_SAVED: &str = "Notedown could not save which notes you have seen.";
 
@@ -135,14 +144,71 @@ struct Indexed {
     note: Option<Note>,
 }
 
-type Seen = BTreeMap<String, BTreeMap<String, u64>>;
+/// The markers of one account in one data folder.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Folder {
+    data_dir: PathBuf,
+    seen: BTreeMap<String, u64>,
+}
+
+/// Per account its folders, the one used last first.
+type Seen = BTreeMap<String, Vec<Folder>>;
+
+fn marks_of<'a>(seen: &'a Seen, account: &str, dir: &Path) -> Option<&'a BTreeMap<String, u64>> {
+    seen.get(account)?
+        .iter()
+        .find(|f| f.data_dir == dir)
+        .map(|f| &f.seen)
+}
+
+fn marks_mut<'a>(
+    seen: &'a mut Seen,
+    account: &str,
+    dir: &Path,
+) -> Option<&'a mut BTreeMap<String, u64>> {
+    seen.get_mut(account)?
+        .iter_mut()
+        .find(|f| f.data_dir == dir)
+        .map(|f| &mut f.seen)
+}
+
+/// Puts the folder `dir` of `account` first. True when the order changed.
+fn use_folder(seen: &mut Seen, account: &str, dir: &Path) -> bool {
+    let Some(folders) = seen.get_mut(account) else {
+        return false;
+    };
+    match folders.iter().position(|f| f.data_dir == dir) {
+        Some(at) if at > 0 => {
+            let folder = folders.remove(at);
+            folders.insert(0, folder);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The baseline of `account` in `dir`: first, and the folder used longest ago goes past
+/// [`FOLDERS_KEPT`].
+fn add_folder(seen: &mut Seen, account: &str, dir: &Path, marks: BTreeMap<String, u64>) {
+    let folders = seen.entry(account.to_owned()).or_default();
+    folders.insert(
+        0,
+        Folder {
+            data_dir: dir.to_path_buf(),
+            seen: marks,
+        },
+    );
+    folders.truncate(FOLDERS_KEPT);
+}
 
 struct State {
     /// The data folder and the account the index is of; `None` without an account.
     place: Option<(PathBuf, String)>,
     /// By file name.
     files: BTreeMap<String, Indexed>,
-    /// Loaded at the first use.
+    /// Loaded at the first use; `None` also while seen.json cannot be read (nothing is written
+    /// then, and every scan tries to load it again).
     seen: Option<Seen>,
     /// The markers changed and are not saved yet.
     dirty: bool,
@@ -161,7 +227,7 @@ struct Inner {
     config_dir: PathBuf,
     emit: NotesEmit,
     /// The index, the markers and what the windows were told. Scans and marks run whole under
-    /// it; no call to anything but the file system is made under it.
+    /// it, with their file reads and writes; the emit made under it only sends into a channel.
     state: Mutex<State>,
     /// A window that shows notes is visible.
     visible: Mutex<bool>,
@@ -231,18 +297,26 @@ impl Notes {
             .filter_map(|f| f.note.as_ref())
             .find(|n| n.summary.key == key)
             .map(|n| n.text_seq);
-        let account = state.place.as_ref().map(|(_, a)| a.clone());
-        let result = match (found, account) {
-            (Some(seq), Some(account)) => {
-                let marks = self.seen_map(&mut state).entry(account).or_default();
-                if marks.get(key) != Some(&seq) {
-                    marks.insert(key.to_owned(), seq);
-                    state.dirty = true;
-                }
-                if self.save_seen(&mut state) {
-                    Ok(())
-                } else {
-                    Err(SEEN_NOT_SAVED.to_owned())
+        let place = state.place.clone();
+        let result = match (found, place) {
+            (Some(seq), Some((dir, account))) => {
+                let marks = state
+                    .seen
+                    .as_mut()
+                    .and_then(|seen| marks_mut(seen, &account, &dir));
+                match marks {
+                    None => Err(SEEN_NOT_READ.to_owned()),
+                    Some(marks) => {
+                        if marks.get(key) != Some(&seq) {
+                            marks.insert(key.to_owned(), seq);
+                            state.dirty = true;
+                        }
+                        if self.save_seen(&mut state) {
+                            Ok(())
+                        } else {
+                            Err(SEEN_NOT_SAVED.to_owned())
+                        }
+                    }
                 }
             }
             _ => {
@@ -289,13 +363,18 @@ impl Notes {
         std::thread::spawn(move || scan_loop(&weak, &rx, every))
     }
 
-    fn seen_map<'a>(&self, state: &'a mut State) -> &'a mut Seen {
-        state
-            .seen
-            .get_or_insert_with(|| load_seen(&self.inner.config_dir))
+    /// Loads the markers when they are not loaded yet. A seen.json that cannot be read stays
+    /// unloaded, so it is never written over.
+    fn load(&self, state: &mut State) {
+        if state.seen.is_none() {
+            match load_seen(&self.inner.config_dir) {
+                Ok(seen) => state.seen = Some(seen),
+                Err(e) => eprintln!("notedown: the seen notes could not be read: {e}"),
+            }
+        }
     }
 
-    /// Brings the index up to the store, then sets the baseline, carries markers over and
+    /// Brings the index up to the store, then sets the baseline, brings markers along and
     /// prunes them.
     fn scan(&self, state: &mut State) {
         let (data_dir, account) = (self.inner.place)();
@@ -306,31 +385,46 @@ impl Notes {
             state.place = place.clone();
             state.files.clear();
         }
+        self.load(state);
         let Some((data_dir, account)) = place else {
             return;
         };
-        let dir = data_dir.join("pipeline").join(&account).join("notes");
-        // A folder that cannot be read keeps the index as it is, and prunes nothing. In a data
-        // folder that is there, a store the pipeline has not made yet is a new account: its
-        // baseline is empty. A data folder that is not there (a disk that is not mounted) sets
-        // none.
+        if let Some(seen) = state.seen.as_mut()
+            && use_folder(seen, &account, &data_dir)
+        {
+            state.dirty = true;
+        }
+        let store = data_dir.join("pipeline").join(&account);
+        let dir = store.join("notes");
         let read = match fs::read_dir(&dir) {
             Ok(read) => read,
-            Err(e) => {
-                if e.kind() == io::ErrorKind::NotFound && data_dir.is_dir() {
-                    let seen = self.seen_map(state);
-                    let fresh = !seen.contains_key(&account);
-                    seen.entry(account).or_default();
-                    if fresh {
-                        state.dirty = true;
-                    }
+            // The store is not there (yet, or any more) in a data folder that is: no notes, and
+            // nothing pruned. A store the pipeline made without notes yet gets an empty
+            // baseline. A data folder that cannot be read (a disk that is not mounted) keeps
+            // the index as it is.
+            Err(e) if e.kind() == io::ErrorKind::NotFound && data_dir.is_dir() => {
+                state.files.clear();
+                if store.is_dir()
+                    && let Some(seen) = state.seen.as_mut()
+                    && marks_of(seen, &account, &data_dir).is_none()
+                {
+                    add_folder(seen, &account, &data_dir, BTreeMap::new());
+                    state.dirty = true;
                 }
                 return;
             }
+            Err(_) => return,
         };
         let mut old = std::mem::take(&mut state.files);
         let mut files = BTreeMap::new();
-        for entry in read.flatten() {
+        // The earlier state of every note read again or gone.
+        let mut before: Vec<Note> = Vec::new();
+        let mut complete = true;
+        for entry in read {
+            let Ok(entry) = entry else {
+                complete = false;
+                continue;
+            };
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 continue;
@@ -339,8 +433,18 @@ impl Notes {
             if name.starts_with('.') || !name.ends_with(".json") {
                 continue;
             }
-            let Ok(meta) = fs::symlink_metadata(entry.path()) else {
-                continue;
+            let path = entry.path();
+            let meta = match fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                // Not gone, only not readable for now: it stays as it was.
+                Err(_) => {
+                    if let Some(known) = old.remove(name) {
+                        files.insert(name.to_owned(), known);
+                    }
+                    complete = false;
+                    continue;
+                }
             };
             if !meta.is_file() {
                 continue;
@@ -348,74 +452,69 @@ impl Notes {
             let stamp = stamp_of(&meta);
             let indexed = match old.remove(name) {
                 Some(known) if known.stamp == stamp => known,
-                _ => Indexed {
-                    stamp,
-                    note: read_note(&entry.path(), stamp),
+                known => match read_note(&path, stamp) {
+                    Ok(note) => {
+                        before.extend(known.and_then(|k| k.note));
+                        Indexed { stamp, note }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        before.extend(known.and_then(|k| k.note));
+                        continue;
+                    }
+                    // Not readable for now: the old entry stays (with its old stamp, so the
+                    // next scan reads it again), and nothing is pruned.
+                    Err(_) => {
+                        complete = false;
+                        match known {
+                            Some(known) => known,
+                            None => continue,
+                        }
+                    }
                 },
             };
             files.insert(name.to_owned(), indexed);
         }
-        let gone: Vec<Note> = old.into_values().filter_map(|f| f.note).collect();
-        state.files = files;
-        self.mark(state, &account, &gone);
-    }
-
-    /// The baseline of a new account, the markers of moved path-keyed notes, and pruning.
-    fn mark(&self, state: &mut State, account: &str, gone: &[Note]) {
-        let mut present: BTreeSet<String> = BTreeSet::new();
-        let mut notes: Vec<Note> = Vec::new();
-        for (name, file) in &state.files {
-            present.insert(key_of_file(name));
-            if let Some(note) = &file.note {
-                present.insert(note.summary.key.clone());
-                notes.push(note.clone());
+        if complete {
+            before.extend(old.into_values().filter_map(|f| f.note));
+        } else {
+            // A file that could not be listed is not gone: the old entries stay this scan.
+            for (name, known) in old {
+                files.entry(name).or_insert(known);
             }
         }
-        let seen = self.seen_map(state);
-        let mut changed = false;
-        match seen.get_mut(account) {
+        state.files = files;
+        self.mark(state, &account, &data_dir, &before, complete);
+    }
+
+    /// The baseline of a new store, markers of notes that came back or moved, and pruning
+    /// (only after a scan that read every file).
+    fn mark(&self, state: &mut State, account: &str, dir: &Path, before: &[Note], complete: bool) {
+        let Some(mut seen) = state.seen.take() else {
+            return;
+        };
+        let notes: Vec<&Note> = state
+            .files
+            .values()
+            .filter_map(|f| f.note.as_ref())
+            .collect();
+        let changed = match marks_mut(&mut seen, account, dir) {
             None => {
                 let baseline = notes
                     .iter()
                     .filter(|n| n.summary.pages_with_text > 0)
                     .map(|n| (n.summary.key.clone(), n.text_seq))
                     .collect();
-                seen.insert(account.to_owned(), baseline);
-                changed = true;
+                add_folder(&mut seen, account, dir, baseline);
+                true
             }
             Some(marks) => {
-                let old_keys: Vec<String> = marks
-                    .keys()
-                    .filter(|k| !present.contains(*k))
-                    .cloned()
-                    .collect();
-                for old in old_keys {
-                    let value = marks.remove(&old).unwrap_or_default();
-                    changed = true;
-                    if !old.starts_with("path:") {
-                        continue;
-                    }
-                    let before = gone.iter().find(|n| n.summary.key == old);
-                    let candidates: Vec<&Note> = notes
-                        .iter()
-                        .filter(|n| {
-                            n.summary.key.starts_with("path:")
-                                && !marks.contains_key(&n.summary.key)
-                        })
-                        .filter(|n| match before {
-                            // The same pages with the same text versions.
-                            Some(before) => !before.pages.is_empty() && n.pages == before.pages,
-                            // Not indexed before (a move while the app was not running): the
-                            // seq of a text version belongs to one note only.
-                            None => value > 0 && n.text_seq == value,
-                        })
-                        .collect();
-                    if let [moved] = candidates.as_slice() {
-                        marks.insert(moved.summary.key.clone(), value);
-                    }
-                }
+                let came_back = follow_returns(marks, &notes, before);
+                let moving = follow_moves(marks, &notes);
+                let pruned = complete && prune(marks, &notes, state.files.keys(), before);
+                came_back || moving || pruned
             }
-        }
+        };
+        state.seen = Some(seen);
         if changed {
             state.dirty = true;
         }
@@ -444,12 +543,105 @@ impl Notes {
 
     /// Tells the windows when All notes or New notes is not what they were told last.
     fn tell(&self, state: &mut State) {
-        let now = (listed(state), new_of(state));
-        if state.told.as_ref() != Some(&now) {
-            state.told = Some(now);
+        let all = listed_notes(state);
+        let new = new_notes_of(state);
+        let same = |told: &[NoteSummary], now: &[&Note]| {
+            told.len() == now.len() && told.iter().zip(now).all(|(t, n)| *t == n.summary)
+        };
+        let unchanged = state
+            .told
+            .as_ref()
+            .is_some_and(|(a, n)| same(a, &all) && same(n, &new));
+        if !unchanged {
+            let summaries =
+                |notes: Vec<&Note>| notes.into_iter().map(|n| n.summary.clone()).collect();
+            state.told = Some((summaries(all), summaries(new)));
             (self.inner.emit)();
         }
     }
+}
+
+/// A note that came back (from the bin, into the scope): the text it had when it went was
+/// seen, so its marker follows it to the text it has now. True when a marker changed.
+fn follow_returns(marks: &mut BTreeMap<String, u64>, notes: &[&Note], before: &[Note]) -> bool {
+    let mut changed = false;
+    for note in notes.iter().filter(|n| n.live()) {
+        let went = before
+            .iter()
+            .find(|b| b.summary.key == note.summary.key && !b.live());
+        if let (Some(went), Some(mark)) = (went, marks.get_mut(&note.summary.key))
+            && *mark >= went.text_seq
+            && *mark < note.text_seq
+        {
+            *mark = note.text_seq;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// A path-keyed note in the middle of a move (the pipeline writes the new state before it
+/// removes the old one): the new key has the same pages with the same text versions as one
+/// marked note, and gets its marker. True when a marker was added.
+fn follow_moves(marks: &mut BTreeMap<String, u64>, notes: &[&Note]) -> bool {
+    let mut changed = false;
+    for note in notes {
+        let key = &note.summary.key;
+        if !key.starts_with("path:") || note.pages.is_empty() || marks.contains_key(key) {
+            continue;
+        }
+        let twins: Vec<u64> = notes
+            .iter()
+            .filter(|o| o.summary.key.starts_with("path:") && o.pages == note.pages)
+            .filter_map(|o| marks.get(&o.summary.key).copied())
+            .collect();
+        if let [value] = twins.as_slice() {
+            marks.insert(key.clone(), *value);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Removes the markers of keys that have no state file. A gone path-keyed key passes its
+/// marker to the one unmarked path-keyed note that is the same note. True when a marker
+/// changed.
+fn prune<'a>(
+    marks: &mut BTreeMap<String, u64>,
+    notes: &[&Note],
+    names: impl Iterator<Item = &'a String>,
+    before: &[Note],
+) -> bool {
+    let mut present: BTreeSet<String> = names.map(|name| key_of_file(name)).collect();
+    present.extend(notes.iter().map(|n| n.summary.key.clone()));
+    let gone: Vec<String> = marks
+        .keys()
+        .filter(|k| !present.contains(*k))
+        .cloned()
+        .collect();
+    let changed = !gone.is_empty();
+    for old in gone {
+        let value = marks.remove(&old).unwrap_or_default();
+        if !old.starts_with("path:") {
+            continue;
+        }
+        let went = before.iter().find(|n| n.summary.key == old);
+        let candidates: Vec<&&Note> = notes
+            .iter()
+            .filter(|n| n.summary.key.starts_with("path:") && !marks.contains_key(&n.summary.key))
+            .filter(|n| match went {
+                // The same pages with the same text versions.
+                Some(went) => !went.pages.is_empty() && n.pages == went.pages,
+                // Not indexed before (a move while the app was not running): the seq of a
+                // text version belongs to one note only.
+                None => value > 0 && n.text_seq == value,
+            })
+            .collect();
+        if let [moved] = candidates.as_slice() {
+            marks.insert(moved.summary.key.clone(), value);
+        }
+    }
+    changed
 }
 
 fn scan_loop(weak: &Weak<Inner>, rx: &Receiver<()>, every: Duration) {
@@ -514,18 +706,25 @@ fn listed(state: &State) -> Vec<NoteSummary> {
         .collect()
 }
 
-/// New notes: none before the baseline of the account is set.
-fn new_of(state: &State) -> Vec<NoteSummary> {
+/// New notes: none before the baseline of the store is set, or while the markers cannot be
+/// read.
+fn new_notes_of(state: &State) -> Vec<&Note> {
     let Some(marks) = state
         .place
         .as_ref()
-        .and_then(|(_, account)| state.seen.as_ref()?.get(account))
+        .and_then(|(dir, account)| marks_of(state.seen.as_ref()?, account, dir))
     else {
         return Vec::new();
     };
     listed_notes(state)
         .into_iter()
         .filter(|n| n.text_seq > marks.get(&n.summary.key).copied().unwrap_or(0))
+        .collect()
+}
+
+fn new_of(state: &State) -> Vec<NoteSummary> {
+    new_notes_of(state)
+        .into_iter()
         .map(|n| n.summary.clone())
         .collect()
 }
@@ -539,10 +738,15 @@ fn stamp_of(meta: &fs::Metadata) -> Stamp {
     }
 }
 
-/// The summary of one store file; `None` when it cannot be read or parsed.
-fn read_note(path: &Path, stamp: Stamp) -> Option<Note> {
-    let bytes = fs::read(path).ok()?;
-    let stored: StoredNote = serde_json::from_slice(&bytes).ok()?;
+/// The summary of one store file; `None` when it does not parse, an error when it cannot be
+/// read.
+fn read_note(path: &Path, stamp: Stamp) -> io::Result<Option<Note>> {
+    let file = io::BufReader::new(fs::File::open(path)?);
+    let stored: StoredNote = match serde_json::from_reader(file) {
+        Ok(stored) => stored,
+        Err(e) if e.is_io() => return Err(e.into()),
+        Err(_) => return Ok(None),
+    };
     let pages_with_text = stored.pages.iter().filter(|p| !p.blocks.is_empty()).count();
     let text_seq = stored.pages.iter().filter_map(|p| p.seq).max().unwrap_or(0);
     let changed_ms = i64::try_from(stamp.mtime_ns.div_euclid(1_000_000)).unwrap_or(0);
@@ -551,7 +755,7 @@ fn read_note(path: &Path, stamp: Stamp) -> Option<Note> {
     } else {
         stored.title
     };
-    Some(Note {
+    Ok(Some(Note {
         summary: NoteSummary {
             key: stored.key,
             path: stored.path,
@@ -568,7 +772,7 @@ fn read_note(path: &Path, stamp: Stamp) -> Option<Note> {
             .into_iter()
             .map(|p| (p.page_id, p.seq))
             .collect(),
-    })
+    }))
 }
 
 /// The file name without `.note`, as the pipeline names a note.
@@ -595,16 +799,18 @@ fn safe_component(name: &str) -> bool {
 }
 
 /// The markers in `dir`; none when there is no file. A file that does not parse is kept as
-/// `seen.json.broken` and the markers start empty (the next scan sets a new baseline).
-fn load_seen(dir: &Path) -> Seen {
+/// `seen.json.broken` and the markers start empty (the next scan sets a new baseline). A file
+/// that cannot be read is an error: it is never written over.
+fn load_seen(dir: &Path) -> io::Result<Seen> {
     let path = dir.join(SEEN_FILE);
     match fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_else(|e| {
             eprintln!("notedown: {} does not parse: {e}", path.display());
             let _ = fs::rename(&path, dir.join(SEEN_BROKEN));
             Seen::new()
-        }),
-        Err(_) => Seen::new(),
+        })),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Seen::new()),
+        Err(e) => Err(e),
     }
 }
 
@@ -622,8 +828,13 @@ fn write_seen(dir: &Path, seen: &Seen) -> io::Result<()> {
     })();
     if written.is_err() {
         let _ = fs::remove_file(&temp);
+        return written;
     }
-    written
+    // The rename is flushed too; the new file is in place already, so a failure is only logged.
+    if let Err(e) = fs::File::open(dir).and_then(|folder| folder.sync_all()) {
+        eprintln!("notedown: the folder of {SEEN_FILE} could not be flushed: {e}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

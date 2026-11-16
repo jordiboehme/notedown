@@ -1172,7 +1172,7 @@ impl Store {
     /// not prune or write the MD5 cache itself. When an entry of the page was not seen by a scan
     /// as it is (no id of its kind, or a file whose cache row is not current: made, changed or
     /// renamed by hand since the last scan), its folder goes through `scan` first: one scan of
-    /// the direct children per such folder and page. So its id and its MD5 come with the event
+    /// the direct children per such folder and request. So its id and its MD5 come with the event
     /// of that change, and a rename within the folder is a move that keeps the id. An entry
     /// that the scan could not journal (it is still changing) is left out of the page; its
     /// event brings it later. A missing `path` is [`Page::NotFound`], a file
@@ -1196,6 +1196,9 @@ impl Store {
         };
         let limit = limit.max(1);
         let mut anchor = after.cloned();
+        // The folders scanned in this request: a retry after a page that vanished does not
+        // scan them again.
+        let mut scanned: Vec<WirePath> = Vec::new();
         loop {
             let before = self.check_tree(false)?;
             let mut found = Vec::new();
@@ -1213,19 +1216,19 @@ impl Store {
             list::walk_window(path, &top.fs_path, rest, &window, &mut found)?;
             let more = found.len() > limit;
             found.truncate(limit);
-            // The folders that hold an unseen entry, each once, in the order of the page.
-            let mut folders: Vec<WirePath> = Vec::new();
+            // The folders that hold an unseen entry, each once in this request, in the order
+            // of the page.
+            let mut unseen = false;
             for f in found.iter().filter(|f| !self.seen(f)) {
+                unseen = true;
                 let folder = f.path.parent().unwrap_or_else(WirePath::root);
-                if !folders.contains(&folder) {
-                    folders.push(folder);
+                if !scanned.contains(&folder) {
+                    scan(&folder)?;
+                    scanned.push(folder);
                 }
             }
-            for folder in &folders {
-                scan(folder)?;
-            }
             let last = found.last().map(|f| f.path.clone());
-            if !folders.is_empty() {
+            if unseen {
                 // One the scan could not journal yet (it changes right now) waits for its
                 // event: an id or a cache row given here would swallow that event.
                 found.retain(|f| self.seen(f));

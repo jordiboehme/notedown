@@ -148,6 +148,37 @@ fn continuation_pages_do_not_scan_the_folder() {
     }
 }
 
+/// A continuation page whose entries all change while the scan reads them: the window moves on
+/// over the folder, and the folder is scanned once in this request, not once per window.
+#[test]
+fn an_unstable_page_scans_its_folder_once() {
+    let s = start_imported();
+    let t = s.token();
+    let dir = "NOTE/Note/busy";
+    let names = many(&s, dir, 12);
+    let base = format!("/tree?path={}&limit=2", q(dir));
+    let first = page(&s, &t, &base);
+    let next = first["next"].as_str().unwrap().to_string();
+    // Every file after the first page is changed by hand, and changes again whenever the scan
+    // reads it, so no scan can journal it.
+    for n in &names[2..] {
+        hand(&s, n, b"changed by hand");
+    }
+    let root = files(&s);
+    let round = std::sync::atomic::AtomicU64::new(0);
+    let store = s.state.store("jordi").unwrap();
+    store.set_scan_hash_hook(move |p| {
+        let n = round.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(root.join(p.display()), format!("still changing {n}")).unwrap();
+    });
+    let (scans, _) = store.walk_counts();
+    let p = page(&s, &t, &format!("{base}&cursor={next}"));
+    let (scans_1, _) = store.walk_counts();
+    assert_eq!(scans_1 - scans, 1, "the folder was scanned more than once");
+    assert_eq!(p["entries"], json!([]), "{p}");
+    assert_eq!(p["next"], Value::Null, "{p}");
+}
+
 #[test]
 fn tree_pages_keep_the_segment_order() {
     let s = start_imported();

@@ -346,7 +346,12 @@ fn a_path_that_does_not_parse_is_bad_name() {
 fn a_missing_or_root_path_is_bad_name() {
     let s = start_imported();
     let token = s.token();
-    for url in ["/entries", "/entries?path=", "/entries?path=%2F", "/entries?other=1"] {
+    for url in [
+        "/entries",
+        "/entries?path=",
+        "/entries?path=%2F",
+        "/entries?other=1",
+    ] {
         let (status, answer) = s.get(Some(&token), url);
         assert_eq!(
             (status, &answer["error"]),

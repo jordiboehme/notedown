@@ -138,7 +138,8 @@ pub const ABOUT_LINKS: [&str; 2] = [
 /// How many lines of each child's log the Server page shows.
 pub const LOG_SHOWN: usize = 30;
 
-/// An `http://` or `https://` address with a host.
+/// An `http://` or `https://` address with a host and without a user or a password: a login
+/// in the address would end up in the config file and in status lines.
 fn is_web_address(url: &str) -> bool {
     let Some(rest) = url
         .strip_prefix("http://")
@@ -148,7 +149,10 @@ fn is_web_address(url: &str) -> bool {
     };
     // The URL parser reads `http:///x` as the host `x`; the text must name the host itself.
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = authority.rsplit('@').next().unwrap_or("");
+    if authority.contains('@') {
+        return false;
+    }
+    let host = authority;
     let named = !host.is_empty() && !host.starts_with(':');
     named && reqwest::Url::parse(url).is_ok_and(|u| u.host_str().is_some_and(|h| !h.is_empty()))
 }
@@ -575,6 +579,37 @@ mod tests {
         assert!(
             state
                 .set_mode(Mode::Remote, None, Some("http://pi.local:19072".into()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_address_with_a_login_in_it_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        for url in [
+            "https://user:secret@n.example.org",
+            "https://user@n.example.org",
+            "http://user:secret@pi.local:19072/rest/v1",
+            "http://@pi.local",
+        ] {
+            assert_eq!(
+                state
+                    .set_mode(Mode::Remote, None, Some(url.to_owned()))
+                    .unwrap_err(),
+                NEEDS_ADDRESS,
+                "{url}"
+            );
+        }
+        assert_eq!(state.current().server_url, None);
+        // An @ after the host is no login.
+        assert!(
+            state
+                .set_mode(
+                    Mode::Remote,
+                    None,
+                    Some("https://n.example.org/x?to=a@b".into())
+                )
                 .is_ok()
         );
     }

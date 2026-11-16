@@ -670,14 +670,10 @@ fn the_token_goes_only_into_the_header() {
 
 #[test]
 fn a_failed_request_shows_no_credentials_of_the_address() {
-    // A server that sends the client round in circles until it gives up.
-    let looping = TestServer::start(Some(
-        "HTTP/1.1 302 Found\r\nlocation: /rest/v1/account\r\ncontent-length: 0\r\n\
-         connection: close\r\n\r\n"
-            .to_owned(),
-    ));
+    // Not an HTTP answer at all: the request fails.
+    let garbage = TestServer::start(Some("this is no HTTP\r\n\r\n".to_owned()));
     let sources = RealSources::new(crate::process::spawn_program("/bin/false".into()));
-    let base = format!("http://user:hunter2@127.0.0.1:{}/rest/v1", looping.port);
+    let base = format!("http://user:hunter2@127.0.0.1:{}/rest/v1", garbage.port);
     let answer = sources.account(&base, None);
     let AccountAnswer::Failed(text) = &answer else {
         panic!("{answer:?}")
@@ -685,6 +681,60 @@ fn a_failed_request_shows_no_credentials_of_the_address() {
     assert!(text.starts_with("the request failed"), "{text}");
     assert!(!text.contains("hunter2"), "{text}");
     assert!(!text.contains("127.0.0.1"), "no address at all: {text}");
+}
+
+#[test]
+fn a_broken_answer_shows_no_credentials_of_the_address() {
+    // It promises more of the body than it sends, then closes.
+    let short = TestServer::start(Some(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 500\r\n\
+         connection: close\r\n\r\n{\"slug\""
+            .to_owned(),
+    ));
+    let sources = RealSources::new(crate::process::spawn_program("/bin/false".into()));
+    let base = format!("http://user:hunter2@127.0.0.1:{}/rest/v1", short.port);
+    let answer = sources.account(&base, None);
+    let AccountAnswer::Failed(text) = &answer else {
+        panic!("{answer:?}")
+    };
+    assert!(text.starts_with("the answer could not be read"), "{text}");
+    assert!(!text.contains("hunter2"), "{text}");
+    assert!(!text.contains("127.0.0.1"), "no address at all: {text}");
+}
+
+#[test]
+fn a_redirect_is_not_followed() {
+    let moved = TestServer::start(Some(
+        "HTTP/1.1 301 Moved Permanently\r\nlocation: http://192.0.2.1/rest/v1/account\r\n\
+         content-length: 0\r\nconnection: close\r\n\r\n"
+            .to_owned(),
+    ));
+    let sources = RealSources::new(crate::process::spawn_program("/bin/false".into()));
+    let base = format!("http://127.0.0.1:{}/rest/v1", moved.port);
+    assert_eq!(
+        sources.account(&base, Some(&Token::new("secret"))),
+        AccountAnswer::Failed("the server answered 301".into())
+    );
+}
+
+#[test]
+fn loopback_bases_are_known() {
+    for base in [
+        "http://127.0.0.1:19072/rest/v1",
+        "http://[::1]:19072/rest/v1",
+        "http://localhost:19072/rest/v1",
+        "http://127.0.0.5/rest/v1",
+    ] {
+        assert!(is_loopback(base), "{base}");
+    }
+    for base in [
+        "https://notes.example.org/rest/v1",
+        "http://192.168.1.5:19072/rest/v1",
+        "http://localhost.example.org/rest/v1",
+        "not a url",
+    ] {
+        assert!(!is_loopback(base), "{base}");
+    }
 }
 
 #[test]

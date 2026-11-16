@@ -445,15 +445,21 @@ impl Inner {
 pub struct RealSources {
     spawn: SpawnFn,
     /// Made on the first poll, on a poller thread: a blocking client must not be made inside
-    /// an async runtime.
-    client: Mutex<Option<reqwest::blocking::Client>>,
+    /// an async runtime. One for the app's own server on loopback, one for another machine.
+    clients: Mutex<Clients>,
+}
+
+#[derive(Default)]
+struct Clients {
+    loopback: Option<reqwest::blocking::Client>,
+    remote: Option<reqwest::blocking::Client>,
 }
 
 impl RealSources {
     pub fn new(spawn: SpawnFn) -> Self {
         Self {
             spawn,
-            client: Mutex::new(None),
+            clients: Mutex::default(),
         }
     }
 }
@@ -464,7 +470,7 @@ impl Sources for RealSources {
     }
 
     fn account(&self, base: &str, token: Option<&Token>) -> AccountAnswer {
-        let client = match self.client() {
+        let client = match self.client(is_loopback(base)) {
             Ok(client) => client,
             Err(why) => return AccountAnswer::Failed(why),
         };
@@ -499,7 +505,11 @@ impl Sources for RealSources {
                 Err(e) if e.is_timeout() => {
                     AccountAnswer::Unreachable("no answer in time".to_owned())
                 }
-                Err(e) => AccountAnswer::Failed(format!("the answer could not be read: {e}")),
+                // Without the address, as above.
+                Err(e) => AccountAnswer::Failed(format!(
+                    "the answer could not be read: {}",
+                    e.without_url()
+                )),
             },
             401 => AccountAnswer::Refused,
             410 => AccountAnswer::Failed("the account was removed".to_owned()),
@@ -526,6 +536,21 @@ impl Sources for RealSources {
     }
 }
 
+/// Whether `base` is on this Mac: a loopback address or `localhost`.
+fn is_loopback(base: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let ip = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || ip
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// The address for a line of text, without a user or a password in it.
 fn shown(base: &str) -> String {
     match reqwest::Url::parse(base) {
@@ -539,17 +564,31 @@ fn shown(base: &str) -> String {
 }
 
 impl RealSources {
-    fn client(&self) -> Result<reqwest::blocking::Client, String> {
-        let mut client = lock(&self.client);
-        if let Some(client) = client.as_ref() {
+    /// The client for `loopback` or another machine, made once. Neither follows a redirect: a
+    /// Notedown server never sends one, so a redirect is shown as "the server answered 301"
+    /// and the token never goes to another address. The loopback client uses no proxy: the
+    /// app's own server is on this Mac, and a system proxy must not see its token.
+    fn client(&self, loopback: bool) -> Result<reqwest::blocking::Client, String> {
+        let mut clients = lock(&self.clients);
+        let slot = if loopback {
+            &mut clients.loopback
+        } else {
+            &mut clients.remote
+        };
+        if let Some(client) = slot.as_ref() {
             return Ok(client.clone());
         }
-        let made = reqwest::blocking::Client::builder()
+        let mut builder = reqwest::blocking::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none());
+        if loopback {
+            builder = builder.no_proxy();
+        }
+        let made = builder
             .build()
             .map_err(|e| format!("no HTTP client: {e}"))?;
-        *client = Some(made.clone());
+        *slot = Some(made.clone());
         Ok(made)
     }
 }

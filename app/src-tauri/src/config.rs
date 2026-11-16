@@ -162,6 +162,21 @@ pub fn save(dir: &Path, config: &AppConfig) -> io::Result<()> {
     fs::File::open(dir)?.sync_all()
 }
 
+/// The address without a user or a password in it, for a status line or the Keychain key.
+/// Everything else stays as written (no parser that changes the case or adds a slash), so an
+/// address without a login comes back unchanged.
+pub fn without_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    match authority.rsplit_once('@') {
+        Some((_, host)) => format!("{scheme}://{host}{tail}"),
+        None => url.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +222,28 @@ mod tests {
             fs::read_to_string(dir.path().join("config.json.broken")).unwrap(),
             "{ not json"
         );
+    }
+
+    #[test]
+    fn the_login_part_of_an_address_is_dropped() {
+        for (url, shown) in [
+            ("https://user:secret@n.example.org", "https://n.example.org"),
+            ("https://user@n.example.org/x", "https://n.example.org/x"),
+            (
+                "http://u:p@pi.local:19072/rest/v1?a=b",
+                "http://pi.local:19072/rest/v1?a=b",
+            ),
+            // Unchanged without a login, also the case and a trailing slash.
+            ("https://Notes.Example.org/", "https://Notes.Example.org/"),
+            (
+                "https://n.example.org/x?to=a@b",
+                "https://n.example.org/x?to=a@b",
+            ),
+            ("https://n.example.org#a@b", "https://n.example.org#a@b"),
+            ("no address", "no address"),
+        ] {
+            assert_eq!(without_userinfo(url), shown, "{url}");
+        }
     }
 
     #[test]

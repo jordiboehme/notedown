@@ -400,6 +400,32 @@ fn status_of_an_unreachable_server() {
 }
 
 #[test]
+fn the_server_line_shows_no_login_of_the_address() {
+    let mut remote = local();
+    remote.config.mode = Mode::Remote;
+    remote.config.server_url = Some("https://user:secret@notes.example.org".into());
+    remote.account = None;
+    assert_eq!(
+        status_from(&remote, NOW).server.line,
+        "Checking https://notes.example.org..."
+    );
+    remote.account = unreachable(NOW - MIN, true);
+    assert_eq!(
+        status_from(&remote, NOW).server.line,
+        "https://notes.example.org does not answer"
+    );
+    remote.account = Some(AccountPoll {
+        had_token: true,
+        answer: AccountAnswer::Account(account(ACCOUNT)),
+        unreachable_since_ms: None,
+    });
+    assert_eq!(
+        status_from(&remote, NOW).server.line,
+        "Runs on https://notes.example.org"
+    );
+}
+
+#[test]
 fn agents_come_from_the_consumers() {
     let s = status_from(&local(), NOW);
     let names: Vec<_> = s.agents.iter().map(|a| a.name.as_str()).collect();

@@ -341,7 +341,14 @@ fn reach(parts: &Parts, now_ms: u64) -> Reach {
 fn server_status(parts: &Parts, reach: Reach, attention: &mut Vec<Attention>) -> ServerStatus {
     let device_urls = parts.device_urls.clone();
     if parts.config.mode == Mode::Remote {
-        let line = match parts.config.server_url.as_deref().filter(|u| !u.is_empty()) {
+        // Never a login of the address in a line.
+        let url = parts
+            .config
+            .server_url
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .map(crate::config::without_userinfo);
+        let line = match url {
             None => "No server address yet".to_owned(),
             Some(url) => match reach {
                 Reach::Unknown => format!("Checking {url}..."),

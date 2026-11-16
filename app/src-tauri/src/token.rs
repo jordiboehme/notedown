@@ -55,7 +55,8 @@ pub fn token_key(config: &AppConfig) -> Option<String> {
         Mode::Local => Some(format!("local|{slug}")),
         Mode::Remote => {
             let url = config.server_url.as_deref().filter(|s| !s.is_empty())?;
-            Some(format!("{url}|{slug}"))
+            // Set refuses a login in the address; one in an older config stays out of the key.
+            Some(format!("{}|{slug}", crate::config::without_userinfo(url)))
         }
     }
 }
@@ -169,6 +170,17 @@ mod tests {
         );
         assert_eq!(
             token_key(&remote).as_deref(),
+            Some("https://notes.example.org|jordi")
+        );
+
+        // A login in the address never goes into the key.
+        let with_login = config(
+            Mode::Remote,
+            Some("https://user:secret@notes.example.org"),
+            Some("jordi"),
+        );
+        assert_eq!(
+            token_key(&with_login).as_deref(),
             Some("https://notes.example.org|jordi")
         );
 

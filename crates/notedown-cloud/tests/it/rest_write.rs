@@ -1223,3 +1223,178 @@ fn a_json_body_over_8_mib_gets_a_json_413() {
     assert_eq!(status, 413, "{answer}");
     assert_eq!(answer, json!({"error": "too_large"}));
 }
+
+/// An upload of `total` bytes to `path` on a raw connection that has sent only `first` so far,
+/// once its staging folder is there (so every check before the body has passed).
+fn partial_upload(
+    s: &Server,
+    token: &str,
+    path: &str,
+    total: usize,
+    first: &[u8],
+) -> std::net::TcpStream {
+    use std::io::Write;
+    let addr = s.base.trim_start_matches("http://");
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    let head = upload_head(path, token, &format!("\r\nContent-Length: {total}"));
+    stream
+        .write_all(format!("{head}\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes())
+        .unwrap();
+    stream.write_all(first).unwrap();
+    stream.flush().unwrap();
+    for _ in 0..250 {
+        if !app_staging(s).is_empty() {
+            return stream;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("the upload never reached staging");
+}
+
+/// Sends the rest of a [`partial_upload`]: (status, answer text).
+fn finish_upload(mut stream: std::net::TcpStream, rest: &[u8]) -> (u16, String) {
+    use std::io::Write;
+    stream.write_all(rest).unwrap();
+    stream.flush().unwrap();
+    let mut text = Vec::new();
+    let _ = stream.read_to_end(&mut text);
+    let text = String::from_utf8_lossy(&text).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    (status, text)
+}
+
+#[test]
+fn a_removed_account_token_cannot_upload() {
+    let s = start_imported();
+    let t = writer(&s);
+    let accounts = s.state.auth.accounts();
+    accounts.remove("jordi", &s.state.journal).unwrap();
+    accounts.create("jordi", EMAIL, PASSWORD).unwrap();
+    let (status, answer) = upload(&s, &t, "NOTE/Note/a.txt", b"x");
+    assert_eq!(status, 410, "{answer}");
+    assert_eq!(answer["error"], "account_removed");
+    assert!(!files(&s).join("NOTE/Note/a.txt").exists());
+}
+
+#[test]
+fn uploads_wait_while_a_scan_holds_the_account() {
+    let s = start_imported();
+    let t = writer(&s);
+    let read = s.token();
+    let gone = s.put("gone.note", b"g");
+    let note_tree = format!("/tree?path={}", q("NOTE/Note"));
+    // Before the body: only the headers are sent.
+    std::fs::remove_file(files(&s).join(&gone)).unwrap();
+    assert_eq!(s.get(Some(&read), &note_tree).0, 423);
+    let (status, text) = raw(
+        &s,
+        &upload_head("NOTE/Note/a.txt", &t, "\r\nContent-Length: 100000000"),
+        b"",
+        false,
+    );
+    assert_eq!(status, 423, "{text}");
+    assert!(text.contains("scan_hold"), "{text}");
+    // Lift the hold, start an upload, hold again while its body is on the way: refused under
+    // the lock.
+    // The file is back and the hold lifted (as `cloud scan --accept` would).
+    hand(&s, &gone, b"g");
+    std::fs::remove_file(s.data.join("accounts/jordi/scan-hold.json")).unwrap();
+    assert_eq!(s.get(Some(&read), &note_tree).0, 200);
+    let n = events(&s).len();
+    let stream = partial_upload(&s, &t, "NOTE/Note/a.txt", 6, b"abc");
+    std::fs::remove_file(files(&s).join(&gone)).unwrap();
+    assert_eq!(s.get(Some(&read), &note_tree).0, 423);
+    let (status, text) = finish_upload(stream, b"def");
+    assert_eq!(status, 423, "{text}");
+    assert!(text.contains("scan_hold"), "{text}");
+    wait_for_clean_staging(&s);
+    assert_eq!(events(&s).len(), n);
+    assert!(!files(&s).join("NOTE/Note/a.txt").exists());
+}
+
+#[test]
+fn uploads_wait_for_the_import_in_protect_mode() {
+    // Before the body: only the headers are sent.
+    let s = start();
+    assert!(s.state.config.protect);
+    let t = writer(&s);
+    let (status, text) = raw(
+        &s,
+        &upload_head("NOTE/Note/a.txt", &t, "\r\nContent-Length: 100000000"),
+        b"",
+        false,
+    );
+    assert_eq!(status, 423, "{text}");
+    assert!(text.contains("not_imported"), "{text}");
+    drop(s);
+    // The marker goes away while the body is on the way: refused under the lock.
+    let s = start_imported();
+    let t = writer(&s);
+    let stream = partial_upload(&s, &t, "NOTE/Note/a.txt", 6, b"abc");
+    let accounts = Accounts::new(&s.data);
+    let mut a = accounts.get("jordi").unwrap().unwrap();
+    a.imported = None;
+    accounts.save(&a).unwrap();
+    let (status, text) = finish_upload(stream, b"def");
+    assert_eq!(status, 423, "{text}");
+    assert!(text.contains("not_imported"), "{text}");
+    wait_for_clean_staging(&s);
+    assert!(!files(&s).join("NOTE/Note/a.txt").exists());
+}
+
+#[test]
+fn the_quota_is_checked_again_under_the_lock() {
+    let s = start_imported();
+    let accounts = Accounts::new(&s.data);
+    let mut a = accounts.get("jordi").unwrap().unwrap();
+    a.quota_bytes = Some(10);
+    accounts.save(&a).unwrap();
+    let t = writer(&s);
+    // Each fits alone, not both: the first passes its checks before the body, then the second
+    // commits, then the first ends.
+    let stream = partial_upload(&s, &t, "NOTE/Note/a.txt", 6, b"abc");
+    assert_eq!(upload(&s, &t, "NOTE/Note/b.txt", b"123456").0, 201);
+    let (status, text) = finish_upload(stream, b"def");
+    assert_eq!(status, 507, "{text}");
+    assert!(text.contains("quota_exceeded"), "{text}");
+    wait_for_clean_staging(&s);
+    assert!(!files(&s).join("NOTE/Note/a.txt").exists());
+    // The usage the server keeps knows the second upload: refused before the body now.
+    let (status, text) = raw(
+        &s,
+        &upload_head("NOTE/Note/c.txt", &t, "\r\nContent-Length: 6"),
+        b"",
+        false,
+    );
+    assert_eq!(status, 507, "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn without_quota_bytes_there_is_no_quota_check() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = start_imported();
+    assert!(
+        Accounts::new(&s.data)
+            .get("jordi")
+            .unwrap()
+            .unwrap()
+            .quota_bytes
+            .is_none()
+    );
+    let t = writer(&s);
+    // A folder no walk of the whole tree can read: an upload elsewhere never walks it.
+    let locked = files(&s).join("EXPORT/locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let (status, answer) = upload(&s, &t, "NOTE/Note/big.bin", &vec![1u8; 3_000_000]);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(status, 201, "{answer}");
+}

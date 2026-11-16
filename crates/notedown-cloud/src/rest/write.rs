@@ -5,14 +5,18 @@
 //! Before the body is read (no store lock): the path ([`parse_target`]), the sync mode (409
 //! `sync_refused`), a look at the gates (423 `not_imported`, `scan_hold`) and at the device sync
 //! lock (423 `device_syncing` with `Retry-After`), `Content-Length` (411 `length_required`), the
-//! size limit (413 `too_large`) and the quota (507 `quota_exceeded`). Then the body streams into
-//! `accounts/<slug>/staging/app-<op id>/`; a body shorter than `Content-Length` is 400
-//! `bad_length`, one whose MD5 is not `X-Notedown-Md5` 400 `bad_md5`. Then, in one blocking
-//! task under one store lock, in this order: the gates, the device sync lock, the sync mode, the
-//! scans of the folders on the way, [`check_target`], the quota again, and the commit (the
-//! precondition `If-None-Match: *` or `If-Match: "<md5>"`, 412 `precondition_failed`, comes after
-//! the check for identical bytes, which is always 200 `unchanged`). The staging folder goes
-//! away in every case, also when the client drops the connection.
+//! size limit (413 `too_large`) and the quota from the cached usage (507 `quota_exceeded`).
+//! Then the body streams into `accounts/<slug>/staging/app-<op id>/`; a body shorter than
+//! `Content-Length` is 400 `bad_length`, one whose MD5 is not `X-Notedown-Md5` 400 `bad_md5`.
+//! Then, in one blocking task under one store lock, in this order: the gates, the device sync
+//! lock, the sync mode, the scans of the folders on the way, [`check_target`], the quota again
+//! (a walk of the tree only when the cached usage is cold or near the quota), and the commit
+//! (the precondition `If-None-Match: *` or `If-Match: "<md5>"`, 412 `precondition_failed`,
+//! comes after the check for identical bytes, which is always 200 `unchanged`). The staging
+//! folder goes away in every case, also when the client drops the connection.
+//!
+//! Only an account with `quota_bytes` has a quota; without it there is no check and no walk,
+//! as for a device upload. The cached usage learns each upload's size change, so it stays warm.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,7 +35,7 @@ use super::errors::{device_syncing, write_error};
 use super::routes::{Refusal, bad_request, error, internal, query, writer_of};
 use crate::SyncMode;
 use crate::api::files::{gate_locked, scan_way};
-use crate::auth::{Account, DEFAULT_QUOTA_BYTES};
+use crate::auth::Account;
 use crate::journal::Origin;
 use crate::put::{Precondition, PutOutcome, PutResult, commit_staged};
 use crate::server::AppState;
@@ -157,11 +161,17 @@ fn current_size(store: &Store, path: &WirePath) -> u64 {
         .map_or(0, |m| m.len())
 }
 
-/// Whether writing `size` bytes at `path` takes the account past its quota: only what the
-/// upload adds counts, so a replace by fewer bytes always passes.
-fn over_quota(account: &Account, used: u64, current: u64, size: u64) -> bool {
-    let quota = account.quota_bytes.unwrap_or(DEFAULT_QUOTA_BYTES);
+/// Whether writing `size` bytes over a file of `current` bytes takes the account past
+/// `quota` when it uses `used` bytes: only what the upload adds counts, so a replace by fewer
+/// bytes always passes.
+fn over_quota(quota: u64, used: u64, current: u64, size: u64) -> bool {
     size > current && used.saturating_sub(current).saturating_add(size) > quota
+}
+
+/// Whether `used` (the cached usage) is close enough to `quota` after the upload that the
+/// check under the lock walks the tree for the exact usage: within a tenth of the quota.
+fn near_quota(quota: u64, used: u64, current: u64, size: u64) -> bool {
+    over_quota(quota - quota / 10, used, current, size)
 }
 
 /// The look before the body: the gates and the device sync lock, read without the store lock.
@@ -184,24 +194,19 @@ fn look(state: &AppState, account: &Account) -> crate::Result<Result<PathBuf, St
     Ok(Ok(store.account_dir().to_path_buf()))
 }
 
-/// The quota before the body (the usage of the cache, which may take the store lock briefly).
+/// The quota before the body: only for an account with `quota_bytes`, and only from the
+/// cached usage. A cold cache is no refusal here: the check under the lock decides.
 fn quota_look(
     state: &AppState,
     account: &Account,
     path: &WirePath,
     size: u64,
 ) -> crate::Result<bool> {
-    let store = state.store(&account.slug)?;
-    let current = current_size(&store, path);
-    if size <= current {
+    let (Some(quota), Some(used)) = (account.quota_bytes, state.cached_usage(&account.slug)) else {
         return Ok(false);
-    }
-    Ok(over_quota(
-        account,
-        state.used_bytes(&account.slug)?,
-        current,
-        size,
-    ))
+    };
+    let store = state.store(&account.slug)?;
+    Ok(over_quota(quota, used, current_size(&store, path), size))
 }
 
 /// The upload's commit under the store lock (module docs).
@@ -230,8 +235,21 @@ fn commit(
         return Ok(Err(Stop::Target(r)));
     }
     let current = current_size(&store, path);
-    if size > current && over_quota(account, store.disk_bytes(&guard)?, current, size) {
-        return Ok(Err(Stop::Quota));
+    // Only an account with `quota_bytes` has a quota (the device uploads check none). The
+    // tree is walked only when the cached usage is cold or near the quota.
+    if let Some(quota) = account.quota_bytes
+        && size > current
+    {
+        let cached = state
+            .cached_usage(slug)
+            .filter(|&used| !near_quota(quota, used, current, size));
+        if cached.is_none() {
+            let used = store.disk_bytes(&guard)?;
+            state.remember_usage(slug, used);
+            if over_quota(quota, used, current, size) {
+                return Ok(Err(Stop::Quota));
+            }
+        }
     }
     let done = commit_staged(
         &store,
@@ -246,10 +264,13 @@ fn commit(
         // The way was scanned above, before the target check.
         &|_| Ok(()),
     );
-    drop(guard);
-    if matches!(&done, Ok(r) if r.outcome != PutOutcome::Unchanged) {
-        state.invalidate_usage(slug);
+    // The cached usage stays warm: it learns what this upload changed, under the lock.
+    match &done {
+        Ok(r) if r.outcome == PutOutcome::Created => state.adjust_usage(slug, r.size, 0),
+        Ok(r) if r.outcome == PutOutcome::Replaced => state.adjust_usage(slug, r.size, current),
+        _ => {}
     }
+    drop(guard);
     done.map(Ok)
 }
 

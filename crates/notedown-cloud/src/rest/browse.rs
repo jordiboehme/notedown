@@ -57,9 +57,9 @@ impl From<&Entry> for AppEntry {
     }
 }
 
-/// The answer to a store error: that of a write ([`write_error`]: 423 `scan_hold` while a scan
-/// holds the account, 423 `not_imported` while the protect gate is closed, 503 `store_damaged`,
-/// else 500 `internal`).
+/// The answer to a store error: that of a write ([`write_error`]). A read only meets its
+/// `ScanHold` (423 `scan_hold`), `GateClosed` (423 `not_imported`), `StoreDamaged` (503
+/// `store_damaged`) and I/O (500 `internal`) arms.
 fn store_error(e: Error) -> Response {
     write_error(e)
 }

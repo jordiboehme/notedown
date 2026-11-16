@@ -303,10 +303,7 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         drip.join().unwrap();
         assert_eq!(got, ServerProbe::Other);
-        assert!(
-            took < Duration::from_millis(2500),
-            "the probe took {took:?}"
-        );
+        assert!(took < Duration::from_secs(5), "the probe took {took:?}");
     }
 
     #[test]

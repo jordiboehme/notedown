@@ -522,7 +522,9 @@ fn the_status_call_reads_its_answer() {
 #[test]
 fn a_hanging_status_call_is_ended() {
     let dir = tempfile::tempdir().unwrap();
-    let spawn = sidecar(dir.path(), "exec /bin/sleep 313");
+    // Each test that starts a sleep uses its own length (301-305, 307, 311-314),
+    // so a pgrep here never sees the sleep of a test running next to it.
+    let spawn = sidecar(dir.path(), "exec /bin/sleep 314");
     let start = Instant::now();
     let answer = run_status(&spawn, &[], Duration::from_millis(300));
     assert_eq!(
@@ -531,7 +533,7 @@ fn a_hanging_status_call_is_ended() {
     );
     assert!(start.elapsed() < Duration::from_secs(5));
     let left = Command::new("pgrep")
-        .args(["-f", "sleep 313"])
+        .args(["-f", "sleep 314"])
         .output()
         .unwrap();
     assert!(left.stdout.is_empty(), "the call was ended");

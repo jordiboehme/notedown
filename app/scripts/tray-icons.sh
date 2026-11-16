@@ -15,7 +15,12 @@ out="$here/../src-tauri/icons/tray"
 mkdir -p "$out"
 
 # The attention variant: the same drawing, cut out around the dot, plus the dot.
-body=$(sed -e '1d' -e '$d' "$src")
+# Everything inside the <svg> element, wherever its tags sit.
+body=$(perl -0777 -ne 'print $1 if m{<svg\b[^>]*>(.*)</svg>}s' "$src")
+if [ -z "$body" ]; then
+  echo "no <svg> content in $src" >&2
+  exit 1
+fi
 attention="$out/attention.svg"
 cat > "$attention" <<SVG
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18" width="18" height="18">

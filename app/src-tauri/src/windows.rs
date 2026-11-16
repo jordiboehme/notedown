@@ -1,6 +1,7 @@
 //! The windows: the panel under the tray icon, the library and the settings. A menu bar app
 //! shows a Dock icon only while the library or the settings window is visible.
 
+use std::sync::mpsc::Sender;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -9,7 +10,7 @@ use tauri::{
 };
 
 use crate::poller::Poller;
-use crate::tray::{self, Area, PanelAction};
+use crate::tray::{self, Area, PanelAction, Screen};
 
 /// The windows of the app, by their labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -56,6 +57,23 @@ pub fn policy_for(visible: &[WindowKind]) -> Policy {
     } else {
         Policy::Accessory
     }
+}
+
+/// One thread tells the poller what is visible, in order, and reads the visibility when it
+/// does so, not when it was asked: a fast show and hide ends on the hidden cadence.
+/// `read` says whether anything is visible; `apply(visible, panel_opened)` tells the poller.
+/// A send of `true` means the panel opened (poll at once).
+pub fn visibility_worker(
+    read: impl Fn() -> bool + Send + 'static,
+    apply: impl Fn(bool, bool) + Send + 'static,
+) -> std::sync::mpsc::Sender<bool> {
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    std::thread::spawn(move || {
+        for panel_opened in rx {
+            apply(read(), panel_opened);
+        }
+    });
+    tx
 }
 
 /// The event that tells an open settings window which page to show: a page name.
@@ -136,19 +154,42 @@ fn apply_policy(app: &AppHandle, visible: &[WindowKind]) {
     let _ = (app, visible);
 }
 
-/// Tells the poller whether anything is visible, off the calling thread (a poll start reads
-/// locks the children's supervisors also hold).
-fn tell_poller(app: &AppHandle, visible: &[WindowKind], panel_opened: bool) {
-    let any = !visible.is_empty();
-    let app = app.clone();
-    std::thread::spawn(move || {
-        if let Some(poller) = app.try_state::<Poller>() {
-            poller.set_visible(any);
-            if panel_opened {
-                poller.poll_now();
-            }
-        }
-    });
+/// The sender of the [`visibility_worker`], managed by the app.
+pub struct PollerVisibility(Mutex<Sender<bool>>);
+
+impl PollerVisibility {
+    /// Starts the worker: it reads [`Shown`] and tells the poller, off the main thread (a poll
+    /// start reads locks the children's supervisors also hold).
+    pub fn start(app: &AppHandle) -> Self {
+        let read_app = app.clone();
+        let apply_app = app.clone();
+        Self(Mutex::new(visibility_worker(
+            move || {
+                read_app
+                    .try_state::<Shown>()
+                    .is_some_and(|shown| !shown.visible().is_empty())
+            },
+            move |visible, panel_opened| {
+                if let Some(poller) = apply_app.try_state::<Poller>() {
+                    poller.set_visible(visible);
+                    if panel_opened {
+                        poller.poll_now();
+                    }
+                }
+            },
+        )))
+    }
+}
+
+/// Asks the worker to tell the poller what is visible now.
+fn tell_poller(app: &AppHandle, panel_opened: bool) {
+    if let Some(worker) = app.try_state::<PollerVisibility>() {
+        let _ = worker
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .send(panel_opened);
+    }
 }
 
 /// Shows the library or the settings window, made on first use. Order: Regular, show,
@@ -170,8 +211,8 @@ pub fn show_window(app: &AppHandle, kind: WindowKind, page: Option<String>) -> t
     window.show()?;
     window.unminimize()?;
     window.set_focus()?;
-    let visible = shown.set(kind, true);
-    tell_poller(app, &visible, false);
+    shown.set(kind, true);
+    tell_poller(app, false);
     Ok(())
 }
 
@@ -207,7 +248,7 @@ pub fn hide_window(app: &AppHandle, kind: WindowKind) {
     }
     let visible = app.state::<Shown>().set(kind, false);
     apply_policy(app, &visible);
-    tell_poller(app, &visible, false);
+    tell_poller(app, false);
 }
 
 /// Hides every window (Quit).
@@ -223,52 +264,63 @@ pub fn tray_clicked(app: &AppHandle, tray: Area) {
     shown.set_tray(tray);
     let panel_visible = shown.is_visible(WindowKind::Panel);
     match tray::tray_click(panel_visible, shown.ms_since_blur_hide()) {
-        PanelAction::Show => show_panel(app),
+        PanelAction::Show => open_panel(app, Some(tray), cursor_points(app)),
         PanelAction::Hide => hide_window(app, WindowKind::Panel),
         PanelAction::Ignore => {}
     }
 }
 
-/// Shows the panel under the tray icon and looks at the status at once.
+/// Shows the panel under the tray icon (a second launch): where the icon is now, else where
+/// it was at the last click.
 pub fn show_panel(app: &AppHandle) {
+    let tray = tray::tray_area(app).or_else(|| app.state::<Shown>().tray());
+    open_panel(app, tray, None);
+}
+
+/// Shows the panel under `tray` and looks at the status at once. `cursor` (logical points)
+/// names the screen of a click.
+fn open_panel(app: &AppHandle, tray: Option<Area>, cursor: Option<(f64, f64)>) {
     let Some(panel) = app.get_webview_window(WindowKind::Panel.label()) else {
         return;
     };
-    let tray_area = app.state::<Shown>().tray().or_else(|| tray::tray_area(app));
-    if let Some(area) = tray_area {
-        place_panel(app, &panel, area);
+    if let Some(area) = tray {
+        place_panel(app, &panel, area, cursor);
     }
     let _ = panel.show();
     let _ = panel.set_focus();
-    let visible = app.state::<Shown>().set(WindowKind::Panel, true);
-    tell_poller(app, &visible, true);
+    app.state::<Shown>().set(WindowKind::Panel, true);
+    tell_poller(app, true);
     crate::reprobe_outside(app);
 }
 
-fn place_panel(app: &AppHandle, panel: &WebviewWindow, area: Area) {
-    let scale = panel.scale_factor().unwrap_or(1.0);
-    let centre = (area.x + area.w / 2.0, area.y + area.h / 2.0);
-    let screen = app
+/// The cursor in global logical points. tao gives it scaled by the primary screen, whichever
+/// screen it is on, so this undoes one known scale.
+fn cursor_points(app: &AppHandle) -> Option<(f64, f64)> {
+    let cursor = app.cursor_position().ok()?;
+    let scale = app.primary_monitor().ok()??.scale_factor();
+    Some((cursor.x / scale, cursor.y / scale))
+}
+
+/// Places the panel in logical points: every screen has its own scale, so physical values of
+/// two screens do not compare.
+fn place_panel(app: &AppHandle, panel: &WebviewWindow, area: Area, cursor: Option<(f64, f64)>) {
+    let screens: Vec<Screen> = app
         .available_monitors()
         .unwrap_or_default()
         .into_iter()
-        .map(|m| Area {
-            x: f64::from(m.position().x),
-            y: f64::from(m.position().y),
-            w: f64::from(m.size().width),
-            h: f64::from(m.size().height),
+        .map(|m| Screen {
+            physical: Area {
+                x: f64::from(m.position().x),
+                y: f64::from(m.position().y),
+                w: f64::from(m.size().width),
+                h: f64::from(m.size().height),
+            },
+            scale: m.scale_factor(),
         })
-        .find(|s| {
-            centre.0 >= s.x && centre.0 < s.x + s.w && centre.1 >= s.y && centre.1 < s.y + s.h
-        });
-    let screen = screen.unwrap_or(Area {
-        x: f64::MIN / 4.0,
-        y: 0.0,
-        w: f64::MAX / 2.0,
-        h: f64::MAX / 2.0,
-    });
-    let (x, y) = tray::panel_position(area, PANEL_WIDTH * scale, screen);
-    let _ = panel.set_position(tauri::PhysicalPosition::new(x, y));
+        .collect();
+    if let Some((x, y)) = tray::panel_place(area, cursor, PANEL_WIDTH, &screens) {
+        let _ = panel.set_position(tauri::LogicalPosition::new(x, y));
+    }
 }
 
 /// The window events of the app: closing a window hides it (a menu bar app never quits on a
@@ -307,6 +359,40 @@ mod tests {
         assert_eq!(policy_for(&[Settings]), Policy::Regular);
         assert_eq!(policy_for(&[Panel, Settings]), Policy::Regular);
         assert_eq!(policy_for(&[Library, Settings]), Policy::Regular);
+    }
+
+    #[test]
+    fn the_poller_gets_the_visibility_of_the_moment_in_order() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::Duration;
+
+        let visible = Arc::new(AtomicBool::new(true));
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let (seen_tx, seen_rx) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate_rx);
+        let read_visible = visible.clone();
+        let log = applied.clone();
+        let tx = visibility_worker(
+            move || read_visible.load(Ordering::SeqCst),
+            move |v, opened| {
+                log.lock().unwrap().push((v, opened));
+                seen_tx.send(()).unwrap();
+                // The first apply waits, as a slow poll start would.
+                if opened {
+                    gate.lock().unwrap().recv().unwrap();
+                }
+            },
+        );
+        // The panel opens, then a blur hides it before the first call is through.
+        tx.send(true).unwrap();
+        seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        visible.store(false, Ordering::SeqCst);
+        tx.send(false).unwrap();
+        gate_tx.send(()).unwrap();
+        seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(*applied.lock().unwrap(), vec![(true, true), (false, false)]);
     }
 
     #[test]

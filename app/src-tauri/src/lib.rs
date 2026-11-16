@@ -65,6 +65,7 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             tray::build(app.handle())?;
+            app.manage(windows::PollerVisibility::start(app.handle()));
             let config_dir = app.path().app_config_dir()?;
             let config = commands::ConfigState::load(config_dir);
             let reader = config.reader();

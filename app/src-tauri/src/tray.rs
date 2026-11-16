@@ -168,9 +168,12 @@ pub fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     use tauri::menu::MenuItemKind;
     let menu = Menu::default(app)?;
     // The app submenu comes first and its last item is the native Quit (Menu::default in
-    // tauri 2.12). A changed layout leaves two Quit items, which the manual check shows.
+    // tauri 2.12); it is removed only when its text says Quit. A changed layout leaves two
+    // Quit items, which the manual check shows.
     if let Some(MenuItemKind::Submenu(app_menu)) = menu.items()?.first() {
-        if let Some(native_quit) = app_menu.items()?.last() {
+        if let Some(MenuItemKind::Predefined(native_quit)) = app_menu.items()?.last()
+            && is_quit_text(&native_quit.text()?)
+        {
             app_menu.remove(native_quit)?;
         }
         app_menu.append(&MenuItem::with_id(
@@ -184,9 +187,169 @@ pub fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     Ok(menu)
 }
 
+/// A screen as tao reports it on macOS: position and size are its logical (point) values
+/// times its own scale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Screen {
+    pub physical: Area,
+    pub scale: f64,
+}
+
+impl Screen {
+    /// The screen in global logical points, the space every screen shares.
+    pub fn logical(&self) -> Area {
+        let p = self.physical;
+        Area {
+            x: p.x / self.scale,
+            y: p.y / self.scale,
+            w: p.w / self.scale,
+            h: p.h / self.scale,
+        }
+    }
+}
+
+/// Where the panel goes, in logical points: centred under the tray icon on the screen it is
+/// on. `tray` is physical, scaled by its own screen, which is not known; `cursor` (logical
+/// points, at the click) names that screen. Without a cursor the first screen whose logical
+/// area holds the scaled-down icon is taken. `None` when no screen fits.
+pub fn panel_place(
+    tray: Area,
+    cursor: Option<(f64, f64)>,
+    panel_w: f64,
+    screens: &[Screen],
+) -> Option<(f64, f64)> {
+    let holds =
+        |a: Area, (x, y): (f64, f64)| x >= a.x && x < a.x + a.w && y >= a.y && y < a.y + a.h;
+    let scaled = |s: &Screen| Area {
+        x: tray.x / s.scale,
+        y: tray.y / s.scale,
+        w: tray.w / s.scale,
+        h: tray.h / s.scale,
+    };
+    let screen = match cursor {
+        Some(point) => screens.iter().find(|s| holds(s.logical(), point)),
+        None => screens.iter().find(|s| {
+            let icon = scaled(s);
+            holds(s.logical(), (icon.x + icon.w / 2.0, icon.y + icon.h / 2.0))
+        }),
+    }?;
+    Some(panel_position(scaled(screen), panel_w, screen.logical()))
+}
+
+/// The native Quit of the app menu, by its text ("Quit Notedown" on macOS, "&Quit" elsewhere).
+pub fn is_quit_text(text: &str) -> bool {
+    text.trim_start_matches('&').starts_with("Quit")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A 2x laptop (1512x982 points) and a 1x display of 1920x1080 points to its right.
+    fn two_screens() -> [Screen; 2] {
+        [
+            Screen {
+                physical: Area {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 3024.0,
+                    h: 1964.0,
+                },
+                scale: 2.0,
+            },
+            Screen {
+                physical: Area {
+                    x: 1512.0,
+                    y: 0.0,
+                    w: 1920.0,
+                    h: 1080.0,
+                },
+                scale: 1.0,
+            },
+        ]
+    }
+
+    #[test]
+    fn the_panel_is_placed_in_points_on_screens_of_different_scales() {
+        let screens = two_screens();
+        assert_eq!(
+            screens[0].logical(),
+            Area {
+                x: 0.0,
+                y: 0.0,
+                w: 1512.0,
+                h: 982.0
+            }
+        );
+        assert_eq!(
+            screens[1].logical(),
+            Area {
+                x: 1512.0,
+                y: 0.0,
+                w: 1920.0,
+                h: 1080.0
+            }
+        );
+        // On the laptop: the icon at 1000 points is 2000 physical.
+        let laptop = Area {
+            x: 2000.0,
+            y: 0.0,
+            w: 48.0,
+            h: 48.0,
+        };
+        assert_eq!(
+            panel_place(laptop, Some((1010.0, 10.0)), 340.0, &screens),
+            Some((842.0, 24.0))
+        );
+        assert_eq!(
+            panel_place(laptop, None, 340.0, &screens),
+            Some((842.0, 24.0))
+        );
+        // Near the laptop's right edge: kept on the laptop.
+        let edge = Area {
+            x: 2960.0,
+            y: 0.0,
+            w: 48.0,
+            h: 48.0,
+        };
+        assert_eq!(
+            panel_place(edge, Some((1490.0, 10.0)), 340.0, &screens),
+            Some((1172.0, 24.0))
+        );
+        // On the 1x display at 3000 points: 3000 physical, which halved would also be on the
+        // laptop. The cursor says which screen it is.
+        let display = Area {
+            x: 3000.0,
+            y: 0.0,
+            w: 24.0,
+            h: 24.0,
+        };
+        assert_eq!(
+            panel_place(display, Some((3010.0, 10.0)), 340.0, &screens),
+            Some((2842.0, 24.0))
+        );
+        // Without a cursor, a place only the display holds; kept inside it on the right.
+        let far = Area {
+            x: 3300.0,
+            y: 0.0,
+            w: 24.0,
+            h: 24.0,
+        };
+        assert_eq!(
+            panel_place(far, None, 340.0, &screens),
+            Some((3092.0, 24.0))
+        );
+        // Nothing fits.
+        assert_eq!(panel_place(far, None, 340.0, &[]), None);
+    }
+
+    #[test]
+    fn only_the_quit_item_is_taken_for_the_native_quit() {
+        assert!(is_quit_text("Quit Notedown"));
+        assert!(is_quit_text("&Quit"));
+        assert!(!is_quit_text("Hide Others"));
+        assert!(!is_quit_text("Services"));
+    }
 
     #[test]
     fn tray_icon_shows_attention() {

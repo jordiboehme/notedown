@@ -53,13 +53,31 @@ impl QuitFlow {
         {
             return false;
         }
-        let flow = self.clone();
+        let finish = Finish {
+            flow: self.clone(),
+            exit: Some(exit),
+        };
         std::thread::spawn(move || {
+            // Runs on drop, so a stop that panics still ends the app.
+            let _finish = finish;
             stop();
-            flow.state.store(DONE, Ordering::SeqCst);
-            exit();
         });
         true
+    }
+}
+
+/// The end of the Quit flow: Done, then exit. A drop guard, so it also runs on a panic.
+struct Finish<F: FnOnce()> {
+    flow: Arc<QuitFlow>,
+    exit: Option<F>,
+}
+
+impl<F: FnOnce()> Drop for Finish<F> {
+    fn drop(&mut self) {
+        self.flow.state.store(DONE, Ordering::SeqCst);
+        if let Some(exit) = self.exit.take() {
+            exit();
+        }
     }
 }
 
@@ -122,6 +140,18 @@ mod tests {
         assert_eq!(flow.on_exit_request(Some(0)), ExitDecision::Prevent);
         assert!(!flow.quit_with(|| panic!("a second stop"), || panic!("a second exit")));
         release_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(flow.on_exit_request(Some(0)), ExitDecision::Allow);
+    }
+
+    #[test]
+    fn a_stop_that_panics_still_exits() {
+        let flow = flow();
+        let (done_tx, done_rx) = mpsc::channel();
+        assert!(flow.quit_with(
+            || panic!("the stop failed (expected in this test)"),
+            move || done_tx.send(()).unwrap(),
+        ));
         done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(flow.on_exit_request(Some(0)), ExitDecision::Allow);
     }

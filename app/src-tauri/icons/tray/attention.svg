@@ -1,6 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18" width="18" height="18">
 <mask id="gap"><rect width="18" height="18" fill="#fff"/><circle cx="14.2" cy="3.8" r="4.2" fill="#000"/></mask>
 <g mask="url(#gap)">
+
 <rect x="3.2" y="1.6" width="11.6" height="14.8" rx="2" fill="none" stroke="#000" stroke-width="1.6"/>
 <path d="M7.4 5.2L6.6 12.8M11.2 5.2L10.4 12.8M5.4 7.6H12.6M5.2 10.4H12.4" fill="none" stroke="#000" stroke-width="1.3" stroke-linecap="round"/>
 </g>

@@ -123,7 +123,7 @@ title: "Test 2"
 description: "Handwritten Supernote note, 1 page, read by OCR."
 resource: "Test 2.note"
 tags: [supernote]
-generated: { by: notedown/0.1.0, model: "chandra-ocr-2 Q4_K_M", at: 2026-10-05T23:10:00Z }
+generated: { by: notedown/<version>, model: "chandra-ocr-2 Q4_K_M", at: 2026-10-05T23:10:00Z }
 source_date: 2026-10-05
 sources:
   - { id: note, resource: "Test 2.note", last_modified: 2026-10-05T22:55:35Z }

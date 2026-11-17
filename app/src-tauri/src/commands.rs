@@ -197,9 +197,30 @@ impl ConfigState {
         self.update(|c| c.start_view = view)
     }
 
+    /// Gives the logged-in account the Markdown folder of the pipeline's own config when the
+    /// app has none for it yet ([`AppConfig::seed_markdown_dir`]), and saves it. Runs before
+    /// the pipeline starts with `--markdown-dir` (at the start of the app and at a login), so
+    /// the flag never replaces a folder the user set up for the pipeline. Nothing is saved
+    /// when there is nothing to add.
+    pub fn seed_markdown_dir(&self) -> Result<AppConfig, String> {
+        match self.try_update(|c| {
+            if c.seed_markdown_dir() {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }) {
+            Ok((_, next)) => Ok(next),
+            Err(TryUpdateError::Refused(())) => Ok(self.current()),
+            Err(TryUpdateError::NotSaved(why)) => Err(why),
+        }
+    }
+
     /// Sets the Markdown folder of the logged-in account. The folder must be a full path (a
     /// leading `~` is the home folder) outside the data folder: the pipeline refuses a folder
-    /// inside it. The check is [`inside`]: as written, and with the links resolved.
+    /// inside it. The check is [`inside`]: as written, as the pipeline compares, and also with
+    /// the links resolved. So the app is stricter than the pipeline: it also refuses a folder
+    /// that reaches into the data folder through a link, which the pipeline would take.
     pub fn set_markdown_dir(&self, dir: PathBuf) -> Result<AppConfig, String> {
         let dir = without_dots(&expand_home(&dir)?);
         self.try_update(|c| {
@@ -1241,6 +1262,53 @@ mod tests {
         );
         // A folder next to the data folder with a longer name is outside it.
         state.set_markdown_dir("/data/notes-md".into()).unwrap();
+    }
+
+    #[test]
+    fn the_seeded_markdown_folder_is_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let state = ConfigState::load(dir.path().join("config"));
+        state
+            .set_mode(Mode::Local, Some(data.clone()), None)
+            .unwrap();
+        state
+            .try_update(|c| {
+                c.account = Some("jordi".into());
+                Ok::<(), ()>(())
+            })
+            .ok()
+            .unwrap();
+        // Nothing in the pipeline's config: the default, and nothing is written for it.
+        let saved = std::fs::read_to_string(dir.path().join("config/config.json")).unwrap();
+        state.seed_markdown_dir().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config/config.json")).unwrap(),
+            saved
+        );
+        assert_eq!(
+            state.current().markdown_dir(),
+            Some(config::default_markdown_dir())
+        );
+        // The pipeline's entry is kept in the app config, so the OCR page shows it.
+        std::fs::write(
+            data.join("server.toml"),
+            "[pipeline.markdown_dirs]\njordi = \"/notes/md\"\n",
+        )
+        .unwrap();
+        state.seed_markdown_dir().unwrap();
+        assert_eq!(
+            config::load(&dir.path().join("config")).markdown_dirs["jordi"],
+            PathBuf::from("/notes/md")
+        );
+        // The app's entry wins from then on.
+        state.set_markdown_dir("/chosen/md".into()).unwrap();
+        state.seed_markdown_dir().unwrap();
+        assert_eq!(
+            state.current().markdown_dir(),
+            Some(PathBuf::from("/chosen/md"))
+        );
     }
 
     #[test]

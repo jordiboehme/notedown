@@ -238,6 +238,9 @@ pub fn log_in(
         }
         c.account = Some(answer.slug.clone());
         c.email = Some(email.to_owned());
+        // The folder the pipeline was set up with, before the pipeline starts again with the
+        // account's `--markdown-dir`.
+        c.seed_markdown_dir();
         Ok(())
     });
     let (replaced, saved) = match saved {

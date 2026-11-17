@@ -95,6 +95,11 @@ pub fn run() {
             app.manage(windows::PollerVisibility::start(app.handle()));
             let config_dir = app.path().app_config_dir()?;
             let config = commands::ConfigState::load(config_dir.clone());
+            // Before the pipeline first starts with `--markdown-dir`: an account without a
+            // Markdown folder in the app keeps the one the pipeline was set up with.
+            if let Err(why) = config.seed_markdown_dir() {
+                eprintln!("notedown: the Markdown folder was not kept: {why}");
+            }
             let reader = config.reader();
             let library_reader = config.reader();
             let notes = notes_for(app.handle().clone(), config.reader(), config_dir);

@@ -908,3 +908,39 @@ fn a_failed_save_on_a_new_login_of_the_same_account_keeps_the_old_token() {
     assert_eq!(kept.expose(), "old-token");
     assert_eq!(state.current().account.as_deref(), Some("jordi"));
 }
+
+#[test]
+fn a_login_keeps_the_markdown_folder_of_the_pipeline() {
+    let server = Scripted::start(vec![code_answer(), token_answer("jordi")]);
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(
+        data.join("pipeline.toml"),
+        "[server]\nurl = \"http://pi.local:19072\"\n[pipeline.markdown_dirs]\njordi = \"/notes/md\"\n",
+    )
+    .unwrap();
+    let config = AppConfig {
+        mode: Mode::Remote,
+        server_url: Some(server_url(server.port)),
+        data_dir: data,
+        ..AppConfig::default()
+    };
+    config::save(dir.path(), &config).unwrap();
+    let state = ConfigState::load(dir.path().to_path_buf());
+    let saved = log_in(
+        &LoginGate::default(),
+        &state,
+        &ServeInfo::default(),
+        &MemoryStore::new(),
+        "me@example.org",
+        &Password::new(PASSWORD),
+    )
+    .unwrap();
+    // Saved with the login, so the pipeline starts again with the same folder.
+    assert_eq!(
+        saved.config.markdown_dir(),
+        Some(std::path::PathBuf::from("/notes/md"))
+    );
+    assert_eq!(config::load(dir.path()), saved.config);
+}

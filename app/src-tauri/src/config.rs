@@ -85,6 +85,71 @@ impl AppConfig {
     }
 }
 
+impl AppConfig {
+    /// Gives the logged-in account the Markdown folder the pipeline's own config names for
+    /// it, when the app has none for it yet ([`pipeline_markdown_dir`]). Answers whether it
+    /// added one. Without one the account keeps [`default_markdown_dir`] and nothing is added.
+    pub fn seed_markdown_dir(&mut self) -> bool {
+        let Some(slug) = self.account_slug() else {
+            return false;
+        };
+        if self.markdown_dirs.contains_key(slug) {
+            return false;
+        }
+        let Some(dir) = pipeline_markdown_dir(&self.data_dir, slug) else {
+            return false;
+        };
+        let slug = slug.to_owned();
+        self.markdown_dirs.insert(slug, dir);
+        true
+    }
+}
+
+/// The `[pipeline]` table of the file the pipeline reads, as far as the app needs it. Other
+/// keys are the pipeline's (or the server's) and are not checked here.
+#[derive(Deserialize, Default)]
+struct PipelineFile {
+    #[serde(default)]
+    pipeline: Option<PipelineTable>,
+}
+
+#[derive(Deserialize, Default)]
+struct PipelineTable {
+    #[serde(default)]
+    markdown_dirs: BTreeMap<String, PathBuf>,
+}
+
+/// The Markdown folder that the pipeline's own config names for `slug`: `markdown_dirs` of
+/// `[pipeline]` in `<data>/pipeline.toml` when that file is there (two machines), else in
+/// `<data>/server.toml` (one machine), as the pipeline chooses. A leading `~` is the home
+/// folder (the pipeline itself does not expand it) and a relative folder is below the data
+/// folder. `None` for no file, no entry, an empty one or a file that cannot be read.
+pub fn pipeline_markdown_dir(data_dir: &Path, slug: &str) -> Option<PathBuf> {
+    let pipeline = data_dir.join("pipeline.toml");
+    let file = if pipeline.exists() {
+        pipeline
+    } else {
+        data_dir.join("server.toml")
+    };
+    let text = fs::read_to_string(file).ok()?;
+    let parsed: PipelineFile = toml::from_str(&text).ok()?;
+    let dir = parsed.pipeline?.markdown_dirs.remove(slug)?;
+    let text = dir.to_string_lossy();
+    if text.trim().is_empty() {
+        return None;
+    }
+    let dir = if text == "~" || text.starts_with("~/") {
+        let home = PathBuf::from(std::env::var_os("HOME")?);
+        home.join(text.trim_start_matches('~').trim_start_matches('/'))
+    } else if dir.is_relative() {
+        data_dir.join(&dir)
+    } else {
+        dir.clone()
+    };
+    // `home.join("")` leaves a trailing slash; components drop it.
+    Some(dir.components().collect())
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -269,6 +334,94 @@ mod tests {
         assert_eq!(config.markdown_dir(), None);
         config.account = Some(String::new());
         assert_eq!(config.markdown_dir(), None);
+    }
+
+    fn logged_in(data_dir: &Path) -> AppConfig {
+        AppConfig {
+            data_dir: data_dir.to_owned(),
+            account: Some("jordi".into()),
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn the_markdown_folder_is_seeded_from_the_pipeline_config() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let data = tempfile::tempdir().unwrap();
+        // One machine: `server.toml` `[pipeline]`, next to the server's own keys.
+        fs::write(
+            data.path().join("server.toml"),
+            "listen = \"127.0.0.1:19072\"\n[pipeline]\nocr_settle = \"5m\"\n\
+             [pipeline.markdown_dirs]\nother = \"/elsewhere\"\njordi = \"/notes/md\"\n",
+        )
+        .unwrap();
+        let mut config = logged_in(data.path());
+        assert!(config.seed_markdown_dir());
+        assert_eq!(config.markdown_dir(), Some(PathBuf::from("/notes/md")));
+        assert_eq!(config.markdown_dirs.len(), 1, "{:?}", config.markdown_dirs);
+        // Seeded once: an entry of the app is never replaced.
+        fs::write(
+            data.path().join("server.toml"),
+            "[pipeline.markdown_dirs]\njordi = \"/new/md\"\n",
+        )
+        .unwrap();
+        assert!(!config.seed_markdown_dir());
+        assert_eq!(config.markdown_dir(), Some(PathBuf::from("/notes/md")));
+
+        // Two machines: only `pipeline.toml` counts, `~` is the home folder and a relative
+        // folder is below the data folder, as the pipeline reads it.
+        fs::write(
+            data.path().join("pipeline.toml"),
+            "[server]\nurl = \"http://pi.local:19072\"\n[pipeline.markdown_dirs]\njordi = \"~/md\"\nother = \"md\"\n",
+        )
+        .unwrap();
+        let mut config = logged_in(data.path());
+        assert!(config.seed_markdown_dir());
+        assert_eq!(config.markdown_dir(), Some(home.join("md")));
+        let mut other = logged_in(data.path());
+        other.account = Some("other".into());
+        assert!(other.seed_markdown_dir());
+        assert_eq!(other.markdown_dir(), Some(data.path().join("md")));
+    }
+
+    #[test]
+    fn without_a_pipeline_entry_the_default_is_used() {
+        let data = tempfile::tempdir().unwrap();
+        // No file, no entry for this account, an empty entry, a broken file: nothing is seeded.
+        for server_toml in [
+            None,
+            Some("[pipeline.markdown_dirs]\nother = \"/elsewhere\"\n"),
+            Some("[pipeline.markdown_dirs]\njordi = \"\"\n"),
+            Some("[pipeline"),
+        ] {
+            let _ = fs::remove_file(data.path().join("server.toml"));
+            if let Some(text) = server_toml {
+                fs::write(data.path().join("server.toml"), text).unwrap();
+            }
+            let mut config = logged_in(data.path());
+            assert!(!config.seed_markdown_dir(), "{server_toml:?}");
+            assert!(config.markdown_dirs.is_empty());
+            assert_eq!(config.markdown_dir(), Some(default_markdown_dir()));
+        }
+        // With `pipeline.toml`, an entry in `server.toml` is not the pipeline's.
+        fs::write(
+            data.path().join("server.toml"),
+            "[pipeline.markdown_dirs]\njordi = \"/notes/md\"\n",
+        )
+        .unwrap();
+        fs::write(
+            data.path().join("pipeline.toml"),
+            "[server]\nurl = \"http://pi.local:19072\"\n",
+        )
+        .unwrap();
+        let mut config = logged_in(data.path());
+        assert!(!config.seed_markdown_dir());
+        // No account: nothing to seed.
+        let mut config = AppConfig {
+            data_dir: data.path().to_owned(),
+            ..AppConfig::default()
+        };
+        assert!(!config.seed_markdown_dir());
     }
 
     #[test]

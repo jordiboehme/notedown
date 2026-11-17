@@ -9,8 +9,8 @@
 	<key>NSDownloadsFolderUsageDescription</key>
 	<string>Notedown saves the files you download from your library in the Downloads folder.</string>
 	<key>NSDesktopFolderUsageDescription</key>
-	<string>Notedown reads the files you drop on the library window to upload them.</string>
+	<string>Notedown reads files you drop on the library and writes the Markdown of your notes when your Markdown folder is on the Desktop.</string>
 	<key>NSDocumentsFolderUsageDescription</key>
-	<string>Notedown reads the files you drop on the library window to upload them.</string>
+	<string>Notedown reads files you drop on the library and writes the Markdown of your notes to your Markdown folder.</string>
 </dict>
 </plist>

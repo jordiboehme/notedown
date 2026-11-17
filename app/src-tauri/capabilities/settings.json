@@ -30,6 +30,7 @@
     "allow-markdown-dir",
     "allow-set-markdown-dir",
     "allow-show-markdown-dir",
+    "allow-set-model-idle",
     "allow-recheck",
     "allow-create-account",
     "allow-connect-pipeline",

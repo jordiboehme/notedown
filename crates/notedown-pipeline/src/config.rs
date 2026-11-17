@@ -33,7 +33,7 @@ impl Default for PipelineConfig {
     fn default() -> Self {
         PipelineConfig {
             ocr_settle: Duration::from_secs(10 * 60),
-            model_idle: Duration::from_secs(15 * 60),
+            model_idle: Duration::from_secs(5 * 60),
             text_keep_days: 90,
             ingest_folders: vec!["NOTE/Note/**".to_string()],
             ingest_exclude: Vec::new(),
@@ -205,7 +205,7 @@ mod tests {
         write(d.path(), "scan_interval = 60\n");
         let c = PipelineConfig::load(d.path()).unwrap();
         assert_eq!(c.ocr_settle, Duration::from_secs(600));
-        assert_eq!(c.model_idle, Duration::from_secs(900));
+        assert_eq!(c.model_idle, Duration::from_secs(300));
         assert_eq!(c.text_keep_days, 90);
         assert_eq!(c.ingest_folders, vec!["NOTE/Note/**"]);
         assert!(c.ingest_exclude.is_empty());

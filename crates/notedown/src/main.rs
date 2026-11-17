@@ -91,6 +91,10 @@ struct PipelineArgs {
     /// the only account the pipeline serves
     #[arg(long, value_name = "[SLUG=]DIR")]
     markdown_dir: Vec<String>,
+    /// Unload the OCR model after this long without work, like 90s, 5m or 2h (wins over
+    /// model_idle of [pipeline] in the config; default 5m)
+    #[arg(long, value_name = "DURATION")]
+    model_idle: Option<String>,
 }
 
 #[cfg(feature = "ocr")]
@@ -2441,7 +2445,9 @@ fn pipeline_command(args: PipelineArgs) -> Result<ExitCode> {
         let dir = std::path::absolute(&dir).with_context(|| format!("--markdown-dir {text}"))?;
         flags.push((slug, dir));
     }
-    let setup = notedown_pipeline::setup::Setup::load(&data)?.with_markdown_dirs(flags)?;
+    let setup = notedown_pipeline::setup::Setup::load(&data)?
+        .with_markdown_dirs(flags)?
+        .with_model_idle(args.model_idle.as_deref())?;
     // A folder without an account needs exactly one served account. Checked now when the
     // account list can be read; the worker checks it again on every pass.
     if setup.markdown_only.is_some()

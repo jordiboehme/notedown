@@ -58,11 +58,19 @@ pub fn child_args(kind: ChildKind, data_dir: &Path, parent: u32) -> Vec<String> 
     ]
 }
 
-/// The pipeline's arguments: [`child_args`], and with a logged-in account
-/// `--markdown-dir <slug>=<dir>`, its Markdown folder ([`AppConfig::markdown_dir`]). The flag
-/// wins over `markdown_dirs` of the pipeline's own config for that account.
+/// The pipeline's arguments: [`child_args`], `--model-idle <n>m` (the model idle time of the
+/// OCR page; a value it does not offer, from a hand-edited config, gives 5), and with a
+/// logged-in account `--markdown-dir <slug>=<dir>`, its Markdown folder
+/// ([`AppConfig::markdown_dir`]). Both flags win over the pipeline's own config.
 fn pipeline_args(config: &AppConfig, parent: u32) -> Vec<String> {
     let mut args = child_args(ChildKind::Pipeline, &config.data_dir, parent);
+    args.push("--model-idle".to_string());
+    let minutes = if config::MODEL_IDLE_MINUTES.contains(&config.model_idle_minutes) {
+        config.model_idle_minutes
+    } else {
+        AppConfig::default().model_idle_minutes
+    };
+    args.push(format!("{minutes}m"));
     if let (Some(slug), Some(dir)) = (config.account_slug(), config.markdown_dir()) {
         args.push("--markdown-dir".to_string());
         args.push(format!("{slug}={}", dir.display()));
@@ -269,13 +277,40 @@ mod tests {
     }
 
     fn args(sub: &str, data: &Path, parent: u32) -> Vec<String> {
-        vec![
+        let mut args = vec![
             sub.to_string(),
             "--data".to_string(),
             data.display().to_string(),
             "--exit-with-parent".to_string(),
             parent.to_string(),
-        ]
+        ];
+        // The pipeline always gets the model idle time, 5 minutes by default.
+        if sub == "pipeline" {
+            args.extend(["--model-idle".to_string(), "5m".to_string()]);
+        }
+        args
+    }
+
+    #[test]
+    fn the_pipeline_gets_the_model_idle_time() {
+        let dir = tempfile::tempdir().unwrap();
+        // A value the OCR page does not offer (a hand-edited config.json) gives 5 minutes.
+        for (minutes, want) in [(1, 1), (5, 5), (15, 15), (60, 60), (0, 5), (7, 5)] {
+            let config = AppConfig {
+                model_idle_minutes: minutes,
+                ..config(Mode::Local, dir.path())
+            };
+            let plan = plan(&config, 3);
+            let Launch::Start(pipeline) = plan.pipeline else {
+                panic!("no pipeline");
+            };
+            let at = pipeline.iter().position(|a| a == "--model-idle").unwrap();
+            assert_eq!(pipeline[at + 1], format!("{want}m"), "{minutes}");
+            let Launch::Start(server) = plan.server else {
+                panic!("no server");
+            };
+            assert!(!server.iter().any(|a| a == "--model-idle"));
+        }
     }
 
     #[test]

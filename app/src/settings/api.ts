@@ -16,6 +16,8 @@ export interface AppConfig {
   startView: StartView;
   /** The Markdown folder of each account, by its slug. */
   markdownDirs: Record<string, string>;
+  /** The pipeline unloads the OCR model after this many minutes without work: 1, 5, 15 or 60. */
+  modelIdleMinutes: number;
   /** What the setup checklist keeps between two starts. */
   setup: SetupRecord;
 }
@@ -232,6 +234,7 @@ export const snbakTime = (path: string) => invoke<number>("snbak_time", { path }
 export const markdownDir = () => invoke<string | null>("markdown_dir");
 /** Saves the Markdown folder of the logged-in account; the pipeline starts again with it. */
 export const setMarkdownDir = (dir: string) => invoke<string | null>("set_markdown_dir", { dir });
+export const setModelIdle = (minutes: number) => invoke<AppConfig>("set_model_idle", { minutes });
 /** Opens the Markdown folder in the Finder (it is made first when it is not there yet). */
 export const showMarkdownDir = () => invoke("show_markdown_dir");
 

@@ -56,6 +56,7 @@ const COMMANDS: &[&str] = &[
     "markdown_dir",
     "set_markdown_dir",
     "show_markdown_dir",
+    "set_model_idle",
     "recheck",
     "create_account",
     "connect_pipeline",

@@ -408,6 +408,13 @@ describe("the columns", () => {
     expect(view.columns[1].rows.filter((r) => r.selected).map((r) => r.name)).toEqual(["Manual.pdf"]);
   });
 
+  it("gives each row its entry, so it can be moved; the device trees have none", () => {
+    const view = columnsView("DOCUMENT/Document", { [listingKey("DOCUMENT/Document", false)]: document });
+    expect(view.columns[0].rows.every((r) => r.entry === null)).toBe(true);
+    const manual = view.columns[1].rows.find((r) => r.name === "Manual.pdf");
+    expect(manual?.entry?.path).toBe("DOCUMENT/Document/Manual.pdf");
+  });
+
   it("keeps a root as one level", () => {
     const view = columnsView("NOTE/Note", {});
     expect(view.columns.map((c) => c.path)).toEqual([null, "NOTE/Note"]);

@@ -76,6 +76,8 @@ export type Job = {
   text: string | null;
   question: Clash | null;
   result: string | null;
+  /** The drop an upload came from (for Cancel all of the drop); null for other jobs. */
+  dropId: number | null;
 };
 
 /**

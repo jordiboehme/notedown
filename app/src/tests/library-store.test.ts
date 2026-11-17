@@ -24,6 +24,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 const store = await import("../lib/library.svelte");
 const { library, applyEvent, startLibrary, listFolder, listNext, isBusy, showListings, resetLibrary, loadView, chooseView } = store;
+const { setDropTarget, answerUpload, jobAction, moveEntry, renameEntry, newFolder, deleteEntry, downloadEntry, clearJobs, retryJobs } = store;
 
 /** The next call of `command` answers what `answer` gives; it waits until `release` is called. */
 function answerLater(command: string) {
@@ -78,6 +79,7 @@ const job: Job = {
   text: null,
   question: null,
   result: null,
+  dropId: null,
 };
 
 beforeEach(() => {
@@ -118,7 +120,7 @@ describe("the library store", () => {
     expect(library.generation).toBe(generation + 1);
     expect(library.jobs[4]).toBeDefined();
 
-    // Nothing uploads yet: a drop is let go, so Rust forgets its paths.
+    // With no window to find its folder, a drop is let go, so Rust forgets its paths.
     applyEvent({ type: "drop", dropId: 9, position: { x: 1, y: 2 }, count: 1 });
     expect(calls).toContainEqual({ command: "library_cancel_drop", args: { dropId: 9 } });
   });
@@ -346,3 +348,184 @@ describe("the view of the window", () => {
     expect(calls.filter((c) => c.command === "set_start_view")).toHaveLength(1);
   });
 });
+
+describe("drops", () => {
+  const drop = (dropId: number): LibraryEvent => ({ type: "drop", dropId, position: { x: 40, y: 80 }, count: 2 });
+  const uploads = () => calls.filter((c) => c.command === "library_upload").map((c) => c.args);
+  const cancels = () => calls.filter((c) => c.command === "library_cancel_drop").map((c) => c.args);
+
+  it("uploads into the folder the window finds at the drop position", async () => {
+    const seen: { x: number; y: number }[] = [];
+    setDropTarget((position) => {
+      seen.push(position);
+      return "NOTE/Note/Work";
+    });
+    answerNow("library_upload", null);
+    applyEvent(drop(3));
+    await flush();
+    expect(seen).toEqual([{ x: 40, y: 80 }]);
+    expect(uploads()).toEqual([{ dropId: 3, folder: "NOTE/Note/Work" }]);
+    expect(cancels()).toEqual([]);
+    expect(library.asks).toEqual([]);
+  });
+
+  it("on a folder that is not writable says so and lets the drop go", async () => {
+    setDropTarget(() => "NOTE");
+    applyEvent(drop(4));
+    await flush();
+    expect(library.notice).toBe("This folder cannot be changed.");
+    expect(uploads()).toEqual([]);
+    expect(cancels()).toEqual([{ dropId: 4 }]);
+  });
+
+  it("without a folder asks for one and lets the drop go", async () => {
+    setDropTarget(() => null);
+    applyEvent(drop(5));
+    await flush();
+    expect(library.notice).toBe("Drop the files on a folder.");
+    expect(cancels()).toEqual([{ dropId: 5 }]);
+  });
+
+  it("shows the questions of the upload and answers them", async () => {
+    setDropTarget(() => "INBOX");
+    answerNow("library_upload", { ask: "packages", text: "Foo.app is a package. Upload what is in it too?" });
+    answerNow("library_upload", { ask: "many", text: "Upload 1,234 files?" });
+    answerNow("library_upload", null);
+    applyEvent(drop(6));
+    await flush();
+    expect(library.asks).toEqual([
+      { dropId: 6, folder: "INBOX", ask: { ask: "packages", text: "Foo.app is a package. Upload what is in it too?" } },
+    ]);
+    await answerUpload(6, "no");
+    expect(library.asks).toMatchObject([{ dropId: 6, packages: false, ask: { ask: "many" } }]);
+    await answerUpload(6, "yes");
+    expect(library.asks).toEqual([]);
+    expect(uploads()).toEqual([
+      { dropId: 6, folder: "INBOX" },
+      { dropId: 6, folder: "INBOX", packages: false },
+      { dropId: 6, folder: "INBOX", packages: false, many: true },
+    ]);
+    expect(cancels()).toEqual([]);
+  });
+
+  it("lets the drop go when a question is cancelled or the upload fails", async () => {
+    setDropTarget(() => "INBOX");
+    answerNow("library_upload", { ask: "many", text: "Upload 1,234 files?" });
+    applyEvent(drop(7));
+    await flush();
+    await answerUpload(7, "cancel");
+    expect(library.asks).toEqual([]);
+    expect(cancels()).toEqual([{ dropId: 7 }]);
+
+    answers.set("library_upload", [() => Promise.reject("There is nothing in the drop to upload.")]);
+    applyEvent(drop(8));
+    await flush();
+    expect(library.notice).toBe("There is nothing in the drop to upload.");
+    expect(cancels()).toEqual([{ dropId: 7 }, { dropId: 8 }]);
+  });
+});
+
+describe("jobs", () => {
+  const upload: Job = { ...job, id: 11, kind: "upload", dropId: 2 };
+
+  it("notes when a job ended and clears it later", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(5000);
+      applyEvent({ type: "job", job: { ...upload, state: "running" } });
+      expect(library.ended[11]).toBeUndefined();
+      applyEvent({ type: "job", job: { ...upload, state: "done" } });
+      expect(library.ended[11]).toBe(5000);
+      // A later event of the same end keeps the first time.
+      vi.setSystemTime(6000);
+      applyEvent({ type: "job", job: { ...upload, state: "done" } });
+      expect(library.ended[11]).toBe(5000);
+      clearJobs(5000 + 60_000 * 10);
+      expect(library.jobs[11]).toBeUndefined();
+      expect(library.ended[11]).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a job that ended when an older event of it comes late", () => {
+    const moved: Job = { ...job, id: 30, kind: "change", total: null, state: "done" };
+    applyEvent({ type: "job", job: moved });
+    applyEvent({ type: "job", job: { ...moved, state: "running" } });
+    expect(library.jobs[30].state).toBe("done");
+    // A failed upload starts again on Retry.
+    applyEvent({ type: "job", job: { ...upload, state: "failed" } });
+    applyEvent({ type: "job", job: { ...upload, state: "queued" } });
+    expect(library.jobs[11].state).toBe("queued");
+  });
+
+  it("sends each action of a job row to Rust", async () => {
+    applyEvent({ type: "job", job: upload });
+    await jobAction(upload, "replace");
+    await jobAction(upload, "keepBoth");
+    await jobAction(upload, "skip");
+    await jobAction(upload, "retry");
+    await jobAction(upload, "cancel");
+    await jobAction(upload, "cancelAll");
+    await jobAction({ ...job, state: "done", result: "/Users/me/Downloads/a.pdf" }, "reveal");
+    expect(calls.map((c) => [c.command, c.args])).toEqual([
+      ["library_answer", { job: 11, choice: "replace" }],
+      ["library_answer", { job: 11, choice: "keepBoth" }],
+      ["library_answer", { job: 11, choice: "skip" }],
+      ["library_retry", { job: 11 }],
+      ["library_cancel", { job: 11 }],
+      ["library_cancel_drop", { dropId: 2 }],
+      ["library_reveal", { path: "/Users/me/Downloads/a.pdf" }],
+    ]);
+    calls.length = 0;
+    await retryJobs([11, 12]);
+    expect(calls.map((c) => [c.command, c.args])).toEqual([
+      ["library_retry", { job: 11 }],
+      ["library_retry", { job: 12 }],
+    ]);
+    await jobAction(upload, "clear");
+    expect(library.jobs[11]).toBeUndefined();
+  });
+
+  it("shows the error of an action", async () => {
+    answers.set("library_reveal", [() => Promise.reject("This file is not there anymore.")]);
+    await jobAction({ ...job, state: "done", result: "/x" }, "reveal");
+    expect(library.notice).toBe("This file is not there anymore.");
+  });
+
+  it("runs the file actions as jobs and keeps the job each answers", async () => {
+    const answered = (id: number, label: string, state: Job["state"] = "done"): Job => ({
+      ...job,
+      id,
+      kind: "change",
+      label,
+      total: null,
+      state,
+    });
+    answerNow("library_move", answered(20, "Move a.pdf to Home"));
+    answerNow("library_rename", answered(21, "Rename a.pdf to b.pdf"));
+    answerNow("library_new_folder", answered(22, "New folder Plans", "failed"));
+    answerNow("library_delete", answered(23, "Delete b.pdf"));
+    answerNow("library_download", { ...job, id: 24 });
+    await moveEntry(7, "NOTE/Note/Home");
+    await renameEntry(7, "b.pdf");
+    await newFolder("NOTE/Note", "Plans");
+    await deleteEntry(7);
+    await downloadEntry(7);
+    expect(calls.map((c) => [c.command, c.args])).toEqual([
+      ["library_move", { id: 7, toFolder: "NOTE/Note/Home" }],
+      ["library_rename", { id: 7, name: "b.pdf" }],
+      ["library_new_folder", { parent: "NOTE/Note", name: "Plans" }],
+      ["library_delete", { id: 7 }],
+      ["library_download", { id: 7 }],
+    ]);
+    expect(Object.keys(library.jobs).map(Number)).toEqual([20, 21, 22, 23, 24]);
+    expect(library.jobs[22].state).toBe("failed");
+    expect(library.ended[20]).toBeDefined();
+
+    answers.set("library_download", [() => Promise.reject("This is a folder, not a file.")]);
+    await downloadEntry(8);
+    expect(library.notice).toBe("This is a folder, not a file.");
+  });
+});
+

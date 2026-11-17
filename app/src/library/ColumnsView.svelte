@@ -3,6 +3,7 @@
   import { isBusy, library, listNext } from "../lib/library.svelte";
   import ColumnList from "./ColumnList.svelte";
   import PathBar from "./PathBar.svelte";
+  import type { Entry } from "../lib/library-types";
   import { listingKey, type Column } from "./view";
 
   // The columns view: the path bar and one column per level of the selected folder, the device
@@ -10,9 +11,18 @@
   let {
     path,
     columns,
+    renaming,
     onSelect,
     onFile,
-  }: { path: string; columns: Column[]; onSelect: (path: string) => void; onFile: (path: string) => void } = $props();
+    onRename,
+  }: {
+    path: string;
+    columns: Column[];
+    renaming: string | null;
+    onSelect: (path: string) => void;
+    onFile: (path: string) => void;
+    onRename: (entry: Entry, typed: string | null) => void;
+  } = $props();
 
   let strip: HTMLDivElement | undefined = $state();
 
@@ -30,6 +40,8 @@
       {column}
       next={column.path === null ? null : (library.next[listingKey(column.path, false)] ?? null)}
       busy={column.path === null ? false : isBusy(column.path, false)}
+      {renaming}
+      {onRename}
       onSelect={(picked, kind) => (kind === "folder" ? onSelect(picked) : onFile(picked))}
       onMore={() => column.path !== null && void listNext(column.path, false)}
     />

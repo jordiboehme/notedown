@@ -253,6 +253,8 @@ fn an_upload_takes_only_paths_of_a_drop() {
     assert_eq!((ended.done, ended.total), (5, Some(5)));
     assert_eq!(ended.result.as_deref(), Some("NOTE/Note/a.txt"));
     assert_eq!(jobs.first().unwrap().state, JobState::Queued);
+    // Every event of the job names its drop: the window's Cancel all for the drop.
+    assert!(jobs.iter().all(|job| job.drop_id == Some(id)));
 
     // A drop is used once.
     assert_eq!(

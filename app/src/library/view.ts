@@ -272,7 +272,8 @@ export function rootRows(selected: string | null): TreeRow[] {
   }));
 }
 
-export type ColumnRow = { path: string; name: string; kind: "file" | "folder"; selected: boolean };
+/** A row of a column; `entry` is null for a device tree (it cannot be moved or renamed). */
+export type ColumnRow = { path: string; name: string; kind: "file" | "folder"; selected: boolean; entry: Entry | null };
 
 export type Column = {
   /** The folder the column lists; null for the first column, the device trees. */
@@ -304,7 +305,13 @@ export function columnsView(
     {
       path: null,
       last: false,
-      rows: ROOTS.map((root) => ({ path: root.path, name: root.name, kind: "folder", selected: root.path === crumbs[0]?.path })),
+      rows: ROOTS.map((root) => ({
+        path: root.path,
+        name: root.name,
+        kind: "folder",
+        selected: root.path === crumbs[0]?.path,
+        entry: null,
+      })),
       loading: false,
       empty: false,
       error: null,
@@ -323,7 +330,13 @@ export function columnsView(
     columns.push({
       path: crumb.path,
       last,
-      rows: entries.map((e) => ({ path: e.path, name: e.name, kind: e.kind, selected: e.path === next || (last && e.kind === "file" && e.path === file) })),
+      rows: entries.map((e) => ({
+        path: e.path,
+        name: e.name,
+        kind: e.kind,
+        selected: e.path === next || (last && e.kind === "file" && e.path === file),
+        entry: e,
+      })),
       loading: !listing || (!listing.complete && listing.error === null),
       empty: listing !== undefined && listing.complete && entries.length === 0,
       error: listing?.error ?? null,

@@ -593,6 +593,7 @@ impl Library {
                 text: refused.clone(),
                 question: None,
                 result: None,
+                drop_id: Some(drop),
             };
             self.send(&job);
             up.items.insert(

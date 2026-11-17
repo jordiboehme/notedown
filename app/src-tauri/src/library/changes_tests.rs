@@ -70,6 +70,7 @@ fn done(id: u64, label: &str, result: Option<&str>) -> Job {
         text: None,
         question: None,
         result: result.map(str::to_owned),
+        drop_id: None,
     }
 }
 
@@ -404,6 +405,7 @@ fn restore_into_a_taken_path_asks_for_a_name() {
                 can_replace: false,
             }),
             result: None,
+            drop_id: None,
         }
     );
     let (method, target, body) = request(&s);

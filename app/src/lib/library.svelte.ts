@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { answerAsk, clearedJobs, dropPlan, type AskChoice, type JobAction, type Point, type UploadArgs } from "../library/actions";
 import { listingKey, type LibraryView } from "../library/view";
 import {
   LIBRARY_EVENT,
@@ -9,6 +10,7 @@ import {
   type LibraryStateView,
   type Listing,
   type ShownListing,
+  type UploadAsk,
 } from "./library-types";
 
 // The library window's store: what Rust sent about the library. Every `LibraryEvent` goes
@@ -34,7 +36,16 @@ type Store = {
   busy: Record<string, true>;
   /** The folders are shown as a tree or as columns; saved as the start view. */
   viewMode: LibraryView;
+  /** When each job ended (done or cancelled), in ms: its row goes after a while. */
+  ended: Record<number, number>;
+  /** The questions of uploads that wait for an answer, the oldest first. */
+  asks: Ask[];
+  /** A short text about the last action that did not work (a drop, a download); null when none. */
+  notice: string | null;
 };
+
+/** An upload that asks before it starts: the next call of `library_upload` and its question. */
+export type Ask = UploadArgs & { ask: UploadAsk };
 
 export const library = $state<Store>({
   view: null,
@@ -45,7 +56,16 @@ export const library = $state<Store>({
   recycle: 0,
   busy: {},
   viewMode: "tree",
+  ended: {},
+  asks: [],
+  notice: null,
 });
+
+/**
+ * Finds the folder under a drop (physical pixels of the web view), or the folder that is
+ * shown; null when there is none. The window sets it: it needs the DOM.
+ */
+let dropTarget: ((position: Point) => string | null) | null = null;
 
 /** What `library_shown` was last told, to call it only on a change. */
 let lastShown: string | null = null;
@@ -72,6 +92,10 @@ export function resetLibrary() {
   library.recycle = 0;
   library.busy = {};
   library.viewMode = "tree";
+  library.ended = {};
+  library.asks = [];
+  library.notice = null;
+  dropTarget = null;
   lastShown = null;
   shownKeys = null;
   chosen = false;
@@ -97,7 +121,7 @@ export function applyEvent(event: LibraryEvent) {
       break;
     }
     case "job":
-      library.jobs[event.job.id] = event.job;
+      keepJob(event.job);
       break;
     case "relist":
       library.listings = {};
@@ -111,10 +135,143 @@ export function applyEvent(event: LibraryEvent) {
       library.recycle += 1;
       break;
     case "drop":
-      // Uploads come with the drop target; until then the dropped paths are let go.
-      invoke("library_cancel_drop", { dropId: event.dropId }).catch(report("library_cancel_drop"));
+      // The folder is found at once: what is under the pointer can change.
+      void startDrop(event.dropId, dropTarget ? dropTarget(event.position) : null, dropTarget !== null);
       break;
   }
+}
+
+/** Keeps a job as Rust sent or answered it, and notes when it ended. */
+function keepJob(job: Job) {
+  const ended = job.state === "done" || job.state === "cancelled";
+  // A done or cancelled job never runs again: a running event that comes after the answer
+  // of its command is older.
+  if (!ended && library.ended[job.id] !== undefined) return;
+  library.jobs[job.id] = job;
+  if (ended && library.ended[job.id] === undefined) library.ended[job.id] = Date.now();
+}
+
+/** Forgets the jobs whose rows are cleared at `now`. */
+export function clearJobs(now: number) {
+  for (const id of clearedJobs(library.jobs, library.ended, now)) {
+    delete library.jobs[id];
+    delete library.ended[id];
+  }
+}
+
+/** Sets how the window finds the folder of a drop (null: the window is gone). */
+export function setDropTarget(find: ((position: Point) => string | null) | null) {
+  dropTarget = find;
+}
+
+/** Rust forgets the paths of a drop that is not uploaded. */
+function letGo(dropId: number) {
+  return invoke("library_cancel_drop", { dropId }).catch(report("library_cancel_drop"));
+}
+
+async function startDrop(dropId: number, folder: string | null, located: boolean) {
+  if (!located) {
+    await letGo(dropId);
+    return;
+  }
+  const plan = dropPlan(folder, null);
+  if ("refuse" in plan) {
+    library.notice = plan.refuse;
+    await letGo(dropId);
+    return;
+  }
+  await upload({ dropId, folder: plan.upload });
+}
+
+/** Calls `library_upload`; a question waits in `asks`, an error lets the drop go. */
+async function upload(args: UploadArgs) {
+  try {
+    const ask = await invoke<UploadAsk | null>("library_upload", args);
+    if (ask) library.asks.push({ ...args, ask });
+  } catch (error) {
+    library.notice = String(error);
+    await letGo(args.dropId);
+  }
+}
+
+/** The answer to the question of the drop `dropId`: the upload goes on, or the drop is let go. */
+export async function answerUpload(dropId: number, choice: AskChoice) {
+  const at = library.asks.findIndex((a) => a.dropId === dropId);
+  if (at < 0) return;
+  const { ask, ...args } = library.asks[at];
+  library.asks.splice(at, 1);
+  const next = answerAsk(args, ask, choice);
+  if (next === null) await letGo(dropId);
+  else await upload(next);
+}
+
+/** Runs a command; its error becomes the notice. */
+async function run<T>(command: string, args: Record<string, unknown>): Promise<T | undefined> {
+  try {
+    return await invoke<T>(command, args);
+  } catch (error) {
+    library.notice = String(error);
+    return undefined;
+  }
+}
+
+/** A button of a job row, or Cancel all of its drop. */
+export async function jobAction(job: Job, action: JobAction | "cancelAll") {
+  switch (action) {
+    case "replace":
+    case "keepBoth":
+    case "skip":
+      await run("library_answer", { job: job.id, choice: action });
+      break;
+    case "retry":
+      await run("library_retry", { job: job.id });
+      break;
+    case "cancel":
+      await run("library_cancel", { job: job.id });
+      break;
+    case "cancelAll":
+      if (job.dropId !== null) await run("library_cancel_drop", { dropId: job.dropId });
+      break;
+    case "reveal":
+      if (job.result) await run("library_reveal", { path: job.result });
+      break;
+    case "clear":
+      delete library.jobs[job.id];
+      delete library.ended[job.id];
+      break;
+  }
+}
+
+/** Retry all: tries the failed uploads of a drop again, one call each. */
+export async function retryJobs(ids: number[]) {
+  for (const id of ids) await run("library_retry", { job: id });
+}
+
+/** Runs a change or a download and keeps the job it answers (also answered). */
+async function change(command: string, args: Record<string, unknown>): Promise<Job | undefined> {
+  const job = await run<Job>(command, args);
+  if (job) keepJob(job);
+  return job;
+}
+
+export function moveEntry(id: number, toFolder: string) {
+  return change("library_move", { id, toFolder });
+}
+
+export function renameEntry(id: number, name: string) {
+  return change("library_rename", { id, name });
+}
+
+export function newFolder(parent: string, name: string) {
+  return change("library_new_folder", { parent, name });
+}
+
+export function deleteEntry(id: number) {
+  return change("library_delete", { id });
+}
+
+export function downloadEntry(id: number) {
+  return change("library_download", { id });
 }
 
 /**

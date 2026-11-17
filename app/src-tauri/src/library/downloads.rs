@@ -449,6 +449,7 @@ impl Library {
             text: None,
             question: None,
             result: None,
+            drop_id: None,
         };
         self.send(&job);
         queue.items.insert(
@@ -601,6 +602,7 @@ impl Library {
                     text: None,
                     question: None,
                     result: None,
+                    drop_id: None,
                 },
             };
             job.state = JobState::Done;

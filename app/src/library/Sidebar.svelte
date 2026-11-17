@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { LibraryStateView } from "../lib/library-types";
   import StateNotice from "./StateNotice.svelte";
+  import { drag } from "./drag.svelte";
   import type { SidebarItem, TreeRow } from "./view";
 
   // The sidebar: New and All notes, the device trees (folders only, a folder listed when it
@@ -52,6 +53,7 @@
         <li
           class="node"
           class:selected={row.selected}
+          class:target={drag.current?.over === row.path}
           role="treeitem"
           aria-selected={row.selected}
           aria-expanded={row.empty ? undefined : row.open}
@@ -130,6 +132,12 @@
   .node.selected {
     background: color-mix(in srgb, var(--brand), transparent 86%);
     font-weight: 600;
+  }
+
+  /* The folder a dragged row goes into when it is let go. */
+  .node.target {
+    outline: 2px solid var(--brand);
+    outline-offset: -2px;
   }
 
   .count {

@@ -155,6 +155,8 @@ pub struct Job {
     pub text: Option<String>,
     pub question: Option<Clash>,
     pub result: Option<String>,
+    /// The drop an upload came from (Cancel all of the drop); none for other jobs.
+    pub drop_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

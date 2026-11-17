@@ -1,30 +1,41 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import type { Entry, FolderState } from "../lib/library-types";
+  import NameField from "./NameField.svelte";
   import PathBar from "./PathBar.svelte";
   import VirtualRows from "./VirtualRows.svelte";
+  import { drag, pressOn } from "./drag.svelte";
   import { dateText, listRows, needsNextPage, sizeText, type Range, type Sort } from "./view";
 
   // The selected folder: the path bar, the column heads and the rows. The first page shows at
-  // once; the next page is asked for when the rows near its end come into view.
+  // once; the next page is asked for when the rows near its end come into view. A click picks
+  // a row (for the file actions), a double click opens a folder, a press and a drag moves it.
   let {
     path,
     folder,
     next,
     busy,
     sort,
+    picked,
+    renaming,
     onSort,
     onOpen,
     onMore,
+    onPick,
+    onRename,
   }: {
     path: string;
     folder: FolderState | undefined;
     next: string | null;
     busy: boolean;
     sort: Sort;
+    picked: string | null;
+    renaming: string | null;
     onSort: (sort: Sort) => void;
     onOpen: (path: string) => void;
     onMore: () => void;
+    onPick: (path: string) => void;
+    onRename: (entry: Entry, typed: string | null) => void;
   } = $props();
 
   const ROW = 24;
@@ -77,25 +88,43 @@
 {:else}
   <VirtualRows items={view.rows} rowHeight={ROW} key={(entry: Entry) => entry.id} label="Files and folders" onRange={seen}>
     {#snippet row(entry: Entry)}
-      <div
-        class="row"
-        data-folder={entry.kind === "folder" ? entry.path : undefined}
-        ondblclick={() => entry.kind === "folder" && onOpen(entry.path)}
-        role="presentation"
-      >
-        <span class="name">
-          <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
-            {#if entry.kind === "folder"}
-              <path class="folder" d="M1.5 4.5v8.5h13V5.5H7.5L6 3.5H2z" />
-            {:else}
-              <path class="file" d="M3.5 1.5h6l3 3v10h-9z M9.5 1.5v3h3" />
-            {/if}
-          </svg>
-          <span class="text">{entry.name}</span>
-        </span>
-        <span class="size">{sizeText(entry)}</span>
-        <span class="date">{dateText(entry.mtimeMs)}</span>
-      </div>
+      {#snippet name()}
+        <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+          {#if entry.kind === "folder"}
+            <path class="folder" d="M1.5 4.5v8.5h13V5.5H7.5L6 3.5H2z" />
+          {:else}
+            <path class="file" d="M3.5 1.5h6l3 3v10h-9z M9.5 1.5v3h3" />
+          {/if}
+        </svg>
+      {/snippet}
+      {#if renaming === entry.path}
+        <div class="row picked" data-folder={entry.kind === "folder" ? entry.path : undefined}>
+          <span class="name">
+            {@render name()}
+            <NameField name={entry.name} label="New name" onDone={(typed) => onRename(entry, typed)} />
+          </span>
+          <span class="size">{sizeText(entry)}</span>
+          <span class="date">{dateText(entry.mtimeMs)}</span>
+        </div>
+      {:else}
+        <button
+          type="button"
+          class="row"
+          class:picked={picked === entry.path}
+          class:target={drag.current?.over === entry.path}
+          data-folder={entry.kind === "folder" ? entry.path : undefined}
+          onclick={() => onPick(entry.path)}
+          ondblclick={() => entry.kind === "folder" && onOpen(entry.path)}
+          onpointerdown={(event) => pressOn(entry, event)}
+        >
+          <span class="name">
+            {@render name()}
+            <span class="text">{entry.name}</span>
+          </span>
+          <span class="size">{sizeText(entry)}</span>
+          <span class="date">{dateText(entry.mtimeMs)}</span>
+        </button>
+      {/if}
     {/snippet}
   </VirtualRows>
   {#if busy && next}
@@ -141,9 +170,31 @@
   }
 
   .row {
+    width: 100%;
     height: 100%;
     box-sizing: border-box;
+    font: inherit;
+    color: var(--primary);
+    text-align: left;
+    border: 0;
     border-bottom: 1px solid var(--separator);
+    background: none;
+  }
+
+  /* Paper and ink, as the sidebar's selection. */
+  .row.picked {
+    background: color-mix(in srgb, var(--brand), transparent 86%);
+  }
+
+  /* The folder a dragged row goes into when it is let go. */
+  .row.target {
+    outline: 2px solid var(--brand);
+    outline-offset: -2px;
+  }
+
+  .row:focus-visible {
+    outline: 3px solid color-mix(in srgb, var(--accent), transparent 50%);
+    outline-offset: -3px;
   }
 
   .name {

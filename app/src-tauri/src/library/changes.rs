@@ -152,6 +152,7 @@ impl Library {
             text: None,
             question: None,
             result: None,
+            drop_id: None,
         }
     }
 

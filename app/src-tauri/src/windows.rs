@@ -376,7 +376,14 @@ pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
             if kind == WindowKind::Library =>
         {
             if let Some(library) = app.try_state::<crate::library::Library>() {
-                library.dropped(paths.clone(), position.x, position.y);
+                // wry on macOS gives points of the web view; the event says physical pixels.
+                let scale = if cfg!(target_os = "macos") {
+                    window.scale_factor().unwrap_or(1.0)
+                } else {
+                    1.0
+                };
+                let (x, y) = drop_pixels(position.x, position.y, scale);
+                library.dropped(paths.clone(), x, y);
             }
         }
         WindowEvent::Focused(false) if kind == WindowKind::Panel => {
@@ -390,10 +397,23 @@ pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
     }
 }
 
+/// A drop position in points of the web view as physical pixels of the web view.
+fn drop_pixels(x: f64, y: f64, scale: f64) -> (f64, f64) {
+    (x * scale, y * scale)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use WindowKind::*;
+
+    #[test]
+    fn a_drop_position_in_points_becomes_physical_pixels() {
+        // wry on macOS gives the drop in points of the web view (draggingLocation, flipped
+        // by the view's height), though the type says physical pixels.
+        assert_eq!(drop_pixels(120.4, 48.0, 2.0), (240.8, 96.0));
+        assert_eq!(drop_pixels(120.0, 48.0, 1.0), (120.0, 48.0));
+    }
 
     #[test]
     fn policy_follows_the_visible_windows() {

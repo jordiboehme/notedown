@@ -618,6 +618,7 @@ fn no_library_event_holds_the_token() {
                 can_replace: true,
             }),
             result: None,
+            drop_id: Some(4),
         },
     };
     assert_eq!(
@@ -635,7 +636,7 @@ fn no_library_event_holds_the_token() {
         json!({ "type": "job", "job": { "id": 3, "kind": "upload", "label": "a.note", "done": 5,
             "total": 12, "state": "asking", "text": null,
             "question": { "name": "a.note", "existing": "A.note", "canReplace": true },
-            "result": null } })
+            "result": null, "dropId": 4 } })
     );
     assert_eq!(
         serde_json::to_value(LibraryEvent::Relist).unwrap(),

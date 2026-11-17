@@ -135,12 +135,17 @@ export const NOTES_EVENT = "notes";
  * A note for the review (src-tauri/src/review.rs), as `note_open(path)` answers it: the Markdown
  * of each page from the pipeline's store. Show it as text (`white-space: pre-wrap`), never as
  * HTML. `catchingUp`: a page waits for OCR, or the server has a newer version of the note.
- * `landscape` is false until the store records the orientation of a page.
+ * `landscape` is always false for now (the store has no orientation): take the aspect ratio of a
+ * page from its loaded image (Task 13). A note the pipeline has not read yet answers "The text of
+ * this note is not ready yet.", a gone one "This note is not there anymore.".
  *
- * `note_page_image(path, index)` answers page `index` as a `data:image/png;base64,...` URL; ask
- * only for pages near the view and drop the URLs of pages far away. `note_close(path)` ends the
- * review: its waiting calls fail with "The review was closed." and its renders stop. Hiding the
- * library window closes every review.
+ * `note_page_image(path, index)` answers page `index` as a `data:image/png;base64,...` URL
+ * ("This page is not in the note." past its pages). At most two pages render at once, the
+ * newest request first: ask only for pages near the view. When a page goes far away, drop its
+ * URL and call `note_page_drop(path, index)`: its waiting call fails with "The page is not shown
+ * anymore." and its render stops. `note_close(path)` ends the review: its waiting calls fail
+ * with "The review was closed." and its renders stop. Hiding the library window closes every
+ * review.
  */
 export type NoteView = {
   key: string;

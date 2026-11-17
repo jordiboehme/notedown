@@ -45,9 +45,9 @@ use std::time::{Duration, SystemTime};
 use base64::Engine as _;
 use md5::{Digest as _, Md5};
 use reqwest::header::ETAG;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
-use crate::library::{Entry, EntryKind, Library, Session, is_md5};
+use crate::library::{Entry, EntryKind, Library, LibraryError, Session, is_md5};
 use crate::notes::{NOTE_GONE, Notes};
 use crate::process::{self, SpawnFn};
 use crate::rest::RestError;
@@ -80,8 +80,19 @@ pub const NO_IMAGE: &str = "The page could not be shown.";
 /// The render did not end in time.
 pub const TOO_LONG: &str = "The page took too long to show.";
 
+/// A note the server has that the pipeline has not read yet.
+pub const NOT_READY: &str = "The text of this note is not ready yet.";
+/// A page index past the note's pages.
+pub const NO_SUCH_PAGE: &str = "This page is not in the note.";
+/// What a call hears when its page was dropped from the view while it waited.
+pub const PAGE_DROPPED: &str = "The page is not shown anymore.";
+
 /// The first bytes of every PNG file.
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+/// How many renders run at once.
+pub const RUNS_AT_ONCE: usize = 2;
+/// How long a render that was killed may take to be reaped.
+const GONE_WAIT: Duration = Duration::from_secs(5);
 /// The stderr bytes a render keeps for its error text.
 const STDERR_KEPT: u64 = 64 * 1024;
 /// The stdout lines a render keeps.
@@ -110,6 +121,29 @@ pub enum PageState {
     Pending,
     Failed,
     Truncated,
+}
+
+/// A page image as a `data:image/png;base64,...` URL. Shared: every call that waited for one
+/// render gets the same string, not a copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataUrl(Arc<str>);
+
+impl DataUrl {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Serialize for DataUrl {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl PartialEq<String> for DataUrl {
+    fn eq(&self, other: &String) -> bool {
+        *self.0 == **other
+    }
 }
 
 /// A note as the review shows it.
@@ -181,6 +215,19 @@ struct Inner {
     /// The leftovers of earlier runs were removed. Held while they are removed.
     swept: Mutex<bool>,
     next_job: AtomicU64,
+    /// The renders that run and the ones that wait for a free run.
+    runs: Mutex<Runs>,
+    /// Signals a free run, a new waiter or a stop.
+    runs_changed: Condvar,
+    /// Orders the requests: the newest waits least.
+    next_order: AtomicU64,
+}
+
+/// At most [`RUNS_AT_ONCE`] renders run; of the ones that wait, the newest request goes first.
+#[derive(Default)]
+struct Runs {
+    running: usize,
+    waiting: Vec<Arc<Slot>>,
 }
 
 #[derive(Default)]
@@ -210,9 +257,13 @@ struct Slot {
 #[derive(Default)]
 struct SlotState {
     /// The data URL, or why there is none.
-    result: Option<Result<Arc<str>, String>>,
+    result: Option<Result<DataUrl, String>>,
     /// The reviews (by note path) that wait for it.
     paths: HashSet<String>,
+    /// Why a review stopped waiting: it closed, or it dropped the page.
+    left: HashMap<String, &'static str>,
+    /// The newest request for it, for the order of the runs.
+    order: u64,
     /// The process group of the render, until it is reaped.
     pgid: Option<u32>,
     /// Why it was stopped: no review waits anymore, or Quit.
@@ -276,7 +327,12 @@ fn title_of(path: &str) -> String {
 
 /// Marks a cache file as used, for the trim's "oldest first".
 fn touch(path: &Path) {
-    if let Ok(file) = File::options().write(true).open(path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let opened = File::options()
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path);
+    if let Ok(file) = opened {
         let _ = file.set_modified(SystemTime::now());
     }
 }
@@ -307,17 +363,22 @@ fn create_new(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-/// A regular file at `path` (no symlink), read whole.
-fn read_regular(path: &Path) -> Option<Vec<u8>> {
+/// A regular file at `path` opened for reading, never through a symlink.
+fn open_regular(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
-    let mut file = File::options()
+    let file = File::options()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("not a regular file"));
     }
+    Ok(file)
+}
+
+/// A regular file at `path` (no symlink), read whole.
+fn read_regular(path: &Path) -> Option<Vec<u8>> {
+    let mut file = open_regular(path).ok()?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).ok()?;
     Some(bytes)
@@ -397,6 +458,9 @@ impl Review {
                 fetching: Mutex::new(HashMap::new()),
                 swept: Mutex::new(false),
                 next_job: AtomicU64::new(0),
+                runs: Mutex::new(Runs::default()),
+                runs_changed: Condvar::new(),
+                next_order: AtomicU64::new(0),
             }),
         }
     }
@@ -404,14 +468,12 @@ impl Review {
     /// The note at the wire path `path`, from the pipeline's store. Blocking: it scans the
     /// store and asks the server for the entry.
     pub fn open(&self, path: &str) -> Result<NoteView, String> {
-        let file = self
-            .inner
-            .notes
-            .store_file(path)
-            .ok_or_else(|| NOTE_GONE.to_owned())?;
+        let Some(file) = self.inner.notes.store_file(path) else {
+            return Err(self.inner.missing(path));
+        };
         let stored: StoredNote = match File::open(&file) {
             Ok(f) => serde_json::from_reader(BufReader::new(f)).map_err(|_| NOT_READ.to_owned())?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(NOTE_GONE.to_owned()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(self.inner.missing(path)),
             Err(_) => return Err(NOT_READ.to_owned()),
         };
         let pages: Vec<PageView> = stored
@@ -424,7 +486,8 @@ impl Review {
                 markdown: page
                     .blocks
                     .iter()
-                    .map(|b| b.text.as_str())
+                    // As the pipeline's Markdown writer joins them.
+                    .map(|b| b.text.trim_end())
                     .collect::<Vec<_>>()
                     .join("\n\n"),
                 landscape: page.landscape.unwrap_or(stored.landscape),
@@ -453,8 +516,18 @@ impl Review {
 
     /// Page `index` (0-based) of the note at `path` as a `data:image/png;base64,...` URL.
     /// Blocking: it asks the server, may download the note and waits for the render.
-    pub fn page_image(&self, path: &str, index: usize) -> Result<String, String> {
+    pub fn page_image(&self, path: &str, index: usize) -> Result<DataUrl, String> {
         let inner = &self.inner;
+        if lock(&inner.table).quitting {
+            return Err(QUITTING.to_owned());
+        }
+        // Only a page of the note as the store has it: no request, download or run for one
+        // past its end.
+        match inner.notes.find(path) {
+            None => return Err(inner.missing(path)),
+            Some(note) if index >= note.pages => return Err(NO_SUCH_PAGE.to_owned()),
+            Some(_) => {}
+        }
         let mark = {
             let table = lock(&inner.table);
             if table.quitting {
@@ -502,13 +575,23 @@ impl Review {
                 .get(&key)
                 .filter(|slot| lock(&slot.state).stopped.is_none())
                 .cloned();
+            let order = inner.next_order.fetch_add(1, Ordering::SeqCst) + 1;
             if let Some(slot) = running {
-                lock(&slot.state).paths.insert(path.to_owned());
+                {
+                    let mut state = lock(&slot.state);
+                    state.paths.insert(path.to_owned());
+                    state.left.remove(path);
+                    state.order = order;
+                }
                 table.joined += 1;
                 slot
             } else {
                 let slot = Arc::new(Slot::default());
-                lock(&slot.state).paths.insert(path.to_owned());
+                {
+                    let mut state = lock(&slot.state);
+                    state.paths.insert(path.to_owned());
+                    state.order = order;
+                }
                 table.jobs.insert(key, slot.clone());
                 table.started += 1;
                 let worker = inner.clone();
@@ -523,13 +606,18 @@ impl Review {
         let mut state = lock(&slot.state);
         loop {
             if let Some(result) = &state.result {
-                return result.clone().map(|url| url.to_string());
+                return result.clone();
             }
             if let Some(why) = state.stopped {
                 return Err(why.to_owned());
             }
             if !state.paths.contains(path) {
-                return Err(REVIEW_CLOSED.to_owned());
+                return Err(state
+                    .left
+                    .get(path)
+                    .copied()
+                    .unwrap_or(REVIEW_CLOSED)
+                    .to_owned());
             }
             state = slot
                 .done
@@ -541,41 +629,65 @@ impl Review {
     /// The review of `path` closed: its calls that wait end, and a render no other review
     /// waits for is killed. It never blocks for long (short locks and signals).
     pub fn close(&self, path: &str) {
-        let mut table = lock(&self.inner.table);
-        *table.closes.entry(path.to_owned()).or_default() += 1;
-        for slot in table.jobs.values() {
-            let mut state = lock(&slot.state);
-            if state.paths.remove(path) {
-                if state.paths.is_empty() {
-                    stop(&mut state, REVIEW_CLOSED);
-                }
-                slot.done.notify_all();
+        {
+            let mut table = lock(&self.inner.table);
+            *table.closes.entry(path.to_owned()).or_default() += 1;
+            for slot in table.jobs.values() {
+                leave(slot, path, REVIEW_CLOSED);
             }
         }
+        self.inner.wake_runs();
+    }
+
+    /// The review of `path` does not show page `index` anymore (it went far out of view): its
+    /// call that waits ends, and the render is killed when no other review waits for it. It
+    /// never blocks for long.
+    pub fn drop_page(&self, path: &str, index: usize) {
+        {
+            let table = lock(&self.inner.table);
+            for ((_, at), slot) in &table.jobs {
+                if *at == index {
+                    leave(slot, path, PAGE_DROPPED);
+                }
+            }
+        }
+        self.inner.wake_runs();
     }
 
     /// Every review closed (the library window hid). Runs on the main thread: it only takes
     /// short locks and sends signals.
     pub fn close_all(&self) {
-        let mut table = lock(&self.inner.table);
-        table.all_closes += 1;
-        for slot in table.jobs.values() {
-            let mut state = lock(&slot.state);
-            state.paths.clear();
-            stop(&mut state, REVIEW_CLOSED);
-            slot.done.notify_all();
+        {
+            let mut table = lock(&self.inner.table);
+            table.all_closes += 1;
+            for slot in table.jobs.values() {
+                let mut state = lock(&slot.state);
+                state.paths.clear();
+                stop(&mut state, REVIEW_CLOSED);
+                slot.done.notify_all();
+            }
         }
+        self.inner.wake_runs();
     }
 
     /// Quit: every render is killed and nothing starts after it. It does not wait.
     pub fn quit(&self) {
-        let mut table = lock(&self.inner.table);
-        table.quitting = true;
-        for slot in table.jobs.values() {
-            let mut state = lock(&slot.state);
-            stop(&mut state, QUITTING);
-            slot.done.notify_all();
+        {
+            let mut table = lock(&self.inner.table);
+            table.quitting = true;
+            for slot in table.jobs.values() {
+                let mut state = lock(&slot.state);
+                stop(&mut state, QUITTING);
+                slot.done.notify_all();
+            }
         }
+        self.inner.wake_runs();
+    }
+
+    /// How many renders wait for a free run.
+    #[cfg(test)]
+    fn queued(&self) -> usize {
+        lock(&self.inner.runs).waiting.len()
     }
 
     /// How many calls joined a running render.
@@ -616,6 +728,19 @@ impl Review {
     }
 }
 
+/// The review of `path` stops waiting for `slot`, for `why`; with no review left the render
+/// stops.
+fn leave(slot: &Slot, path: &str, why: &'static str) {
+    let mut state = lock(&slot.state);
+    if state.paths.remove(path) {
+        state.left.insert(path.to_owned(), why);
+        if state.paths.is_empty() {
+            stop(&mut state, why);
+        }
+        slot.done.notify_all();
+    }
+}
+
 /// Stops a render that has no result yet: kills its group while it is unreaped.
 fn stop(state: &mut SlotState, why: &'static str) {
     if state.result.is_some() {
@@ -628,13 +753,60 @@ fn stop(state: &mut SlotState, why: &'static str) {
 }
 
 /// The cached page at `png` as a data URL, touched; none when it is not there.
-fn cached(png: &Path) -> Option<String> {
+fn cached(png: &Path) -> Option<DataUrl> {
     let bytes = read_regular(png)?;
     if !bytes.starts_with(PNG_SIGNATURE) {
         return None;
     }
     touch(png);
-    Some(data_url(&bytes))
+    Some(DataUrl(data_url(&bytes).into()))
+}
+
+/// A run of the sidecar; the next waiter may go when it is dropped.
+struct RunPermit<'a> {
+    inner: &'a Inner,
+}
+
+impl Drop for RunPermit<'_> {
+    fn drop(&mut self) {
+        lock(&self.inner.runs).running -= 1;
+        self.inner.runs_changed.notify_all();
+    }
+}
+
+/// Answers every waiter of a render when the worker ends, also when it panics.
+struct Finish<'a> {
+    inner: &'a Inner,
+    key: (String, usize),
+    slot: &'a Arc<Slot>,
+    result: Option<Result<DataUrl, String>>,
+}
+
+impl Drop for Finish<'_> {
+    fn drop(&mut self) {
+        let result = self
+            .result
+            .take()
+            .unwrap_or_else(|| Err(NO_IMAGE.to_owned()));
+        {
+            let mut table = lock(&self.inner.table);
+            if table
+                .jobs
+                .get(&self.key)
+                .is_some_and(|s| Arc::ptr_eq(s, self.slot))
+            {
+                table.jobs.remove(&self.key);
+            }
+            table.started -= 1;
+        }
+        let mut state = lock(&self.slot.state);
+        let result = match state.stopped {
+            Some(why) if result.is_err() => Err(why.to_owned()),
+            _ => result,
+        };
+        state.result = Some(result);
+        self.slot.done.notify_all();
+    }
 }
 
 impl Inner {
@@ -648,25 +820,68 @@ impl Inner {
     /// The worker of one render: renders, trims the cache, takes the job out of the table and
     /// answers every caller that waits.
     fn run(self: &Arc<Self>, entry: &Entry, md5: &str, index: usize, slot: &Arc<Slot>) {
-        let result = self.render(entry, md5, index, slot).map(Arc::<str>::from);
+        let mut finish = Finish {
+            inner: self,
+            key: (md5.to_owned(), index),
+            slot,
+            result: None,
+        };
+        let result = self
+            .render(entry, md5, index, slot)
+            .map(|url| DataUrl(url.into()));
         // While the job is still in the table, so its own files stay.
         self.trim();
-        {
-            let mut table = lock(&self.table);
-            let key = (md5.to_owned(), index);
-            if table.jobs.get(&key).is_some_and(|s| Arc::ptr_eq(s, slot)) {
-                table.jobs.remove(&key);
-            }
-            table.started -= 1;
-        }
-        {
-            let mut state = lock(&slot.state);
-            let result = match state.stopped {
-                Some(why) if result.is_err() => Err(why.to_owned()),
-                _ => result,
+        finish.result = Some(result);
+    }
+
+    /// Wakes the renders that wait for a run, after a stop. Taking the lock first means no
+    /// waiter misses it between its look and its wait.
+    fn wake_runs(&self) {
+        let _runs = lock(&self.runs);
+        self.runs_changed.notify_all();
+    }
+
+    /// Waits for a free run: at most [`RUNS_AT_ONCE`], the newest request first. A stop ends
+    /// the wait.
+    fn run_permit(&self, slot: &Arc<Slot>) -> Result<RunPermit<'_>, String> {
+        let mut runs = lock(&self.runs);
+        runs.waiting.push(slot.clone());
+        loop {
+            let (stopped, mine) = {
+                let state = lock(&slot.state);
+                (state.stopped, state.order)
             };
-            state.result = Some(result);
-            slot.done.notify_all();
+            let newest = runs.waiting.iter().all(|other| {
+                let state = lock(&other.state);
+                state.stopped.is_some() || state.order <= mine
+            });
+            if stopped.is_some() || (newest && runs.running < RUNS_AT_ONCE) {
+                runs.waiting.retain(|s| !Arc::ptr_eq(s, slot));
+                if let Some(why) = stopped {
+                    drop(runs);
+                    self.runs_changed.notify_all();
+                    return Err(why.to_owned());
+                }
+                runs.running += 1;
+                return Ok(RunPermit { inner: self });
+            }
+            runs = self
+                .runs_changed
+                .wait(runs)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Why the store has no note at `path`: the server has the file and the pipeline has not
+    /// read it yet, or it is gone (not there, or a folder). Other answers say what went wrong.
+    fn missing(&self, path: &str) -> String {
+        match self
+            .library
+            .call(|rest| rest.get_json::<Entry>("/entries", &[("path", path)]))
+        {
+            Ok(entry) if entry.kind == EntryKind::File => NOT_READY.to_owned(),
+            Ok(_) | Err(LibraryError::Rest(RestError::NotFound)) => NOTE_GONE.to_owned(),
+            Err(e) => e.to_string(),
         }
     }
 
@@ -677,13 +892,15 @@ impl Inner {
         entry: &Entry,
         md5: &str,
         index: usize,
-        slot: &Slot,
+        slot: &Arc<Slot>,
     ) -> Result<String, String> {
         if !self.cache.is_absolute() {
             return Err(NO_CACHE.to_owned());
         }
         self.sweep_once();
         let note = self.note_file(entry, md5, slot)?;
+        // Held until the run ends; the download above does not count.
+        let _run = self.run_permit(slot)?;
         let pages = self.cache.join("pages");
         fs::create_dir_all(&pages).map_err(|_| NO_CACHE.to_owned())?;
         let job = self.next_job.fetch_add(1, Ordering::SeqCst) + 1;
@@ -723,31 +940,33 @@ impl Inner {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let (tx, rx) = mpsc::channel();
-        std::thread::scope(|s| {
-            s.spawn(move || {
-                let errors = std::thread::spawn(move || {
-                    let mut kept = Vec::new();
-                    if let Some(mut stderr) = stderr {
-                        let _ = (&mut stderr).take(STDERR_KEPT).read_to_end(&mut kept);
-                        let _ = io::copy(&mut stderr, &mut io::sink());
-                    }
-                    kept
-                });
-                let mut lines = Vec::new();
-                if let Some(stdout) = stdout {
-                    for line in BufReader::new(stdout).lines() {
-                        let Ok(line) = line else { break };
-                        if lines.len() < LINES_KEPT {
-                            lines.push(line);
-                        }
+        // The reaper is a thread of its own (not scoped): a wait for it is always bounded.
+        let reaper = slot.clone();
+        std::thread::spawn(move || {
+            let errors = std::thread::spawn(move || {
+                let mut kept = Vec::new();
+                if let Some(mut stderr) = stderr {
+                    let _ = (&mut stderr).take(STDERR_KEPT).read_to_end(&mut kept);
+                    let _ = io::copy(&mut stderr, &mut io::sink());
+                }
+                kept
+            });
+            let mut lines = Vec::new();
+            if let Some(stdout) = stdout {
+                for line in BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    if lines.len() < LINES_KEPT {
+                        lines.push(line);
                     }
                 }
-                let status = child.wait();
-                // Reaped: no signal to this group from now on.
-                lock(&slot.state).pgid = None;
-                let errors = errors.join().unwrap_or_default();
-                let _ = tx.send((status, lines, errors));
-            });
+            }
+            let status = child.wait();
+            // Reaped: no signal to this group from now on.
+            lock(&reaper.state).pgid = None;
+            let errors = errors.join().unwrap_or_default();
+            let _ = tx.send((status, lines, errors));
+        });
+        {
             let (ended, late) = match rx.recv_timeout(RENDER_TIMEOUT) {
                 Ok(ended) => (Some(ended), false),
                 Err(_) => {
@@ -757,7 +976,7 @@ impl Inner {
                             let _ = process::signal_group(pgid, libc::SIGKILL);
                         }
                     }
-                    (rx.recv().ok(), true)
+                    (rx.recv_timeout(GONE_WAIT).ok(), true)
                 }
             };
             if let Some(why) = lock(&slot.state).stopped {
@@ -777,7 +996,7 @@ impl Inner {
                 ));
             }
             self.keep_page(&tmp, &lines, md5, index)
-        })
+        }
     }
 
     /// Moves the PNG the render printed into the cache and answers it as a data URL.
@@ -847,7 +1066,7 @@ impl Inner {
                     touch(file);
                     return Ok(file.to_owned());
                 }
-                let right = File::open(file)
+                let right = open_regular(file)
                     .and_then(|mut f| md5_of(&mut f))
                     .is_ok_and(|m| m == md5);
                 if right {
@@ -1016,7 +1235,7 @@ impl Inner {
                     }
                 }
                 if !busy.contains(md5) {
-                    folders.push(dir);
+                    folders.push((dir, md5.to_owned()));
                 }
             }
         }
@@ -1030,6 +1249,12 @@ impl Inner {
                 if busy.contains(&md5) {
                     continue;
                 }
+                // Checked again right before the remove: a job that started since keeps its
+                // note's files.
+                let table = lock(&self.table);
+                if table.jobs.keys().any(|(m, _)| *m == md5) {
+                    continue;
+                }
                 if fs::remove_file(&path).is_ok() {
                     total -= len;
                 }
@@ -1037,8 +1262,11 @@ impl Inner {
         }
         // A page folder left empty goes (it fails while a page is in it); not one a render is
         // about to use.
-        for dir in folders {
-            let _ = fs::remove_dir(dir);
+        for (dir, md5) in folders {
+            let table = lock(&self.table);
+            if !table.jobs.keys().any(|(m, _)| *m == md5) {
+                let _ = fs::remove_dir(dir);
+            }
         }
     }
 }

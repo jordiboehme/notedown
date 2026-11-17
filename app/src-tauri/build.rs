@@ -52,6 +52,7 @@ const COMMANDS: &[&str] = &[
     "note_open",
     "note_page_image",
     "note_close",
+    "note_page_drop",
 ];
 
 fn main() {

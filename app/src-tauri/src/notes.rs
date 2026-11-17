@@ -335,6 +335,16 @@ impl Notes {
         by_path(&state).remove(path).map(|n| n.summary.clone())
     }
 
+    /// The note at the wire path `path`, by the rule of [`at_path`](Self::at_path). Scans
+    /// first.
+    pub fn find(&self, path: &str) -> Option<NoteSummary> {
+        let mut state = lock(&self.inner.state);
+        self.scan(&mut state);
+        self.save_seen(&mut state);
+        self.tell(&mut state);
+        by_path(&state).remove(path).map(|n| n.summary.clone())
+    }
+
     /// The store file of the note at the wire path `path`, by the rule of
     /// [`at_path`](Self::at_path), for a reader of the whole note (the review). Scans first.
     pub fn store_file(&self, path: &str) -> Option<PathBuf> {

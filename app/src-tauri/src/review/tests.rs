@@ -62,7 +62,8 @@ fn bytes_of(body: &[u8]) -> Act {
 
 /// The fake `notedown`: every call goes to `calls`. `render <file> ... --page N --out D`
 /// writes a PNG `D/Plan-page-00N.png` that holds the page and the note's bytes, and prints its
-/// path. With `fail` it reports the page as failed; with `hold` it waits for `release` (10 s at
+/// path. With `fail` it reports the page as failed; with `hold` it waits for `release` or
+/// `release-<N>` (10 s at
 /// most) before it writes; with `linger` it writes, prints and then runs this test's own sleep
 /// of the length in `linger`.
 fn sidecar(dir: &Path) -> SpawnFn {
@@ -91,7 +92,9 @@ if [ -f "{d}/fail" ]; then
 fi
 if [ -f "{d}/hold" ]; then
   i=0
-  while [ ! -f "{d}/release" ] && [ "$i" -lt 1000 ]; do sleep 0.01; i=$((i + 1)); done
+  while [ ! -f "{d}/release" ] && [ ! -f "{d}/release-$page" ] && [ "$i" -lt 1000 ]; do
+    sleep 0.01; i=$((i + 1))
+  done
 fi
 png="$out/Plan-page-$(printf %03d "$page").png"
 printf '\211PNG\r\n\032\npage %s of %s' "$page" "$(cat "$file")" > "$png"
@@ -130,7 +133,6 @@ struct Setup {
     _config: tempfile::TempDir,
     /// The app cache (`<root>/cache`).
     root: tempfile::TempDir,
-    time: Arc<AtomicU64>,
 }
 
 impl Drop for Setup {
@@ -192,15 +194,27 @@ fn setup_with_limit(routes: Vec<(String, Act)>, limit: u64) -> Setup {
         clock,
         limit,
     );
-    Setup {
+    let s = Setup {
         server,
         review,
         bin,
         data,
         _config: config_dir,
         root,
-        time,
-    }
+    };
+    // The store has both notes with 12 pages, so page indexes up to 11 are in the note.
+    s.store(&stored(&md5_hex(BYTES), pages(12)));
+    s.store(&stored_at("F_other", OTHER, pages(12)));
+    s
+}
+
+const OTHER: &str = "NOTE/Note/Other.note";
+
+/// `n` pages without text.
+fn pages(n: usize) -> Vec<Value> {
+    (0..n)
+        .map(|i| page(&format!("P{i}"), i, "done", vec![]))
+        .collect()
 }
 
 fn store_dir(data: &Path) -> PathBuf {
@@ -287,6 +301,15 @@ fn stored(md5: &str, pages: Vec<Value>) -> Value {
     })
 }
 
+/// A store file of another note.
+fn stored_at(key: &str, path: &str, pages: Vec<Value>) -> Value {
+    let mut note = stored(&md5_hex(BYTES), pages);
+    note["key"] = json!(key);
+    note["path"] = json!(path);
+    note["title"] = json!("");
+    note
+}
+
 fn page(id: &str, position: usize, state: &str, blocks: Vec<Value>) -> Value {
     json!({"pageId": id, "position": position, "pageHash": "h", "strokesHash": "s",
            "layersHash": "l", "seq": 3, "state": state,
@@ -295,7 +318,7 @@ fn page(id: &str, position: usize, state: &str, blocks: Vec<Value>) -> Value {
 
 #[test]
 fn note_open_gives_the_markdown_per_page() {
-    let s = setup(vec![(look(NOTE), entry())]);
+    let s = setup(vec![(look(NOTE), entry()), (look(OTHER), entry())]);
     let mut landscape = page("P2", 1, "done", vec![block("b3", "| a | b |")]);
     landscape["landscape"] = json!(true);
     s.store(&stored(
@@ -305,7 +328,10 @@ fn note_open_gives_the_markdown_per_page() {
                 "P1",
                 0,
                 "done",
-                vec![block("b1", "# Plan"), block("b2", "first line\nsecond")],
+                vec![
+                    block("b1", "# Plan\n"),
+                    block("b2", "first line\nsecond  \n"),
+                ],
             ),
             landscape,
             page("P3", 2, "failed", vec![]),
@@ -341,11 +367,8 @@ fn note_open_gives_the_markdown_per_page() {
     assert_eq!(wire["catchingUp"], json!(false));
     assert_eq!(wire["pages"][1]["landscape"], json!(true));
     assert_eq!(wire["pages"][2]["state"], json!("failed"));
-    // A note the store does not have.
-    assert_eq!(
-        s.review.open("NOTE/Note/Other.note").unwrap_err(),
-        crate::notes::NOTE_GONE
-    );
+    // The title of a note without one is its file name.
+    assert_eq!(s.review.open(OTHER).unwrap().title, "Other");
     // Reading the note renders nothing and downloads nothing.
     assert!(s.calls().is_empty());
     assert!(
@@ -610,7 +633,7 @@ fn a_killed_render_leaves_no_cache() {
     // Killed from outside: its page, printed and written, is no answer.
     kill_in(s.bin.path());
     let error = call.join().unwrap().unwrap_err();
-    assert!(!error.is_empty());
+    assert!(error.starts_with(NO_IMAGE), "{error}");
     assert!(gone(s.bin.path()), "{}", left_in(s.bin.path()));
     assert_eq!(
         s.cached(),
@@ -765,7 +788,6 @@ fn the_cache_is_trimmed_past_its_limit() {
     ];
     want.sort();
     assert_eq!(s.cached(), want, "the empty folder of {a} goes too");
-    let _ = &s.time;
 }
 
 /// A render that was stopped stays in the table until its worker sees it (here: while it waits
@@ -859,4 +881,123 @@ fn the_render_always_has_out() {
         assert!(name.starts_with(&format!("{md5}.tmp-")), "{call}");
     }
     assert_eq!(s.calls().len(), 2);
+}
+
+#[test]
+fn a_note_not_in_the_store_is_not_ready_or_gone() {
+    let (new, gone, folder) = (
+        "NOTE/Note/New.note",
+        "NOTE/Note/Gone.note",
+        "NOTE/Note/Folder",
+    );
+    let not_found = || {
+        Act::Answer(answer(
+            "404 Not Found",
+            &json!({"error": "not_found"}).to_string(),
+        ))
+    };
+    let s = setup(vec![
+        (look(new), entry()),
+        (look(gone), not_found()),
+        (look(folder), entry_of(json!(null), "folder")),
+        (look(new), entry()),
+        (look(gone), not_found()),
+    ]);
+    // A file the pipeline has not read yet.
+    assert_eq!(s.review.open(new).unwrap_err(), NOT_READY);
+    assert_eq!(s.review.open(gone).unwrap_err(), crate::notes::NOTE_GONE);
+    assert_eq!(s.review.open(folder).unwrap_err(), crate::notes::NOTE_GONE);
+    // Its pages are not asked for either: the store knows no page count.
+    assert_eq!(s.review.page_image(new, 0).unwrap_err(), NOT_READY);
+    assert_eq!(
+        s.review.page_image(gone, 0).unwrap_err(),
+        crate::notes::NOTE_GONE
+    );
+    assert!(s.calls().is_empty());
+}
+
+#[test]
+fn a_page_past_the_end_is_refused() {
+    let s = setup(vec![]);
+    for index in [12, 13, usize::MAX] {
+        assert_eq!(s.review.page_image(NOTE, index).unwrap_err(), NO_SUCH_PAGE);
+    }
+    // No entry, no bytes, no render.
+    assert!(s.server.received().is_empty());
+    assert!(s.calls().is_empty());
+    assert!(s.cached().is_empty(), "{:?}", s.cached());
+}
+
+#[test]
+fn at_most_two_renders_run_at_once_newest_first() {
+    let s = setup(vec![
+        (look(NOTE), entry()),
+        (FILE.to_owned(), bytes_of(BYTES)),
+        (look(NOTE), entry()),
+        (look(NOTE), entry()),
+        (look(NOTE), entry()),
+    ]);
+    s.flag("hold", "");
+    let ask = |index: usize| {
+        let review = s.review.clone();
+        std::thread::spawn(move || review.page_image(NOTE, index))
+    };
+    let first = ask(0);
+    s.wait_until("the first render", || s.calls().len() == 1);
+    let second = ask(1);
+    s.wait_until("the second render", || s.calls().len() == 2);
+    // A third page waits for a free run.
+    let third = ask(2);
+    s.wait_until("the third page to queue", || s.review.queued() == 1);
+    assert_eq!(s.calls().len(), 2);
+    let fourth = ask(3);
+    s.wait_until("the fourth page to queue", || s.review.queued() == 2);
+    assert_eq!(s.calls().len(), 2);
+    // One run ends: the newest request goes first.
+    s.flag("release-1", "");
+    assert_eq!(first.join().unwrap().unwrap(), data_url(&png_of(1, BYTES)));
+    s.wait_until("the next render", || s.calls().len() == 3);
+    assert!(s.calls()[2].contains(" --page 4 "), "{:?}", s.calls());
+    s.flag("release", "");
+    assert_eq!(second.join().unwrap().unwrap(), data_url(&png_of(2, BYTES)));
+    assert_eq!(fourth.join().unwrap().unwrap(), data_url(&png_of(4, BYTES)));
+    assert_eq!(third.join().unwrap().unwrap(), data_url(&png_of(3, BYTES)));
+    assert!(s.calls()[3].contains(" --page 3 "), "{:?}", s.calls());
+}
+
+#[test]
+fn a_dropped_page_stops_its_run() {
+    let md5 = md5_hex(BYTES);
+    let s = setup(vec![
+        (look(NOTE), entry()),
+        (FILE.to_owned(), bytes_of(BYTES)),
+        (look(NOTE), entry()),
+    ]);
+    s.flag("linger", "325");
+    let call = {
+        let review = s.review.clone();
+        std::thread::spawn(move || review.page_image(NOTE, 4))
+    };
+    s.wait_until("the render", || s.calls().len() == 1);
+    // Another page of the review is no reason to stop it.
+    s.review.drop_page(NOTE, 3);
+    s.review.drop_page(OTHER, 4);
+    assert_eq!(s.review.running(), 1);
+    assert!(!call.is_finished());
+    s.review.drop_page(NOTE, 4);
+    assert_eq!(call.join().unwrap().unwrap_err(), PAGE_DROPPED);
+    assert!(gone(s.bin.path()), "{}", left_in(s.bin.path()));
+    s.review.join();
+    assert!(!s.cache().join("pages").join(&md5).exists());
+    assert!(
+        s.cached().iter().all(|f| !f.contains(".tmp-")),
+        "{:?}",
+        s.cached()
+    );
+    // The page can be asked for again.
+    fs::remove_file(s.bin.path().join("linger")).unwrap();
+    assert_eq!(
+        s.review.page_image(NOTE, 4).unwrap(),
+        data_url(&png_of(5, BYTES))
+    );
 }

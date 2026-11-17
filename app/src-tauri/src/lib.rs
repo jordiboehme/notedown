@@ -198,7 +198,8 @@ pub fn run() {
             commands::note_seen,
             commands::note_open,
             commands::note_page_image,
-            commands::note_close
+            commands::note_close,
+            commands::note_page_drop
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
@@ -620,6 +621,7 @@ mod tests {
                 "note_open",
                 "note_page_image",
                 "note_close",
+                "note_page_drop",
                 "open_settings"
             ])
         );
@@ -688,7 +690,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 47);
+        assert_eq!(handler_commands().len(), 48);
     }
 
     #[test]
@@ -741,6 +743,7 @@ mod tests {
             "note_open",
             "note_page_image",
             "note_close",
+            "note_page_drop",
         ]);
         assert_eq!(manifest_commands(), all);
         // Every granted command is a real one.
@@ -793,7 +796,12 @@ mod tests {
 
     #[test]
     fn the_review_is_only_the_librarys() {
-        for command in ["note_open", "note_page_image", "note_close"] {
+        for command in [
+            "note_open",
+            "note_page_image",
+            "note_close",
+            "note_page_drop",
+        ] {
             assert!(granted("library").contains(command), "{command}");
             for window in ["panel", "settings"] {
                 assert!(!granted(window).contains(command), "{window} has {command}");

@@ -14,7 +14,7 @@ use crate::model::{ModelControl, ModelState};
 use crate::notes::{NoteSummary, Notes};
 use crate::poller::Poller;
 use crate::processes::{ProcessStates, Processes};
-use crate::review::{NoteView, Review};
+use crate::review::{DataUrl, NoteView, Review};
 use crate::serve_info::ServeInfo;
 use crate::status::Status;
 use crate::token::{KeychainStore, TokenStore, token_key};
@@ -818,7 +818,7 @@ pub async fn note_page_image(
     review: State<'_, Review>,
     path: String,
     index: usize,
-) -> Result<String, String> {
+) -> Result<DataUrl, String> {
     let review = review.inner().clone();
     tauri::async_runtime::spawn_blocking(move || review.page_image(&path, index))
         .await
@@ -831,6 +831,21 @@ pub async fn note_page_image(
 pub async fn note_close(review: State<'_, Review>, path: String) -> Result<(), String> {
     let review = review.inner().clone();
     tauri::async_runtime::spawn_blocking(move || review.close(&path))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The review of the note at `path` does not show page `index` anymore (it went far out of
+/// view): its waiting call ends and its render stops when no other review waits for it. Off
+/// the main thread.
+#[tauri::command]
+pub async fn note_page_drop(
+    review: State<'_, Review>,
+    path: String,
+    index: usize,
+) -> Result<(), String> {
+    let review = review.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || review.drop_page(&path, index))
         .await
         .map_err(|e| e.to_string())
 }

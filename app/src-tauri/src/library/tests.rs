@@ -173,11 +173,10 @@ fn the_library_is_bound_to_base_account_and_token() {
         "the call uses the bound token"
     );
 
-    // The same place again: no new binding and no Keychain read.
-    let generation = library.generation();
+    // The same place again: no new binding (no event, the session goes on) and no Keychain
+    // read.
     library.refresh();
     assert_eq!(store.gets(), 1);
-    assert_eq!(library.generation(), generation);
     assert_eq!(events.all().len(), 2);
     assert!(!first.is_cancelled());
 
@@ -186,7 +185,7 @@ fn the_library_is_bound_to_base_account_and_token() {
     library.relogin();
     assert_eq!(store.gets(), 2);
     assert!(first.is_cancelled());
-    assert!(library.generation() > generation);
+    assert_eq!(events.all().last(), Some(&LibraryEvent::Relist));
     assert_eq!(events.states(), [LibraryState::Ready, LibraryState::Ready]);
     get_account(&library).unwrap();
     assert_eq!(server.next().header("authorization"), Some("Bearer tok-2"));

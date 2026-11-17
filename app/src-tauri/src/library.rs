@@ -406,11 +406,6 @@ impl Library {
         lock(&self.inner.bound).view.clone()
     }
 
-    /// Counts the bindings.
-    pub fn generation(&self) -> u64 {
-        lock(&self.inner.bound).generation
-    }
-
     /// Binds again when the REST base or the account's Keychain key changed since the last
     /// binding (a new place, a new address of the app's own server). A login the server
     /// refused stays refused for the same key. Blocking: run it off the main thread.

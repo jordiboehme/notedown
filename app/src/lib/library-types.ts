@@ -111,12 +111,10 @@ export type LibraryEvent =
  */
 export type UploadAsk = { ask: "many" | "packages"; text: string };
 
-/**
- * The answer to an upload job that asks (`library_answer(job, choice)`). `replace` only when its
- * question says `canReplace`. Other upload commands: `library_retry(job)` for a failed upload,
- * `library_cancel(job)` (also ends a restore that asks), `library_cancel_drop(dropId)` (Cancel all).
- */
-export type UploadChoice = "replace" | "keepBoth" | "skip";
+// An upload job that asks is answered with `library_answer(job, choice)`, `choice` one of
+// "replace" (only when its question says `canReplace`), "keepBoth" or "skip". Other upload
+// commands: `library_retry(job)` for a failed upload, `library_cancel(job)` (also ends a restore
+// that asks), `library_cancel_drop(dropId)` (Cancel all).
 
 /** The name of the Tauri event that carries every `LibraryEvent`. */
 export const LIBRARY_EVENT = "library";
@@ -170,11 +168,9 @@ export type NoteView = {
 };
 
 /**
- * Where Rust opens the library window (`open_library(note?, newNotes?)`): at the review of a
- * note (its path), or at New. A new window finds it in `window.__NOTEDOWN_AT__` (null: as it
- * starts), an open one gets it as the `LIBRARY_AT_EVENT`.
+ * The name of the Tauri event that tells an open library window where to go. Rust opens the
+ * window (`open_library(note?, newNotes?)`) at `{ at: "note", path }` (the review of a note) or
+ * `{ at: "new" }`. A new window finds it in `window.__NOTEDOWN_AT__` (null: as it starts), an
+ * open one gets it as this event; `openAt` (library/view.ts) reads it.
  */
-export type LibraryAt = { at: "note"; path: string } | { at: "new" };
-
-/** The name of the Tauri event that tells an open library window where to go. */
 export const LIBRARY_AT_EVENT = "library-at";

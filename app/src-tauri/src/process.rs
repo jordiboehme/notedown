@@ -59,12 +59,18 @@ pub fn child_args(kind: ChildKind, data_dir: &Path, parent: u32) -> Vec<String> 
 }
 
 /// The pipeline's arguments: [`child_args`], `--model-idle <n>m` (the model idle time of the
-/// OCR page), and with a logged-in account `--markdown-dir <slug>=<dir>`, its Markdown folder
+/// OCR page; a value it does not offer, from a hand-edited config, gives 5), and with a
+/// logged-in account `--markdown-dir <slug>=<dir>`, its Markdown folder
 /// ([`AppConfig::markdown_dir`]). Both flags win over the pipeline's own config.
 fn pipeline_args(config: &AppConfig, parent: u32) -> Vec<String> {
     let mut args = child_args(ChildKind::Pipeline, &config.data_dir, parent);
     args.push("--model-idle".to_string());
-    args.push(format!("{}m", config.model_idle_minutes));
+    let minutes = if config::MODEL_IDLE_MINUTES.contains(&config.model_idle_minutes) {
+        config.model_idle_minutes
+    } else {
+        AppConfig::default().model_idle_minutes
+    };
+    args.push(format!("{minutes}m"));
     if let (Some(slug), Some(dir)) = (config.account_slug(), config.markdown_dir()) {
         args.push("--markdown-dir".to_string());
         args.push(format!("{slug}={}", dir.display()));
@@ -288,7 +294,8 @@ mod tests {
     #[test]
     fn the_pipeline_gets_the_model_idle_time() {
         let dir = tempfile::tempdir().unwrap();
-        for minutes in [1, 5, 15, 60] {
+        // A value the OCR page does not offer (a hand-edited config.json) gives 5 minutes.
+        for (minutes, want) in [(1, 1), (5, 5), (15, 15), (60, 60), (0, 5), (7, 5)] {
             let config = AppConfig {
                 model_idle_minutes: minutes,
                 ..config(Mode::Local, dir.path())
@@ -298,7 +305,7 @@ mod tests {
                 panic!("no pipeline");
             };
             let at = pipeline.iter().position(|a| a == "--model-idle").unwrap();
-            assert_eq!(pipeline[at + 1], format!("{minutes}m"));
+            assert_eq!(pipeline[at + 1], format!("{want}m"), "{minutes}");
             let Launch::Start(server) = plan.server else {
                 panic!("no server");
             };

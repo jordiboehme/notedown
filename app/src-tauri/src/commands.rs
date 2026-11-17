@@ -185,6 +185,9 @@ impl ConfigState {
                 c.account = None;
                 c.email = None;
             }
+            // A kept account without a Markdown folder in the app gets the pipeline's, before
+            // the children start again with `--markdown-dir`.
+            c.seed_markdown_dir();
             Ok::<(), std::convert::Infallible>(())
         })
         .map_err(|e| match e {
@@ -1308,6 +1311,39 @@ mod tests {
         assert_eq!(
             state.current().markdown_dir(),
             Some(PathBuf::from("/chosen/md"))
+        );
+    }
+
+    #[test]
+    fn set_mode_seeds_the_markdown_folder_of_a_kept_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let state = ConfigState::load(dir.path().join("config"));
+        state
+            .set_mode(Mode::Local, Some(data.clone()), None)
+            .unwrap();
+        state
+            .try_update(|c| {
+                c.account = Some("jordi".into());
+                Ok::<(), ()>(())
+            })
+            .ok()
+            .unwrap();
+        // The pipeline's config gets an entry; Set with the same server keeps the account.
+        std::fs::write(
+            data.join("server.toml"),
+            "[pipeline.markdown_dirs]\njordi = \"/notes/md\"\n",
+        )
+        .unwrap();
+        let cfg = state
+            .set_mode(Mode::Local, Some(data.clone()), None)
+            .unwrap();
+        assert_eq!(cfg.account.as_deref(), Some("jordi"));
+        assert_eq!(cfg.markdown_dir(), Some(PathBuf::from("/notes/md")));
+        assert_eq!(
+            config::load(&dir.path().join("config")).markdown_dirs["jordi"],
+            PathBuf::from("/notes/md")
         );
     }
 

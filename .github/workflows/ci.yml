@@ -35,10 +35,12 @@ jobs:
   #
   # The tested-tree skip: on a push to main, a pull request run that passed
   # every gated job on the same tree (the same files, so the same build) left
-  # an artifact tested-tree-<tree> (see ci-passed). When it is found, the
-  # gated jobs are skipped instead of running the same work a second time.
-  # Any error, an empty answer or anything unclear leaves tested=false, and
-  # the gates read `!= 'true'`, so a missing output runs everything.
+  # an artifact tested-tree-<tree> (see ci-passed). With tested=true the
+  # clippy, test, pi, app and musl jobs only compile and lint (so main still
+  # saves the caches pull requests restore) and skip their tests; fmt is
+  # skipped; cargo-deny and workflow-lint still run. Any error, an empty
+  # answer or anything unclear leaves tested=false, and the checks read
+  # `!= 'true'`, so a missing output runs everything.
   changes:
     name: changes
     timeout-minutes: 10
@@ -199,7 +201,7 @@ jobs:
             run_the_tests "no pull request run of this repository left an unexpired $name"
           fi
 
-          echo "tested: the pull request run(s) $runs passed every gated job on the tree $tree, so the gated jobs are skipped."
+          echo "tested: the pull request run(s) $runs passed every gated job on the tree $tree, so the Rust jobs only compile and lint, and fmt is skipped."
           echo "tested=true" >>"$GITHUB_OUTPUT"
 
   fmt:
@@ -228,7 +230,7 @@ jobs:
     name: clippy (${{ matrix.os }})
     timeout-minutes: 45
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' && needs.changes.outputs.tested != 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -277,7 +279,7 @@ jobs:
     name: test (${{ matrix.os }})
     timeout-minutes: 60
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' && needs.changes.outputs.tested != 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -316,13 +318,21 @@ jobs:
           shared-key: test
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # A pull request run tested this tree: compile the tests only, so the
+      # cache main saves holds them.
+      - name: Compile the tests only (the pull request tested this tree)
+        if: ${{ needs.changes.outputs.tested == 'true' }}
+        run: cargo nextest run --workspace --locked --no-run
+
       # --no-tests=warn: a workspace whose crates have no tests yet is not an
       # error.
       - name: cargo nextest run
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: cargo nextest run --workspace --locked --no-tests=warn
 
       # nextest does not run doctests.
       - name: cargo test --doc
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: cargo test --workspace --doc --locked
 
   # Linux on arm64, the Raspberry Pi. This job is the spec's Pi build check:
@@ -332,7 +342,7 @@ jobs:
     name: pi (arm64)
     timeout-minutes: 30
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' && needs.changes.outputs.tested != 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -358,15 +368,24 @@ jobs:
         run: cargo build -p notedown-cloud --locked
 
       - name: cargo nextest run -p notedown-cloud
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: cargo nextest run -p notedown-cloud --locked --no-tests=warn
 
       - name: cargo test --doc -p notedown-cloud
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: cargo test -p notedown-cloud --doc --locked
 
       - name: cargo clippy -p notedown --no-default-features
         run: cargo clippy -p notedown --no-default-features --all-targets --locked -- -D warnings
 
+      - name: Compile the tests only (the pull request tested this tree)
+        if: ${{ needs.changes.outputs.tested == 'true' }}
+        run: |
+          cargo nextest run -p notedown-cloud --locked --no-run
+          cargo nextest run -p notedown --no-default-features --locked --no-run
+
       - name: cargo nextest run -p notedown --no-default-features
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: cargo nextest run -p notedown --no-default-features --locked --no-tests=warn
 
       - name: The Pi build has no OCR in its dependency tree
@@ -384,14 +403,15 @@ jobs:
   # The Linux release build: a static musl binary of notedown without its
   # `ocr` feature, for amd64 and arm64, each on a native runner (the release
   # builds the same way). Checks that the binary is static and that
-  # --version names the workspace version. The amd64 binary is uploaded as
+  # --version names the workspace version. It runs on a tested main push too
+  # (it is a build and saves its cache there). The amd64 binary is uploaded as
   # the artifact musl-amd64 for the .deb and image smoke tests (upload-artifact
   # does not keep the exec bit, so a user of it runs chmod first).
   musl:
     name: musl (${{ matrix.arch }})
     timeout-minutes: 30
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' && needs.changes.outputs.tested != 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -443,11 +463,7 @@ jobs:
             echo "::error::$bin is not a static binary"
             exit 1
           fi
-          version="$(awk '
-            /^\[/ { inside = ($0 ~ /^\[workspace\.package\][[:space:]]*$/) ; next }
-            inside && /^version[[:space:]]*=/ {
-              sub(/^version[[:space:]]*=[[:space:]]*"/, ""); sub(/".*$/, ""); print; exit
-            }' Cargo.toml)"
+          version="$(bash scripts/ci/workspace-version.sh)"
           got="$("$bin" --version)"
           echo "--version: $got"
           if [ "$got" != "notedown $version" ]; then
@@ -472,7 +488,7 @@ jobs:
     name: cargo-deny
     timeout-minutes: 15
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' && needs.changes.outputs.tested != 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -510,7 +526,7 @@ jobs:
     name: app
     timeout-minutes: 45
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' && needs.changes.outputs.tested != 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -539,10 +555,12 @@ jobs:
         working-directory: app
 
       - name: npm run check
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: npm run check
         working-directory: app
 
       - name: vitest
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: npx vitest run
         working-directory: app
 
@@ -563,6 +581,7 @@ jobs:
           printf 'Placeholder of a CI build.\n' >resources/THIRD-PARTY-NOTICES.txt
 
       - name: cargo fmt --check
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: cargo fmt --check
         working-directory: app/src-tauri
 
@@ -570,7 +589,13 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
         working-directory: app/src-tauri
 
+      - name: Compile the tests only (the pull request tested this tree)
+        if: ${{ needs.changes.outputs.tested == 'true' }}
+        run: cargo test --locked --no-run
+        working-directory: app/src-tauri
+
       - name: cargo test
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: cargo test --locked
         working-directory: app/src-tauri
 
@@ -617,9 +642,10 @@ jobs:
         run: bash scripts/ci/version-pins.sh
 
       # A release pull request learns here, not after its merge, when its
-      # notes file has no H1. Without a notes file this needs no network.
+      # notes file has no H1. Without a notes file this needs no network;
+      # with one it asks the remote for the tag, hence the retries.
       - name: Release check
-        run: bash scripts/release-check.sh
+        run: bash scripts/ci/retry.sh 3 bash scripts/release-check.sh
 
   # The one check a branch protection rule requires. It always runs and
   # passes when every job above passed or was skipped (a documentation-only

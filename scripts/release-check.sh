@@ -72,12 +72,7 @@ if [ "${1:-}" = "tag-commit" ]; then
 fi
 [ "$#" -eq 0 ] || { echo "usage: $0 [tag-commit <tag>]" >&2; exit 2; }
 
-# `version = "x.y.z"` inside [workspace.package], up to the next section.
-version="$(awk '
-  /^\[/ { inside = ($0 ~ /^\[workspace\.package\][[:space:]]*$/) ; next }
-  inside && /^version[[:space:]]*=/ {
-    sub(/^version[[:space:]]*=[[:space:]]*"/, ""); sub(/".*$/, ""); print; exit
-  }' "$root/Cargo.toml")"
+version="$(bash "$root/scripts/ci/workspace-version.sh" "$root")"
 if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "::error file=Cargo.toml::no workspace version of the form X.Y.Z in [workspace.package] of Cargo.toml (found '$version')" >&2
   exit 1

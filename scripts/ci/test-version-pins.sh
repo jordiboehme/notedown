@@ -59,13 +59,23 @@ else
   fail "untouched copy: exit $rc; output: $out"
 fi
 
-ver="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$repo/Cargo.toml" | head -1)"
+ver="$(bash "$repo/scripts/ci/workspace-version.sh" "$repo")"
 other="9.8.7"
 
-root="$(fixture path-dep)"
-perl -pi -e 's/(notedown-cloud = \{ path = "crates\/notedown-cloud", version = )"[^"]*"/$1"'"$other"'"/' "$root/Cargo.toml"
-run "$root"
-expect_fail "an internal path dependency off the version fails" "Cargo.toml"
+deps="$(sed -nE 's/^([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*\{.*path[[:space:]]*=[[:space:]]*"crates\/.*/\1/p' "$repo/Cargo.toml")"
+if [ "$(grep -c . <<<"$deps")" -lt 5 ]; then
+  fail "expected at least five path dependencies in Cargo.toml, found: $deps"
+fi
+for dep in $deps; do
+  root="$(fixture "path-dep-$dep")"
+  perl -pi -e 's/^(\Q'"$dep"'\E = \{.*\bversion = )"[^"]*"/$1"'"$other"'"/' "$root/Cargo.toml"
+  if cmp -s "$repo/Cargo.toml" "$root/Cargo.toml"; then
+    fail "the mutation of the path dependency $dep changed nothing"
+    continue
+  fi
+  run "$root"
+  expect_fail "the path dependency $dep off the version fails" "Cargo.toml"
+done
 
 root="$(fixture crate-own-version)"
 perl -pi -e 's/^version\.workspace = true$/version = "'"$other"'"/' "$root/crates/notedown-ocr/Cargo.toml"
@@ -73,7 +83,8 @@ run "$root"
 expect_fail "a crate with its own version fails" "crates/notedown-ocr/Cargo.toml"
 
 root="$(fixture app-crate)"
-perl -pi -e 's/^version = "[^"]*"$/version = "'"$other"'"/ if $. < 10' "$root/app/src-tauri/Cargo.toml"
+# The version inside [package] only.
+perl -pi -e '$in = /^\[package\]\s*$/ if /^\[/; s/^version = "[^"]*"$/version = "'"$other"'"/ if $in' "$root/app/src-tauri/Cargo.toml"
 run "$root"
 expect_fail "the app crate off the version fails" "app/src-tauri/Cargo.toml"
 

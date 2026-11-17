@@ -30,10 +30,11 @@ fail() { echo "FAIL $1" >&2; fails=$((fails + 1)); }
 # A fresh fixture: work tree $tmp/<name>/work, its origin $tmp/<name>/origin.git.
 fixture() {
   local dir="$tmp/$1"
-  mkdir -p "$dir/work/scripts"
+  mkdir -p "$dir/work/scripts/ci"
   g init -q --bare "$dir/origin.git"
   g init -q "$dir/work"
   cp "$repo/scripts/release-check.sh" "$dir/work/scripts/"
+  cp "$repo/scripts/ci/workspace-version.sh" "$dir/work/scripts/ci/"
   cat >"$dir/work/Cargo.toml" <<'TOML'
 [workspace]
 members = []
@@ -49,11 +50,13 @@ TOML
 }
 
 # Runs the default mode; sets rc, out and outputs (the $GITHUB_OUTPUT text).
+# A second argument is the remote to ask.
 check() {
-  local work="$1"
+  local work="$1" remote="${2:-origin}"
   : >"$tmp/output"
   rc=0
-  out="$(GITHUB_OUTPUT="$tmp/output" bash "$work/scripts/release-check.sh" 2>&1)" || rc=$?
+  out="$(GITHUB_OUTPUT="$tmp/output" RELEASE_CHECK_REMOTE="$remote" \
+    bash "$work/scripts/release-check.sh" 2>&1)" || rc=$?
   outputs="$(cat "$tmp/output")"
 }
 
@@ -66,10 +69,11 @@ expect_outputs() {
   fi
 }
 
-# No notes file: no release, green, and no tag lookup needed.
+# No notes file: no release, green, and no tag lookup: the remote asked
+# does not exist, so any lookup would fail.
 w="$(fixture no-notes)"
-check "$w"
-expect_outputs "no notes file answers release=false" "$(printf 'tag=v1.2.3\nrelease=false')"
+check "$w" "$tmp/nowhere.git"
+expect_outputs "no notes file answers release=false without a tag lookup" "$(printf 'tag=v1.2.3\nrelease=false')"
 
 # Notes with an H1, no tag anywhere: release.
 w="$(fixture notes-h1)"

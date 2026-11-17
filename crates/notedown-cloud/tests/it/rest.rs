@@ -13,7 +13,9 @@ use notedown_cloud::rest;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use crate::rest_server::{EMAIL, PASSWORD, json_of, log_text, q, start, start_imported};
+use crate::rest_server::{
+    EMAIL, PASSWORD, json_of, log_text, q, send_json, start, start_imported, writer,
+};
 
 #[test]
 fn login_gives_a_token_that_reads_the_account() {
@@ -638,4 +640,91 @@ fn the_account_lists_the_newest_sync_first_and_never_synced_last() {
     assert_eq!(serials, ["SN-B", "SN-C", "SN-A", "SN-D"], "{me}");
     assert_eq!(list[0]["lastSyncMs"], 3_000, "{me}");
     assert!(list[3]["lastSyncMs"].is_null(), "{me}");
+}
+
+#[test]
+fn logout_revokes_the_callers_token() {
+    let s = start();
+    let (_, answer, _) = s.login_with(EMAIL, PASSWORD);
+    let token = writer(&s);
+    let id = answer["id"].as_str().unwrap().to_string();
+    assert!(
+        list_tokens(&s.data, "jordi")
+            .unwrap()
+            .iter()
+            .any(|t| t.id == id)
+    );
+    let (status, body, _) = send_json(&s, &token, "POST", "/logout", None);
+    assert_eq!((status, body), (200, json!({"revoked": true})));
+    let (status, body) = s.get(Some(&token), "/account");
+    assert_eq!((status, body), (401, json!({"error": "token_refused"})));
+    let tokens = list_tokens(&s.data, "jordi").unwrap();
+    assert_eq!(tokens.len(), 1, "only the other login is left");
+    assert_eq!(tokens[0].id, id);
+}
+
+#[test]
+fn logout_keeps_the_other_tokens() {
+    let s = start();
+    let first = writer(&s);
+    let second = writer(&s);
+    assert_eq!(send_json(&s, &first, "POST", "/logout", None).0, 200);
+    assert_eq!(s.get(Some(&second), "/account").0, 200);
+}
+
+#[test]
+fn logout_works_with_a_read_token() {
+    let s = start();
+    let (_, answer, _) = s.login_with(EMAIL, PASSWORD);
+    let token = answer["token"].as_str().unwrap();
+    let (status, body, _) = send_json(&s, token, "POST", "/logout", None);
+    assert_eq!((status, body), (200, json!({"revoked": true})));
+    assert_eq!(s.get(Some(token), "/account").0, 401);
+}
+
+#[test]
+fn a_second_logout_is_refused() {
+    let s = start();
+    let token = writer(&s);
+    assert_eq!(send_json(&s, &token, "POST", "/logout", None).0, 200);
+    let (status, body, _) = send_json(&s, &token, "POST", "/logout", None);
+    assert_eq!((status, body), (401, json!({"error": "token_refused"})));
+}
+
+#[test]
+fn logout_is_not_gated() {
+    // Not imported, protect on: logout still works.
+    let s = start();
+    let token = writer(&s);
+    assert_eq!(send_json(&s, &token, "POST", "/logout", None).0, 200);
+}
+
+#[test]
+fn account_says_whether_the_account_is_imported() {
+    let s = start();
+    let (status, me) = s.get(Some(&s.token()), "/account");
+    assert_eq!(status, 200);
+    assert_eq!(
+        (&me["imported"], &me["appDataImported"]),
+        (&json!(false), &json!(false))
+    );
+    let s = start_imported();
+    let (_, me) = s.get(Some(&s.token()), "/account");
+    assert_eq!(
+        (&me["imported"], &me["appDataImported"]),
+        (&json!(true), &json!(false))
+    );
+    // The marker of the app data import.
+    let accounts = Accounts::new(&s.data);
+    let mut a = accounts.get("jordi").unwrap().unwrap();
+    a.app_data_imported = Some(notedown_cloud::auth::AppDataImported {
+        at: "2026-11-16T11:00:00Z".into(),
+        source: String::new(),
+        digests: 0,
+        groups: 0,
+        marks: 0,
+    });
+    accounts.save(&a).unwrap();
+    let (_, me) = s.get(Some(&s.token()), "/account");
+    assert_eq!(me["appDataImported"], json!(true));
 }

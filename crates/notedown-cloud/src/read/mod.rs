@@ -37,6 +37,12 @@ pub struct ServerAccount {
     /// The devices of the account (`GET /account`); empty from servers of an older version.
     #[serde(default)]
     pub devices: Vec<DeviceView>,
+    /// The files of the account are imported (`GET /account`); false from older servers.
+    #[serde(default)]
+    pub imported: bool,
+    /// The app data of the account is imported (`GET /account`); false from older servers.
+    #[serde(default)]
+    pub app_data_imported: bool,
 }
 
 /// A device of an account as `GET /account` shows it.
@@ -413,6 +419,8 @@ mod tests {
             slug: "jordi".into(),
             user_id: 5,
             devices: Vec::new(),
+            imported: false,
+            app_data_imported: false,
         };
         assert_eq!(serde_json::to_value(&a).unwrap()["userId"], 5);
     }

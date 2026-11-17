@@ -124,6 +124,8 @@ impl ServerData for FolderSource {
                 slug: a.slug,
                 user_id: a.user_id,
                 devices: Vec::new(),
+                imported: a.imported.is_some(),
+                app_data_imported: a.app_data_imported.is_some(),
             })
             .collect())
     }

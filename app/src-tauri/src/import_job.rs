@@ -418,6 +418,20 @@ pub const SNBAK_TOO_OLD: &str = "This .snbak file is too old. Make a new one on 
 /// How old a backup or a `.snbak` file may be.
 const FRESH_MS: u64 = 24 * 3_600_000;
 
+/// The check after the server stopped: the backup in `dir` was made after the newest device
+/// sync `last_sync_ms`. A time that cannot be read passes here; [`backup_fresh`] refused it
+/// before the stop.
+pub fn backup_synced_before(dir: &Path, last_sync_ms: Option<u64>) -> Result<(), String> {
+    let time = std::fs::read(dir.join("backup.json"))
+        .ok()
+        .and_then(|text| serde_json::from_slice::<BackupFile>(&text).ok())
+        .and_then(|file| rfc3339_ms(&file.time));
+    match (time, last_sync_ms) {
+        (Some(made), Some(sync)) if made <= sync => Err(BACKUP_TOO_OLD.to_owned()),
+        _ => Ok(()),
+    }
+}
+
 /// The import's own guard (the Setup page checks this as well): the backup in `dir` was made
 /// within 24 hours of `now_ms` and after the newest device sync `last_sync_ms` (a file missing
 /// on the server is deleted on the Supernote). A backup whose time cannot be read is refused.
@@ -677,9 +691,16 @@ impl ImportJobs {
         replace: bool,
         allow_empty: bool,
     ) -> Result<(), String> {
-        self.inner.start(JobKind::Import, || {
-            self.import_args(backup_dir, false, replace, allow_empty)
-        })
+        self.inner.start_checked(
+            JobKind::Import,
+            || self.import_args(backup_dir, false, replace, allow_empty),
+            // The server is stopped now and no device sync can end any more: a sync that
+            // ended while it stopped is on disk and is checked against the backup again.
+            || {
+                let config = self.inner.host.config();
+                backup_synced_before(backup_dir, last_device_sync(&config, None))
+            },
+        )
     }
 
     /// `cloud import-app-data --dry-run` of `snbak`; `None` is `--empty`.
@@ -793,6 +814,17 @@ impl Inner {
         kind: JobKind,
         args: impl FnOnce() -> Result<Vec<String>, String>,
     ) -> Result<(), String> {
+        self.start_checked(kind, args, || Ok(()))
+    }
+
+    /// [`start`](Self::start) with a last check `after_stop`, made once the app's server is
+    /// stopped and before the program starts. When it refuses, the server starts again.
+    fn start_checked(
+        self: &Arc<Self>,
+        kind: JobKind,
+        args: impl FnOnce() -> Result<Vec<String>, String>,
+        after_stop: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
         let holds = kind.holds_server();
         if holds && self.host.outside() {
             return Err(OUTSIDE_LINE.to_owned());
@@ -829,6 +861,13 @@ impl Inner {
         };
         if holds {
             self.host.stop_all();
+            if let Err(why) = after_stop() {
+                // No "restarting" progress: the command returns the error.
+                self.start_children();
+                lock(&self.run).kind = None;
+                drop(hold);
+                return Err(why);
+            }
         }
         // The job also ends when the app dies without a clean Quit, as the children do.
         args.extend([

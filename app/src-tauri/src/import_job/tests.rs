@@ -42,6 +42,8 @@ struct FakeHost {
     outside: AtomicBool,
     /// The lock of the jobs, to note whether the import still holds the server at its start.
     server: Mutex<Option<ServerUse>>,
+    /// Runs in `stop_all`, after the note: what happens while the server stops.
+    on_stop: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl FakeHost {
@@ -56,6 +58,7 @@ impl FakeHost {
             }),
             outside: AtomicBool::new(false),
             server: Mutex::new(None),
+            on_stop: Mutex::new(None),
         })
     }
 
@@ -76,6 +79,9 @@ impl Host for FakeHost {
     }
     fn stop_all(&self) {
         self.note("stop");
+        if let Some(hook) = self.on_stop.lock().unwrap().as_ref() {
+            hook();
+        }
     }
     fn start(&self) {
         let held = self
@@ -1091,6 +1097,45 @@ fn the_import_sees_a_device_sync_on_disk_while_the_status_has_none() {
         ..config
     };
     assert_eq!(last_device_sync(&none, None), None);
+}
+
+#[test]
+fn a_device_sync_that_ends_while_the_server_stops_refuses_the_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let backup = backup_dir(dir.path());
+    fs::create_dir_all(&backup).unwrap();
+    backup_made(&backup, "2026-11-17T14:05:00Z");
+    let host = FakeHost::new(dir.path());
+    // The Supernote's sync ends while the server stops: the device file on disk is newer.
+    let devices = dir.path().join("data/accounts/me/devices");
+    *host.on_stop.lock().unwrap() = Some(Box::new(move || {
+        fs::create_dir_all(&devices).unwrap();
+        fs::write(
+            devices.join("SN1.json"),
+            format!(
+                r#"{{"serial":"SN1","token_generation":1,"last_login_ms":5,"last_sync_ms":{}}}"#,
+                MADE + 60_000
+            ),
+        )
+        .unwrap();
+    }));
+    let (jobs, events) = jobs(sidecar(dir.path(), "exit 0"), host);
+    assert_eq!(
+        jobs.import(&backup, false, false),
+        Err(BACKUP_TOO_OLD.to_owned())
+    );
+    // The program never ran, and the server started again.
+    assert_eq!(calls(dir.path()), ["stop", "start held", "poll"]);
+    assert!(!jobs.busy());
+    assert!(jobs.use_server().is_ok());
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "{:?}",
+        events.lock().unwrap()
+    );
+    // Without a newer sync the import starts.
+    assert_eq!(backup_synced_before(&backup, Some(MADE - 1)), Ok(()));
+    assert_eq!(backup_synced_before(&backup, None), Ok(()));
 }
 
 #[test]

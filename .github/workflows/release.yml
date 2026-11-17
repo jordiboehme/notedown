@@ -1961,12 +1961,41 @@ jobs:
           find dist -type f -exec ls -l {} +
           exit "$bad"
 
+      # Two tries, like the installs.
       - name: Log in to GHCR
+        id: ghcr
+        continue-on-error: true
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+
+      - name: Wait before the second try
+        if: ${{ steps.ghcr.outcome == 'failure' }}
+        run: sleep 30
+
+      - name: Log in to GHCR (second try)
+        if: ${{ steps.ghcr.outcome == 'failure' }}
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # The pinned base image of the Dockerfile, for both platforms, under
+      # retry: a registry that does not answer fails here with retries and
+      # not in the middle of the build. buildx fetches it again into its own
+      # builder, so this is a check, not a cache.
+      - name: Pull the base image
+        run: |
+          set -euo pipefail
+          base="$(sed -n 's/^FROM[[:space:]]\{1,\}//p' Dockerfile)"
+          [ "$(wc -l <<<"$base")" -eq 1 ] && [ -n "$base" ] \
+            || { echo "::error::the Dockerfile must have exactly one FROM line"; exit 1; }
+          for platform in linux/amd64 linux/arm64; do
+            bash scripts/ci/retry.sh 3 docker pull --platform "$platform" "$base"
+          done
 
       # No QEMU: the Dockerfile has no RUN step (it only copies the files
       # staged above and sets metadata), so the linux/arm64 build runs

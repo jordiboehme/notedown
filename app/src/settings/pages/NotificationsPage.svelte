@@ -20,12 +20,18 @@
   let problem = $state<string | null>(null);
   // A change waits for the save and, when the switch goes on, for the answer of macOS.
   let busy = $state(false);
+  // Counts the changes: a permission read started before a change (or during one) is old.
+  let changes = 0;
 
   const view = $derived(notificationRows(config.current, authorization));
 
   function readPermission() {
+    if (busy) return;
+    const started = changes;
     notificationAuthorization()
-      .then((answer) => (authorization = answer))
+      .then((answer) => {
+        if (!busy && started === changes) authorization = answer;
+      })
       .catch((error: unknown) => (problem = failure(error)));
   }
 
@@ -36,6 +42,7 @@
     const choices = config.current?.notifications;
     if (!choices || busy) return;
     busy = true;
+    changes += 1;
     try {
       const answer = await setNotifications(withChoice(choices, key, on));
       config.current = answer.config;
@@ -61,11 +68,7 @@
 
 <Form>
   <Section footer={DOT_LINE}>
-    <Row
-      title={view.master.title}
-      note={problem ?? view.permission?.text}
-      tone={problem ? "bad" : (view.permission?.tone ?? "secondary")}
-    >
+    <Row title={view.master.title} note={view.permission?.text} tone={view.permission?.tone ?? "secondary"}>
       {#if view.permission?.openSettings}
         <button type="button" class="button" onclick={openSettings}>Open System Settings</button>
       {/if}
@@ -76,6 +79,9 @@
         onchange={(on) => change("enabled", on)}
       />
     </Row>
+    {#if problem}
+      <Row title="Not done" note={problem} tone="bad" />
+    {/if}
   </Section>
   <Section>
     {#each view.events as row (row.key)}

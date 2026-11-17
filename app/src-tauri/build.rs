@@ -49,6 +49,9 @@ const COMMANDS: &[&str] = &[
     "notes_new",
     "notes_all",
     "note_seen",
+    "note_open",
+    "note_page_image",
+    "note_close",
 ];
 
 fn main() {

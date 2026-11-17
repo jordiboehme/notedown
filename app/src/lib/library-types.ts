@@ -130,3 +130,27 @@ export type NoteSummary = {
  * carries nothing: ask `notes_new` or `notes_all` again.
  */
 export const NOTES_EVENT = "notes";
+
+/**
+ * A note for the review (src-tauri/src/review.rs), as `note_open(path)` answers it: the Markdown
+ * of each page from the pipeline's store. Show it as text (`white-space: pre-wrap`), never as
+ * HTML. `catchingUp`: a page waits for OCR, or the server has a newer version of the note.
+ * `landscape` is false until the store records the orientation of a page.
+ *
+ * `note_page_image(path, index)` answers page `index` as a `data:image/png;base64,...` URL; ask
+ * only for pages near the view and drop the URLs of pages far away. `note_close(path)` ends the
+ * review: its waiting calls fail with "The review was closed." and its renders stop. Hiding the
+ * library window closes every review.
+ */
+export type NoteView = {
+  key: string;
+  path: string;
+  title: string;
+  catchingUp: boolean;
+  pages: {
+    index: number;
+    state: "done" | "pending" | "failed" | "truncated";
+    markdown: string;
+    landscape: boolean;
+  }[];
+};

@@ -263,6 +263,13 @@ fn tell_library(app: &AppHandle, kind: WindowKind, visible: bool) {
     {
         library.set_visible(visible);
     }
+    // A hidden library shows no review: its renders stop (short locks and signals only).
+    if kind == WindowKind::Library
+        && !visible
+        && let Some(review) = app.try_state::<crate::review::Review>()
+    {
+        review.close_all();
+    }
 }
 
 /// Tells the notes index whether a window that shows notes (the panel, the library) is

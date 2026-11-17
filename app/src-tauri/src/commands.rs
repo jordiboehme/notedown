@@ -14,6 +14,7 @@ use crate::model::{ModelControl, ModelState};
 use crate::notes::{NoteSummary, Notes};
 use crate::poller::Poller;
 use crate::processes::{ProcessStates, Processes};
+use crate::review::{NoteView, Review};
 use crate::serve_info::ServeInfo;
 use crate::status::Status;
 use crate::token::{KeychainStore, TokenStore, token_key};
@@ -798,6 +799,40 @@ pub async fn note_seen(notes: State<'_, Notes>, key: String) -> Result<(), Strin
     tauri::async_runtime::spawn_blocking(move || notes.seen(&key))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// The note at `path` for the review: the Markdown of each page from the pipeline's store, and
+/// whether it is catching up. Off the main thread (it scans the store and asks the server).
+#[tauri::command]
+pub async fn note_open(review: State<'_, Review>, path: String) -> Result<NoteView, String> {
+    let review = review.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || review.open(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Page `index` (0-based) of the note at `path` as a `data:image/png;base64,...` URL, rendered
+/// alone when it is not cached. Off the main thread: it may download the note and render.
+#[tauri::command]
+pub async fn note_page_image(
+    review: State<'_, Review>,
+    path: String,
+    index: usize,
+) -> Result<String, String> {
+    let review = review.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || review.page_image(&path, index))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The review of the note at `path` closed: its waiting calls end and its renders that no
+/// other review waits for are killed. Off the main thread.
+#[tauri::command]
+pub async fn note_close(review: State<'_, Review>, path: String) -> Result<(), String> {
+    let review = review.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || review.close(&path))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// The last lines of both children's output, for the Server page.

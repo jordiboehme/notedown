@@ -335,6 +335,29 @@ impl Notes {
         by_path(&state).remove(path).map(|n| n.summary.clone())
     }
 
+    /// The store file of the note at the wire path `path`, by the rule of
+    /// [`at_path`](Self::at_path), for a reader of the whole note (the review). Scans first.
+    pub fn store_file(&self, path: &str) -> Option<PathBuf> {
+        let mut state = lock(&self.inner.state);
+        self.scan(&mut state);
+        self.save_seen(&mut state);
+        self.tell(&mut state);
+        let (data_dir, account) = state.place.clone()?;
+        let winner = by_path(&state).remove(path)?;
+        let name = state
+            .files
+            .iter()
+            .find(|(_, f)| f.note.as_ref().is_some_and(|n| std::ptr::eq(n, winner)))
+            .map(|(name, _)| name.clone())?;
+        Some(
+            data_dir
+                .join("pipeline")
+                .join(account)
+                .join("notes")
+                .join(name),
+        )
+    }
+
     /// A window that shows notes (the panel, the library) was shown or hidden. It never
     /// blocks: the scanner's thread does the work.
     pub fn set_visible(&self, visible: bool) {

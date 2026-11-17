@@ -412,7 +412,7 @@ fn copy_name(name: &str, n: u32) -> String {
     }
 }
 
-pub(super) fn is_md5(s: &str) -> bool {
+pub(crate) fn is_md5(s: &str) -> bool {
     s.len() == 32 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 

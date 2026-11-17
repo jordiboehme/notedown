@@ -551,6 +551,7 @@ mod uploads;
 
 pub use cache::{Key, Listed};
 pub use listing::{FOLLOW_EVERY, RecycleItem, RecyclePage};
+pub(crate) use uploads::is_md5;
 pub use uploads::{Ask, Choice, UploadAsk};
 
 /// A library that is never set up, for tests of other parts that need one.

@@ -13,6 +13,7 @@ pub mod process;
 pub mod processes;
 pub mod quit;
 pub mod rest;
+pub mod review;
 pub mod serve_info;
 pub mod status;
 pub mod supervisor;
@@ -111,13 +112,23 @@ pub fn run() {
                 pipeline_grace: ChildKind::Pipeline.grace(),
             }));
             app.manage(model_control(app.handle().clone(), sidecar_spawn.clone()));
-            let poller = status_poller(sidecar_spawn, reader, processes.clone());
+            let poller = status_poller(sidecar_spawn.clone(), reader, processes.clone());
             let library = library_for(
                 app.handle().clone(),
                 library_reader,
                 processes.clone(),
                 library_notes,
             );
+            // The review renders pages with the sidecar into the app cache. It holds the
+            // library and the notes index; neither holds it.
+            app.manage(review::Review::new(
+                library.clone(),
+                app.state::<Notes>().inner().clone(),
+                sidecar_spawn.clone(),
+                app.path().app_cache_dir()?,
+                rest::monotonic_clock(),
+                review::CACHE_LIMIT,
+            ));
             let rebind = library_worker(library.clone());
             library.start_following(library::FOLLOW_EVERY);
             app.manage(library);
@@ -184,7 +195,10 @@ pub fn run() {
             commands::library_reveal,
             commands::notes_new,
             commands::notes_all,
-            commands::note_seen
+            commands::note_seen,
+            commands::note_open,
+            commands::note_page_image,
+            commands::note_close
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
@@ -269,6 +283,10 @@ pub fn reprobe_outside(app: &AppHandle) {
 fn stop_for_good(app: &AppHandle) {
     if let Some(poller) = app.try_state::<Poller>() {
         poller.stop();
+    }
+    // Kills the running renders; it does not wait.
+    if let Some(review) = app.try_state::<review::Review>() {
+        review.quit();
     }
     let model = app.try_state::<ModelControl>().map(|m| m.inner().clone());
     std::thread::scope(|s| {
@@ -599,6 +617,9 @@ mod tests {
                 "notes_new",
                 "notes_all",
                 "note_seen",
+                "note_open",
+                "note_page_image",
+                "note_close",
                 "open_settings"
             ])
         );
@@ -667,7 +688,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 44);
+        assert_eq!(handler_commands().len(), 47);
     }
 
     #[test]
@@ -717,6 +738,9 @@ mod tests {
             "notes_new",
             "notes_all",
             "note_seen",
+            "note_open",
+            "note_page_image",
+            "note_close",
         ]);
         assert_eq!(manifest_commands(), all);
         // Every granted command is a real one.
@@ -760,6 +784,16 @@ mod tests {
         }
         assert!(!granted("settings").contains("notes_new"));
         for command in ["notes_all", "note_seen"] {
+            assert!(granted("library").contains(command), "{command}");
+            for window in ["panel", "settings"] {
+                assert!(!granted(window).contains(command), "{window} has {command}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_review_is_only_the_librarys() {
+        for command in ["note_open", "note_page_image", "note_close"] {
             assert!(granted("library").contains(command), "{command}");
             for window in ["panel", "settings"] {
                 assert!(!granted(window).contains(command), "{window} has {command}");

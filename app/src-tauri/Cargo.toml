@@ -49,6 +49,10 @@ tokio = { version = "=1.54.1", default-features = false, features = ["rt", "time
 http-body = "=1.1.0"
 bytes = "=1.12.1"
 
+# The review gets each page image as a `data:image/png;base64,...` URL. Already in the tree
+# through Tauri.
+base64 = "=0.23.1"
+
 [dev-dependencies]
 tempfile = "=3.27.0"
 

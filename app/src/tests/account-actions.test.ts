@@ -57,10 +57,11 @@ describe("accountActions", () => {
     });
     expect(same.logIn.note).toBe(KEEPS);
     expect(same.logOut.enabled).toBe(true);
-    // An account in the config without a token: nothing to replace and nothing to log out.
+    // An account in the config without a token: nothing to replace, but Log out still forgets
+    // the account (the Keychain read may also have failed).
     const noToken = accountActions({ ...base, account: "jordi", accountEmail: "jordi@example.org" });
     expect(noToken.logIn.note).toBe(KEEPS);
-    expect(noToken.logOut.enabled).toBe(false);
+    expect(noToken.logOut.enabled).toBe(true);
   });
 
   it("does nothing else while a login or a log out runs", () => {

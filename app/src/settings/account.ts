@@ -37,6 +37,7 @@ export function accountActions(state: AccountState): AccountActions {
   else note = "Notedown keeps a write token in the Keychain of this Mac.";
   return {
     logIn: { enabled: state.busy === null && ready && filled, note },
-    logOut: { enabled: state.busy === null && state.loggedIn },
+    // An account in the config without a token can be logged out too: it forgets the account.
+    logOut: { enabled: state.busy === null && (state.loggedIn || state.account !== null) },
   };
 }

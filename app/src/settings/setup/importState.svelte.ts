@@ -72,6 +72,9 @@ export function startImportFlow(): void {
   if (started) return;
   started = true;
   void listen<JobProgress>(SETUP_JOB_PROGRESS_EVENT, (event) => {
+    // The server starting again while no step runs here: a start that was refused (its command
+    // already returned the error). It must not show the step as running.
+    if (flow.job === null && event.payload.phase === "restarting") return;
     flow.job = event.payload.kind;
     flow.progress = event.payload;
   });
@@ -156,6 +159,13 @@ async function run(kind: JobKind, start: () => Promise<unknown>): Promise<void> 
   } catch (error) {
     flow.job = null;
     flow.error = failure(error);
+    // What runs after the refusal, from Rust: a late progress event cannot leave a step shown
+    // as running.
+    try {
+      flow.job = await jobState();
+    } catch {
+      // The step shows the refusal; the next event sets the job.
+    }
   }
 }
 

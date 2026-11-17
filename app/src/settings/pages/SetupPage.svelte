@@ -50,6 +50,7 @@
           job: flow.job,
           hasLogin: loggedIn,
           dryRun: flow.dryRun && { filesPresent: flow.dryRun.filesPresent },
+          againRuns: flow.again && !(flow.filesThisRun && flow.appDataThisRun),
         }
       : null,
   );

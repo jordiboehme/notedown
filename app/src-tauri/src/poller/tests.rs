@@ -990,6 +990,11 @@ fn the_first_sync_is_checked_once() {
     rig.settle();
     assert_eq!(lock(&rig.fake.check_calls).len(), 1);
     assert!(lock(&saved).is_empty());
+    // The status says why, for step 6 of the Setup page.
+    assert_eq!(
+        rig.poller.status().first_sync_error.as_deref(),
+        Some("no answer")
+    );
     // A status went out with the sync but without a check: the check failed. The next sync
     // is checked before its status goes out.
     *lock(&early) = 0;
@@ -1004,6 +1009,8 @@ fn the_first_sync_is_checked_once() {
     );
     assert_eq!(*lock(&saved), vec![("local|me".to_owned(), deleted)]);
     assert_eq!(*lock(&early), 0);
+    // Checked: the error is gone.
+    assert_eq!(rig.poller.status().first_sync_error, None);
     // Checked: later syncs are not checked again.
     *lock(&rig.fake.account_answer) = Some(synced(Some(T0 + 600 * SEC)));
     rig.advance(120 * SEC);

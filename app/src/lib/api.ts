@@ -74,6 +74,9 @@ export interface Status {
   account: { imported: boolean | null; appDataImported: boolean | null } | null;
   /** How the server answered the last `GET /account`. */
   connection: Connection;
+  /** Why the last check of the first sync failed; null when it did not fail or is done. The
+   * app tries it again every minute. */
+  firstSyncError: string | null;
 }
 
 export type Connection = "unknown" | "reached" | "refused" | "unreachable" | "failed";

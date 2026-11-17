@@ -149,19 +149,19 @@ export function backupResumable(state: BackupFolder): boolean {
   return state.state === "resumable";
 }
 
-/** A backup must not be imported when it is older than 24 hours or older than the last device
- * sync: a file missing on the server is deleted on the Supernote. A time that cannot be read is
- * too old as well. */
+/** A backup must not be imported when it is older than 24 hours or not newer than the last
+ * device sync (the same rule as import_job.rs backup_fresh): a file missing on the server is
+ * deleted on the Supernote. A time that cannot be read is too old as well. */
 export function backupTooOld(backupTimeMs: number, nowMs: number, lastSyncMs: number | null): boolean {
   if (!Number.isFinite(backupTimeMs)) return true;
   if (nowMs - backupTimeMs > DAY) return true;
-  return lastSyncMs !== null && backupTimeMs < lastSyncMs;
+  return lastSyncMs !== null && backupTimeMs <= lastSyncMs;
 }
 
 /** Why a backup is too old, with the only way on. */
 export function tooOldLine(backupTimeMs: number, nowMs: number, lastSyncMs: number | null): string {
   const why =
-    Number.isFinite(backupTimeMs) && nowMs - backupTimeMs <= DAY && lastSyncMs !== null && backupTimeMs < lastSyncMs
+    Number.isFinite(backupTimeMs) && nowMs - backupTimeMs <= DAY && lastSyncMs !== null && backupTimeMs <= lastSyncMs
       ? "The Supernote synced after this backup."
       : "This backup is older than 24 hours.";
   return `${why} Make a new backup into a new folder.`;

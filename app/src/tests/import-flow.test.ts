@@ -122,6 +122,9 @@ describe("importStage", () => {
     const lastSyncMs = BACKUP.getTime() + HOUR;
     expect(backupTooOld(BACKUP.getTime(), NOW, lastSyncMs)).toBe(true);
     expect(backupTooOld(BACKUP.getTime(), NOW, BACKUP.getTime() - HOUR)).toBe(false);
+    // The same boundary as Rust (backup_fresh): a backup made at the time of the sync is refused.
+    expect(backupTooOld(BACKUP.getTime(), NOW, BACKUP.getTime())).toBe(true);
+    expect(backupTooOld(BACKUP.getTime(), NOW, BACKUP.getTime() - 1)).toBe(false);
     expect(importStage(flow({ lastSyncMs }))).toBe("tooOld");
     expect(tooOldLine(BACKUP.getTime(), NOW, lastSyncMs)).toBe(
       "The Supernote synced after this backup. Make a new backup into a new folder.",

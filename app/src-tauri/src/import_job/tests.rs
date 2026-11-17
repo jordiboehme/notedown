@@ -251,6 +251,41 @@ fn a_pause_after_the_end_keeps_the_result() {
 }
 
 #[test]
+fn a_pause_after_the_report_line_is_done_not_paused() {
+    let dir = tempfile::tempdir().unwrap();
+    // The report is printed, but the process has not ended yet.
+    let body = r#"echo '{"report":{"complete":true,"files":4,"errors":[],"stale":[]}}'
+echo '{"files":4,"bytes":400,"path":"Note/d.note"}'
+exec "$S" 337"#;
+    let (jobs, events) = jobs(sidecar(dir.path(), body), FakeHost::new(dir.path()));
+    jobs.backup("http://sn:8089", &backup_dir(dir.path()), false)
+        .unwrap();
+    // The same reader read the report before this progress line.
+    wait_for(&events, is_progress);
+    jobs.pause();
+    let ended = gone(dir.path());
+    kill_in(dir.path());
+    assert!(ended, "{}", left_in(dir.path()));
+    let end = wait_for(&events, |e| {
+        is_end(e) || matches!(e, JobEvent::Paused { .. })
+    });
+    assert!(
+        matches!(&end, JobEvent::Done(r) if r.ok && r.json["files"] == 4),
+        "{end:?}"
+    );
+    wait_idle(&jobs);
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, JobEvent::Paused { .. })),
+        "{:?}",
+        events.lock().unwrap()
+    );
+}
+
+#[test]
 fn resume_passes_resume() {
     let dir = tempfile::tempdir().unwrap();
     let backup = backup_dir(dir.path());
@@ -502,10 +537,12 @@ fn a_sidecar_that_cannot_start_restarts_the_server() {
     assert_eq!(calls(dir.path()), ["stop", "start held", "poll"]);
     assert!(!jobs.busy());
     assert!(jobs.use_server().is_ok());
-    assert!(matches!(
-        &events.lock().unwrap()[..],
-        [JobEvent::Progress(p)] if p.phase.as_deref() == Some(RESTARTING)
-    ));
+    // No progress event: one that arrived after the error would show the step as running.
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "{:?}",
+        events.lock().unwrap()
+    );
 }
 
 #[test]
@@ -535,6 +572,20 @@ fn the_mark_is_taken_when_the_import_ends() {
 fn journal(data: &Path, name: &str, text: &str) {
     fs::create_dir_all(data.join("journal")).unwrap();
     fs::write(data.join("journal").join(name), text).unwrap();
+}
+
+#[test]
+fn a_torn_tail_longer_than_the_window_keeps_the_line_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    journal(&data, "journal-000000000001.jsonl", "{\"seq\":1}\n");
+    // The last append did not finish and is longer than the first window read (64 KiB).
+    let torn = format!(
+        "{{\"seq\":2}}\n{{\"seq\":3,\"text\":\"{}",
+        "c".repeat(100_000)
+    );
+    journal(&data, "journal-000000000002.jsonl", &torn);
+    assert_eq!(journal_end(&data), Some(2));
 }
 
 #[test]
@@ -712,9 +763,15 @@ exec "$S" 335"#;
             .unwrap_or_else(|| panic!("no command {command}"));
         let body = &source[start..];
         let body = &body[..body.find("\n}\n").unwrap()];
+        // Bound to a name: `let _ =` would drop the guard at once.
         assert!(
-            body.contains("= jobs.use_server()?;"),
+            body.contains("let _server = jobs.use_server()?;")
+                || body.contains("let server = jobs.use_server()?;"),
             "{command} has no guard"
+        );
+        assert!(
+            !body.contains("let _ = jobs.use_server()"),
+            "{command} drops its guard at once"
         );
     }
 }
@@ -984,6 +1041,50 @@ fn the_import_refuses_an_old_backup() {
         backup_fresh(other.path(), MADE, None),
         Err(BACKUP_TOO_OLD.to_owned())
     );
+}
+
+#[test]
+fn the_import_sees_a_device_sync_on_disk_while_the_status_has_none() {
+    let dir = tempfile::tempdir().unwrap();
+    backup_made(dir.path(), "2026-11-17T14:05:00Z");
+    let data = dir.path().join("data");
+    let config = AppConfig {
+        mode: Mode::Local,
+        data_dir: data.clone(),
+        account: Some("me".into()),
+        ..AppConfig::default()
+    };
+    // No device file: only the 24 hours count.
+    assert_eq!(last_device_sync(&config, None), None);
+    let devices = data.join("accounts/me/devices");
+    fs::create_dir_all(&devices).unwrap();
+    fs::write(
+        devices.join("SN1.json"),
+        format!(
+            r#"{{"serial":"SN1","token_generation":1,"last_login_ms":5,"last_sync_ms":{}}}"#,
+            MADE + 60_000
+        ),
+    )
+    .unwrap();
+    // The server does not run, so the status has no device: the file on disk still counts.
+    let last = last_device_sync(&config, None);
+    assert_eq!(last, Some(MADE + 60_000));
+    assert_eq!(
+        backup_fresh(dir.path(), MADE + HOUR_MS, last),
+        Err(BACKUP_TOO_OLD.to_owned())
+    );
+    // The larger of the two wins.
+    assert_eq!(last_device_sync(&config, Some(MADE)), Some(MADE + 60_000));
+    assert_eq!(
+        last_device_sync(&config, Some(MADE + HOUR_MS)),
+        Some(MADE + HOUR_MS)
+    );
+    // Without an account no device file is read.
+    let none = AppConfig {
+        account: None,
+        ..config
+    };
+    assert_eq!(last_device_sync(&none, None), None);
 }
 
 #[test]

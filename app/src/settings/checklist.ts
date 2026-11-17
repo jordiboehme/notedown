@@ -32,6 +32,9 @@ export interface ChecklistInput {
   /** The last dry run of the files import, when one ran: it says whether the server already
    * holds files. */
   dryRun?: { filesPresent: number } | null;
+  /** Import again runs and has not imported both the files and the digests yet: step 5 is not
+   * done, though the server still says imported, and step 6 waits for it. */
+  againRuns?: boolean;
 }
 
 /** What the server line says while Notedown runs outside the app (status.rs OUTSIDE_LINE). */
@@ -106,8 +109,9 @@ function server({ status, config, job }: ChecklistInput): Own {
   if (config.mode === "local") {
     const state = status.server.state;
     if (holdsServer(job)) return { done: true, line: "The import holds the server on this Mac." };
-    if (state?.state === "outside") return { done: false, line: OUTSIDE_LINE };
-    switch (state?.state) {
+    if (state === null) return { done: false, line: "Checking the server." };
+    if (state.state === "outside") return { done: false, line: OUTSIDE_LINE };
+    switch (state.state) {
       case "running":
         return { done: true, line: "The server runs on this Mac." };
       case "starting":
@@ -175,8 +179,12 @@ const JOB_LINES: Record<JobKind, string> = {
   appData: "Importing the digests.",
 };
 
-function importStep({ status, config, job, dryRun }: ChecklistInput): Own {
+function importStep({ status, config, job, dryRun, againRuns }: ChecklistInput): Own {
   const working = job !== null ? JOB_LINES[job] : undefined;
+  // The server still says imported from the first time: Import again is done only with both.
+  if (againRuns === true) {
+    return { done: false, line: "Import again is not finished. Import the files and the digests.", working };
+  }
   const state = status.account;
   if (state === null) return { done: false, line: "Notedown cannot see the import yet.", working };
   if (state.imported === null) return { done: false, line: "Update the server on the other machine.", working };
@@ -214,7 +222,16 @@ function supernote({ status, config }: ChecklistInput): Own {
       : { done: false, line: "Connect the Supernote and sync it once." };
   }
   const checked = record.syncChecked;
-  if (checked === null) return { done: false, line: "Connect the Supernote and sync it once." };
+  if (checked === null) {
+    const why = status.firstSyncError?.trim().replace(/\.+$/, "") ?? "";
+    if (why !== "") {
+      return {
+        done: false,
+        line: `Notedown could not check the first sync: ${why}. It tries again every minute.`,
+      };
+    }
+    return { done: false, line: "Connect the Supernote and sync it once." };
+  }
   const deletes = checked.files + checked.folders + (checked.digests ?? 0);
   if (!checked.cannotTell && deletes === 0) {
     return { done: true, line: "The first sync worked. Nothing was deleted." };
@@ -362,11 +379,17 @@ export function inUse(folder: ExistingFolder, config: AppConfig): boolean {
   return used.mode === "local" || (used.serverUrl ?? "") === (config.serverUrl ?? "");
 }
 
-/** Step 1 offers Start: a server on this Mac that does not run and that no import holds. */
+/** Step 1 offers Start: a server on this Mac that does not run and that no import holds. Not
+ * while its state is not known yet, and not while it stops. */
 export function startOffered(input: ChecklistInput): boolean {
   const state = input.status.server.state?.state;
   return (
-    input.config.mode === "local" && !holdsServer(input.job) && state !== "running" && state !== "starting"
+    input.config.mode === "local" &&
+    !holdsServer(input.job) &&
+    state !== undefined &&
+    state !== "running" &&
+    state !== "starting" &&
+    state !== "stopping"
   );
 }
 

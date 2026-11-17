@@ -152,6 +152,8 @@ struct State {
     mark_failed_ms: Option<u64>,
     /// When the last check of the first sync failed.
     check_failed_ms: Option<u64>,
+    /// Why it failed, with the key of the mark it was for (shown in the status).
+    check_error: Option<(String, String)>,
 }
 
 /// The least time between two failed calls for the mark of a server on another machine, and
@@ -537,14 +539,22 @@ impl Inner {
     fn check_first_sync(&self, config: &AppConfig, base: &str, token: &Token, mark: &SyncMark) {
         match self.sources.first_sync(config, base, token, mark.seq) {
             Ok(check) => {
-                lock(&self.state).check_failed_ms = None;
+                {
+                    let mut state = lock(&self.state);
+                    state.check_failed_ms = None;
+                    state.check_error = None;
+                }
                 if let Some(cb) = lock(&self.checks).as_ref() {
                     cb(mark.key.clone(), check);
                 }
             }
             Err(why) => {
                 eprintln!("notedown: the first sync could not be checked: {why}");
-                lock(&self.state).check_failed_ms = Some((self.clock)());
+                let mut state = lock(&self.state);
+                state.check_failed_ms = Some((self.clock)());
+                // The first line, for the Setup page.
+                let line = why.trim().lines().next().unwrap_or_default().to_owned();
+                state.check_error = Some((mark.key.clone(), line));
             }
         }
     }
@@ -556,9 +566,9 @@ impl Inner {
     /// The status from `inputs` and the last answers that belong to its config.
     fn make(&self, inputs: &Inputs) -> Status {
         let key = Key::of(&inputs.config);
-        let parts = {
+        let (parts, check_error) = {
             let state = lock(&self.state);
-            Parts {
+            let parts = Parts {
                 config: inputs.config.clone(),
                 config_reset: inputs.config_reset,
                 existing: match &state.existing {
@@ -571,9 +581,21 @@ impl Inner {
                 device_urls: inputs.serve_info.device_urls.clone(),
                 pipeline_status: state.pipeline.of(&key).cloned(),
                 account: state.account.of(&key).cloned(),
-            }
+            };
+            (parts, state.check_error.clone())
         };
-        status_from(&parts, (self.clock)())
+        let mut status = status_from(&parts, (self.clock)());
+        // Only for the mark of the login, and only while its first sync is not checked.
+        let setup = &inputs.config.setup;
+        let login = token_key(&inputs.config);
+        status.first_sync_error = check_error
+            .filter(|(mark, _)| {
+                setup.sync_checked.is_none()
+                    && login.as_ref() == Some(mark)
+                    && setup.sync_mark.as_ref().is_some_and(|m| &m.key == mark)
+            })
+            .map(|(_, why)| why);
+        status
     }
 
     /// Makes the status and hands it to the listeners when it changed. The listener lock is

@@ -37,6 +37,7 @@ function sample(ocr: string): Status {
     existing: { server: true, pipeline: false },
     account: { imported: true, appDataImported: true },
     connection: "reached",
+    firstSyncError: null,
   };
 }
 

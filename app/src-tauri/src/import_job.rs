@@ -315,8 +315,15 @@ fn last_seq(file: &Path) -> Option<u64> {
         f.seek(SeekFrom::Start(start)).ok()?;
         let mut tail = Vec::new();
         f.by_ref().take(len - start).read_to_end(&mut tail).ok()?;
-        // Up to the last newline: what follows it is a torn line.
-        let end = tail.iter().rposition(|b| *b == b'\n')?;
+        // Up to the last newline: what follows it is a torn line. A torn line longer than the
+        // window hides the newline before it: read more.
+        let Some(end) = tail.iter().rposition(|b| *b == b'\n') else {
+            if start == 0 {
+                return None;
+            }
+            window = window.saturating_mul(2);
+            continue;
+        };
         let complete = &tail[..end];
         match complete.iter().rposition(|b| *b == b'\n') {
             Some(at) => return line_seq(&complete[at + 1..]),
@@ -380,6 +387,28 @@ pub fn newest_device_sync(data_dir: &Path, slug: &str) -> Option<u64> {
         .filter_map(|text| serde_json::from_slice::<DeviceFile>(&text).ok())
         .filter_map(|d| d.last_sync_ms)
         .max()
+}
+
+/// Whether a final report says the step went well, as its exit code would: a backup without
+/// errors and without stale files. Only a backup can be paused; any other kind is not clean.
+fn report_clean(kind: JobKind, json: &serde_json::Value) -> bool {
+    let empty = |key: &str| {
+        json.get(key)
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty)
+    };
+    kind == JobKind::Backup && empty("errors") && empty("stale")
+}
+
+/// The newest device sync the import's guard compares with: the larger of what the status
+/// knows (`from_status`) and the device files of the account on disk. The status has none while
+/// this Mac's server is not running; the files on disk are the truth then (imports run only in
+/// Local mode).
+pub fn last_device_sync(config: &AppConfig, from_status: Option<u64>) -> Option<u64> {
+    let disk = config
+        .account_slug()
+        .and_then(|slug| newest_device_sync(&config.data_dir, slug));
+    from_status.max(disk)
 }
 
 /// What the import refuses for a backup older than 24 hours or not newer than the last sync.
@@ -823,8 +852,10 @@ impl Inner {
             Ok(child) => child,
             Err(e) => {
                 drop(run);
+                // No "restarting" progress: the command returns the error, and a progress event
+                // that arrived after it would show the step as running.
                 if holds {
-                    self.restart(kind);
+                    self.start_children();
                 }
                 lock(&self.run).kind = None;
                 drop(hold);
@@ -844,7 +875,8 @@ impl Inner {
         lock(&self.run).quitting
     }
 
-    /// Starts the app's server and pipeline again after an import and polls.
+    /// Starts the app's server and pipeline again after an import and polls; the Setup page
+    /// sees the "restarting" phase.
     fn restart(&self, kind: JobKind) {
         (self.sink)(&JobEvent::Progress(JobProgress {
             kind,
@@ -854,6 +886,11 @@ impl Inner {
             total: None,
             phase: Some(RESTARTING.to_owned()),
         }));
+        self.start_children();
+    }
+
+    /// Starts the app's server and pipeline again and polls, without a progress event.
+    fn start_children(&self) {
         self.host.start();
         self.host.poll_now();
     }
@@ -923,9 +960,17 @@ impl Inner {
             }
         }
         let stopped = lock(&self.run).stop_requested;
+        // A final line that was already read wins over a pause: the step had ended.
+        let final_read = lock(&last).is_some();
         let event = match (status, lock(&last).take()) {
             (Ok(status), Some(mut json)) => {
-                let ok = status.success();
+                // Ended by the pause's signal after its report: the report says how it ended,
+                // as the exit code would have.
+                let ok = if stopped && status.code().is_none() {
+                    report_clean(kind, &json)
+                } else {
+                    status.success()
+                };
                 if !ok && let Some(object) = json.as_object_mut() {
                     let error = job_error_text(&lock(&errors), status);
                     object.insert("error".to_owned(), serde_json::Value::String(error));
@@ -959,7 +1004,7 @@ impl Inner {
             run.kind = None;
             run.quitting
         };
-        if !stopped {
+        if !stopped || (final_read && !quitting) {
             (self.sink)(&event);
         } else if !quitting {
             (self.sink)(&JobEvent::Paused { kind });

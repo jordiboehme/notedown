@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const calls: { command: string; args: Record<string, unknown> | undefined }[] = [];
+const handlers = new Map<string, (event: { payload: unknown }) => void>();
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn((command: string, args?: Record<string, unknown>) => {
@@ -10,9 +11,16 @@ vi.mock("@tauri-apps/api/core", () => ({
     return Promise.resolve(null);
   }),
 }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn((name: string, handler: (event: { payload: unknown }) => void) => {
+    handlers.set(name, handler);
+    return Promise.resolve(() => {});
+  }),
+}));
 
-const { flow, makeBackup, check, newBackup, importFiles } = await import("../settings/setup/importState.svelte");
+const { flow, makeBackup, check, newBackup, importFiles, startImportFlow } = await import(
+  "../settings/setup/importState.svelte"
+);
 
 describe("the import flow store", () => {
   beforeEach(() => {
@@ -59,5 +67,30 @@ describe("a refused backup", () => {
     expect(flow.error).toBe("The folder holds a finished backup. Choose an empty folder.");
     expect(flow.backup?.state.state).toBe("complete");
     expect(flow.backup?.madeThisRun).toBe(false);
+  });
+});
+
+describe("a step that cannot start", () => {
+  it("is not shown as running after a late restarting progress", async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    vi.mocked(invoke).mockImplementation((command: string) => {
+      if (command === "import_run") return Promise.reject("The notedown program could not start: gone");
+      if (command === "job_state") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+    startImportFlow();
+    await importFiles(false);
+    expect(flow.error).toBe("The notedown program could not start: gone");
+    expect(flow.job).toBe(null);
+    // The progress of the server that starts again comes after the error.
+    handlers.get("setup-job-progress")?.({
+      payload: { kind: "import", files: null, bytes: null, done: null, total: null, phase: "restarting" },
+    });
+    expect(flow.job).toBe(null);
+    // A real step's progress still shows.
+    handlers.get("setup-job-progress")?.({
+      payload: { kind: "import", files: null, bytes: null, done: 1, total: 4, phase: "importing" },
+    });
+    expect(flow.job).toBe("import");
   });
 });

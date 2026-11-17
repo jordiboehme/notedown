@@ -1501,7 +1501,7 @@ pub async fn import_dry_run(
 
 /// Imports the backup folder of the setup record, with the app's server stopped. Off the main
 /// thread: the stop can take the children's grace. A backup older than 24 hours, or not newer
-/// than the last device sync the status knows, is refused (design note 12; the Setup page
+/// than the last device sync (the status or the device files on disk), is refused (design note 12; the Setup page
 /// checks it too).
 #[tauri::command]
 pub async fn import_run(
@@ -1513,8 +1513,11 @@ pub async fn import_run(
 ) -> Result<(), String> {
     let dir = backup_dir(&config)?;
     let jobs = jobs.inner().clone();
-    let last_sync_ms = poller.status().device.last_sync_ms;
+    let from_status = poller.status().device.last_sync_ms;
+    let current = config.current();
     tauri::async_runtime::spawn_blocking(move || {
+        // The status knows no sync while the server is not running: the disk is read too.
+        let last_sync_ms = import_job::last_device_sync(&current, from_status);
         import_job::backup_fresh(&dir, import_job::now_ms(), last_sync_ms)?;
         jobs.import(&dir, replace, allow_empty)
     })

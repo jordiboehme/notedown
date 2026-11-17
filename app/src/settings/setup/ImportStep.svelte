@@ -259,6 +259,8 @@
       >
         Try again with Replace
       </button>
+      <!-- A failure that a retry cannot fix: a new backup into a new folder. -->
+      <button type="button" class="button" onclick={freshBackup}>Make a new backup</button>
     </Row>
   {:else if stage === "snbak"}
     <Row

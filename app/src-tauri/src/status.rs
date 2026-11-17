@@ -175,6 +175,9 @@ pub struct Status {
     pub account: Option<ImportState>,
     /// How the server answered the last `/account` poll.
     pub connection: Connection,
+    /// Why the last check of the first sync of the login failed; `None` when it did not fail
+    /// or the sync is checked. The poller fills it in and tries again every minute.
+    pub first_sync_error: Option<String>,
 }
 
 /// What `GET /account` says about the import; `None` where an older server says nothing.
@@ -326,6 +329,7 @@ pub fn status_from(parts: &Parts, now_ms: u64) -> Status {
         existing: parts.existing,
         account,
         connection,
+        first_sync_error: None,
     }
 }
 
@@ -356,6 +360,7 @@ fn not_set_up(parts: &Parts, note: Option<String>) -> Status {
         existing: parts.existing,
         account,
         connection,
+        first_sync_error: None,
     }
 }
 

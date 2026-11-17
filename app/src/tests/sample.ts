@@ -23,6 +23,7 @@ export function sampleStatus(now: number): Status {
     existing: { server: true, pipeline: true },
     account: { imported: true, appDataImported: true },
     connection: "reached",
+    firstSyncError: null,
   };
 }
 
@@ -39,6 +40,7 @@ export function notSetUp(): Status {
     existing: { server: false, pipeline: false },
     account: null,
     connection: "unknown",
+    firstSyncError: null,
   };
 }
 

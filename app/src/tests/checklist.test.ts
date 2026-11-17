@@ -284,6 +284,12 @@ describe("checklist", () => {
     expect(startOffered(input({ status }))).toBe(false);
     const remote = { ...sampleConfig(), mode: "remote" as const, serverUrl: "http://pi.local:19072" };
     expect(startOffered(input({ status: notSetUp(), config: remote }))).toBe(false);
+    // Not while it stops, and not while its state is not known yet.
+    status.server.state = { state: "stopping" };
+    expect(startOffered(input({ status }))).toBe(false);
+    status.server.state = null;
+    expect(startOffered(input({ status }))).toBe(false);
+    expect(byId(checklist(input({ status }))).server.line).toBe("Checking the server.");
   });
 
   it("the remote server line has no login in the address", () => {
@@ -353,6 +359,43 @@ describe("checklist", () => {
     config.setup.syncChecked = { files: 0, folders: 0, digests: null, cannotTell: true };
     config.setup.syncAcknowledged = false;
     expect(byId(checklist(input({ status, config }))).supernote.state).toBe("todo");
+  });
+
+  it("a failed check of the first sync says why on step 6", () => {
+    const status = sampleStatus(NOW);
+    const config = sampleConfig();
+    config.setup.syncMark = { key: "local|me", seq: 40, atMs: 1, syncAtMark: null };
+    status.firstSyncError = "journal tail took too long.";
+    const step = byId(checklist(input({ status, config }))).supernote;
+    expect(step.state).toBe("todo");
+    expect(step.line).toBe(
+      "Notedown could not check the first sync: journal tail took too long. It tries again every minute.",
+    );
+    // Once checked, the check counts.
+    config.setup.syncChecked = { files: 0, folders: 0, digests: 0, cannotTell: false };
+    expect(byId(checklist(input({ status, config }))).supernote.line).toBe(
+      "The first sync worked. Nothing was deleted.",
+    );
+  });
+
+  it("import again keeps step 5 open and step 6 waiting until both imports are done", () => {
+    const status = sampleStatus(NOW);
+    const config = sampleConfig();
+    config.setup.syncMark = { key: "local|me", seq: 40, atMs: 1, syncAtMark: null };
+    config.setup.syncChecked = { files: 0, folders: 0, digests: 0, cannotTell: false };
+    // The server still says imported from the first time.
+    let steps = byId(checklist(input({ status, config, againRuns: true })));
+    expect(steps.import.state).toBe("todo");
+    expect(steps.supernote.state).toBe("blocked");
+    expect(steps.supernote.blockedBy).toBe("import");
+    // While a step of it runs, step 5 works and step 6 still waits.
+    steps = byId(checklist(input({ status, config, againRuns: true, job: "importDryRun" })));
+    expect(steps.import.state).toBe("working");
+    expect(steps.supernote.state).toBe("blocked");
+    // Both imports done: as before.
+    steps = byId(checklist(input({ status, config, againRuns: false })));
+    expect(steps.import.state).toBe("done");
+    expect(steps.supernote.state).toBe("done");
   });
 
   it("an adopted setup without a mark is done after the first device sync", () => {

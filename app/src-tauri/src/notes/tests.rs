@@ -761,3 +761,37 @@ fn a_file_that_cannot_be_read_for_a_moment_is_not_gone() {
     readable(&path);
     assert_eq!(f.notes.all()[0].changed_ms, ms(20));
 }
+
+#[test]
+fn notes_newer_than_counts_listed_notes_with_newer_text() {
+    let f = Fixture::new();
+    // Nothing yet: no count and no newest seq.
+    assert_eq!(f.notes.notes_newer_than(0), (0, None));
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 10);
+    f.write(
+        &note(
+            B,
+            "NOTE/Note/b.note",
+            &[("P1", Some(5), true), ("P2", Some(9), true)],
+        ),
+        11,
+    );
+    // Not listed: no text yet, deleted, unscoped.
+    f.write(&note(C, "NOTE/Note/c.note", &[("P1", Some(20), false)]), 12);
+    let mut deleted = note("F5", "NOTE/Note/e.note", &[("P1", Some(21), true)]);
+    deleted["deleted"] = json!(true);
+    f.write(&deleted, 13);
+    let mut unscoped = note("F6", "NOTE/Note/f.note", &[("P1", Some(22), true)]);
+    unscoped["unscoped"] = json!(true);
+    f.write(&unscoped, 14);
+    // It scans first: the notes written above count without a refresh.
+    assert_eq!(f.notes.notes_newer_than(0), (2, Some(9)));
+    assert_eq!(f.notes.notes_newer_than(4), (1, Some(9)));
+    assert_eq!(f.notes.notes_newer_than(9), (0, Some(9)));
+    // The seen markers do not matter: an opened note still counts.
+    f.notes.seen(B).unwrap();
+    assert_eq!(f.notes.notes_newer_than(4), (1, Some(9)));
+    // Without an account there are no notes.
+    *lock(&f.account) = None;
+    assert_eq!(f.notes.notes_newer_than(0), (0, None));
+}

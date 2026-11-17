@@ -93,6 +93,8 @@ pub enum LibraryAt {
         path: String,
     },
     New,
+    /// All notes (a click on a sync notification).
+    All,
     /// The recycle bin (Settings > Setup, after a first sync that deleted files).
     Bin,
 }

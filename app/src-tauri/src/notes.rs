@@ -287,6 +287,21 @@ impl Notes {
         new_of(&state)
     }
 
+    /// How many notes of [`all`](Self::all) have text with a seq above `seq`, and the newest
+    /// text seq of them all (`None` without notes). The seen markers do not matter. Scans
+    /// first, so it takes the index lock and may tell the windows: the notifier calls it on
+    /// its own thread, and only when an OCR pass is done.
+    pub fn notes_newer_than(&self, seq: u64) -> (u64, Option<u64>) {
+        let mut state = lock(&self.inner.state);
+        self.scan(&mut state);
+        self.save_seen(&mut state);
+        self.tell(&mut state);
+        let notes = listed_notes(&state);
+        let newer = notes.iter().filter(|n| n.text_seq > seq).count();
+        let newest = notes.iter().map(|n| n.text_seq).max();
+        (u64::try_from(newer).unwrap_or(u64::MAX), newest)
+    }
+
     /// The user opened the note `key`: its text up to now is seen. Scans first.
     pub fn seen(&self, key: &str) -> Result<(), String> {
         let mut state = lock(&self.inner.state);

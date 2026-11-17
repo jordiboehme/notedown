@@ -60,3 +60,30 @@ export function withChoice(
 ): NotificationChoices {
   return { ...choices, [key]: on };
 }
+
+/**
+ * Reads what macOS allows. A read started while a change is busy, or overtaken by a change,
+ * is old: its answer and its error are dropped (the change brings its own).
+ */
+export function permissionReads(busy: () => boolean) {
+  let changes = 0;
+  return {
+    /** A change starts. */
+    changed() {
+      changes += 1;
+    },
+    read(ask: () => Promise<Authorization>, answer: (a: Authorization) => void, fail: (error: unknown) => void) {
+      if (busy()) return;
+      const started = changes;
+      const current = () => !busy() && started === changes;
+      ask().then(
+        (a) => {
+          if (current()) answer(a);
+        },
+        (error: unknown) => {
+          if (current()) fail(error);
+        },
+      );
+    },
+  };
+}

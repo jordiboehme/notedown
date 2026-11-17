@@ -13,26 +13,24 @@
   import Row from "../kit/Row.svelte";
   import Section from "../kit/Section.svelte";
   import Switch from "../kit/Switch.svelte";
-  import { DOT_LINE, NOTIFICATIONS_PANE, notificationRows, withChoice } from "../notifications";
+  import { DOT_LINE, NOTIFICATIONS_PANE, notificationRows, permissionReads, withChoice } from "../notifications";
 
   // Settings > Notifications: the switch, the choice per event and what macOS allows.
   let authorization = $state<Authorization | null>(null);
   let problem = $state<string | null>(null);
   // A change waits for the save and, when the switch goes on, for the answer of macOS.
   let busy = $state(false);
-  // Counts the changes: a permission read started before a change (or during one) is old.
-  let changes = 0;
+  // A permission read started before a change (or during one) is old.
+  const reads = permissionReads(() => busy);
 
   const view = $derived(notificationRows(config.current, authorization));
 
   function readPermission() {
-    if (busy) return;
-    const started = changes;
-    notificationAuthorization()
-      .then((answer) => {
-        if (!busy && started === changes) authorization = answer;
-      })
-      .catch((error: unknown) => (problem = failure(error)));
+    reads.read(
+      notificationAuthorization,
+      (answer) => (authorization = answer),
+      (error) => (problem = failure(error)),
+    );
   }
 
   // Again on focus: the permission may have changed in System Settings.
@@ -42,7 +40,7 @@
     const choices = config.current?.notifications;
     if (!choices || busy) return;
     busy = true;
-    changes += 1;
+    reads.changed();
     try {
       const answer = await setNotifications(withChoice(choices, key, on));
       config.current = answer.config;

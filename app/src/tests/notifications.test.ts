@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
-import type { AppConfig, NotificationChoices } from "../settings/api";
-import { DOT_LINE, NOTIFICATIONS_PANE, notificationRows, withChoice } from "../settings/notifications";
+import type { AppConfig, Authorization, NotificationChoices } from "../settings/api";
+import {
+  DOT_LINE,
+  NOTIFICATIONS_PANE,
+  notificationRows,
+  permissionReads,
+  withChoice,
+} from "../settings/notifications";
 
 const choices = (enabled: boolean): NotificationChoices => ({
   enabled,
@@ -84,5 +90,41 @@ describe("the Notifications page", () => {
   it("changes one choice and keeps the others", () => {
     expect(withChoice(choices(false), "enabled", true)).toEqual(choices(true));
     expect(withChoice(choices(true), "agent", true)).toEqual({ ...choices(true), agent: true });
+  });
+
+  it("drops the answer and the error of a permission read that a change overtook", async () => {
+    let busy = false;
+    const reads = permissionReads(() => busy);
+    const answers: Authorization[] = [];
+    const errors: unknown[] = [];
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    // No change in between: the answer and the error count.
+    reads.read(() => Promise.resolve("allowed"), (a) => answers.push(a), (e) => errors.push(e));
+    reads.read(() => Promise.reject(new Error("no answer")), (a) => answers.push(a), (e) => errors.push(e));
+    await settle();
+    expect(answers).toEqual(["allowed"]);
+    expect(errors).toHaveLength(1);
+
+    // A change starts while the reads run: both are old.
+    let answer!: (a: Authorization) => void;
+    let refuse!: (e: unknown) => void;
+    reads.read(() => new Promise((resolve) => (answer = resolve)), (a) => answers.push(a), (e) => errors.push(e));
+    reads.read(() => new Promise((_, reject) => (refuse = reject)), (a) => answers.push(a), (e) => errors.push(e));
+    busy = true;
+    reads.changed();
+    answer("denied");
+    refuse(new Error("no answer"));
+    await settle();
+    busy = false;
+    await settle();
+    expect(answers).toEqual(["allowed"]);
+    expect(errors).toHaveLength(1);
+
+    // Nothing is read while a change is busy.
+    busy = true;
+    let asked = false;
+    reads.read(() => ((asked = true), Promise.resolve("allowed")), (a) => answers.push(a), (e) => errors.push(e));
+    expect(asked).toBe(false);
   });
 });

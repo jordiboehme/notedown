@@ -82,9 +82,9 @@ the digests, import the digests. A bad `.snbak` file sends you back to the choic
 without a second import of the files. "Import again" is a separate path for a Supernote that
 synced before. It needs a new backup and the Replace option.
 
-While a backup or an import runs, the app holds the server. Start, Stop, the mode, log in, log
-out, create account and connect answer "Wait until the import is done." An import does not start
-while the server runs outside the app.
+While the files or the digests are imported, the app's server is stopped. Start, the mode, log
+in, log out, create account, connect and the Markdown folder answer "Wait until the import is
+done." An import does not start while the server runs outside the app.
 
 ## Commands
 

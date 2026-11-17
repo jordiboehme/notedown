@@ -203,6 +203,19 @@ impl Setup {
         Ok(self)
     }
 
+    /// The setup with the `--model-idle` flag: a duration like `90s`, `5m` or `2h` wins over
+    /// `model_idle` of the config. `None` keeps the config's.
+    pub fn with_model_idle(mut self, flag: Option<&str>) -> Result<Setup> {
+        if let Some(text) = flag {
+            self.cfg.model_idle =
+                crate::config::parse_duration(text).map_err(|message| Error::Invalid {
+                    what: "--model-idle",
+                    message,
+                })?;
+        }
+        Ok(self)
+    }
+
     /// An error when `dir` is the server's data folder or lies inside it, or inside the
     /// pipeline's own folder: the writer would put files among the server's or its own.
     fn check_markdown_place(&self, what: &'static str, dir: &Path) -> Result<()> {
@@ -412,6 +425,37 @@ mod tests {
         assert!(!s.two_machines);
         assert_eq!(s.local, d.path());
         assert_eq!(s.source.describe(), FolderSource::new(d.path()).describe());
+    }
+
+    #[test]
+    fn the_model_idle_flag_wins_over_the_config() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "server.toml", "[pipeline]\nmodel_idle = \"2h\"\n");
+        let from_file = Setup::load(d.path()).unwrap();
+        assert_eq!(
+            from_file.cfg.model_idle,
+            std::time::Duration::from_secs(7200)
+        );
+        let s = from_file.with_model_idle(None).unwrap();
+        assert_eq!(s.cfg.model_idle, std::time::Duration::from_secs(7200));
+        for (flag, secs) in [("90s", 90), ("5m", 300), ("2h", 7200)] {
+            let s = Setup::load(d.path())
+                .unwrap()
+                .with_model_idle(Some(flag))
+                .unwrap();
+            assert_eq!(
+                s.cfg.model_idle,
+                std::time::Duration::from_secs(secs),
+                "{flag}"
+            );
+        }
+        let e = Setup::load(d.path())
+            .unwrap()
+            .with_model_idle(Some("soon"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("--model-idle") && e.contains("soon"), "{e}");
     }
 
     #[test]

@@ -257,6 +257,29 @@ records. `--empty` gives zeros and empty lists.
 
 Both commands take a hidden `--exit-with-parent <pid>`, like `backup-device`.
 
+## Pipeline settings
+
+`notedown pipeline` reads the `[pipeline]` section of `server.toml` (one machine) or
+`pipeline.toml` (two machines). A duration is a number with `s`, `m`, `h` or `d`, like `"90s"` or
+`"10m"`.
+
+- `ocr_settle` (default `"10m"`): a page is read this long after its last change.
+- `model_idle` (default `"5m"`): the OCR model is unloaded after this long without work, to free
+  its memory. It loads again for the next page.
+- `text_keep_days` (default 90): days to keep old text versions.
+- `ingest_folders`, `ingest_exclude`, `ingest_keyword`: which notes are read (see the
+  [getting started guide](getting-started.md)).
+- `markdown_dirs`: see [Markdown files](#markdown-files).
+
+```toml
+[pipeline]
+model_idle = "15m"
+```
+
+`notedown pipeline --data DIR --model-idle DURATION` sets `model_idle` for this run. The flag wins
+over the config. A value that is not a duration stops Notedown with an error that names
+`--model-idle`. The Mac app always passes the value of its setting on the OCR page.
+
 ## Pipeline status
 
 `notedown pipeline status --data DIR [--account A]` prints the state of the OCR pipeline of one account

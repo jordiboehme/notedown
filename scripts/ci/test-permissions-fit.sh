@@ -128,6 +128,46 @@ release_yml "" | sed '/^permissions:/,/^  contents: read/d' >"$d/release.yml"
 caller_yml "$grant" "" >"$d/ci.yml"
 expect "a called workflow without top-level permissions fails" "$d" 1 "has no top-level permissions block"
 
+d="$(case_dir empty-grant)"
+release_yml "" >"$d/release.yml"
+caller_yml '    permissions: {}' "" >"$d/ci.yml"
+expect "an empty grant ({}) is no grant and fails" "$d" 1 "release.yml asks for contents: read, but ci.yml job release grants none"
+
+d="$(case_dir none-scope)"
+release_yml "" >"$d/release.yml"
+caller_yml '    permissions:
+      contents: none' "" >"$d/ci.yml"
+expect "a scope granted at none fails" "$d" 1 "release.yml asks for contents: read, but ci.yml job release grants none"
+
+d="$(case_dir other-called)"
+release_yml "" >"$d/release.yml"
+caller_yml "$grant" "" >"$d/ci.yml"
+cat >"$d/build.yml" <<'EOF2'
+name: Build
+on:
+  workflow_call: {}
+permissions:
+  contents: read
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - run: true
+EOF2
+cat >"$d/other.yml" <<'EOF2'
+name: Other
+on:
+  push: {}
+permissions:
+  contents: read
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+EOF2
+expect "any other called workflow is checked too" "$d" 1 "build.yml asks for packages: write, but other.yml job build grants none"
+
 expect "the repository's own workflows fit" "$here/../../.github/workflows" 0
 
 if [ "$fails" -gt 0 ]; then

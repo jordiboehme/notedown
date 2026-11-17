@@ -159,6 +159,12 @@ jobs:
                 build=false
               fi
             fi
+          elif [ -n "${DRY_RUN:-}" ]; then
+            # inputs.dry_run is set ("true" or "false") only in a call; a
+            # dispatch and a tag push leave it empty. A call with an empty
+            # tag would otherwise turn into a silent dry run.
+            echo "::error::release.yml was called without a tag"
+            exit 1
           elif [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
             tag="$GITHUB_REF_NAME"
             called=false
@@ -188,7 +194,6 @@ jobs:
       - name: The release notes file exists and opens with an H1
         env:
           RELEASE_TAG: ${{ steps.resolve.outputs.tag }}
-          PUBLISH: ${{ steps.resolve.outputs.publish }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
@@ -198,7 +203,7 @@ jobs:
           fi
           file="release-notes/${RELEASE_TAG}.md"
           if [ ! -s "$file" ]; then
-            if [ "${DRY_RUN:-}" = true ] && [ "$PUBLISH" != true ]; then
+            if [ "${DRY_RUN:-}" = true ]; then
               echo "::notice file=$file::$file is missing or empty; fine for a rehearsal, a release needs it"
               exit 0
             fi
@@ -477,28 +482,11 @@ jobs:
       - name: cargo auditable build --release --target musl -p notedown --no-default-features
         run: cargo auditable build --release --frozen --target "$LEG_TARGET" -p notedown --no-default-features
 
-      # Compared with the workspace version, never with name_ver: a dry run
-      # names its files 0.0.0-dev, the binary still says the real version.
+      # The same check as ci.yml's musl job. It compares with the workspace
+      # version, never with name_ver: a dry run names its files 0.0.0-dev,
+      # the binary still says the real version.
       - name: The binary is static and names the workspace version
-        run: |
-          set -euo pipefail
-          bin="target/$LEG_TARGET/release/notedown"
-          info="$(file -b "$bin")"
-          echo "file: $info"
-          # Rust's musl targets link static-pie, which file reports as
-          # "static-pie linked"; older file versions say "statically linked".
-          if ! grep -qE 'static(ally|-pie) linked' <<<"$info" \
-            || grep -qE 'dynamically linked|interpreter' <<<"$info"; then
-            echo "::error::$bin is not a static binary"
-            exit 1
-          fi
-          version="$(bash scripts/ci/workspace-version.sh)"
-          got="$("$bin" --version)"
-          echo "--version: $got"
-          if [ "$got" != "notedown $version" ]; then
-            echo "::error::$bin --version printed '$got', want 'notedown $version'"
-            exit 1
-          fi
+        run: bash scripts/ci/check-linux-binary.sh "target/$LEG_TARGET/release/notedown"
 
       # dist/THIRD-PARTY-NOTICES.txt is where the .deb's asset list reads the
       # notices from ([package.metadata.deb] of crates/notedown).
@@ -524,7 +512,10 @@ jobs:
           rm -rf "$stage" out
           mkdir -p "$stage" out
           cp "$bin" LICENSE NOTICE README.md "$notices" "$stage/"
-          tar -C dist -czf "out/$name.tar.gz" "$name"
+          # Owned by root in the archive, not by the runner's user, and in a
+          # fixed order.
+          tar -C dist --owner=0 --group=0 --numeric-owner --sort=name \
+            -czf "out/$name.tar.gz" "$name"
           want="$(printf '%s\n' "$name/" "$name/LICENSE" "$name/NOTICE" "$name/README.md" \
             "$name/THIRD-PARTY-NOTICES.txt" "$name/notedown" | LC_ALL=C sort)"
           got="$(tar -tzf "out/$name.tar.gz" | LC_ALL=C sort)"

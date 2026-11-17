@@ -25,7 +25,10 @@ cat >"$tmp/app.json" <<'EOF'
   "metadata": {"component": {"name": "notedown-app", "bom-ref": "path+file:///w/app/src-tauri#notedown-app@0.1.0"}},
   "components": [
     {"name": "serde", "version": "1.0.0", "bom-ref": "registry#serde@1.0.0", "purl": "pkg:cargo/serde@1.0.0"},
-    {"name": "tauri", "version": "2.12.5", "bom-ref": "registry#tauri@2.12.5", "purl": "pkg:cargo/tauri@2.12.5"}
+    {"name": "tauri", "version": "2.12.5", "bom-ref": "registry#tauri@2.12.5", "purl": "pkg:cargo/tauri@2.12.5"},
+    {"name": "bare-a", "version": "1.0.0"},
+    {"name": "bare-b", "version": "1.0.0"},
+    {"name": "bare-a", "version": "1.0.0"}
   ],
   "dependencies": [
     {"ref": "path+file:///w/app/src-tauri#notedown-app@0.1.0", "dependsOn": ["registry#tauri@2.12.5"]},
@@ -106,6 +109,8 @@ else
   pass "the merge runs"
   check "the app stays the root" '.metadata.component.name == "notedown-app"'
   check "a crate in both trees is listed once" '[.components[] | select(.name == "serde")] | length == 1'
+  check "components without purl and bom-ref stay apart, by name@version" \
+    '[.components[] | select(.name | startswith("bare-")) | .name] == ["bare-a", "bare-b"]'
   check "the crates of the program are in" 'any(.components[]; .name == "llama-cpp-sys-2")'
   check "the program itself is a component" 'any(.components[]; .name == "notedown")'
   check "the production npm package is in" 'any(.components[]; .name == "@tauri-apps/api")'

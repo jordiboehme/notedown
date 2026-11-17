@@ -451,25 +451,7 @@ jobs:
         run: cargo build --release --locked --target "$LEG_TARGET" -p notedown --no-default-features
 
       - name: The binary is static and names the workspace version
-        run: |
-          set -euo pipefail
-          bin="target/$LEG_TARGET/release/notedown"
-          info="$(file -b "$bin")"
-          echo "file: $info"
-          # Rust's musl targets link static-pie, which file reports as
-          # "static-pie linked"; older file versions say "statically linked".
-          if ! grep -qE 'static(ally|-pie) linked' <<<"$info" \
-            || grep -qE 'dynamically linked|interpreter' <<<"$info"; then
-            echo "::error::$bin is not a static binary"
-            exit 1
-          fi
-          version="$(bash scripts/ci/workspace-version.sh)"
-          got="$("$bin" --version)"
-          echo "--version: $got"
-          if [ "$got" != "notedown $version" ]; then
-            echo "::error::$bin --version printed '$got', want 'notedown $version'"
-            exit 1
-          fi
+        run: bash scripts/ci/check-linux-binary.sh "target/$LEG_TARGET/release/notedown"
 
       - name: Upload the amd64 binary
         if: ${{ matrix.arch == 'amd64' }}
@@ -810,6 +792,7 @@ jobs:
           bash scripts/ci/test-notices.sh
           bash scripts/ci/test-permissions-fit.sh
           bash scripts/ci/test-app-sbom.sh
+          bash scripts/ci/test-check-linux-binary.sh
 
       # A called workflow that asks for a scope its caller does not grant
       # fails the whole calling run at startup, on every push. release.yml's

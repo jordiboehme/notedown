@@ -13,7 +13,7 @@
 #
 # The result is the app-crates SBOM (its metadata and root component) with
 # these components, deduplicated by purl (by bom-ref when a component has no
-# purl):
+# purl, by name@version when it has neither):
 #
 #   - the crates of the app,
 #   - the notedown program itself (the root component of the cli SBOM) and
@@ -71,7 +71,7 @@ jq -n \
   | ($app.metadata.component["bom-ref"] // error("the app SBOM has no root bom-ref")) as $root
   | $app
   | .components = ([$app.components[], $program, $cli.components[], $packages[]]
-      | unique_by(.purl // .["bom-ref"]))
+      | unique_by(.purl // .["bom-ref"] // "\(.name)@\(.version)"))
   | (.components | map(select(.["bom-ref"] != null) | {(.["bom-ref"]): true}) | add // {}) as $known
   | .dependencies = (
       [ ($app.dependencies // [])[], ($cli.dependencies // [])[],

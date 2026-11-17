@@ -8,6 +8,7 @@
   import {
     appDataLines,
     backupProgressText,
+    backupResumable,
     endedText,
     type FlowInput,
     importAgainOffered,
@@ -50,7 +51,7 @@
   const mode = $derived(config.current?.mode ?? "notSet");
   const account = $derived(status.current?.account ?? null);
   const lastSyncMs = $derived(status.current?.device.lastSyncMs ?? null);
-  const serverRunning = $derived(status.current?.server.state?.state === "running");
+  const serverState = $derived(status.current?.server.state?.state ?? null);
   const backupTimeMs = $derived(
     flow.backup && (flow.backup.state.state === "complete" || flow.backup.state.state === "resumable")
       ? Date.parse(flow.backup.state.time)
@@ -72,7 +73,7 @@
     appDataThisRun: flow.appDataThisRun,
   });
   const stage = $derived(importStage(input));
-  const panel = $derived(importPanel({ state: step.state, job: flow.job, last: flow.last, mode, serverRunning }));
+  const panel = $derived(importPanel({ state: step.state, job: flow.job, last: flow.last, mode, server: serverState }));
   const actions = $derived(flow.dryRun ? reviewActions(flow.dryRun) : null);
   const lastText = $derived(flow.last && !flow.last.ok ? endedText(flow.last) : null);
   const snbakProblem = $derived(
@@ -183,10 +184,16 @@
     {#each Array.isArray(flow.last?.json?.errors) ? (flow.last?.json?.errors as { path: string; message: string }[]) : [] as error, i (i)}
       <Row title={error.path} note={error.message} tone="bad" />
     {/each}
-    <Row title="Try again" note="Resume fetches the files that failed.">
-      <button type="button" class="button strong" onclick={() => void resumeBackup()}>Resume</button>
-      <button type="button" class="button" onclick={freshBackup}>Make a new backup</button>
-    </Row>
+    {#if flow.backup && backupResumable(flow.backup.state)}
+      <Row title="Try again" note="Resume fetches the files that failed.">
+        <button type="button" class="button strong" onclick={() => void resumeBackup()}>Resume</button>
+        <button type="button" class="button" onclick={freshBackup}>Make a new backup</button>
+      </Row>
+    {:else}
+      <Row title="Try again" note="Make a new backup into a new folder.">
+        <button type="button" class="button strong" onclick={freshBackup}>Make a new backup</button>
+      </Row>
+    {/if}
   {:else if stage === "tooOld"}
     <Row title="Backup" note={tooOldLine(backupTimeMs, now, lastSyncMs)} tone="bad">
       <button type="button" class="button strong" onclick={freshBackup}>Make a new backup</button>
@@ -215,9 +222,15 @@
           >
         {/if}
       </Row>
+      {#if !actions.canImport}
+        <Row title="New backup" note="The import refuses this backup. Make a new one into a new folder.">
+          <button type="button" class="button" onclick={freshBackup}>Make a new backup</button>
+        </Row>
+      {/if}
     {:else}
       <Row title="Review" note={lastText ?? "Check the backup before the import."} tone={lastText ? "bad" : "secondary"}>
         <button type="button" class="button strong" onclick={() => void check()}>Check the backup</button>
+        <button type="button" class="button" onclick={freshBackup}>Make a new backup</button>
       </Row>
     {/if}
   {:else if stage === "importing"}

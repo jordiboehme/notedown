@@ -71,6 +71,10 @@
 />
 <Row title="Log in" note="Log in with the e-mail and the password from step 2." />
 <Row title="Folders" note="Select the folders Note, Document, MyStyle, EXPORT, SCREENSHOT and INBOX." />
-<Row title="Auto Sync" note="Leave Auto Sync off for now." />
-<Row title="Sync" note="Sync once by hand." />
+{#if check && done}
+  <Row title="Auto Sync" note="Turn Auto Sync on, on the Supernote." />
+{:else}
+  <Row title="Auto Sync" note="Leave Auto Sync off for now." />
+  <Row title="Sync" note="Sync once by hand." />
+{/if}
 {#if problem}<Row title="Problem" note={problem} tone="bad" />{/if}

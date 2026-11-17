@@ -249,7 +249,9 @@ export async function noDigests(): Promise<void> {
   flow.appData = null;
   flow.last = null;
   flow.snbak = { path: null, timeMs: Date.now(), chosenThisRun: true };
-  await run("appDataDryRun", () => appDataDryRun(true, false));
+  // An account that holds digests (Import again) needs Replace for the empty choice too.
+  const replace = flow.appDataReplace || flow.again;
+  await run("appDataDryRun", () => appDataDryRun(true, replace));
 }
 
 /** The app data import of the reviewed .snbak (or the empty choice). */
@@ -257,7 +259,7 @@ export async function importAppData(replace = flow.appDataReplace || flow.again)
   const empty = flow.snbak?.path === null;
   flow.appDataThisRun = false;
   flow.last = null;
-  await run("appData", () => appDataRun(empty, empty ? false : replace));
+  await run("appData", () => appDataRun(empty, replace));
 }
 
 /** Back to the .snbak choice after a failed app data import. */

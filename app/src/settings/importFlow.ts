@@ -135,6 +135,12 @@ function staleIn(json: Record<string, unknown> | null): boolean {
   return Array.isArray(stale) && stale.length > 0;
 }
 
+/** Resume continues only a backup that did not finish: a run that ended with errors leaves a
+ * finished folder, which takes no Resume (only a new backup into a new folder). */
+export function backupResumable(state: BackupFolder): boolean {
+  return state.state === "resumable";
+}
+
 /** A backup must not be imported when it is older than 24 hours or older than the last device
  * sync: a file missing on the server is deleted on the Supernote. A time that cannot be read is
  * too old as well. */
@@ -291,19 +297,20 @@ export function importProgressText(progress: JobProgress): string | null {
 
 /** Whether the import part of step 5 shows, and a line for it. A step blocked after an import
  * ended (the server starts again, or did not start) keeps its part with the last result, and
- * asks for Start while the server on this Mac does not run. */
+ * asks for Start while the server on this Mac neither runs nor starts (`server` is its state,
+ * status.server.state.state). */
 export function importPanel(input: {
   state: StepState;
   job: JobKind | null;
   last: Ended | null;
   mode: Mode;
-  serverRunning: boolean;
+  server: string | null;
 }): { show: boolean; line: string | null } {
   if (input.state !== "blocked") return { show: true, line: null };
   if (input.job !== null) return { show: true, line: null };
   if (input.last === null) return { show: false, line: null };
-  const line = input.mode === "local" && !input.serverRunning ? "Press Start in step 1." : null;
-  return { show: true, line };
+  const up = input.server === "running" || input.server === "starting";
+  return { show: true, line: input.mode === "local" && !up ? "Press Start in step 1." : null };
 }
 
 /** What step 6 shows after the first sync was checked: a line when nothing (or nothing more)
@@ -326,11 +333,13 @@ export function firstSyncView(
   if (checked.cannotTell) {
     return { line: null, banner: ["Notedown cannot tell what the first sync changed. Check the recycle bin."] };
   }
-  const banner = [`The Supernote deleted ${files(checked.files)} on the server. They are in the recycle bin.`];
-  const more: string[] = [];
-  if (checked.folders > 0) more.push(count(checked.folders, "folder", "folders"));
-  if ((checked.digests ?? 0) > 0) more.push(count(checked.digests ?? 0, "digest", "digests"));
-  if (more.length > 0) banner.push(`It also deleted ${more.join(" and ")}.`);
+  // The first count that is not 0 leads; the others follow.
+  const counts: string[] = [];
+  if (checked.files > 0) counts.push(files(checked.files));
+  if (checked.folders > 0) counts.push(count(checked.folders, "folder", "folders"));
+  if ((checked.digests ?? 0) > 0) counts.push(count(checked.digests ?? 0, "digest", "digests"));
+  const banner = [`The Supernote deleted ${counts[0]} on the server. They are in the recycle bin.`];
+  if (counts.length > 1) banner.push(`It also deleted ${counts.slice(1).join(" and ")}.`);
   if (noDigests) banner.push(digestNote);
   return { line: null, banner };
 }

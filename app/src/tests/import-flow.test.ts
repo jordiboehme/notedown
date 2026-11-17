@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   appDataLines,
   backupProgressText,
+  backupResumable,
   backupTooOld,
   firstSyncView,
   type DryRun,
@@ -94,6 +95,9 @@ describe("importStage", () => {
   it("a backup with errors shows its report", () => {
     const last = { kind: "backup" as const, ok: false, json: { errors: [{ path: "Note/a.note", message: "x" }] }, text: "1 file failed" };
     expect(importStage(flow({ last }))).toBe("backupDone");
+    // A run with errors leaves a complete folder: Resume is refused there, only a new backup.
+    expect(backupResumable({ state: "complete", time: iso(BACKUP) })).toBe(false);
+    expect(backupResumable({ state: "resumable", time: iso(BACKUP) })).toBe(true);
     // Resume is offered only within the 24 hours, and not over files the Supernote dropped.
     expect(importStage(flow({ last, nowMs: BACKUP.getTime() + 25 * HOUR }))).toBe("tooOld");
     const stale = { ...last, json: { errors: [], stale: ["Note/gone.note"] } };
@@ -296,23 +300,28 @@ describe("importPanel", () => {
     const last = { kind: "import" as const, ok: true, json: { files: 3 }, text: null };
     // Blocked for a moment after the import: the part stays, and asks for Start when the
     // server does not run.
-    expect(importPanel({ state: "blocked", job: null, last, mode: "local", serverRunning: false })).toEqual({
+    expect(importPanel({ state: "blocked", job: null, last, mode: "local", server: "stopped" })).toEqual({
       show: true,
       line: "Press Start in step 1.",
     });
-    expect(importPanel({ state: "blocked", job: null, last, mode: "local", serverRunning: true })).toEqual({
+    expect(importPanel({ state: "blocked", job: null, last, mode: "local", server: "running" })).toEqual({
       show: true,
       line: null,
     });
+    // While it starts again, step 1 offers no Start: no line.
+    expect(importPanel({ state: "blocked", job: null, last, mode: "local", server: "starting" }).line).toBeNull();
+    expect(importPanel({ state: "blocked", job: null, last, mode: "local", server: "backoff" }).line).toBe(
+      "Press Start in step 1.",
+    );
     // Blocked before anything ran: only the step's own line.
-    expect(importPanel({ state: "blocked", job: null, last: null, mode: "local", serverRunning: false }).show).toBe(
+    expect(importPanel({ state: "blocked", job: null, last: null, mode: "local", server: "stopped" }).show).toBe(
       false,
     );
     // A running step is always shown.
-    expect(importPanel({ state: "blocked", job: "import", last: null, mode: "local", serverRunning: false }).show).toBe(
+    expect(importPanel({ state: "blocked", job: "import", last: null, mode: "local", server: "stopped" }).show).toBe(
       true,
     );
-    expect(importPanel({ state: "todo", job: null, last: null, mode: "local", serverRunning: true })).toEqual({
+    expect(importPanel({ state: "todo", job: null, last: null, mode: "local", server: "running" })).toEqual({
       show: true,
       line: null,
     });
@@ -349,6 +358,10 @@ describe("firstSyncView", () => {
     expect(firstSyncView({ ...deleted, folders: 0, digests: null }, false, "remote").banner).toEqual([
       "The Supernote deleted 3 files on the server. They are in the recycle bin.",
       "Deleted digests are not checked for a server on another machine.",
+    ]);
+    // Only folders: the banner leads with them.
+    expect(firstSyncView({ files: 0, folders: 2, digests: 0, cannotTell: false }, false, "local").banner).toEqual([
+      "The Supernote deleted 2 folders on the server. They are in the recycle bin.",
     ]);
     // Seen: the step is done, Auto Sync next.
     expect(firstSyncView(deleted, true, "local")).toEqual({

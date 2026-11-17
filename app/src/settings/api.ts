@@ -13,6 +13,8 @@ export interface AppConfig {
   account: string | null;
   email: string | null;
   startView: StartView;
+  /** The Markdown folder of each account, by its slug. */
+  markdownDirs: Record<string, string>;
 }
 
 export interface Progress {
@@ -35,9 +37,15 @@ export const MODEL_READY_EVENT = "model-ready";
 export const MODEL_FAILED_EVENT = "model-failed";
 export const SETTINGS_PAGE_EVENT = "settings-page";
 
+/** The config after a change, and a sentence when an old login stayed in the Keychain. */
+export interface ConfigAnswer {
+  config: AppConfig;
+  keychain: string | null;
+}
+
 export const getConfig = () => invoke<AppConfig>("get_config");
 export const setMode = (mode: Mode, dataDir: string | null, serverUrl: string | null) =>
-  invoke<AppConfig>("set_mode", { mode, dataDir, serverUrl });
+  invoke<ConfigAnswer>("set_mode", { mode, dataDir, serverUrl });
 export const setStartView = (startView: StartView) => invoke<AppConfig>("set_start_view", { startView });
 export const startProcesses = () => invoke("start_processes");
 export const stopProcesses = () => invoke("stop_processes");
@@ -46,11 +54,22 @@ export const mcpInfo = () => invoke<{ sidecar: string; dataDir: string }>("mcp_i
 export const openLink = (url: string) => invoke("open_link", { url });
 export const getAutostart = () => invoke<boolean>("get_autostart");
 export const setAutostart = (on: boolean) => invoke<boolean>("set_autostart", { on });
-export const logOut = () => invoke("log_out");
+/** Logs in and keeps a write token in the Keychain; answers the config with the account. */
+export const logIn = (email: string, password: string) => invoke<ConfigAnswer>("log_in", { email, password });
+/** Whether the Keychain keeps a login for the account in the config. */
+export const hasLogin = () => invoke<boolean>("has_login");
+/** Deletes the login and forgets the account; answers the config without it. */
+export const logOut = () => invoke<AppConfig>("log_out");
 export const modelState = () => invoke<ModelState>("model_state");
 export const modelPull = () => invoke("model_pull");
 export const modelPause = () => invoke<ModelState>("model_pause");
 export const modelRemove = () => invoke<ModelState>("model_remove");
+/** The Markdown folder of the logged-in account; null without an account. */
+export const markdownDir = () => invoke<string | null>("markdown_dir");
+/** Saves the Markdown folder of the logged-in account; the pipeline starts again with it. */
+export const setMarkdownDir = (dir: string) => invoke<string | null>("set_markdown_dir", { dir });
+/** Opens the Markdown folder in the Finder (it is made first when it is not there yet). */
+export const showMarkdownDir = () => invoke("show_markdown_dir");
 
 /** The text of a failed command: Rust sends a string. */
 export function failure(error: unknown): string {

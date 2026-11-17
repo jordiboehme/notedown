@@ -45,6 +45,20 @@ impl Rig {
         rig
     }
 
+    /// The pipeline's fake says what it got, then holds `<data>/pipeline/.writer.lock` as the
+    /// real pipeline does (exclusive, for its whole run) and waits `secs`.
+    fn hold_the_writer_lock(&self, secs: u32) {
+        std::fs::write(
+            self.dir.path().join("pipeline.sh"),
+            format!(
+                "echo \"got: $*\"\nmkdir -p \"$3/pipeline\"\n\
+                 exec /usr/bin/perl -e 'use Fcntl qw(:flock); open(my $f, \">>\", $ARGV[0]) \
+                 or die $!; flock($f, LOCK_EX) or die $!; sleep {secs}' \"$3/pipeline/.writer.lock\""
+            ),
+        )
+        .unwrap();
+    }
+
     fn data(&self) -> PathBuf {
         self.dir.path().join("data")
     }
@@ -314,6 +328,35 @@ fn the_serve_info_follows_the_server() {
 }
 
 #[test]
+fn a_new_serve_address_is_told() {
+    let rig = Rig::new();
+    rig.listen_on(free_port());
+    let p = rig.processes(Path::new("/bin/sleep"));
+    let told = Arc::new(AtomicUsize::new(0));
+    let count = told.clone();
+    p.on_serve_info(move || {
+        count.fetch_add(1, Ordering::SeqCst);
+    });
+    p.start_all(&rig.config());
+    running_pid(p.server());
+    let data = rig.data();
+    assert!(wait_until(
+        || p.serve_info().data_dir.as_deref() == Some(data.as_path())
+    ));
+    // The address, the device URL, the REST line and the folder each change it; the header
+    // of a fresh start changes nothing.
+    assert!(wait_until(|| told.load(Ordering::SeqCst) >= 4));
+    assert_eq!(told.load(Ordering::SeqCst), 4);
+    // A short, bounded look that no more come.
+    let until = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < until {
+        assert_eq!(told.load(Ordering::SeqCst), 4);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    p.stop_all();
+}
+
+#[test]
 fn remote_mode_reclaims_and_runs_no_server() {
     let rig = Rig::new();
     let o = orphan_sleep();
@@ -389,5 +432,137 @@ fn a_start_reads_the_config_inside_its_lock() {
         Some(true),
         "the probe read the config outside the lock"
     );
+    p.stop_all();
+}
+
+#[test]
+fn changing_the_markdown_folder_restarts_the_pipeline() {
+    let rig = Rig::new();
+    rig.listen_on(free_port());
+    rig.hold_the_writer_lock(326);
+    let p = rig.processes(Path::new("/bin/sleep"));
+    let with = |dir: &str| AppConfig {
+        account: Some("jordi".into()),
+        markdown_dirs: [("jordi".to_owned(), PathBuf::from(dir))].into(),
+        ..rig.config()
+    };
+    let said = |dir: &str| {
+        let want = format!("--markdown-dir jordi={dir}");
+        let p = &p;
+        wait_until(move || p.pipeline().log().iter().any(|l| l.contains(&want)))
+    };
+    p.start_all(&with("/a"));
+    let server = running_pid(p.server());
+    let first = running_pid(p.pipeline());
+    assert!(said("/a"), "{:?}", p.pipeline().log());
+    // The app's own pipeline holds the writer lock, as the real one does for its whole run.
+    assert!(wait_until(|| probe::pipeline_lock(&rig.data())));
+
+    // The same arguments start nothing again.
+    p.relaunch_pipeline_with(|| with("/a"));
+    assert_eq!(running_pid(p.pipeline()), first);
+
+    // Another folder: the pipeline starts again with it; the server runs on.
+    p.relaunch_pipeline_with(|| with("/b"));
+    assert!(said("/b"), "{:?}", p.pipeline().log());
+    let second = running_pid(p.pipeline());
+    assert_ne!(second, first);
+    assert!(!alive(first), "the old pipeline still runs");
+    assert_eq!(running_pid(p.server()), server);
+
+    // After Stop, a new folder starts nothing.
+    p.stop_all();
+    p.relaunch_pipeline_with(|| with("/c"));
+    assert_eq!(p.pipeline().state(), ChildState::Stopped);
+    assert_eq!(p.server().state(), ChildState::Stopped);
+}
+
+#[test]
+fn a_quit_during_the_stop_of_the_old_pipeline_starts_none() {
+    let rig = Rig::new();
+    rig.listen_on(free_port());
+    rig.hold_the_writer_lock(328);
+    let p = rig.processes(Path::new("/bin/sleep"));
+    let with = |dir: &str| AppConfig {
+        account: Some("jordi".into()),
+        markdown_dirs: [("jordi".to_owned(), PathBuf::from(dir))].into(),
+        ..rig.config()
+    };
+    p.start_all(&with("/a"));
+    let first = running_pid(p.pipeline());
+    // Quit sets its flag at once and then waits for the relaunch to end: here it comes after
+    // the relaunch read the config, while the old pipeline stops.
+    p.relaunch_pipeline_with(|| {
+        p.quitting.store(true, Ordering::SeqCst);
+        with("/b")
+    });
+    assert!(!alive(first), "the old pipeline still runs");
+    assert_eq!(p.pipeline().state(), ChildState::Stopped);
+    p.quit();
+}
+
+#[test]
+fn a_log_in_and_a_log_out_restart_the_pipeline() {
+    use crate::commands::{ConfigState, log_out_of, relaunch_pipeline};
+    use crate::login::LoginGate;
+    use crate::token::MemoryStore;
+    let rig = Rig::new();
+    rig.listen_on(free_port());
+    rig.hold_the_writer_lock(327);
+    let config_dir = rig.dir.path().join("config");
+    crate::config::save(&config_dir, &rig.config()).unwrap();
+    let state = ConfigState::load(config_dir);
+    let p = Arc::new(rig.processes(Path::new("/bin/sleep")));
+    let got = |p: &Processes| -> Vec<String> {
+        p.pipeline()
+            .log()
+            .into_iter()
+            .filter(|l| l.starts_with("got: "))
+            .collect()
+    };
+    p.start_with(|| state.current());
+    let first = running_pid(p.pipeline());
+    assert!(wait_until(|| got(&p).len() == 1));
+    assert!(!got(&p)[0].contains("--markdown-dir"), "{:?}", got(&p));
+    assert!(wait_until(|| probe::pipeline_lock(&rig.data())));
+
+    // A log in saves the account (login::log_in), then the command relaunches the pipeline.
+    state
+        .try_update(|c| {
+            c.account = Some("jordi".into());
+            Ok::<(), ()>(())
+        })
+        .ok()
+        .unwrap();
+    relaunch_pipeline(&state, &p);
+    let want = format!(
+        "--markdown-dir jordi={}",
+        crate::config::default_markdown_dir().display()
+    );
+    assert!(
+        wait_until(|| got(&p).len() == 2 && got(&p)[1].contains(&want)),
+        "{:?}",
+        p.pipeline().log()
+    );
+    let second = running_pid(p.pipeline());
+    assert_ne!(second, first);
+    assert!(wait_until(|| probe::pipeline_lock(&rig.data())));
+
+    // A log out forgets the account: the pipeline runs again without the folder.
+    log_out_of(
+        &LoginGate::default(),
+        &MemoryStore::new(),
+        &state,
+        &crate::library::idle(),
+    )
+    .unwrap();
+    relaunch_pipeline(&state, &p);
+    assert!(
+        wait_until(|| got(&p).len() == 3),
+        "{:?}",
+        p.pipeline().log()
+    );
+    assert!(!got(&p)[2].contains("--markdown-dir"), "{:?}", got(&p));
+    assert_ne!(running_pid(p.pipeline()), second);
     p.stop_all();
 }

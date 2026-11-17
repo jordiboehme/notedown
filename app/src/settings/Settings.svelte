@@ -18,6 +18,7 @@
   import ServerPage from "./pages/ServerPage.svelte";
   import SetupPage from "./pages/SetupPage.svelte";
   import SupernotePage from "./pages/SupernotePage.svelte";
+  import "../lib/system.css";
   import "./settings.css";
 
   // The settings window: the sidebar with the grouped pages on the left, the page on the

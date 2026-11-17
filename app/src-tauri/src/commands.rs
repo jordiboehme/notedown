@@ -8,15 +8,37 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::config::{self, AppConfig, Mode, StartView};
+use crate::library::{Choice, Entry, Job, Key, Library, Listed, RecyclePage, StateView, UploadAsk};
+use crate::login::{self, LoginError, LoginGate, Password};
 use crate::model::{ModelControl, ModelState};
+use crate::notes::{NoteSummary, Notes};
 use crate::poller::Poller;
 use crate::processes::{ProcessStates, Processes};
+use crate::review::{DataUrl, NoteView, Review};
+use crate::serve_info::ServeInfo;
 use crate::status::Status;
 use crate::token::{KeychainStore, TokenStore, token_key};
-use crate::windows::{self, WindowKind};
+use crate::windows::{self, Opening, WindowKind};
 
 /// How the config is written to its folder: [`config::save`], or a slow one in tests.
 pub type SaveFn = Arc<dyn Fn(&Path, &AppConfig) -> std::io::Result<()> + Send + Sync>;
+
+/// The config after a change, and a Keychain problem that the change could not fix (an old
+/// login that could not be removed), as a sentence to show.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigAnswer {
+    pub config: AppConfig,
+    pub keychain: Option<String>,
+}
+
+/// Why [`ConfigState::try_update`] changed nothing.
+pub enum TryUpdateError<E> {
+    /// The change refused.
+    Refused(E),
+    /// The save failed.
+    NotSaved(String),
+}
 
 /// The live config and the folder it is saved in.
 #[derive(Clone)]
@@ -92,13 +114,32 @@ impl ConfigState {
     /// The save (with its fsync) runs outside the config's lock, so a read never waits for
     /// it; the new config is swapped in under a short lock afterwards.
     fn update(&self, change: impl FnOnce(&mut AppConfig)) -> Result<AppConfig, String> {
+        self.try_update(|c| {
+            change(c);
+            Ok::<(), ()>(())
+        })
+        .map(|(_, next)| next)
+        .map_err(|e| match e {
+            TryUpdateError::NotSaved(why) => why,
+            TryUpdateError::Refused(()) => unreachable!("the change never refuses"),
+        })
+    }
+
+    /// [`update`](Self::update) with a change that may refuse, made while no other change
+    /// runs. Answers the config it replaced and the new one.
+    pub fn try_update<E>(
+        &self,
+        change: impl FnOnce(&mut AppConfig) -> Result<(), E>,
+    ) -> Result<(AppConfig, AppConfig), TryUpdateError<E>> {
         let _saving = self.saving.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut next = self.current();
-        change(&mut next);
-        (self.save)(&self.dir, &next).map_err(|e| format!("the config was not saved: {e}"))?;
+        let before = self.current();
+        let mut next = before.clone();
+        change(&mut next).map_err(TryUpdateError::Refused)?;
+        (self.save)(&self.dir, &next)
+            .map_err(|e| TryUpdateError::NotSaved(format!("the config was not saved: {e}")))?;
         *self.config.lock().unwrap_or_else(PoisonError::into_inner) = next.clone();
         self.reset.store(false, Ordering::SeqCst);
-        Ok(next)
+        Ok((before, next))
     }
 
     /// Sets where the server runs. Remote needs an `http://` or `https://` address; a folder
@@ -111,6 +152,18 @@ impl ConfigState {
         data_dir: Option<PathBuf>,
         server_url: Option<String>,
     ) -> Result<AppConfig, String> {
+        self.set_mode_replacing(mode, data_dir, server_url)
+            .map(|(_, next)| next)
+    }
+
+    /// [`set_mode`](Self::set_mode) that also answers the config it replaced, read under the
+    /// same lock as the change.
+    pub fn set_mode_replacing(
+        &self,
+        mode: Mode,
+        data_dir: Option<PathBuf>,
+        server_url: Option<String>,
+    ) -> Result<(AppConfig, AppConfig), String> {
         let server_url = server_url
             .map(|u| u.trim().to_owned())
             .filter(|u| !u.is_empty());
@@ -118,7 +171,7 @@ impl ConfigState {
             return Err(NEEDS_ADDRESS.to_owned());
         }
         let data_dir = data_dir.map(|d| expand_home(&d)).transpose()?;
-        self.update(|c| {
+        self.try_update(|c| {
             let before = (c.mode, c.server_url.clone(), c.data_dir.clone());
             c.mode = mode;
             if let Some(dir) = data_dir {
@@ -132,13 +185,75 @@ impl ConfigState {
                 c.account = None;
                 c.email = None;
             }
+            // A kept account without a Markdown folder in the app gets the pipeline's, before
+            // the children start again with `--markdown-dir`.
+            c.seed_markdown_dir();
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .map_err(|e| match e {
+            TryUpdateError::NotSaved(why) => why,
+            TryUpdateError::Refused(never) => match never {},
         })
     }
 
     pub fn set_start_view(&self, view: StartView) -> Result<AppConfig, String> {
         self.update(|c| c.start_view = view)
     }
+
+    /// Gives the logged-in account the Markdown folder of the pipeline's own config when the
+    /// app has none for it yet ([`AppConfig::seed_markdown_dir`]), and saves it. Runs before
+    /// the pipeline starts with `--markdown-dir` (at the start of the app and at a login), so
+    /// the flag never replaces a folder the user set up for the pipeline. Nothing is saved
+    /// when there is nothing to add.
+    pub fn seed_markdown_dir(&self) -> Result<AppConfig, String> {
+        match self.try_update(|c| {
+            if c.seed_markdown_dir() {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }) {
+            Ok((_, next)) => Ok(next),
+            Err(TryUpdateError::Refused(())) => Ok(self.current()),
+            Err(TryUpdateError::NotSaved(why)) => Err(why),
+        }
+    }
+
+    /// Sets the Markdown folder of the logged-in account. The folder must be a full path (a
+    /// leading `~` is the home folder) outside the data folder: the pipeline refuses a folder
+    /// inside it. The check is [`inside`]: as written, as the pipeline compares, and also with
+    /// the links resolved. So the app is stricter than the pipeline: it also refuses a folder
+    /// that reaches into the data folder through a link, which the pipeline would take.
+    pub fn set_markdown_dir(&self, dir: PathBuf) -> Result<AppConfig, String> {
+        let dir = without_dots(&expand_home(&dir)?);
+        self.try_update(|c| {
+            let slug = c.account_slug().ok_or(NEEDS_ACCOUNT)?.to_owned();
+            if inside(&dir, &without_dots(&c.data_dir)) {
+                return Err(OUTSIDE_DATA);
+            }
+            c.markdown_dirs.insert(slug, dir);
+            Ok(())
+        })
+        .map(|(_, next)| next)
+        .map_err(|e| match e {
+            TryUpdateError::Refused(text) => text.to_owned(),
+            TryUpdateError::NotSaved(why) => why,
+        })
+    }
+
+    /// Forgets the account and the e-mail (Log out).
+    pub fn forget_login(&self) -> Result<AppConfig, String> {
+        self.update(|c| {
+            c.account = None;
+            c.email = None;
+        })
+    }
 }
+
+/// What the Markdown folder refuses without an account.
+pub const NEEDS_ACCOUNT: &str = "Log in to choose the Markdown folder.";
+/// What the Markdown folder refuses inside the data folder: the pipeline would refuse it too.
+pub const OUTSIDE_DATA: &str = "Choose a folder outside the Notedown data folder.";
 
 /// What Set refuses for Another machine without a web address.
 pub const NEEDS_ADDRESS: &str =
@@ -192,12 +307,83 @@ fn expand_home(dir: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Log out: deletes the token of the account in the config. The account stays, so the
-/// pipeline still knows whose notes it reads.
-pub fn log_out_of(store: &dyn TokenStore, config: &AppConfig) -> Result<(), String> {
-    match token_key(config) {
-        Some(key) => store.delete(&key).map_err(|e| e.to_string()),
-        None => Ok(()),
+/// Log out: deletes the token of the account in the config, then forgets the account and
+/// the e-mail. The answer is the config without them. It takes the login lock: a log out
+/// during a login waits for it and then removes the token it left, so none stays behind.
+/// The library binds again: its jobs end and it is logged out.
+pub fn log_out_of(
+    gate: &LoginGate,
+    store: &dyn TokenStore,
+    state: &ConfigState,
+    library: &Library,
+) -> Result<AppConfig, String> {
+    let forgotten = {
+        let _no_login = gate.hold();
+        if let Some(key) = token_key(&state.current()) {
+            store.delete(&key).map_err(|e| e.to_string())?;
+        }
+        state.forget_login()
+    };
+    // The token is gone also when the config was not saved. After the login lock, as after a
+    // login: the binding reads the Keychain.
+    library.relogin();
+    forgotten
+}
+
+/// Log in ([`login::log_in`]), then bind the library to the new login.
+pub fn log_in_to(
+    gate: &LoginGate,
+    state: &ConfigState,
+    serve_info: &ServeInfo,
+    store: &dyn TokenStore,
+    library: &Library,
+    email: &str,
+    password: &Password,
+) -> Result<ConfigAnswer, LoginError> {
+    let answer = login::log_in(gate, state, serve_info, store, email, password)?;
+    library.relogin();
+    Ok(answer)
+}
+
+/// An absolute path with `.` and `..` resolved as written, without asking the disk (as the
+/// pipeline's own check does).
+fn without_dots(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Whether `dir` is `data` or lies inside it: as written (`.` and `..` resolved, as the
+/// pipeline compares), or after the links are resolved (a symlinked folder, `/tmp` and
+/// `/private/tmp`, the case of an APFS name). Of a path that is not there yet, its deepest
+/// existing folder is resolved and the rest added as written.
+fn inside(dir: &Path, data: &Path) -> bool {
+    dir.starts_with(data) || resolved(dir).starts_with(resolved(data))
+}
+
+/// `path` with the links of its deepest existing part resolved; as it is when none resolves.
+fn resolved(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut part = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(part) {
+            return rest.iter().rev().fold(real, |acc, name| acc.join(name));
+        }
+        match (part.parent(), part.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                part = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
     }
 }
 
@@ -220,18 +406,29 @@ pub fn get_config(state: State<'_, ConfigState>) -> Result<AppConfig, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Saves the new place of the server; when the mode, the folder or the address changed, runs
-/// `restart` on a blocking thread of its own and waits for it. A refused change restarts
-/// nothing.
+/// Saves the new place of the server off the calling thread ([`change_place`]); when the
+/// mode, the folder or the address changed, runs `restart` on a blocking thread of its own and
+/// waits for it. A refused change restarts nothing.
+#[allow(clippy::too_many_arguments)]
 pub async fn set_mode_then(
     state: &ConfigState,
+    gate: Arc<LoginGate>,
+    store: Arc<dyn TokenStore>,
+    library: Library,
     mode: Mode,
     data_dir: Option<PathBuf>,
     server_url: Option<String>,
     restart: impl FnOnce() + Send + 'static,
-) -> Result<AppConfig, String> {
-    let before = state.current();
-    let config = state.set_mode(mode, data_dir, server_url)?;
+) -> Result<ConfigAnswer, String> {
+    let placing = state.clone();
+    let (before, answer) = tauri::async_runtime::spawn_blocking(move || {
+        change_place(
+            &gate, &*store, &placing, &library, mode, data_dir, server_url,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let config = &answer.config;
     let changed = (before.mode, &before.data_dir, &before.server_url)
         != (config.mode, &config.data_dir, &config.server_url);
     if changed {
@@ -239,7 +436,38 @@ pub async fn set_mode_then(
             .await
             .map_err(|e| e.to_string())?;
     }
-    Ok(config)
+    Ok(answer)
+}
+
+/// Saves the new place. When that forgets the account (another server), its token goes too,
+/// so no write token stays where Log out cannot reach it. It takes the login lock, so it never
+/// meets a running login half way. Answers the config it replaced and the new one. The library
+/// binds again when its server or its account changed.
+pub fn change_place(
+    gate: &LoginGate,
+    store: &dyn TokenStore,
+    state: &ConfigState,
+    library: &Library,
+    mode: Mode,
+    data_dir: Option<PathBuf>,
+    server_url: Option<String>,
+) -> Result<(AppConfig, ConfigAnswer), String> {
+    let (replaced, config, keychain) = {
+        let _no_login = gate.hold();
+        let (replaced, config) = state.set_mode_replacing(mode, data_dir, server_url)?;
+        let mut keychain = None;
+        if replaced.account.is_some()
+            && config.account.is_none()
+            && let Some(key) = token_key(&replaced)
+            && let Err(e) = store.delete(&key)
+        {
+            keychain = Some(login::old_login_kept(&e.0));
+        }
+        (replaced, config, keychain)
+    };
+    // After the login lock, as after a login: the binding reads the Keychain.
+    library.refresh();
+    Ok((replaced, ConfigAnswer { config, keychain }))
 }
 
 /// Sets where the server runs (the mode control on the Server page). When the mode, the folder
@@ -249,16 +477,25 @@ pub async fn set_mode_then(
 pub async fn set_mode(
     state: State<'_, ConfigState>,
     processes: State<'_, Arc<Processes>>,
+    gate: State<'_, Arc<LoginGate>>,
+    library: State<'_, Library>,
     mode: Mode,
     data_dir: Option<PathBuf>,
     server_url: Option<String>,
-) -> Result<AppConfig, String> {
+) -> Result<ConfigAnswer, String> {
     let processes = processes.inner().clone();
     let reader = state.reader();
     // The start reads the config inside its lock: the newest place wins.
-    set_mode_then(&state, mode, data_dir, server_url, move || {
-        processes.start_with(|| reader.current())
-    })
+    set_mode_then(
+        &state,
+        gate.inner().clone(),
+        Arc::new(KeychainStore::new()),
+        library.inner().clone(),
+        mode,
+        data_dir,
+        server_url,
+        move || processes.start_with(|| reader.current()),
+    )
     .await
 }
 
@@ -314,16 +551,23 @@ pub fn process_states(processes: State<'_, Arc<Processes>>) -> ProcessStates {
     processes.states()
 }
 
-/// Opens the library window. Async, so the window is made off the main thread.
+/// Opens the library window: at the review of the note at `note` (its path) when given, at New
+/// with `new_notes`, else as it is. Async, so the window is made off the main thread.
 #[tauri::command]
-pub async fn open_library(app: AppHandle) -> Result<(), String> {
-    windows::show_window(&app, WindowKind::Library, None).map_err(|e| e.to_string())
+pub async fn open_library(
+    app: AppHandle,
+    note: Option<String>,
+    new_notes: Option<bool>,
+) -> Result<(), String> {
+    let opening = windows::library_opening(note, new_notes);
+    windows::show_window(&app, WindowKind::Library, opening).map_err(|e| e.to_string())
 }
 
 /// Opens the settings window, at `page` when given.
 #[tauri::command]
 pub async fn open_settings(app: AppHandle, page: Option<String>) -> Result<(), String> {
-    windows::show_window(&app, WindowKind::Settings, page).map_err(|e| e.to_string())
+    let opening = page.map_or(Opening::Plain, Opening::Page);
+    windows::show_window(&app, WindowKind::Settings, opening).map_err(|e| e.to_string())
 }
 
 /// Quit: stops every child, then ends the app. Returns at once.
@@ -338,18 +582,440 @@ pub fn request_quit(app: AppHandle) {
     crate::request_quit(&app);
 }
 
-/// Log out: deletes the token from the Keychain, off the main thread, then polls again.
+/// Log in with an e-mail and a password, off the main thread: the client is made, used and
+/// dropped on a blocking thread. The answer is the config with the new account; the password
+/// and the token never come back. Then the library binds to the new login and the status polls
+/// again.
+#[tauri::command]
+pub async fn log_in(
+    config: State<'_, ConfigState>,
+    processes: State<'_, Arc<Processes>>,
+    poller: State<'_, Poller>,
+    gate: State<'_, Arc<LoginGate>>,
+    library: State<'_, Library>,
+    email: String,
+    password: String,
+) -> Result<ConfigAnswer, String> {
+    let state = config.inner().clone();
+    let gate = gate.inner().clone();
+    let library = library.inner().clone();
+    let serve_info = processes.serve_info();
+    let password = Password::new(password);
+    let saved = tauri::async_runtime::spawn_blocking(move || {
+        log_in_to(
+            &gate,
+            &state,
+            &serve_info,
+            &KeychainStore::new(),
+            &library,
+            &email,
+            &password,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    relaunch_pipeline(config.inner(), processes.inner());
+    poller.poll_now();
+    Ok(saved)
+}
+
+/// Starts the pipeline again when its arguments changed (another Markdown folder, or another
+/// account: the folder belongs to it), on a blocking thread that nobody waits for: the stop of
+/// the old pipeline can take its grace. The config is read inside the start's lock, so the
+/// newest wins.
+pub(crate) fn relaunch_pipeline(config: &ConfigState, processes: &Arc<Processes>) {
+    let reader = config.reader();
+    let processes = processes.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        processes.relaunch_pipeline_with(|| reader.current());
+    });
+}
+
+/// Whether the Keychain keeps a login for the account in the config, off the main thread.
+#[tauri::command]
+pub async fn has_login(config: State<'_, ConfigState>) -> Result<bool, String> {
+    let config = config.current();
+    tauri::async_runtime::spawn_blocking(move || login::has_login(&KeychainStore::new(), &config))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Log out: deletes the token from the Keychain, forgets the account and stops the library,
+/// off the main thread (where it may wait for a running login), then polls again.
 #[tauri::command]
 pub async fn log_out(
     config: State<'_, ConfigState>,
+    processes: State<'_, Arc<Processes>>,
     poller: State<'_, Poller>,
-) -> Result<(), String> {
-    let config = config.current();
-    tauri::async_runtime::spawn_blocking(move || log_out_of(&KeychainStore::new(), &config))
+    gate: State<'_, Arc<LoginGate>>,
+    library: State<'_, Library>,
+) -> Result<AppConfig, String> {
+    let state = config.inner().clone();
+    let gate = gate.inner().clone();
+    let library = library.inner().clone();
+    let after = tauri::async_runtime::spawn_blocking(move || {
+        log_out_of(&gate, &KeychainStore::new(), &state, &library)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    relaunch_pipeline(config.inner(), processes.inner());
+    poller.poll_now();
+    Ok(after)
+}
+
+/// The Markdown folder of the logged-in account (the OCR page); `null` without an account.
+#[tauri::command]
+pub fn markdown_dir(config: State<'_, ConfigState>) -> Option<String> {
+    config
+        .current()
+        .markdown_dir()
+        .map(|dir| dir.display().to_string())
+}
+
+/// Sets the Markdown folder of the logged-in account (Choose... on the OCR page) and answers
+/// it. When the pipeline's arguments changed, the pipeline starts again with them on a thread of
+/// its own after the answer (its stop can take the grace); the server runs on.
+#[tauri::command]
+pub async fn set_markdown_dir(
+    config: State<'_, ConfigState>,
+    processes: State<'_, Arc<Processes>>,
+    dir: PathBuf,
+) -> Result<Option<String>, String> {
+    let state = config.inner().clone();
+    let saved = tauri::async_runtime::spawn_blocking(move || state.set_markdown_dir(dir))
         .await
         .map_err(|e| e.to_string())??;
-    poller.poll_now();
+    relaunch_pipeline(config.inner(), processes.inner());
+    Ok(saved.markdown_dir().map(|dir| dir.display().to_string()))
+}
+
+/// Show in Finder for the Markdown folder: makes it when it is not there yet (the pipeline
+/// makes it too, with its first note), then `/usr/bin/open -- <dir>`.
+fn finder_command(dir: &Path) -> Result<std::process::Command, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("The folder could not be made: {e}"))?;
+    let mut command = std::process::Command::new("/usr/bin/open");
+    command.arg("--").arg(dir);
+    Ok(command)
+}
+
+/// Opens the Markdown folder of the logged-in account in the Finder, off the main thread.
+#[tauri::command]
+pub async fn show_markdown_dir(config: State<'_, ConfigState>) -> Result<(), String> {
+    let dir = config.current().markdown_dir().ok_or(NEEDS_ACCOUNT)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let status = finder_command(&dir)?.status().map_err(|e| e.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("The Finder did not open.".to_owned())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The state of the library, its text and its Settings page, for the library window when it
+/// opens; `null` before the first binding (a `state` event follows). It reads only what the
+/// library keeps: no call and no Keychain read.
+#[tauri::command]
+pub fn library_state(library: State<'_, Library>) -> Option<StateView> {
+    library.state()
+}
+
+/// The folder at `path` as loaded so far, with the cursor of its next page: the first page
+/// without `cursor`, else the page after it. `foldersOnly` lists only its folders (the tree).
+/// The calls run off the main thread.
+#[tauri::command]
+pub async fn library_list(
+    library: State<'_, Library>,
+    path: String,
+    cursor: Option<String>,
+    folders_only: Option<bool>,
+) -> Result<Listed, String> {
+    let library = library.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library.list(&path, cursor.as_deref(), folders_only.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
+/// A listing the library window shows: a folder, or only its folders (the tree).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShownListing {
+    pub path: String,
+    #[serde(default)]
+    pub folders_only: bool,
+}
+
+/// The listings the library window shows now, and whether it shows the recycle bin. The
+/// library keeps and follows only these, and lists only these again after a gap or a long
+/// pause; while the bin is shown it follows the events even without a listing, so a delete
+/// from elsewhere sends `recycle`. Async, so it never waits on the main thread.
+#[tauri::command]
+pub async fn library_shown(
+    library: State<'_, Library>,
+    listings: Vec<ShownListing>,
+    bin_shown: bool,
+) -> Result<(), String> {
+    let keys: Vec<Key> = listings
+        .iter()
+        .map(|l| Key::new(&l.path, l.folders_only))
+        .collect();
+    // The bin first: a step between the two calls never sees neither.
+    library.set_bin_shown(bin_shown);
+    library.set_shown(&keys);
     Ok(())
+}
+
+/// One file or folder by its id.
+#[tauri::command]
+pub async fn library_entry(library: State<'_, Library>, id: u64) -> Result<Entry, String> {
+    let library = library.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || library.entry(id))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// A page of the recycle bin: the first one without `cursor`.
+#[tauri::command]
+pub async fn library_recycle(
+    library: State<'_, Library>,
+    cursor: Option<String>,
+) -> Result<RecyclePage, String> {
+    let library = library.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || library.recycle(cursor.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// Runs a change of the library off the main thread and answers its job as it ended.
+async fn change(
+    library: &Library,
+    work: impl FnOnce(Library) -> Job + Send + 'static,
+) -> Result<Job, String> {
+    let library = library.clone();
+    tauri::async_runtime::spawn_blocking(move || work(library))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Makes the folder `name` in `parent`, as a change job.
+#[tauri::command]
+pub async fn library_new_folder(
+    library: State<'_, Library>,
+    parent: String,
+    name: String,
+) -> Result<Job, String> {
+    change(&library, move |l| l.new_folder(&parent, &name)).await
+}
+
+/// Renames the file or folder `id` to `name` in its folder, as a change job.
+#[tauri::command]
+pub async fn library_rename(
+    library: State<'_, Library>,
+    id: u64,
+    name: String,
+) -> Result<Job, String> {
+    change(&library, move |l| l.rename(id, &name)).await
+}
+
+/// Moves the file or folder `id` into the folder `toFolder`, as a change job.
+#[tauri::command]
+pub async fn library_move(
+    library: State<'_, Library>,
+    id: u64,
+    to_folder: String,
+) -> Result<Job, String> {
+    change(&library, move |l| l.move_to(id, &to_folder)).await
+}
+
+/// Moves the file or folder `id` to the recycle bin, as a change job.
+#[tauri::command]
+pub async fn library_delete(library: State<'_, Library>, id: u64) -> Result<Job, String> {
+    change(&library, move |l| l.delete(id)).await
+}
+
+/// Brings the bin item `key` back, at `path` or where it was, as a change job. A taken path
+/// answers the job as `asking` with the clash; the window asks for a name and calls again
+/// with `path`, which goes on with the same job.
+#[tauri::command]
+pub async fn library_restore(
+    library: State<'_, Library>,
+    key: String,
+    path: Option<String>,
+) -> Result<Job, String> {
+    change(&library, move |l| l.restore(&key, path.as_deref())).await
+}
+
+/// Removes every deleted item from the recycle bin for good, as a change job.
+#[tauri::command]
+pub async fn library_empty(library: State<'_, Library>) -> Result<Job, String> {
+    change(&library, |l| l.empty_bin()).await
+}
+
+/// Uploads the drop `drop_id` (files and folders dropped on the library window; Rust kept their
+/// paths) into `folder`. Answers a question to ask first, or none when the jobs are queued: the
+/// window then follows their `job` events. Call it again with `many` after "Upload 1,234
+/// files?", and with `packages` (true: go into them, false: leave them out) after the package
+/// question.
+#[tauri::command]
+pub async fn library_upload(
+    library: State<'_, Library>,
+    drop_id: u64,
+    folder: String,
+    many: Option<bool>,
+    packages: Option<bool>,
+) -> Result<Option<UploadAsk>, String> {
+    let library = library.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library.upload(drop_id, &folder, many.unwrap_or(false), packages)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The answer to an upload that asks about a name in the way: replace, keepBoth or skip.
+#[tauri::command]
+pub async fn library_answer(
+    library: State<'_, Library>,
+    job: u64,
+    choice: Choice,
+) -> Result<(), String> {
+    library.answer(job, choice)
+}
+
+/// Tries a failed upload again.
+#[tauri::command]
+pub async fn library_retry(library: State<'_, Library>, job: u64) -> Result<(), String> {
+    library.retry(job)
+}
+
+/// Cancels a job: an upload wherever it is, or a restore that asks for a name.
+#[tauri::command]
+pub async fn library_cancel(library: State<'_, Library>, job: u64) -> Result<(), String> {
+    library.cancel(job);
+    Ok(())
+}
+
+/// Cancel all: every job of the drop `drop_id` ends, and an unused drop is forgotten.
+#[tauri::command]
+pub async fn library_cancel_drop(library: State<'_, Library>, drop_id: u64) -> Result<(), String> {
+    library.cancel_drop(drop_id);
+    Ok(())
+}
+
+/// Downloads the file `id` into the Downloads folder: answers the queued `download` job, whose
+/// events follow. Retry and Cancel are `library_retry` and `library_cancel`.
+#[tauri::command]
+pub async fn library_download(library: State<'_, Library>, id: u64) -> Result<Job, String> {
+    let library = library.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || library.download(id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Show in Finder: `/usr/bin/open -R -- <path>`, only for a file Notedown downloaded in this
+/// run, by the path its job answered.
+#[tauri::command]
+pub async fn library_reveal(library: State<'_, Library>, path: String) -> Result<(), String> {
+    let library = library.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let status = library
+            .reveal_command(&path)?
+            .status()
+            .map_err(|e| e.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("The Finder did not open.".to_owned())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The notes with text the user has not opened since it came, newest first (the panel and the
+/// library). It scans the store first, off the main thread.
+#[tauri::command]
+pub async fn notes_new(notes: State<'_, Notes>) -> Result<Vec<NoteSummary>, String> {
+    let notes = notes.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || notes.new_notes())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Every note with text, newest first (the library's All notes). It scans the store first, off
+/// the main thread.
+#[tauri::command]
+pub async fn notes_all(notes: State<'_, Notes>) -> Result<Vec<NoteSummary>, String> {
+    let notes = notes.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || notes.all())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The library opened the note `key`: its text up to now is seen. Off the main thread.
+#[tauri::command]
+pub async fn note_seen(notes: State<'_, Notes>, key: String) -> Result<(), String> {
+    let notes = notes.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || notes.seen(&key))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The note at `path` for the review: the Markdown of each page from the pipeline's store, and
+/// whether it is catching up. Off the main thread (it scans the store and asks the server).
+#[tauri::command]
+pub async fn note_open(review: State<'_, Review>, path: String) -> Result<NoteView, String> {
+    let review = review.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || review.open(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Page `index` (0-based) of the note at `path` as a `data:image/png;base64,...` URL, rendered
+/// alone when it is not cached. Off the main thread: it may download the note and render.
+#[tauri::command]
+pub async fn note_page_image(
+    review: State<'_, Review>,
+    path: String,
+    index: usize,
+) -> Result<DataUrl, String> {
+    let review = review.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || review.page_image(&path, index))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The review of the note at `path` closed: its waiting calls end and its renders that no
+/// other review waits for are killed. Off the main thread.
+#[tauri::command]
+pub async fn note_close(review: State<'_, Review>, path: String) -> Result<(), String> {
+    let review = review.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || review.close(&path))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The review of the note at `path` does not show page `index` anymore (it went far out of
+/// view): its waiting call ends and its render stops when no other review waits for it. Off
+/// the main thread.
+#[tauri::command]
+pub async fn note_page_drop(
+    review: State<'_, Review>,
+    path: String,
+    index: usize,
+) -> Result<(), String> {
+    let review = review.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || review.drop_page(&path, index))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// The last lines of both children's output, for the Server page.
@@ -570,6 +1236,210 @@ mod tests {
     }
 
     #[test]
+    fn the_markdown_folder_is_saved_for_the_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        state
+            .set_mode(Mode::Local, Some("/data/notes".into()), None)
+            .unwrap();
+        // It belongs to the account: none, no folder.
+        assert_eq!(
+            state.set_markdown_dir("/md".into()).unwrap_err(),
+            NEEDS_ACCOUNT
+        );
+        state
+            .try_update(|c| {
+                c.account = Some("jordi".into());
+                Ok::<(), ()>(())
+            })
+            .ok()
+            .unwrap();
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let cfg = state.set_markdown_dir("~/Notes/md/".into()).unwrap();
+        assert_eq!(cfg.markdown_dir(), Some(home.join("Notes/md")));
+        let cfg = state.set_markdown_dir("/data/notes/../md".into()).unwrap();
+        assert_eq!(cfg.markdown_dirs["jordi"], PathBuf::from("/data/md"));
+        assert_eq!(
+            config::load(dir.path()).markdown_dir(),
+            Some(PathBuf::from("/data/md"))
+        );
+        // A folder next to the data folder with a longer name is outside it.
+        state.set_markdown_dir("/data/notes-md".into()).unwrap();
+    }
+
+    #[test]
+    fn the_seeded_markdown_folder_is_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let state = ConfigState::load(dir.path().join("config"));
+        state
+            .set_mode(Mode::Local, Some(data.clone()), None)
+            .unwrap();
+        state
+            .try_update(|c| {
+                c.account = Some("jordi".into());
+                Ok::<(), ()>(())
+            })
+            .ok()
+            .unwrap();
+        // Nothing in the pipeline's config: the default, and nothing is written for it.
+        let saved = std::fs::read_to_string(dir.path().join("config/config.json")).unwrap();
+        state.seed_markdown_dir().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config/config.json")).unwrap(),
+            saved
+        );
+        assert_eq!(
+            state.current().markdown_dir(),
+            Some(config::default_markdown_dir())
+        );
+        // The pipeline's entry is kept in the app config, so the OCR page shows it.
+        std::fs::write(
+            data.join("server.toml"),
+            "[pipeline.markdown_dirs]\njordi = \"/notes/md\"\n",
+        )
+        .unwrap();
+        state.seed_markdown_dir().unwrap();
+        assert_eq!(
+            config::load(&dir.path().join("config")).markdown_dirs["jordi"],
+            PathBuf::from("/notes/md")
+        );
+        // The app's entry wins from then on.
+        state.set_markdown_dir("/chosen/md".into()).unwrap();
+        state.seed_markdown_dir().unwrap();
+        assert_eq!(
+            state.current().markdown_dir(),
+            Some(PathBuf::from("/chosen/md"))
+        );
+    }
+
+    #[test]
+    fn set_mode_seeds_the_markdown_folder_of_a_kept_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let state = ConfigState::load(dir.path().join("config"));
+        state
+            .set_mode(Mode::Local, Some(data.clone()), None)
+            .unwrap();
+        state
+            .try_update(|c| {
+                c.account = Some("jordi".into());
+                Ok::<(), ()>(())
+            })
+            .ok()
+            .unwrap();
+        // The pipeline's config gets an entry; Set with the same server keeps the account.
+        std::fs::write(
+            data.join("server.toml"),
+            "[pipeline.markdown_dirs]\njordi = \"/notes/md\"\n",
+        )
+        .unwrap();
+        let cfg = state
+            .set_mode(Mode::Local, Some(data.clone()), None)
+            .unwrap();
+        assert_eq!(cfg.account.as_deref(), Some("jordi"));
+        assert_eq!(cfg.markdown_dir(), Some(PathBuf::from("/notes/md")));
+        assert_eq!(
+            config::load(&dir.path().join("config")).markdown_dirs["jordi"],
+            PathBuf::from("/notes/md")
+        );
+    }
+
+    #[test]
+    fn show_in_finder_makes_the_markdown_folder_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("Documents").join("Markdown");
+        let command = finder_command(&folder).unwrap();
+        assert!(folder.is_dir(), "the folder was not made");
+        assert_eq!(command.get_program(), "/usr/bin/open");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, [std::ffi::OsStr::new("--"), folder.as_os_str()]);
+        // A folder that is there already is fine.
+        finder_command(&folder).unwrap();
+        // A file in the way is an error, said plainly.
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        let err = finder_command(&file.join("md")).unwrap_err();
+        assert!(err.starts_with("The folder could not be made:"), "{err}");
+    }
+
+    #[test]
+    fn a_markdown_folder_inside_the_data_folder_is_refused_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("data").join("md")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let state = ConfigState::load(dir.path().join("config"));
+        let logged_in = |data: &Path| {
+            state
+                .set_mode(Mode::Local, Some(data.to_owned()), None)
+                .unwrap();
+            state
+                .try_update(|c| {
+                    c.account = Some("jordi".into());
+                    Ok::<(), ()>(())
+                })
+                .ok()
+                .unwrap();
+        };
+        // The data folder through the link, the choice by its real path, and the other way.
+        logged_in(&link.join("data"));
+        for inside in [real.join("data").join("md"), real.join("data").join("new")] {
+            assert_eq!(
+                state.set_markdown_dir(inside.clone()).unwrap_err(),
+                OUTSIDE_DATA,
+                "{inside:?}"
+            );
+        }
+        logged_in(&real.join("data"));
+        for inside in [link.join("data").join("md"), link.join("data/new/deeper")] {
+            assert_eq!(
+                state.set_markdown_dir(inside.clone()).unwrap_err(),
+                OUTSIDE_DATA,
+                "{inside:?}"
+            );
+        }
+        // Next to it is fine, through the link too.
+        state.set_markdown_dir(link.join("md")).unwrap();
+    }
+
+    #[test]
+    fn a_markdown_folder_inside_the_data_folder_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        state
+            .set_mode(Mode::Local, Some("/data/notes".into()), None)
+            .unwrap();
+        state
+            .try_update(|c| {
+                c.account = Some("jordi".into());
+                Ok::<(), ()>(())
+            })
+            .ok()
+            .unwrap();
+        for inside in [
+            "/data/notes",
+            "/data/notes/",
+            "/data/notes/md",
+            "/data/./notes/x/../md",
+        ] {
+            assert_eq!(
+                state.set_markdown_dir(inside.into()).unwrap_err(),
+                OUTSIDE_DATA,
+                "{inside}"
+            );
+        }
+        assert_eq!(
+            state.set_markdown_dir("md".into()).unwrap_err(),
+            NEEDS_FULL_PATH
+        );
+        assert!(state.current().markdown_dirs.is_empty());
+    }
+
+    #[test]
     fn set_mode_checks_its_input() {
         let dir = tempfile::tempdir().unwrap();
         let state = ConfigState::load(dir.path().to_owned());
@@ -721,12 +1591,16 @@ mod tests {
         let set = |mode, dir: &str| {
             tauri::async_runtime::block_on(set_mode_then(
                 &state,
+                Arc::new(LoginGate::default()),
+                Arc::new(crate::token::MemoryStore::new()),
+                crate::library::idle(),
                 mode,
                 Some(dir.into()),
                 None,
                 restart(&state),
             ))
             .unwrap()
+            .config
         };
         set(Mode::Local, "/data/a");
         // The same place again restarts nothing.
@@ -744,6 +1618,9 @@ mod tests {
         assert!(
             tauri::async_runtime::block_on(set_mode_then(
                 &state,
+                Arc::new(LoginGate::default()),
+                Arc::new(crate::token::MemoryStore::new()),
+                crate::library::idle(),
                 Mode::Remote,
                 None,
                 None,
@@ -754,21 +1631,31 @@ mod tests {
     }
 
     #[test]
-    fn log_out_deletes_the_token_only() {
+    fn log_out_deletes_the_token_and_forgets_the_account() {
         use crate::token::{MemoryStore, Token, TokenStore};
-        let store = MemoryStore::new();
+        let dir = tempfile::tempdir().unwrap();
         let config = AppConfig {
             mode: Mode::Local,
             account: Some("jordi".into()),
+            email: Some("me@example.org".into()),
             ..AppConfig::default()
         };
+        config::save(dir.path(), &config).unwrap();
+        let state = ConfigState::load(dir.path().to_path_buf());
+        let store = MemoryStore::new();
         store.set("local|jordi", &Token::new("secret")).unwrap();
         store.set("local|other", &Token::new("other")).unwrap();
-        log_out_of(&store, &config).unwrap();
+        let gate = LoginGate::default();
+        let after = log_out_of(&gate, &store, &state, &crate::library::idle()).unwrap();
         assert_eq!(store.get("local|jordi").unwrap(), None);
         assert!(store.get("local|other").unwrap().is_some());
+        assert_eq!(after.account, None);
+        assert_eq!(after.email, None);
+        assert_eq!(after.mode, Mode::Local);
+        assert_eq!(state.current(), after);
+        assert_eq!(config::load(dir.path()), after);
         // Without an account there is nothing to delete.
-        log_out_of(&store, &AppConfig::default()).unwrap();
+        log_out_of(&gate, &store, &state, &crate::library::idle()).unwrap();
     }
 
     #[test]

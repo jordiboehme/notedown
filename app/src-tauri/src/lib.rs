@@ -2,27 +2,36 @@
 
 pub mod commands;
 pub mod config;
+pub mod library;
+pub mod login;
 pub mod model;
+pub mod notes;
 pub mod pidfile;
 pub mod poller;
 pub mod probe;
 pub mod process;
 pub mod processes;
 pub mod quit;
+pub mod rest;
+pub mod review;
 pub mod serve_info;
 pub mod status;
 pub mod supervisor;
 #[cfg(test)]
 mod test_procs;
 pub mod token;
+pub mod transfer;
 pub mod tray;
 pub mod windows;
 
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
 
+use library::{LIBRARY_EVENT, Library, LibraryEvent};
 use model::{ModelControl, ModelEvent};
+use notes::{NOTES_EVENT, NOTES_EVERY, Notes};
 use poller::{Inputs, Poller, RealSources, TICK_EVERY};
 use process::ChildKind;
 use processes::{Options, Processes, REPROBE_EVERY};
@@ -69,11 +78,14 @@ pub fn run() {
                 .macos_launcher(tauri_plugin_autostart::MacosLauncher::LaunchAgent)
                 .build(),
         )
+        // The folder picker of the Markdown folder; only the settings window may open it.
+        .plugin(tauri_plugin_dialog::init())
         .menu(tray::app_menu)
         .on_menu_event(|app, event| tray::on_menu_event(app, event.id().as_ref()))
         .on_window_event(windows::on_window_event)
         .manage(Shown::default())
         .manage(Arc::new(QuitFlow::new()))
+        .manage(Arc::new(login::LoginGate::default()))
         .setup(|app| {
             // A menu bar app: no Dock icon until a library or settings window shows. The
             // Info.plist says so too (LSUIElement), so the bundle never shows one at launch.
@@ -82,8 +94,18 @@ pub fn run() {
             tray::build(app.handle())?;
             app.manage(windows::PollerVisibility::start(app.handle()));
             let config_dir = app.path().app_config_dir()?;
-            let config = commands::ConfigState::load(config_dir);
+            let config = commands::ConfigState::load(config_dir.clone());
+            // Before the pipeline first starts with `--markdown-dir`: an account without a
+            // Markdown folder in the app keeps the one the pipeline was set up with.
+            if let Err(why) = config.seed_markdown_dir() {
+                eprintln!("notedown: the Markdown folder was not kept: {why}");
+            }
             let reader = config.reader();
+            let library_reader = config.reader();
+            let notes = notes_for(app.handle().clone(), config.reader(), config_dir);
+            notes.start_scanning(NOTES_EVERY);
+            let library_notes = notes.clone();
+            app.manage(notes);
             app.manage(config);
             let sidecar = process::sidecar_path()?;
             let sidecar_spawn = process::spawn_program(sidecar.clone());
@@ -97,8 +119,38 @@ pub fn run() {
                 pipeline_grace: ChildKind::Pipeline.grace(),
             }));
             app.manage(model_control(app.handle().clone(), sidecar_spawn.clone()));
-            let poller = status_poller(sidecar_spawn, reader, processes.clone());
-            report_states(app.handle().clone(), &processes, poller.clone());
+            let poller = status_poller(sidecar_spawn.clone(), reader, processes.clone());
+            let library = library_for(
+                app.handle().clone(),
+                library_reader,
+                processes.clone(),
+                library_notes,
+            );
+            // The review renders pages with the sidecar into the app cache. It holds the
+            // library and the notes index; neither holds it.
+            app.manage(review::Review::new(
+                library.clone(),
+                app.state::<Notes>().inner().clone(),
+                sidecar_spawn.clone(),
+                app.path().app_cache_dir()?,
+                rest::monotonic_clock(),
+                review::CACHE_LIMIT,
+            ));
+            let rebind = library_worker(library.clone());
+            library.start_following(library::FOLLOW_EVERY);
+            app.manage(library);
+            let serve_rebind = rebind.clone();
+            processes.on_serve_info(move || {
+                let _ = serve_rebind.send(());
+            });
+            report_states(
+                app.handle().clone(),
+                &processes,
+                poller.clone(),
+                rebind.clone(),
+            );
+            // The first binding reads the Keychain: on the library's own thread.
+            let _ = rebind.send(());
             report_status(app.handle().clone(), &poller);
             app.manage(processes);
             app.manage(poller.clone());
@@ -118,6 +170,8 @@ pub fn run() {
             commands::open_settings,
             commands::quit_app,
             commands::request_quit,
+            commands::log_in,
+            commands::has_login,
             commands::log_out,
             commands::process_logs,
             commands::mcp_info,
@@ -127,7 +181,35 @@ pub fn run() {
             commands::model_state,
             commands::model_pull,
             commands::model_pause,
-            commands::model_remove
+            commands::model_remove,
+            commands::library_state,
+            commands::library_list,
+            commands::library_entry,
+            commands::library_recycle,
+            commands::library_shown,
+            commands::library_new_folder,
+            commands::library_rename,
+            commands::library_move,
+            commands::library_delete,
+            commands::library_restore,
+            commands::library_empty,
+            commands::library_upload,
+            commands::library_answer,
+            commands::library_retry,
+            commands::library_cancel,
+            commands::library_cancel_drop,
+            commands::library_download,
+            commands::library_reveal,
+            commands::notes_new,
+            commands::notes_all,
+            commands::note_seen,
+            commands::note_open,
+            commands::note_page_image,
+            commands::note_close,
+            commands::note_page_drop,
+            commands::markdown_dir,
+            commands::set_markdown_dir,
+            commands::show_markdown_dir
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
@@ -212,6 +294,10 @@ pub fn reprobe_outside(app: &AppHandle) {
 fn stop_for_good(app: &AppHandle) {
     if let Some(poller) = app.try_state::<Poller>() {
         poller.stop();
+    }
+    // Kills the running renders; it does not wait.
+    if let Some(review) = app.try_state::<review::Review>() {
+        review.quit();
     }
     let model = app.try_state::<ModelControl>().map(|m| m.inner().clone());
     std::thread::scope(|s| {
@@ -312,10 +398,92 @@ fn report_status(app: AppHandle, poller: &Poller) {
     });
 }
 
-/// Sends every state change to the webview and makes the status again. The supervisors'
-/// listeners only put the change into a channel, which never blocks; a thread of its own emits
-/// the events.
-fn report_states(app: AppHandle, processes: &Processes, poller: Poller) {
+/// The library of the account in the config. It reads the config and the server's start lines
+/// through handles of their own, so it holds no handle to the app; its events go into a
+/// channel, and a thread of its own sends them to the library window. Each binding (the start,
+/// a login, a log out, a new place) also wakes a scan of the notes, so a new account gets its
+/// baseline at its login.
+fn library_for(
+    app: AppHandle,
+    config: commands::ConfigReader,
+    processes: Arc<Processes>,
+    notes: Notes,
+) -> Library {
+    // The Downloads folder in the user's home. Nothing reads it before the first download.
+    let downloads = app
+        .path()
+        .home_dir()
+        .ok()
+        .map(|home| home.join("Downloads"));
+    let (tx, rx) = mpsc::channel::<LibraryEvent>();
+    std::thread::spawn(move || {
+        for event in rx {
+            if let LibraryEvent::Relist { leave } = &event {
+                notes.wake();
+                // Another account (a login, a log out, another server) leaves the review: the
+                // window shows another place, and no render of the old one runs on. Looked up
+                // per event, so the review is not held here (it holds the library).
+                if *leave && let Some(review) = app.try_state::<review::Review>() {
+                    review.close_all();
+                }
+            }
+            let _ = app.emit_to(windows::WindowKind::Library.label(), LIBRARY_EVENT, event);
+        }
+    });
+    let library = Library::new(
+        Arc::new(KeychainStore::new()),
+        Arc::new(move || (config.current(), processes.serve_info())),
+        Arc::new(move |event| {
+            let _ = tx.send(event);
+        }),
+    );
+    if let Some(downloads) = downloads {
+        library.set_downloads(downloads);
+    }
+    library
+}
+
+/// The notes index of the account in the config. It reads the config through a handle of its
+/// own; its events go into a channel, and a thread of its own tells the panel and the library.
+fn notes_for(app: AppHandle, config: commands::ConfigReader, config_dir: PathBuf) -> Notes {
+    let (tx, rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        for () in rx {
+            for kind in [windows::WindowKind::Panel, windows::WindowKind::Library] {
+                let _ = app.emit_to(kind.label(), NOTES_EVENT, ());
+            }
+        }
+    });
+    Notes::new(
+        Arc::new(move || {
+            let config = config.current();
+            (config.data_dir, config.account)
+        }),
+        config_dir,
+        Arc::new(move || {
+            let _ = tx.send(());
+        }),
+    )
+}
+
+/// The thread that binds the library again when the server's address may have changed (a new
+/// start line, a new state of the server) and once at start. A send never blocks; sends that
+/// pile up while it binds make one binding.
+fn library_worker(library: Library) -> mpsc::Sender<()> {
+    let (tx, rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        while rx.recv().is_ok() {
+            while rx.try_recv().is_ok() {}
+            library.refresh();
+        }
+    });
+    tx
+}
+
+/// Sends every state change to the webview, makes the status again and tells the library,
+/// whose address may have changed with the server. The supervisors' listeners only put the
+/// change into a channel, which never blocks; a thread of its own emits the events.
+fn report_states(app: AppHandle, processes: &Processes, poller: Poller, rebind: mpsc::Sender<()>) {
     let (tx, rx) = mpsc::channel::<ProcessStateEvent>();
     for sup in [processes.server(), processes.pipeline()] {
         let tx = tx.clone();
@@ -331,6 +499,7 @@ fn report_states(app: AppHandle, processes: &Processes, poller: Poller) {
         for event in rx {
             let _ = app.emit(PROCESS_STATE_EVENT, event);
             poller.refresh();
+            let _ = rebind.send(());
         }
     });
 }
@@ -407,7 +576,7 @@ mod tests {
         names.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    const SETTINGS_ONLY: [&str; 16] = [
+    const SETTINGS_ONLY: [&str; 21] = [
         "get_config",
         "set_mode",
         "set_start_view",
@@ -415,6 +584,8 @@ mod tests {
         "stop_processes",
         "set_autostart",
         "get_autostart",
+        "log_in",
+        "has_login",
         "log_out",
         "model_pull",
         "model_pause",
@@ -424,6 +595,9 @@ mod tests {
         "process_logs",
         "open_link",
         "process_states",
+        "markdown_dir",
+        "set_markdown_dir",
+        "show_markdown_dir",
     ];
 
     #[test]
@@ -432,30 +606,68 @@ mod tests {
             granted("panel"),
             set(&[
                 "get_status",
+                "notes_new",
                 "open_library",
                 "open_settings",
                 "request_quit",
                 "quit_app"
             ])
         );
-        assert_eq!(granted("library"), set(&[]));
+        assert_eq!(
+            granted("library"),
+            set(&[
+                "get_status",
+                // The view button reads the saved start view and saves a new one.
+                "get_config",
+                "set_start_view",
+                "library_state",
+                "library_list",
+                "library_entry",
+                "library_recycle",
+                "library_shown",
+                "library_new_folder",
+                "library_rename",
+                "library_move",
+                "library_delete",
+                "library_restore",
+                "library_empty",
+                "library_upload",
+                "library_answer",
+                "library_retry",
+                "library_cancel",
+                "library_cancel_drop",
+                "library_download",
+                "library_reveal",
+                "notes_new",
+                "notes_all",
+                "note_seen",
+                "note_open",
+                "note_page_image",
+                "note_close",
+                "note_page_drop",
+                "open_settings"
+            ])
+        );
         let mut settings = set(&SETTINGS_ONLY);
         settings.remove("process_states");
         settings.insert("get_status".into());
         assert_eq!(granted("settings"), settings);
         for command in SETTINGS_ONLY {
             assert!(!granted("panel").contains(command), "panel has {command}");
-            assert!(
-                !granted("library").contains(command),
-                "library has {command}"
-            );
+            // The library shares only the start view with the settings.
+            if !["get_config", "set_start_view"].contains(&command) {
+                assert!(
+                    !granted("library").contains(command),
+                    "library has {command}"
+                );
+            }
         }
     }
 
     #[test]
     fn the_capabilities_are_one_file_per_window_that_calls_tauri() {
         let names: Vec<String> = capability_files().into_iter().map(|(n, _)| n).collect();
-        assert_eq!(names, ["panel.json", "settings.json"]);
+        assert_eq!(names, ["library.json", "panel.json", "settings.json"]);
     }
 
     #[test]
@@ -470,17 +682,22 @@ mod tests {
             ])
         );
         // The settings follow events, name the window after the page and show the version.
+        // They alone open the folder picker of the Markdown folder.
         assert_eq!(
             core("settings"),
             set(&[
                 "core:app:allow-version",
+                "dialog:allow-open",
                 "core:event:allow-listen",
                 "core:event:allow-unlisten",
                 "core:window:allow-set-title",
             ])
         );
-        // The library placeholder calls nothing.
-        assert_eq!(permissions("library"), set(&[]));
+        // The library follows its events.
+        assert_eq!(
+            core("library"),
+            set(&["core:event:allow-listen", "core:event:allow-unlisten"])
+        );
     }
 
     /// The commands of `generate_handler!` in this file.
@@ -501,7 +718,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 21);
+        assert_eq!(handler_commands().len(), 51);
     }
 
     #[test]
@@ -518,6 +735,8 @@ mod tests {
             "open_settings",
             "quit_app",
             "request_quit",
+            "log_in",
+            "has_login",
             "log_out",
             "process_logs",
             "mcp_info",
@@ -528,11 +747,96 @@ mod tests {
             "model_pull",
             "model_pause",
             "model_remove",
+            "library_state",
+            "library_list",
+            "library_entry",
+            "library_recycle",
+            "library_shown",
+            "library_new_folder",
+            "library_rename",
+            "library_move",
+            "library_delete",
+            "library_restore",
+            "library_empty",
+            "library_upload",
+            "library_answer",
+            "library_retry",
+            "library_cancel",
+            "library_cancel_drop",
+            "library_download",
+            "library_reveal",
+            "notes_new",
+            "notes_all",
+            "note_seen",
+            "note_open",
+            "note_page_image",
+            "note_close",
+            "note_page_drop",
+            "markdown_dir",
+            "set_markdown_dir",
+            "show_markdown_dir",
         ]);
         assert_eq!(manifest_commands(), all);
         // Every granted command is a real one.
         for window in ["panel", "library", "settings"] {
             assert!(granted(window).is_subset(&all), "{window}");
+        }
+    }
+
+    #[test]
+    fn library_state_is_only_the_librarys() {
+        for window in ["panel", "settings"] {
+            for command in [
+                "library_state",
+                "library_list",
+                "library_entry",
+                "library_recycle",
+                "library_shown",
+                "library_new_folder",
+                "library_rename",
+                "library_move",
+                "library_delete",
+                "library_restore",
+                "library_empty",
+                "library_upload",
+                "library_answer",
+                "library_retry",
+                "library_cancel",
+                "library_cancel_drop",
+                "library_download",
+                "library_reveal",
+            ] {
+                assert!(!granted(window).contains(command), "{window} has {command}");
+            }
+        }
+    }
+
+    #[test]
+    fn notes_new_is_the_panels_and_the_librarys_and_the_rest_only_the_librarys() {
+        for window in ["panel", "library"] {
+            assert!(granted(window).contains("notes_new"), "{window}");
+        }
+        assert!(!granted("settings").contains("notes_new"));
+        for command in ["notes_all", "note_seen"] {
+            assert!(granted("library").contains(command), "{command}");
+            for window in ["panel", "settings"] {
+                assert!(!granted(window).contains(command), "{window} has {command}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_review_is_only_the_librarys() {
+        for command in [
+            "note_open",
+            "note_page_image",
+            "note_close",
+            "note_page_drop",
+        ] {
+            assert!(granted("library").contains(command), "{command}");
+            for window in ["panel", "settings"] {
+                assert!(!granted(window).contains(command), "{window} has {command}");
+            }
         }
     }
 

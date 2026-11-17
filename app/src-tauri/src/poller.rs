@@ -537,7 +537,7 @@ impl Sources for RealSources {
 }
 
 /// Whether `base` is on this Mac: a loopback address or `localhost`.
-fn is_loopback(base: &str) -> bool {
+pub(crate) fn is_loopback(base: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base) else {
         return false;
     };
@@ -552,7 +552,7 @@ fn is_loopback(base: &str) -> bool {
 }
 
 /// The address for a line of text, without a user or a password in it.
-fn shown(base: &str) -> String {
+pub(crate) fn shown(base: &str) -> String {
     match reqwest::Url::parse(base) {
         Ok(mut url) => {
             let _ = url.set_username("");

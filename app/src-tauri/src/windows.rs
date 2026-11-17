@@ -5,6 +5,9 @@ use std::sync::mpsc::Sender;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
+use serde::Serialize;
+use serde_json::Value;
+
 use tauri::{
     AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
@@ -78,6 +81,68 @@ pub fn visibility_worker(
 
 /// The event that tells an open settings window which page to show: a page name.
 pub const SETTINGS_PAGE_EVENT: &str = "settings-page";
+
+/// The event that tells an open library window where to go: a [`LibraryAt`].
+pub const LIBRARY_AT_EVENT: &str = "library-at";
+
+/// Where the library window opens: at a note (its review), or at New.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "at", rename_all = "camelCase")]
+pub enum LibraryAt {
+    Note { path: String },
+    New,
+}
+
+/// How a window is opened: as it is, at a settings page, or at a place of the library.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Opening {
+    Plain,
+    Page(String),
+    At(LibraryAt),
+}
+
+/// What a window is told about its opening: a new window by its init script (it runs before
+/// the page's code), an open one by an event.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Tell {
+    Script(String),
+    Emit(&'static str, serde_json::Value),
+}
+
+/// Where `open_library(note, new_notes)` opens the library: at the note (its path) when given,
+/// at New with `new_notes`, else as it is.
+pub fn library_opening(note: Option<String>, new_notes: Option<bool>) -> Opening {
+    match (note, new_notes) {
+        (Some(path), _) => Opening::At(LibraryAt::Note { path }),
+        (None, Some(true)) => Opening::At(LibraryAt::New),
+        (None, _) => Opening::Plain,
+    }
+}
+
+/// What the window `kind` is told when it opens as `opening`; `open` says it exists already.
+/// The value goes into the script as JSON, so a path is never code.
+pub fn tell(kind: WindowKind, opening: &Opening, open: bool) -> Option<Tell> {
+    let (name, event, value) = match (kind, opening) {
+        (WindowKind::Settings, Opening::Page(page)) => (
+            "__NOTEDOWN_PAGE__",
+            SETTINGS_PAGE_EVENT,
+            serde_json::to_value(page).ok()?,
+        ),
+        (WindowKind::Settings, _) => ("__NOTEDOWN_PAGE__", SETTINGS_PAGE_EVENT, Value::Null),
+        (WindowKind::Library, Opening::At(at)) => (
+            "__NOTEDOWN_AT__",
+            LIBRARY_AT_EVENT,
+            serde_json::to_value(at).ok()?,
+        ),
+        (WindowKind::Library, _) => ("__NOTEDOWN_AT__", LIBRARY_AT_EVENT, Value::Null),
+        (WindowKind::Panel, _) => return None,
+    };
+    if open {
+        (!value.is_null()).then_some(Tell::Emit(event, value))
+    } else {
+        Some(Tell::Script(format!("window.{name} = {value};")))
+    }
+}
 
 /// The width of the panel in logical pixels.
 pub const PANEL_WIDTH: f64 = 340.0;
@@ -194,15 +259,15 @@ fn tell_poller(app: &AppHandle, panel_opened: bool) {
 
 /// Shows the library or the settings window, made on first use. Order: Regular, show,
 /// unminimize, focus.
-pub fn show_window(app: &AppHandle, kind: WindowKind, page: Option<String>) -> tauri::Result<()> {
+pub fn show_window(app: &AppHandle, kind: WindowKind, opening: Opening) -> tauri::Result<()> {
     let window = match app.get_webview_window(kind.label()) {
         Some(window) => {
-            if let Some(page) = &page {
-                let _ = window.emit_to(kind.label(), SETTINGS_PAGE_EVENT, page);
+            if let Some(Tell::Emit(event, value)) = tell(kind, &opening, true) {
+                let _ = window.emit_to(kind.label(), event, value);
             }
             window
         }
-        None => build_window(app, kind, page.as_deref())?,
+        None => build_window(app, kind, &opening)?,
     };
     let shown = app.state::<Shown>();
     let mut visible = shown.visible();
@@ -213,30 +278,32 @@ pub fn show_window(app: &AppHandle, kind: WindowKind, page: Option<String>) -> t
     window.set_focus()?;
     shown.set(kind, true);
     tell_poller(app, false);
+    tell_library(app, kind, true);
+    tell_notes(app);
     Ok(())
 }
 
 fn build_window(
     app: &AppHandle,
     kind: WindowKind,
-    page: Option<&str>,
+    opening: &Opening,
 ) -> tauri::Result<WebviewWindow> {
     let builder =
         WebviewWindowBuilder::new(app, kind.label(), WebviewUrl::App("index.html".into()))
             .visible(false);
     let builder = match kind {
-        WindowKind::Settings => {
-            let page = serde_json::to_string(&page).unwrap_or_else(|_| "null".into());
-            builder
-                .title("Notedown Settings")
-                .inner_size(720.0, 540.0)
-                .min_inner_size(640.0, 460.0)
-                .initialization_script(format!("window.__NOTEDOWN_PAGE__ = {page};"))
-        }
+        WindowKind::Settings => builder
+            .title("Notedown Settings")
+            .inner_size(720.0, 540.0)
+            .min_inner_size(640.0, 460.0),
         _ => builder
             .title("Notedown Library")
             .inner_size(960.0, 640.0)
             .min_inner_size(640.0, 460.0),
+    };
+    let builder = match tell(kind, opening, false) {
+        Some(Tell::Script(script)) => builder.initialization_script(script),
+        _ => builder,
     };
     builder.build()
 }
@@ -249,6 +316,36 @@ pub fn hide_window(app: &AppHandle, kind: WindowKind) {
     let visible = app.state::<Shown>().set(kind, false);
     apply_policy(app, &visible);
     tell_poller(app, false);
+    tell_library(app, kind, false);
+    tell_notes(app);
+}
+
+/// Tells the library's follower that its window was shown or hidden: it follows the changes
+/// only while the window is visible. It never blocks (a flag and a wake of its thread).
+fn tell_library(app: &AppHandle, kind: WindowKind, visible: bool) {
+    if kind == WindowKind::Library
+        && let Some(library) = app.try_state::<crate::library::Library>()
+    {
+        library.set_visible(visible);
+    }
+    // A hidden library shows no review: its renders stop (short locks and signals only).
+    if kind == WindowKind::Library
+        && !visible
+        && let Some(review) = app.try_state::<crate::review::Review>()
+    {
+        review.close_all();
+    }
+}
+
+/// Tells the notes index whether a window that shows notes (the panel, the library) is
+/// visible: it scans the store only then. It never blocks (a flag and a wake of its thread).
+fn tell_notes(app: &AppHandle) {
+    if let Some(notes) = app.try_state::<crate::notes::Notes>() {
+        let shown = app.state::<Shown>();
+        notes.set_visible(
+            shown.is_visible(WindowKind::Panel) || shown.is_visible(WindowKind::Library),
+        );
+    }
 }
 
 /// Hides every window (Quit).
@@ -290,6 +387,7 @@ fn open_panel(app: &AppHandle, tray: Option<Area>, cursor: Option<(f64, f64)>) {
     let _ = panel.set_focus();
     app.state::<Shown>().set(WindowKind::Panel, true);
     tell_poller(app, true);
+    tell_notes(app);
     crate::reprobe_outside(app);
 }
 
@@ -325,7 +423,8 @@ fn place_panel(app: &AppHandle, panel: &WebviewWindow, area: Area, cursor: Optio
 }
 
 /// The window events of the app: closing a window hides it (a menu bar app never quits on a
-/// close), and the panel hides when it loses the focus.
+/// close), the panel hides when it loses the focus, and files dropped on the library are kept
+/// for an upload.
 pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
     let Some(kind) = WindowKind::from_label(window.label()) else {
         return;
@@ -335,6 +434,22 @@ pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
         WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
             hide_window(app, kind);
+        }
+        // Files dropped on the library: Rust keeps their paths, the window gets a drop id. A
+        // short lock and a channel send, so the main thread never waits.
+        WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position })
+            if kind == WindowKind::Library =>
+        {
+            if let Some(library) = app.try_state::<crate::library::Library>() {
+                // wry on macOS gives points of the web view; the event says physical pixels.
+                let scale = if cfg!(target_os = "macos") {
+                    window.scale_factor().unwrap_or(1.0)
+                } else {
+                    1.0
+                };
+                let (x, y) = drop_pixels(position.x, position.y, scale);
+                library.dropped(paths.clone(), x, y);
+            }
         }
         WindowEvent::Focused(false) if kind == WindowKind::Panel => {
             let shown = app.state::<Shown>();
@@ -347,10 +462,23 @@ pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
     }
 }
 
+/// A drop position in points of the web view as physical pixels of the web view.
+fn drop_pixels(x: f64, y: f64, scale: f64) -> (f64, f64) {
+    (x * scale, y * scale)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use WindowKind::*;
+
+    #[test]
+    fn a_drop_position_in_points_becomes_physical_pixels() {
+        // wry on macOS gives the drop in points of the web view (draggingLocation, flipped
+        // by the view's height), though the type says physical pixels.
+        assert_eq!(drop_pixels(120.4, 48.0, 2.0), (240.8, 96.0));
+        assert_eq!(drop_pixels(120.0, 48.0, 1.0), (120.0, 48.0));
+    }
 
     #[test]
     fn policy_follows_the_visible_windows() {
@@ -394,6 +522,80 @@ mod tests {
         gate_tx.send(()).unwrap();
         seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(*applied.lock().unwrap(), vec![(true, true), (false, false)]);
+    }
+
+    #[test]
+    fn open_library_at_a_note_tells_the_window() {
+        let at = Opening::At(LibraryAt::Note {
+            path: "/Note/Work/Plan \"A\" </script>.note".into(),
+        });
+        // A new window learns it from its init script, as JSON (quotes and tags escaped).
+        let Some(Tell::Script(script)) = tell(Library, &at, false) else {
+            panic!("no init script");
+        };
+        assert_eq!(
+            script,
+            r#"window.__NOTEDOWN_AT__ = {"at":"note","path":"/Note/Work/Plan \"A\" </script>.note"};"#
+        );
+        // An open window gets an event.
+        assert_eq!(
+            tell(Library, &at, true),
+            Some(Tell::Emit(
+                LIBRARY_AT_EVENT,
+                serde_json::json!({"at": "note", "path": "/Note/Work/Plan \"A\" </script>.note"})
+            ))
+        );
+        // "N more" opens it at New.
+        assert_eq!(
+            tell(Library, &Opening::At(LibraryAt::New), true),
+            Some(Tell::Emit(
+                LIBRARY_AT_EVENT,
+                serde_json::json!({"at": "new"})
+            ))
+        );
+        // Open Library keeps an open window as it is; a new one starts where it starts.
+        assert_eq!(tell(Library, &Opening::Plain, true), None);
+        assert_eq!(
+            tell(Library, &Opening::Plain, false),
+            Some(Tell::Script("window.__NOTEDOWN_AT__ = null;".into()))
+        );
+        // The settings window keeps its page.
+        let page = Opening::Page("setup".into());
+        assert_eq!(
+            tell(Settings, &page, false),
+            Some(Tell::Script(
+                r#"window.__NOTEDOWN_PAGE__ = "setup";"#.into()
+            ))
+        );
+        assert_eq!(
+            tell(Settings, &Opening::Plain, false),
+            Some(Tell::Script("window.__NOTEDOWN_PAGE__ = null;".into()))
+        );
+        assert_eq!(
+            tell(Settings, &page, true),
+            Some(Tell::Emit(SETTINGS_PAGE_EVENT, serde_json::json!("setup")))
+        );
+        assert_eq!(tell(Settings, &Opening::Plain, true), None);
+        // A page is no place in the library, a note none in the settings.
+        assert_eq!(tell(Library, &page, true), None);
+        assert_eq!(tell(Settings, &at, true), None);
+        assert_eq!(tell(Panel, &at, false), None);
+    }
+
+    #[test]
+    fn open_library_opens_at_the_note_at_new_or_as_it_is() {
+        assert_eq!(
+            library_opening(Some("NOTE/Note/A.note".into()), Some(true)),
+            Opening::At(LibraryAt::Note {
+                path: "NOTE/Note/A.note".into()
+            })
+        );
+        assert_eq!(
+            library_opening(None, Some(true)),
+            Opening::At(LibraryAt::New)
+        );
+        assert_eq!(library_opening(None, Some(false)), Opening::Plain);
+        assert_eq!(library_opening(None, None), Opening::Plain);
     }
 
     #[test]

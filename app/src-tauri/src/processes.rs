@@ -50,10 +50,16 @@ pub struct Processes {
     server_grace: Duration,
     pipeline_grace: Duration,
     serve_info: Arc<Mutex<ServeInfo>>,
+    /// Told when a start line changed the serve info.
+    serve_listeners: Arc<Mutex<Vec<ServeListener>>>,
     /// Serializes start, probe and stop, so a probe never undoes a stop.
     ops: Mutex<()>,
+    /// What the pipeline was last told to do; `None` before the first start and after a stop.
+    pipeline_launch: Mutex<Option<Launch>>,
     quitting: AtomicBool,
 }
+
+type ServeListener = Box<dyn Fn() + Send + Sync>;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -80,8 +86,21 @@ impl Processes {
             );
         }
         let serve_info = Arc::new(Mutex::new(ServeInfo::default()));
-        let info = serve_info.clone();
-        server.on_line(move |line| serve_info::parse_line(&mut lock(&info), line));
+        let serve_listeners: Arc<Mutex<Vec<ServeListener>>> = Arc::default();
+        let (info, listeners) = (serve_info.clone(), serve_listeners.clone());
+        server.on_line(move |line| {
+            let changed = {
+                let mut info = lock(&info);
+                let before = info.clone();
+                serve_info::parse_line(&mut info, line);
+                *info != before
+            };
+            if changed {
+                for listener in lock(&listeners).iter() {
+                    listener();
+                }
+            }
+        });
         Self {
             server,
             pipeline,
@@ -91,7 +110,9 @@ impl Processes {
             server_grace: options.server_grace,
             pipeline_grace: options.pipeline_grace,
             serve_info,
+            serve_listeners,
             ops: Mutex::new(()),
+            pipeline_launch: Mutex::new(None),
             quitting: AtomicBool::new(false),
         }
     }
@@ -109,6 +130,12 @@ impl Processes {
             server: self.server.state(),
             pipeline: self.pipeline.state(),
         }
+    }
+
+    /// Runs `cb` whenever a start line of the server changed what [`serve_info`](Self::serve_info)
+    /// knows (a new address). It runs on the server's output thread, so it must not block.
+    pub fn on_serve_info(&self, cb: impl Fn() + Send + Sync + 'static) {
+        lock(&self.serve_listeners).push(Box::new(cb));
     }
 
     /// The start lines of the running server; empty while it does not run.
@@ -154,6 +181,7 @@ impl Processes {
             }
         });
         let plan = process::plan(config, self.parent);
+        *lock(&self.pipeline_launch) = Some(plan.pipeline.clone());
         self.launch(&self.server, &plan.server, config);
         self.launch(&self.pipeline, &plan.pipeline, config);
     }
@@ -179,14 +207,46 @@ impl Processes {
             (&self.pipeline, &plan.pipeline),
         ] {
             if matches!(sup.state(), ChildState::Outside { .. }) {
+                if sup.kind() == ChildKind::Pipeline {
+                    *lock(&self.pipeline_launch) = Some(launch.clone());
+                }
                 self.launch(sup, launch, config);
             }
         }
     }
 
+    /// Starts the pipeline again when what it is to run changed (another Markdown folder, a log
+    /// in or a log out), with the config read inside the lock. The server runs on. Nothing
+    /// starts after a stop, before the first start or after Quit.
+    pub fn relaunch_pipeline_with(&self, read: impl FnOnce() -> AppConfig) {
+        let _ops = lock(&self.ops);
+        if self.quitting.load(Ordering::SeqCst) {
+            return;
+        }
+        let config = &read();
+        let launch = process::plan(config, self.parent).pipeline;
+        {
+            let mut last = lock(&self.pipeline_launch);
+            match &*last {
+                Some(before) if *before != launch => *last = Some(launch.clone()),
+                _ => return,
+            }
+        }
+        // The app's own pipeline holds the writer lock for its whole run: stop it first, or
+        // the probe would take it for another Notedown.
+        self.pipeline.stop();
+        // Quit sets its flag before it waits for this lock: one that came during the stop
+        // (it can take the grace) starts nothing.
+        if self.quitting.load(Ordering::SeqCst) {
+            return;
+        }
+        self.launch(&self.pipeline, &launch, config);
+    }
+
     /// Stops both children at once. They stay stopped until the next start.
     pub fn stop_all(&self) {
         let _ops = lock(&self.ops);
+        *lock(&self.pipeline_launch) = None;
         self.stop_both();
     }
 

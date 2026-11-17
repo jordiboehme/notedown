@@ -151,10 +151,12 @@ fn area_of(rect: &Rect) -> Area {
 pub fn on_menu_event(app: &AppHandle, id: &str) {
     match id {
         OPEN_LIBRARY_ID => {
-            let _ = windows::show_window(app, windows::WindowKind::Library, None);
+            let _ =
+                windows::show_window(app, windows::WindowKind::Library, windows::Opening::Plain);
         }
         SETTINGS_ID => {
-            let _ = windows::show_window(app, windows::WindowKind::Settings, None);
+            let _ =
+                windows::show_window(app, windows::WindowKind::Settings, windows::Opening::Plain);
         }
         QUIT_ID => crate::request_quit(app),
         _ => {}

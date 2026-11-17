@@ -1,0 +1,60 @@
+/* macOS system colours as Roger's SwiftUI form uses them, in light and dark mode, for the
+   settings and the library window. The settings kit components read these variables. */
+.settings,
+.library {
+  --window: #ececec;
+  --sidebar: #e4e3e3;
+  --box: #f6f6f6;
+  --box-rim: rgba(0, 0, 0, 0.07);
+  --separator: rgba(0, 0, 0, 0.08);
+  --primary: rgba(0, 0, 0, 0.85);
+  --secondary: rgba(0, 0, 0, 0.5);
+  --tertiary: rgba(0, 0, 0, 0.3);
+  --accent: #007aff;
+  /* Notedown's own accents (app.css), as in the panel: ink on paper in light mode. */
+  --brand: var(--color-ink);
+  --on-brand: var(--color-paper);
+  --good: #34c759;
+  --warning: #ff9500;
+  --bad: #ff3b30;
+  --unknown: #8e8e93;
+  --pink: #ff2d55;
+  --button: #ffffff;
+  --button-rim: rgba(0, 0, 0, 0.14);
+  --field: #ffffff;
+  --switch-off: rgba(0, 0, 0, 0.1);
+  --segment-track: rgba(0, 0, 0, 0.06);
+  --segment-on: #ffffff;
+  --track: rgba(0, 0, 0, 0.08);
+  --code: rgba(0, 0, 0, 0.04);
+}
+
+@media (prefers-color-scheme: dark) {
+  .settings,
+  .library {
+    --window: #1e1e1e;
+    --sidebar: #262626;
+    --box: #2a2a2a;
+    --box-rim: rgba(255, 255, 255, 0.06);
+    --separator: rgba(255, 255, 255, 0.08);
+    --primary: rgba(255, 255, 255, 0.85);
+    --secondary: rgba(255, 255, 255, 0.55);
+    --tertiary: rgba(255, 255, 255, 0.25);
+    --accent: #0a84ff;
+    --brand: var(--color-paper);
+    --on-brand: var(--color-ink);
+    --good: #30d158;
+    --warning: #ff9f0a;
+    --bad: #ff453a;
+    --unknown: #98989d;
+    --pink: #ff375f;
+    --button: #5a5a5c;
+    --button-rim: rgba(255, 255, 255, 0.08);
+    --field: #1e1e1e;
+    --switch-off: rgba(255, 255, 255, 0.15);
+    --segment-track: rgba(255, 255, 255, 0.08);
+    --segment-on: #636366;
+    --track: rgba(255, 255, 255, 0.12);
+    --code: rgba(255, 255, 255, 0.05);
+  }
+}

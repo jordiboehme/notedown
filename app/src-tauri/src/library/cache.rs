@@ -237,6 +237,7 @@ fn gone_event(key: &Key, text: &str) -> LibraryEvent {
             loading: false,
             error: Some(text.to_owned()),
         },
+        folders_only: key.folders_only,
     }
 }
 
@@ -836,6 +837,7 @@ impl Cache {
     fn event(&self, key: &Key) -> LibraryEvent {
         LibraryEvent::Folder {
             folder: self.folders[key].state(&key.path),
+            folders_only: key.folders_only,
         }
     }
 

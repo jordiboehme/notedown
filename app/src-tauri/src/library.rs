@@ -193,8 +193,13 @@ pub enum LibraryEvent {
     /// The state, its text or its Settings page changed. A binding sends it, then `Relist`; a
     /// call's answer (unreachable, not imported, refused, ready again) sends it alone.
     State(StateView),
-    /// A folder was listed or changed.
-    Folder { folder: FolderState },
+    /// A folder was listed or changed. `folders_only` names the listing: the tree's (only the
+    /// child folders) or the list's (everything); the window may show the same path in both.
+    #[serde(rename_all = "camelCase")]
+    Folder {
+        folder: FolderState,
+        folders_only: bool,
+    },
     /// A job moved on.
     Job { job: Job },
     /// The library bound again (or must list again): the window drops what it shows and lists

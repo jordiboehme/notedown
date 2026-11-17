@@ -1,0 +1,263 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { FolderState, Job, LibraryEvent, Listing } from "../lib/library-types";
+
+type Handler = (event: { payload: unknown }) => void;
+const handlers = new Map<string, Handler>();
+const unlisten = vi.fn();
+const calls: { command: string; args: Record<string, unknown> | undefined }[] = [];
+const answers = new Map<string, ((args: Record<string, unknown> | undefined) => Promise<unknown>)[]>();
+
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(async (name: string, handler: Handler) => {
+    handlers.set(name, handler);
+    return unlisten;
+  }),
+}));
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn((command: string, args?: Record<string, unknown>) => {
+    calls.push({ command, args });
+    const next = answers.get(command)?.shift();
+    return next ? next(args) : Promise.resolve(null);
+  }),
+}));
+
+const store = await import("../lib/library.svelte");
+const { library, applyEvent, startLibrary, listFolder, listNext, isBusy, showListings, resetLibrary } = store;
+
+/** The next call of `command` answers what `answer` gives; it waits until `release` is called. */
+function answerLater(command: string) {
+  let release: (value: unknown) => void = () => {};
+  let fail: (error: unknown) => void = () => {};
+  const list = answers.get(command) ?? [];
+  list.push(
+    () =>
+      new Promise((resolve, reject) => {
+        release = resolve;
+        fail = reject;
+      }),
+  );
+  answers.set(command, list);
+  return { release: (value: unknown) => release(value), fail: (error: unknown) => fail(error) };
+}
+
+function answerNow(command: string, value: unknown) {
+  const list = answers.get(command) ?? [];
+  list.push(() => Promise.resolve(value));
+  answers.set(command, list);
+}
+
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+function folder(path: string, names: string[], complete: boolean): FolderState {
+  return {
+    path,
+    entries: names.map((name, i) => ({
+      id: i + 1,
+      path: `${path}/${name}`,
+      name,
+      kind: "file",
+      size: 1,
+      md5: null,
+      mtimeMs: 0,
+      writable: true,
+    })),
+    complete,
+    loading: false,
+    error: null,
+  };
+}
+
+const job: Job = {
+  id: 4,
+  kind: "download",
+  label: "a.pdf",
+  done: 0,
+  total: 10,
+  state: "queued",
+  text: null,
+  question: null,
+  result: null,
+};
+
+beforeEach(() => {
+  calls.length = 0;
+  answers.clear();
+  handlers.clear();
+  resetLibrary();
+});
+
+describe("the library store", () => {
+  it("applies each LibraryEvent", () => {
+    applyEvent({ type: "state", state: "unreachable", text: "The server does not answer.", page: "server" });
+    expect(library.view).toEqual({ state: "unreachable", text: "The server does not answer.", page: "server" });
+
+    applyEvent({ type: "folder", folder: folder("INBOX", ["a"], true), foldersOnly: false });
+    applyEvent({ type: "folder", folder: folder("INBOX", [], true), foldersOnly: true });
+    // The tree's listing and the list's of the same path stay apart.
+    expect(library.listings["list:INBOX"].entries).toHaveLength(1);
+    expect(library.listings["tree:INBOX"].entries).toHaveLength(0);
+
+    applyEvent({ type: "job", job });
+    applyEvent({ type: "job", job: { ...job, state: "running", done: 5 } });
+    expect(library.jobs[4]).toMatchObject({ state: "running", done: 5 });
+
+    const recycle = library.recycle;
+    applyEvent({ type: "recycle" });
+    expect(library.recycle).toBe(recycle + 1);
+
+    // A state change without a new binding keeps the view.
+    applyEvent({ type: "state", state: "ready", text: null, page: null });
+    expect(library.listings["list:INBOX"]).toBeDefined();
+
+    // A new binding drops what is shown.
+    const generation = library.generation;
+    applyEvent({ type: "relist" });
+    expect(library.listings).toEqual({});
+    expect(library.next).toEqual({});
+    expect(library.generation).toBe(generation + 1);
+    expect(library.jobs[4]).toBeDefined();
+
+    // Nothing uploads yet: a drop is let go, so Rust forgets its paths.
+    applyEvent({ type: "drop", dropId: 9, position: { x: 1, y: 2 }, count: 1 });
+    expect(calls).toContainEqual({ command: "library_cancel_drop", args: { dropId: 9 } });
+  });
+
+  it("forgets the cursor of a folder that an event shows complete", async () => {
+    answerNow("library_list", { folder: folder("INBOX", ["a"], false), next: "t1:a" } satisfies Listing);
+    await listFolder("INBOX", false);
+    expect(library.next["list:INBOX"]).toBe("t1:a");
+    applyEvent({ type: "folder", folder: folder("INBOX", ["a", "b"], true), foldersOnly: false });
+    expect(library.next["list:INBOX"]).toBeNull();
+  });
+
+  it("starts with the state Rust has, unless an event came first", async () => {
+    const first = answerLater("library_state");
+    const stop = await startLibrary();
+    handlers.get("library")!({
+      payload: { type: "state", state: "loggedOut", text: "Log in to see your library.", page: "account" },
+    } satisfies { payload: LibraryEvent });
+    first.release({ state: "ready", text: null, page: null });
+    await flush();
+    expect(library.view?.state).toBe("loggedOut");
+    stop();
+    expect(unlisten).toHaveBeenCalled();
+
+    resetLibrary();
+    answerNow("library_state", { state: "ready", text: null, page: null });
+    await startLibrary();
+    await flush();
+    expect(library.view?.state).toBe("ready");
+  });
+
+  it("lists a folder page by page, one call at a time", async () => {
+    answerNow("library_list", { folder: folder("INBOX", ["a"], false), next: "t1:a" } satisfies Listing);
+    await listFolder("INBOX", false);
+    expect(calls.at(-1)).toEqual({
+      command: "library_list",
+      args: { path: "INBOX", cursor: null, foldersOnly: false },
+    });
+
+    const second = answerLater("library_list");
+    const going = listNext("INBOX", false);
+    expect(isBusy("INBOX", false)).toBe(true);
+    void listNext("INBOX", false);
+    expect(calls.filter((c) => c.command === "library_list")).toHaveLength(2);
+    second.release({ folder: folder("INBOX", ["a", "b"], true), next: null } satisfies Listing);
+    await going;
+    expect(isBusy("INBOX", false)).toBe(false);
+    expect(library.listings["list:INBOX"].entries.map((e) => e.name)).toEqual(["a", "b"]);
+    expect(library.next["list:INBOX"]).toBeNull();
+    // Complete: no more calls.
+    await listNext("INBOX", false);
+    expect(calls.filter((c) => c.command === "library_list")).toHaveLength(2);
+  });
+
+  it("drops an answer that comes after a new binding", async () => {
+    const late = answerLater("library_list");
+    const going = listFolder("EXPORT", true);
+    applyEvent({ type: "relist" });
+    expect(isBusy("EXPORT", true)).toBe(false);
+    late.release({ folder: folder("EXPORT", ["old"], true), next: null } satisfies Listing);
+    await going;
+    expect(library.listings["tree:EXPORT"]).toBeUndefined();
+  });
+
+  it("says why a folder could not be listed, but not for a new binding", async () => {
+    const failing = answerLater("library_list");
+    const going = listFolder("INBOX", false);
+    failing.fail("The server does not answer.");
+    await going;
+    expect(library.listings["list:INBOX"]).toMatchObject({ error: "The server does not answer.", loading: false });
+
+    resetLibrary();
+    const changed = answerLater("library_list");
+    const again = listFolder("INBOX", false);
+    changed.fail("The library changed. List again.");
+    await again;
+    expect(library.listings["list:INBOX"]).toBeUndefined();
+  });
+
+  it("takes no listing that is not shown, so a folder opened again is listed fresh", async () => {
+    showListings([]);
+    // A follower event that was on its way when the folder closed.
+    applyEvent({ type: "folder", folder: folder("EXPORT", ["a"], false), foldersOnly: true });
+    expect(library.listings["tree:EXPORT"]).toBeUndefined();
+    showListings([{ path: "EXPORT", foldersOnly: true }]);
+    expect(library.listings["tree:EXPORT"]).toBeUndefined();
+
+    // An answer that comes after the folder closed.
+    const late = answerLater("library_list");
+    const going = listFolder("EXPORT", true);
+    showListings([]);
+    late.release({ folder: folder("EXPORT", ["a"], true), next: null } satisfies Listing);
+    await going;
+    expect(library.listings["tree:EXPORT"]).toBeUndefined();
+    const failing = answerLater("library_list");
+    const again = listFolder("EXPORT", true);
+    failing.fail("The server does not answer.");
+    await again;
+    expect(library.listings["tree:EXPORT"]).toBeUndefined();
+    expect(isBusy("EXPORT", true)).toBe(false);
+  });
+
+  it("tells Rust the shown folders only when they change", () => {
+    showListings([
+      { path: "NOTE/Note", foldersOnly: true },
+      { path: "INBOX", foldersOnly: false },
+    ]);
+    showListings([
+      { path: "NOTE/Note", foldersOnly: true },
+      { path: "INBOX", foldersOnly: false },
+    ]);
+    const shown = calls.filter((c) => c.command === "library_shown");
+    expect(shown).toEqual([
+      {
+        command: "library_shown",
+        args: {
+          listings: [
+            { path: "NOTE/Note", foldersOnly: true },
+            { path: "INBOX", foldersOnly: false },
+          ],
+        },
+      },
+    ]);
+    // A listing that is not shown any more is not followed by Rust: the store forgets it, so
+    // opening the folder again lists it again.
+    applyEvent({ type: "folder", folder: folder("NOTE/Note", [], true), foldersOnly: true });
+    applyEvent({ type: "folder", folder: folder("INBOX", ["a"], false), foldersOnly: false });
+    library.next["list:INBOX"] = "t1:a";
+    showListings([{ path: "INBOX", foldersOnly: false }]);
+    expect(Object.keys(library.listings)).toEqual(["list:INBOX"]);
+    expect(library.next["list:INBOX"]).toBe("t1:a");
+    showListings([]);
+    expect(library.listings).toEqual({});
+    expect(library.next).toEqual({});
+
+    // After a new binding Rust starts over: tell it again.
+    applyEvent({ type: "relist" });
+    showListings([{ path: "INBOX", foldersOnly: false }]);
+    showListings([{ path: "INBOX", foldersOnly: false }]);
+    expect(calls.filter((c) => c.command === "library_shown")).toHaveLength(4);
+  });
+});

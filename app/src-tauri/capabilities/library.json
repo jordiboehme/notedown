@@ -1,11 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "library",
-  "description": "The library window follows the library's events, reads the library's state when it opens, lists folders page by page, reads one entry and the recycle bin, tells which folders it shows, makes, renames, moves and deletes files and folders, restores and empties the recycle bin, uploads what was dropped on it (by the drop id Rust gives it, never by a path), downloads files into the Downloads folder and shows them in the Finder (only files it downloaded, by the path Rust answered), answers, retries and cancels jobs, lists the new notes and all notes and marks a note it opened as seen, opens a note for the review with its text and its page images (rendered by Rust from the note's path, never from a path the window builds) drops pages that went out of view and closes the review, and opens the settings at the page its state names. Every call to the server is made in Rust: the token never reaches the window.",
+  "description": "The library window follows the library's events and the status (its status line shows the lines of the panel), reads the status and the library's state when it opens, lists folders page by page, reads one entry and the recycle bin, tells which folders it shows, makes, renames, moves and deletes files and folders, restores and empties the recycle bin, uploads what was dropped on it (by the drop id Rust gives it, never by a path), downloads files into the Downloads folder and shows them in the Finder (only files it downloaded, by the path Rust answered), answers, retries and cancels jobs, lists the new notes and all notes and marks a note it opened as seen, opens a note for the review with its text and its page images (rendered by Rust from the note's path, never from a path the window builds) drops pages that went out of view and closes the review, and opens the settings at the page its state names. Every call to the server is made in Rust: the token never reaches the window.",
   "windows": ["library"],
   "permissions": [
     "core:event:allow-listen",
     "core:event:allow-unlisten",
+    "allow-get-status",
     "allow-library-state",
     "allow-library-list",
     "allow-library-entry",

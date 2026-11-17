@@ -80,7 +80,8 @@ export type Job = {
 
 /**
  * A binding sends `state` and then `relist` (drop what is shown and list again); the answer of a
- * call sends `state` alone. `recycle` says the bin may have changed (the app's own delete,
+ * call sends `state` alone. `folder` carries a listing of the folder: the tree's (`foldersOnly`,
+ * only its child folders) or the list's; the window may show the same path in both. `recycle` says the bin may have changed (the app's own delete,
  * restore or Empty, or a delete the library read from the server): the window lists the bin
  * again when it shows it, and ignores it otherwise. `drop` says files or folders were dropped on
  * the window: Rust keeps their paths under `dropId`; the window finds the folder at `position`
@@ -88,7 +89,7 @@ export type Job = {
  */
 export type LibraryEvent =
   | { type: "state"; state: LibraryState; text: string | null; page: string | null }
-  | { type: "folder"; folder: FolderState }
+  | { type: "folder"; folder: FolderState; foldersOnly: boolean }
   | { type: "job"; job: Job }
   | { type: "relist" }
   | { type: "recycle" }

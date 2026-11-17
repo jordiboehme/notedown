@@ -600,6 +600,7 @@ fn no_library_event_holds_the_token() {
             loading: true,
             error: Some("The server does not answer.".into()),
         },
+        folders_only: true,
     };
     let job = LibraryEvent::Job {
         job: Job {
@@ -625,7 +626,8 @@ fn no_library_event_holds_the_token() {
             "entries": [{ "id": 7, "path": "/Note/a.note", "name": "a.note", "kind": "file",
                 "size": 12, "md5": "0123456789abcdef0123456789abcdef",
                 "mtimeMs": 1_763_300_000_000_i64, "writable": true }],
-            "complete": false, "loading": true, "error": "The server does not answer." } })
+            "complete": false, "loading": true, "error": "The server does not answer." },
+            "foldersOnly": true })
     );
     assert_eq!(
         serde_json::to_value(&job).unwrap(),

@@ -597,6 +597,7 @@ mod tests {
         assert_eq!(
             granted("library"),
             set(&[
+                "get_status",
                 "library_state",
                 "library_list",
                 "library_entry",

@@ -94,7 +94,7 @@ impl Setup {
         self.events.0.lock().unwrap().clear();
         all.into_iter()
             .filter_map(|e| match e {
-                LibraryEvent::Folder { folder } => Some(folder),
+                LibraryEvent::Folder { folder, .. } => Some(folder),
                 _ => None,
             })
             .collect()
@@ -214,10 +214,25 @@ fn the_library_lists_a_folder_page_by_page() {
     let again = s.list(NOTE, Some("t1:b"));
     assert_eq!(again, second);
 
-    // The tree: only folders, a listing of its own.
+    // The tree: only folders, a listing of its own. Its events say so: the window shows the
+    // same path in the tree and in the list.
+    s.events.0.lock().unwrap().clear();
     let tree_listing = s.library.list(NOTE, None, true).unwrap();
     assert_eq!(names(&tree_listing.folder), ["b"]);
     assert!(tree_listing.folder.complete);
+    assert!(!s.events.all().is_empty());
+    for event in s.events.all() {
+        assert!(
+            matches!(
+                event,
+                LibraryEvent::Folder {
+                    folders_only: true,
+                    ..
+                }
+            ),
+            "{event:?}"
+        );
+    }
 
     // The follower reads from the lowest seq of the pages (10, then 11), plus one.
     s.follow();

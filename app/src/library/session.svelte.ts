@@ -5,8 +5,10 @@ import { nearPages } from "./review";
 /** The image of a page: asked for, shown (a data URL), or why there is none. */
 export type PageImage = { state: "loading" } | { state: "shown"; url: string } | { state: "failed"; text: string };
 
+/** What Rust answers to a page whose call was dropped (`note_page_drop`). */
+const DROPPED = "The page is not shown anymore.";
 /** What Rust answers to a page call that the window ended itself: no failure, the placeholder stays. */
-const ENDED = new Set(["The page is not shown anymore.", "The review was closed."]);
+const ENDED = new Set([DROPPED, "The review was closed."]);
 
 function text(error: unknown): string {
   return typeof error === "string" ? error : error instanceof Error ? error.message : String(error);
@@ -53,8 +55,18 @@ export class ReviewSession {
 
   /** Page `index` came into view or left it. */
   seen(index: number, visible: boolean) {
-    if (visible) this.#visible.add(index);
-    else this.#visible.delete(index);
+    this.seenMany([[index, visible]]);
+  }
+
+  /**
+   * The pages that came into view or left it at once (one observer callback): all of them are
+   * taken before the near pages are worked out, so a jump asks only near where it lands.
+   */
+  seenMany(changes: [index: number, visible: boolean][]) {
+    for (const [index, visible] of changes) {
+      if (visible) this.#visible.add(index);
+      else this.#visible.delete(index);
+    }
     this.#update();
   }
 
@@ -94,6 +106,11 @@ export class ReviewSession {
     }
   }
 
+  #near(index: number): boolean {
+    const pages = this.view ? nearPages(this.#visible, this.view.pages.length) : null;
+    return pages !== null && index >= pages.near[0] && index <= pages.near[1];
+  }
+
   #ask(index: number) {
     const ask = (this.#asks.get(index) ?? 0) + 1;
     this.#asks.set(index, ask);
@@ -109,6 +126,8 @@ export class ReviewSession {
         if (ENDED.has(why)) {
           delete this.images[index];
           this.#asks.set(index, ask + 1);
+          // A drop of an older ask ended this one in Rust too: a page still near is asked again.
+          if (why === DROPPED && this.#near(index)) this.#update();
         } else {
           this.images[index] = { state: "failed", text: why };
         }

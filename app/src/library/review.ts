@@ -104,3 +104,30 @@ export function nearPages(
     keep: [clamp(first - PAGES_KEPT), clamp(last + PAGES_KEPT)],
   };
 }
+
+/** The name of a note by its path, as the review shows it before or without its text. */
+export function noteTitle(path: string): string {
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  return name.endsWith(".note") ? name.slice(0, -".note".length) : name;
+}
+
+export type Side = "pages" | "text";
+
+/**
+ * Keeps the two sides from following each other back: the window remembers the value it set
+ * on a side, and the scroll event of that side within a pixel of it is not followed. Any other
+ * scroll of the side is the user's and ends the guard.
+ */
+export function syncGuard() {
+  const set: Partial<Record<Side, number>> = {};
+  return {
+    set(side: Side, top: number) {
+      set[side] = top;
+    },
+    follows(side: Side, top: number): boolean {
+      const expected = set[side];
+      delete set[side];
+      return expected === undefined || Math.abs(top - expected) > 1;
+    },
+  };
+}

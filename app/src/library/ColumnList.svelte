@@ -3,18 +3,21 @@
   import type { Entry } from "../lib/library-types";
   import NameField from "./NameField.svelte";
   import VirtualRows from "./VirtualRows.svelte";
+  import { opensReview } from "./actions";
   import { drag, pressOn } from "./drag.svelte";
   import { needsNextPage, type Column, type ColumnRow, type Range } from "./view";
 
   // One column of the columns view: a lazy, virtual list of one folder. The next page is asked
   // for when the rows near its end come into view. A row that is not a device tree can be
-  // dragged onto a folder; the row being renamed shows a field.
+  // dragged onto a folder; the row being renamed shows a field. A double click on a .note file
+  // opens its review.
   let {
     column,
     next,
     busy,
     renaming,
     onSelect,
+    onOpenNote,
     onMore,
     onRename,
   }: {
@@ -23,6 +26,7 @@
     busy: boolean;
     renaming: string | null;
     onSelect: (path: string, kind: "file" | "folder") => void;
+    onOpenNote: (path: string) => void;
     onMore: () => void;
     onRename: (entry: Entry, typed: string | null) => void;
   } = $props();
@@ -78,6 +82,7 @@
             data-folder={entry.kind === "folder" ? entry.path : undefined}
             aria-current={entry.selected ? "true" : undefined}
             onclick={() => onSelect(entry.path, entry.kind)}
+            ondblclick={() => opensReview(entry) && onOpenNote(entry.path)}
             onpointerdown={(event) => entry.entry && pressOn(entry.entry, event)}
           >
             {@render icon()}

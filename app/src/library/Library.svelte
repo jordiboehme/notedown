@@ -177,7 +177,7 @@
       listen(LIBRARY_AT_EVENT, (event) => {
         const at = openAt(event.payload);
         if (at?.kind === "note") openNote(at.path);
-        else if (at) selection = at;
+        else if (at) show(at);
       }),
     ];
     loadNotes();
@@ -195,10 +195,18 @@
     };
   });
 
+  /** Shows `next`: the picked row, a rename and a new folder's name end. */
+  function show(next: Selection) {
+    selection = next;
+    picked = null;
+    renaming = null;
+    naming = false;
+  }
+
   /** Shows the review of the note at `path`; Back goes to what was shown before. */
   function openNote(path: string) {
     if (selection.kind !== "note") back = selection;
-    selection = { kind: "note", path };
+    show({ kind: "note", path });
     openings += 1;
   }
 
@@ -330,6 +338,7 @@
           onRename={() => (renaming = actedOn)}
           onDelete={() => void remove()}
           onDownload={download}
+          onOpen={() => actedOn && openNote(actedOn)}
         />
         {#if !inTree}
           {#key library.generation}
@@ -339,6 +348,7 @@
               {renaming}
               onSelect={select}
               onFile={pickFile}
+              onOpenNote={openNote}
               onRename={rename}
             />
           {/key}
@@ -354,6 +364,7 @@
               {renaming}
               onSort={(next) => (sort = next)}
               onOpen={select}
+              onOpenNote={openNote}
               onMore={() => void listNext(path, false)}
               onPick={(row) => (picked = row)}
               onRename={rename}

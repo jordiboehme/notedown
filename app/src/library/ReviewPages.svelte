@@ -1,10 +1,11 @@
 <script lang="ts">
   import type { PageImage } from "./session.svelte";
-  import { syncTop, type Offsets, type ReviewPage } from "./review";
+  import { syncGuard, syncTop, type Offsets, type ReviewPage, type Side } from "./review";
 
   // The review's two sides: the handwritten pages and their Markdown, scrolled together page by
-  // page. The Markdown is shown as text (pre-wrap), never as HTML. It tells which pages are in
-  // view (`onSeen`) and the size of each loaded image (`onMeasured`); it asks for nothing itself.
+  // page. The Markdown is shown as text (pre-wrap), never as HTML. It tells which pages came
+  // into view or left it (`onSeen`, all of one observer callback at once) and the size of each
+  // loaded image (`onMeasured`); it asks for nothing itself.
   let {
     rows,
     images,
@@ -13,14 +14,16 @@
   }: {
     rows: ReviewPage[];
     images: Record<number, PageImage>;
-    onSeen: (index: number, visible: boolean) => void;
+    onSeen: (changes: [index: number, visible: boolean][]) => void;
     onMeasured: (index: number, width: number, height: number) => void;
   } = $props();
 
   let pagesSide = $state<HTMLDivElement>();
   let textSide = $state<HTMLDivElement>();
-  /** The side the window scrolled itself: its next scroll event is not followed back. */
-  let driven: HTMLDivElement | null = null;
+  /** The value the window set on a side: its scroll event is not followed back. */
+  const guard = syncGuard();
+  /** The page tops of each side, measured again when a page changes its size. */
+  const tops: Partial<Record<Side, Offsets>> = {};
 
   const count = $derived(rows.length);
 
@@ -31,10 +34,7 @@
     if (!root || count === 0) return;
     const observer = new IntersectionObserver(
       (entries) => {
-        for (const entry of entries) {
-          const index = Number((entry.target as HTMLElement).dataset.page);
-          onSeen(index, entry.isIntersecting);
-        }
+        onSeen(entries.map((entry) => [Number((entry.target as HTMLElement).dataset.page), entry.isIntersecting]));
       },
       { root },
     );
@@ -42,30 +42,46 @@
     return () => observer.disconnect();
   });
 
+  // A page that changes its size (an image's ratio became known, the window was resized) moves
+  // the tops: they are measured again at the next scroll.
+  $effect(() => {
+    const sides = [pagesSide, textSide];
+    if (sides.some((side) => !side) || count === 0) return;
+    const resized = new ResizeObserver(() => {
+      delete tops.pages;
+      delete tops.text;
+    });
+    for (const side of sides) for (const page of side!.querySelectorAll("[data-page]")) resized.observe(page);
+    return () => resized.disconnect();
+  });
+
   /** The tops of a side's pages in its scroll area (each side is their offset parent). */
-  function offsets(side: HTMLDivElement): Offsets {
-    const pages = [...side.querySelectorAll<HTMLElement>("[data-page]")];
-    return { tops: pages.map((p) => p.offsetTop), end: side.scrollHeight };
+  function offsets(name: Side, side: HTMLDivElement): Offsets {
+    let known = tops[name];
+    if (!known) {
+      const pages = [...side.querySelectorAll<HTMLElement>("[data-page]")];
+      known = { tops: pages.map((p) => p.offsetTop), end: side.scrollHeight };
+      tops[name] = known;
+    }
+    return known;
   }
 
-  function follow(from: HTMLDivElement | undefined, to: HTMLDivElement | undefined) {
-    if (!from || !to) return;
-    if (driven === from) {
-      driven = null;
-      return;
-    }
-    const top = syncTop(from.scrollTop, offsets(from), offsets(to));
-    if (Math.abs(to.scrollTop - top) < 1) return;
-    driven = to;
-    to.scrollTop = top;
-    requestAnimationFrame(() => {
-      if (driven === to) driven = null;
-    });
+  function follow(from: Side) {
+    const to: Side = from === "pages" ? "text" : "pages";
+    const fromSide = from === "pages" ? pagesSide : textSide;
+    const toSide = to === "pages" ? pagesSide : textSide;
+    if (!fromSide || !toSide) return;
+    if (!guard.follows(from, fromSide.scrollTop)) return;
+    const top = syncTop(fromSide.scrollTop, offsets(from, fromSide), offsets(to, toSide));
+    if (Math.abs(toSide.scrollTop - top) < 1) return;
+    toSide.scrollTop = top;
+    // What the side took (it stops at its end), so its own scroll event matches.
+    guard.set(to, toSide.scrollTop);
   }
 </script>
 
 <div class="sides">
-  <div class="side pages" bind:this={pagesSide} onscroll={() => follow(pagesSide, textSide)} aria-label="Pages">
+  <div class="side pages" bind:this={pagesSide} onscroll={() => follow("pages")} aria-label="Pages">
     {#each rows as row (row.index)}
       {@const image = images[row.index]}
       <section class="page" data-page={row.index} aria-label={row.label}>
@@ -89,7 +105,7 @@
       </section>
     {/each}
   </div>
-  <div class="side text" bind:this={textSide} onscroll={() => follow(textSide, pagesSide)} aria-label="Text">
+  <div class="side text" bind:this={textSide} onscroll={() => follow("text")} aria-label="Text">
     {#each rows as row (row.index)}
       <section class="page" data-page={row.index} aria-label={row.label}>
         <p class="label">{row.label}</p>

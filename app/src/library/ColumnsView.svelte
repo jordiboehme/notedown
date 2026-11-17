@@ -14,6 +14,7 @@
     renaming,
     onSelect,
     onFile,
+    onOpenNote,
     onRename,
   }: {
     path: string;
@@ -21,6 +22,7 @@
     renaming: string | null;
     onSelect: (path: string) => void;
     onFile: (path: string) => void;
+    onOpenNote: (path: string) => void;
     onRename: (entry: Entry, typed: string | null) => void;
   } = $props();
 
@@ -42,6 +44,7 @@
       busy={column.path === null ? false : isBusy(column.path, false)}
       {renaming}
       {onRename}
+      {onOpenNote}
       onSelect={(picked, kind) => (kind === "folder" ? onSelect(picked) : onFile(picked))}
       onMore={() => column.path !== null && void listNext(column.path, false)}
     />

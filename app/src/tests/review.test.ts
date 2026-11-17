@@ -19,7 +19,7 @@ vi.mock("@tauri-apps/api/core", () => ({
   }),
 }));
 
-const { reviewPages, pageAt, syncTop, reviewNotice, nearPages, PORTRAIT } = await import("../library/review");
+const { reviewPages, pageAt, syncTop, reviewNotice, nearPages, noteTitle, syncGuard, PORTRAIT } = await import("../library/review");
 const { ReviewSession } = await import("../library/session.svelte");
 const { openAt } = await import("../library/view");
 const ReviewPages = (await import("../library/ReviewPages.svelte")).default;
@@ -125,6 +125,30 @@ describe("pageAt", () => {
   });
 });
 
+describe("noteTitle", () => {
+  it("names a note by its file name without .note", () => {
+    expect(noteTitle("NOTE/Note/Work/Plan.note")).toBe("Plan");
+    expect(noteTitle("INBOX/a.pdf")).toBe("a.pdf");
+    expect(noteTitle("Plan.note")).toBe("Plan");
+  });
+});
+
+describe("syncGuard", () => {
+  it("does not follow back the scroll the window set itself", () => {
+    const guard = syncGuard();
+    expect(guard.follows("text", 100)).toBe(true);
+    guard.set("pages", 400);
+    // The scroll event of the side set: within a pixel of the value, not followed back.
+    expect(guard.follows("pages", 400.5)).toBe(false);
+    // The user scrolls it then: followed.
+    expect(guard.follows("pages", 420)).toBe(true);
+    guard.set("text", 50);
+    // A user scroll elsewhere than the set value is followed and ends the guard.
+    expect(guard.follows("text", 80)).toBe(true);
+    expect(guard.follows("text", 50)).toBe(true);
+  });
+});
+
 describe("nearPages", () => {
   it("is one page above the view and two below, and keeps four on each side", () => {
     expect(nearPages([4, 5], 20)).toEqual({ near: [3, 7], keep: [0, 9] });
@@ -215,6 +239,52 @@ describe("the review session", () => {
     session.seen(9, false);
     session.seen(1, true);
     expect(asked("note_page_image").slice(7)).toEqual([0, 1, 2, 3]);
+  });
+
+  it("takes the pages that enter and leave the view at once: a jump asks only near it", async () => {
+    const session = await opened(Array.from({ length: 300 }, () => "done" as const));
+    session.seen(290, true);
+    expect(asked("note_page_image")).toEqual([289, 290, 291, 292]);
+    // A jump to the top: page 0 enters and page 290 leaves in one observer callback.
+    session.seenMany([
+      [0, true],
+      [290, false],
+    ]);
+    expect(asked("note_page_image")).toEqual([289, 290, 291, 292, 0, 1, 2]);
+    expect(asked("note_page_drop")).toEqual([289, 290, 291, 292]);
+  });
+
+  it("asks again for a page that Rust dropped after it was asked again", async () => {
+    const session = await opened();
+    session.seen(0, true);
+    session.seenMany([
+      [0, false],
+      [9, true],
+    ]);
+    session.seenMany([
+      [9, false],
+      [0, true],
+    ]);
+    expect(asked("note_page_image").filter((i) => i === 0)).toHaveLength(2);
+    // The drop of the first ask came after the second joined it in Rust: that one ends too.
+    pending.get("0")?.reject("The page is not shown anymore.");
+    await flush();
+    expect(asked("note_page_image").filter((i) => i === 0)).toHaveLength(3);
+    expect(session.images[0]).toEqual({ state: "loading" });
+  });
+
+  it("does not ask again for a dropped page that is kept but not near", async () => {
+    const session = await opened();
+    session.seen(0, true);
+    // Page 2 is kept (no drop) but no longer near.
+    session.seenMany([
+      [0, false],
+      [5, true],
+    ]);
+    pending.get("2")?.reject("The page is not shown anymore.");
+    await flush();
+    expect(asked("note_page_image").filter((i) => i === 2)).toHaveLength(1);
+    expect(session.images[2]).toBeUndefined();
   });
 
   it("keeps the pages a little out of view (no ask and drop at the edge)", async () => {

@@ -2,8 +2,8 @@
   import NameField from "./NameField.svelte";
   import type { EntryActions } from "./actions";
 
-  // The actions on files: New Folder in the shown folder; Rename, Delete and Download on the
-  // picked row. A new folder is named in place.
+  // The actions on files: New Folder in the shown folder; Open (a .note in the review), Rename,
+  // Delete and Download on the picked row. A new folder is named in place.
   let {
     actions,
     naming,
@@ -12,6 +12,7 @@
     onRename,
     onDelete,
     onDownload,
+    onOpen,
   }: {
     actions: EntryActions;
     naming: boolean;
@@ -20,6 +21,7 @@
     onRename: () => void;
     onDelete: () => void;
     onDownload: () => void;
+    onOpen: () => void;
   } = $props();
 </script>
 
@@ -31,6 +33,7 @@
   {:else}
     <button type="button" class="button" disabled={!actions.newFolder} onclick={onNewFolder}>New Folder</button>
   {/if}
+  <button type="button" class="button" disabled={!actions.open} onclick={onOpen}>Open</button>
   <button type="button" class="button" disabled={!actions.rename} onclick={onRename}>Rename</button>
   <button type="button" class="button" disabled={!actions.delete} onclick={onDelete}>Delete</button>
   <button type="button" class="button" disabled={!actions.download} onclick={onDownload}>Download</button>

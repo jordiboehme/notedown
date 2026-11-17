@@ -15,6 +15,7 @@ import {
   jobRows,
   moveTarget,
   newName,
+  opensReview,
   pressRow,
   release,
   shownAfter,
@@ -195,23 +196,38 @@ describe("the actions on a row", () => {
       rename: true,
       delete: true,
       download: true,
+      open: false,
     });
     expect(entryActions(entry("NOTE/Note/Work/Sub"), "NOTE/Note/Work")).toEqual({
       newFolder: true,
       rename: true,
       delete: true,
       download: false,
+      open: false,
     });
     // A device tree itself: New Folder in it, nothing on it.
-    expect(entryActions(null, "NOTE/Note")).toEqual({ newFolder: true, rename: false, delete: false, download: false });
-    expect(entryActions(null, null)).toEqual({ newFolder: false, rename: false, delete: false, download: false });
+    expect(entryActions(null, "NOTE/Note")).toEqual({ newFolder: true, rename: false, delete: false, download: false, open: false });
+    expect(entryActions(null, null)).toEqual({ newFolder: false, rename: false, delete: false, download: false, open: false });
     // A file that cannot be changed can still be downloaded.
     expect(entryActions(entry("NOTE/Note/Work/b.pdf", "file", false), "NOTE/Note/Work")).toEqual({
       newFolder: true,
       rename: false,
       delete: false,
       download: true,
+      open: false,
     });
+    // A note opens in the review.
+    expect(entryActions(entry("NOTE/Note/Work/Plan.note", "file", false), "NOTE/Note/Work").open).toBe(true);
+  });
+
+  it("opens a .note file in the review, and nothing else", () => {
+    expect(opensReview(entry("NOTE/Note/Work/Plan.note", "file"))).toBe(true);
+    expect(opensReview(entry("NOTE/Note/Work/Plan.NOTE", "file"))).toBe(true);
+    expect(opensReview(entry("NOTE/Note/Work/Plan.pdf", "file"))).toBe(false);
+    expect(opensReview(entry("NOTE/Note/Work/notes", "file"))).toBe(false);
+    expect(opensReview(entry("NOTE/Note/Work/Old.note"))).toBe(false);
+    expect(opensReview({ path: "INBOX/a.note", kind: "file" })).toBe(true);
+    expect(opensReview(null)).toBe(false);
   });
 
   it("takes a typed name only when it is new", () => {

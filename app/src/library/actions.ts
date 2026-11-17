@@ -124,7 +124,12 @@ export function entryAt(path: string, listings: Record<string, FolderState>): En
   return null;
 }
 
-export type EntryActions = { newFolder: boolean; rename: boolean; delete: boolean; download: boolean };
+export type EntryActions = { newFolder: boolean; rename: boolean; delete: boolean; download: boolean; open: boolean };
+
+/** A `.note` file (any case) opens in the review; the path is the one `note_open` takes. */
+export function opensReview(entry: { path: string; kind: "file" | "folder" } | null): boolean {
+  return entry?.kind === "file" && entry.path.toLowerCase().endsWith(".note");
+}
 
 /** The actions of the toolbar: New Folder in the shown folder, the rest on the picked entry. */
 export function entryActions(entry: Entry | null, folder: string | null): EntryActions {
@@ -133,6 +138,7 @@ export function entryActions(entry: Entry | null, folder: string | null): EntryA
     rename: entry?.writable === true,
     delete: entry?.writable === true,
     download: entry?.kind === "file",
+    open: opensReview(entry),
   };
 }
 

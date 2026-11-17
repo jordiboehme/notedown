@@ -4,12 +4,14 @@
   import NameField from "./NameField.svelte";
   import PathBar from "./PathBar.svelte";
   import VirtualRows from "./VirtualRows.svelte";
+  import { opensReview } from "./actions";
   import { drag, pressOn } from "./drag.svelte";
   import { dateText, listRows, needsNextPage, sizeText, type Range, type Sort } from "./view";
 
   // The selected folder: the path bar, the column heads and the rows. The first page shows at
   // once; the next page is asked for when the rows near its end come into view. A click picks
-  // a row (for the file actions), a double click opens a folder, a press and a drag moves it.
+  // a row (for the file actions), a double click opens a folder or the review of a .note file
+  // (Enter too, for a .note), a press and a drag moves it.
   let {
     path,
     folder,
@@ -20,6 +22,7 @@
     renaming,
     onSort,
     onOpen,
+    onOpenNote,
     onMore,
     onPick,
     onRename,
@@ -33,6 +36,7 @@
     renaming: string | null;
     onSort: (sort: Sort) => void;
     onOpen: (path: string) => void;
+    onOpenNote: (path: string) => void;
     onMore: () => void;
     onPick: (path: string) => void;
     onRename: (entry: Entry, typed: string | null) => void;
@@ -116,7 +120,12 @@
             class:target={drag.current?.over === entry.path}
             data-folder={entry.kind === "folder" ? entry.path : undefined}
             onclick={() => onPick(entry.path)}
-            ondblclick={() => entry.kind === "folder" && onOpen(entry.path)}
+            ondblclick={() => (entry.kind === "folder" ? onOpen(entry.path) : opensReview(entry) && onOpenNote(entry.path))}
+            onkeydown={(event) => {
+              if (event.key !== "Enter" || !opensReview(entry)) return;
+              event.preventDefault();
+              onOpenNote(entry.path);
+            }}
             onpointerdown={(event) => pressOn(entry, event)}
           >
             <span class="name">

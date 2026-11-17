@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { ReviewSession } from "./session.svelte";
-  import { reviewNotice, reviewPages } from "./review";
+  import { noteTitle, reviewNotice, reviewPages } from "./review";
   import ReviewPages from "./ReviewPages.svelte";
 
   // The review of one note: opened when it mounts (that marks it seen), closed in Rust when it
@@ -23,7 +23,7 @@
 
 <header class="head">
   <button type="button" class="back" onclick={onBack}>Back</button>
-  <h1 class="title">{session.view?.title ?? ""}</h1>
+  <h1 class="title">{session.view?.title ?? noteTitle(path)}</h1>
 </header>
 {#if notice}<p class="notice">{notice}</p>{/if}
 
@@ -37,7 +37,7 @@
   <ReviewPages
     {rows}
     images={session.images}
-    onSeen={(index, visible) => session.seen(index, visible)}
+    onSeen={(changes) => session.seenMany(changes)}
     onMeasured={(index, width, height) => session.measured(index, width, height)}
   />
 {/if}

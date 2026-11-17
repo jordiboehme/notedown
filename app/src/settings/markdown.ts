@@ -26,13 +26,20 @@ export interface MarkdownRow {
 
 export const NEEDS_LOGIN = "Log in to choose the Markdown folder.";
 
-/** The pipeline's own refusal of its `--markdown-dir`, without its prefixes; null for others. */
+/**
+ * The pipeline's own refusal of its `--markdown-dir`, or of `markdown_dirs` in its own config
+ * (it checks those too), without its prefixes; null for other errors.
+ */
 function pipelineRefusal(state: ChildState | null): string | null {
-  if (state?.state !== "backoff" || !state.lastError.includes("--markdown-dir")) return null;
-  const text = state.lastError
-    .replace(/^error:\s*/, "")
-    .replace(/^invalid --markdown-dir:\s*/, "");
-  return `The pipeline refused this folder: ${text}`;
+  if (state?.state !== "backoff") return null;
+  const text = state.lastError.replace(/^error:\s*/, "");
+  if (text.includes("--markdown-dir")) {
+    return `The pipeline refused this folder: ${text.replace(/^invalid --markdown-dir:\s*/, "")}`;
+  }
+  if (text.includes("markdown_dirs")) {
+    return `The pipeline refused a Markdown folder of its own config: ${text.replace(/^invalid markdown_dirs:\s*/, "")}`;
+  }
+  return null;
 }
 
 export function markdownRow(folder: MarkdownFolder): MarkdownRow {

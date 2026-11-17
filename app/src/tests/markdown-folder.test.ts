@@ -70,6 +70,28 @@ describe("the Markdown folder row of the OCR page", () => {
     expect(markdownRow({ ...base, pipeline, error: "Not saved." }).note).toBe("Not saved.");
   });
 
+  it("shows the pipeline's refusal of a folder in its own config", () => {
+    const backoff = (lastError: string): ChildState => ({ state: "backoff", untilMs: 5, lastError });
+    const inside = markdownRow({
+      ...base,
+      pipeline: backoff(
+        "error: invalid markdown_dirs: the Markdown folder /d/md is inside the server's data folder /d; pick a folder outside it",
+      ),
+    });
+    expect(inside.note).toBe(
+      "The pipeline refused a Markdown folder of its own config: the Markdown folder /d/md is inside the server's data folder /d; pick a folder outside it",
+    );
+    expect(inside.tone).toBe("bad");
+    const slug = markdownRow({
+      ...base,
+      pipeline: backoff('error: /d/server.toml: markdown_dirs: "a/b": not a valid account name'),
+    });
+    expect(slug.note).toBe(
+      'The pipeline refused a Markdown folder of its own config: /d/server.toml: markdown_dirs: "a/b": not a valid account name',
+    );
+    expect(slug.tone).toBe("bad");
+  });
+
   it("clears an old error when the folder reads again", () => {
     const failed = { ...base, path: undefined, error: "Notedown is quitting." };
     const read = markdownRead(failed, { path: "/Users/j/md" });

@@ -8,6 +8,8 @@ const COMMANDS: &[&str] = &[
     "get_config",
     "set_mode",
     "set_start_view",
+    "set_notifications",
+    "notification_authorization",
     "start_processes",
     "stop_processes",
     "process_states",

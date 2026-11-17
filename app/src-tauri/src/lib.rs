@@ -245,6 +245,8 @@ pub fn run() {
             commands::get_config,
             commands::set_mode,
             commands::set_start_view,
+            commands::set_notifications,
+            commands::notification_authorization,
             commands::start_processes,
             commands::stop_processes,
             commands::process_states,
@@ -907,10 +909,12 @@ mod tests {
         names.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    const SETTINGS_ONLY: [&str; 42] = [
+    const SETTINGS_ONLY: [&str; 44] = [
         "get_config",
         "set_mode",
         "set_start_view",
+        "set_notifications",
+        "notification_authorization",
         "start_processes",
         "stop_processes",
         "set_autostart",
@@ -1071,7 +1075,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 72);
+        assert_eq!(handler_commands().len(), 74);
     }
 
     #[test]
@@ -1080,6 +1084,8 @@ mod tests {
             "get_config",
             "set_mode",
             "set_start_view",
+            "set_notifications",
+            "notification_authorization",
             "start_processes",
             "stop_processes",
             "process_states",

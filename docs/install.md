@@ -21,6 +21,8 @@ Or download `notedown-app-v<ver>-macos.dmg`, open it and drag Notedown into Appl
 
 The app looks for updates at start and every 24 hours. When there is a new version, it opens Settings on the About page once and shows the version and its notes. It installs only when you say so. "Check for Updates..." in the menu bar checks right away.
 
+Notifications are off by default. Turn them on in Settings > Notifications, and allow them when macOS asks. You choose which events show: the Supernote synced (with the number of changed files), OCR is done, an agent read new notes, and something needs attention. The number of changed files counts right with one Supernote per account. If you said no to macOS, allow Notedown in System Settings > Notifications. The dot on the menu bar icon shows problems also with notifications off.
+
 ### The command line tool
 
 ```sh

@@ -121,6 +121,17 @@ without new pages: 1 min, 5 min (the default), 15 min or 1 hour. The app passes 
 pipeline as `--model-idle`, and a change starts only the pipeline again (`set_model_idle`). The
 model loads again for the next page.
 
+## The Notifications page
+
+Desktop notifications are off by default. "Show notifications" on the Notifications page turns
+them on, and macOS asks for the permission the first time (`set_notifications`; the page reads
+the answer with `notification_authorization`). A denial keeps the switch on, and the page links
+to the Notifications pane of System Settings. Each event has its own switch: a sync of the
+Supernote with the number of changed files, OCR done, an agent read new notes, and problems.
+The file count assumes one Supernote per account. Notifications show only from the installed
+app, not from `tauri dev`. The dot on the menu bar icon shows problems also with notifications
+off.
+
 ## Commands
 
 The Setup page calls these Tauri commands (`src-tauri/src/commands.rs`). The ones that run the

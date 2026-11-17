@@ -183,7 +183,7 @@ function importStep({ status, config, job, dryRun, againRuns }: ChecklistInput):
   const working = job !== null ? JOB_LINES[job] : undefined;
   // The server still says imported from the first time: Import again is done only with both.
   if (againRuns === true) {
-    return { done: false, line: "Import again is not finished. Import the files and the digests.", working };
+    return { done: false, line: "Import again is not finished yet.", working };
   }
   const state = status.account;
   if (state === null) return { done: false, line: "Notedown cannot see the import yet.", working };

@@ -152,8 +152,8 @@ struct State {
     mark_failed_ms: Option<u64>,
     /// When the last check of the first sync failed.
     check_failed_ms: Option<u64>,
-    /// Why it failed, with the key of the mark it was for (shown in the status).
-    check_error: Option<(String, String)>,
+    /// Why it failed, with the mark it was for (shown in the status while that mark holds).
+    check_error: Option<(SyncMark, String)>,
 }
 
 /// The least time between two failed calls for the mark of a server on another machine, and
@@ -554,7 +554,7 @@ impl Inner {
                 state.check_failed_ms = Some((self.clock)());
                 // The first line, for the Setup page.
                 let line = why.trim().lines().next().unwrap_or_default().to_owned();
-                state.check_error = Some((mark.key.clone(), line));
+                state.check_error = Some((mark.clone(), line));
             }
         }
     }
@@ -591,8 +591,8 @@ impl Inner {
         status.first_sync_error = check_error
             .filter(|(mark, _)| {
                 setup.sync_checked.is_none()
-                    && login.as_ref() == Some(mark)
-                    && setup.sync_mark.as_ref().is_some_and(|m| &m.key == mark)
+                    && login.as_ref() == Some(&mark.key)
+                    && setup.sync_mark.as_ref() == Some(mark)
             })
             .map(|(_, why)| why);
         status

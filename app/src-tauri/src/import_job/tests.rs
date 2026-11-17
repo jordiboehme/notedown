@@ -1056,6 +1056,12 @@ fn the_import_sees_a_device_sync_on_disk_while_the_status_has_none() {
     };
     // No device file: only the 24 hours count.
     assert_eq!(last_device_sync(&config, None), None);
+    // The command uses it.
+    let source = include_str!("../commands.rs");
+    let start = source.find("pub async fn import_run(").unwrap();
+    let body = &source[start..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains("import_job::last_device_sync("), "{body}");
     let devices = data.join("accounts/me/devices");
     fs::create_dir_all(&devices).unwrap();
     fs::write(

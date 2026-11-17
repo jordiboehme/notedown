@@ -995,6 +995,14 @@ fn the_first_sync_is_checked_once() {
         rig.poller.status().first_sync_error.as_deref(),
         Some("no answer")
     );
+    // A new mark of the same login (Import again) does not carry the old reason.
+    let first = lock(&rig.inputs).config.setup.sync_mark.clone();
+    lock(&rig.inputs).config.setup.sync_mark = Some(SyncMark {
+        seq: 20,
+        ..first.clone().unwrap()
+    });
+    assert_eq!(rig.poller.status().first_sync_error, None);
+    lock(&rig.inputs).config.setup.sync_mark = first;
     // A status went out with the sync but without a check: the check failed. The next sync
     // is checked before its status goes out.
     *lock(&early) = 0;

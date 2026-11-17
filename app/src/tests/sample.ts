@@ -55,6 +55,7 @@ export function sampleConfig(): AppConfig {
     email: "me@example.org",
     startView: "tree",
     markdownDirs: {},
+    modelIdleMinutes: 5,
     setup: {
       backupUrl: null,
       backupDir: null,

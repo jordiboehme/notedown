@@ -158,6 +158,7 @@ const config: AppConfig = {
   email: null,
   startView: "tree",
   markdownDirs: {},
+  modelIdleMinutes: 5,
   setup: {
     backupUrl: null,
     backupDir: null,

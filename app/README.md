@@ -83,8 +83,15 @@ without a second import of the files. "Import again" is a separate path for a Su
 synced before. It needs a new backup and the Replace option.
 
 While the files or the digests are imported, the app's server is stopped. Start, the mode, log
-in, log out, create account, connect and the Markdown folder answer "Wait until the import is
-done." An import does not start while the server runs outside the app.
+in, log out, create account, connect, the Markdown folder and the model idle time answer "Wait
+until the import is done." An import does not start while the server runs outside the app.
+
+## The OCR page
+
+"Free memory after" on the OCR page sets how long the pipeline keeps the OCR model loaded
+without new pages: 1 min, 5 min (the default), 15 min or 1 hour. The app passes it to the
+pipeline as `--model-idle`, and a change starts only the pipeline again (`set_model_idle`). The
+model loads again for the next page.
 
 ## Commands
 

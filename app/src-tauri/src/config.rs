@@ -47,6 +47,9 @@ pub struct AppConfig {
     /// The Markdown folder of each account, by its slug. An account without an entry uses
     /// [`default_markdown_dir`].
     pub markdown_dirs: BTreeMap<String, PathBuf>,
+    /// The pipeline unloads the OCR model after this many minutes without work
+    /// (`--model-idle`): 1, 5, 15 or 60 ([`MODEL_IDLE_MINUTES`]).
+    pub model_idle_minutes: u32,
     /// What the setup checklist keeps between two starts.
     pub setup: SetupRecord,
 }
@@ -162,6 +165,9 @@ pub fn default_data_dir() -> PathBuf {
         .unwrap_or_default()
         .join("notedown-data")
 }
+
+/// The model idle times the OCR page offers, in minutes.
+pub const MODEL_IDLE_MINUTES: [u32; 4] = [1, 5, 15, 60];
 
 /// `~/Documents/Markdown`: the Markdown folder of an account without one of its own.
 pub fn default_markdown_dir() -> PathBuf {
@@ -292,6 +298,7 @@ impl Default for AppConfig {
             email: None,
             start_view: StartView::Tree,
             markdown_dirs: BTreeMap::new(),
+            model_idle_minutes: 5,
             setup: SetupRecord::default(),
         }
     }
@@ -434,6 +441,7 @@ mod tests {
             email: Some("jordi@example.org".into()),
             start_view: StartView::Columns,
             markdown_dirs: [("jordi".to_owned(), PathBuf::from("/notes/md"))].into(),
+            model_idle_minutes: 15,
             setup: SetupRecord {
                 backup_url: Some("http://192.168.1.20:8089".into()),
                 backup_dir: Some(PathBuf::from("/Users/me/supernote-backup-2026-11-17")),
@@ -649,6 +657,20 @@ mod tests {
         assert!(config.data_dir.ends_with("notedown-data"));
         assert_eq!(config.server_url, None);
         assert_eq!(config.account, None);
+        assert_eq!(config.model_idle_minutes, 5);
+    }
+
+    #[test]
+    fn a_config_without_the_model_idle_time_frees_after_5_minutes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"version": 1, "mode": "local", "account": "jordi"}"#,
+        )
+        .unwrap();
+        let config = load(dir.path());
+        assert_eq!(config.mode, Mode::Local);
+        assert_eq!(config.model_idle_minutes, 5);
     }
 
     #[test]

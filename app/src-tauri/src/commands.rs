@@ -247,6 +247,22 @@ impl ConfigState {
         })
     }
 
+    /// Sets the model idle time of the pipeline, one of [`config::MODEL_IDLE_MINUTES`].
+    pub fn set_model_idle(&self, minutes: u32) -> Result<AppConfig, String> {
+        self.try_update(|c| {
+            if !config::MODEL_IDLE_MINUTES.contains(&minutes) {
+                return Err(MODEL_IDLE_CHOICES);
+            }
+            c.model_idle_minutes = minutes;
+            Ok(())
+        })
+        .map(|(_, next)| next)
+        .map_err(|e| match e {
+            TryUpdateError::Refused(text) => text.to_owned(),
+            TryUpdateError::NotSaved(why) => why,
+        })
+    }
+
     /// Saves what the settings window chose for the backup and the import, and that the user
     /// saw the deletes of the first sync. A folder or a file must be a full path (a leading `~`
     /// is the home folder).
@@ -352,6 +368,9 @@ impl ConfigState {
 pub const NEEDS_ACCOUNT: &str = "Log in to choose the Markdown folder.";
 /// What the Markdown folder refuses inside the data folder: the pipeline would refuse it too.
 pub const OUTSIDE_DATA: &str = "Choose a folder outside the Notedown data folder.";
+
+/// What the model idle time refuses: the OCR page offers only these.
+pub const MODEL_IDLE_CHOICES: &str = "Choose 1, 5, 15 or 60 minutes.";
 
 /// What Set refuses for Another machine without a web address.
 pub const NEEDS_ADDRESS: &str =
@@ -979,6 +998,25 @@ pub async fn set_markdown_dir(
         .map_err(|e| e.to_string())??;
     relaunch_pipeline(config.inner(), processes.inner(), server);
     Ok(saved.markdown_dir().map(|dir| dir.display().to_string()))
+}
+
+/// Sets the model idle time of the pipeline (Free memory after on the OCR page) and answers the
+/// config. When the pipeline's arguments changed, the pipeline starts again with them on a
+/// thread of its own after the answer; the server runs on.
+#[tauri::command]
+pub async fn set_model_idle(
+    config: State<'_, ConfigState>,
+    processes: State<'_, Arc<Processes>>,
+    jobs: State<'_, ImportJobs>,
+    minutes: u32,
+) -> Result<AppConfig, String> {
+    let server = jobs.use_server()?;
+    let state = config.inner().clone();
+    let saved = tauri::async_runtime::spawn_blocking(move || state.set_model_idle(minutes))
+        .await
+        .map_err(|e| e.to_string())??;
+    relaunch_pipeline(config.inner(), processes.inner(), server);
+    Ok(saved)
 }
 
 /// Show in Finder for the Markdown folder: makes it when it is not there yet (the pipeline
@@ -1720,6 +1758,28 @@ mod tests {
         assert!(!reader.was_reset());
         assert_eq!(reader.current().start_view, StartView::Columns);
         assert!(!ConfigState::load(dir.path().to_owned()).was_reset());
+    }
+
+    #[test]
+    fn the_model_idle_time_is_one_of_four() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        assert_eq!(state.current().model_idle_minutes, 5);
+        for minutes in [1, 15, 60, 5] {
+            let cfg = state.set_model_idle(minutes).unwrap();
+            assert_eq!(cfg.model_idle_minutes, minutes);
+            assert_eq!(config::load(dir.path()).model_idle_minutes, minutes);
+        }
+        state.set_model_idle(60).unwrap();
+        for minutes in [0, 2, 30, 61, 1440] {
+            assert_eq!(
+                state.set_model_idle(minutes).unwrap_err(),
+                MODEL_IDLE_CHOICES
+            );
+        }
+        assert_eq!(MODEL_IDLE_CHOICES, "Choose 1, 5, 15 or 60 minutes.");
+        assert_eq!(state.current().model_idle_minutes, 60);
+        assert_eq!(config::load(dir.path()).model_idle_minutes, 60);
     }
 
     #[test]

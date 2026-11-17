@@ -159,7 +159,8 @@ fn local_mode_runs_serve_and_the_pipeline_as_two_children() {
     assert_ne!(server_pid, pipeline_pid);
     let data = rig.path().join("data").display().to_string();
     let serve_line = format!("args: serve --data {data} --exit-with-parent {me}");
-    let pipeline_line = format!("args: pipeline --data {data} --exit-with-parent {me}");
+    let pipeline_line =
+        format!("args: pipeline --data {data} --exit-with-parent {me} --model-idle 5m");
     assert!(
         wait_until(|| has_line(&server, &serve_line)),
         "{:?}",

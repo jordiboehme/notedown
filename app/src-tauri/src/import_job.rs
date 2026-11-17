@@ -9,14 +9,15 @@
 //! `error:` line.
 //!
 //! A real import runs while the app's own server and pipeline are stopped: nothing else writes
-//! to the account meanwhile. They start again after it, also after a failure, but not when the
-//! app quits.
+//! to the account meanwhile. It holds the [`ServerUse`] lock from before the stop until the
+//! children run again, so no command that starts them or changes the login runs during it.
+//! They start again after it, also after a failure, but not when the app quits.
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::{Child, ChildStderr, ChildStdout, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStderr, ChildStdout, ExitStatus, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
@@ -24,21 +25,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::ConfigState;
 use crate::config::{AppConfig, Mode, SyncMark};
-use crate::poller::{self, Poller};
+use crate::poller::Poller;
 use crate::process::{self, SpawnFn};
 use crate::processes::Processes;
 use crate::rest::Rest;
 use crate::status::OUTSIDE_LINE;
 use crate::supervisor::ChildState;
-use crate::token::{TokenStore, token_key};
+use crate::token::token_key;
 
 pub const SETUP_JOB_PROGRESS_EVENT: &str = "setup-job-progress";
 pub const SETUP_JOB_DONE_EVENT: &str = "setup-job-done";
 pub const SETUP_JOB_FAILED_EVENT: &str = "setup-job-failed";
+pub const SETUP_JOB_PAUSED_EVENT: &str = "setup-job-paused";
 
 /// What a second step hears while one runs.
 pub const ANOTHER_RUNS: &str = "Another step is running.";
-/// What the commands that touch the server or the login hear while a step runs.
+/// What the commands that touch the server or the login hear while an import runs.
 pub const WAIT_FOR_IMPORT: &str = "Wait until the import is done.";
 /// A backup folder with files that are not the app's backup.
 pub const NOT_EMPTY: &str = "The folder holds other files. Choose an empty folder.";
@@ -47,8 +49,12 @@ pub const BACKUP_DONE_THERE: &str = "The folder holds a finished backup. Choose 
 /// A backup folder with a backup that did not finish, without Resume.
 pub const BACKUP_NOT_DONE: &str =
     "The folder holds a backup that did not finish. Resume it or choose an empty folder.";
+/// A backup folder that cannot be read.
+pub const CANNOT_READ: &str = "Notedown cannot read this folder.";
 /// The imports write to the server's data folder, which is on this Mac only in Local mode.
 pub const IMPORT_HERE_ONLY: &str = "The import runs on the machine of the server.";
+/// The phase of an import's progress while the server starts again.
+pub const RESTARTING: &str = "restarting";
 
 const QUITTING: &str = "Notedown is quitting.";
 
@@ -60,12 +66,10 @@ const GONE_WAIT: Duration = Duration::from_secs(5);
 const DRAIN: Duration = Duration::from_secs(1);
 /// The stderr lines a job keeps for its error text.
 const STDERR_LINES: usize = 50;
-/// How long the mark waits for the server that starts again after the import.
-const MARK_WAIT: Duration = Duration::from_secs(60);
-/// The time between two tries of the mark.
-const MARK_EVERY: Duration = Duration::from_millis(500);
-/// How long one `GET /events` for the mark may take.
+/// How long one `GET /events` for the mark of a server on another machine may take.
 const MARK_TIMEOUT: Duration = Duration::from_secs(8);
+/// How much of the end of a journal file is read at first to find its last line.
+const TAIL: u64 = 64 * 1024;
 
 /// The steps of the setup that run the sidecar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,7 +100,8 @@ impl JobKind {
 }
 
 /// One progress line: a backup counts `files` and `bytes`, an import names its `phase` with
-/// `files` (recycling) or `done` of `total` (importing).
+/// `files` (recycling) or `done` of `total` (importing). The app adds the phase
+/// [`RESTARTING`] while the server starts again after an import.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobProgress {
@@ -128,6 +133,10 @@ pub enum JobEvent {
         kind: JobKind,
         text: String,
     },
+    /// Pause stopped the job, and the next step may start.
+    Paused {
+        kind: JobKind,
+    },
 }
 
 /// Gets every event. It must not block: the app only sends it into a channel.
@@ -144,9 +153,67 @@ pub trait Host: Send + Sync {
     /// Starts them again as the config asks (after an import).
     fn start(&self);
     fn poll_now(&self);
-    /// The app data of this Mac's server is imported, after the restart: takes the sync mark
-    /// and clears the backup choices. Gives up when `quitting` says so.
-    fn imported(&self, quitting: &dyn Fn() -> bool);
+    /// The files are imported into this Mac's server, before it starts again: takes the sync
+    /// mark from the journal.
+    fn files_imported(&self);
+    /// The app data is imported too: the backup choices are no longer needed.
+    fn app_data_imported(&self);
+}
+
+/// Who uses the app's server: the commands that start the children or change the login use
+/// it ([`ServerUse::try_use`]), each for its whole run, and an import holds it alone
+/// ([`ServerUse::try_hold`]). Neither waits: the one that comes second is refused. Cheap to
+/// clone; every clone is the same lock.
+#[derive(Clone, Default)]
+pub struct ServerUse(Arc<Mutex<Users>>);
+
+#[derive(Default)]
+struct Users {
+    using: usize,
+    held: bool,
+}
+
+/// A command's use of the server; it ends when the guard is dropped.
+#[must_use]
+pub struct UseGuard(ServerUse);
+
+/// An import's hold of the server; it ends when the guard is dropped.
+#[must_use]
+struct HoldGuard(ServerUse);
+
+impl ServerUse {
+    /// Refused with [`WAIT_FOR_IMPORT`] while an import holds the server.
+    pub fn try_use(&self) -> Result<UseGuard, String> {
+        let mut users = lock(&self.0);
+        if users.held {
+            return Err(WAIT_FOR_IMPORT.to_owned());
+        }
+        users.using += 1;
+        Ok(UseGuard(self.clone()))
+    }
+
+    /// `None` while a command uses the server or another import holds it.
+    fn try_hold(&self) -> Option<HoldGuard> {
+        let mut users = lock(&self.0);
+        if users.held || users.using > 0 {
+            return None;
+        }
+        users.held = true;
+        Some(HoldGuard(self.clone()))
+    }
+}
+
+impl Drop for UseGuard {
+    fn drop(&mut self) {
+        let mut users = lock(&(self.0).0);
+        users.using = users.using.saturating_sub(1);
+    }
+}
+
+impl Drop for HoldGuard {
+    fn drop(&mut self) {
+        lock(&(self.0).0).held = false;
+    }
 }
 
 /// What a backup folder holds.
@@ -165,6 +232,8 @@ pub enum BackupFolder {
     },
     /// Anything else: no backup of the app's.
     Foreign,
+    /// The folder (or its `backup.json`) cannot be read.
+    Unreadable,
 }
 
 /// The fields of `backup.json` the app reads.
@@ -182,13 +251,19 @@ pub fn backup_folder_state(dir: &Path) -> BackupFolder {
     let mut entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BackupFolder::Missing,
-        Err(_) => return BackupFolder::Foreign,
+        // A file is no folder for a backup.
+        Err(_) if dir.is_file() => return BackupFolder::Foreign,
+        Err(_) => return BackupFolder::Unreadable,
     };
-    if entries.next().is_none() {
-        return BackupFolder::Empty;
+    match entries.next() {
+        None => return BackupFolder::Empty,
+        Some(Err(_)) => return BackupFolder::Unreadable,
+        Some(Ok(_)) => {}
     }
-    let Ok(text) = std::fs::read(dir.join("backup.json")) else {
-        return BackupFolder::Foreign;
+    let text = match std::fs::read(dir.join("backup.json")) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BackupFolder::Foreign,
+        Err(_) => return BackupFolder::Unreadable,
     };
     match serde_json::from_slice::<BackupFile>(&text) {
         Ok(file) if file.complete => BackupFolder::Complete { time: file.time },
@@ -204,7 +279,7 @@ struct EventsEnd {
 }
 
 /// The highest journal number of the account the token belongs to, from
-/// `GET <base>/events?from=0&limit=1`.
+/// `GET <base>/events?from=0&limit=1` (the mark of a server on another machine).
 pub fn events_end(base: &str, token: crate::token::Token) -> Result<u64, String> {
     let rest = Rest::with_timeout(base, Some(token), MARK_TIMEOUT).map_err(|e| e.to_string())?;
     rest.get_json::<EventsEnd>("/events", &[("from", "0"), ("limit", "1")])
@@ -212,26 +287,89 @@ pub fn events_end(base: &str, token: crate::token::Token) -> Result<u64, String>
         .map_err(|e| e.to_string())
 }
 
-/// Takes the sync mark of the logged-in account from the server at `base` once: `Ok(true)`
-/// when it was saved, `Ok(false)` when there is no account, no token or a mark already.
-pub fn mark_once(state: &ConfigState, base: &str, store: &dyn TokenStore) -> Result<bool, String> {
+/// The `seq` of a journal line.
+#[derive(Deserialize)]
+struct Seq {
+    seq: u64,
+}
+
+/// The last journal number on disk: the `seq` of the last complete line of the newest
+/// `<data>/journal/journal-<first seq>.jsonl` that has one. A last line without its newline
+/// is an append that did not finish and does not count. `None` without a journal.
+pub fn journal_end(data_dir: &Path) -> Option<u64> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(data_dir.join("journal"))
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("journal-") && n.ends_with(".jsonl"))
+        })
+        .collect();
+    // The first seq has 12 digits: the names sort as the files follow one another.
+    files.sort();
+    files.iter().rev().find_map(|file| last_seq(file))
+}
+
+/// The `seq` of the last complete line of `file`, read from its end.
+fn last_seq(file: &Path) -> Option<u64> {
+    let mut f = std::fs::File::open(file).ok()?;
+    let len = f.metadata().ok()?.len();
+    let mut window = TAIL;
+    loop {
+        let start = len.saturating_sub(window);
+        f.seek(SeekFrom::Start(start)).ok()?;
+        let mut tail = Vec::new();
+        f.by_ref().take(len - start).read_to_end(&mut tail).ok()?;
+        // Up to the last newline: what follows it is a torn line.
+        let end = tail.iter().rposition(|b| *b == b'\n')?;
+        let complete = &tail[..end];
+        match complete.iter().rposition(|b| *b == b'\n') {
+            Some(at) => return line_seq(&complete[at + 1..]),
+            None if start == 0 => return line_seq(complete),
+            // The last line is longer than the window: read more.
+            None => window = window.saturating_mul(2),
+        }
+    }
+}
+
+fn line_seq(line: &[u8]) -> Option<u64> {
+    serde_json::from_slice::<Seq>(line).ok().map(|s| s.seq)
+}
+
+/// Takes the sync mark of the logged-in account of this Mac's server from its journal on
+/// disk: `Ok(true)` when it was saved, `Ok(false)` without an account or a journal.
+pub fn take_journal_mark(state: &ConfigState) -> Result<bool, String> {
     let config = state.current();
     let Some(key) = token_key(&config) else {
         return Ok(false);
     };
-    if config
-        .setup
-        .sync_mark
-        .as_ref()
-        .is_some_and(|m| m.key == key)
-    {
-        return Ok(false);
-    }
-    let Some(token) = store.get(&key).map_err(|e| e.to_string())? else {
+    let Some(seq) = journal_end(&config.data_dir) else {
         return Ok(false);
     };
-    let seq = events_end(base, token)?;
-    state.take_sync_mark(SyncMark { key, seq })
+    state.set_sync_mark(SyncMark { key, seq })
+}
+
+/// What a job that failed says: its last `error:` line (the CLI prints one), else its last
+/// stderr line, else how it ended. Warnings and other lines before it are left out.
+pub fn job_error_text(stderr: &[u8], status: ExitStatus) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if let Some(error) = lines.iter().rev().find_map(|l| l.strip_prefix("error: ")) {
+        return error.to_owned();
+    }
+    if let Some(last) = lines.last() {
+        return (*last).to_owned();
+    }
+    match status.code() {
+        Some(code) => format!("it ended with exit code {code}"),
+        None => "it ended by a signal".to_owned(),
+    }
 }
 
 /// The backup and the imports. Cheap to clone; every clone is the same control.
@@ -245,18 +383,23 @@ struct Inner {
     grace: Duration,
     sink: Sink,
     host: Arc<dyn Host>,
+    server: ServerUse,
     run: Mutex<Run>,
     /// Signals the end of a job's process.
     reaped: Condvar,
+    /// A wait between the end of the process and its reap, so a test can pause in it.
+    #[cfg(test)]
+    after_exit: Mutex<Duration>,
 }
 
 #[derive(Default)]
 struct Run {
     /// The running job, from its start (an import: before the server stops) to its event.
     kind: Option<JobKind>,
-    /// The process group of the running job, until it is reaped.
+    /// The process group of the running job, until it ended. Its leader is not reaped while
+    /// this is set, so the number cannot belong to another process.
     pgid: Option<u32>,
-    /// Pause or Quit asked the job to stop: its end is no failure.
+    /// Pause or Quit stopped the job: its end is no failure.
     stop_requested: bool,
     /// After Quit nothing starts.
     quitting: bool,
@@ -270,6 +413,37 @@ fn text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// Waits until the process `pid` (a child of this one) has ended, without reaping it.
+fn wait_ended(pid: u32) {
+    let pid: libc::id_t = pid;
+    loop {
+        // SAFETY: an all-zero siginfo_t is a valid value; waitid only writes to it.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waitid with WNOWAIT only reads the state of our own child.
+        let r = unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        if r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return;
+        }
+    }
+}
+
+/// Whether the child `pid` has ended (and is not reaped yet).
+fn has_ended(pid: u32) -> bool {
+    let id: libc::id_t = pid;
+    // SAFETY: an all-zero siginfo_t is a valid value; waitid only writes to it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: as in [`wait_ended`]; WNOHANG makes it answer at once.
+    let r = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            id,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    r == 0 && info.si_pid != 0
+}
+
 impl ImportJobs {
     /// `grace` is the wait between SIGTERM and SIGKILL when a job is stopped.
     pub fn new(spawn: SpawnFn, grace: Duration, sink: Sink, host: Arc<dyn Host>) -> Self {
@@ -279,8 +453,11 @@ impl ImportJobs {
                 grace,
                 sink,
                 host,
+                server: ServerUse::default(),
                 run: Mutex::new(Run::default()),
                 reaped: Condvar::new(),
+                #[cfg(test)]
+                after_exit: Mutex::new(Duration::ZERO),
             }),
         }
     }
@@ -295,6 +472,7 @@ impl ImportJobs {
             (BackupFolder::Resumable { .. }, false) => return Err(BACKUP_NOT_DONE.to_owned()),
             (BackupFolder::Complete { .. }, _) => return Err(BACKUP_DONE_THERE.to_owned()),
             (BackupFolder::Foreign, _) => return Err(NOT_EMPTY.to_owned()),
+            (BackupFolder::Unreadable, _) => return Err(CANNOT_READ.to_owned()),
         }
         let mut args = vec![
             "cloud".to_owned(),
@@ -305,11 +483,12 @@ impl ImportJobs {
         if resume {
             args.push("--resume".to_owned());
         }
-        self.inner.start(JobKind::Backup, args)
+        self.inner.start(JobKind::Backup, || Ok(args))
     }
 
-    /// Stops a running backup; its `.part` files stay for a resume. Returns when it is gone.
-    /// Nothing else is stopped by it.
+    /// Stops a running backup; its `.part` files stay for a resume. Returns when it is gone;
+    /// [`JobEvent::Paused`] comes once the next step may start. Nothing else is stopped by it,
+    /// and a backup that ended by itself gives its result.
     pub fn pause(&self) {
         self.inner.stop(Some(JobKind::Backup));
     }
@@ -328,8 +507,9 @@ impl ImportJobs {
         replace: bool,
         allow_empty: bool,
     ) -> Result<(), String> {
-        let args = self.import_args(backup_dir, true, replace, allow_empty)?;
-        self.inner.start(JobKind::ImportDryRun, args)
+        self.inner.start(JobKind::ImportDryRun, || {
+            self.import_args(backup_dir, true, replace, allow_empty)
+        })
     }
 
     /// `cloud import` of the backup in `backup_dir`, with the server stopped.
@@ -339,20 +519,23 @@ impl ImportJobs {
         replace: bool,
         allow_empty: bool,
     ) -> Result<(), String> {
-        let args = self.import_args(backup_dir, false, replace, allow_empty)?;
-        self.inner.start(JobKind::Import, args)
+        self.inner.start(JobKind::Import, || {
+            self.import_args(backup_dir, false, replace, allow_empty)
+        })
     }
 
     /// `cloud import-app-data --dry-run` of `snbak`; `None` is `--empty`.
     pub fn app_data_dry_run(&self, snbak: Option<&Path>, replace: bool) -> Result<(), String> {
-        let args = self.app_data_args(snbak, true, replace)?;
-        self.inner.start(JobKind::AppDataDryRun, args)
+        self.inner.start(JobKind::AppDataDryRun, || {
+            self.app_data_args(snbak, true, replace)
+        })
     }
 
     /// `cloud import-app-data` of `snbak` (`None` is `--empty`), with the server stopped.
     pub fn app_data(&self, snbak: Option<&Path>, replace: bool) -> Result<(), String> {
-        let args = self.app_data_args(snbak, false, replace)?;
-        self.inner.start(JobKind::AppData, args)
+        self.inner.start(JobKind::AppData, || {
+            self.app_data_args(snbak, false, replace)
+        })
     }
 
     /// A job runs.
@@ -365,13 +548,16 @@ impl ImportJobs {
         lock(&self.inner.run).kind
     }
 
-    /// The guard of the commands that touch the server or the login: refused while a job runs.
-    pub fn not_busy(&self) -> Result<(), String> {
-        if self.busy() {
-            Err(WAIT_FOR_IMPORT.to_owned())
-        } else {
-            Ok(())
-        }
+    /// The guard of the commands that start the children or change the login, held for the
+    /// whole command: refused with [`WAIT_FOR_IMPORT`] while an import holds the server, and
+    /// an import does not start while one is held.
+    pub fn use_server(&self) -> Result<UseGuard, String> {
+        self.inner.server.try_use()
+    }
+
+    /// The lock behind [`use_server`](Self::use_server).
+    pub fn server_use(&self) -> ServerUse {
+        self.inner.server.clone()
     }
 
     /// `--data <dir> --account <slug>` of the app's own server: Local mode with an account.
@@ -431,17 +617,29 @@ impl ImportJobs {
         }
         Ok(args)
     }
+
+    /// Makes the end of a job wait `wait` between the end of its process and its reap.
+    #[cfg(test)]
+    fn hold_after_exit(&self, wait: Duration) {
+        *lock(&self.inner.after_exit) = wait;
+    }
 }
 
 impl Inner {
-    /// Starts `kind` with `args` and `--json --exit-with-parent <pid>`. An import first stops
-    /// the app's server and pipeline; it is refused while either runs outside the app.
-    fn start(self: &Arc<Self>, kind: JobKind, mut args: Vec<String>) -> Result<(), String> {
+    /// Starts `kind` with the arguments of `args` and `--json --exit-with-parent <pid>`. An
+    /// import takes the server first (refused while a command uses it), then reads its
+    /// arguments (the config cannot change meanwhile) and stops the app's server and pipeline;
+    /// it is refused while either runs outside the app.
+    fn start(
+        self: &Arc<Self>,
+        kind: JobKind,
+        args: impl FnOnce() -> Result<Vec<String>, String>,
+    ) -> Result<(), String> {
         let holds = kind.holds_server();
         if holds && self.host.outside() {
             return Err(OUTSIDE_LINE.to_owned());
         }
-        {
+        let hold = {
             let mut run = lock(&self.run);
             if run.quitting {
                 return Err(QUITTING.to_owned());
@@ -449,11 +647,28 @@ impl Inner {
             if run.kind.is_some() {
                 return Err(ANOTHER_RUNS.to_owned());
             }
-            // Taken before the stop, which can take the children's grace: no second job and
-            // no command of the guard gets in meanwhile.
+            let hold = if holds {
+                Some(
+                    self.server
+                        .try_hold()
+                        .ok_or_else(|| ANOTHER_RUNS.to_owned())?,
+                )
+            } else {
+                None
+            };
+            // Taken before the stop, which can take the children's grace: no second job
+            // gets in meanwhile.
             run.kind = Some(kind);
             run.stop_requested = false;
-        }
+            hold
+        };
+        let mut args = match args() {
+            Ok(args) => args,
+            Err(why) => {
+                lock(&self.run).kind = None;
+                return Err(why);
+            }
+        };
         if holds {
             self.host.stop_all();
         }
@@ -478,12 +693,12 @@ impl Inner {
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(e) => {
-                run.kind = None;
                 drop(run);
                 if holds {
-                    self.host.start();
-                    self.host.poll_now();
+                    self.restart(kind);
                 }
+                lock(&self.run).kind = None;
+                drop(hold);
                 return Err(format!("The notedown program could not start: {e}"));
             }
         };
@@ -492,7 +707,7 @@ impl Inner {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let inner = self.clone();
-        std::thread::spawn(move || inner.follow(kind, child, stdout, stderr));
+        std::thread::spawn(move || inner.follow(kind, child, stdout, stderr, hold));
         Ok(())
     }
 
@@ -500,14 +715,29 @@ impl Inner {
         lock(&self.run).quitting
     }
 
-    /// Reads the job's lines until it ends, starts the server again after an import and
-    /// reports how the job ended.
+    /// Starts the app's server and pipeline again after an import and polls.
+    fn restart(&self, kind: JobKind) {
+        (self.sink)(&JobEvent::Progress(JobProgress {
+            kind,
+            files: None,
+            bytes: None,
+            done: None,
+            total: None,
+            phase: Some(RESTARTING.to_owned()),
+        }));
+        self.host.start();
+        self.host.poll_now();
+    }
+
+    /// Reads the job's lines until it ends, takes the mark and starts the server again after
+    /// an import, and reports how the job ended.
     fn follow(
         self: Arc<Self>,
         kind: JobKind,
         mut child: Child,
         stdout: Option<ChildStdout>,
         stderr: Option<ChildStderr>,
+        hold: Option<HoldGuard>,
     ) {
         let last = Arc::new(Mutex::new(None::<serde_json::Value>));
         let errors = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -543,13 +773,17 @@ impl Inner {
             });
         }
         drop(done_tx);
-        let status = child.wait();
-        // Reaped: a stop must not signal the group from now on.
+        // Ended, not reaped: until `pgid` is cleared a stop sees that it ended by itself, and
+        // its number still belongs to it.
+        wait_ended(child.id());
+        #[cfg(test)]
+        std::thread::sleep(*lock(&self.after_exit));
         {
             let mut run = lock(&self.run);
             run.pgid = None;
             self.reaped.notify_all();
         }
+        let status = child.wait();
         // The readers end with the pipes; a grandchild may hold them, so the wait is bounded.
         let until = Instant::now() + DRAIN;
         while let Err(mpsc::RecvTimeoutError::Timeout) =
@@ -564,31 +798,42 @@ impl Inner {
             (Ok(status), Some(mut json)) => {
                 let ok = status.success();
                 if !ok && let Some(object) = json.as_object_mut() {
-                    let error = process::error_text(&lock(&errors), status);
+                    let error = job_error_text(&lock(&errors), status);
                     object.insert("error".to_owned(), serde_json::Value::String(error));
                 }
                 JobEvent::Done(JobResult { kind, ok, json })
             }
             (Ok(status), None) => JobEvent::Failed {
                 kind,
-                text: process::error_text(&lock(&errors), status),
+                text: job_error_text(&lock(&errors), status),
             },
             (Err(e), _) => JobEvent::Failed {
                 kind,
                 text: format!("the step could not be followed: {e}"),
             },
         };
-        // The server starts again, also after a failure; never when the app quits.
+        // The server starts again, also after a failure; never when the app quits. The mark
+        // is the journal's end while the server is still stopped: no device change is in it.
         if kind.holds_server() && !self.quitting() {
-            self.host.start();
-            self.host.poll_now();
-            if kind == JobKind::AppData && matches!(&event, JobEvent::Done(r) if r.ok) {
-                self.host.imported(&|| self.quitting());
+            if matches!(&event, JobEvent::Done(r) if r.ok) {
+                match kind {
+                    JobKind::Import => self.host.files_imported(),
+                    JobKind::AppData => self.host.app_data_imported(),
+                    _ => {}
+                }
             }
+            self.restart(kind);
         }
-        lock(&self.run).kind = None;
+        drop(hold);
+        let quitting = {
+            let mut run = lock(&self.run);
+            run.kind = None;
+            run.quitting
+        };
         if !stopped {
             (self.sink)(&event);
+        } else if !quitting {
+            (self.sink)(&JobEvent::Paused { kind });
         }
     }
 
@@ -626,14 +871,18 @@ impl Inner {
         (self.sink)(&JobEvent::Progress(progress));
     }
 
-    /// SIGTERM to the job's group, SIGKILL after the grace; returns when it is reaped. With
-    /// `only`, a job of another kind runs on.
+    /// SIGTERM to the job's group, SIGKILL after the grace; returns when it ended. With
+    /// `only`, a job of another kind runs on. A job that ended by itself is not stopped: it
+    /// gives its result.
     fn stop(&self, only: Option<JobKind>) {
         let mut run = lock(&self.run);
         let Some(pgid) = run.pgid else {
             return;
         };
         if only.is_some() && run.kind != only {
+            return;
+        }
+        if has_ended(pgid) {
             return;
         }
         run.stop_requested = true;
@@ -655,12 +904,11 @@ impl Inner {
     }
 }
 
-/// The app's own children, the poller, the config and the Keychain.
+/// The app's own children, the poller and the config.
 pub struct AppHost {
     pub config: ConfigState,
     pub processes: Arc<Processes>,
     pub poller: Poller,
-    pub store: Arc<dyn TokenStore>,
 }
 
 impl Host for AppHost {
@@ -688,28 +936,15 @@ impl Host for AppHost {
         self.poller.poll_now();
     }
 
-    fn imported(&self, quitting: &dyn Fn() -> bool) {
+    fn files_imported(&self) {
+        if let Err(why) = take_journal_mark(&self.config) {
+            eprintln!("notedown: the import mark was not saved: {why}");
+        }
+    }
+
+    fn app_data_imported(&self) {
         if let Err(why) = self.config.imports_done() {
             eprintln!("notedown: the backup choices were not cleared: {why}");
-        }
-        // The server that just started again needs a moment before it answers.
-        let until = Instant::now() + MARK_WAIT;
-        loop {
-            if quitting() {
-                return;
-            }
-            let config = self.config.current();
-            let Some(base) = poller::rest_base(&config, &self.processes.serve_info()) else {
-                return;
-            };
-            match mark_once(&self.config, &base, &*self.store) {
-                Ok(_) => return,
-                Err(why) if Instant::now() >= until => {
-                    eprintln!("notedown: the import mark was not taken: {why}");
-                    return;
-                }
-                Err(_) => std::thread::sleep(MARK_EVERY),
-            }
         }
     }
 }

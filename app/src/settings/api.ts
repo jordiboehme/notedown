@@ -58,7 +58,8 @@ export interface SetupChange {
 /** The steps of the setup that run the notedown program. */
 export type JobKind = "backup" | "importDryRun" | "import" | "appDataDryRun" | "appData";
 
-/** A progress line of a step: a backup counts files and bytes, an import names its phase. */
+/** A progress line of a step: a backup counts files and bytes, an import names its phase
+ * (recycling, importing, verifying, and "restarting" while the app's server starts again). */
 export interface JobProgress {
   kind: JobKind;
   files: number | null;
@@ -88,13 +89,16 @@ export type BackupFolder =
   | { state: "empty" }
   | { state: "resumable"; time: string }
   | { state: "complete"; time: string }
-  | { state: "foreign" };
+  | { state: "foreign" }
+  | { state: "unreadable" };
 
 export const SETUP_JOB_PROGRESS_EVENT = "setup-job-progress";
 export const SETUP_JOB_DONE_EVENT = "setup-job-done";
 export const SETUP_JOB_FAILED_EVENT = "setup-job-failed";
+/** Pause stopped the backup ({kind}); the next step may start. */
+export const SETUP_JOB_PAUSED_EVENT = "setup-job-paused";
 
-/** What the commands that touch the server answer while a step runs. */
+/** What the commands that touch the server answer while an import runs. */
 export const WAIT_FOR_IMPORT = "Wait until the import is done.";
 
 /** The backup folder of a backup made on `today`: ~/supernote-backup-YYYY-MM-DD (local date). */
@@ -191,7 +195,7 @@ export const modelRemove = () => invoke<ModelState>("model_remove");
 /** Backs the Supernote at url up into dir; progress and the end come as events. */
 export const backupStart = (url: string, dir: string, resume: boolean) =>
   invoke<void>("backup_start", { url, dir, resume });
-/** Stops the running backup; Resume continues it. */
+/** Stops the running backup; Resume continues it once setup-job-paused came. */
 export const backupPause = () => invoke<void>("backup_pause");
 export const backupFolder = (dir: string) => invoke<BackupFolder>("backup_folder", { dir });
 /** The dry run of the import of setup.backupDir. */

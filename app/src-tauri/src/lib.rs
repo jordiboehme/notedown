@@ -137,7 +137,6 @@ pub fn run() {
                     config: app.state::<commands::ConfigState>().inner().clone(),
                     processes: processes.clone(),
                     poller: poller.clone(),
-                    store: Arc::new(KeychainStore::new()),
                 },
             ));
             let library = library_for(
@@ -388,6 +387,10 @@ fn import_jobs(app: AppHandle, spawn: process::SpawnFn, host: ImportHost) -> Imp
                 JobEvent::Failed { kind, text } => app.emit(
                     import_job::SETUP_JOB_FAILED_EVENT,
                     serde_json::json!({ "kind": kind, "text": text }),
+                ),
+                JobEvent::Paused { kind } => app.emit(
+                    import_job::SETUP_JOB_PAUSED_EVENT,
+                    serde_json::json!({ "kind": kind }),
                 ),
             };
         }

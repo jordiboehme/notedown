@@ -6,11 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::*;
+use crate::config::SyncMark;
 use crate::config::{AppConfig, Mode};
 use crate::process::spawn_program;
-use crate::rest::test_http::{Scripted, answer};
 use crate::test_procs::{gone, kill_in, left_in, tagged_sleep};
-use crate::token::{MemoryStore, Token, TokenStore};
 
 /// How long a test waits for an event before it fails.
 const WAIT: Duration = Duration::from_secs(10);
@@ -42,6 +41,8 @@ struct FakeHost {
     calls: PathBuf,
     config: Mutex<AppConfig>,
     outside: AtomicBool,
+    /// The lock of the jobs, to note whether the import still holds the server at its start.
+    server: Mutex<Option<ServerUse>>,
 }
 
 impl FakeHost {
@@ -55,6 +56,7 @@ impl FakeHost {
                 ..AppConfig::default()
             }),
             outside: AtomicBool::new(false),
+            server: Mutex::new(None),
         })
     }
 
@@ -77,13 +79,22 @@ impl Host for FakeHost {
         self.note("stop");
     }
     fn start(&self) {
-        self.note("start");
+        let held = self
+            .server
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| s.try_use().is_err());
+        self.note(if held { "start held" } else { "start" });
     }
     fn poll_now(&self) {
         self.note("poll");
     }
-    fn imported(&self, _quitting: &dyn Fn() -> bool) {
-        self.note("imported");
+    fn files_imported(&self) {
+        self.note("mark");
+    }
+    fn app_data_imported(&self) {
+        self.note("cleared");
     }
 }
 
@@ -96,8 +107,9 @@ fn jobs(spawn: SpawnFn, host: Arc<FakeHost>) -> (ImportJobs, Events) {
         spawn,
         GRACE,
         Arc::new(move |event: &JobEvent| seen.lock().unwrap().push(event.clone())),
-        host,
+        host.clone(),
     );
+    *host.server.lock().unwrap() = Some(jobs.server_use());
     (jobs, events)
 }
 
@@ -199,12 +211,43 @@ exec "$S" 331"#;
     assert_eq!(jobs.state(), Some(JobKind::Backup));
     jobs.pause();
     assert!(gone(dir.path()), "{}", left_in(dir.path()));
-    wait_idle(&jobs);
-    std::thread::sleep(Duration::from_millis(100));
+    // The event says the next step may start: Resume is not refused.
+    wait_for(&events, |e| {
+        *e == JobEvent::Paused {
+            kind: JobKind::Backup,
+        }
+    });
+    assert_eq!(jobs.state(), None);
     assert!(
         !events.lock().unwrap().iter().any(is_end),
         "{:?}",
         events.lock().unwrap()
+    );
+}
+
+#[test]
+fn a_pause_after_the_end_keeps_the_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = r#"echo '{"report":{"complete":true,"files":3}}'"#;
+    let (jobs, events) = jobs(sidecar(dir.path(), body), FakeHost::new(dir.path()));
+    // The process has ended, but the job has not noticed yet.
+    jobs.hold_after_exit(Duration::from_millis(800));
+    jobs.backup("http://sn:8089", &backup_dir(dir.path()), false)
+        .unwrap();
+    let start = Instant::now();
+    while calls(dir.path()).is_empty() {
+        assert!(start.elapsed() < WAIT);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(jobs.state(), Some(JobKind::Backup));
+    jobs.pause();
+    let end = wait_for(&events, |e| {
+        is_end(e) || matches!(e, JobEvent::Paused { .. })
+    });
+    assert!(
+        matches!(&end, JobEvent::Done(r) if r.ok && r.json["files"] == 3),
+        "{end:?}"
     );
 }
 
@@ -409,14 +452,21 @@ esac"#;
         .collect();
     assert_eq!(
         phases,
-        vec![Some("importing".into()), Some("verifying".into())]
+        vec![
+            Some("importing".into()),
+            Some("verifying".into()),
+            Some(RESTARTING.into())
+        ]
     );
     wait_idle(&jobs);
+    // The mark is taken while the server is still stopped, and the import holds the server
+    // until it runs again.
     let calls = calls(dir.path());
-    assert_eq!(calls.len(), 4, "{calls:?}");
+    assert_eq!(calls.len(), 5, "{calls:?}");
     assert_eq!(calls[0], "stop");
     assert!(calls[1].starts_with("cloud import "), "{calls:?}");
-    assert_eq!(&calls[2..], ["start", "poll"]);
+    assert_eq!(&calls[2..], ["mark", "start held", "poll"]);
+    assert!(jobs.use_server().is_ok());
     // Also after a failure, and the mark is only for app data that was imported.
     events.lock().unwrap().clear();
     fs::remove_file(dir.path().join("calls")).unwrap();
@@ -435,7 +485,28 @@ esac"#;
     assert_eq!(calls.len(), 4, "{calls:?}");
     assert_eq!(calls[0], "stop");
     assert!(calls[1].starts_with("cloud import-app-data "), "{calls:?}");
-    assert_eq!(&calls[2..], ["start", "poll"]);
+    assert_eq!(&calls[2..], ["start held", "poll"]);
+}
+
+#[test]
+fn a_sidecar_that_cannot_start_restarts_the_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = FakeHost::new(dir.path());
+    let (jobs, events) = jobs(spawn_program(dir.path().join("missing")), host);
+    let refused = jobs
+        .import(&backup_dir(dir.path()), false, false)
+        .unwrap_err();
+    assert!(
+        refused.starts_with("The notedown program could not start"),
+        "{refused}"
+    );
+    assert_eq!(calls(dir.path()), ["stop", "start held", "poll"]);
+    assert!(!jobs.busy());
+    assert!(jobs.use_server().is_ok());
+    assert!(matches!(
+        &events.lock().unwrap()[..],
+        [JobEvent::Progress(p)] if p.phase.as_deref() == Some(RESTARTING)
+    ));
 }
 
 #[test]
@@ -450,35 +521,61 @@ fn the_mark_is_taken_when_the_import_ends() {
     assert_eq!(calls(dir.path()).len(), 1);
     fs::remove_file(dir.path().join("calls")).unwrap();
     events.lock().unwrap().clear();
+    // The app data import clears the backup choices; the mark came with the files.
     jobs.app_data(None, false).unwrap();
     let end = wait_for(&events, is_end);
     assert!(matches!(&end, JobEvent::Done(r) if r.ok && r.kind == JobKind::AppData));
-    // The event comes after the mark, so the page reads the config with it.
     let calls = calls(dir.path());
     assert_eq!(calls.len(), 5, "{calls:?}");
     assert_eq!(calls[0], "stop");
     assert!(calls[1].starts_with("cloud import-app-data --empty "));
-    assert_eq!(&calls[2..], ["start", "poll", "imported"]);
+    assert_eq!(&calls[2..], ["cleared", "start held", "poll"]);
+}
+
+/// Writes `<data>/journal/<name>` with `text`.
+fn journal(data: &Path, name: &str, text: &str) {
+    fs::create_dir_all(data.join("journal")).unwrap();
+    fs::write(data.join("journal").join(name), text).unwrap();
 }
 
 #[test]
 fn the_mark_is_the_end_of_the_journal() {
     let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    // No journal: no mark.
+    assert_eq!(journal_end(&data), None);
+    journal(
+        &data,
+        "journal-000000000001.jsonl",
+        "{\"seq\":1,\"ts\":1}\n{\"seq\":2,\"ts\":2}\n",
+    );
+    journal(&data, ".lock", "");
+    assert_eq!(journal_end(&data), Some(2));
+    // The newest file counts; a last line without its newline is an append that did not end.
+    journal(
+        &data,
+        "journal-000000000003.jsonl",
+        "{\"seq\":3,\"ts\":3,\"account\":\"me\"}\n{\"seq\":4,\"ts\":4}\n{\"seq\":5,\"t",
+    );
+    assert_eq!(journal_end(&data), Some(4));
+    // A newest file without a complete line: the one before it.
+    journal(&data, "journal-000000000005.jsonl", "{\"seq\":5");
+    assert_eq!(journal_end(&data), Some(4));
+    // A last line longer than the first window read.
+    let long = format!(
+        "{{\"seq\":6,\"text\":\"{}\"}}\n{{\"seq\":7,\"text\":\"{}\"}}\n",
+        "a".repeat(10),
+        "b".repeat(200_000)
+    );
+    journal(&data, "journal-000000000006.jsonl", &long);
+    assert_eq!(journal_end(&data), Some(7));
+
     let state = crate::commands::ConfigState::load(dir.path().to_owned());
     state
-        .set_mode(Mode::Local, Some(dir.path().join("data")), None)
+        .set_mode(Mode::Local, Some(data.clone()), None)
         .unwrap();
-    state
-        .set_setup_record(
-            serde_json::from_str(r#"{"backupDir":"/b/backup","snbak":"/b/a.snbak"}"#).unwrap(),
-        )
-        .unwrap();
-    let store = MemoryStore::new();
     // No account: no mark.
-    assert_eq!(
-        mark_once(&state, "http://127.0.0.1:1/rest/v1", &store),
-        Ok(false)
-    );
+    assert_eq!(take_journal_mark(&state), Ok(false));
     state
         .try_update(|c| {
             c.account = Some("me".into());
@@ -486,36 +583,31 @@ fn the_mark_is_the_end_of_the_journal() {
         })
         .ok()
         .unwrap();
-    store.set("local|me", &Token::new("t0k3n")).unwrap();
-    let server = Scripted::start(vec![answer(
-        "200 OK",
-        r#"{"events":[],"next":1,"end":42,"more":false,"gap":false}"#,
-    )]);
-    assert_eq!(mark_once(&state, &server.base(), &store), Ok(true));
-    let request = server.next();
-    assert_eq!(request.target, "/rest/v1/events?from=0&limit=1");
-    assert_eq!(request.header("authorization"), Some("Bearer t0k3n"));
-    let setup = state.current().setup;
+    assert_eq!(take_journal_mark(&state), Ok(true));
     assert_eq!(
-        setup.sync_mark,
-        Some(crate::config::SyncMark {
+        state.current().setup.sync_mark,
+        Some(SyncMark {
             key: "local|me".into(),
-            seq: 42
+            seq: 7
         })
     );
-    // A second mark for the same account is not taken.
-    assert_eq!(
-        state.take_sync_mark(crate::config::SyncMark {
-            key: "local|me".into(),
-            seq: 50
-        }),
-        Ok(false)
-    );
-    assert_eq!(state.current().setup.sync_mark.unwrap().seq, 42);
-    // Both imports are done: the backup choices are cleared.
-    assert_eq!(setup.backup_dir, Some(PathBuf::from("/b/backup")));
-    let setup = state.imports_done().unwrap().setup;
-    assert_eq!((setup.backup_dir, setup.snbak), (None, None));
+    // An import again takes the new end.
+    journal(&data, "journal-000000000008.jsonl", "{\"seq\":8}\n");
+    assert_eq!(take_journal_mark(&state), Ok(true));
+    assert_eq!(state.current().setup.sync_mark.unwrap().seq, 8);
+    // A data folder without a journal takes none and keeps the old one.
+    state
+        .set_mode(Mode::Local, Some(dir.path().join("empty")), None)
+        .unwrap();
+    state
+        .try_update(|c| {
+            c.account = Some("me".into());
+            Ok::<(), ()>(())
+        })
+        .ok()
+        .unwrap();
+    assert_eq!(take_journal_mark(&state), Ok(false));
+    assert_eq!(state.current().setup.sync_mark.unwrap().seq, 8);
 }
 
 #[test]
@@ -534,7 +626,19 @@ exec "$S" 333"#;
     assert_eq!(calls.len(), 2, "{calls:?}");
     assert_eq!(calls[0], "stop");
     assert!(calls[1].starts_with("cloud import "));
-    assert!(!events.lock().unwrap().iter().any(is_end));
+    // No mark, no restart and no event: the app quits.
+    let events = events.lock().unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| is_end(e) || matches!(e, JobEvent::Paused { .. })),
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, JobEvent::Progress(p) if p.phase.as_deref() == Some(RESTARTING)))
+    );
 }
 
 #[test]
@@ -574,10 +678,10 @@ fn busy_blocks_the_commands_that_touch_the_server() {
     let body = r#"echo '{"phase":"importing","done":1,"total":10}'
 exec "$S" 335"#;
     let (jobs, events) = jobs(sidecar(dir.path(), body), FakeHost::new(dir.path()));
-    assert_eq!(jobs.not_busy(), Ok(()));
+    assert!(jobs.use_server().is_ok());
     jobs.import(&backup_dir(dir.path()), false, false).unwrap();
     wait_for(&events, is_progress);
-    assert_eq!(jobs.not_busy(), Err(WAIT_FOR_IMPORT.to_owned()));
+    assert_eq!(jobs.use_server().err(), Some(WAIT_FOR_IMPORT.to_owned()));
     // A pause is for the backup only: the import runs on.
     jobs.pause();
     assert_eq!(jobs.state(), Some(JobKind::Import));
@@ -586,8 +690,8 @@ exec "$S" 335"#;
     kill_in(dir.path());
     assert!(ended);
     wait_idle(&jobs);
-    assert_eq!(jobs.not_busy(), Ok(()));
-    // Each command that touches the server or the login asks the guard first.
+    assert!(jobs.use_server().is_ok());
+    // Each command that starts the children or changes the login holds the guard.
     let source = include_str!("../commands.rs");
     for command in [
         "start_processes",
@@ -596,14 +700,76 @@ exec "$S" 335"#;
         "log_out",
         "create_account",
         "connect_pipeline",
+        "set_markdown_dir",
     ] {
         let start = source
             .find(&format!("pub async fn {command}("))
             .unwrap_or_else(|| panic!("no command {command}"));
         let body = &source[start..];
         let body = &body[..body.find("\n}\n").unwrap()];
-        assert!(body.contains("jobs.not_busy()?"), "{command} has no guard");
+        assert!(
+            body.contains("= jobs.use_server()?;"),
+            "{command} has no guard"
+        );
     }
+}
+
+#[test]
+fn a_command_in_flight_keeps_the_import_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = r#"case "$2" in
+backup-device) echo '{"files":1,"bytes":1,"path":"a"}'; exec "$S" 336 ;;
+*) echo '{"dryRun":{"files":1}}' ;;
+esac"#;
+    let (jobs, events) = jobs(sidecar(dir.path(), body), FakeHost::new(dir.path()));
+    let backup = backup_dir(dir.path());
+    {
+        // A command uses the server, for example a login that is still waiting for its answer.
+        let _command = jobs.use_server().unwrap();
+        assert_eq!(
+            jobs.import(&backup, false, false),
+            Err(ANOTHER_RUNS.to_owned())
+        );
+        assert_eq!(jobs.app_data(None, false), Err(ANOTHER_RUNS.to_owned()));
+        assert!(!jobs.busy());
+        // The steps that leave the server alone may run meanwhile.
+        jobs.import_dry_run(&backup, false, false).unwrap();
+        wait_for(&events, is_end);
+        wait_idle(&jobs);
+    }
+    assert!(calls(dir.path()).iter().all(|c| c != "stop"));
+    // A running backup does not keep the commands out.
+    jobs.backup("http://sn:8089", &dir.path().join("b2"), false)
+        .unwrap();
+    wait_for(&events, is_progress);
+    let command = jobs.use_server();
+    assert!(command.is_ok());
+    // But one step at a time: the import waits for the backup.
+    drop(command);
+    assert_eq!(
+        jobs.import(&backup, false, false),
+        Err(ANOTHER_RUNS.to_owned())
+    );
+    jobs.quit();
+    let ended = gone(dir.path());
+    kill_in(dir.path());
+    assert!(ended, "{}", left_in(dir.path()));
+}
+
+#[test]
+fn the_error_text_is_the_error_line_or_the_last_line() {
+    use std::os::unix::process::ExitStatusExt;
+    let failed = ExitStatus::from_raw(1 << 8);
+    assert_eq!(
+        job_error_text(b"warning: slow\nerror: no files\nnote: x\n", failed),
+        "no files"
+    );
+    // The CLI broke its contract: its last line, never all of them.
+    assert_eq!(
+        job_error_text(b"warning: slow\nsomething broke\n", failed),
+        "something broke"
+    );
+    assert_eq!(job_error_text(b"", failed), "it ended with exit code 1");
 }
 
 #[test]
@@ -697,6 +863,16 @@ fn backup_folder_states() {
     fs::create_dir(&stray).unwrap();
     fs::write(stray.join("notes.txt"), "x").unwrap();
     assert_eq!(backup_folder_state(&stray), BackupFolder::Foreign);
+    // A folder that cannot be read is not called foreign.
+    let locked = dir.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let state = backup_folder_state(&locked);
+    let (jobs, _) = jobs(sidecar(dir.path(), "exit 0"), FakeHost::new(dir.path()));
+    let refused = jobs.backup("http://sn:8089", &locked, false);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(state, BackupFolder::Unreadable);
+    assert_eq!(refused, Err(CANNOT_READ.to_owned()));
     // A file is no folder.
     assert_eq!(
         backup_folder_state(&stray.join("notes.txt")),

@@ -826,13 +826,19 @@ fn the_poller_takes_the_mark_of_an_import_on_another_machine() {
         rig.settle();
     }
     assert!(lock(&rig.fake.events_calls).is_empty());
-    // A failed call is tried again at the next poll.
+    // A failed call is tried again, but at most once a minute.
     *lock(&rig.fake.account_answer) = Some(account(Some(true)));
     *lock(&rig.fake.events_answer) = Some(Err("no answer".into()));
     rig.poller.poll_now();
     rig.settle();
     assert!(lock(&marks).is_empty());
     *lock(&rig.fake.events_answer) = Some(Ok(813));
+    rig.advance(30 * SEC);
+    rig.poller.poll_now();
+    rig.settle();
+    assert!(lock(&marks).is_empty());
+    assert_eq!(lock(&rig.fake.events_calls).len(), 1);
+    rig.advance(30 * SEC);
     rig.poller.poll_now();
     rig.settle();
     assert_eq!(

@@ -534,7 +534,11 @@ fn a_log_in_and_a_log_out_restart_the_pipeline() {
         })
         .ok()
         .unwrap();
-    relaunch_pipeline(&state, &p);
+    relaunch_pipeline(
+        &state,
+        &p,
+        crate::import_job::ServerUse::default().try_use().unwrap(),
+    );
     let want = format!(
         "--markdown-dir jordi={}",
         crate::config::default_markdown_dir().display()
@@ -558,7 +562,11 @@ fn a_log_in_and_a_log_out_restart_the_pipeline() {
         &crate::serve_info::ServeInfo::default(),
     )
     .unwrap();
-    relaunch_pipeline(&state, &p);
+    relaunch_pipeline(
+        &state,
+        &p,
+        crate::import_job::ServerUse::default().try_use().unwrap(),
+    );
     assert!(
         wait_until(|| got(&p).len() == 3),
         "{:?}",

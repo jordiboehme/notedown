@@ -135,7 +135,12 @@ struct State {
     account: Slot<AccountPoll>,
     status: Option<Status>,
     existing: Option<Existing>,
+    /// When the last call for the mark of a server on another machine failed.
+    mark_failed_ms: Option<u64>,
 }
+
+/// The least time between two failed calls for the mark of a server on another machine.
+const MARK_RETRY_MS: u64 = 60_000;
 
 /// What the data folder held when it was last looked at.
 struct Existing {
@@ -384,9 +389,8 @@ impl Inner {
             Some(Err(e)) => (None, AccountAnswer::Failed(e.to_string())),
         };
         let had_token = token.is_some();
-        if let Some(token) = &token {
-            self.mark_remote(config, base, token, &answer);
-        }
+        // Taken after the answer is out, so a slow or failing mark never holds the status up.
+        let marking = token.filter(|_| self.wants_mark(config, &answer));
         let key = Key::of(config);
         let current = self.current_key();
         {
@@ -413,38 +417,51 @@ impl Inner {
             }
         }
         self.refresh();
+        if let Some(token) = marking {
+            self.mark_remote(config, base, &token);
+        }
         lock(&self.state).account.busy = false;
     }
 
     /// On another machine the import is done there: the first poll that sees the files
-    /// imported, with no mark for the account yet, takes the mark.
-    fn mark_remote(&self, config: &AppConfig, base: &str, token: &Token, answer: &AccountAnswer) {
+    /// imported, with no mark for the account yet, takes the mark (see [`mark_remote`]).
+    ///
+    /// [`mark_remote`]: Self::mark_remote
+    fn wants_mark(&self, config: &AppConfig, answer: &AccountAnswer) -> bool {
         let AccountAnswer::Account(info) = answer else {
-            return;
+            return false;
         };
         if config.mode != Mode::Remote || info.imported != Some(true) {
-            return;
+            return false;
         }
         let Some(key) = token_key(config) else {
-            return;
+            return false;
         };
-        if config
+        let now = (self.clock)();
+        let tried = lock(&self.state).mark_failed_ms;
+        !config
             .setup
             .sync_mark
             .as_ref()
             .is_some_and(|m| m.key == key)
-        {
-            return;
-        }
-        if lock(&self.marks).is_none() {
-            return;
-        }
-        // A failed call is tried again at the next poll.
-        let Ok(seq) = self.sources.events_end(base, token) else {
+            && lock(&self.marks).is_some()
+            && tried.is_none_or(|at| now >= at.saturating_add(MARK_RETRY_MS))
+    }
+
+    /// Asks the server for the journal end and hands the mark out. A failed call is tried
+    /// again at most once in [`MARK_RETRY_MS`].
+    fn mark_remote(&self, config: &AppConfig, base: &str, token: &Token) {
+        let Some(key) = token_key(config) else {
             return;
         };
-        if let Some(cb) = lock(&self.marks).as_ref() {
-            cb(SyncMark { key, seq });
+        match self.sources.events_end(base, token) {
+            Ok(seq) => {
+                lock(&self.state).mark_failed_ms = None;
+                if let Some(cb) = lock(&self.marks).as_ref() {
+                    cb(SyncMark { key, seq });
+                }
+            }
+            Err(_) => lock(&self.state).mark_failed_ms = Some((self.clock)()),
         }
     }
 

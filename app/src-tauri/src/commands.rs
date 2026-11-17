@@ -137,10 +137,6 @@ impl ConfigState {
         let before = self.current();
         let mut next = before.clone();
         change(&mut next).map_err(TryUpdateError::Refused)?;
-        // The first sync belongs to one server and one account: another one has its own.
-        if token_key(&before) != token_key(&next) {
-            next.setup.forget_sync();
-        }
         (self.save)(&self.dir, &next)
             .map_err(|e| TryUpdateError::NotSaved(format!("the config was not saved: {e}")))?;
         *self.config.lock().unwrap_or_else(PoisonError::into_inner) = next.clone();
@@ -263,9 +259,21 @@ impl ConfigState {
         self.update(|c| change.apply(&mut c.setup))
     }
 
-    /// Saves the sync mark when it belongs to the logged-in account and that account has none
-    /// yet; answers whether it was saved.
+    /// Saves the sync mark of a new import of the logged-in account (`mark.key` must be its
+    /// token key). It replaces an older mark, also of the same account, and the check of the
+    /// first sync after the old one. Answers whether it was saved.
+    pub fn set_sync_mark(&self, mark: config::SyncMark) -> Result<bool, String> {
+        self.save_mark(mark, true)
+    }
+
+    /// [`set_sync_mark`](Self::set_sync_mark) only when there is no mark for that account
+    /// yet (the import on another machine, seen by the poller). A mark of another key is
+    /// replaced; a mark is kept over a log out and used only while its key is the login's.
     pub fn take_sync_mark(&self, mark: config::SyncMark) -> Result<bool, String> {
+        self.save_mark(mark, false)
+    }
+
+    fn save_mark(&self, mark: config::SyncMark, replace_own: bool) -> Result<bool, String> {
         match self.try_update(|c| {
             let same = token_key(c).as_deref() == Some(mark.key.as_str());
             let has = c
@@ -273,9 +281,10 @@ impl ConfigState {
                 .sync_mark
                 .as_ref()
                 .is_some_and(|m| m.key == mark.key);
-            if !same || has {
+            if !same || (has && !replace_own) {
                 return Err(());
             }
+            c.setup.forget_sync();
             c.setup.sync_mark = Some(mark);
             Ok(())
         }) {
@@ -595,7 +604,7 @@ pub async fn set_mode(
     data_dir: Option<PathBuf>,
     server_url: Option<String>,
 ) -> Result<ConfigAnswer, String> {
-    jobs.not_busy()?;
+    let _server = jobs.use_server()?;
     let processes = processes.inner().clone();
     let serve_info = processes.serve_info();
     let reader = state.reader();
@@ -640,7 +649,7 @@ pub async fn start_processes(
     processes: State<'_, Arc<Processes>>,
     jobs: State<'_, ImportJobs>,
 ) -> Result<ProcessStates, String> {
-    jobs.not_busy()?;
+    let _server = jobs.use_server()?;
     let config = config.reader();
     let processes = processes.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -721,7 +730,7 @@ pub async fn log_in(
     email: String,
     password: String,
 ) -> Result<ConfigAnswer, String> {
-    jobs.not_busy()?;
+    let server = jobs.use_server()?;
     let state = config.inner().clone();
     let gate = gate.inner().clone();
     let library = library.inner().clone();
@@ -741,7 +750,7 @@ pub async fn log_in(
     })
     .await
     .map_err(|e| e.to_string())??;
-    relaunch_pipeline(config.inner(), processes.inner());
+    relaunch_pipeline(config.inner(), processes.inner(), server);
     poller.poll_now();
     Ok(saved)
 }
@@ -750,11 +759,19 @@ pub async fn log_in(
 /// account: the folder belongs to it), on a blocking thread that nobody waits for: the stop of
 /// the old pipeline can take its grace. The config is read inside the start's lock, so the
 /// newest wins.
-pub(crate) fn relaunch_pipeline(config: &ConfigState, processes: &Arc<Processes>) {
+///
+/// `server` is the command's use of the server ([`ImportJobs::use_server`]): it lasts until the
+/// relaunch is over, so no import stops the children in the middle of it.
+pub(crate) fn relaunch_pipeline(
+    config: &ConfigState,
+    processes: &Arc<Processes>,
+    server: import_job::UseGuard,
+) {
     let reader = config.reader();
     let processes = processes.clone();
     tauri::async_runtime::spawn_blocking(move || {
         processes.relaunch_pipeline_with(|| reader.current());
+        drop(server);
     });
 }
 
@@ -779,7 +796,7 @@ pub async fn log_out(
     library: State<'_, Library>,
     jobs: State<'_, ImportJobs>,
 ) -> Result<AppConfig, String> {
-    jobs.not_busy()?;
+    let server = jobs.use_server()?;
     let state = config.inner().clone();
     let gate = gate.inner().clone();
     let library = library.inner().clone();
@@ -789,7 +806,7 @@ pub async fn log_out(
     })
     .await
     .map_err(|e| e.to_string())??;
-    relaunch_pipeline(config.inner(), processes.inner());
+    relaunch_pipeline(config.inner(), processes.inner(), server);
     poller.poll_now();
     Ok(after)
 }
@@ -821,7 +838,7 @@ pub async fn create_account(
     email: String,
     password: String,
 ) -> Result<ConfigAnswer, String> {
-    jobs.not_busy()?;
+    let server = jobs.use_server()?;
     let state = config.inner().clone();
     let gate = gate.inner().clone();
     let library = library.inner().clone();
@@ -844,7 +861,7 @@ pub async fn create_account(
     .await
     .map_err(|e| e.to_string())?;
     // Also after a failed login: the server has the account now.
-    relaunch_pipeline(config.inner(), processes.inner());
+    relaunch_pipeline(config.inner(), processes.inner(), server);
     poller.poll_now();
     answer
 }
@@ -861,7 +878,7 @@ pub async fn connect_pipeline(
     jobs: State<'_, ImportJobs>,
     password: String,
 ) -> Result<ConfigAnswer, String> {
-    jobs.not_busy()?;
+    let server = jobs.use_server()?;
     let current = config.current();
     let spawn = sidecar.0.clone();
     let password = Password::new(password);
@@ -870,7 +887,7 @@ pub async fn connect_pipeline(
     })
     .await
     .map_err(|e| e.to_string())??;
-    relaunch_pipeline(config.inner(), processes.inner());
+    relaunch_pipeline(config.inner(), processes.inner(), server);
     poller.poll_now();
     Ok(ConfigAnswer {
         config: config.current(),
@@ -906,13 +923,15 @@ pub fn markdown_dir(config: State<'_, ConfigState>) -> Option<String> {
 pub async fn set_markdown_dir(
     config: State<'_, ConfigState>,
     processes: State<'_, Arc<Processes>>,
+    jobs: State<'_, ImportJobs>,
     dir: PathBuf,
 ) -> Result<Option<String>, String> {
+    let server = jobs.use_server()?;
     let state = config.inner().clone();
     let saved = tauri::async_runtime::spawn_blocking(move || state.set_markdown_dir(dir))
         .await
         .map_err(|e| e.to_string())??;
-    relaunch_pipeline(config.inner(), processes.inner());
+    relaunch_pipeline(config.inner(), processes.inner(), server);
     Ok(saved.markdown_dir().map(|dir| dir.display().to_string()))
 }
 
@@ -2135,7 +2154,8 @@ mod tests {
     }
 
     #[test]
-    fn another_account_forgets_the_mark() {
+    fn the_mark_is_kept_with_its_key() {
+        use config::{SyncCheck, SyncMark};
         let dir = tempfile::tempdir().unwrap();
         let state = ConfigState::load(dir.path().to_owned());
         state
@@ -2150,60 +2170,61 @@ mod tests {
                 .ok()
                 .unwrap();
         };
+        let mark = |key: &str, seq| SyncMark {
+            key: key.to_owned(),
+            seq,
+        };
         let checked = |state: &ConfigState| {
-            let mark = config::SyncMark {
-                key: token_key(&state.current()).unwrap(),
-                seq: 7,
-            };
-            assert_eq!(state.take_sync_mark(mark), Ok(true));
             state
                 .try_update(|c| {
-                    c.setup.sync_checked = Some(config::SyncCheck::default());
+                    c.setup.sync_checked = Some(SyncCheck::default());
+                    c.setup.sync_acknowledged = true;
                     Ok::<(), ()>(())
                 })
                 .ok()
                 .unwrap();
-            state
-                .set_setup_record(serde_json::from_str(r#"{"syncAcknowledged":true}"#).unwrap())
-                .unwrap();
-            let setup = state.current().setup;
-            assert!(setup.sync_mark.is_some() && setup.sync_checked.is_some());
-            assert!(setup.sync_acknowledged);
         };
-        let forgotten = |state: &ConfigState| {
-            let setup = state.current().setup;
-            assert_eq!(
-                (setup.sync_mark, setup.sync_checked, setup.sync_acknowledged),
-                (None, None, false)
-            );
-        };
+        // No login: no mark.
+        assert_eq!(state.take_sync_mark(mark("local|jordi", 7)), Ok(false));
         log_in("jordi");
         // A mark of another account is not taken.
-        let other = config::SyncMark {
-            key: "local|other".into(),
-            seq: 7,
-        };
-        assert_eq!(state.take_sync_mark(other), Ok(false));
-        assert_eq!(state.current().setup.sync_mark, None);
+        assert_eq!(state.take_sync_mark(mark("local|other", 7)), Ok(false));
+        assert_eq!(state.take_sync_mark(mark("local|jordi", 7)), Ok(true));
         checked(&state);
-        // Saving other things keeps it.
-        state.set_start_view(StartView::Columns).unwrap();
-        assert!(state.current().setup.sync_mark.is_some());
-        // A login to another account.
-        log_in("anna");
-        forgotten(&state);
-        // Log out.
-        checked(&state);
+        // The poller takes no second one for the same account.
+        assert_eq!(state.take_sync_mark(mark("local|jordi", 9)), Ok(false));
+        // Log out and log in again: the mark and its check stay.
         state.forget_login().unwrap();
-        forgotten(&state);
-        // Another server.
+        assert_eq!(
+            state.current().setup.sync_mark,
+            Some(mark("local|jordi", 7))
+        );
         log_in("jordi");
-        checked(&state);
+        let setup = state.current().setup;
+        assert_eq!(setup.sync_mark, Some(mark("local|jordi", 7)));
+        assert!(setup.sync_checked.is_some() && setup.sync_acknowledged);
+        // Another server keeps it too, but it is not that account's.
         state
             .set_mode(Mode::Local, Some("/data/b".into()), None)
             .unwrap();
-        forgotten(&state);
-        assert!(config::load(dir.path()).setup.sync_mark.is_none());
+        assert_eq!(
+            state.current().setup.sync_mark,
+            Some(mark("local|jordi", 7))
+        );
+        // A mark of another key replaces it, and the old check goes with it.
+        log_in("anna");
+        assert_eq!(state.take_sync_mark(mark("local|anna", 3)), Ok(true));
+        let setup = state.current().setup;
+        assert_eq!(setup.sync_mark, Some(mark("local|anna", 3)));
+        assert_eq!((setup.sync_checked, setup.sync_acknowledged), (None, false));
+        // A new import of the same account replaces its mark.
+        checked(&state);
+        assert_eq!(state.set_sync_mark(mark("local|anna", 20)), Ok(true));
+        let setup = config::load(dir.path()).setup;
+        assert_eq!(setup.sync_mark, Some(mark("local|anna", 20)));
+        assert_eq!((setup.sync_checked, setup.sync_acknowledged), (None, false));
+        // Never for an account that is not logged in.
+        assert_eq!(state.set_sync_mark(mark("local|jordi", 30)), Ok(false));
     }
 
     #[test]

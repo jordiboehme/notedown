@@ -698,7 +698,10 @@ fn notify_statuses(app: &AppHandle, poller: &Poller) {
         reads,
         tx.clone(),
     );
-    poller.on_status(notifier::listener(tx));
+    let login = app.state::<commands::ConfigState>().reader();
+    poller.on_status(notifier::listener(tx, move || {
+        token::token_key(&login.current())
+    }));
     std::thread::spawn(move || notifier.run(rx));
     app.manage(stop);
 }

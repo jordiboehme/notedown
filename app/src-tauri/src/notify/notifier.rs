@@ -5,7 +5,8 @@
 //! [`wants_ocr_count`] says so, runs [`decide`], saves the notifier's fields, and only then
 //! shows the notices. A failed save shows nothing: the notices come again with a later status
 //! instead of twice. When [`next_wake`] names a time, [`decide`] runs again then with the last
-//! status, also when no new status came.
+//! status, also when no new status came. Each status carries the token key of its login; a
+//! status for another login than the config's makes no round.
 
 use std::io;
 use std::sync::Arc;
@@ -27,15 +28,26 @@ pub const WAKE_FLOOR: Duration = Duration::from_secs(5);
 /// What goes into the notifier's channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Msg {
-    Status(Box<Status>),
+    /// A status and the token key of the login it was made for (`None` without a login).
+    Status {
+        status: Box<Status>,
+        key: Option<String>,
+    },
     /// The app quits: the thread ends without another notice.
     Stop,
 }
 
-/// The poller's listener: it only sends the status into the channel.
-pub fn listener(tx: Sender<Msg>) -> impl Fn(&Status) + Send + Sync + 'static {
+/// The poller's listener: it only sends the status into the channel, with the token key that
+/// `key` gives when the status is handed out.
+pub fn listener(
+    tx: Sender<Msg>,
+    key: impl Fn() -> Option<String> + Send + Sync + 'static,
+) -> impl Fn(&Status) + Send + Sync + 'static {
     move |status| {
-        let _ = tx.send(Msg::Status(Box::new(status.clone())));
+        let _ = tx.send(Msg::Status {
+            status: Box::new(status.clone()),
+            key: key(),
+        });
     }
 }
 
@@ -159,7 +171,7 @@ impl Notifier {
     /// Takes the statuses in order until [`Msg::Stop`] or the channel closes. Between two
     /// statuses it wakes at [`next_wake`] and decides again with the last status.
     pub fn run(mut self, rx: Receiver<Msg>) {
-        let mut last: Option<Status> = None;
+        let mut last: Option<(Status, Option<String>)> = None;
         let mut wake: Option<u64> = None;
         loop {
             let msg = match wake {
@@ -178,23 +190,29 @@ impl Notifier {
             };
             match msg {
                 Some(Msg::Stop) => return,
-                Some(Msg::Status(status)) => last = Some(*status),
+                Some(Msg::Status { status, key }) => last = Some((*status, key)),
                 None => {}
             }
             if self.stopped() {
                 return;
             }
-            if let Some(status) = &last {
-                wake = self.round(status);
+            if let Some((status, key)) = &last {
+                wake = self.round(status, key.as_deref());
             }
         }
     }
 
-    /// One status: decide, save, then show. Gives the next wake time.
-    pub fn round(&mut self, status: &Status) -> Option<u64> {
+    /// One status, made for the login `for_key`: decide, save, then show. Gives the next wake
+    /// time.
+    pub fn round(&mut self, status: &Status, for_key: Option<&str>) -> Option<u64> {
         let config = (self.reads.config)();
         // Without a login nothing happens.
         let key = token_key(&config)?;
+        // A status made before a login change (one that waited in the channel, or the last
+        // one at a wake) is not for this login: its consumers and problems would seed it.
+        if for_key != Some(key.as_str()) {
+            return None;
+        }
         let record = self.records.key_record(&key);
         let ocr_new = wants_ocr_count(&record, status, &config.data_dir)
             .then(|| (self.reads.notes_newer_than)(record.ocr_text_seq.unwrap_or(0)));
@@ -358,6 +376,11 @@ mod tests {
         rig_with(record, false, FakeDeliver::default(), config())
     }
 
+    /// The poller's listener for the login of [`config`].
+    fn send(tx: &Sender<Msg>, status: Status) {
+        listener(tx.clone(), || Some(KEY.to_owned()))(&status);
+    }
+
     fn bodies(shown: &[Notice]) -> Vec<&str> {
         shown.iter().map(|n| n.body.as_str()).collect()
     }
@@ -365,16 +388,22 @@ mod tests {
     #[test]
     fn the_listener_only_sends() {
         let (tx, rx) = mpsc::channel();
-        let listen = listener(tx);
+        let listen = listener(tx, || Some(KEY.to_owned()));
         listen(&base_status());
-        assert_eq!(rx.try_recv(), Ok(Msg::Status(Box::new(base_status()))));
+        assert_eq!(
+            rx.try_recv(),
+            Ok(Msg::Status {
+                status: Box::new(base_status()),
+                key: Some(KEY.to_owned()),
+            })
+        );
         assert!(rx.try_recv().is_err());
     }
 
     #[test]
     fn the_record_is_saved_before_a_notice_shows() {
         let mut rig = rig(synced());
-        rig.notifier.round(&base_status());
+        rig.notifier.round(&base_status(), Some(KEY));
         assert_eq!(bodies(&rig.deliver.shown()), ["12 files changed."]);
         // One save, and nothing was shown before it.
         assert_eq!(*rig.records.saves.lock().unwrap(), [0]);
@@ -383,14 +412,14 @@ mod tests {
             Some(NOW - MIN)
         );
         // The same status again shows nothing.
-        rig.notifier.round(&base_status());
+        rig.notifier.round(&base_status(), Some(KEY));
         assert_eq!(rig.deliver.shown().len(), 1);
     }
 
     #[test]
     fn a_failed_save_shows_nothing() {
         let mut rig = rig_with(synced(), true, FakeDeliver::default(), config());
-        rig.notifier.round(&base_status());
+        rig.notifier.round(&base_status(), Some(KEY));
         assert_eq!(*rig.records.saves.lock().unwrap(), [0]);
         assert!(rig.deliver.shown().is_empty());
     }
@@ -406,7 +435,7 @@ mod tests {
                 ..config()
             },
         );
-        assert_eq!(rig.notifier.round(&base_status()), None);
+        assert_eq!(rig.notifier.round(&base_status(), Some(KEY)), None);
         assert!(rig.records.saves.lock().unwrap().is_empty());
         assert!(rig.deliver.shown().is_empty());
     }
@@ -415,7 +444,7 @@ mod tests {
     fn a_denial_shows_nothing_but_the_record_moves() {
         let deliver = FakeDeliver::new(Authorization::Denied, Authorization::Denied);
         let mut rig = rig_with(synced(), false, deliver, config());
-        rig.notifier.round(&base_status());
+        rig.notifier.round(&base_status(), Some(KEY));
         assert!(rig.deliver.shown().is_empty());
         assert_eq!(
             rig.records.record.lock().unwrap().sync_shown_at,
@@ -428,7 +457,7 @@ mod tests {
         let mut config = config();
         config.notifications.enabled = false;
         let mut rig = rig_with(synced(), false, FakeDeliver::default(), config);
-        rig.notifier.round(&base_status());
+        rig.notifier.round(&base_status(), Some(KEY));
         assert!(rig.deliver.shown().is_empty());
         assert_eq!(
             rig.records.record.lock().unwrap().sync_shown_at,
@@ -442,12 +471,12 @@ mod tests {
         let mut busy = base_status();
         busy.ocr.queued = 2;
         busy.ocr.last_run_ms = Some(NOW);
-        rig.notifier.round(&busy);
+        rig.notifier.round(&busy, Some(KEY));
         assert_eq!(rig.counts.load(Ordering::SeqCst), 0);
         // The pass ended and nothing is left: counted once.
         let mut done = base_status();
         done.ocr.last_run_ms = Some(NOW);
-        rig.notifier.round(&done);
+        rig.notifier.round(&done, Some(KEY));
         assert_eq!(rig.counts.load(Ordering::SeqCst), 1);
         assert!(bodies(&rig.deliver.shown()).contains(&"3 notes are ready."));
     }
@@ -463,7 +492,7 @@ mod tests {
             sync_at_mark: Some(NOW - 60 * MIN),
         });
         let mut rig = rig_with(synced(), false, FakeDeliver::default(), config);
-        rig.notifier.round(&base_status());
+        rig.notifier.round(&base_status(), Some(KEY));
         assert!(rig.deliver.shown().is_empty());
     }
 
@@ -471,7 +500,7 @@ mod tests {
     fn a_stop_ends_the_thread_before_a_waiting_status_shows() {
         let rig = rig(synced());
         // A status waits in the channel when the app quits: it makes no round.
-        rig.tx.send(Msg::Status(Box::new(base_status()))).unwrap();
+        send(&rig.tx, base_status());
         rig.stop.stop();
         rig.notifier.run(rig.rx);
         assert!(rig.deliver.shown().is_empty());
@@ -502,7 +531,7 @@ mod tests {
             stop,
             ..
         } = rig;
-        tx.send(Msg::Status(Box::new(base_status()))).unwrap();
+        send(&tx, base_status());
         let (done_tx, done_rx) = mpsc::channel();
         let thread = std::thread::spawn(move || {
             notifier.run(rx);
@@ -541,7 +570,7 @@ mod tests {
             stop,
             ..
         } = rig;
-        tx.send(Msg::Status(Box::new(base_status()))).unwrap();
+        send(&tx, base_status());
         let thread = std::thread::spawn(move || notifier.run(rx));
         let waited = Instant::now();
         while deliver.shown().is_empty() && waited.elapsed() < Duration::from_secs(5) {
@@ -595,7 +624,7 @@ mod tests {
                 now_ms: Box::new(|| NOW),
             };
             let (mut notifier, _) = Notifier::new(store, deliver.clone(), reads, tx);
-            notifier.round(&base_status());
+            notifier.round(&base_status(), Some(KEY));
         };
         NotifyStore::load(dir.path())
             .update(|r| {
@@ -608,5 +637,29 @@ mod tests {
         let second = Arc::new(FakeDeliver::default());
         run(&second);
         assert!(second.shown().is_empty());
+    }
+
+    #[test]
+    fn a_status_for_another_login_makes_no_round() {
+        // A status of the old login waits in the channel when the login changes.
+        let Rig {
+            notifier,
+            records,
+            deliver,
+            rx,
+            tx,
+            stop,
+            ..
+        } = rig(synced());
+        listener(tx, || Some("local|other".to_owned()))(&base_status());
+        drop(stop);
+        notifier.run(rx);
+        assert!(records.saves.lock().unwrap().is_empty());
+        assert!(deliver.shown().is_empty());
+        // Nor one made without a login.
+        let mut rig = rig(synced());
+        assert_eq!(rig.notifier.round(&base_status(), None), None);
+        assert!(rig.records.saves.lock().unwrap().is_empty());
+        assert!(rig.deliver.shown().is_empty());
     }
 }

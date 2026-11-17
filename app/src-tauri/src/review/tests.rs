@@ -205,6 +205,8 @@ fn setup_with_limit(routes: Vec<(String, Act)>, limit: u64) -> Setup {
     // The store has both notes with 12 pages, so page indexes up to 11 are in the note.
     s.store(&stored(&md5_hex(BYTES), pages(12)));
     s.store(&stored_at("F_other", OTHER, pages(12)));
+    // The index knows them, as after `note_open` or a scan.
+    s.review.inner.notes.refresh();
     s
 }
 
@@ -926,6 +928,18 @@ fn a_page_past_the_end_is_refused() {
     assert!(s.server.received().is_empty());
     assert!(s.calls().is_empty());
     assert!(s.cached().is_empty(), "{:?}", s.cached());
+}
+
+/// The page check uses the notes index as it is: a page image does not scan the store (the
+/// review's `note_open` and the scanner keep the index fresh).
+#[test]
+fn a_page_image_does_not_scan_the_store() {
+    let s = setup(vec![]);
+    // The note grew to 20 pages in the store since the last scan: the index still says 12.
+    s.store(&stored(&md5_hex(BYTES), pages(20)));
+    assert_eq!(s.review.page_image(NOTE, 15).unwrap_err(), NO_SUCH_PAGE);
+    assert!(s.server.received().is_empty());
+    assert!(s.calls().is_empty());
 }
 
 #[test]

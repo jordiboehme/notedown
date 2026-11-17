@@ -522,8 +522,9 @@ impl Review {
             return Err(QUITTING.to_owned());
         }
         // Only a page of the note as the store has it: no request, download or run for one
-        // past its end.
-        match inner.notes.find(path) {
+        // past its end. The index as it is: `note_open` scanned before, and the scanner keeps
+        // it fresh, so a page does not scan the store again.
+        match inner.notes.at_path(path) {
             None => return Err(inner.missing(path)),
             Some(note) if index >= note.pages => return Err(NO_SUCH_PAGE.to_owned()),
             Some(_) => {}

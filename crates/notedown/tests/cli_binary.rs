@@ -3386,3 +3386,34 @@ fn cloud_import_json_real_run_of_a_bad_backup_prints_one_sentence() {
         "{out:?}"
     );
 }
+
+#[test]
+fn cloud_account_list_uses_the_default_folder() {
+    let home = tempfile::tempdir().unwrap();
+    let data = home.path().join("notedown-data");
+    std::fs::create_dir(&data).unwrap();
+    let out = cloud(
+        &data,
+        &[
+            "add",
+            "jordi",
+            "--email",
+            "jordi@example.org",
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(out.status.success());
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .env("HOME", home.path())
+        .env_remove("NOTEDOWN_DATA")
+        .args(["cloud", "account", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("jordi@example.org"));
+}

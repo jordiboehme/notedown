@@ -73,6 +73,8 @@ That's it for Markdown. Run `convert` again later: notes that didn't change are 
 reads every new page while it runs. Fill the cloud with a backup of the device first: a cloud that
 misses files makes the device delete them.
 
+Every command that takes `--data` uses `$NOTEDOWN_DATA` when you leave it out, or `~/notedown-data` when that is not set.
+
 ```sh
 # an account for the device to log in with
 notedown cloud account --data ~/notedown-data add me --email you@example.org

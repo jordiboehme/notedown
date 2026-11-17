@@ -66,12 +66,12 @@ enum Command {
 
 #[cfg(feature = "ocr")]
 #[derive(clap::Args)]
-#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+#[command(args_conflicts_with_subcommands = true)]
 struct PipelineArgs {
     #[command(subcommand)]
     action: Option<PipelineAction>,
-    /// The data folder
-    #[arg(long, value_name = "DIR", required = true)]
+    /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
+    #[arg(long, value_name = "DIR")]
     data: Option<PathBuf>,
     /// Read every page that is due now, without waiting for the settle time, then stop
     #[arg(long)]
@@ -98,9 +98,9 @@ struct PipelineArgs {
 enum PipelineAction {
     /// List the bookmarks of the consumers per account as JSON, or remove one
     Consumers {
-        /// The data folder
+        /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
         #[arg(long, value_name = "DIR")]
-        data: PathBuf,
+        data: Option<PathBuf>,
         /// Only this account (to remove a bookmark: needed when there are several accounts)
         #[arg(long)]
         account: Option<String>,
@@ -116,18 +116,18 @@ enum PipelineAction {
     /// consumers with their last ack, last read and notes behind. Creates and changes nothing.
     /// Each call reads the whole text log, so do not ask more often than every few seconds
     Status {
-        /// The data folder
+        /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
         #[arg(long, value_name = "DIR")]
-        data: PathBuf,
+        data: Option<PathBuf>,
         /// The account slug (can be left out when the data folder has only one account)
         #[arg(long)]
         account: Option<String>,
     },
     /// Move the bookmark of a consumer to --up-to, never backwards, and print it as JSON
     Ack {
-        /// The data folder
+        /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
         #[arg(long, value_name = "DIR")]
-        data: PathBuf,
+        data: Option<PathBuf>,
         /// The account slug (can be left out when the data folder has only one account)
         #[arg(long)]
         account: Option<String>,
@@ -144,9 +144,9 @@ enum PipelineAction {
 #[derive(clap::Args)]
 #[command(group(clap::ArgGroup::new("start").required(true).args(["consumer", "since", "from"])))]
 struct ChangesArgs {
-    /// The data folder
+    /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
     #[arg(long, value_name = "DIR")]
-    data: PathBuf,
+    data: Option<PathBuf>,
     /// The account slug (can be left out when the data folder has only one account)
     #[arg(long)]
     account: Option<String>,
@@ -174,9 +174,9 @@ struct ChangesArgs {
 #[cfg(feature = "ocr")]
 #[derive(clap::Args)]
 struct McpArgs {
-    /// The data folder
+    /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
     #[arg(long, value_name = "DIR")]
-    data: PathBuf,
+    data: Option<PathBuf>,
     /// The account slug (can be left out when the data folder has only one account)
     #[arg(long)]
     account: Option<String>,
@@ -184,9 +184,9 @@ struct McpArgs {
 
 #[derive(clap::Args)]
 struct ServeArgs {
-    /// The data folder (server.toml, accounts, logs)
+    /// The data folder (server.toml, accounts, logs) (default: $NOTEDOWN_DATA, else ~/notedown-data)
     #[arg(long, value_name = "DIR")]
-    data: PathBuf,
+    data: Option<PathBuf>,
     /// Also write every request and frame, masked, to <data>/capture/ (this run only)
     #[arg(long)]
     capture: bool,
@@ -207,9 +207,9 @@ struct ServeArgs {
 enum CloudAction {
     /// Manage the accounts of a data folder
     Account {
-        /// The data folder
+        /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
         #[arg(long, value_name = "DIR")]
-        data: PathBuf,
+        data: Option<PathBuf>,
         #[command(subcommand)]
         action: AccountAction,
     },
@@ -247,9 +247,9 @@ enum CloudAction {
 
 #[derive(clap::Args)]
 struct DiagnoseArgs {
-    /// The data folder
+    /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
     #[arg(long, value_name = "DIR")]
-    data: PathBuf,
+    data: Option<PathBuf>,
     /// The start of the window: a date (2026-10-09), a time (2026-10-09T08:00:00Z) or a
     /// duration back from now (30m, 12h, 3d)
     #[arg(long, value_name = "TIME", default_value = "3d")]
@@ -270,9 +270,9 @@ struct DiagnoseArgs {
 
 #[derive(clap::Args)]
 struct CloudRenderArgs {
-    /// The data folder
+    /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
     #[arg(long, value_name = "DIR")]
-    data: PathBuf,
+    data: Option<PathBuf>,
     /// Only this account (default: every account)
     #[arg(long)]
     account: Option<String>,
@@ -283,9 +283,9 @@ struct CloudRenderArgs {
 
 #[derive(clap::Args)]
 struct ScanArgs {
-    /// The data folder
+    /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
     #[arg(long, value_name = "DIR")]
-    data: PathBuf,
+    data: Option<PathBuf>,
     /// The account slug (default: every account, one after the other)
     #[arg(long)]
     account: Option<String>,
@@ -307,9 +307,9 @@ enum RecycleAction {
 
 #[derive(clap::Args)]
 struct RecyclePruneArgs {
-    /// The data folder
+    /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
     #[arg(long, value_name = "DIR")]
-    data: PathBuf,
+    data: Option<PathBuf>,
     /// The account slug
     #[arg(long)]
     account: String,
@@ -323,9 +323,9 @@ struct ImportArgs {
     /// The backup folder (Note, Document, MyStyle, EXPORT, SCREENSHOT, INBOX)
     #[arg(value_name = "BACKUP DIR")]
     backup: PathBuf,
-    /// The data folder
+    /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
     #[arg(long, value_name = "DIR")]
-    data: PathBuf,
+    data: Option<PathBuf>,
     /// The account slug
     #[arg(long)]
     account: String,
@@ -355,9 +355,9 @@ struct ImportAppDataArgs {
     /// The device backup (.snbak, made by the device's own backup function)
     #[arg(value_name = "SNBAK", required_unless_present = "empty")]
     snbak: Option<PathBuf>,
-    /// The data folder
+    /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
     #[arg(long, value_name = "DIR")]
-    data: PathBuf,
+    data: Option<PathBuf>,
     /// The account slug
     #[arg(long)]
     account: String,
@@ -382,9 +382,9 @@ struct ImportAppDataArgs {
 struct PutArgs {
     /// The file to copy
     file: PathBuf,
-    /// The data folder
+    /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
     #[arg(long, value_name = "DIR")]
-    data: PathBuf,
+    data: Option<PathBuf>,
     /// The account slug
     #[arg(long)]
     account: String,
@@ -425,9 +425,9 @@ struct BackupDeviceArgs {
 enum JournalAction {
     /// Print the journal events as JSON lines
     Tail {
-        /// The data folder
+        /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
         #[arg(long, value_name = "DIR")]
-        data: PathBuf,
+        data: Option<PathBuf>,
         /// Start at this seq (default: the oldest kept event)
         #[arg(long, value_name = "SEQ")]
         from: Option<u64>,
@@ -437,9 +437,9 @@ enum JournalAction {
     },
     /// Journal the current files, folders, digests and to-dos of an account as created events
     Snapshot {
-        /// The data folder
+        /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
         #[arg(long, value_name = "DIR")]
-        data: PathBuf,
+        data: Option<PathBuf>,
         /// The account slug
         #[arg(long)]
         account: String,
@@ -924,6 +924,41 @@ fn read_password(from_stdin: bool, confirm: bool) -> Result<String> {
 
 /// Finish or drop unfinished changes of every account (a crash of the server or of an
 /// earlier command). Runs at the start of every cloud command.
+/// The data folder of a command: `--data`, else `$NOTEDOWN_DATA` when it is set and not empty,
+/// else `~/notedown-data`.
+fn resolve_data(
+    arg: Option<PathBuf>,
+    env: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(path) = arg {
+        return Ok(path);
+    }
+    if let Some(path) = env.filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    match home.filter(|h| !h.as_os_str().is_empty()) {
+        Some(home) => Ok(home.join("notedown-data")),
+        None => Err(anyhow!("no data folder: pass --data or set NOTEDOWN_DATA")),
+    }
+}
+
+/// `resolve_data` with the real environment.
+fn data_dir(arg: Option<PathBuf>) -> Result<PathBuf> {
+    resolve_data(
+        arg,
+        std::env::var_os("NOTEDOWN_DATA"),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+/// Resolves a command's data folder and writes it back, so the command sees the same folder.
+fn pin_data(slot: &mut Option<PathBuf>) -> Result<PathBuf> {
+    let data = data_dir(slot.take())?;
+    *slot = Some(data.clone());
+    Ok(data)
+}
+
 fn recover_accounts(data: &Path) -> Result<()> {
     if !data.join("accounts").is_dir() {
         return Ok(());
@@ -942,51 +977,52 @@ fn recover_accounts(data: &Path) -> Result<()> {
 fn cloud_command(action: CloudAction) -> Result<ExitCode> {
     match action {
         CloudAction::Account { data, action } => {
+            let data = data_dir(data)?;
             recover_accounts(&data)?;
             account_command(&data, action)
         }
         CloudAction::Journal { action } => {
             let data = match &action {
                 JournalAction::Tail { data, .. } | JournalAction::Snapshot { data, .. } => {
-                    data.clone()
+                    data_dir(data.clone())?
                 }
             };
             recover_accounts(&data)?;
             journal_command(&data, action)
         }
-        CloudAction::Import(args) => {
+        CloudAction::Import(mut args) => {
             if !args.dry_run {
-                recover_accounts(&args.data)?;
+                recover_accounts(&pin_data(&mut args.data)?)?;
             }
             import_command(args)
         }
-        CloudAction::ImportAppData(args) => {
+        CloudAction::ImportAppData(mut args) => {
             if !args.dry_run {
-                recover_accounts(&args.data)?;
+                recover_accounts(&pin_data(&mut args.data)?)?;
             }
             import_app_data_command(args)
         }
-        CloudAction::Put(args) => {
-            recover_accounts(&args.data)?;
+        CloudAction::Put(mut args) => {
+            recover_accounts(&pin_data(&mut args.data)?)?;
             put_command(args)
         }
         CloudAction::BackupDevice(args) => backup_device_command(args),
         CloudAction::Recycle {
-            action: RecycleAction::Prune(args),
+            action: RecycleAction::Prune(mut args),
         } => {
             if !args.dry_run {
-                recover_accounts(&args.data)?;
+                recover_accounts(&pin_data(&mut args.data)?)?;
             }
             recycle_prune_command(args)
         }
-        CloudAction::Scan(args) => {
+        CloudAction::Scan(mut args) => {
             if !args.dry_run {
-                recover_accounts(&args.data)?;
+                recover_accounts(&pin_data(&mut args.data)?)?;
             }
             scan_command(args)
         }
-        CloudAction::Render(args) => {
-            recover_accounts(&args.data)?;
+        CloudAction::Render(mut args) => {
+            recover_accounts(&pin_data(&mut args.data)?)?;
             render_command(args)
         }
         // No recovery: diagnose writes nothing into the data folder.
@@ -995,6 +1031,7 @@ fn cloud_command(action: CloudAction) -> Result<ExitCode> {
 }
 
 fn diagnose_command(args: DiagnoseArgs) -> Result<ExitCode> {
+    let data = data_dir(args.data.clone())?;
     use notedown_cloud::diag::bundle::{DiagnoseOptions, LOCK_WAIT, diagnose};
     let now = time::OffsetDateTime::now_utc();
     let local = notedown_cloud::localtime::local_utc_offset().unwrap_or(time::UtcOffset::UTC);
@@ -1011,7 +1048,7 @@ fn diagnose_command(args: DiagnoseArgs) -> Result<ExitCode> {
         ))
     });
     let done = diagnose(&DiagnoseOptions {
-        data: args.data,
+        data,
         since,
         device: args.device,
         account: args.account,
@@ -1166,6 +1203,7 @@ fn import_command(args: ImportArgs) -> Result<ExitCode> {
 }
 
 fn import_command_inner(args: ImportArgs) -> Result<ExitCode> {
+    let data = data_dir(args.data.clone())?;
     use notedown_cloud::import;
     let options = import::ImportOptions {
         replace: args.replace,
@@ -1175,7 +1213,7 @@ fn import_command_inner(args: ImportArgs) -> Result<ExitCode> {
     let json = args.json;
     exit_with_parent(args.exit_with_parent);
     if args.dry_run {
-        let plan = import::dry_run(&args.data, &args.account, &args.backup, &options)?;
+        let plan = import::dry_run(&data, &args.account, &args.backup, &options)?;
         let empty_refused = plan.scan.files() == 0 && !args.allow_empty;
         if json {
             print_json_line(&dry_run_json(&plan, args.replace));
@@ -1217,10 +1255,10 @@ fn import_command_inner(args: ImportArgs) -> Result<ExitCode> {
             ExitCode::from(1)
         });
     }
-    let journal = notedown_cloud::journal::Journal::open(&args.data)?;
+    let journal = notedown_cloud::journal::Journal::open(&data)?;
     let slug = args.account.clone();
     let result = import::import(
-        &args.data,
+        &data,
         &args.account,
         &args.backup,
         &options,
@@ -1269,21 +1307,17 @@ fn import_app_data_command(args: ImportAppDataArgs) -> Result<ExitCode> {
 }
 
 fn import_app_data_command_inner(args: ImportAppDataArgs) -> Result<ExitCode> {
+    let data = data_dir(args.data.clone())?;
     use notedown_cloud::appdata::{AppImportOptions, dry_run_app_data, import_app_data};
     let json = args.json;
     exit_with_parent(args.exit_with_parent);
     let result = if args.dry_run {
         // No lock and no journal: a dry run writes nothing, not even a folder.
-        dry_run_app_data(
-            &args.data,
-            &args.account,
-            args.snbak.as_deref(),
-            args.replace,
-        )
+        dry_run_app_data(&data, &args.account, args.snbak.as_deref(), args.replace)
     } else {
-        let journal = notedown_cloud::journal::Journal::open(&args.data)?;
+        let journal = notedown_cloud::journal::Journal::open(&data)?;
         import_app_data(
-            &args.data,
+            &data,
             &args.account,
             args.snbak.as_deref(),
             &AppImportOptions {
@@ -1353,17 +1387,18 @@ fn import_app_data_command_inner(args: ImportAppDataArgs) -> Result<ExitCode> {
 }
 
 fn put_command(args: PutArgs) -> Result<ExitCode> {
+    let data = data_dir(args.data.clone())?;
     use notedown_cloud::put::{PutOutcome, put};
-    let journal = notedown_cloud::journal::Journal::open(&args.data)?;
+    let journal = notedown_cloud::journal::Journal::open(&data)?;
     let r = put(
-        &args.data,
+        &data,
         &args.account,
         &journal,
         &args.file,
         &args.to,
         args.name.as_deref(),
     )
-    .map_err(|e| held_error(&args.data, &args.account, e))?;
+    .map_err(|e| held_error(&data, &args.account, e))?;
     let what = match r.outcome {
         PutOutcome::Created => "created",
         PutOutcome::Replaced => "replaced, the old version is in the recycle bin",
@@ -1392,20 +1427,21 @@ fn local_time(ms: u64, offset: time::UtcOffset) -> String {
 }
 
 fn recycle_prune_command(args: RecyclePruneArgs) -> Result<ExitCode> {
+    let data = data_dir(args.data.clone())?;
     use notedown_cloud::journal::{Journal, Origin};
     use notedown_cloud::store::{RecycleReason, Store};
     // A dry run leaves the registry log as it is.
     let store = if args.dry_run {
-        Store::open_no_compact(&args.data, &args.account)?
+        Store::open_no_compact(&data, &args.account)?
     } else {
-        Store::open(&args.data, &args.account)?
+        Store::open(&data, &args.account)?
     };
     // Never write server.toml here, and a dry run creates nothing at all.
-    let config = notedown_cloud::Config::load_or_default(&args.data)?;
+    let config = notedown_cloud::Config::load_or_default(&data)?;
     let journal = if args.dry_run {
-        Journal::open_no_create(&args.data)
+        Journal::open_no_create(&data)
     } else {
-        Journal::open(&args.data)?
+        Journal::open(&data)?
     };
     let offset = notedown_cloud::localtime::local_utc_offset().unwrap_or_else(|| {
         eprintln!("warning: can't read the local UTC offset; days are counted in UTC");
@@ -1596,20 +1632,18 @@ fn render_one_account(data: &Path, slug: &str, root: &Path, all: bool) -> Result
 }
 
 fn render_command(args: CloudRenderArgs) -> Result<ExitCode> {
-    if !args.data.is_dir() {
-        return Err(anyhow!(
-            "data folder {} does not exist",
-            args.data.display()
-        ));
+    let data = data_dir(args.data.clone())?;
+    if !data.is_dir() {
+        return Err(anyhow!("data folder {} does not exist", data.display()));
     }
     // Never write server.toml here.
-    let config = notedown_cloud::Config::load_or_default(&args.data)?;
+    let config = notedown_cloud::Config::load_or_default(&data)?;
     let root = config
-        .render_root(&args.data)
+        .render_root(&data)
         .ok_or_else(|| anyhow!("render_dir is empty in server.toml: rendering is off"))?;
     let slugs = match &args.account {
         Some(slug) => vec![slug.clone()],
-        None => notedown_cloud::auth::Accounts::new(&args.data)
+        None => notedown_cloud::auth::Accounts::new(&data)
             .list()?
             .into_iter()
             .map(|a| a.slug)
@@ -1618,7 +1652,7 @@ fn render_command(args: CloudRenderArgs) -> Result<ExitCode> {
     let mut failed = false;
     for slug in &slugs {
         // With --account the error ends the command; otherwise the other accounts still run.
-        match render_one_account(&args.data, slug, &root, args.all) {
+        match render_one_account(&data, slug, &root, args.all) {
             Ok(f) => failed |= f,
             Err(e) if args.account.is_some() => return Err(e),
             Err(e) => {
@@ -1647,23 +1681,21 @@ fn held_error(data: &Path, slug: &str, e: notedown_cloud::Error) -> anyhow::Erro
 }
 
 fn scan_command(args: ScanArgs) -> Result<ExitCode> {
+    let data = data_dir(args.data.clone())?;
     use notedown_cloud::journal::Journal;
-    if !args.data.is_dir() {
-        return Err(anyhow!(
-            "data folder {} does not exist",
-            args.data.display()
-        ));
+    if !data.is_dir() {
+        return Err(anyhow!("data folder {} does not exist", data.display()));
     }
     // Never write server.toml here, and a dry run creates nothing at all.
-    let config = notedown_cloud::Config::load_or_default(&args.data)?;
+    let config = notedown_cloud::Config::load_or_default(&data)?;
     let journal = if args.dry_run {
-        Journal::open_no_create(&args.data)
+        Journal::open_no_create(&data)
     } else {
-        Journal::open(&args.data)?
+        Journal::open(&data)?
     };
     let slugs = match &args.account {
         Some(slug) => vec![slug.clone()],
-        None => notedown_cloud::auth::Accounts::new(&args.data)
+        None => notedown_cloud::auth::Accounts::new(&data)
             .list()?
             .into_iter()
             .map(|a| a.slug)
@@ -1672,7 +1704,7 @@ fn scan_command(args: ScanArgs) -> Result<ExitCode> {
     let mut failed = false;
     for slug in &slugs {
         // With --account the error ends the command; otherwise the other accounts still run.
-        match scan_account(&args.data, slug, &args, config.scan_min_files, &journal) {
+        match scan_account(&data, slug, &args, config.scan_min_files, &journal) {
             Ok(held) => failed |= held,
             Err(e) if args.account.is_some() => return Err(e),
             Err(e) => {
@@ -2066,9 +2098,10 @@ fn host_ipv4s() -> Vec<std::net::Ipv4Addr> {
 }
 
 fn serve_command(args: ServeArgs) -> Result<ExitCode> {
+    let data = data_dir(args.data.clone())?;
     use notedown_cloud::Config;
     use notedown_cloud::server::{AppState, bind, serve_until_with};
-    let (mut config, config_warnings) = Config::load_with_warnings(&args.data)?;
+    let (mut config, config_warnings) = Config::load_with_warnings(&data)?;
     // The flag counts for this run only; server.toml is not rewritten.
     let capture_from_file = config.capture && !args.capture;
     config.capture |= args.capture;
@@ -2078,7 +2111,7 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         let listeners = bind(&config).await?;
-        let state = AppState::open(config.clone(), &args.data)?;
+        let state = AppState::open(config.clone(), &data)?;
         println!("notedown cloud server");
         for l in &listeners {
             println!("listening on: {}", l.local_addr()?);
@@ -2107,10 +2140,10 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
         if let Some(url) = &config.external_base_url {
             println!("external base URL: {url}");
         }
-        println!("data folder: {}", args.data.display());
+        println!("data folder: {}", data.display());
         println!("log folder: {}", state.log.logs_dir().display());
         if config.capture {
-            println!("capture dumps: {}/capture", args.data.display());
+            println!("capture dumps: {}/capture", data.display());
         }
         if capture_from_file {
             eprintln!(
@@ -2142,7 +2175,7 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
                 );
             }
         }
-        match config.render_root(&args.data) {
+        match config.render_root(&data) {
             Some(root) => println!("render: {}", root.display()),
             None => println!("render: off"),
         }
@@ -2186,7 +2219,7 @@ fn serve_command(args: ServeArgs) -> Result<ExitCode> {
         let guard = PipelineGuard(child.clone());
         #[cfg(feature = "ocr")]
         if args.pipeline {
-            let started = start_pipeline(&args.data)?;
+            let started = start_pipeline(&data)?;
             println!("pipeline: started notedown pipeline (pid {})", started.id());
             *child.lock().unwrap_or_else(|e| e.into_inner()) = Some(started);
             tokio::spawn(watch_pipeline(child.clone()));
@@ -2396,7 +2429,7 @@ fn pipeline_command(args: PipelineArgs) -> Result<ExitCode> {
     if let Some(action) = args.action {
         return pipeline_action(action);
     }
-    let data = args.data.context("--data is missing")?;
+    let data = data_dir(args.data)?;
     if !data.is_dir() {
         return Err(anyhow!("data folder {} does not exist", data.display()));
     }
@@ -2475,6 +2508,7 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
             account,
             remove,
         } => {
+            let data = data_dir(data)?;
             if let Some(name) = remove {
                 let slug = resolve_account(&data, account.as_deref())?;
                 let store = TextStore::open(&data, &slug)?;
@@ -2514,8 +2548,9 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
             println!("{}", to_json(&out));
         }
         PipelineAction::Changes(a) => {
-            let slug = resolve_account(&a.data, a.account.as_deref())?;
-            let store = TextStore::open(&a.data, &slug)?;
+            let data = data_dir(a.data.clone())?;
+            let slug = resolve_account(&data, a.account.as_deref())?;
+            let store = TextStore::open(&data, &slug)?;
             let local =
                 notedown_cloud::localtime::local_utc_offset().unwrap_or(time::UtcOffset::UTC);
             let start = match (a.consumer, a.since, a.from, a.up_to) {
@@ -2536,6 +2571,7 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
             }
         }
         PipelineAction::Status { data, account } => {
+            let data = data_dir(data)?;
             let slug = resolve_account(&data, account.as_deref())?;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2549,6 +2585,7 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
             consumer,
             up_to,
         } => {
+            let data = data_dir(data)?;
             let slug = resolve_account(&data, account.as_deref())?;
             let store = TextStore::open(&data, &slug)?;
             let local =
@@ -2574,9 +2611,9 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
 struct ConnectArgs {
     /// The server, for example http://pi.local:19072
     url: String,
-    /// The pipeline's own data folder (it gets pipeline.toml and tokens/)
-    #[arg(long)]
-    data: PathBuf,
+    /// The pipeline's own data folder (it gets pipeline.toml and tokens/) (default: $NOTEDOWN_DATA, else ~/notedown-data)
+    #[arg(long, value_name = "DIR")]
+    data: Option<PathBuf>,
     /// The email of the account
     #[arg(long)]
     email: String,
@@ -2590,10 +2627,11 @@ struct ConnectArgs {
 
 #[cfg(feature = "ocr")]
 fn connect_command(a: ConnectArgs) -> Result<ExitCode> {
+    let data = data_dir(a.data.clone())?;
     // A wrong folder or URL is said before the password is asked for.
-    notedown_pipeline::connect::check(&a.url, &a.data)?;
+    notedown_pipeline::connect::check(&a.url, &data)?;
     let password = read_password(a.password_stdin, false)?;
-    let c = notedown_pipeline::connect::connect(&a.url, &a.data, &a.email, &password, &a.name)?;
+    let c = notedown_pipeline::connect::connect(&a.url, &data, &a.email, &password, &a.name)?;
     let url = a.url.trim().trim_end_matches('/');
     println!(
         "connected to {url} as {} (user id {}), token {} stored in {}",
@@ -2614,7 +2652,7 @@ fn connect_command(a: ConnectArgs) -> Result<ExitCode> {
 #[cfg(feature = "ocr")]
 fn mcp_command(args: McpArgs) -> Result<ExitCode> {
     // serve_stdio builds its own runtime; this is plain synchronous code.
-    notedown_pipeline::mcp::serve_stdio(&args.data, args.account.as_deref())?;
+    notedown_pipeline::mcp::serve_stdio(&data_dir(args.data.clone())?, args.account.as_deref())?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -2670,6 +2708,46 @@ mod tests {
 
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn resolve_data_prefers_the_argument() {
+        let got = resolve_data(
+            Some("/a".into()),
+            Some("/env".into()),
+            Some("/home/u".into()),
+        )
+        .unwrap();
+        assert_eq!(got, PathBuf::from("/a"));
+    }
+
+    #[test]
+    fn resolve_data_uses_the_environment() {
+        let got = resolve_data(None, Some("/env".into()), Some("/home/u".into())).unwrap();
+        assert_eq!(got, PathBuf::from("/env"));
+    }
+
+    #[test]
+    fn resolve_data_ignores_an_empty_environment() {
+        let got = resolve_data(None, Some("".into()), Some("/home/u".into())).unwrap();
+        assert_eq!(got, PathBuf::from("/home/u/notedown-data"));
+    }
+
+    #[test]
+    fn resolve_data_falls_back_to_home() {
+        let got = resolve_data(None, None, Some("/home/u".into())).unwrap();
+        assert_eq!(got, PathBuf::from("/home/u/notedown-data"));
+    }
+
+    #[test]
+    fn resolve_data_without_any_source_is_an_error() {
+        let err = resolve_data(None, None, None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no data folder: pass --data or set NOTEDOWN_DATA"
+        );
+        let err = resolve_data(None, Some("".into()), Some("".into())).unwrap_err();
+        assert!(err.to_string().starts_with("no data folder"));
+    }
 
     #[test]
     fn dry_run_json_lists_folders_skips_and_needs_replace() {

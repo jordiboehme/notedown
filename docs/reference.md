@@ -257,6 +257,12 @@ records. `--empty` gives zeros and empty lists.
 
 Both commands take a hidden `--exit-with-parent <pid>`, like `backup-device`.
 
+## The data folder
+
+Every command with a `--data` option uses `$NOTEDOWN_DATA` when you leave the option out and the
+variable is set and not empty. Without both it uses `~/notedown-data`. A command stops with "no data
+folder: pass --data or set NOTEDOWN_DATA" when there is no home folder either.
+
 ## Pipeline status
 
 `notedown pipeline status --data DIR [--account A]` prints the state of the OCR pipeline of one account

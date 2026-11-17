@@ -20,9 +20,13 @@ What does not release:
 
 - A version bump without a notes file. CI stays green.
 - A notes file for a version that is tagged already. CI stays green.
-- A notes file without an H1. CI fails.
+- A notes file without an H1, or with nothing after it. CI fails.
 
 A push of a `v<ver>` tag also starts `release.yml`, as a fallback.
+
+## When a release fails
+
+If publish, images or homebrew fail, open that run and use "Re-run failed jobs". A new merge does not release again, because the tag exists already. A re-run of images moves `latest` to that version.
 
 ## Dry runs
 

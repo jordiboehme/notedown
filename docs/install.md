@@ -19,7 +19,7 @@ brew install --cask jordiboehme/tap/notedown-app
 
 Or download `notedown-app-v<ver>-macos.dmg`, open it and drag Notedown into Applications. The app is signed and notarized.
 
-The app looks for updates at start and every 24 hours. When there is one, it opens Settings on the About page and shows the new version and its notes. It installs only when you say so. "Check for Updates..." in the menu bar checks right away.
+The app looks for updates at start and every 24 hours. When there is a new version, it opens Settings on the About page once and shows the version and its notes. It installs only when you say so. "Check for Updates..." in the menu bar checks right away.
 
 ### The command line tool
 
@@ -148,7 +148,7 @@ Notes:
 
 ## Check a download
 
-Every release has a `SHA256SUMS` file with the checksum of every other file. `SHA256SUMS.sigstore.json` is its signature: the release workflow of this repository signed it with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/), without a key. Check the signature first, then the files:
+Every release has a `SHA256SUMS` file with the checksum of every other file. `SHA256SUMS.sigstore.json` is its signature: the release workflow of this repository signed it with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/), without a key. You need cosign 3 or later. Check the signature first, then the files:
 
 ```sh
 cosign verify-blob SHA256SUMS \

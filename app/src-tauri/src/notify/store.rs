@@ -97,59 +97,123 @@ pub struct ProblemState {
 /// notify.json behind a lock. Share it with an `Arc`.
 pub struct NotifyStore {
     dir: PathBuf,
-    record: Mutex<NotifyRecord>,
+    state: Mutex<State>,
+}
+
+struct State {
+    record: NotifyRecord,
+    /// notify.json is there but could not be read, or a broken one could not be set aside:
+    /// it is never written over. Changes stay in memory until the file reads again.
+    blocked: bool,
+}
+
+/// What [`read_file`] found.
+enum OnDisk {
+    /// No file, or a broken one that was set aside: start empty.
+    Empty,
+    Record(NotifyRecord),
+    /// The file is there and must not be written over.
+    Blocked,
 }
 
 impl NotifyStore {
     /// Reads `<dir>/notify.json`. A missing file is an empty record. A file that does not
     /// parse is kept as `notify.json.broken` and the record starts empty: the next statuses
-    /// are baselines. A file that cannot be read starts empty too (logged).
+    /// are baselines. A file that cannot be read (or a broken one that cannot be set aside)
+    /// starts empty too, but it is not written over: changes stay in memory, and each
+    /// [`update`](Self::update) tries to read the file again.
     pub fn load(dir: &Path) -> Self {
-        let path = dir.join(FILE);
-        let record = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                eprintln!(
-                    "notedown: {} does not parse ({e}); kept as {BROKEN}",
-                    path.display()
-                );
-                let _ = fs::rename(&path, dir.join(BROKEN));
-                NotifyRecord::default()
-            }),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => NotifyRecord::default(),
-            Err(e) => {
-                eprintln!("notedown: {} could not be read: {e}", path.display());
-                NotifyRecord::default()
-            }
+        let (record, blocked) = match read_file(dir, true) {
+            OnDisk::Empty => (NotifyRecord::default(), false),
+            OnDisk::Record(record) => (record, false),
+            OnDisk::Blocked => (NotifyRecord::default(), true),
         };
         Self {
             dir: dir.to_owned(),
-            record: Mutex::new(record),
+            state: Mutex::new(State { record, blocked }),
         }
     }
 
     /// A copy of the record.
     pub fn read(&self) -> NotifyRecord {
-        self.lock().clone()
+        self.lock().record.clone()
     }
 
-    /// Changes the record with `f` and saves it, under the lock, when `f` changed it. A failed
-    /// save puts the record back as it was and is the error.
+    /// Changes a copy of the record with `f` and saves it, under the lock, when `f` changed it;
+    /// the copy takes the place of the record only after a good save. So a failed save is the
+    /// error and leaves the record as it was, and a panic in `f` changes nothing. A login
+    /// without any field set (an `entry().or_default()` alone) is no change and is not kept.
+    ///
+    /// While notify.json cannot be read, the file is read again first: once it reads, its
+    /// record is the one `f` changes; until then the change stays in memory and nothing is
+    /// saved.
     pub fn update<R>(&self, f: impl FnOnce(&mut NotifyRecord) -> R) -> io::Result<R> {
-        let mut record = self.lock();
-        let before = record.clone();
-        let result = f(&mut record);
-        if *record != before
-            && let Err(e) = write(&self.dir, &record)
-        {
-            *record = before;
-            return Err(e);
+        let mut state = self.lock();
+        if state.blocked {
+            // Said once at the load; the tries after it are quiet.
+            match read_file(&self.dir, false) {
+                OnDisk::Blocked => {}
+                OnDisk::Empty => state.blocked = false,
+                OnDisk::Record(record) => {
+                    state.record = record;
+                    state.blocked = false;
+                }
+            }
+        }
+        let mut next = state.record.clone();
+        let result = f(&mut next);
+        next.keys.retain(|_, key| *key != KeyRecord::default());
+        if next != state.record {
+            if !state.blocked {
+                write(&self.dir, &next)?;
+            }
+            state.record = next;
         }
         Ok(result)
     }
 
-    fn lock(&self) -> MutexGuard<'_, NotifyRecord> {
-        // A writer that panicked does not stop the other; the next change saves what is there.
-        self.record.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> MutexGuard<'_, State> {
+        // A writer that panicked changed nothing: `update` changes a copy.
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Reads `<dir>/notify.json`; sets a broken one aside. `loud` logs a file that is kept.
+fn read_file(dir: &Path, loud: bool) -> OnDisk {
+    let path = dir.join(FILE);
+    match fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(record) => OnDisk::Record(record),
+            Err(e) => match fs::rename(&path, dir.join(BROKEN)) {
+                Ok(()) => {
+                    eprintln!(
+                        "notedown: {} does not parse ({e}); kept as {BROKEN}",
+                        path.display()
+                    );
+                    OnDisk::Empty
+                }
+                Err(why) => {
+                    if loud {
+                        eprintln!(
+                            "notedown: {} does not parse ({e}) and could not be set aside \
+                             ({why}); it is not written over",
+                            path.display()
+                        );
+                    }
+                    OnDisk::Blocked
+                }
+            },
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => OnDisk::Empty,
+        Err(e) => {
+            if loud {
+                eprintln!(
+                    "notedown: {} could not be read ({e}); it is not written over",
+                    path.display()
+                );
+            }
+            OnDisk::Blocked
+        }
     }
 }
 

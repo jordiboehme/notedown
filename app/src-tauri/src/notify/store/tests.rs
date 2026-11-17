@@ -1,5 +1,6 @@
 //! The store on disk: round trip, a broken file, saves only on change, two writers.
 
+use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Barrier};
 
 use super::*;
@@ -158,16 +159,137 @@ fn update_saves_only_on_a_change() {
     assert_eq!(NotifyStore::load(dir.path()).read(), want);
 }
 
+/// Sets the mode of `path` and puts it back when dropped, so a failed test leaves no folder
+/// the temp dir cannot remove.
+struct Mode<'a>(&'a Path, u32);
+
+impl<'a> Mode<'a> {
+    fn set(path: &'a Path, mode: u32, back: u32) -> Self {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        Mode(path, back)
+    }
+}
+
+impl Drop for Mode<'_> {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(self.1));
+    }
+}
+
 #[test]
 fn a_failed_save_keeps_the_record_as_it_was() {
     let dir = tempfile::tempdir().unwrap();
-    // A file where the folder should be: nothing can be written.
-    let blocked = dir.path().join("blocked");
-    fs::write(&blocked, "").unwrap();
-    let store = NotifyStore::load(&blocked);
+    let store = NotifyStore::load(dir.path());
+    // A folder nothing can be written to.
+    let mode = Mode::set(dir.path(), 0o555, 0o755);
     let result = store.update(|r| r.keys.entry(KEY.into()).or_default().cursor = Some(1));
+    drop(mode);
     assert!(result.is_err());
     assert_eq!(store.read(), NotifyRecord::default());
+    assert!(!dir.path().join(FILE).exists());
+}
+
+#[test]
+fn a_login_without_fields_is_no_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = NotifyStore::load(dir.path());
+    store
+        .update(|r| {
+            r.keys.entry(KEY.into()).or_default();
+        })
+        .unwrap();
+    assert!(!dir.path().join(FILE).exists());
+    assert_eq!(store.read(), NotifyRecord::default());
+    // Next to a saved record too.
+    store.update(|r| *r = full()).unwrap();
+    fs::remove_file(dir.path().join(FILE)).unwrap();
+    store
+        .update(|r| {
+            r.keys.entry("another|key".into()).or_default();
+        })
+        .unwrap();
+    assert!(!dir.path().join(FILE).exists());
+    assert_eq!(store.read(), full());
+}
+
+#[test]
+fn a_panic_in_the_change_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = NotifyStore::load(dir.path());
+    store.update(|r| *r = full()).unwrap();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = store.update(|r| {
+            r.keys.get_mut(KEY).unwrap().unshown_files = 99;
+            panic!("half way");
+        });
+    }));
+    assert!(panicked.is_err());
+    assert_eq!(store.read(), full());
+    // The next change does not carry the half change along.
+    store
+        .update(|r| r.keys.get_mut(KEY).unwrap().cursor = Some(900))
+        .unwrap();
+    let mut want = full();
+    want.keys.get_mut(KEY).unwrap().cursor = Some(900);
+    assert_eq!(NotifyStore::load(dir.path()).read(), want);
+}
+
+#[test]
+fn a_file_that_cannot_be_read_is_not_written_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(FILE);
+    NotifyStore::load(dir.path())
+        .update(|r| *r = full())
+        .unwrap();
+    let saved = fs::read(&path).unwrap();
+    let mode = Mode::set(&path, 0o000, 0o644);
+    let store = NotifyStore::load(dir.path());
+    assert_eq!(store.read(), NotifyRecord::default());
+    // Changes stay in memory; the file is left alone.
+    store
+        .update(|r| r.keys.entry("local|other".into()).or_default().cursor = Some(1))
+        .unwrap();
+    assert_eq!(store.read().keys["local|other"].cursor, Some(1));
+    drop(mode);
+    assert_eq!(fs::read(&path).unwrap(), saved);
+    assert!(!dir.path().join(BROKEN).exists());
+    // Once it reads again, its record is the one that changes and is saved.
+    store
+        .update(|r| r.keys.get_mut(KEY).unwrap().cursor = Some(900))
+        .unwrap();
+    let mut want = full();
+    want.keys.get_mut(KEY).unwrap().cursor = Some(900);
+    assert_eq!(store.read(), want);
+    assert_eq!(NotifyStore::load(dir.path()).read(), want);
+}
+
+#[test]
+fn a_broken_file_that_cannot_be_set_aside_is_not_written_over() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join(FILE), "{not json").unwrap();
+    // No rename in a read-only folder.
+    let mode = Mode::set(dir.path(), 0o555, 0o755);
+    let store = NotifyStore::load(dir.path());
+    assert_eq!(store.read(), NotifyRecord::default());
+    store
+        .update(|r| r.keys.entry(KEY.into()).or_default().cursor = Some(7))
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(dir.path().join(FILE)).unwrap(),
+        "{not json"
+    );
+    assert!(!dir.path().join(BROKEN).exists());
+    drop(mode);
+    // Once it can be set aside, the record in memory is saved.
+    store
+        .update(|r| r.keys.get_mut(KEY).unwrap().unshown_files = 2)
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(dir.path().join(BROKEN)).unwrap(),
+        "{not json"
+    );
+    let key = &NotifyStore::load(dir.path()).read().keys[KEY];
+    assert_eq!((key.cursor, key.unshown_files), (Some(7), 2));
 }
 
 #[test]

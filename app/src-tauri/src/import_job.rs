@@ -739,8 +739,8 @@ impl ImportJobs {
         self.inner.server.try_use()
     }
 
-    /// An import holds the app's server: from before it stops the server until the server
-    /// started again.
+    /// An import holds the app's server: from before it stops the server until it asked the
+    /// server to start again (the start itself is not waited for).
     pub fn holds_server(&self) -> bool {
         self.inner.server.held()
     }

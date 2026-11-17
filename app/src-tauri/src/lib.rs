@@ -113,6 +113,9 @@ pub fn run() {
             }
             let reader = config.reader();
             let library_reader = config.reader();
+            // What the notifications remember; the poller writes the count of each device sync.
+            let notify = Arc::new(notify::store::NotifyStore::load(&config_dir));
+            app.manage(notify.clone());
             let notes = notes_for(app.handle().clone(), config.reader(), config_dir);
             notes.start_scanning(NOTES_EVERY);
             let library_notes = notes.clone();
@@ -131,7 +134,7 @@ pub fn run() {
             }));
             app.manage(model_control(app.handle().clone(), sidecar_spawn.clone()));
             app.manage(setup::Sidecar(sidecar_spawn.clone()));
-            let poller = status_poller(sidecar_spawn.clone(), reader, processes.clone());
+            let poller = status_poller(sidecar_spawn.clone(), reader, processes.clone(), notify);
             let marking = app.state::<commands::ConfigState>().inner().clone();
             let told = app.handle().clone();
             poller.on_sync_mark(move |mark| match marking.take_sync_mark(mark) {
@@ -619,6 +622,7 @@ fn status_poller(
     spawn: process::SpawnFn,
     config: commands::ConfigReader,
     processes: Arc<Processes>,
+    notify: Arc<notify::store::NotifyStore>,
 ) -> Poller {
     Poller::new(
         Arc::new(RealSources::new(spawn)),
@@ -628,6 +632,7 @@ fn status_poller(
             config_reset: config.was_reset(),
             processes: processes.states(),
             serve_info: processes.serve_info(),
+            notify: notify.clone(),
         }),
         supervisor::system_clock(),
     )

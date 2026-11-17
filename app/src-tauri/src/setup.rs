@@ -368,7 +368,7 @@ pub fn sync_check_local(
     Ok(check)
 }
 
-/// One page of `GET /events`, as far as the check reads it.
+/// One page of `GET /events`, as far as the checks read it.
 #[derive(Deserialize)]
 struct EventsPage {
     events: Vec<FileEvent>,
@@ -383,6 +383,59 @@ struct FileEvent {
     #[serde(rename = "type")]
     kind: String,
     origin: String,
+    /// The entry; a number for files and folders.
+    #[serde(default)]
+    id: Option<u64>,
+    #[serde(default)]
+    path: String,
+    /// The device and the time of the change (the server's clock). Not read yet: one
+    /// Supernote per account is the rule, so a count does not split devices.
+    #[serde(default)]
+    #[allow(dead_code)]
+    device: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    ts: Option<u64>,
+}
+
+/// Whether [`each_event`] read every page up to the end.
+#[derive(Debug, PartialEq, Eq)]
+enum Paged {
+    Done,
+    /// It stopped after `pages` pages with more to read.
+    Bounded,
+}
+
+/// Reads `GET /events` page by page from `from + 1` and hands each event in `(from, end]` to
+/// `f`, with whether a page had a `gap`. At most `pages` pages, when given.
+fn each_event(
+    rest: &Rest,
+    from: u64,
+    end: u64,
+    pages: Option<usize>,
+    mut f: impl FnMut(&FileEvent),
+) -> Result<(Paged, bool), RestError> {
+    let mut gap = false;
+    let mut next = from.saturating_add(1);
+    let mut read = 0;
+    while next <= end {
+        if pages.is_some_and(|most| read >= most) {
+            return Ok((Paged::Bounded, gap));
+        }
+        let query = next.to_string();
+        let page = rest.get_json::<EventsPage>("/events", &[("from", query.as_str())])?;
+        read += 1;
+        gap |= page.gap;
+        for event in page.events.iter().filter(|e| e.seq > from && e.seq <= end) {
+            f(event);
+        }
+        // A page that does not move on would be asked again for ever.
+        if !page.more || page.next <= next {
+            break;
+        }
+        next = page.next;
+    }
+    Ok((Paged::Done, gap))
 }
 
 /// What the first sync deleted on a server on another machine: the device deletes of the
@@ -391,28 +444,42 @@ struct FileEvent {
 /// means events are missing: then what the sync did cannot be told.
 pub fn sync_check_remote(rest: &Rest, mark: u64, end: u64) -> Result<SyncCheck, RestError> {
     let mut check = SyncCheck::default();
-    let mut from = mark.saturating_add(1);
-    while from <= end {
-        let query = from.to_string();
-        let page = rest.get_json::<EventsPage>("/events", &[("from", query.as_str())])?;
-        check.cannot_tell |= page.gap;
-        for event in page.events.iter().filter(|e| e.seq > mark && e.seq <= end) {
-            if event.origin != "device" {
-                continue;
-            }
-            match event.kind.as_str() {
-                FILE_DELETED => check.files += 1,
-                FOLDER_DELETED => check.folders += 1,
-                _ => {}
-            }
+    let (_, gap) = each_event(rest, mark, end, None, |event| {
+        if event.origin != "device" {
+            return;
         }
-        // A page that does not move on would be asked again for ever.
-        if !page.more || page.next <= from {
-            break;
+        match event.kind.as_str() {
+            FILE_DELETED => check.files += 1,
+            FOLDER_DELETED => check.folders += 1,
+            _ => {}
         }
-        from = page.next;
-    }
+    })?;
+    check.cannot_tell = gap;
     Ok(check)
+}
+
+/// The most pages of `GET /events` one count reads. The status waits for the count, so it is
+/// bounded; a sync with more events than that has no number.
+pub const COUNT_PAGES: usize = 50;
+
+/// How many files the device changed in `(from, end]`: the distinct entries of the `file.*`
+/// events with the origin `device`. Folders and the changes of others are not counted. `None`
+/// when it cannot be told: a page with `gap`, or more than [`COUNT_PAGES`] pages.
+pub fn count_device_files(rest: &Rest, from: u64, end: u64) -> Result<Option<u64>, RestError> {
+    let mut files = std::collections::BTreeSet::new();
+    let (paged, gap) = each_event(rest, from, end, Some(COUNT_PAGES), |event| {
+        if event.origin == "device" && event.kind.starts_with("file.") {
+            // An event without an id is told apart by its path.
+            files.insert(event.id.map_or_else(
+                || (None, event.path.clone()),
+                |id| (Some(id), String::new()),
+            ));
+        }
+    })?;
+    if gap || paged == Paged::Bounded {
+        return Ok(None);
+    }
+    Ok(Some(files.len() as u64))
 }
 
 /// The check of the first sync of the login, for the Setup page.

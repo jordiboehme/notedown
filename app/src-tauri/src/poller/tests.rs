@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::Instant;
 
 use super::*;
+use crate::notify::store::{KeyRecord, SyncCount};
 use crate::probe::test_server::{TestServer, accept_within, free_port, http};
 use crate::status::Attention;
 use crate::supervisor::ChildState;
@@ -45,6 +46,9 @@ struct Fake {
     /// The marks `first_sync` was asked for (mode and seq), and its answer.
     check_calls: Mutex<Vec<(Mode, u64)>>,
     check_answer: Mutex<Option<Result<SyncCheck, String>>>,
+    /// The cursors `device_changes` was asked for, and its answer.
+    changes_calls: Mutex<Vec<u64>>,
+    changes_answer: Mutex<Option<Result<DeviceChanges, String>>>,
     /// While true, every call waits.
     held: Mutex<bool>,
     released: Condvar,
@@ -123,10 +127,24 @@ impl Sources for Fake {
             .clone()
             .unwrap_or_else(|| Err("no answer".to_owned()))
     }
+
+    fn device_changes(
+        &self,
+        _base: &str,
+        _token: &Token,
+        cursor: u64,
+    ) -> Result<DeviceChanges, String> {
+        lock(&self.changes_calls).push(cursor);
+        lock(&self.changes_answer)
+            .clone()
+            .unwrap_or_else(|| Err("no answer".to_owned()))
+    }
 }
 
 struct Rig {
     fake: Arc<Fake>,
+    /// The folder of notify.json; it lives as long as the rig.
+    notify_dir: tempfile::TempDir,
     tokens: Arc<MemoryStore>,
     inputs: Arc<Mutex<Inputs>>,
     now: Arc<AtomicU64>,
@@ -135,6 +153,8 @@ struct Rig {
 
 impl Rig {
     fn new(config: AppConfig) -> Self {
+        let notify_dir = tempfile::tempdir().unwrap();
+        let notify = Arc::new(NotifyStore::load(notify_dir.path()));
         let fake = Arc::new(Fake::default());
         let tokens = Arc::new(MemoryStore::new());
         let inputs = Arc::new(Mutex::new(Inputs {
@@ -151,6 +171,7 @@ impl Rig {
                 },
             },
             serve_info: ServeInfo::default(),
+            notify,
         }));
         let now = Arc::new(AtomicU64::new(T0));
         let read = inputs.clone();
@@ -163,6 +184,7 @@ impl Rig {
         );
         Self {
             fake,
+            notify_dir,
             tokens,
             inputs,
             now,
@@ -824,6 +846,13 @@ fn the_poller_takes_the_mark_of_an_import_on_another_machine() {
         ..AppConfig::default()
     });
     rig.tokens.set(&key, &Token::new("t")).unwrap();
+    // The sync count has its baselines: only the mark asks for the journal end here.
+    let notify = lock(&rig.inputs).notify.clone();
+    for login in [key.as_str(), "local|jordi"] {
+        notify
+            .update(|r| r.keys.entry(login.to_owned()).or_default().cursor = Some(1))
+            .unwrap();
+    }
     let marks: Arc<Mutex<Vec<SyncMark>>> = Arc::default();
     let seen = marks.clone();
     rig.poller.on_sync_mark(move |mark| lock(&seen).push(mark));
@@ -1090,4 +1119,495 @@ fn the_first_sync_is_found_by_server_times_only() {
     rig.settle();
     assert_eq!(*lock(&rig.fake.check_calls), vec![(Mode::Remote, 50)]);
     assert_eq!(lock(&checks).len(), 1);
+}
+
+// The count of the files of a device sync (design note 3 of plan E).
+
+const ME: &str = "local|me";
+/// A device sync by the server's clock, far from the Mac's.
+const S: u64 = T0 - 7_200 * SEC;
+
+impl Rig {
+    /// A rig of the account `me` on this Mac, logged in.
+    fn me() -> Self {
+        let rig = Self::new(local_config(Some("me")));
+        rig.tokens.set(ME, &Token::new("t")).unwrap();
+        rig
+    }
+
+    fn poll(&self) {
+        self.poller.poll_now();
+        self.settle();
+    }
+
+    fn answer(&self, answer: AccountAnswer) {
+        *lock(&self.fake.account_answer) = Some(answer);
+    }
+
+    fn record(&self) -> KeyRecord {
+        let notify = lock(&self.inputs).notify.clone();
+        notify.read().keys.get(ME).cloned().unwrap_or_default()
+    }
+
+    fn set_record(&self, f: impl FnOnce(&mut KeyRecord)) {
+        let notify = lock(&self.inputs).notify.clone();
+        notify
+            .update(|r| f(r.keys.entry(ME.to_owned()).or_default()))
+            .unwrap();
+    }
+
+    /// Ends the poller and starts a new one on the same notify.json, as an app restart does.
+    fn restart(&mut self) {
+        self.poller.stop();
+        lock(&self.inputs).notify = Arc::new(NotifyStore::load(self.notify_dir.path()));
+        let read = self.inputs.clone();
+        let clock_now = self.now.clone();
+        self.poller = Poller::new(
+            self.fake.clone(),
+            self.tokens.clone(),
+            Arc::new(move || lock(&read).clone()),
+            Arc::new(move || clock_now.load(Ordering::SeqCst)),
+        );
+    }
+
+    fn changes_calls(&self) -> Vec<u64> {
+        lock(&self.fake.changes_calls).clone()
+    }
+
+    fn changes(&self, answer: Result<DeviceChanges, String>) {
+        *lock(&self.fake.changes_answer) = Some(answer);
+    }
+}
+
+fn changed(files: Option<u64>, end: u64) -> Result<DeviceChanges, String> {
+    Ok(DeviceChanges { files, end })
+}
+
+/// The poller's fields of a record.
+fn poller_fields(
+    last_sync_ms: Option<u64>,
+    cursor: Option<u64>,
+    last_count: Option<SyncCount>,
+) -> KeyRecord {
+    KeyRecord {
+        last_sync_ms,
+        cursor,
+        last_count,
+        ..KeyRecord::default()
+    }
+}
+
+/// An `/account` answer with two Supernotes: their last syncs and whether they sync now.
+fn two_devices(a: (Option<u64>, bool), b: (Option<u64>, bool)) -> AccountAnswer {
+    let device = |serial: &str, (sync, syncing): (Option<u64>, bool)| crate::status::Device {
+        serial: serial.into(),
+        last_sync_ms: sync,
+        syncing,
+        ..crate::status::Device::default()
+    };
+    AccountAnswer::Account(AccountInfo {
+        slug: "me".into(),
+        imported: Some(true),
+        app_data_imported: Some(true),
+        devices: vec![device("SN1", a), device("SN2", b)],
+        ..AccountInfo::default()
+    })
+}
+
+#[test]
+fn the_first_sight_is_a_baseline_with_the_cursor() {
+    let rig = Rig::me();
+    rig.answer(synced(Some(S)));
+    // Without the journal end nothing is stored; it is asked again at most once a minute.
+    *lock(&rig.fake.events_answer) = Some(Err("no answer".into()));
+    rig.poll();
+    assert_eq!(rig.record(), KeyRecord::default());
+    *lock(&rig.fake.events_answer) = Some(Ok(40));
+    rig.advance(30 * SEC);
+    rig.poll();
+    assert_eq!(rig.record(), KeyRecord::default());
+    rig.advance(30 * SEC);
+    rig.poll();
+    assert_eq!(rig.record(), poller_fields(Some(S), Some(40), None));
+    assert_eq!(lock(&rig.fake.events_calls).len(), 2);
+    // The baseline counts nothing.
+    assert!(rig.changes_calls().is_empty());
+    assert_eq!(rig.poller.status().device.files_changed, None);
+    // The same sync again: nothing.
+    rig.advance(120 * SEC);
+    rig.poll();
+    assert!(rig.changes_calls().is_empty());
+    assert_eq!(lock(&rig.fake.events_calls).len(), 2);
+}
+
+#[test]
+fn a_new_sync_is_counted_before_its_status_goes_out() {
+    let rig = Rig::me();
+    rig.set_record(|r| *r = poller_fields(Some(S), Some(40), None));
+    // Each status with the new sync carries its count.
+    let without: Arc<Mutex<usize>> = Arc::default();
+    let count = without.clone();
+    rig.poller.on_status(move |status| {
+        if status.device.last_sync_ms == Some(S + SEC) && status.device.files_changed.is_none() {
+            *lock(&count) += 1;
+        }
+    });
+    rig.changes(changed(Some(3), 45));
+    rig.answer(synced(Some(S + SEC)));
+    rig.poll();
+    assert_eq!(rig.changes_calls(), vec![40]);
+    let count = SyncCount {
+        at_ms: S + SEC,
+        files: Some(3),
+    };
+    assert_eq!(
+        rig.record(),
+        poller_fields(Some(S + SEC), Some(45), Some(count))
+    );
+    assert_eq!(rig.poller.status().device.files_changed, Some(count));
+    assert_eq!(*lock(&without), 0);
+    // The next one counts after the new cursor.
+    rig.changes(changed(Some(0), 47));
+    rig.answer(synced(Some(S + 2 * SEC)));
+    rig.advance(60 * SEC);
+    rig.poll();
+    assert_eq!(rig.changes_calls(), vec![40, 45]);
+    assert_eq!(
+        rig.record().last_count,
+        Some(SyncCount {
+            at_ms: S + 2 * SEC,
+            files: Some(0),
+        })
+    );
+}
+
+#[test]
+fn a_baseline_before_any_sync_counts_the_first_one() {
+    let rig = Rig::me();
+    *lock(&rig.fake.events_answer) = Some(Ok(40));
+    rig.answer(synced(None));
+    rig.poll();
+    assert_eq!(rig.record(), poller_fields(None, Some(40), None));
+    rig.changes(changed(Some(2), 44));
+    rig.answer(synced(Some(S)));
+    rig.advance(60 * SEC);
+    rig.poll();
+    assert_eq!(rig.changes_calls(), vec![40]);
+    assert_eq!(
+        rig.record(),
+        poller_fields(
+            Some(S),
+            Some(44),
+            Some(SyncCount {
+                at_ms: S,
+                files: Some(2),
+            })
+        )
+    );
+}
+
+#[test]
+fn a_device_that_syncs_holds_the_count() {
+    let rig = Rig::me();
+    rig.set_record(|r| *r = poller_fields(Some(S), Some(40), None));
+    rig.changes(changed(Some(1), 41));
+    // The newest sync is of SN1, but SN2 syncs now: wait.
+    rig.answer(two_devices((Some(S + SEC), false), (Some(S - SEC), true)));
+    rig.poll();
+    assert!(rig.changes_calls().is_empty());
+    assert_eq!(rig.record(), poller_fields(Some(S), Some(40), None));
+    // Both are done: the newest sync over all devices is counted.
+    rig.answer(two_devices(
+        (Some(S + SEC), false),
+        (Some(S + 2 * SEC), false),
+    ));
+    rig.advance(60 * SEC);
+    rig.poll();
+    assert_eq!(rig.changes_calls(), vec![40]);
+    assert_eq!(
+        rig.record().last_count,
+        Some(SyncCount {
+            at_ms: S + 2 * SEC,
+            files: Some(1),
+        })
+    );
+}
+
+#[test]
+fn a_failed_count_is_tried_again_once_a_minute() {
+    let rig = Rig::me();
+    rig.set_record(|r| *r = poller_fields(Some(S), Some(40), None));
+    let shown: Arc<Mutex<Vec<Option<SyncCount>>>> = Arc::default();
+    let keep = shown.clone();
+    rig.poller.on_status(move |status| {
+        let files = status.device.files_changed;
+        let mut shown = lock(&keep);
+        if shown.last() != Some(&files) {
+            shown.push(files);
+        }
+    });
+    rig.answer(synced(Some(S + SEC)));
+    rig.changes(Err("no answer".into()));
+    rig.poll();
+    // The old values stay; the failure is kept with its time.
+    assert_eq!(
+        rig.record(),
+        KeyRecord {
+            count_failing_since: Some(T0),
+            ..poller_fields(Some(S), Some(40), None)
+        }
+    );
+    rig.advance(30 * SEC);
+    rig.poll();
+    assert_eq!(rig.changes_calls().len(), 1, "at most once a minute");
+    rig.advance(30 * SEC);
+    rig.poll();
+    assert_eq!(rig.changes_calls().len(), 2);
+    assert_eq!(
+        rig.record().count_failing_since,
+        Some(T0),
+        "since the first"
+    );
+    rig.changes(changed(Some(12), 52));
+    rig.advance(60 * SEC);
+    rig.poll();
+    assert_eq!(rig.changes_calls(), vec![40, 40, 40]);
+    let count = SyncCount {
+        at_ms: S + SEC,
+        files: Some(12),
+    };
+    assert_eq!(
+        rig.record(),
+        poller_fields(Some(S + SEC), Some(52), Some(count))
+    );
+    // One count, with the number.
+    assert_eq!(*lock(&shown), vec![None, Some(count)]);
+}
+
+#[test]
+fn five_minutes_of_failures_store_no_number_once() {
+    let rig = Rig::me();
+    rig.set_record(|r| *r = poller_fields(Some(S), Some(40), None));
+    rig.answer(synced(Some(S + SEC)));
+    rig.changes(Err("no answer".into()));
+    for _ in 0..5 {
+        rig.poll();
+        assert_eq!(rig.record().last_count, None);
+        rig.advance(60 * SEC);
+    }
+    rig.poll();
+    assert_eq!(rig.changes_calls().len(), 6);
+    // It moves on without a number. The cursor stays where the last count ended: the end of
+    // this sync was never read, so the next count takes this sync's files too.
+    let count = SyncCount {
+        at_ms: S + SEC,
+        files: None,
+    };
+    assert_eq!(
+        rig.record(),
+        poller_fields(Some(S + SEC), Some(40), Some(count))
+    );
+    assert_eq!(rig.poller.status().device.files_changed, Some(count));
+    // Once.
+    rig.advance(600 * SEC);
+    rig.poll();
+    assert_eq!(rig.changes_calls().len(), 6);
+    // The next sync is counted again from the old cursor.
+    rig.changes(changed(Some(5), 60));
+    rig.answer(synced(Some(S + 2 * SEC)));
+    rig.poll();
+    assert_eq!(rig.changes_calls().last(), Some(&40));
+    assert_eq!(rig.record().cursor, Some(60));
+}
+
+#[test]
+fn a_sync_without_a_cursor_has_no_number() {
+    let rig = Rig::me();
+    rig.set_record(|r| *r = poller_fields(Some(S), None, None));
+    rig.answer(synced(Some(S + SEC)));
+    *lock(&rig.fake.events_answer) = Some(Err("no answer".into()));
+    rig.poll();
+    assert_eq!(rig.record(), poller_fields(Some(S), None, None));
+    *lock(&rig.fake.events_answer) = Some(Ok(50));
+    rig.advance(60 * SEC);
+    rig.poll();
+    assert!(rig.changes_calls().is_empty());
+    assert_eq!(
+        rig.record(),
+        poller_fields(
+            Some(S + SEC),
+            Some(50),
+            Some(SyncCount {
+                at_ms: S + SEC,
+                files: None,
+            })
+        )
+    );
+}
+
+#[test]
+fn the_import_mark_is_the_baseline() {
+    use crate::config::SyncMark;
+    let rig = Rig::me();
+    // A record from before the import.
+    rig.set_record(|r| *r = poller_fields(Some(S - 60 * SEC), Some(10), None));
+    lock(&rig.inputs).config.setup.sync_mark = Some(SyncMark {
+        key: ME.into(),
+        seq: 30,
+        at_ms: T0,
+        sync_at_mark: Some(S),
+    });
+    let inputs = rig.inputs.clone();
+    rig.poller.on_sync_checked(move |_, check| {
+        lock(&inputs).config.setup.sync_checked = Some(check);
+    });
+    rig.changes(changed(Some(7), 38));
+    // Before the first sync after the mark: the record is the mark.
+    rig.answer(synced(Some(S)));
+    rig.poll();
+    assert_eq!(rig.record(), poller_fields(Some(S), Some(30), None));
+    assert!(lock(&rig.fake.events_calls).is_empty());
+    // The first sync, while its check fails: no count.
+    rig.answer(synced(Some(S + SEC)));
+    rig.poll();
+    assert!(rig.changes_calls().is_empty());
+    assert_eq!(rig.record(), poller_fields(Some(S), Some(30), None));
+    // The check is saved, then the sync is counted from the mark.
+    *lock(&rig.fake.check_answer) = Some(Ok(SyncCheck::default()));
+    rig.advance(60 * SEC);
+    rig.poll();
+    rig.advance(60 * SEC);
+    rig.poll();
+    assert_eq!(rig.changes_calls(), vec![30]);
+    assert_eq!(
+        rig.record(),
+        poller_fields(
+            Some(S + SEC),
+            Some(38),
+            Some(SyncCount {
+                at_ms: S + SEC,
+                files: Some(7),
+            })
+        )
+    );
+    // A mark without a sync before it: any sync after it counts.
+    let rig = Rig::me();
+    lock(&rig.inputs).config.setup.sync_mark = Some(SyncMark {
+        key: ME.into(),
+        seq: 30,
+        at_ms: T0,
+        sync_at_mark: None,
+    });
+    rig.answer(synced(None));
+    rig.poll();
+    assert_eq!(rig.record(), poller_fields(None, Some(30), None));
+    // The mark of another login is no baseline of this one.
+    let rig = Rig::me();
+    *lock(&rig.fake.events_answer) = Some(Ok(40));
+    lock(&rig.inputs).config.setup.sync_mark = Some(SyncMark {
+        key: "local|anna".into(),
+        seq: 30,
+        at_ms: T0,
+        sync_at_mark: None,
+    });
+    rig.answer(synced(Some(S)));
+    rig.poll();
+    assert_eq!(rig.record(), poller_fields(Some(S), Some(40), None));
+}
+
+#[test]
+fn a_restart_with_the_same_sync_does_nothing() {
+    let mut rig = Rig::me();
+    rig.set_record(|r| *r = poller_fields(Some(S), Some(40), None));
+    rig.changes(changed(Some(3), 45));
+    rig.answer(synced(Some(S + SEC)));
+    rig.poll();
+    let counted = rig.record();
+    rig.restart();
+    rig.advance(3_600 * SEC);
+    rig.poll();
+    rig.advance(60 * SEC);
+    rig.poll();
+    assert_eq!(rig.changes_calls().len(), 1);
+    assert!(lock(&rig.fake.events_calls).is_empty());
+    assert_eq!(rig.record(), counted);
+    // The page still shows the count after the restart.
+    assert_eq!(rig.poller.status().device.files_changed, counted.last_count);
+}
+
+#[test]
+fn the_notifiers_fields_stay_untouched() {
+    use crate::notify::store::{ConsumerRecord, ProblemState};
+    let rig = Rig::me();
+    let notifier = KeyRecord {
+        sync_shown_at: Some(S - SEC),
+        sync_last_notice_ms: Some(T0 - SEC),
+        unshown_files: 4,
+        ocr_text_seq: Some(9),
+        ocr_data_dir: Some(PathBuf::from("/nowhere/notedown-data")),
+        ocr_last_run_ms: Some(T0 - 2 * SEC),
+        ocr_last_notice_ms: Some(T0 - 3 * SEC),
+        unshown_notes: 2,
+        consumers: [(
+            "claude".to_owned(),
+            ConsumerRecord {
+                seq: 5,
+                pending_seq: Some(6),
+                rose_at: Some(T0),
+            },
+        )]
+        .into(),
+        problems: [(
+            "server".to_owned(),
+            ProblemState {
+                active: true,
+                last_notice_ms: T0 - SEC,
+                for_sync: None,
+            },
+        )]
+        .into(),
+        ..KeyRecord::default()
+    };
+    rig.set_record(|r| *r = notifier.clone());
+    let only_notifier = |r: KeyRecord| KeyRecord {
+        last_sync_ms: None,
+        cursor: None,
+        last_count: None,
+        count_failing_since: None,
+        ..r
+    };
+    // A baseline, a failed count, a count and a give-up.
+    *lock(&rig.fake.events_answer) = Some(Ok(40));
+    rig.answer(synced(Some(S)));
+    rig.poll();
+    assert_eq!(rig.record().cursor, Some(40));
+    rig.answer(synced(Some(S + SEC)));
+    rig.changes(Err("no answer".into()));
+    rig.advance(60 * SEC);
+    rig.poll();
+    assert!(rig.record().count_failing_since.is_some());
+    rig.changes(changed(Some(1), 41));
+    rig.advance(60 * SEC);
+    rig.poll();
+    assert!(rig.record().last_count.is_some());
+    rig.answer(synced(Some(S + 2 * SEC)));
+    rig.changes(Err("no answer".into()));
+    for _ in 0..6 {
+        rig.advance(60 * SEC);
+        rig.poll();
+    }
+    assert_eq!(rig.record().last_count.map(|c| c.files), Some(None));
+    assert_eq!(only_notifier(rig.record()), notifier);
+}
+
+#[test]
+fn without_a_login_nothing_is_counted() {
+    let rig = Rig::new(local_config(Some("me")));
+    *lock(&rig.fake.events_answer) = Some(Ok(40));
+    rig.changes(changed(Some(1), 41));
+    rig.answer(synced(Some(S)));
+    rig.poll();
+    assert!(lock(&rig.fake.events_calls).is_empty());
+    assert!(rig.changes_calls().is_empty());
+    assert_eq!(rig.record(), KeyRecord::default());
 }

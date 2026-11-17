@@ -199,6 +199,11 @@ fn the_library_lists_a_folder_page_by_page() {
     assert_eq!(names(&first.folder), ["a.note", "b"]);
     assert!(!first.folder.complete);
     assert_eq!(first.next.as_deref(), Some("t1:b"));
+    // The event carries the cursor too: a folder Rust lists again by itself pages on.
+    assert!(s.events.all().iter().any(|e| matches!(
+        e,
+        LibraryEvent::Folder { next: Some(n), folders_only: false, .. } if n == "t1:b"
+    )));
     assert_eq!(s.folders(), std::slice::from_ref(&first.folder));
 
     let second = s.list(NOTE, Some("t1:b"));

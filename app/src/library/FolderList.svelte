@@ -61,7 +61,7 @@
   {/each}
 </nav>
 
-<div class="heads" role="presentation">
+<div class="heads" role="group" aria-label="Sort">
   {#each [["name", "Name"], ["size", "Size"], ["date", "Changed"]] as const as [by, title] (by)}
     <button
       type="button"

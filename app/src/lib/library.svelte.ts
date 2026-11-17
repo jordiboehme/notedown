@@ -84,7 +84,7 @@ export function applyEvent(event: LibraryEvent) {
       const key = listingKey(event.folder.path, event.foldersOnly);
       if (!isShown(key)) break;
       library.listings[key] = event.folder;
-      if (event.folder.complete || event.folder.error !== null) library.next[key] = null;
+      library.next[key] = event.next;
       break;
     }
     case "job":

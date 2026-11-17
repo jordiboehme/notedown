@@ -92,8 +92,8 @@ describe("the library store", () => {
     applyEvent({ type: "state", state: "unreachable", text: "The server does not answer.", page: "server" });
     expect(library.view).toEqual({ state: "unreachable", text: "The server does not answer.", page: "server" });
 
-    applyEvent({ type: "folder", folder: folder("INBOX", ["a"], true), foldersOnly: false });
-    applyEvent({ type: "folder", folder: folder("INBOX", [], true), foldersOnly: true });
+    applyEvent({ type: "folder", folder: folder("INBOX", ["a"], true), foldersOnly: false, next: null });
+    applyEvent({ type: "folder", folder: folder("INBOX", [], true), foldersOnly: true, next: null });
     // The tree's listing and the list's of the same path stay apart.
     expect(library.listings["list:INBOX"].entries).toHaveLength(1);
     expect(library.listings["tree:INBOX"].entries).toHaveLength(0);
@@ -127,8 +127,23 @@ describe("the library store", () => {
     answerNow("library_list", { folder: folder("INBOX", ["a"], false), next: "t1:a" } satisfies Listing);
     await listFolder("INBOX", false);
     expect(library.next["list:INBOX"]).toBe("t1:a");
-    applyEvent({ type: "folder", folder: folder("INBOX", ["a", "b"], true), foldersOnly: false });
+    applyEvent({ type: "folder", folder: folder("INBOX", ["a", "b"], true), foldersOnly: false, next: null });
     expect(library.next["list:INBOX"]).toBeNull();
+  });
+
+  it("pages on with the cursor of a folder Rust listed again by itself", async () => {
+    showListings([{ path: "INBOX", foldersOnly: false }]);
+    answerNow("library_list", { folder: folder("INBOX", ["a", "b"], true), next: null } satisfies Listing);
+    await listFolder("INBOX", false);
+    // A gap: Rust lists page 1 again and sends it with its cursor.
+    applyEvent({ type: "folder", folder: folder("INBOX", ["a"], false), foldersOnly: false, next: "t2:a" });
+    expect(library.next["list:INBOX"]).toBe("t2:a");
+    answerNow("library_list", { folder: folder("INBOX", ["a", "b"], true), next: null } satisfies Listing);
+    await listNext("INBOX", false);
+    expect(calls.at(-1)).toEqual({
+      command: "library_list",
+      args: { path: "INBOX", cursor: "t2:a", foldersOnly: false },
+    });
   });
 
   it("starts with the state Rust has, unless an event came first", async () => {
@@ -201,7 +216,7 @@ describe("the library store", () => {
   it("takes no listing that is not shown, so a folder opened again is listed fresh", async () => {
     showListings([]);
     // A follower event that was on its way when the folder closed.
-    applyEvent({ type: "folder", folder: folder("EXPORT", ["a"], false), foldersOnly: true });
+    applyEvent({ type: "folder", folder: folder("EXPORT", ["a"], false), foldersOnly: true, next: null });
     expect(library.listings["tree:EXPORT"]).toBeUndefined();
     showListings([{ path: "EXPORT", foldersOnly: true }]);
     expect(library.listings["tree:EXPORT"]).toBeUndefined();
@@ -244,8 +259,8 @@ describe("the library store", () => {
     ]);
     // A listing that is not shown any more is not followed by Rust: the store forgets it, so
     // opening the folder again lists it again.
-    applyEvent({ type: "folder", folder: folder("NOTE/Note", [], true), foldersOnly: true });
-    applyEvent({ type: "folder", folder: folder("INBOX", ["a"], false), foldersOnly: false });
+    applyEvent({ type: "folder", folder: folder("NOTE/Note", [], true), foldersOnly: true, next: null });
+    applyEvent({ type: "folder", folder: folder("INBOX", ["a"], false), foldersOnly: false, next: null });
     library.next["list:INBOX"] = "t1:a";
     showListings([{ path: "INBOX", foldersOnly: false }]);
     expect(Object.keys(library.listings)).toEqual(["list:INBOX"]);

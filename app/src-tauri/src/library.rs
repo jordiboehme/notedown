@@ -80,7 +80,7 @@ impl LibraryState {
 /// The text of a binding whose Keychain read failed (state `loggedOut`, page "account").
 pub const KEYCHAIN_UNREADABLE: &str = "The Keychain could not be read.";
 /// The text of a binding whose client could not be made (state `unreachable`, page "server").
-pub const NO_CLIENT: &str = "The app could not set up the connection.";
+pub const NO_CLIENT: &str = "Notedown could not set up the connection.";
 
 /// The state with its text and the Settings page its button opens: the `state` event and the
 /// answer of `library_state`.

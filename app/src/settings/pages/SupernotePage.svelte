@@ -1,6 +1,7 @@
 <script lang="ts">
   import { relativeTime } from "../../lib/format";
   import { status } from "../../lib/status.svelte";
+  import { filesChangedText } from "../format";
   import { importStatusText } from "../importFlow";
   import Form from "../kit/Form.svelte";
   import Row from "../kit/Row.svelte";
@@ -8,8 +9,9 @@
   import StatusDot from "../kit/StatusDot.svelte";
   import SupernoteStep from "../setup/SupernoteStep.svelte";
 
-  // Settings > Supernote: the last sync, a sync that runs now, whether it is online, the
-  // import, and how the Supernote connects (the device steps of the setup).
+  // Settings > Supernote: the last sync and the files it changed, a sync that runs now,
+  // whether it is online, the import, and how the Supernote connects (the device steps of
+  // the setup).
   let { now, onSetup }: { now: number; onSetup: () => void } = $props();
 
   const device = $derived(status.current?.device ?? null);
@@ -29,6 +31,11 @@
       <Row title="Last sync" note="The last sync that ended well.">
         <span class="value">{device.lastSyncMs === null ? "Not synced yet" : relativeTime(device.lastSyncMs, now)}</span>
       </Row>
+      {#if device.lastSyncMs !== null}
+        <Row title="Files changed" note="The files the Supernote changed in the last sync.">
+          <span class="value">{filesChangedText(device.filesChanged)}</span>
+        </Row>
+      {/if}
       <Row title="Syncing now">
         <StatusDot level={device.syncing ? "warning" : "unknown"} text={device.syncing ? "Syncing" : "No"} />
       </Row>

@@ -169,6 +169,7 @@ const config: AppConfig = {
     syncChecked: null,
     syncAcknowledged: false,
   },
+  notifications: { enabled: false, sync: true, ocr: true, agent: true, problems: true },
 };
 
 const answer = (account: string): ConfigAnswer => ({

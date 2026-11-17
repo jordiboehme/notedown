@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatBytes, fraction } from "../settings/format";
+import { filesChangedText, formatBytes, fraction } from "../settings/format";
 
 describe("the numbers of the settings pages", () => {
   it("says sizes as the Finder does", () => {
@@ -15,5 +15,13 @@ describe("the numbers of the settings pages", () => {
     expect(fraction(50, 100)).toBe(0.5);
     expect(fraction(1, 0)).toBe(0);
     expect(fraction(200, 100)).toBe(1);
+  });
+
+  it("says how many files the last sync changed", () => {
+    expect(filesChangedText({ atMs: 1, files: 12 })).toBe("12 files changed");
+    expect(filesChangedText({ atMs: 1, files: 1 })).toBe("1 file changed");
+    expect(filesChangedText({ atMs: 1, files: 0 })).toBe("No files changed");
+    expect(filesChangedText({ atMs: 1, files: null })).toBe("Not known");
+    expect(filesChangedText(null)).toBe("Not known");
   });
 });

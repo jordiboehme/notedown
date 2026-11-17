@@ -822,6 +822,130 @@ fn a_gap_cannot_tell() {
     assert_eq!(check.digests, None);
 }
 
+// The count of the files a device sync changed.
+
+/// An event of the entry `id`.
+fn entry_event(seq: u64, kind: &str, origin: &str, id: u64) -> String {
+    format!(
+        r#"{{"seq":{seq},"ts":1763290000123,"type":"{kind}","origin":"{origin}","device":"SN1","opId":"o{seq}","id":{id},"path":"/Note/{id}.note"}}"#
+    )
+}
+
+#[test]
+fn the_count_takes_each_file_the_device_changed_once() {
+    let server = Scripted::start(vec![
+        events_page(
+            &[
+                // The event at the cursor was counted last time.
+                entry_event(10, "file.modified", "device", 9),
+                entry_event(11, "file.created", "device", 1),
+                entry_event(12, "file.modified", "device", 1),
+                entry_event(13, "file.modified", "app", 2),
+                entry_event(14, "folder.created", "device", 3),
+            ]
+            .join(","),
+            15,
+            20,
+            true,
+            false,
+        ),
+        events_page(
+            &[
+                entry_event(15, "file.moved", "device", 1),
+                entry_event(16, "file.deleted", "device", 4),
+                entry_event(17, "file.copied", "device", 5),
+                entry_event(18, "folder.deleted", "device", 6),
+                entry_event(19, "file.modified", "scan", 7),
+                entry_event(20, "file.modified", "device", 8),
+                // Past the end: the next sync's.
+                entry_event(21, "file.modified", "device", 10),
+            ]
+            .join(","),
+            22,
+            21,
+            false,
+            false,
+        ),
+    ]);
+    // Files 1, 4, 5 and 8.
+    assert_eq!(
+        count_device_files(&rest_on(&server), 10, 20).unwrap(),
+        Some(4)
+    );
+    assert_eq!(server.next().target, "/rest/v1/events?from=11");
+    assert_eq!(server.next().target, "/rest/v1/events?from=15");
+}
+
+#[test]
+fn nothing_after_the_cursor_is_no_file_and_no_call() {
+    let server = Scripted::start(vec![]);
+    assert_eq!(
+        count_device_files(&rest_on(&server), 20, 20).unwrap(),
+        Some(0)
+    );
+    assert!(server.received().is_empty());
+}
+
+#[test]
+fn a_gap_gives_no_count() {
+    let server = Scripted::start(vec![events_page(
+        &entry_event(15, "file.modified", "device", 1),
+        16,
+        16,
+        false,
+        true,
+    )]);
+    assert_eq!(count_device_files(&rest_on(&server), 10, 16).unwrap(), None);
+}
+
+#[test]
+fn more_than_the_page_bound_gives_no_count() {
+    // Each page moves on by one and says there is more.
+    let pages = (0..=COUNT_PAGES as u64)
+        .map(|n| {
+            events_page(
+                &entry_event(11 + n, "file.modified", "device", n),
+                12 + n,
+                1_000,
+                true,
+                false,
+            )
+        })
+        .collect();
+    let server = Scripted::start(pages);
+    assert_eq!(
+        count_device_files(&rest_on(&server), 10, 1_000).unwrap(),
+        None
+    );
+    assert_eq!(server.received().len(), COUNT_PAGES);
+    // Within the bound the count is there.
+    let pages = (0..COUNT_PAGES as u64)
+        .map(|n| {
+            events_page(
+                &entry_event(11 + n, "file.modified", "device", n),
+                12 + n,
+                10 + COUNT_PAGES as u64,
+                true,
+                false,
+            )
+        })
+        .collect();
+    let server = Scripted::start(pages);
+    assert_eq!(
+        count_device_files(&rest_on(&server), 10, 10 + COUNT_PAGES as u64).unwrap(),
+        Some(COUNT_PAGES as u64)
+    );
+}
+
+#[test]
+fn a_failed_page_is_the_error() {
+    let server = Scripted::start(vec![answer(
+        "500 Internal Server Error",
+        r#"{"error":"internal"}"#,
+    )]);
+    assert!(count_device_files(&rest_on(&server), 10, 16).is_err());
+}
+
 #[test]
 fn the_sync_state_is_the_check_of_the_login() {
     use crate::config::SyncMark;
@@ -847,4 +971,38 @@ fn the_sync_state_is_the_check_of_the_login() {
     // The mark of another login is not this one's.
     config.account = Some("anna".into());
     assert_eq!(sync_state(&config), SyncState::default());
+}
+
+#[test]
+fn a_count_out_of_time_is_a_failure() {
+    let pages = (0..3u64)
+        .map(|n| {
+            events_page(
+                &entry_event(11 + n, "file.modified", "device", n),
+                12 + n,
+                100,
+                true,
+                false,
+            )
+        })
+        .collect();
+    let server = Scripted::start(pages);
+    // Time for two pages only.
+    let mut left = 2;
+    let counted = count_device_files_within(&rest_on(&server), 10, 100, || {
+        left -= 1;
+        left >= 0
+    });
+    assert!(counted.is_err());
+    assert_eq!(server.received().len(), 2);
+}
+
+#[test]
+fn a_page_starts_only_when_it_ends_within_the_budget() {
+    assert!(page_fits(Duration::ZERO));
+    assert!(page_fits(COUNT_BUDGET - REST_PAGE_TIMEOUT));
+    assert!(!page_fits(
+        COUNT_BUDGET - REST_PAGE_TIMEOUT + Duration::from_millis(1)
+    ));
+    assert!(!page_fits(COUNT_BUDGET));
 }

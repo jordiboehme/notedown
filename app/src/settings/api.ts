@@ -20,6 +20,26 @@ export interface AppConfig {
   modelIdleMinutes: number;
   /** What the setup checklist keeps between two starts. */
   setup: SetupRecord;
+  /** Which desktop notifications to show; off by default. */
+  notifications: NotificationChoices;
+}
+
+/** The switch of the desktop notifications and the choice of each event (config.rs). */
+export interface NotificationChoices {
+  enabled: boolean;
+  sync: boolean;
+  ocr: boolean;
+  agent: boolean;
+  problems: boolean;
+}
+
+/** Whether macOS lets Notedown show notifications (notify/deliver.rs Authorization). */
+export type Authorization = "unknown" | "allowed" | "denied" | "unavailable";
+
+/** What set_notifications answers: the saved config and the permission. */
+export interface NotificationsAnswer {
+  config: AppConfig;
+  authorization: Authorization;
 }
 
 /** What the setup checklist keeps (config.rs SetupRecord). */
@@ -174,6 +194,11 @@ export const getConfig = () => invoke<AppConfig>("get_config");
 export const setMode = (mode: Mode, dataDir: string | null, serverUrl: string | null) =>
   invoke<ConfigAnswer>("set_mode", { mode, dataDir, serverUrl });
 export const setStartView = (startView: StartView) => invoke<AppConfig>("set_start_view", { startView });
+/** Saves the notification choices; asks macOS for the permission when the switch goes on. */
+export const setNotifications = (choices: NotificationChoices) =>
+  invoke<NotificationsAnswer>("set_notifications", { choices });
+/** Whether macOS lets Notedown show notifications, without asking. */
+export const notificationAuthorization = () => invoke<Authorization>("notification_authorization");
 export const startProcesses = () => invoke("start_processes");
 export const stopProcesses = () => invoke("stop_processes");
 export const processLogs = () => invoke<{ server: string[]; pipeline: string[] }>("process_logs");

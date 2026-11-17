@@ -30,6 +30,15 @@ export interface InWork {
   startedMs: number;
 }
 
+/** How many files a device sync changed; `files` is null when it is not known. */
+export interface SyncCount {
+  /** The lastSyncMs of the sync (the server's clock). */
+  atMs: number;
+  files: number | null;
+  /** When the app stored the count (this Mac's clock); missing when it cannot tell. */
+  countedAtMs?: number;
+}
+
 export interface LastError {
   text: string;
   atMs: number;
@@ -37,6 +46,8 @@ export interface LastError {
 
 export interface AgentStatus {
   name: string;
+  /** The journal seq the consumer acked up to. */
+  seq: number;
   readAtMs: number | null;
   ackedAtMs: number | null;
   notesBehind: number;
@@ -57,6 +68,8 @@ export interface Status {
     lastSyncMs: number | null;
     syncing: boolean;
     online: boolean;
+    /** The files the shown sync changed; null unless they were counted for that sync. */
+    filesChanged: SyncCount | null;
   };
   ocr: {
     line: string;
@@ -65,6 +78,10 @@ export interface Status {
     queued: number;
     pending: number;
     waiting: number;
+    /** When the last pass ended. */
+    lastRunMs: number | null;
+    /** The status has an answer of `pipeline status`. */
+    facts: boolean;
   };
   agents: AgentStatus[];
   attention: Attention[];

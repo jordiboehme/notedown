@@ -24,12 +24,14 @@ export type Selection =
 
 /**
  * Where Rust opens the window (`window.__NOTEDOWN_AT__` or the `library-at` event), as a
- * selection: the review of a note, New or the recycle bin. Anything else is no place.
+ * selection: the review of a note, New, All notes (a click on a sync notification) or the
+ * recycle bin. Anything else is no place.
  */
 export function openAt(value: unknown): Selection | null {
   if (typeof value !== "object" || value === null) return null;
   const at = value as Record<string, unknown>;
   if (at.at === "new") return { kind: "new" };
+  if (at.at === "all") return { kind: "all" };
   if (at.at === "bin") return { kind: "bin" };
   if (at.at === "note" && typeof at.path === "string") return { kind: "note", path: at.path };
   return null;

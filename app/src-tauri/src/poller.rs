@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::config::{self, AppConfig, ExistingSetup, Mode, SyncCheck, SyncMark};
+use crate::notify::STALE_MS;
+use crate::notify::store::{KeyRecord, NotifyStore, SyncCount};
 use crate::process::{self, SpawnFn};
 use crate::processes::ProcessStates;
 use crate::serve_info::{self, ServeInfo};
@@ -102,15 +104,35 @@ pub trait Sources: Send + Sync {
         token: &Token,
         mark: u64,
     ) -> Result<SyncCheck, String>;
+    /// What the devices changed after the journal number `cursor`: the journal end now, then
+    /// the files the devices changed up to it (`GET /events`).
+    fn device_changes(
+        &self,
+        base: &str,
+        token: &Token,
+        cursor: u64,
+    ) -> Result<DeviceChanges, String>;
+}
+
+/// The files the devices changed after a cursor, up to `end`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceChanges {
+    /// `None` when it cannot be told (see [`crate::setup::count_device_files`]).
+    pub files: Option<u64>,
+    /// The journal end the count went up to: the next count starts after it.
+    pub end: u64,
 }
 
 /// What the poller reads from the rest of the app at each tick.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Inputs {
     pub config: AppConfig,
     pub config_reset: bool,
     pub processes: ProcessStates,
     pub serve_info: ServeInfo,
+    /// What the notifications remember. The poller reads the count of the last device sync
+    /// for the status and writes its own fields (the count) only.
+    pub notify: Arc<NotifyStore>,
 }
 
 pub type InputsFn = Arc<dyn Fn() -> Inputs + Send + Sync>;
@@ -154,11 +176,35 @@ struct State {
     check_failed_ms: Option<u64>,
     /// Why it failed, with the mark it was for (shown in the status while that mark holds).
     check_error: Option<(SyncMark, String)>,
+    /// When the last call for the count of a device sync (or for the journal end of its
+    /// baseline) failed.
+    count_failed_ms: Option<u64>,
+    /// The `lastSyncMs` whose count fails since `count_failing_since`. Another sync (or none
+    /// known, after a start) starts its own [`COUNT_GIVE_UP_MS`].
+    failing_sync: Option<u64>,
+    /// What the last `/account` answer in this run said of the device syncs.
+    sync_seen: Option<SyncSeen>,
+}
+
+/// The newest device sync of one `/account` answer, for `SyncCount::counted_at_ms`.
+struct SyncSeen {
+    /// The token key of the login.
+    key: String,
+    newest: Option<u64>,
+    /// When the answer came (this Mac's clock).
+    polled_ms: u64,
+    /// The newest sync came up since an answer at most [`STALE_MS`] before it: the sync is
+    /// recent on this Mac's clock.
+    recent: bool,
 }
 
 /// The least time between two failed calls for the mark of a server on another machine, and
-/// between two failed checks of the first sync.
+/// between two failed checks of the first sync or counts of a device sync.
 const MARK_RETRY_MS: u64 = 60_000;
+
+/// A count of a device sync that fails this long is given up: the sync is stored without a
+/// number.
+const COUNT_GIVE_UP_MS: u64 = 5 * 60_000;
 
 /// What the data folder held when it was last looked at.
 struct Existing {
@@ -427,6 +473,13 @@ impl Inner {
             } else if let Some(mark) = self.wants_check(config, &answer) {
                 self.check_first_sync(config, base, token, &mark);
             }
+            // The count of a device sync is saved before the status with that sync goes out
+            // too, so the Supernote page shows it at once. A count ends within
+            // `setup::COUNT_BUDGET` (20 s, the journal end and the pages); a failed one is tried
+            // again a minute later. The give-up after 5 minutes reads the journal end once more.
+            if let AccountAnswer::Account(info) = &answer {
+                self.count_sync(config, base, token, info);
+            }
         }
         let key = Key::of(config);
         let current = self.current_key();
@@ -559,6 +612,166 @@ impl Inner {
         }
     }
 
+    /// Keeps the newest device sync of this `/account` answer. True when that sync is recent on
+    /// this Mac's clock: it came up since an answer of the same login at most [`STALE_MS`]
+    /// before. The first answer of a run, or one after a long pause (a sleep), cannot tell:
+    /// the sync may be hours old.
+    fn see_syncs(&self, key: &str, newest: Option<u64>, now: u64) -> bool {
+        let mut state = lock(&self.state);
+        let recent = match state.sync_seen.as_ref().filter(|seen| seen.key == key) {
+            Some(seen) if seen.newest == newest => seen.recent,
+            Some(seen) => now <= seen.polled_ms.saturating_add(STALE_MS),
+            None => false,
+        };
+        state.sync_seen = Some(SyncSeen {
+            key: key.to_owned(),
+            newest,
+            polled_ms: now,
+            recent,
+        });
+        recent
+    }
+
+    /// Counts the files of a new device sync into notify.json (design note 3 of plan E). Runs
+    /// with notifications off too: the Supernote page shows the count.
+    ///
+    /// - The newest `lastSyncMs` over all devices rose above the stored one and no device of
+    ///   the account syncs now: count after the cursor, store the count, the end as the new
+    ///   cursor and the sync as counted.
+    /// - First sight (neither a sync nor a cursor stored): the baseline, the newest sync and the
+    ///   journal end, without a count.
+    /// - A sync stored without a cursor: no number, the journal end as the cursor.
+    /// - The import mark of the login, while its first sync is not checked: the mark is the
+    ///   baseline (its seq and the newest sync at the mark); nothing is counted.
+    ///
+    /// A failed call stores nothing and is tried again at most once a minute. A count of one
+    /// sync that fails for [`COUNT_GIVE_UP_MS`] stores the sync without a number and the
+    /// journal end as the cursor, so the next count does not take its files; when that read
+    /// fails too, the cursor stays and the next count takes the files of both syncs.
+    fn count_sync(&self, config: &AppConfig, base: &str, token: &Token, info: &AccountInfo) {
+        let Some(key) = token_key(config) else {
+            return;
+        };
+        let notify = (self.inputs)().notify;
+        let save = |what: &str, f: &dyn Fn(&mut KeyRecord)| {
+            let saved = notify.update(|record| f(record.keys.entry(key.clone()).or_default()));
+            if let Err(e) = saved {
+                eprintln!("notedown: {what} was not saved: {e}");
+            }
+        };
+        let now = (self.clock)();
+        let newest = info.devices.iter().filter_map(|d| d.last_sync_ms).max();
+        let recent = self.see_syncs(&key, newest, now);
+        // The import mark: the first sync after it is checked first, then counted from it.
+        if let Some(mark) = config.setup.sync_mark.as_ref().filter(|m| m.key == key)
+            && config.setup.sync_checked.is_none()
+        {
+            save("the import mark of the sync count", &|r| {
+                r.last_sync_ms = mark.sync_at_mark;
+                r.cursor = Some(mark.seq);
+            });
+            return;
+        }
+        if info.devices.iter().any(|d| d.syncing) {
+            return;
+        }
+        let record = notify.read().keys.get(&key).cloned().unwrap_or_default();
+        let first_sight = record.last_sync_ms.is_none() && record.cursor.is_none();
+        let rose = newest.is_some_and(|n| record.last_sync_ms.is_none_or(|last| n > last));
+        if !first_sight && !rose {
+            return;
+        }
+        let counted_at_ms = recent.then_some(now);
+        let tried = lock(&self.state).count_failed_ms;
+        if tried.is_some_and(|at| now < at.saturating_add(MARK_RETRY_MS)) {
+            return;
+        }
+        match (first_sight, record.cursor, newest) {
+            // The baseline, or a sync without a cursor: the journal end, without a count.
+            (true, _, _) | (false, None, _) => match self.sources.events_end(base, token) {
+                Ok(end) => {
+                    {
+                        let mut state = lock(&self.state);
+                        state.count_failed_ms = None;
+                        state.failing_sync = None;
+                    }
+                    save("the baseline of the sync count", &|r| {
+                        r.last_sync_ms = newest;
+                        r.cursor = Some(end);
+                        r.count_failing_since = None;
+                        if !first_sight && let Some(at_ms) = newest {
+                            r.last_count = Some(SyncCount {
+                                at_ms,
+                                files: None,
+                                counted_at_ms,
+                            });
+                        }
+                    });
+                }
+                Err(_) => lock(&self.state).count_failed_ms = Some(now),
+            },
+            (false, Some(cursor), Some(at_ms)) => {
+                match self.sources.device_changes(base, token, cursor) {
+                    Ok(changes) => {
+                        {
+                            let mut state = lock(&self.state);
+                            state.count_failed_ms = None;
+                            state.failing_sync = None;
+                        }
+                        save("the sync count", &|r| {
+                            r.last_sync_ms = Some(at_ms);
+                            r.cursor = Some(changes.end);
+                            r.last_count = Some(SyncCount {
+                                at_ms,
+                                files: changes.files,
+                                counted_at_ms,
+                            });
+                            r.count_failing_since = None;
+                        });
+                    }
+                    Err(why) => {
+                        eprintln!("notedown: the files of the sync could not be counted: {why}");
+                        let same_sync = {
+                            let mut state = lock(&self.state);
+                            state.count_failed_ms = Some(now);
+                            state.failing_sync.replace(at_ms) == Some(at_ms)
+                        };
+                        let since = record
+                            .count_failing_since
+                            .filter(|_| same_sync)
+                            .unwrap_or(now);
+                        let give_up = now >= since.saturating_add(COUNT_GIVE_UP_MS);
+                        // One read of the journal end, so the next count starts after this sync.
+                        let end = if give_up {
+                            lock(&self.state).failing_sync = None;
+                            self.sources.events_end(base, token).ok()
+                        } else {
+                            None
+                        };
+                        save("the failed sync count", &|r| {
+                            if give_up {
+                                r.last_sync_ms = Some(at_ms);
+                                if let Some(end) = end {
+                                    r.cursor = Some(end);
+                                }
+                                r.last_count = Some(SyncCount {
+                                    at_ms,
+                                    files: None,
+                                    counted_at_ms,
+                                });
+                                r.count_failing_since = None;
+                            } else {
+                                r.count_failing_since = Some(since);
+                            }
+                        });
+                    }
+                }
+            }
+            // A rise always has a newest sync.
+            (false, Some(_), None) => {}
+        }
+    }
+
     fn current_key(&self) -> Key {
         Key::of(&(self.inputs)().config)
     }
@@ -581,6 +794,8 @@ impl Inner {
                 device_urls: inputs.serve_info.device_urls.clone(),
                 pipeline_status: state.pipeline.of(&key).cloned(),
                 account: state.account.of(&key).cloned(),
+                sync_count: token_key(&inputs.config)
+                    .and_then(|k| inputs.notify.read().keys.get(&k).and_then(|r| r.last_count)),
             };
             (parts, state.check_error.clone())
         };
@@ -667,6 +882,24 @@ impl Sources for RealSources {
             }
             _ => Err("no account to check".to_owned()),
         }
+    }
+
+    fn device_changes(
+        &self,
+        base: &str,
+        token: &Token,
+        cursor: u64,
+    ) -> Result<DeviceChanges, String> {
+        let rest = crate::rest::Rest::with_timeout(base, Some(token.clone()), REQUEST_TIMEOUT)
+            .map_err(|e| e.to_string())?;
+        // The status waits for the count: every call has to end within its budget.
+        let start = std::time::Instant::now();
+        let end = crate::setup::journal_end(&rest).map_err(|e| e.to_string())?;
+        let files = crate::setup::count_device_files_within(&rest, cursor, end, || {
+            crate::setup::page_fits(start.elapsed())
+        })
+        .map_err(|e| e.to_string())?;
+        Ok(DeviceChanges { files, end })
     }
 
     fn account(&self, base: &str, token: Option<&Token>) -> AccountAnswer {

@@ -192,6 +192,11 @@ impl ServerUse {
         Ok(UseGuard(self.clone()))
     }
 
+    /// An import holds the server.
+    fn held(&self) -> bool {
+        lock(&self.0).held
+    }
+
     /// `None` while a command uses the server or another import holds it.
     fn try_hold(&self) -> Option<HoldGuard> {
         let mut users = lock(&self.0);
@@ -732,6 +737,12 @@ impl ImportJobs {
     /// an import does not start while one is held.
     pub fn use_server(&self) -> Result<UseGuard, String> {
         self.inner.server.try_use()
+    }
+
+    /// An import holds the app's server: from before it stops the server until it asked the
+    /// server to start again (the start itself is not waited for).
+    pub fn holds_server(&self) -> bool {
+        self.inner.server.held()
     }
 
     /// The lock behind [`use_server`](Self::use_server).

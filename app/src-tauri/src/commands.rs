@@ -7,12 +7,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use serde::Serialize;
 use tauri::{AppHandle, State};
 
-use crate::config::{self, AppConfig, Mode, StartView};
+use crate::config::{self, AppConfig, Mode, NotificationChoices, StartView};
 use crate::import_job::{self, BackupFolder, ImportJobs, JobKind};
 use crate::library::{Choice, Entry, Job, Key, Library, Listed, RecyclePage, StateView, UploadAsk};
 use crate::login::{self, LoginError, LoginGate, Password};
 use crate::model::{ModelControl, ModelState};
 use crate::notes::{NoteSummary, Notes};
+use crate::notify::deliver::{Authorization, Deliver};
 use crate::poller::{Poller, rest_base};
 use crate::processes::{ProcessStates, Processes};
 use crate::review::{DataUrl, NoteView, Review};
@@ -204,6 +205,21 @@ impl ConfigState {
 
     pub fn set_start_view(&self, view: StartView) -> Result<AppConfig, String> {
         self.update(|c| c.start_view = view)
+    }
+
+    /// Saves the notification choices; answers the config they replaced and the new one.
+    pub fn set_notifications(
+        &self,
+        choices: NotificationChoices,
+    ) -> Result<(AppConfig, AppConfig), String> {
+        self.try_update(|c| {
+            c.notifications = choices;
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .map_err(|e| match e {
+            TryUpdateError::NotSaved(why) => why,
+            TryUpdateError::Refused(never) => match never {},
+        })
     }
 
     /// Gives the logged-in account the Markdown folder of the pipeline's own config when the
@@ -416,6 +432,10 @@ pub const SETUP_LINKS: [&str; 3] = [
     "https://github.com/jordiboehme/notedown/blob/main/docs/getting-started.md#a-pipeline-on-a-mac",
 ];
 
+/// The Notifications pane of System Settings, where a denied permission is allowed again.
+pub const NOTIFICATIONS_PANE: &str =
+    "x-apple.systempreferences:com.apple.Notifications-Settings.extension";
+
 /// How many lines of each child's log the Server page shows.
 pub const LOG_SHOWN: usize = 30;
 
@@ -558,7 +578,7 @@ fn resolved(path: &Path) -> PathBuf {
 }
 
 pub fn allowed_link(url: &str) -> bool {
-    ABOUT_LINKS.contains(&url) || SETUP_LINKS.contains(&url)
+    ABOUT_LINKS.contains(&url) || SETUP_LINKS.contains(&url) || url == NOTIFICATIONS_PANE
 }
 
 pub fn last_lines(mut lines: Vec<String>, n: usize) -> Vec<String> {
@@ -719,6 +739,65 @@ pub async fn set_start_view(
     tauri::async_runtime::spawn_blocking(move || state.set_start_view(start_view))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// What the Notifications page gets back from a change: the saved config and the permission.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationsAnswer {
+    pub config: AppConfig,
+    pub authorization: Authorization,
+}
+
+/// Saves the choices, then asks macOS for the permission when the switch went from off to on
+/// (a system dialog the first time); any other change only reads the permission. The question
+/// comes after the save and outside the config's lock, so a dialog never holds up another
+/// change. A denial keeps the switch on: the page says how to allow it. Blocks while macOS
+/// answers, so it never runs on the main thread.
+pub fn apply_notifications(
+    state: &ConfigState,
+    deliver: &dyn Deliver,
+    choices: NotificationChoices,
+) -> Result<NotificationsAnswer, String> {
+    let (before, config) = state.set_notifications(choices)?;
+    let authorization = if !before.notifications.enabled && config.notifications.enabled {
+        deliver.request()
+    } else {
+        deliver.authorization()
+    };
+    Ok(NotificationsAnswer {
+        config,
+        authorization,
+    })
+}
+
+/// Saves the notification choices (the Notifications page), off the main thread: the save
+/// waits for the disk and turning them on waits for the answer of macOS.
+#[tauri::command]
+pub async fn set_notifications(
+    state: State<'_, ConfigState>,
+    deliver: State<'_, Arc<dyn Deliver>>,
+    choices: NotificationChoices,
+) -> Result<NotificationsAnswer, String> {
+    let state = state.inner().clone();
+    let deliver = deliver.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        apply_notifications(&state, deliver.as_ref(), choices)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Whether macOS lets Notedown show notifications, without asking. Off the main thread: the
+/// notification center answers in a callback.
+#[tauri::command]
+pub async fn notification_authorization(
+    deliver: State<'_, Arc<dyn Deliver>>,
+) -> Result<Authorization, String> {
+    let deliver = deliver.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || deliver.authorization())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Starts both children afresh as the config asks (Start on the Server page). Off the main
@@ -1707,6 +1786,7 @@ pub fn file_time_ms(path: &Path) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notify::deliver::FakeDeliver;
 
     #[test]
     fn set_mode_and_start_view_are_saved() {
@@ -2319,6 +2399,77 @@ mod tests {
         ));
         assert!(!allowed_link("https://example.org"));
         assert!(!allowed_link("file:///etc/passwd"));
+        // The Notifications page opens the Notifications pane of System Settings, no other.
+        assert!(allowed_link(
+            "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
+        ));
+        assert!(!allowed_link(
+            "x-apple.systempreferences:com.apple.preference.security"
+        ));
+    }
+
+    fn choices(enabled: bool) -> NotificationChoices {
+        NotificationChoices {
+            enabled,
+            ..NotificationChoices::default()
+        }
+    }
+
+    #[test]
+    fn turning_notifications_on_asks_and_a_denial_keeps_them_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        let deliver = FakeDeliver::new(Authorization::Unknown, Authorization::Denied);
+        let answer = apply_notifications(&state, &deliver, choices(true)).unwrap();
+        assert!(answer.config.notifications.enabled);
+        assert_eq!(answer.authorization, Authorization::Denied);
+        assert_eq!(deliver.requests(), 1);
+        assert_eq!(config::load(dir.path()).notifications, choices(true));
+        let json = serde_json::to_value(&answer).unwrap();
+        assert_eq!(json["authorization"], "denied");
+        assert_eq!(json["config"]["notifications"]["enabled"], true);
+    }
+
+    #[test]
+    fn only_a_change_from_off_to_on_asks() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        let deliver = FakeDeliver::new(Authorization::Allowed, Authorization::Allowed);
+        // Off to off with one choice changed.
+        let off = NotificationChoices {
+            sync: false,
+            ..choices(false)
+        };
+        let answer = apply_notifications(&state, &deliver, off).unwrap();
+        assert_eq!(answer.config.notifications, off);
+        assert_eq!(answer.authorization, Authorization::Allowed);
+        assert_eq!(deliver.requests(), 0);
+        // Off to on asks once.
+        apply_notifications(&state, &deliver, choices(true)).unwrap();
+        assert_eq!(deliver.requests(), 1);
+        // On to on with one choice changed, then on to off: no question.
+        let on = NotificationChoices {
+            agent: false,
+            ..choices(true)
+        };
+        let answer = apply_notifications(&state, &deliver, on).unwrap();
+        assert_eq!(answer.config.notifications, on);
+        apply_notifications(&state, &deliver, choices(false)).unwrap();
+        assert_eq!(deliver.requests(), 1);
+        assert_eq!(state.current().notifications, choices(false));
+    }
+
+    #[test]
+    fn notifications_not_saved_do_not_ask() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load_with(
+            dir.path().to_owned(),
+            Arc::new(|_: &Path, _: &AppConfig| Err(std::io::Error::other("disk full"))),
+        );
+        let deliver = FakeDeliver::new(Authorization::Unknown, Authorization::Allowed);
+        assert!(apply_notifications(&state, &deliver, choices(true)).is_err());
+        assert_eq!(deliver.requests(), 0);
+        assert!(!state.current().notifications.enabled);
     }
 
     #[test]

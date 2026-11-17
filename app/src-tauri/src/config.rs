@@ -58,6 +58,36 @@ pub struct AppConfig {
     /// The newest version a found update opened Settings on About for. The daily check opens
     /// it again only for a newer one ([`crate::update::should_show`]).
     pub last_update_shown: Option<String>,
+    /// Which desktop notifications to show; off by default.
+    pub notifications: NotificationChoices,
+}
+
+/// The switch of the desktop notifications and the choice of each event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct NotificationChoices {
+    /// The switch of all of them.
+    pub enabled: bool,
+    /// The Supernote synced.
+    pub sync: bool,
+    /// The OCR is done and new notes are ready.
+    pub ocr: bool,
+    /// An agent read the new notes.
+    pub agent: bool,
+    /// The server does not answer, the OCR stopped with an error, or no sync for 7 days.
+    pub problems: bool,
+}
+
+impl Default for NotificationChoices {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sync: true,
+            ocr: true,
+            agent: true,
+            problems: true,
+        }
+    }
 }
 
 /// What the setup checklist keeps: the backup and import choices, what was shown or offered
@@ -308,6 +338,7 @@ impl Default for AppConfig {
             setup: SetupRecord::default(),
             last_update_check_ms: None,
             last_update_shown: None,
+            notifications: NotificationChoices::default(),
         }
     }
 }
@@ -472,6 +503,7 @@ mod tests {
             },
             last_update_check_ms: Some(1_763_300_000_000),
             last_update_shown: Some("0.2.0".into()),
+            notifications: NotificationChoices::default(),
         }
     }
 
@@ -502,6 +534,67 @@ mod tests {
         let text = fs::read_to_string(dir.path().join(FILE)).unwrap();
         assert!(text.contains("\"lastUpdateShown\""), "{text}");
         assert_eq!(load(dir.path()).last_update_shown.as_deref(), Some("0.2.0"));
+    }
+
+    #[test]
+    fn the_notification_choices_round_trip_and_default() {
+        // Off by default, every event chosen.
+        let choices = AppConfig::default().notifications;
+        assert_eq!(
+            choices,
+            NotificationChoices {
+                enabled: false,
+                sync: true,
+                ocr: true,
+                agent: true,
+                problems: true,
+            }
+        );
+        let dir = tempfile::tempdir().unwrap();
+        // A config of an earlier version has no choices: the defaults.
+        fs::write(dir.path().join(FILE), r#"{"mode":"local"}"#).unwrap();
+        let loaded = load_checked(dir.path());
+        assert!(!loaded.reset);
+        assert_eq!(loaded.config.notifications, choices);
+        // Some choices keep the others at their defaults.
+        fs::write(
+            dir.path().join(FILE),
+            r#"{"mode":"local","notifications":{"enabled":true,"agent":false}}"#,
+        )
+        .unwrap();
+        let loaded = load_checked(dir.path());
+        assert!(!loaded.reset);
+        assert_eq!(
+            loaded.config.notifications,
+            NotificationChoices {
+                enabled: true,
+                agent: false,
+                ..choices
+            }
+        );
+        let config = AppConfig {
+            notifications: NotificationChoices {
+                enabled: true,
+                sync: false,
+                ocr: true,
+                agent: true,
+                problems: false,
+            },
+            ..AppConfig::default()
+        };
+        save(dir.path(), &config).unwrap();
+        assert_eq!(load(dir.path()).notifications, config.notifications);
+        let text = fs::read_to_string(dir.path().join(FILE)).unwrap();
+        for key in [
+            "\"notifications\"",
+            "\"enabled\"",
+            "\"sync\"",
+            "\"ocr\"",
+            "\"agent\"",
+            "\"problems\"",
+        ] {
+            assert!(text.contains(key), "{key} in {text}");
+        }
     }
 
     #[test]

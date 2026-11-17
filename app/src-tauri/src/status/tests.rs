@@ -1,6 +1,7 @@
 //! `status_from` on fixture JSON of `pipeline status` and `GET /account`.
 
 use super::*;
+use crate::notify::store::SyncCount;
 
 const MIN: u64 = 60_000;
 const DAY: u64 = 24 * 60 * MIN;
@@ -75,6 +76,7 @@ fn local() -> Parts {
             answer: AccountAnswer::Account(account(ACCOUNT)),
             unreachable_since_ms: None,
         }),
+        sync_count: None,
     }
 }
 
@@ -678,4 +680,96 @@ fn connection_follows_the_last_account_answer() {
         names,
         ["unknown", "reached", "refused", "unreachable", "failed"]
     );
+}
+
+#[test]
+fn the_files_changed_show_only_for_the_shown_sync() {
+    // The newest sync of ACCOUNT is SN2 at 1763290900000.
+    let with = |at_ms: u64| {
+        status_from(
+            &Parts {
+                sync_count: Some(SyncCount {
+                    at_ms,
+                    files: Some(12),
+                    counted_at_ms: None,
+                }),
+                ..local()
+            },
+            NOW,
+        )
+    };
+    let shown = with(1_763_290_900_000);
+    assert_eq!(
+        shown.device.files_changed,
+        Some(SyncCount {
+            at_ms: 1_763_290_900_000,
+            files: Some(12),
+            counted_at_ms: None
+        })
+    );
+    // A count of an older sync is not this one's.
+    assert_eq!(with(1_763_200_000_000).device.files_changed, None);
+    assert_eq!(status_from(&local(), NOW).device.files_changed, None);
+    // Without a device sync to show, no count either.
+    let mut parts = local();
+    parts.sync_count = Some(SyncCount {
+        at_ms: 1_763_290_900_000,
+        files: None,
+        counted_at_ms: None,
+    });
+    parts.account = unreachable(NOW - MIN, true);
+    assert_eq!(status_from(&parts, NOW).device.files_changed, None);
+    // The webview reads camelCase.
+    let v = serde_json::to_value(&shown).unwrap();
+    assert_eq!(
+        v["device"]["filesChanged"],
+        serde_json::json!({"atMs": 1_763_290_900_000u64, "files": 12})
+    );
+    let unknown = serde_json::to_value(parts.sync_count).unwrap();
+    assert_eq!(
+        unknown,
+        serde_json::json!({"atMs": 1_763_290_900_000u64, "files": null})
+    );
+}
+
+#[test]
+fn the_ocr_has_its_last_run_and_says_when_it_has_facts() {
+    let s = status_from(&local(), NOW);
+    assert!(s.ocr.facts);
+    assert_eq!(s.ocr.last_run_ms, Some(1_763_299_000_000));
+    let v = serde_json::to_value(&s).unwrap();
+    assert_eq!(
+        v["ocr"]["lastRunMs"],
+        serde_json::json!(1_763_299_000_000u64)
+    );
+    assert_eq!(v["ocr"]["facts"], serde_json::json!(true));
+
+    // No facts: before the first call, a failed call, no connection, no mode.
+    let mut parts = local();
+    parts.pipeline_status = None;
+    let checking = status_from(&parts, NOW);
+    parts.pipeline_status = Some(PipelineCall::Failed("it broke".into()));
+    let failed = status_from(&parts, NOW);
+    parts.pipeline = ChildState::NotConnected;
+    let not_connected = status_from(&parts, NOW);
+    let not_set = status_from(
+        &Parts {
+            config: AppConfig::default(),
+            ..local()
+        },
+        NOW,
+    );
+    for s in [checking, failed, not_connected, not_set] {
+        assert!(!s.ocr.facts, "{}", s.ocr.line);
+        assert_eq!(s.ocr.last_run_ms, None, "{}", s.ocr.line);
+    }
+}
+
+#[test]
+fn the_agents_carry_their_seq() {
+    let s = status_from(&local(), NOW);
+    let seqs: Vec<u64> = s.agents.iter().map(|a| a.seq).collect();
+    assert_eq!(seqs, [40, 2, 99]);
+    let v = serde_json::to_value(&s).unwrap();
+    assert_eq!(v["agents"][0]["seq"], serde_json::json!(40));
 }

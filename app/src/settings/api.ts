@@ -186,6 +186,8 @@ export const createAccount = (slug: string, email: string, password: string) =>
 export const connectPipeline = (password: string) => invoke<ConfigAnswer>("connect_pipeline", { password });
 /** What the config's data folder, ~/notedown-data and ~/notedown-mac hold. */
 export const existingDetails = () => invoke<ExistingFolder[]>("existing_details");
+/** The home folder of this Mac's user; null when the app has none. */
+export const homeDir = () => invoke<string | null>("home_dir");
 /** Polls the server and the pipeline now; the new status comes as an event. */
 export const recheck = () => invoke<void>("recheck");
 export const modelState = () => invoke<ModelState>("model_state");

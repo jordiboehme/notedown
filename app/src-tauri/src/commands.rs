@@ -912,6 +912,15 @@ pub async fn connect_pipeline(
     })
 }
 
+/// The home folder of this Mac's user, for the setup to write paths with `~`; null when the
+/// app has none.
+#[tauri::command]
+pub fn home_dir() -> Option<String> {
+    std::env::var_os("HOME")
+        .map(|home| home.to_string_lossy().into_owned())
+        .filter(|home| !home.is_empty())
+}
+
 /// What the config's data folder, `~/notedown-data` and `~/notedown-mac` hold (a server with
 /// its accounts, a pipeline with its server), off the main thread.
 #[tauri::command]

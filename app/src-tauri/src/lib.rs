@@ -252,6 +252,7 @@ pub fn run() {
             commands::create_account,
             commands::connect_pipeline,
             commands::existing_details,
+            commands::home_dir,
             commands::backup_start,
             commands::backup_pause,
             commands::backup_folder,
@@ -666,7 +667,7 @@ mod tests {
         names.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    const SETTINGS_ONLY: [&str; 35] = [
+    const SETTINGS_ONLY: [&str; 36] = [
         "get_config",
         "set_mode",
         "set_start_view",
@@ -692,6 +693,7 @@ mod tests {
         "create_account",
         "connect_pipeline",
         "existing_details",
+        "home_dir",
         "backup_start",
         "backup_pause",
         "backup_folder",
@@ -823,7 +825,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 65);
+        assert_eq!(handler_commands().len(), 66);
     }
 
     #[test]
@@ -884,6 +886,7 @@ mod tests {
             "create_account",
             "connect_pipeline",
             "existing_details",
+            "home_dir",
             "backup_start",
             "backup_pause",
             "backup_folder",

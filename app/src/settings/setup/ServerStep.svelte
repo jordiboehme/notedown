@@ -1,8 +1,16 @@
 <script lang="ts">
   import { status } from "../../lib/status.svelte";
-  import { type AppConfig, type ConfigAnswer, type ExistingFolder, failure, setMode, SETUP_LINKS } from "../api";
+  import {
+    type AppConfig,
+    type ConfigAnswer,
+    type ExistingFolder,
+    failure,
+    setMode,
+    SETUP_LINKS,
+    startProcesses,
+  } from "../api";
   import { useFolder } from "../account";
-  import { autostartLine, foundLine, startFolder } from "../checklist";
+  import { autostartLine, foundLine, inUse, startFolder } from "../checklist";
   import { config } from "../config.svelte";
   import Row from "../kit/Row.svelte";
   import Segmented from "../kit/Segmented.svelte";
@@ -10,13 +18,18 @@
 
   // Step 1 of the setup: where the server runs, the data folder, the address of a server on
   // another machine, the folders found on this Mac with Use it, and the address for the
-  // Supernote. `onSaved` gets the e-mail of a found folder with one account.
+  // Supernote, and Start while this Mac's server does not run (`start`, from the checklist).
+  // `onSaved` gets the e-mail of a found folder with one account.
   let {
     details,
+    home,
+    start,
     onSaved,
     onOpen,
   }: {
     details: ExistingFolder[];
+    home: string | null;
+    start: boolean;
     onSaved: (answer: ConfigAnswer, email?: string) => void;
     onOpen: (url: string) => void;
   } = $props();
@@ -30,6 +43,7 @@
   let note = $state<{ text: string; tone: "secondary" | "good" | "bad" } | null>(null);
   let autostart = $state<string | null>(null);
   let busy = $state(false);
+  let startNote = $state<string | null>(null);
 
   const current = $derived(config.current);
   const changed = $derived(
@@ -52,7 +66,7 @@
 
   function choose(next: Where) {
     where = next;
-    if (current && !edited) folder = startFolder(next, current, details);
+    if (current && !edited) folder = startFolder(next, current, details, home);
   }
 
   async function save(mode: Where, dataDir: string, serverUrl: string | null, email?: string) {
@@ -78,6 +92,20 @@
     }
   }
 
+  // As the Server page's Start: it starts the server and the OCR again; a server that runs
+  // outside the app is refused until it is gone.
+  async function startServer() {
+    busy = true;
+    startNote = null;
+    try {
+      await startProcesses();
+    } catch (error) {
+      startNote = failure(error);
+    } finally {
+      busy = false;
+    }
+  }
+
   function use(found: ExistingFolder) {
     const used = useFolder(found);
     void save(used.mode, used.dataDir, used.serverUrl, used.email);
@@ -85,8 +113,12 @@
 </script>
 
 {#each details as found (found.path)}
-  <Row title="Found on this Mac" note={foundLine(found)}>
-    <button type="button" class="button" disabled={busy} onclick={() => use(found)}>Use it</button>
+  <Row title="Found on this Mac" note={foundLine(found, home)}>
+    {#if current && inUse(found, current)}
+      <span class="value">In use</span>
+    {:else}
+      <button type="button" class="button" disabled={busy} onclick={() => use(found)}>Use it</button>
+    {/if}
   </Row>
 {/each}
 <Row title="Server" note="This Mac runs the server for the Supernote, or another machine does.">
@@ -128,6 +160,15 @@
     onclick={() => save(where, folder, where === "remote" ? address : null)}>Save</button
   >
 </Row>
+{#if start}
+  <Row
+    title="Start"
+    note={startNote ?? "Start runs the server and the OCR on this Mac."}
+    tone={startNote ? "bad" : "secondary"}
+  >
+    <button type="button" class="button strong" disabled={busy} onclick={startServer}>Start</button>
+  </Row>
+{/if}
 {#if autostart}<Row title="Start at login" note={autostart} tone="good" />{/if}
 {#if current?.mode === "local"}
   <DeviceAddress urls={status.current?.server.deviceUrls ?? []} />

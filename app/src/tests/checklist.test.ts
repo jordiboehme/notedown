@@ -5,13 +5,16 @@ import {
   OUTSIDE_LINE,
   accountCommand,
   autostartLine,
+  accountAction,
   checklist,
   connectionRows,
   createAccountProblem,
   foundLine,
+  inUse,
   remoteFolder,
   shortPath,
   startFolder,
+  startOffered,
   stepDot,
   tokenKey,
   type ChecklistInput,
@@ -21,6 +24,7 @@ import {
 import { notSetUp, readyModel, sampleConfig, sampleStatus } from "./sample";
 
 const NOW = 1_800_000_000_000;
+const HOME = "/Users/me";
 
 function input(change: Partial<ChecklistInput> = {}): ChecklistInput {
   const status = change.status ?? sampleStatus(NOW);
@@ -74,11 +78,14 @@ describe("checklist", () => {
     );
     expect(steps.server.state).toBe("todo");
     expect(steps.server.line).toBe("Choose where the server runs.");
-    for (const id of ["account", "connection", "model", "import", "supernote"] as const) {
+    for (const id of ["account", "connection", "import", "supernote"] as const) {
       expect(steps[id].state, id).toBe("blocked");
       expect(steps[id].blockedBy, id).toBe("server");
-      expect(steps[id].line, id).toBe("Do choose the server first.");
+      expect(steps[id].line, id).toBe("Do step 1 first.");
     }
+    // The model needs no server: it can be downloaded at once.
+    expect(steps.model.state).toBe("todo");
+    expect(steps.model.blockedBy).toBeUndefined();
     expect(steps.agent.state).toBe("optional");
     expect(steps.agent.blockedBy).toBeUndefined();
   });
@@ -95,7 +102,7 @@ describe("checklist", () => {
       agent: "done",
     });
     expect(steps.supernote.blockedBy).toBe("import");
-    expect(steps.supernote.line).toBe("Do back up and import the Supernote first.");
+    expect(steps.supernote.line).toBe("Do step 5 first.");
   });
 
   it("a supernote that synced before the import does not make step 6 done", () => {
@@ -118,6 +125,11 @@ describe("checklist", () => {
     const steps = byId(checklist(input({ status, config })));
     expect(steps.import.state).toBe("todo");
     expect(steps.import.line).toBe("Update the server on the other machine.");
+    // Step 6 does not open before step 5, also when the Supernote synced.
+    expect(steps.supernote.state).toBe("blocked");
+    expect(steps.supernote.blockedBy).toBe("import");
+    status.device.lastSyncMs = NOW;
+    expect(byId(checklist(input({ status, config }))).supernote.state).toBe("blocked");
   });
 
   it("the agent step is optional and never blocks", () => {
@@ -150,6 +162,8 @@ describe("checklist", () => {
       status.account = null;
       const steps = byId(checklist(input({ status, config, job })));
       expect(steps.server.state, job).toBe("done");
+      expect(steps.connection.state, job).toBe("done");
+      expect(steps.connection.line, job).toBe("The import holds the server.");
       expect(steps.import.state, job).toBe("working");
       expect(steps.import.blockedBy, job).toBeUndefined();
       expect(steps.supernote.state, job).toBe("blocked");
@@ -160,6 +174,7 @@ describe("checklist", () => {
     status.server.line = "Stopped";
     const steps = byId(checklist(input({ status, config, job: "backup" })));
     expect(steps.server.state).toBe("todo");
+    expect(steps.server.line).toBe("The server is stopped. Press Start.");
     expect(steps.import.state).toBe("working");
   });
 
@@ -232,7 +247,7 @@ describe("checklist", () => {
     expect(steps.account.state).toBe("todo");
     expect(steps.connection.state).toBe("blocked");
     expect(steps.connection.blockedBy).toBe("account");
-    expect(steps.connection.line).toBe("Do log in first.");
+    expect(steps.connection.line).toBe("Do step 2 first.");
   });
 
   it("the model step shows a download as working", () => {
@@ -240,6 +255,72 @@ describe("checklist", () => {
     expect(byId(checklist(input({ model }))).model.state).toBe("working");
     const missing: ModelState = { ...readyModel(), installed: false, sizeBytes: 0 };
     expect(byId(checklist(input({ model: missing }))).model.state).toBe("todo");
+  });
+
+  it("the import and the first sync do not wait for the model", () => {
+    const { status, config } = beforeImport();
+    const missing: ModelState = { ...readyModel(), installed: false, sizeBytes: 0 };
+    let steps = byId(checklist(input({ status, config, model: missing })));
+    expect(steps.model.state).toBe("todo");
+    expect(steps.import.state).toBe("todo");
+    steps = byId(checklist(input({ model: missing })));
+    expect(steps.import.state).toBe("done");
+    expect(steps.supernote.state).toBe("done");
+  });
+
+  it("a server that is not running asks for Start", () => {
+    const status = sampleStatus(NOW);
+    status.server.state = { state: "backoff", untilMs: NOW, lastError: "x" };
+    expect(byId(checklist(input({ status }))).server.line).toBe("The server stopped with an error. Press Start.");
+    expect(startOffered(input({ status }))).toBe(true);
+    status.server.state = { state: "outside", what: "server" };
+    expect(startOffered(input({ status }))).toBe(true);
+    status.server.state = { state: "stopped" };
+    expect(startOffered(input({ status }))).toBe(true);
+    // Not while it runs or starts, not while an import holds it, not for another machine.
+    expect(startOffered(input({ status, job: "import" }))).toBe(false);
+    expect(startOffered(input({ status: sampleStatus(NOW) }))).toBe(false);
+    status.server.state = { state: "starting" };
+    expect(startOffered(input({ status }))).toBe(false);
+    const remote = { ...sampleConfig(), mode: "remote" as const, serverUrl: "http://pi.local:19072" };
+    expect(startOffered(input({ status: notSetUp(), config: remote }))).toBe(false);
+  });
+
+  it("the remote server line has no login in the address", () => {
+    const config = { ...sampleConfig(), mode: "remote" as const, serverUrl: "https://u:secret@pi.local:19072" };
+    const status = sampleStatus(NOW);
+    status.setup.mode = "remote";
+    status.server.state = null;
+    const line = byId(checklist(input({ status, config }))).server.line;
+    expect(line).toBe("The server at https://pi.local:19072 answers.");
+  });
+
+  it("never shows a step of the chain done after one that is not", () => {
+    const chain: StepId[] = ["server", "account", "connection", "import", "supernote"];
+    const fixtures: ChecklistInput[] = [];
+    for (const status of [sampleStatus(NOW), notSetUp(), beforeImport().status]) {
+      for (const config of [sampleConfig(), CONFIG_NOT_SET(), beforeImport().config]) {
+        for (const hasLogin of [true, false]) {
+          for (const job of [null, "import", "backup"] as (JobKind | null)[]) {
+            for (const connection of ["reached", "refused", "unreachable"] as const) {
+              const changed: Status = { ...status, connection };
+              const synced = { ...config, setup: { ...config.setup, syncMark: { key: "local|me", seq: 1 } } };
+              for (const cfg of [config, synced]) {
+                fixtures.push(input({ status: changed, config: cfg, hasLogin, job, model: null }));
+              }
+            }
+          }
+        }
+      }
+    }
+    for (const fixture of fixtures) {
+      const steps = byId(checklist(fixture));
+      let open = true;
+      for (const id of chain) {
+        if (!open) expect(steps[id].state, JSON.stringify({ id, job: fixture.job })).not.toBe("done");
+        if (steps[id].state !== "done") open = false;
+      }
+    }
   });
 
   it("the local import needs the files and the digests", () => {
@@ -325,8 +406,8 @@ describe("the setup helpers", () => {
   };
 
   it("names each folder found on this Mac", () => {
-    expect(foundLine(server)).toBe("Notedown found a server folder in ~/notedown-data with the account me.");
-    expect(foundLine(pipeline)).toBe("Notedown found an OCR connection in ~/notedown-mac to http://pi.local:19072.");
+    expect(foundLine(server, HOME)).toBe("Notedown found a server folder in ~/notedown-data with the account me.");
+    expect(foundLine(pipeline, HOME)).toBe("Notedown found an OCR connection in ~/notedown-mac to http://pi.local:19072.");
     const two: ExistingFolder = {
       ...server,
       server: {
@@ -336,26 +417,41 @@ describe("the setup helpers", () => {
         ],
       },
     };
-    expect(foundLine(two)).toBe("Notedown found a server folder in ~/notedown-data with the accounts a and b.");
-    expect(foundLine({ ...server, server: { accounts: [] } })).toBe(
+    expect(foundLine(two, HOME)).toBe("Notedown found a server folder in ~/notedown-data with the accounts a and b.");
+    expect(foundLine({ ...server, server: { accounts: [] } }, HOME)).toBe(
       "Notedown found a server folder in ~/notedown-data.",
     );
-    expect(foundLine({ ...pipeline, pipeline: { url: null } })).toBe(
+    expect(foundLine({ ...pipeline, pipeline: { url: null } }, HOME)).toBe(
       "Notedown found an OCR connection in ~/notedown-mac.",
     );
   });
 
-  it("shortens the home folder", () => {
-    expect(shortPath("/Users/me/notedown-data")).toBe("~/notedown-data");
-    expect(shortPath("/Users/me")).toBe("~");
-    expect(shortPath("/Volumes/x/notedown")).toBe("/Volumes/x/notedown");
+  it("shortens the home folder the app names", () => {
+    expect(shortPath("/Users/me/notedown-data", HOME)).toBe("~/notedown-data");
+    expect(shortPath("/Users/me", HOME)).toBe("~");
+    expect(shortPath("/Users/me", "/Users/me/")).toBe("~");
+    expect(shortPath("/Users/meier/x", HOME)).toBe("/Users/meier/x");
+    expect(shortPath("/Volumes/x/notedown", HOME)).toBe("/Volumes/x/notedown");
+    expect(shortPath("/Users/me/notedown-data", null)).toBe("/Users/me/notedown-data");
+    expect(shortPath("/home/me/n", "/home/me")).toBe("~/n");
+  });
+
+  it("offers Use it only for a folder that is not in use", () => {
+    const config = sampleConfig();
+    expect(inUse(server, config)).toBe(true);
+    expect(inUse(pipeline, config)).toBe(false);
+    expect(inUse(server, { ...config, mode: "remote", serverUrl: "http://pi.local:19072" })).toBe(false);
+    const remote = { ...config, mode: "remote" as const, dataDir: "/Users/me/notedown-mac", serverUrl: "http://pi.local:19072" };
+    expect(inUse(pipeline, remote)).toBe(true);
+    expect(inUse(pipeline, { ...remote, serverUrl: "http://other:19072" })).toBe(false);
   });
 
   it("keeps the OCR of another machine out of a server folder", () => {
-    expect(remoteFolder([server])).toBe("~/notedown-mac");
-    expect(remoteFolder([pipeline])).toBeNull();
-    expect(remoteFolder([{ ...server, path: "/Volumes/x/notes" }])).toBeNull();
-    expect(remoteFolder([])).toBeNull();
+    expect(remoteFolder([server], HOME)).toBe("~/notedown-mac");
+    expect(remoteFolder([server], null)).toBeNull();
+    expect(remoteFolder([pipeline], HOME)).toBeNull();
+    expect(remoteFolder([{ ...server, path: "/Volumes/x/notes" }], HOME)).toBeNull();
+    expect(remoteFolder([], HOME)).toBeNull();
   });
 
   it("gives the command that makes the account on the other machine", () => {
@@ -377,6 +473,19 @@ describe("the setup helpers", () => {
     );
   });
 
+  it("lets the button of step 2 always answer", () => {
+    const fields = { mode: "local" as const, form: "create" as const, email: "me@x.org", slug: "me", password: "a", repeat: "b" };
+    expect(accountAction(fields)).toEqual({ kind: "create", problem: "The two passwords are not the same." });
+    // A Create form left from This Mac logs in on another machine.
+    expect(accountAction({ ...fields, mode: "remote" })).toEqual({ kind: "logIn", problem: null });
+    expect(accountAction({ ...fields, mode: "remote", password: "" })).toEqual({
+      kind: "logIn",
+      problem: "Enter the e-mail and the password.",
+    });
+    expect(accountAction({ ...fields, form: "logIn", email: "" }).problem).toBe("Enter the e-mail and the password.");
+    expect(accountAction({ ...fields, mode: "notSet", form: "logIn" }).problem).toBe("Choose where the server runs first.");
+  });
+
   it("says once that Start at login is on", () => {
     const before = { ...sampleConfig(), mode: "notSet" as const };
     before.setup = { ...before.setup, autostartOffered: false };
@@ -396,11 +505,11 @@ describe("startFolder", () => {
 
   it("keeps the config's folder for its own mode and moves the OCR out of a server folder", () => {
     const config = sampleConfig();
-    expect(startFolder("local", config, [server])).toBe("/Users/me/notedown-data");
-    expect(startFolder("remote", config, [server])).toBe("~/notedown-mac");
-    expect(startFolder("remote", config, [])).toBe("/Users/me/notedown-data");
+    expect(startFolder("local", config, [server], HOME)).toBe("/Users/me/notedown-data");
+    expect(startFolder("remote", config, [server], HOME)).toBe("~/notedown-mac");
+    expect(startFolder("remote", config, [], HOME)).toBe("/Users/me/notedown-data");
     const remote = { ...config, mode: "remote" as const, dataDir: "/Users/me/ocr" };
-    expect(startFolder("remote", remote, [server])).toBe("/Users/me/ocr");
+    expect(startFolder("remote", remote, [server], HOME)).toBe("/Users/me/ocr");
   });
 });
 
@@ -452,7 +561,7 @@ describe("the setup page", () => {
     const body = render(SetupPage, { props: { onOpen: () => {} } }).body;
     expect(body).toContain("1. Choose the server");
     expect(body).toContain("Choose where the server runs.");
-    expect(body).toContain("Do choose the server first.");
+    expect(body).toContain("Do step 1 first.");
     expect(body).toContain("7. Connect an agent");
     // A step that waits shows no controls: no login form before the server.
     expect(body).not.toContain("Create account");

@@ -7,12 +7,10 @@
     type ExistingFolder,
     existingDetails,
     hasLogin,
+    homeDir,
     type JobKind,
     type JobProgress,
     jobState,
-    MODEL_FAILED_EVENT,
-    MODEL_PROGRESS_EVENT,
-    MODEL_READY_EVENT,
     type ModelState,
     modelState,
     SETUP_JOB_DONE_EVENT,
@@ -21,7 +19,7 @@
     SETUP_JOB_PROGRESS_EVENT,
   } from "../api";
   import type { LogInOutcome } from "../account";
-  import { checklist, type Step, type StepId, stepDot } from "../checklist";
+  import { checklist, type ChecklistInput, type Step, type StepId, startOffered, stepDot } from "../checklist";
   import { config } from "../config.svelte";
   import Form from "../kit/Form.svelte";
   import Row from "../kit/Row.svelte";
@@ -39,15 +37,17 @@
   let { onOpen }: { onOpen: (url: string) => void } = $props();
 
   let details = $state<ExistingFolder[]>([]);
+  let home = $state<string | null>(null);
   let model = $state<ModelState | null>(null);
   let job = $state<JobKind | null>(null);
   let loggedIn = $state(false);
-  let email = $state(config.current?.email ?? "");
+  const startEmail = config.current?.email ?? "";
+  let email = $state(startEmail);
   let connectError = $state<string | null>(null);
 
-  const steps = $derived(
+  const input = $derived<ChecklistInput | null>(
     status.current && config.current
-      ? checklist({
+      ? {
           status: status.current,
           config: config.current,
           model,
@@ -55,9 +55,10 @@
           details,
           job,
           hasLogin: loggedIn,
-        })
+        }
       : null,
   );
+  const steps = $derived(input ? checklist(input) : null);
   const step = (id: StepId): Step | undefined => steps?.find((s) => s.id === id);
   const number = (id: StepId) => (steps ? steps.findIndex((s) => s.id === id) + 1 : 0);
   const open = (id: StepId) => {
@@ -82,14 +83,22 @@
       .catch(() => (loggedIn = false));
   });
 
-  // The e-mail follows the config until the user types one.
+  // The e-mail starts as the config's, once; the user may empty it.
+  let emailFilled = startEmail !== "";
   $effect(() => {
     const kept = config.current?.email;
-    if (kept && email === "") email = kept;
+    if (kept && !emailFilled) {
+      emailFilled = true;
+      email = kept;
+    }
   });
 
   onMount(() => {
     readDetails();
+    homeDir()
+      .then((found) => (home = found))
+      .catch(() => (home = null));
+    // The model: read once here, then each change from the download part of step 4.
     modelState()
       .then((m) => (model = m))
       .catch(() => {});
@@ -102,15 +111,6 @@
       listen(SETUP_JOB_DONE_EVENT, ended),
       listen(SETUP_JOB_FAILED_EVENT, ended),
       listen(SETUP_JOB_PAUSED_EVENT, ended),
-      listen(MODEL_PROGRESS_EVENT, () => {
-        if (model && !model.pulling) model = { ...model, pulling: true };
-      }),
-      listen<ModelState>(MODEL_READY_EVENT, (event) => (model = event.payload)),
-      listen(MODEL_FAILED_EVENT, () => {
-        modelState()
-          .then((m) => (model = m))
-          .catch(() => {});
-      }),
     ];
     return () => {
       for (const stop of stops) void stop.then((unlisten) => unlisten());
@@ -148,7 +148,7 @@
   {:else}
     <Section title={`${number("server")}. ${step("server")?.title}`}>
       {@render head("server")}
-      <ServerStep {details} onSaved={saved} {onOpen} />
+      <ServerStep {details} {home} start={input !== null && startOffered(input)} onSaved={saved} {onOpen} />
     </Section>
 
     <Section title={`${number("account")}. ${step("account")?.title}`}>
@@ -172,9 +172,7 @@
 
     <Section title={`${number("model")}. ${step("model")?.title}`}>
       {@render head("model")}
-      {#if open("model")}
-        <ModelDownload onchange={(m) => (model = m)} />
-      {/if}
+      <ModelDownload onchange={(m) => (model = m)} />
     </Section>
 
     <!-- The backup and the import, and the first sync of the Supernote, get their own parts. -->

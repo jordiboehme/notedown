@@ -60,6 +60,7 @@ const COMMANDS: &[&str] = &[
     "create_account",
     "connect_pipeline",
     "existing_details",
+    "home_dir",
     "backup_start",
     "backup_pause",
     "backup_folder",

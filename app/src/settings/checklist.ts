@@ -1,5 +1,6 @@
 import type { Status } from "../lib/api";
 import type { AppConfig, ExistingFolder, JobKind, ModelState } from "./api";
+import { NO_MODE, useFolder } from "./account";
 import { slugFromEmail } from "./slug";
 
 // The setup checklist: the state of each of its seven steps, derived from the status, the
@@ -46,9 +47,10 @@ export const TITLES: Record<StepId, string> = {
   agent: "Connect an agent",
 };
 
-/** The steps in their order; each needs every earlier one but the agent. */
+/** The steps in their order. A step of the chain needs every earlier step of the chain; the
+ * OCR model and the agent need none and hold none up (the import does not need the OCR). */
 const ORDER: StepId[] = ["server", "account", "connection", "model", "import", "supernote", "agent"];
-const REQUIRED: StepId[] = ["server", "account", "connection", "model", "import", "supernote"];
+const CHAIN: StepId[] = ["server", "account", "connection", "import", "supernote"];
 
 /** The steps of the backup and the import that hold the app's server (it is stopped). */
 const HOLDS_SERVER: JobKind[] = ["import", "appData"];
@@ -81,18 +83,18 @@ export function checklist(input: ChecklistInput): Step[] {
       steps.push({ id, title, state: step.done ? "done" : "optional", line: step.line });
       continue;
     }
-    const before = REQUIRED.slice(0, REQUIRED.indexOf(id)).find((earlier) => !own[earlier].done);
+    const chained = CHAIN.indexOf(id);
+    // By the state shown: a step that works again (an import that runs) is not done.
+    const shown = (earlier: StepId) => steps.find((s) => s.id === earlier)?.state;
+    const before = chained === -1 ? undefined : CHAIN.slice(0, chained).find((earlier) => shown(earlier) !== "done");
     if (before !== undefined) {
-      steps.push({ id, title, state: "blocked", line: `Do ${lowerFirst(TITLES[before])} first.`, blockedBy: before });
+      const line = `Do step ${ORDER.indexOf(before) + 1} first.`;
+      steps.push({ id, title, state: "blocked", line, blockedBy: before });
       continue;
     }
     steps.push({ id, title, state: step.done ? "done" : "todo", line: step.line });
   }
   return steps;
-}
-
-function lowerFirst(text: string): string {
-  return text.charAt(0).toLowerCase() + text.slice(1);
 }
 
 function holdsServer(job: JobKind | null): boolean {
@@ -105,10 +107,20 @@ function server({ status, config, job }: ChecklistInput): Own {
     const state = status.server.state;
     if (holdsServer(job)) return { done: true, line: "The import holds the server on this Mac." };
     if (state?.state === "outside") return { done: false, line: OUTSIDE_LINE };
-    if (state?.state === "running") return { done: true, line: "The server runs on this Mac." };
-    return { done: false, line: status.server.line };
+    switch (state?.state) {
+      case "running":
+        return { done: true, line: "The server runs on this Mac." };
+      case "starting":
+        return { done: false, line: "The server is starting." };
+      case "stopping":
+        return { done: false, line: "The server is stopping." };
+      case "backoff":
+        return { done: false, line: "The server stopped with an error. Press Start." };
+      default:
+        return { done: false, line: "The server is stopped. Press Start." };
+    }
   }
-  const where = config.serverUrl ?? "the other machine";
+  const where = config.serverUrl ? withoutUserinfo(config.serverUrl) : "the other machine";
   if (status.connection === "reached" || status.connection === "refused") {
     return { done: true, line: `The server at ${where} answers.` };
   }
@@ -125,7 +137,9 @@ function account({ config, hasLogin }: ChecklistInput): Own {
   };
 }
 
-function connection({ status, config, existing }: ChecklistInput): Own {
+function connection({ status, config, existing, job }: ChecklistInput): Own {
+  // The import stopped the server for its run; the connection worked before it could start.
+  if (config.mode === "local" && holdsServer(job)) return { done: true, line: "The import holds the server." };
   switch (status.connection) {
     case "unknown":
       return { done: false, line: "Checking the connection." };
@@ -260,15 +274,18 @@ export function stepDot(state: StepState): { level: "good" | "warning" | "bad" |
   }
 }
 
-/** A path with the home folder as ~ (macOS homes are /Users/<name>). */
-export function shortPath(path: string): string {
-  return path.replace(/^\/Users\/[^/]+(?=\/|$)/, "~");
+/** A path with the home folder (from the app; null while not known) as ~. */
+export function shortPath(path: string, home: string | null): string {
+  if (home === null || home === "" || home === "/") return path;
+  const base = home.replace(/\/+$/, "");
+  if (path === base) return "~";
+  return path.startsWith(`${base}/`) ? `~${path.slice(base.length)}` : path;
 }
 
 /** The line of a folder found on this Mac; a folder with a server and a pipeline is named by
  * its server, as Use it uses the server. */
-export function foundLine(folder: ExistingFolder): string {
-  const where = shortPath(folder.path);
+export function foundLine(folder: ExistingFolder, home: string | null): string {
+  const where = shortPath(folder.path, home);
   if (folder.server !== null) {
     const names = folder.server.accounts.map((a) => a.slug);
     if (names.length === 0) return `Notedown found a server folder in ${where}.`;
@@ -284,8 +301,8 @@ export function foundLine(folder: ExistingFolder): string {
 
 /** The data folder for Another machine when a server folder is at ~/notedown-data: the OCR
  * keeps its work in ~/notedown-mac, apart from that server. null keeps the config's folder. */
-export function remoteFolder(details: ExistingFolder[]): string | null {
-  const server = details.some((d) => d.server !== null && shortPath(d.path) === "~/notedown-data");
+export function remoteFolder(details: ExistingFolder[], home: string | null): string | null {
+  const server = details.some((d) => d.server !== null && shortPath(d.path, home) === "~/notedown-data");
   return server ? "~/notedown-mac" : null;
 }
 
@@ -321,9 +338,49 @@ export function autostartLine(before: AppConfig | null, after: AppConfig): strin
 
 /** The data folder step 1 starts with for `where`: the config's own folder in its own mode;
  * for Another machine away from a server folder at ~/notedown-data. */
-export function startFolder(where: "local" | "remote", config: AppConfig, details: ExistingFolder[]): string {
+export function startFolder(
+  where: "local" | "remote",
+  config: AppConfig,
+  details: ExistingFolder[],
+  home: string | null,
+): string {
   if (where === config.mode || where === "local") return config.dataDir;
-  return remoteFolder(details) ?? config.dataDir;
+  return remoteFolder(details, home) ?? config.dataDir;
+}
+
+/** The found folder is the place the config already uses: Use it would change nothing. */
+export function inUse(folder: ExistingFolder, config: AppConfig): boolean {
+  const used = useFolder(folder);
+  if (used.mode !== config.mode || used.dataDir !== config.dataDir) return false;
+  return used.mode === "local" || (used.serverUrl ?? "") === (config.serverUrl ?? "");
+}
+
+/** Step 1 offers Start: a server on this Mac that does not run and that no import holds. */
+export function startOffered(input: ChecklistInput): boolean {
+  const state = input.status.server.state?.state;
+  return (
+    input.config.mode === "local" && !holdsServer(input.job) && state !== "running" && state !== "starting"
+  );
+}
+
+export type AccountForm = "logIn" | "create";
+
+/** What the button of step 2 does: Create an account only on this Mac's server; a field
+ * that is missing is said, never ignored. */
+export function accountAction(fields: {
+  mode: AppConfig["mode"];
+  form: AccountForm;
+  email: string;
+  slug: string;
+  password: string;
+  repeat: string;
+}): { kind: AccountForm; problem: string | null } {
+  if (fields.form === "create" && fields.mode === "local") {
+    return { kind: "create", problem: createAccountProblem(fields) };
+  }
+  if (fields.mode === "notSet") return { kind: "logIn", problem: NO_MODE };
+  const missing = fields.email.trim() === "" || fields.password === "";
+  return { kind: "logIn", problem: missing ? "Enter the e-mail and the password." : null };
 }
 
 export interface CheckRow {

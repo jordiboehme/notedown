@@ -34,6 +34,7 @@
     "allow-create-account",
     "allow-connect-pipeline",
     "allow-existing-details",
+    "allow-home-dir",
     "allow-backup-start",
     "allow-backup-pause",
     "allow-backup-folder",

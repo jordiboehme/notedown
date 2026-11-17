@@ -2,7 +2,7 @@
   import type { Status } from "../../lib/api";
   import { ACCOUNT_MADE, type ConfigAnswer, createAccount, failure, SETUP_LINKS } from "../api";
   import { logInFlow, type LogInOutcome } from "../account";
-  import { accountCommand, createAccountProblem } from "../checklist";
+  import { accountAction, accountCommand, type AccountForm } from "../checklist";
   import { config } from "../config.svelte";
   import Row from "../kit/Row.svelte";
   import Segmented from "../kit/Segmented.svelte";
@@ -22,10 +22,9 @@
     onOpen: (url: string) => void;
   } = $props();
 
-  type Form = "logIn" | "create";
   type Note = { text: string; tone: "secondary" | "good" | "bad" };
 
-  let form = $state<Form>("logIn");
+  let form = $state<AccountForm>("logIn");
   let slug = $state("");
   let slugEdited = $state(false);
   let password = $state("");
@@ -36,11 +35,23 @@
 
   const mode = $derived(config.current?.mode ?? "notSet");
   const shownSlug = $derived(slugEdited ? slug : slugFromEmail(email));
-  const problem = $derived(
-    form === "create" ? createAccountProblem({ email, slug: shownSlug, password, repeat }) : null,
-  );
-  const filled = $derived(email.trim() !== "" && password !== "");
+  const action = $derived(accountAction({ mode, form, email, slug: shownSlug, password, repeat }));
+  const creating = $derived(action.kind === "create");
   const command = $derived(accountCommand(email));
+
+  // A new place starts with Log in and an empty form: Create is for this Mac's server only.
+  let lastMode: string | null = null;
+  $effect(() => {
+    if (lastMode !== null && lastMode !== mode) {
+      form = "logIn";
+      slug = "";
+      slugEdited = false;
+      password = "";
+      repeat = "";
+      note = null;
+    }
+    lastMode = mode;
+  });
 
   async function run(work: () => Promise<void>) {
     busy = true;
@@ -75,8 +86,11 @@
     event.preventDefault();
     const cfg = config.current;
     if (busy || cfg === null) return;
-    if (form === "create") {
-      if (problem !== null) return;
+    if (action.problem !== null) {
+      note = { text: action.problem, tone: "bad" };
+      return;
+    }
+    if (action.kind === "create") {
       const name = shownSlug.trim();
       void run(async () => {
         const answer = await createAccount(name, email.trim(), password);
@@ -84,7 +98,6 @@
       });
       return;
     }
-    if (!filled) return;
     void run(async () => {
       const outcome = await logInFlow(email.trim(), password, cfg, existing);
       done(outcome.answer, outcome);
@@ -121,7 +134,7 @@
   <Row title="E-mail" note="The same e-mail the Supernote uses.">
     <input type="email" bind:value={email} autocomplete="username" spellcheck="false" />
   </Row>
-  {#if form === "create" && mode === "local"}
+  {#if creating}
     <Row title="Account name" note="Made from the e-mail. You can change it.">
       <input
         type="text"
@@ -138,19 +151,19 @@
     <input
       type="password"
       bind:value={password}
-      autocomplete={form === "create" ? "new-password" : "current-password"}
+      autocomplete={creating ? "new-password" : "current-password"}
     />
   </Row>
-  {#if form === "create" && mode === "local"}
+  {#if creating}
     <Row title="Repeat the password">
       <input type="password" bind:value={repeat} autocomplete="new-password" />
     </Row>
     <Row
       title="Create the account"
-      note={note?.text ?? (password !== "" ? problem : null) ?? "Notedown makes the account and logs in with it."}
-      tone={note?.tone ?? (password !== "" && problem ? "bad" : "secondary")}
+      note={note?.text ?? "Notedown makes the account and logs in with it."}
+      tone={note?.tone ?? "secondary"}
     >
-      <button type="submit" class="button strong" disabled={busy || problem !== null}>Create account</button>
+      <button type="submit" class="button strong" disabled={busy}>Create account</button>
     </Row>
   {:else}
     <Row
@@ -158,7 +171,7 @@
       note={note?.text ?? "Notedown keeps a write token in the Keychain of this Mac."}
       tone={note?.tone ?? "secondary"}
     >
-      <button type="submit" class="button strong" disabled={busy || !filled || mode === "notSet"}>Log in</button>
+      <button type="submit" class="button strong" disabled={busy}>Log in</button>
     </Row>
   {/if}
 </form>

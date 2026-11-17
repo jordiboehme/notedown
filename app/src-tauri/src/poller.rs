@@ -178,6 +178,9 @@ struct State {
     /// When the last call for the count of a device sync (or for the journal end of its
     /// baseline) failed.
     count_failed_ms: Option<u64>,
+    /// The `lastSyncMs` whose count fails since `count_failing_since`. Another sync (or none
+    /// known, after a start) starts its own [`COUNT_GIVE_UP_MS`].
+    failing_sync: Option<u64>,
 }
 
 /// The least time between two failed calls for the mark of a server on another machine, and
@@ -456,8 +459,9 @@ impl Inner {
                 self.check_first_sync(config, base, token, &mark);
             }
             // The count of a device sync is saved before the status with that sync goes out
-            // too, so the Supernote page shows it at once. Bounded by REST calls of 8 s each
-            // (`setup::COUNT_PAGES` pages at most).
+            // too, so the Supernote page shows it at once. A count ends within
+            // `setup::COUNT_BUDGET` (20 s, the journal end and the pages); a failed one is tried
+            // again a minute later. The give-up after 5 minutes reads the journal end once more.
             if let AccountAnswer::Account(info) = &answer {
                 self.count_sync(config, base, token, info);
             }
@@ -605,8 +609,10 @@ impl Inner {
     /// - The import mark of the login, while its first sync is not checked: the mark is the
     ///   baseline (its seq and the newest sync at the mark); nothing is counted.
     ///
-    /// A failed call stores nothing and is tried again at most once a minute; a count that
-    /// fails for [`COUNT_GIVE_UP_MS`] stores the sync without a number and keeps the cursor.
+    /// A failed call stores nothing and is tried again at most once a minute. A count of one
+    /// sync that fails for [`COUNT_GIVE_UP_MS`] stores the sync without a number and the
+    /// journal end as the cursor, so the next count does not take its files; when that read
+    /// fails too, the cursor stays and the next count takes the files of both syncs.
     fn count_sync(&self, config: &AppConfig, base: &str, token: &Token, info: &AccountInfo) {
         let Some(key) = token_key(config) else {
             return;
@@ -647,10 +653,15 @@ impl Inner {
             // The baseline, or a sync without a cursor: the journal end, without a count.
             (true, _, _) | (false, None, _) => match self.sources.events_end(base, token) {
                 Ok(end) => {
-                    lock(&self.state).count_failed_ms = None;
+                    {
+                        let mut state = lock(&self.state);
+                        state.count_failed_ms = None;
+                        state.failing_sync = None;
+                    }
                     save("the baseline of the sync count", &|r| {
                         r.last_sync_ms = newest;
                         r.cursor = Some(end);
+                        r.count_failing_since = None;
                         if !first_sight && let Some(at_ms) = newest {
                             r.last_count = Some(SyncCount { at_ms, files: None });
                         }
@@ -661,7 +672,11 @@ impl Inner {
             (false, Some(cursor), Some(at_ms)) => {
                 match self.sources.device_changes(base, token, cursor) {
                     Ok(changes) => {
-                        lock(&self.state).count_failed_ms = None;
+                        {
+                            let mut state = lock(&self.state);
+                            state.count_failed_ms = None;
+                            state.failing_sync = None;
+                        }
                         save("the sync count", &|r| {
                             r.last_sync_ms = Some(at_ms);
                             r.cursor = Some(changes.end);
@@ -674,12 +689,29 @@ impl Inner {
                     }
                     Err(why) => {
                         eprintln!("notedown: the files of the sync could not be counted: {why}");
-                        lock(&self.state).count_failed_ms = Some(now);
-                        let since = record.count_failing_since.unwrap_or(now);
+                        let same_sync = {
+                            let mut state = lock(&self.state);
+                            state.count_failed_ms = Some(now);
+                            state.failing_sync.replace(at_ms) == Some(at_ms)
+                        };
+                        let since = record
+                            .count_failing_since
+                            .filter(|_| same_sync)
+                            .unwrap_or(now);
                         let give_up = now >= since.saturating_add(COUNT_GIVE_UP_MS);
+                        // One read of the journal end, so the next count starts after this sync.
+                        let end = if give_up {
+                            lock(&self.state).failing_sync = None;
+                            self.sources.events_end(base, token).ok()
+                        } else {
+                            None
+                        };
                         save("the failed sync count", &|r| {
                             if give_up {
                                 r.last_sync_ms = Some(at_ms);
+                                if let Some(end) = end {
+                                    r.cursor = Some(end);
+                                }
                                 r.last_count = Some(SyncCount { at_ms, files: None });
                                 r.count_failing_since = None;
                             } else {
@@ -814,9 +846,13 @@ impl Sources for RealSources {
     ) -> Result<DeviceChanges, String> {
         let rest = crate::rest::Rest::with_timeout(base, Some(token.clone()), REQUEST_TIMEOUT)
             .map_err(|e| e.to_string())?;
+        // The status waits for the count: every call has to end within its budget.
+        let start = std::time::Instant::now();
         let end = crate::setup::journal_end(&rest).map_err(|e| e.to_string())?;
-        let files =
-            crate::setup::count_device_files(&rest, cursor, end).map_err(|e| e.to_string())?;
+        let files = crate::setup::count_device_files_within(&rest, cursor, end, || {
+            crate::setup::page_fits(start.elapsed())
+        })
+        .map_err(|e| e.to_string())?;
         Ok(DeviceChanges { files, end })
     }
 

@@ -404,15 +404,19 @@ enum Paged {
     Done,
     /// It stopped after `pages` pages with more to read.
     Bounded,
+    /// `may_start` said no before a page.
+    OutOfTime,
 }
 
 /// Reads `GET /events` page by page from `from + 1` and hands each event in `(from, end]` to
-/// `f`, with whether a page had a `gap`. At most `pages` pages, when given.
+/// `f`, with whether a page had a `gap`. At most `pages` pages, when given, and each page only
+/// when `may_start` says yes.
 fn each_event(
     rest: &Rest,
     from: u64,
     end: u64,
     pages: Option<usize>,
+    mut may_start: impl FnMut() -> bool,
     mut f: impl FnMut(&FileEvent),
 ) -> Result<(Paged, bool), RestError> {
     let mut gap = false;
@@ -421,6 +425,9 @@ fn each_event(
     while next <= end {
         if pages.is_some_and(|most| read >= most) {
             return Ok((Paged::Bounded, gap));
+        }
+        if !may_start() {
+            return Ok((Paged::OutOfTime, gap));
         }
         let query = next.to_string();
         let page = rest.get_json::<EventsPage>("/events", &[("from", query.as_str())])?;
@@ -444,16 +451,23 @@ fn each_event(
 /// means events are missing: then what the sync did cannot be told.
 pub fn sync_check_remote(rest: &Rest, mark: u64, end: u64) -> Result<SyncCheck, RestError> {
     let mut check = SyncCheck::default();
-    let (_, gap) = each_event(rest, mark, end, None, |event| {
-        if event.origin != "device" {
-            return;
-        }
-        match event.kind.as_str() {
-            FILE_DELETED => check.files += 1,
-            FOLDER_DELETED => check.folders += 1,
-            _ => {}
-        }
-    })?;
+    let (_, gap) = each_event(
+        rest,
+        mark,
+        end,
+        None,
+        || true,
+        |event| {
+            if event.origin != "device" {
+                return;
+            }
+            match event.kind.as_str() {
+                FILE_DELETED => check.files += 1,
+                FOLDER_DELETED => check.folders += 1,
+                _ => {}
+            }
+        },
+    )?;
     check.cannot_tell = gap;
     Ok(check)
 }
@@ -466,8 +480,31 @@ pub const COUNT_PAGES: usize = 50;
 /// events with the origin `device`. Folders and the changes of others are not counted. `None`
 /// when it cannot be told: a page with `gap`, or more than [`COUNT_PAGES`] pages.
 pub fn count_device_files(rest: &Rest, from: u64, end: u64) -> Result<Option<u64>, RestError> {
+    count_device_files_within(rest, from, end, || true)
+}
+
+/// The whole time one count may take, the journal end and the pages included: the status
+/// waits for it.
+pub const COUNT_BUDGET: Duration = Duration::from_secs(20);
+
+/// The longest one REST call of the count may take.
+pub const REST_PAGE_TIMEOUT: Duration = crate::poller::REQUEST_TIMEOUT;
+
+/// Whether a REST call started `elapsed` after the count began ends within [`COUNT_BUDGET`].
+pub fn page_fits(elapsed: Duration) -> bool {
+    elapsed.saturating_add(REST_PAGE_TIMEOUT) <= COUNT_BUDGET
+}
+
+/// [`count_device_files`], reading a page only when `may_start` says yes. A count that has to
+/// stop for it is an error: it is tried again later.
+pub fn count_device_files_within(
+    rest: &Rest,
+    from: u64,
+    end: u64,
+    may_start: impl FnMut() -> bool,
+) -> Result<Option<u64>, RestError> {
     let mut files = std::collections::BTreeSet::new();
-    let (paged, gap) = each_event(rest, from, end, Some(COUNT_PAGES), |event| {
+    let (paged, gap) = each_event(rest, from, end, Some(COUNT_PAGES), may_start, |event| {
         if event.origin == "device" && event.kind.starts_with("file.") {
             // An event without an id is told apart by its path.
             files.insert(event.id.map_or_else(
@@ -476,8 +513,16 @@ pub fn count_device_files(rest: &Rest, from: u64, end: u64) -> Result<Option<u64
             ));
         }
     })?;
-    if gap || paged == Paged::Bounded {
-        return Ok(None);
+    match paged {
+        Paged::OutOfTime => {
+            return Err(RestError::Failed(format!(
+                "the count took longer than {} s",
+                COUNT_BUDGET.as_secs()
+            )));
+        }
+        Paged::Bounded => return Ok(None),
+        Paged::Done if gap => return Ok(None),
+        Paged::Done => {}
     }
     Ok(Some(files.len() as u64))
 }

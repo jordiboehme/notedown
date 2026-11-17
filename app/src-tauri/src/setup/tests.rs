@@ -972,3 +972,37 @@ fn the_sync_state_is_the_check_of_the_login() {
     config.account = Some("anna".into());
     assert_eq!(sync_state(&config), SyncState::default());
 }
+
+#[test]
+fn a_count_out_of_time_is_a_failure() {
+    let pages = (0..3u64)
+        .map(|n| {
+            events_page(
+                &entry_event(11 + n, "file.modified", "device", n),
+                12 + n,
+                100,
+                true,
+                false,
+            )
+        })
+        .collect();
+    let server = Scripted::start(pages);
+    // Time for two pages only.
+    let mut left = 2;
+    let counted = count_device_files_within(&rest_on(&server), 10, 100, || {
+        left -= 1;
+        left >= 0
+    });
+    assert!(counted.is_err());
+    assert_eq!(server.received().len(), 2);
+}
+
+#[test]
+fn a_page_starts_only_when_it_ends_within_the_budget() {
+    assert!(page_fits(Duration::ZERO));
+    assert!(page_fits(COUNT_BUDGET - REST_PAGE_TIMEOUT));
+    assert!(!page_fits(
+        COUNT_BUDGET - REST_PAGE_TIMEOUT + Duration::from_millis(1)
+    ));
+    assert!(!page_fits(COUNT_BUDGET));
+}

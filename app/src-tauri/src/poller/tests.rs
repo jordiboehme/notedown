@@ -1611,3 +1611,91 @@ fn without_a_login_nothing_is_counted() {
     assert!(rig.changes_calls().is_empty());
     assert_eq!(rig.record(), KeyRecord::default());
 }
+
+#[test]
+fn a_give_up_takes_the_journal_end_as_the_cursor() {
+    let rig = Rig::me();
+    rig.set_record(|r| *r = poller_fields(Some(S), Some(40), None));
+    rig.answer(synced(Some(S + SEC)));
+    rig.changes(Err("no answer".into()));
+    *lock(&rig.fake.events_answer) = Some(Ok(55));
+    for _ in 0..6 {
+        rig.poll();
+        rig.advance(60 * SEC);
+    }
+    // The next sync does not take the files of the one without a number.
+    let count = SyncCount {
+        at_ms: S + SEC,
+        files: None,
+    };
+    assert_eq!(
+        rig.record(),
+        poller_fields(Some(S + SEC), Some(55), Some(count))
+    );
+    assert_eq!(
+        lock(&rig.fake.events_calls).len(),
+        1,
+        "once, at the give-up"
+    );
+}
+
+#[test]
+fn a_new_sync_starts_its_own_five_minutes() {
+    let rig = Rig::me();
+    // A failure left over from long ago (a restart, a device that started to sync).
+    rig.set_record(|r| {
+        *r = KeyRecord {
+            count_failing_since: Some(T0 - 3_600 * SEC),
+            ..poller_fields(Some(S), Some(40), None)
+        }
+    });
+    rig.answer(synced(Some(S + SEC)));
+    rig.changes(Err("no answer".into()));
+    rig.poll();
+    assert_eq!(rig.record().last_count, None, "no give-up at once");
+    assert_eq!(rig.record().count_failing_since, Some(T0));
+    // Three minutes on, a newer sync: its own five minutes start.
+    for _ in 0..3 {
+        rig.advance(60 * SEC);
+        rig.poll();
+    }
+    rig.answer(synced(Some(S + 2 * SEC)));
+    rig.advance(60 * SEC);
+    rig.poll();
+    assert_eq!(rig.record().count_failing_since, Some(T0 + 240 * SEC));
+    for _ in 0..4 {
+        rig.advance(60 * SEC);
+        rig.poll();
+    }
+    assert_eq!(
+        rig.record().last_count,
+        None,
+        "four minutes into the new sync"
+    );
+    rig.advance(60 * SEC);
+    rig.poll();
+    assert_eq!(
+        rig.record().last_count,
+        Some(SyncCount {
+            at_ms: S + 2 * SEC,
+            files: None,
+        })
+    );
+    assert_eq!(rig.record().count_failing_since, None);
+}
+
+#[test]
+fn a_journal_end_without_a_count_ends_the_failure() {
+    let rig = Rig::me();
+    rig.set_record(|r| {
+        *r = KeyRecord {
+            count_failing_since: Some(T0 - SEC),
+            ..poller_fields(Some(S), None, None)
+        }
+    });
+    *lock(&rig.fake.events_answer) = Some(Ok(50));
+    rig.answer(synced(Some(S + SEC)));
+    rig.poll();
+    assert_eq!(rig.record().cursor, Some(50));
+    assert_eq!(rig.record().count_failing_since, None);
+}

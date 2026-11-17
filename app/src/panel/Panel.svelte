@@ -1,14 +1,18 @@
 <script lang="ts">
   import type { Status } from "../lib/api";
   import { panelLines } from "./lines";
+  import type { newNotesView } from "./notes";
   import { QUIT_QUESTION } from "./quit.svelte";
 
-  // The menu bar panel as mockup B: the lines, the slot for plan C's new notes, the footer.
-  // It only shows what it gets; PanelWindow.svelte wires it to Rust.
+  // The menu bar panel as mockup B: the lines, the new notes, the footer. It only shows what it
+  // gets; PanelWindow.svelte wires it to Rust. Note titles are text.
   let {
     status,
     now,
     asking,
+    notes,
+    onOpenNote,
+    onMoreNotes,
     onSetUp,
     onOpenLibrary,
     onSettings,
@@ -19,6 +23,9 @@
     status: Status | null;
     now: number;
     asking: boolean;
+    notes: ReturnType<typeof newNotesView>;
+    onOpenNote: (path: string) => void;
+    onMoreNotes: () => void;
     onSetUp: () => void;
     onOpenLibrary: () => void;
     onSettings: () => void;
@@ -64,8 +71,22 @@
     </ul>
   {/if}
 
-  <!-- Plan C: the new notes go here (mockup B, "New notes"). Empty until then. -->
-  <section class="new-notes" data-slot="new-notes" aria-label="New notes"></section>
+  <section class="new-notes" class:none={notes.rows.length === 0} data-slot="new-notes" aria-label="New notes">
+    {#if notes.rows.length > 0}
+      <h2 class="notes-head">New notes</h2>
+      <ul class="notes">
+        {#each notes.rows as note (note.key)}
+          <li>
+            <button type="button" class="note" onclick={() => onOpenNote(note.path)}>
+              <span class="note-title">{note.title}</span>
+              {#if note.folder}<span class="note-folder">{note.folder}</span>{/if}
+            </button>
+          </li>
+        {/each}
+      </ul>
+      {#if notes.more}<button type="button" class="plain more-notes" onclick={onMoreNotes}>{notes.more}</button>{/if}
+    {/if}
+  </section>
 
   <footer class="footer">
     <button type="button" class="button" onclick={onOpenLibrary}>Open Library</button>
@@ -219,8 +240,66 @@
     margin-top: 6px;
   }
 
-  .new-notes:empty {
+  .new-notes.none {
     display: none;
+  }
+
+  .new-notes {
+    padding: 6px 0 8px;
+    border-top: 1px solid var(--rule);
+  }
+
+  .notes-head {
+    margin: 0;
+    padding: 2px 14px 4px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+  }
+
+  .notes {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .note {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    width: 100%;
+    padding: 3px 14px;
+    font: inherit;
+    color: inherit;
+    text-align: left;
+    background: transparent;
+    border: none;
+  }
+
+  .note:hover {
+    background: var(--rule);
+  }
+
+  .note-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .note-folder {
+    flex: none;
+    max-width: 45%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .more-notes {
+    margin: 2px 0 0 4px;
   }
 
   .footer {

@@ -166,3 +166,13 @@ export type NoteView = {
     landscape: boolean;
   }[];
 };
+
+/**
+ * Where Rust opens the library window (`open_library(note?, newNotes?)`): at the review of a
+ * note (its path), or at New. A new window finds it in `window.__NOTEDOWN_AT__` (null: as it
+ * starts), an open one gets it as the `LIBRARY_AT_EVENT`.
+ */
+export type LibraryAt = { at: "note"; path: string } | { at: "new" };
+
+/** The name of the Tauri event that tells an open library window where to go. */
+export const LIBRARY_AT_EVENT = "library-at";

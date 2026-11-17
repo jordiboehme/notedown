@@ -18,7 +18,7 @@ use crate::review::{DataUrl, NoteView, Review};
 use crate::serve_info::ServeInfo;
 use crate::status::Status;
 use crate::token::{KeychainStore, TokenStore, token_key};
-use crate::windows::{self, WindowKind};
+use crate::windows::{self, LibraryAt, Opening, WindowKind};
 
 /// How the config is written to its folder: [`config::save`], or a slow one in tests.
 pub type SaveFn = Arc<dyn Fn(&Path, &AppConfig) -> std::io::Result<()> + Send + Sync>;
@@ -460,16 +460,27 @@ pub fn process_states(processes: State<'_, Arc<Processes>>) -> ProcessStates {
     processes.states()
 }
 
-/// Opens the library window. Async, so the window is made off the main thread.
+/// Opens the library window: at the review of the note at `note` (its path) when given, at New
+/// with `new_notes`, else as it is. Async, so the window is made off the main thread.
 #[tauri::command]
-pub async fn open_library(app: AppHandle) -> Result<(), String> {
-    windows::show_window(&app, WindowKind::Library, None).map_err(|e| e.to_string())
+pub async fn open_library(
+    app: AppHandle,
+    note: Option<String>,
+    new_notes: Option<bool>,
+) -> Result<(), String> {
+    let opening = match (note, new_notes) {
+        (Some(path), _) => Opening::At(LibraryAt::Note { path }),
+        (None, Some(true)) => Opening::At(LibraryAt::New),
+        (None, _) => Opening::Plain,
+    };
+    windows::show_window(&app, WindowKind::Library, opening).map_err(|e| e.to_string())
 }
 
 /// Opens the settings window, at `page` when given.
 #[tauri::command]
 pub async fn open_settings(app: AppHandle, page: Option<String>) -> Result<(), String> {
-    windows::show_window(&app, WindowKind::Settings, page).map_err(|e| e.to_string())
+    let opening = page.map_or(Opening::Plain, Opening::Page);
+    windows::show_window(&app, WindowKind::Settings, opening).map_err(|e| e.to_string())
 }
 
 /// Quit: stops every child, then ends the app. Returns at once.

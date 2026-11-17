@@ -966,6 +966,42 @@ fn at_most_two_renders_run_at_once_newest_first() {
 }
 
 #[test]
+fn a_page_dropped_while_it_waits_for_a_run_leaves_the_queue() {
+    let s = setup(vec![
+        (look(NOTE), entry()),
+        (FILE.to_owned(), bytes_of(BYTES)),
+        (look(NOTE), entry()),
+        (look(NOTE), entry()),
+    ]);
+    s.flag("hold", "");
+    let ask = |index: usize| {
+        let review = s.review.clone();
+        std::thread::spawn(move || review.page_image(NOTE, index))
+    };
+    let first = ask(0);
+    s.wait_until("the first render", || s.calls().len() == 1);
+    let second = ask(1);
+    s.wait_until("the second render", || s.calls().len() == 2);
+    let third = ask(2);
+    s.wait_until("the third page to queue", || s.review.queued() == 1);
+    // It went far out of view before a run was free.
+    s.review.drop_page(NOTE, 2);
+    assert_eq!(third.join().unwrap().unwrap_err(), PAGE_DROPPED);
+    assert_eq!(s.review.queued(), 0);
+    s.flag("release", "");
+    assert_eq!(first.join().unwrap().unwrap(), data_url(&png_of(1, BYTES)));
+    assert_eq!(second.join().unwrap().unwrap(), data_url(&png_of(2, BYTES)));
+    s.review.join();
+    // No render ran for it.
+    assert_eq!(s.calls().len(), 2, "{:?}", s.calls());
+    assert!(
+        s.calls().iter().all(|call| !call.contains(" --page 3 ")),
+        "{:?}",
+        s.calls()
+    );
+}
+
+#[test]
 fn a_dropped_page_stops_its_run() {
     let md5 = md5_hex(BYTES);
     let s = setup(vec![

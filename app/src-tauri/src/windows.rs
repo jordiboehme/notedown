@@ -5,6 +5,9 @@ use std::sync::mpsc::Sender;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
+use serde::Serialize;
+use serde_json::Value;
+
 use tauri::{
     AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
@@ -78,6 +81,58 @@ pub fn visibility_worker(
 
 /// The event that tells an open settings window which page to show: a page name.
 pub const SETTINGS_PAGE_EVENT: &str = "settings-page";
+
+/// The event that tells an open library window where to go: a [`LibraryAt`].
+pub const LIBRARY_AT_EVENT: &str = "library-at";
+
+/// Where the library window opens: at a note (its review), or at New.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "at", rename_all = "camelCase")]
+pub enum LibraryAt {
+    Note { path: String },
+    New,
+}
+
+/// How a window is opened: as it is, at a settings page, or at a place of the library.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Opening {
+    Plain,
+    Page(String),
+    At(LibraryAt),
+}
+
+/// What a window is told about its opening: a new window by its init script (it runs before
+/// the page's code), an open one by an event.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Tell {
+    Script(String),
+    Emit(&'static str, serde_json::Value),
+}
+
+/// What the window `kind` is told when it opens as `opening`; `open` says it exists already.
+/// The value goes into the script as JSON, so a path is never code.
+pub fn tell(kind: WindowKind, opening: &Opening, open: bool) -> Option<Tell> {
+    let (name, event, value) = match (kind, opening) {
+        (WindowKind::Settings, Opening::Page(page)) => (
+            "__NOTEDOWN_PAGE__",
+            SETTINGS_PAGE_EVENT,
+            serde_json::to_value(page).ok()?,
+        ),
+        (WindowKind::Settings, _) => ("__NOTEDOWN_PAGE__", SETTINGS_PAGE_EVENT, Value::Null),
+        (WindowKind::Library, Opening::At(at)) => (
+            "__NOTEDOWN_AT__",
+            LIBRARY_AT_EVENT,
+            serde_json::to_value(at).ok()?,
+        ),
+        (WindowKind::Library, _) => ("__NOTEDOWN_AT__", LIBRARY_AT_EVENT, Value::Null),
+        (WindowKind::Panel, _) => return None,
+    };
+    if open {
+        (!value.is_null()).then_some(Tell::Emit(event, value))
+    } else {
+        Some(Tell::Script(format!("window.{name} = {value};")))
+    }
+}
 
 /// The width of the panel in logical pixels.
 pub const PANEL_WIDTH: f64 = 340.0;
@@ -194,15 +249,15 @@ fn tell_poller(app: &AppHandle, panel_opened: bool) {
 
 /// Shows the library or the settings window, made on first use. Order: Regular, show,
 /// unminimize, focus.
-pub fn show_window(app: &AppHandle, kind: WindowKind, page: Option<String>) -> tauri::Result<()> {
+pub fn show_window(app: &AppHandle, kind: WindowKind, opening: Opening) -> tauri::Result<()> {
     let window = match app.get_webview_window(kind.label()) {
         Some(window) => {
-            if let Some(page) = &page {
-                let _ = window.emit_to(kind.label(), SETTINGS_PAGE_EVENT, page);
+            if let Some(Tell::Emit(event, value)) = tell(kind, &opening, true) {
+                let _ = window.emit_to(kind.label(), event, value);
             }
             window
         }
-        None => build_window(app, kind, page.as_deref())?,
+        None => build_window(app, kind, &opening)?,
     };
     let shown = app.state::<Shown>();
     let mut visible = shown.visible();
@@ -221,24 +276,24 @@ pub fn show_window(app: &AppHandle, kind: WindowKind, page: Option<String>) -> t
 fn build_window(
     app: &AppHandle,
     kind: WindowKind,
-    page: Option<&str>,
+    opening: &Opening,
 ) -> tauri::Result<WebviewWindow> {
     let builder =
         WebviewWindowBuilder::new(app, kind.label(), WebviewUrl::App("index.html".into()))
             .visible(false);
     let builder = match kind {
-        WindowKind::Settings => {
-            let page = serde_json::to_string(&page).unwrap_or_else(|_| "null".into());
-            builder
-                .title("Notedown Settings")
-                .inner_size(720.0, 540.0)
-                .min_inner_size(640.0, 460.0)
-                .initialization_script(format!("window.__NOTEDOWN_PAGE__ = {page};"))
-        }
+        WindowKind::Settings => builder
+            .title("Notedown Settings")
+            .inner_size(720.0, 540.0)
+            .min_inner_size(640.0, 460.0),
         _ => builder
             .title("Notedown Library")
             .inner_size(960.0, 640.0)
             .min_inner_size(640.0, 460.0),
+    };
+    let builder = match tell(kind, opening, false) {
+        Some(Tell::Script(script)) => builder.initialization_script(script),
+        _ => builder,
     };
     builder.build()
 }
@@ -457,6 +512,64 @@ mod tests {
         gate_tx.send(()).unwrap();
         seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(*applied.lock().unwrap(), vec![(true, true), (false, false)]);
+    }
+
+    #[test]
+    fn open_library_at_a_note_tells_the_window() {
+        let at = Opening::At(LibraryAt::Note {
+            path: "/Note/Work/Plan \"A\" </script>.note".into(),
+        });
+        // A new window learns it from its init script, as JSON (quotes and tags escaped).
+        let Some(Tell::Script(script)) = tell(Library, &at, false) else {
+            panic!("no init script");
+        };
+        assert_eq!(
+            script,
+            r#"window.__NOTEDOWN_AT__ = {"at":"note","path":"/Note/Work/Plan \"A\" </script>.note"};"#
+        );
+        // An open window gets an event.
+        assert_eq!(
+            tell(Library, &at, true),
+            Some(Tell::Emit(
+                LIBRARY_AT_EVENT,
+                serde_json::json!({"at": "note", "path": "/Note/Work/Plan \"A\" </script>.note"})
+            ))
+        );
+        // "N more" opens it at New.
+        assert_eq!(
+            tell(Library, &Opening::At(LibraryAt::New), true),
+            Some(Tell::Emit(
+                LIBRARY_AT_EVENT,
+                serde_json::json!({"at": "new"})
+            ))
+        );
+        // Open Library keeps an open window as it is; a new one starts where it starts.
+        assert_eq!(tell(Library, &Opening::Plain, true), None);
+        assert_eq!(
+            tell(Library, &Opening::Plain, false),
+            Some(Tell::Script("window.__NOTEDOWN_AT__ = null;".into()))
+        );
+        // The settings window keeps its page.
+        let page = Opening::Page("setup".into());
+        assert_eq!(
+            tell(Settings, &page, false),
+            Some(Tell::Script(
+                r#"window.__NOTEDOWN_PAGE__ = "setup";"#.into()
+            ))
+        );
+        assert_eq!(
+            tell(Settings, &Opening::Plain, false),
+            Some(Tell::Script("window.__NOTEDOWN_PAGE__ = null;".into()))
+        );
+        assert_eq!(
+            tell(Settings, &page, true),
+            Some(Tell::Emit(SETTINGS_PAGE_EVENT, serde_json::json!("setup")))
+        );
+        assert_eq!(tell(Settings, &Opening::Plain, true), None);
+        // A page is no place in the library, a note none in the settings.
+        assert_eq!(tell(Library, &page, true), None);
+        assert_eq!(tell(Settings, &at, true), None);
+        assert_eq!(tell(Panel, &at, false), None);
     }
 
     #[test]

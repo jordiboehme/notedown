@@ -34,7 +34,7 @@
     showListings,
     startLibrary,
   } from "../lib/library.svelte";
-  import { NOTES_EVENT, type Entry, type NoteSummary } from "../lib/library-types";
+  import { LIBRARY_AT_EVENT, NOTES_EVENT, type Entry, type NoteSummary } from "../lib/library-types";
   import { startStatus, status } from "../lib/status.svelte";
   import ColumnsView from "./ColumnsView.svelte";
   import FileActions from "./FileActions.svelte";
@@ -42,6 +42,7 @@
   import Jobs from "./Jobs.svelte";
   import NotesList from "./NotesList.svelte";
   import RecycleBin from "./RecycleBin.svelte";
+  import Review from "./Review.svelte";
   import Sidebar from "./Sidebar.svelte";
   import StateNotice from "./StateNotice.svelte";
   import StatusLine from "./StatusLine.svelte";
@@ -49,6 +50,7 @@
   import {
     columnsView,
     listingKey,
+    openAt,
     parentOf,
     pathBar,
     rootRows,
@@ -66,8 +68,13 @@
   import "./library.css";
 
   // The library window: the status line, the sidebar with the notes and the device trees, and
-  // the selected folder or notes. It wires the store to Rust; the view models decide.
-  let selection = $state<Selection>({ kind: "new" });
+  // the selected folder or notes, or the review of a note. It wires the store to Rust; the view
+  // models decide. Rust may open it at a note or at New (`__NOTEDOWN_AT__`, `library-at`).
+  let selection = $state<Selection>(
+    openAt((window as unknown as { __NOTEDOWN_AT__?: unknown }).__NOTEDOWN_AT__) ?? { kind: "new" },
+  );
+  /** Where Back in the review goes. */
+  let back = $state<Selection>({ kind: "new" });
   const open = new SvelteSet<string>();
   let sort = $state<Sort>({ by: "name", ascending: true });
   let newNotes = $state<NoteSummary[] | null>(null);
@@ -158,7 +165,16 @@
     // A drop goes into the folder under it (the position is physical pixels of the web
     // view); the shown folder's listing carries its path, so a drop there goes into it.
     setDropTarget((position) => folderAt(position, window.devicePixelRatio, folderUnder));
-    const stops = [startLibrary(), startStatus(), listen(NOTES_EVENT, loadNotes)];
+    const stops = [
+      startLibrary(),
+      startStatus(),
+      listen(NOTES_EVENT, loadNotes),
+      listen(LIBRARY_AT_EVENT, (event) => {
+        const at = openAt(event.payload);
+        if (at?.kind === "note") openNote(at.path);
+        else if (at) selection = at;
+      }),
+    ];
     loadNotes();
     void loadView();
     const clock = setInterval(() => (now = Date.now()), 30_000);
@@ -173,6 +189,12 @@
       for (const stop of stops) void stop.then((unlisten) => unlisten());
     };
   });
+
+  /** Shows the review of the note at `path`; Back goes to what was shown before. */
+  function openNote(path: string) {
+    if (selection.kind !== "note") back = selection;
+    selection = { kind: "note", path };
+  }
 
   /** Shows a folder and opens the folders above it in the tree. */
   function select(path: string) {
@@ -266,9 +288,13 @@
     />
     <main class="main">
       {#if selection.kind === "new"}
-        <NotesList title="New notes" notes={newNotes} empty="No new notes." />
+        <NotesList title="New notes" notes={newNotes} empty="No new notes." onOpen={(note) => openNote(note.path)} />
       {:else if selection.kind === "all"}
-        <NotesList title="All notes" notes={allNotes} empty="No notes with text yet." />
+        <NotesList title="All notes" notes={allNotes} empty="No notes with text yet." onOpen={(note) => openNote(note.path)} />
+      {:else if selection.kind === "note"}
+        {#key selection.path}
+          <Review path={selection.path} onBack={() => (selection = back)} />
+        {/key}
       {:else if !ready}
         <StateNotice view={library.view} onSettings={settings} />
       {:else if selection.kind === "bin"}

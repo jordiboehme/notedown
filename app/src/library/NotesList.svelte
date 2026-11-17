@@ -3,8 +3,13 @@
   import VirtualRows from "./VirtualRows.svelte";
   import { dateText, folderLabel } from "./view";
 
-  // New notes or all notes as plain rows (the review comes with Task 13). Titles are text.
-  let { title, notes, empty }: { title: string; notes: NoteSummary[] | null; empty: string } = $props();
+  // New notes or all notes as rows; a click opens the review of the note. Titles are text.
+  let {
+    title,
+    notes,
+    empty,
+    onOpen,
+  }: { title: string; notes: NoteSummary[] | null; empty: string; onOpen: (note: NoteSummary) => void } = $props();
 </script>
 
 <h1 class="title">{title}</h1>
@@ -20,12 +25,12 @@
 {:else}
   <VirtualRows items={notes} rowHeight={24} key={(note: NoteSummary) => note.key} label={title}>
     {#snippet row(note: NoteSummary)}
-      <div class="row">
+      <button type="button" class="row" onclick={() => onOpen(note)}>
         <span class="text">{note.title}</span>
         <span class="text muted">{folderLabel(note.path)}</span>
         <span class="pages muted">{note.pages}</span>
         <span class="text muted">{dateText(note.changedMs)}</span>
-      </div>
+      </button>
     {/snippet}
   </VirtualRows>
 {/if}
@@ -59,9 +64,20 @@
   }
 
   .row {
+    width: 100%;
     height: 100%;
     box-sizing: border-box;
+    margin: 0;
+    font: inherit;
+    color: inherit;
+    text-align: left;
+    background: transparent;
+    border: none;
     border-bottom: 1px solid var(--separator);
+  }
+
+  .row:hover {
+    background: var(--track);
   }
 
   .text {

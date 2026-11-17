@@ -15,7 +15,24 @@ export const ROOTS: readonly { path: string; name: string }[] = [
 ];
 
 /** What the main area shows. */
-export type Selection = { kind: "new" } | { kind: "all" } | { kind: "bin" } | { kind: "folder"; path: string };
+export type Selection =
+  | { kind: "new" }
+  | { kind: "all" }
+  | { kind: "bin" }
+  | { kind: "folder"; path: string }
+  | { kind: "note"; path: string };
+
+/**
+ * Where Rust opens the window (`window.__NOTEDOWN_AT__` or the `library-at` event), as a
+ * selection: the review of a note, or New. Anything else is no place.
+ */
+export function openAt(value: unknown): Selection | null {
+  if (typeof value !== "object" || value === null) return null;
+  const at = value as Record<string, unknown>;
+  if (at.at === "new") return { kind: "new" };
+  if (at.at === "note" && typeof at.path === "string") return { kind: "note", path: at.path };
+  return null;
+}
 
 /** The key of a listing in the store: the tree's listing of a path and the list's are apart. */
 export function listingKey(path: string, foldersOnly: boolean): string {

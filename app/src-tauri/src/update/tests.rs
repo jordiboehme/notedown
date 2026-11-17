@@ -325,3 +325,55 @@ fn two_checks_never_run_at_once() {
         Ok(true)
     );
 }
+
+#[test]
+fn a_quiet_check_does_not_end_an_install_that_started_while_it_ran() {
+    for answer in [found("0.2.0"), Ok(None), Err("offline".to_owned())] {
+        let (updates, _) = updates();
+        updates.check_now(|| found("0.2.0")).unwrap();
+        let round = auto_round(
+            &updates,
+            None,
+            NOW,
+            |_| {},
+            || {
+                // The user clicks Install while the daily check waits for GitHub.
+                updates.start_install().unwrap();
+                answer.clone()
+            },
+        );
+        assert!(matches!(round, Round::Checked(_)), "{round:?}");
+        let installing = UpdateState::Installing {
+            version: "0.2.0".into(),
+        };
+        assert_eq!(updates.state(), installing, "{answer:?}");
+        // No Install button again: a second click does not start a second install.
+        assert_eq!(updates.start_install(), None, "{answer:?}");
+        // A failed install still knows its update.
+        updates.install_failed("x");
+        assert!(
+            matches!(updates.state(), UpdateState::InstallFailed { .. }),
+            "{answer:?}"
+        );
+    }
+}
+
+#[test]
+fn a_quiet_check_keeps_a_failed_install_that_came_while_it_ran() {
+    let (updates, _) = updates();
+    updates.check_now(|| found("0.2.0")).unwrap();
+    updates
+        .check_quietly(|| {
+            updates.start_install().unwrap();
+            updates.install_failed("the signature does not match");
+            found("0.2.0")
+        })
+        .unwrap();
+    assert_eq!(
+        updates.state(),
+        UpdateState::InstallFailed {
+            version: "0.2.0".into(),
+            reason: "the signature does not match".into()
+        }
+    );
+}

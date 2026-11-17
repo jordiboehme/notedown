@@ -148,6 +148,7 @@ impl<P: Clone> Updates<P> {
         quiet: bool,
     ) -> Result<Option<UpdateInfo>, String> {
         let mut busy = None;
+        let mut started = None;
         self.tell(|inner| {
             if matches!(inner.state, UpdateState::Installing { .. }) {
                 busy = Some("Notedown is installing an update");
@@ -158,10 +159,11 @@ impl<P: Clone> Updates<P> {
                 return None;
             }
             inner.checking = true;
-            (!quiet).then(|| {
+            if !quiet {
                 inner.state = UpdateState::Checking;
-                inner.state.clone()
-            })
+            }
+            started = Some(inner.state.clone());
+            (!quiet).then(|| inner.state.clone())
         });
         if let Some(why) = busy {
             return Err(why.to_owned());
@@ -174,6 +176,12 @@ impl<P: Clone> Updates<P> {
             .map(|found| found.as_ref().map(|(info, _)| info.clone()))
             .map_err(Clone::clone);
         self.tell(|inner| {
+            // The state changed while the check ran (an install started or failed): it is
+            // newer than the answer, so the answer changes neither the state nor the update
+            // kept for the install.
+            if started.as_ref() != Some(&inner.state) {
+                return None;
+            }
             let next = match answer {
                 Ok(Some((info, handle))) => {
                     let state = UpdateState::Found {

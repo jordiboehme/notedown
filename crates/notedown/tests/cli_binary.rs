@@ -270,7 +270,6 @@ fn model_verify_fails_for_empty_cache() {
 }
 
 fn cloud(data: &std::path::Path, args: &[&str], stdin: Option<&str>) -> std::process::Output {
-    use std::io::Write;
     use std::process::Stdio;
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
         .args(["cloud", "account", "--data"])
@@ -283,10 +282,24 @@ fn cloud(data: &std::path::Path, args: &[&str], stdin: Option<&str>) -> std::pro
         .unwrap();
     let mut pipe = child.stdin.take().unwrap();
     if let Some(text) = stdin {
-        pipe.write_all(text.as_bytes()).unwrap();
+        write_stdin(&mut pipe, text.as_bytes());
     }
     drop(pipe);
     child.wait_with_output().unwrap()
+}
+
+/// Writes to a child's stdin. The child may exit before it reads (an error
+/// that ends the command early), which closes the pipe: that BrokenPipe is
+/// ignored, and the caller judges the child's exit and output as before.
+fn write_stdin(pipe: &mut std::process::ChildStdin, bytes: &[u8]) {
+    use std::io::Write;
+    if let Err(e) = pipe.write_all(bytes) {
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "writing to the child's stdin: {e}"
+        );
+    }
 }
 
 #[test]
@@ -2745,7 +2758,6 @@ fn running_server(data: &std::path::Path) -> Server {
 
 #[cfg(feature = "ocr")]
 fn connect_cmd(url: &str, local: &std::path::Path, password: &str) -> std::process::Output {
-    use std::io::Write;
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
         .args(["connect", url, "--data"])
         .arg(local)
@@ -2756,7 +2768,7 @@ fn connect_cmd(url: &str, local: &std::path::Path, password: &str) -> std::proce
         .spawn()
         .unwrap();
     let mut pipe = child.stdin.take().unwrap();
-    pipe.write_all(format!("{password}\n").as_bytes()).unwrap();
+    write_stdin(&mut pipe, format!("{password}\n").as_bytes());
     drop(pipe);
     child.wait_with_output().unwrap()
 }

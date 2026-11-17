@@ -2,6 +2,7 @@
 //! arguments each gets from the config, and how a child is spawned and signalled.
 
 use std::io::{self, Write as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, mpsc};
@@ -136,7 +137,9 @@ pub fn spawn_program(program: PathBuf) -> SpawnFn {
 }
 
 /// Runs a short `notedown` call to its end and returns what it printed. A call that takes
-/// longer than `timeout` gets SIGKILL and is an error.
+/// longer than `timeout` gets SIGKILL and is an error. The call runs in a process group of its
+/// own, and the SIGKILL goes to the whole group: a process it started that still holds its
+/// output cannot keep the wait open.
 pub fn run_bounded(spawn: &SpawnFn, args: &[String], timeout: Duration) -> Result<Output, String> {
     run_feeding(spawn, args, None, timeout)
 }
@@ -173,7 +176,8 @@ fn run_feeding(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .process_group(0);
     let mut child = command
         .spawn()
         .map_err(|e| format!("the notedown program could not start: {e}"))?;
@@ -193,11 +197,9 @@ fn run_feeding(
             output.map_err(|e| format!("the answer of the notedown program could not be read: {e}"))
         }
         Err(_) => {
-            // The waiter has not reaped the child yet, so the pid is still this child's.
-            if let Ok(pid) = i32::try_from(pid) {
-                // SAFETY: kill only sends a signal; the pid belongs to our unreaped child.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-            }
+            // The waiter has not reaped the child yet, so the group (its pid) is still this
+            // call's.
+            let _ = signal_group(pid, libc::SIGKILL);
             let _ = rx.recv();
             Err("it did not answer in time".to_owned())
         }

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::commands::{ConfigAnswer, ConfigState, log_in_to};
 use crate::config::{AppConfig, Mode, existing_setup, pipeline_server_url};
 use crate::library::Library;
-use crate::login::{LoginGate, Password};
+use crate::login::{self, LoginGate, Password};
 use crate::process::{self, SpawnFn};
 use crate::serve_info::ServeInfo;
 use crate::token::TokenStore;
@@ -25,7 +25,7 @@ pub const PIPELINE_NAME: &str = "Notedown for Mac pipeline";
 pub const COMMAND_FAILED: &str = "The command failed.";
 /// The account was made, but the login after it failed.
 pub const ACCOUNT_MADE: &str = "The account is made. Log in with it.";
-/// What a new account answers outside Local mode.
+/// What a new account answers in Remote mode (without a mode: [`login::NO_MODE`]).
 pub const NOT_HERE: &str = "Accounts on another machine are made there.";
 /// What the pipeline connection answers outside Remote mode.
 pub const ONLY_REMOTE: &str = "Only a server on another machine needs this connection.";
@@ -143,8 +143,10 @@ pub fn create_and_log_in(
     password: &Password,
 ) -> Result<ConfigAnswer, String> {
     let config = state.current();
-    if config.mode != Mode::Local {
-        return Err(NOT_HERE.to_owned());
+    match config.mode {
+        Mode::Local => {}
+        Mode::Remote => return Err(NOT_HERE.to_owned()),
+        Mode::NotSet => return Err(login::NO_MODE.to_owned()),
     }
     create_account(spawn, &config.data_dir, slug, email, password)?;
     log_in_to(gate, state, serve_info, store, library, email, password)

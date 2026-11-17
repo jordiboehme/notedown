@@ -14,6 +14,8 @@ describe("slugFromEmail", () => {
 
   it("cuts to 64 characters", () => {
     expect(slugFromEmail(`${"a".repeat(80)}@x`)).toBe("a".repeat(64));
+    // A dash at the cut is trimmed too.
+    expect(slugFromEmail(`${"a".repeat(63)}.b@x`)).toBe("a".repeat(63));
   });
 
   it("trims dashes and underscores from both ends", () => {

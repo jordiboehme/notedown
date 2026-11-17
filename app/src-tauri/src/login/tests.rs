@@ -990,7 +990,8 @@ fn assert_revoked(server: &Scripted, token: &str) {
     );
 }
 
-/// A loopback port below 1024: tests cannot listen there, so a connection is refused at once.
+/// Port 1 on loopback: nothing listens there in the tests (macOS lets any process bind a low
+/// port, but no test binds this one), so a connection is refused at once.
 const NOBODY_LISTENS: u16 = 1;
 
 /// What a server answers that revoked the token.

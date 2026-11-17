@@ -86,6 +86,49 @@ fn run_with_password_is_bounded() {
     assert!(gone(dir.path()), "left: {left}");
 }
 
+/// A shell that runs the sleep as its child (no exec): the sleep holds stdout and stderr.
+const SLEEPS_AS_A_CHILD: &str = r#""$S" 330
+echo done"#;
+
+#[test]
+fn run_with_password_ends_a_grandchild_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let spawn = sidecar(dir.path(), SLEEPS_AS_A_CHILD);
+    let start = Instant::now();
+    let result = run_with_password(
+        &spawn,
+        &strings(&["connect"]),
+        &Password::new(SECRET),
+        Duration::from_millis(300),
+    );
+    let took = start.elapsed();
+    let left = left_in(dir.path());
+    let ended = gone(dir.path());
+    kill_in(dir.path());
+    assert_eq!(result.unwrap_err(), "it did not answer in time");
+    assert!(took < Duration::from_secs(3), "took {took:?}");
+    assert!(ended, "left: {left}");
+}
+
+#[test]
+fn run_bounded_ends_a_grandchild_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let spawn = sidecar(dir.path(), SLEEPS_AS_A_CHILD);
+    let start = Instant::now();
+    let result = crate::process::run_bounded(
+        &spawn,
+        &strings(&["pipeline", "status"]),
+        Duration::from_millis(300),
+    );
+    let took = start.elapsed();
+    let left = left_in(dir.path());
+    let ended = gone(dir.path());
+    kill_in(dir.path());
+    assert_eq!(result.unwrap_err(), "it did not answer in time");
+    assert!(took < Duration::from_secs(3), "took {took:?}");
+    assert!(ended, "left: {left}");
+}
+
 #[test]
 fn run_with_password_refuses_two_lines_before_the_spawn() {
     let dir = tempfile::tempdir().unwrap();
@@ -380,7 +423,8 @@ fn a_new_account_is_made_and_logged_in() {
 fn a_made_account_whose_login_fails_says_log_in() {
     let dir = tempfile::tempdir().unwrap();
     let spawn = sidecar(dir.path(), READS);
-    // Nobody can listen below 1024 in a test: the login is refused at once.
+    // Port 1: nothing listens there in the tests (macOS lets any process bind a low port,
+    // but no test binds this one), so the login is refused at once.
     let state = local_on(dir.path(), 1);
     let error = create_now(&spawn, &state, &MemoryStore::new()).unwrap_err();
     assert_eq!(error, "The account is made. Log in with it.");
@@ -404,7 +448,10 @@ exit 1"#,
 fn accounts_on_another_machine_are_made_there() {
     let dir = tempfile::tempdir().unwrap();
     let spawn = sidecar(dir.path(), READS);
-    for mode in [Mode::Remote, Mode::NotSet] {
+    for (mode, text) in [
+        (Mode::Remote, "Accounts on another machine are made there."),
+        (Mode::NotSet, "Choose where the server runs first."),
+    ] {
         let state = config_in(
             dir.path(),
             AppConfig {
@@ -414,7 +461,7 @@ fn accounts_on_another_machine_are_made_there() {
             },
         );
         let error = create_now(&spawn, &state, &MemoryStore::new()).unwrap_err();
-        assert_eq!(error, "Accounts on another machine are made there.");
+        assert_eq!(error, text, "{mode:?}");
     }
     assert_eq!(argv(dir.path()), None);
 }
@@ -539,9 +586,15 @@ fn existing_details_looks_in_every_folder_once() {
     fs::create_dir_all(&mac).unwrap();
     fs::write(mac.join("pipeline.toml"), "").unwrap();
     // The config's folder is `~/notedown-data` too, once written with a dot in it.
-    let found = existing_details(&[data.clone(), data.join("."), mac.clone()]);
+    // A link to it is the same folder too.
+    let link = home.path().join("link-to-data");
+    std::os::unix::fs::symlink(&data, &link).unwrap();
+    let found = existing_details(&[data.clone(), data.join("."), link.clone(), mac.clone()]);
     let paths: Vec<&Path> = found.iter().map(|f| f.path.as_path()).collect();
     assert_eq!(paths, vec![data.as_path(), mac.as_path()]);
+    // The link alone is listed as written.
+    let found = existing_details(std::slice::from_ref(&link));
+    assert_eq!(found[0].path, link);
 }
 
 #[test]

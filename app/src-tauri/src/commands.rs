@@ -1797,7 +1797,7 @@ mod tests {
         let gate = LoginGate::default();
         // No server answers there: the revoke fails and the log out still happens.
         let serve_info = ServeInfo {
-            // Below 1024: no test listens there, so the connection is refused.
+            // Port 1: no test binds it (macOS would allow it), so the connection is refused.
             listen: vec!["127.0.0.1:1".parse().unwrap()],
             ..ServeInfo::default()
         };

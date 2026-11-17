@@ -37,8 +37,11 @@ use import_job::{AppHost as ImportHost, ImportJobs, JobEvent};
 use library::{LIBRARY_EVENT, Library, LibraryEvent};
 use model::{ModelControl, ModelEvent};
 use notes::{NOTES_EVENT, NOTES_EVERY, Notes};
+#[cfg(target_os = "macos")]
 use notify::deliver::Deliver;
-use notify::notifier::{self, Notifier, Reads, StopNotifier};
+use notify::notifier::StopNotifier;
+#[cfg(target_os = "macos")]
+use notify::notifier::{self, Notifier, Reads};
 use poller::{Inputs, Poller, RealSources, TICK_EVERY};
 use process::ChildKind;
 use processes::{Options, Processes, REPROBE_EVERY};

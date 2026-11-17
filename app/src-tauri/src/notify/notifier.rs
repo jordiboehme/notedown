@@ -479,6 +479,43 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_ends_a_wait_for_a_far_wake() {
+        // An agent waits for its quiet poll: the next wake is far away.
+        let record = KeyRecord {
+            consumers: [(
+                "claude".to_owned(),
+                crate::notify::store::ConsumerRecord {
+                    seq: 1,
+                    pending_seq: Some(2),
+                    rose_at: Some(NOW),
+                },
+            )]
+            .into(),
+            ..synced()
+        };
+        let mut rig = rig(record);
+        rig.notifier.floor = Duration::from_secs(3600);
+        let Rig {
+            notifier,
+            tx,
+            rx,
+            stop,
+            ..
+        } = rig;
+        tx.send(Msg::Status(Box::new(base_status()))).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            notifier.run(rx);
+            let _ = done_tx.send(());
+        });
+        // Let it take the status and start waiting.
+        std::thread::sleep(Duration::from_millis(368));
+        stop.stop();
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)), Ok(()));
+        thread.join().unwrap();
+    }
+
+    #[test]
     fn withheld_files_show_when_the_gap_ends_without_a_new_status() {
         // A notice was shown just before the start; 3 files wait for the gap's end.
         let start = Instant::now();

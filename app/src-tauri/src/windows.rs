@@ -118,7 +118,8 @@ pub fn opening_for(target: &Target) -> (WindowKind, Opening) {
 }
 
 /// Opens what a clicked notice points to, through [`show_window`]: the window comes to the
-/// front with the Dock icon, also when none was open.
+/// front with the Dock icon, also when none was open. Only the macOS deliverer has clicks.
+#[cfg(target_os = "macos")]
 pub fn route(app: &AppHandle, target: &Target) {
     let (kind, opening) = opening_for(target);
     if let Err(why) = show_window(app, kind, opening) {

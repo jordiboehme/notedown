@@ -1084,7 +1084,7 @@ fn import_progress_text(p: notedown_cloud::import::ImportProgress, slug: &str) -
             "moving the {files} files of account {slug} to the recycle bin"
         )),
         // the closing report at a total that is no multiple is for the app only
-        P::Imported { done, total } if done % PROGRESS_EVERY == 0 => {
+        P::Imported { done, total } if done > 0 && done % PROGRESS_EVERY == 0 => {
             Some(format!("imported {done} of {total} files"))
         }
         P::Imported { .. } => None,
@@ -1140,7 +1140,11 @@ fn one_sentence(e: impl std::fmt::Display) -> anyhow::Error {
     if text.contains("the backup cannot be imported completely") {
         return anyhow::anyhow!("the backup cannot be imported completely");
     }
-    anyhow::anyhow!("{}", text.lines().next().unwrap_or("").trim())
+    let line = text.lines().next().unwrap_or("").trim();
+    anyhow::anyhow!(
+        "{}",
+        line.trim_end_matches(|c: char| c == ':' || c.is_whitespace())
+    )
 }
 
 /// A JSON line on stdout, flushed at once.
@@ -1152,6 +1156,16 @@ fn print_json_line(line: &str) {
 }
 
 fn import_command(args: ImportArgs) -> Result<ExitCode> {
+    let json = args.json;
+    let result = import_command_inner(args);
+    if json {
+        result.map_err(one_sentence)
+    } else {
+        result
+    }
+}
+
+fn import_command_inner(args: ImportArgs) -> Result<ExitCode> {
     use notedown_cloud::import;
     let options = import::ImportOptions {
         replace: args.replace,
@@ -1245,6 +1259,16 @@ fn import_command(args: ImportArgs) -> Result<ExitCode> {
 }
 
 fn import_app_data_command(args: ImportAppDataArgs) -> Result<ExitCode> {
+    let json = args.json;
+    let result = import_app_data_command_inner(args);
+    if json {
+        result.map_err(one_sentence)
+    } else {
+        result
+    }
+}
+
+fn import_app_data_command_inner(args: ImportAppDataArgs) -> Result<ExitCode> {
     use notedown_cloud::appdata::{AppImportOptions, dry_run_app_data, import_app_data};
     let json = args.json;
     exit_with_parent(args.exit_with_parent);
@@ -2689,21 +2713,21 @@ mod tests {
     #[test]
     fn import_progress_json_lines() {
         use notedown_cloud::import::ImportProgress as P;
+        let v =
+            |p| serde_json::from_str::<serde_json::Value>(&super::import_progress_json(p)).unwrap();
         assert_eq!(
-            super::import_progress_json(P::Recycling { files: 7 }),
-            r#"{"files":7,"phase":"recycling"}"#
+            v(P::Recycling { files: 7 }),
+            serde_json::json!({"phase": "recycling", "files": 7})
         );
         assert_eq!(
-            super::import_progress_json(P::Imported {
+            v(P::Imported {
                 done: 100,
                 total: 250
             }),
-            r#"{"done":100,"phase":"importing","total":250}"#
+            serde_json::json!({"phase": "importing", "done": 100, "total": 250})
         );
-        assert_eq!(
-            super::import_progress_json(P::Verifying),
-            r#"{"phase":"verifying"}"#
-        );
+        assert_eq!(v(P::Verifying), serde_json::json!({"phase": "verifying"}));
+        assert!(super::import_progress_text(P::Imported { done: 0, total: 0 }, "a").is_none());
         // the human lines stay as they were: none for the closing report of an odd total
         assert_eq!(
             super::import_progress_text(
@@ -2748,6 +2772,8 @@ mod tests {
         assert_eq!(e.to_string(), "the backup cannot be imported completely");
         let e = super::one_sentence("first\nsecond");
         assert_eq!(e.to_string(), "first");
+        let e = super::one_sentence("the check failed:\n  a");
+        assert_eq!(e.to_string(), "the check failed");
     }
 
     #[test]

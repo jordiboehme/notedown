@@ -3310,3 +3310,79 @@ fn cloud_import_app_data_empty_json_prints_zeros() {
     assert_eq!(v["appData"]["digests"], 0);
     assert_eq!(v["appData"]["leftToDevice"], serde_json::json!([]));
 }
+
+fn account_and_empty_backup(d: &std::path::Path) -> std::path::PathBuf {
+    let out = cloud(
+        d,
+        &[
+            "add",
+            "jordi",
+            "--email",
+            "jordi@example.org",
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(out.status.success(), "{out:?}");
+    let backup = d.join("b");
+    for f in [
+        "Note",
+        "Document",
+        "MyStyle",
+        "EXPORT",
+        "SCREENSHOT",
+        "INBOX",
+    ] {
+        std::fs::create_dir_all(backup.join(f)).unwrap();
+    }
+    backup
+}
+
+#[test]
+fn cloud_import_json_dry_run_of_an_empty_backup_prints_the_line_and_one_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let backup = account_and_empty_backup(d);
+    let out = cloud_sub(
+        d,
+        &[
+            "import",
+            backup.to_str().unwrap(),
+            "--account",
+            "jordi",
+            "--no-report",
+            "--dry-run",
+            "--json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).lines().last().unwrap()).unwrap();
+    assert_eq!(v["dryRun"]["files"], 0);
+    assert_eq!(error_lines(&out).len(), 1, "{out:?}");
+}
+
+#[test]
+fn cloud_import_json_real_run_of_a_bad_backup_prints_one_sentence() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let backup = account_and_empty_backup(d);
+    std::fs::write(backup.join("Note/a.note.part"), b"x").unwrap();
+    let out = cloud_sub(
+        d,
+        &[
+            "import",
+            backup.to_str().unwrap(),
+            "--account",
+            "jordi",
+            "--no-report",
+            "--json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(stdout(&out).trim(), "", "{out:?}");
+    assert_eq!(
+        error_lines(&out),
+        ["error: the backup cannot be imported completely"],
+        "{out:?}"
+    );
+}

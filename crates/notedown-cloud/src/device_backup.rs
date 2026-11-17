@@ -206,13 +206,32 @@ fn parse_date(date: &str, offset: UtcOffset) -> Option<SystemTime> {
     Some(at.into())
 }
 
+/// One thing that happened during [`backup`], for the caller to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupProgress<'a> {
+    /// A file was downloaded or kept (`resume`). `files` and `bytes` are the running totals of
+    /// the backup including this file; `path` is relative to the device root.
+    Downloaded {
+        files: u64,
+        bytes: u64,
+        path: &'a str,
+    },
+    /// An entry could not be copied (also in the report's `errors`).
+    Error { path: &'a str, message: &'a str },
+    /// A listing date did not parse (also in the report's `warnings`).
+    Warning { path: &'a str, message: &'a str },
+    /// The SD card was skipped.
+    SkippedSd { name: &'a str },
+    /// `resume`: a local file or folder (trailing `/`) the device no longer lists.
+    Stale { path: &'a str },
+}
+
 struct Run<'a> {
     client: reqwest::blocking::Client,
     base: String,
     options: BackupOptions,
     report: BackupReport,
-    progress: &'a mut dyn FnMut(&str),
-    downloaded: u64,
+    progress: &'a mut dyn FnMut(BackupProgress<'_>),
     /// The backup folder, for paths in warnings.
     root: PathBuf,
 }
@@ -225,7 +244,7 @@ pub fn backup(
     url: &str,
     dir: &Path,
     options: &BackupOptions,
-    progress: &mut dyn FnMut(&str),
+    progress: &mut dyn FnMut(BackupProgress<'_>),
 ) -> Result<BackupReport> {
     match std::fs::read_dir(dir) {
         Ok(mut entries) => {
@@ -271,7 +290,6 @@ pub fn backup(
             skipped_existing: 0,
         },
         progress,
-        downloaded: 0,
         root: dir.to_path_buf(),
     };
     // Written before the first download: a run that is killed leaves `complete: false`.
@@ -293,7 +311,10 @@ fn now_rfc3339() -> String {
 
 impl Run<'_> {
     fn error(&mut self, path: String, message: String) {
-        (self.progress)(&format!("error: {path}: {message}"));
+        (self.progress)(BackupProgress::Error {
+            path: &path,
+            message: &message,
+        });
         self.report.errors.push(BackupError { path, message });
     }
 
@@ -361,7 +382,7 @@ impl Run<'_> {
             }
             let sd_card = rel.is_empty() && is_sd_card(&entry);
             if sd_card && !self.options.include_sd {
-                (self.progress)(&format!("skipped {} (the SD card)", entry.name));
+                (self.progress)(BackupProgress::SkippedSd { name: &entry.name });
                 continue;
             }
             if rel.is_empty() && entry.name == BACKUP_FILE {
@@ -409,6 +430,11 @@ impl Run<'_> {
                         t.bytes += entry.size;
                         self.report.files += 1;
                         self.report.bytes += entry.size;
+                        (self.progress)(BackupProgress::Downloaded {
+                            files: self.report.files,
+                            bytes: self.report.bytes,
+                            path: &here.join("/"),
+                        });
                     }
                     Err(e) => self.error(path, e),
                 }
@@ -443,9 +469,7 @@ impl Run<'_> {
         let shown = rel.join("/");
         let is_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
         if !is_dir {
-            (self.progress)(&format!(
-                "stale: {shown}: the device no longer lists this file"
-            ));
+            (self.progress)(BackupProgress::Stale { path: &shown });
             self.report.stale.push(shown);
             return;
         }
@@ -465,10 +489,9 @@ impl Run<'_> {
             self.stale_entry(&path.join(&name), &here);
         }
         if self.report.stale.len() == before {
-            (self.progress)(&format!(
-                "stale: {shown}/: the device no longer lists this folder"
-            ));
-            self.report.stale.push(format!("{shown}/"));
+            let folder = format!("{shown}/");
+            (self.progress)(BackupProgress::Stale { path: &folder });
+            self.report.stale.push(folder);
         }
     }
 
@@ -514,7 +537,10 @@ impl Run<'_> {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| entry.name.clone());
             let message = format!("the date {:?} does not parse", entry.date);
-            (self.progress)(&format!("warning: {path}: {message}"));
+            (self.progress)(BackupProgress::Warning {
+                path: &path,
+                message: &message,
+            });
             self.report.date_warnings += 1;
             self.report.warnings.push(BackupError { path, message });
         }
@@ -541,13 +567,6 @@ impl Run<'_> {
                         let _ = std::fs::remove_file(&part);
                         format!("cannot rename the .part file: {e}")
                     })?;
-                    self.downloaded += 1;
-                    if self.downloaded.is_multiple_of(100) {
-                        (self.progress)(&format!(
-                            "downloaded {} files ({} bytes so far)",
-                            self.downloaded, self.report.bytes
-                        ));
-                    }
                     return Ok(false);
                 }
                 Ok(n) => {

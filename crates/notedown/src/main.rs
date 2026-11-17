@@ -400,6 +400,13 @@ struct BackupDeviceArgs {
     /// The device's offset from UTC for the file dates, like +02:00 (default: this computer's)
     #[arg(long, value_name = "+HH:MM", allow_hyphen_values = true)]
     utc_offset: Option<String>,
+    /// Print JSON lines on stdout: progress lines {"files","bytes","path"} and a last line
+    /// {"report": ...}
+    #[arg(long)]
+    json: bool,
+    /// Stop when the process with this id is no longer the parent (the Mac app passes its own)
+    #[arg(long, value_name = "PID", hide = true)]
+    exit_with_parent: Option<u32>,
 }
 
 #[derive(Subcommand)]
@@ -1517,6 +1524,20 @@ fn scan_command(args: ScanArgs) -> Result<ExitCode> {
     })
 }
 
+/// One progress line of `cloud backup-device --json`.
+fn backup_progress_json(files: u64, bytes: u64, path: &str) -> String {
+    // written by hand: the keys keep this order
+    let path = serde_json::Value::from(path);
+    format!(r#"{{"files":{files},"bytes":{bytes},"path":{path}}}"#)
+}
+
+/// The last line of `cloud backup-device --json`: the content of backup.json.
+fn backup_report_json(report: &notedown_cloud::device_backup::BackupReport) -> String {
+    // the report serializes in the field order of backup.json
+    let report = serde_json::to_string(report).expect("a report serializes");
+    format!(r#"{{"report":{report}}}"#)
+}
+
 fn backup_device_command(args: BackupDeviceArgs) -> Result<ExitCode> {
     use notedown_cloud::device_backup::{BackupOptions, backup};
     use notedown_cloud::localtime::{local_utc_offset, parse_utc_offset};
@@ -1533,9 +1554,68 @@ fn backup_device_command(args: BackupDeviceArgs) -> Result<ExitCode> {
         resume: args.resume,
         utc_offset,
     };
-    let report = backup(&args.url, &args.dir, &options, &mut |line| {
-        eprintln!("{line}")
+    // SIGTERM ends the run as it is; the .part files stay and --resume continues.
+    exit_with_parent(args.exit_with_parent);
+    let json = args.json;
+    let mut last = std::time::Instant::now() - Duration::from_secs(10);
+    // the newest progress not yet printed (json mode), printed at the end at the latest
+    let mut pending: Option<(u64, u64, String)> = None;
+    let printed = |files: u64, bytes: u64, path: &str| {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{}", backup_progress_json(files, bytes, path));
+        let _ = out.flush();
+    };
+    let report = backup(&args.url, &args.dir, &options, &mut |event| {
+        use notedown_cloud::device_backup::BackupProgress as P;
+        match event {
+            P::Downloaded { files, bytes, path } if json => {
+                if last.elapsed() >= Duration::from_millis(250) {
+                    last = std::time::Instant::now();
+                    pending = None;
+                    printed(files, bytes, path);
+                } else {
+                    pending = Some((files, bytes, path.to_string()));
+                }
+            }
+            P::Downloaded { files, bytes, .. } => {
+                if files % 100 == 0 {
+                    eprintln!("downloaded {files} files ({bytes} bytes so far)");
+                }
+            }
+            // json mode: the report has these, and stderr holds one error line at most
+            _ if json => {}
+            P::Error { path, message } => eprintln!("error: {path}: {message}"),
+            P::Warning { path, message } => eprintln!("warning: {path}: {message}"),
+            P::SkippedSd { name } => eprintln!("skipped {name} (the SD card)"),
+            P::Stale { path } if path.ends_with('/') => {
+                eprintln!("stale: {path}: the device no longer lists this folder")
+            }
+            P::Stale { path } => {
+                eprintln!("stale: {path}: the device no longer lists this file")
+            }
+        }
     })?;
+    if json {
+        if let Some((files, bytes, path)) = pending {
+            printed(files, bytes, &path);
+        }
+        println!("{}", backup_report_json(&report));
+        if !report.stale.is_empty() {
+            eprintln!(
+                "error: the device changed since the earlier run; make a fresh backup into a new folder"
+            );
+            return Ok(ExitCode::from(1));
+        }
+        if !report.errors.is_empty() {
+            eprintln!(
+                "error: {} could not be backed up",
+                plural(report.errors.len(), "file")
+            );
+            return Ok(ExitCode::from(1));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     for (folder, t) in &report.folders {
         println!(
             "{folder}: {}, {}",
@@ -2426,6 +2506,38 @@ mod tests {
 
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn backup_progress_json_has_files_bytes_and_path() {
+        assert_eq!(
+            super::backup_progress_json(3, 2048, "Note/a.note"),
+            r#"{"files":3,"bytes":2048,"path":"Note/a.note"}"#
+        );
+    }
+
+    #[test]
+    fn backup_report_json_wraps_the_report() {
+        let report = notedown_cloud::device_backup::BackupReport {
+            url: "http://d:8089".into(),
+            time: "2026-11-17T10:00:00Z".into(),
+            complete: true,
+            folders: Default::default(),
+            files: 0,
+            bytes: 0,
+            errors: Vec::new(),
+            date_warnings: 0,
+            warnings: Vec::new(),
+            stale: Vec::new(),
+            skipped_existing: 4,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&super::backup_report_json(&report)).unwrap();
+        assert_eq!(v.as_object().unwrap().len(), 1);
+        assert_eq!(v["report"]["url"], "http://d:8089");
+        assert_eq!(v["report"]["complete"], true);
+        assert_eq!(v["report"]["stale"], serde_json::json!([]));
+        assert!(v["report"].get("skipped_existing").is_none());
+    }
 
     #[test]
     fn wildcard_listen_expands_to_host_addresses() {

@@ -222,6 +222,14 @@ Read the [getting started guide](getting-started.md) before you switch a device.
 backup, the import, the first sync, daily use, the way back and troubleshooting. The protocol is
 documented in the [sync protocol](sync-protocol.md).
 
+### Device backup for apps
+
+`notedown cloud backup-device <url> <folder> --json` prints JSON lines on stdout instead of the
+text lines. A progress line is `{"files": <n>, "bytes": <n>, "path": "<last file>"}`: the running
+totals, at most every 250 ms, and one at the end. The last line is `{"report": {...}}` with the
+content of `backup.json`, also when the run ends with errors. Then the exit code is 1 and stderr
+holds one line `error: <sentence>`. The total is not known up front, so there is no percentage.
+
 ## Pipeline status
 
 `notedown pipeline status --data DIR [--account A]` prints the state of the OCR pipeline of one account

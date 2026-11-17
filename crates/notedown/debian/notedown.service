@@ -25,6 +25,8 @@ RestartSec=2
 
 NoNewPrivileges=yes
 ProtectSystem=strict
+# The service writes only below /var/lib/notedown. A render_dir in server.toml
+# outside it needs a ReadWritePaths= drop-in (sudo systemctl edit notedown).
 ReadWritePaths=/var/lib/notedown
 ProtectHome=yes
 PrivateTmp=yes

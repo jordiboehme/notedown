@@ -16,3 +16,6 @@
 #      ExecStart=/usr/bin/notedown serve --data <folder>);
 #   2. a ReadWritePaths=<folder> line in the same drop-in, because the service
 #      can write only below /var/lib/notedown.
+#
+# The same holds for a render_dir in server.toml outside /var/lib/notedown:
+# it needs a ReadWritePaths=<folder> line in a drop-in.

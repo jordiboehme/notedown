@@ -29,7 +29,6 @@ COPY dist/doc/ /usr/share/doc/notedown/
 # when --data is not given, so `docker exec <container> notedown cloud ...`
 # works on the same folder as the server.
 ENV NOTEDOWN_DATA=/data
-VOLUME /data
 # The default listen address in server.toml is 0.0.0.0:19072.
 EXPOSE 19072
 
@@ -46,6 +45,11 @@ USER nonroot
 # 65532 on the host.
 WORKDIR /data
 WORKDIR /
+
+# VOLUME comes after the WORKDIR lines: the legacy builder drops changes made
+# to a path after it is declared a volume, BuildKit keeps them. In this order
+# both builders ship /data owned by nonroot.
+VOLUME /data
 
 ENTRYPOINT ["/usr/local/bin/notedown"]
 CMD ["serve"]

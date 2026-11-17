@@ -17,9 +17,10 @@ copyright = "2026, Jordi Böhme <jordi@boehme-lopez.de>"
 license-file = "../../LICENSE"
 section = "utils"
 priority = "optional"
-# Static musl binary: no shared-library dependencies to detect, so this stays
-# empty rather than the "$auto" default.
-depends = ""
+# Static musl binary: no shared-library dependencies to detect, so no "$auto".
+# The postinst cargo-deb writes calls systemd-sysusers, which comes with systemd
+# or as the standalone systemd-sysusers package.
+depends = "systemd | systemd-sysusers"
 extended-description = """
 Notedown turns Supernote handwritten notes into Markdown. This Linux build \
 has the sync server your Supernote talks to and the other tools, without \
@@ -28,7 +29,9 @@ enabled or started."""
 # The units dir defaults to this folder. cargo-deb 3.8.0 installs from it:
 # notedown.service to usr/lib/systemd/system/, notedown.tmpfile to
 # usr/lib/tmpfiles.d/notedown.conf and notedown.sysusers to
-# usr/lib/sysusers.d/notedown.conf, and fills #DEBHELPER# in postinst.
+# usr/lib/sysusers.d/notedown.conf. There is no postinst here: cargo-deb
+# writes the maintainer scripts itself (systemd-sysusers, then
+# systemd-tmpfiles, then the unit lines).
 maintainer-scripts = "debian/"
 # dist/THIRD-PARTY-NOTICES.txt (workspace root) is the Linux notices file. The
 # release stages it there before cargo deb; the CI smoke writes a placeholder.

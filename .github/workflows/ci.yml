@@ -547,8 +547,12 @@ jobs:
             --deb-version "$version" --output "dist/notedown_${version}_amd64.deb"
           deb="dist/notedown_${version}_amd64.deb"
           dpkg-deb --info "$deb"
+          # cargo-deb writes the postinst (no debian/postinst): systemd-sysusers
+          # must be in it, and the upgrade try-restart exactly once (a doubled
+          # fragment block would restart a running server twice).
           echo "--- postinst"
-          dpkg-deb --info "$deb" postinst
+          postinst="$(dpkg-deb --info "$deb" postinst)"
+          echo "$postinst"
           echo "--- contents"
           contents="$(dpkg-deb --contents "$deb")"
           echo "$contents"
@@ -572,6 +576,15 @@ jobs:
             echo "::error::/etc/default/notedown is not a conffile"
             missing=1
           fi
+          if ! grep -q 'systemd-sysusers' <<<"$postinst"; then
+            echo "::error::the postinst does not call systemd-sysusers"
+            missing=1
+          fi
+          restarts="$(grep -c 'deb-systemd-invoke try-restart' <<<"$postinst" || true)"
+          if [ "$restarts" != 1 ]; then
+            echo "::error::the postinst has $restarts try-restart lines, want 1"
+            missing=1
+          fi
           got="$(dpkg-deb --field "$deb" Version)"
           if [ "$got" != "$version" ]; then
             echo "::error::the .deb has the version '$got', want '$version'"
@@ -579,7 +592,8 @@ jobs:
           fi
           exit "$missing"
 
-      # Depends is empty, so the install needs no package index.
+      # Depends is systemd, which the runner has, so the install needs no
+      # package index.
       - name: Install the .deb
         run: sudo apt-get install -y ./dist/notedown_*_amd64.deb
 
@@ -591,7 +605,14 @@ jobs:
           set -euo pipefail
           fail() { echo "::error::$1"; exit 1; }
 
-          systemd-analyze verify /usr/lib/systemd/system/notedown.service
+          # verify also prints warnings about the runner's own units (for
+          # example walinuxagent.service); those lines are not ours. Only a
+          # line that names notedown.service fails the step.
+          verify="$(systemd-analyze verify /usr/lib/systemd/system/notedown.service 2>&1 || true)"
+          echo "$verify"
+          if grep -q 'notedown\.service' <<<"$verify"; then
+            fail "systemd-analyze verify complains about notedown.service"
+          fi
 
           state="$(systemctl is-enabled notedown || true)"
           echo "is-enabled: $state"
@@ -601,11 +622,11 @@ jobs:
           [ "$state" != active ] || fail "the unit runs after the install"
 
           id notedown || fail "there is no notedown user"
-          home="$(getent passwd notedown | cut -d: -f6)"
+          home="$(getent passwd notedown | cut -d: -f6 || true)"
           [ "$home" = /var/lib/notedown ] || fail "the home of notedown is '$home'"
           test -f /usr/lib/sysusers.d/notedown.conf || fail "no /usr/lib/sysusers.d/notedown.conf"
           test -f /usr/lib/tmpfiles.d/notedown.conf || fail "no /usr/lib/tmpfiles.d/notedown.conf"
-          owner="$(stat -c %U:%a /var/lib/notedown)"
+          owner="$(stat -c %U:%a /var/lib/notedown || true)"
           [ "$owner" = notedown:750 ] || fail "/var/lib/notedown is $owner, want notedown:750"
 
           # sudo sets HOME to the target user's home, which is how the CLI

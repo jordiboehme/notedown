@@ -922,8 +922,6 @@ fn read_password(from_stdin: bool, confirm: bool) -> Result<String> {
     Ok(password)
 }
 
-/// Finish or drop unfinished changes of every account (a crash of the server or of an
-/// earlier command). Runs at the start of every cloud command.
 /// The data folder of a command: `--data`, else `$NOTEDOWN_DATA` when it is set and not empty,
 /// else `~/notedown-data`.
 fn resolve_data(
@@ -959,6 +957,8 @@ fn pin_data(slot: &mut Option<PathBuf>) -> Result<PathBuf> {
     Ok(data)
 }
 
+/// Finish or drop unfinished changes of every account (a crash of the server or of an
+/// earlier command). Runs at the start of every cloud command.
 fn recover_accounts(data: &Path) -> Result<()> {
     if !data.join("accounts").is_dir() {
         return Ok(());

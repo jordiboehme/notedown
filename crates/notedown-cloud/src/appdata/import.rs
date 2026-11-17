@@ -52,7 +52,8 @@ pub struct AppImportOptions {
 }
 
 /// What [`import_app_data`] did (or, for a dry run, would do).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppImportReport {
     pub digests: u64,
     pub groups: u64,
@@ -67,6 +68,7 @@ pub struct AppImportReport {
     /// Entries of the backup that were not imported (`.mark` files no imported digest names).
     pub skipped: Vec<String>,
     /// One line per digest: id, source path, first 40 characters of the content.
+    #[serde(skip)]
     pub mapping: Vec<String>,
     /// Digests and digest groups of the account soft-deleted by `replace`.
     pub replaced: u64,

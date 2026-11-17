@@ -231,6 +231,32 @@ line is `{"report": {...}}` with the content of `backup.json`, also when the run
 Then the exit code is 1 and stderr holds one line `error: <sentence>`. When the backup cannot start,
 only the error line comes. The total is not known up front, so there is no percentage.
 
+### Import for apps
+
+`notedown cloud import` and `notedown cloud import-app-data` take `--json` too. Every line is one
+JSON object on stdout with camelCase keys. When the exit code is 1, stderr holds exactly one line
+`error: <sentence>`. A scan error reads `error: the backup cannot be imported completely`.
+
+`cloud import --dry-run --json` prints one line:
+`{"dryRun": {"folders": [{"source", "target", "files", "folders", "bytes"}], "skipped": [{"path",
+"reason"}], "errors": ["..."], "filesPresent": <n>, "files": <n>, "bytes": <n>, "needsReplace":
+<bool>}}`. `reason` is the text the dry run prints. `needsReplace` is true when the account holds
+files and `--replace` is not given. The line comes first, then exit 1 when `errors` is not empty or
+the backup holds no files without `--allow-empty`.
+
+`cloud import --json` prints progress lines `{"phase": "recycling", "files": <n>}` (with
+`--replace`), `{"phase": "importing", "done": <n>, "total": <n>}` (every 100 files and once at the
+end) and `{"phase": "verifying"}`. The last line is
+`{"imported": {"files", "bytes", "foldersCreated", "replaced"}}`. A refused import prints only the
+error line.
+
+`cloud import-app-data [--dry-run|--empty] --json` prints one line:
+`{"appData": {"dryRun": <bool>, "digests", "groups", "marks", "leftToDevice": [...],
+"withoutGroup": [...], "skipped": [...], "replaced"}}`. `replaced` counts the cleared digest
+records. `--empty` gives zeros and empty lists.
+
+Both commands take a hidden `--exit-with-parent <pid>`, like `backup-device`.
+
 ## Pipeline status
 
 `notedown pipeline status --data DIR [--account A]` prints the state of the OCR pipeline of one account

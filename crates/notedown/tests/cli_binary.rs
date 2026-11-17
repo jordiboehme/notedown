@@ -3168,3 +3168,145 @@ fn cloud_backup_device_json_ends_with_the_report_and_one_error_line() {
     let errors = stderr.lines().filter(|l| l.starts_with("error: ")).count();
     assert_eq!(errors, 1, "{stderr}");
 }
+
+fn cloud_sub(data: &std::path::Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .arg("cloud")
+        .args(args)
+        .arg("--data")
+        .arg(data)
+        .output()
+        .unwrap()
+}
+
+fn error_lines(out: &std::process::Output) -> Vec<String> {
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|l| l.starts_with("error: "))
+        .map(String::from)
+        .collect()
+}
+
+#[test]
+fn cloud_import_json_dry_run_of_a_folder_that_is_not_a_backup_ends_with_the_line_and_one_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let out = cloud(
+        d,
+        &[
+            "add",
+            "jordi",
+            "--email",
+            "jordi@example.org",
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(out.status.success(), "{out:?}");
+    let backup = d.join("not-a-backup");
+    std::fs::create_dir_all(backup.join("Note")).unwrap();
+    std::fs::write(backup.join("Note/a.note.part"), b"x").unwrap();
+    let out = cloud_sub(
+        d,
+        &[
+            "import",
+            backup.to_str().unwrap(),
+            "--account",
+            "jordi",
+            "--dry-run",
+            "--json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let text = stdout(&out);
+    let last = text.lines().last().expect("a result line");
+    let v: serde_json::Value = serde_json::from_str(last).unwrap();
+    assert!(!v["dryRun"]["errors"].as_array().unwrap().is_empty(), "{v}");
+    assert_eq!(error_lines(&out).len(), 1, "{out:?}");
+}
+
+#[test]
+fn cloud_import_json_into_a_missing_account_prints_one_error_line_and_no_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let backup = d.join("b");
+    std::fs::create_dir_all(&backup).unwrap();
+    for extra in [&["--dry-run"][..], &[][..]] {
+        let mut args = vec![
+            "import",
+            backup.to_str().unwrap(),
+            "--account",
+            "nobody",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let out = cloud_sub(d, &args);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert_eq!(stdout(&out).trim(), "", "{out:?}");
+        assert_eq!(error_lines(&out).len(), 1, "{out:?}");
+    }
+    let out = cloud_sub(
+        d,
+        &[
+            "import-app-data",
+            "--empty",
+            "--account",
+            "nobody",
+            "--json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(error_lines(&out).len(), 1, "{out:?}");
+}
+
+#[test]
+fn cloud_import_app_data_empty_json_prints_zeros() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let out = cloud(
+        d,
+        &[
+            "add",
+            "jordi",
+            "--email",
+            "jordi@example.org",
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(out.status.success(), "{out:?}");
+    let backup = d.join("b");
+    for f in [
+        "Note",
+        "Document",
+        "MyStyle",
+        "EXPORT",
+        "SCREENSHOT",
+        "INBOX",
+    ] {
+        std::fs::create_dir_all(backup.join(f)).unwrap();
+    }
+    let out = cloud_sub(
+        d,
+        &[
+            "import",
+            backup.to_str().unwrap(),
+            "--account",
+            "jordi",
+            "--no-report",
+            "--allow-empty",
+            "--json",
+        ],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).lines().last().unwrap()).unwrap();
+    assert_eq!(v["imported"]["files"], 0);
+    let out = cloud_sub(
+        d,
+        &["import-app-data", "--empty", "--account", "jordi", "--json"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).lines().last().unwrap()).unwrap();
+    assert_eq!(v["appData"]["digests"], 0);
+    assert_eq!(v["appData"]["leftToDevice"], serde_json::json!([]));
+}

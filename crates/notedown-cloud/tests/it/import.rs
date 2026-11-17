@@ -15,7 +15,7 @@ use axum::http::{Request, StatusCode};
 use md5::{Digest, Md5};
 use notedown_cloud::auth::{Accounts, expected_login_hash, md5_hex};
 use notedown_cloud::device_backup::{self, BackupOptions, BackupProgress};
-use notedown_cloud::import::{self, ImportOptions, SkipReason};
+use notedown_cloud::import::{self, ImportOptions, ImportProgress, SkipReason};
 use notedown_cloud::journal::{Event, EventBody, Journal, Origin};
 use notedown_cloud::put::{self, PutOutcome};
 use notedown_cloud::server::{AppState, router};
@@ -122,7 +122,7 @@ fn data_with_account() -> tempfile::TempDir {
     dir
 }
 
-fn quiet() -> impl FnMut(&str) {
+fn quiet() -> impl FnMut(ImportProgress) {
     |_| {}
 }
 
@@ -242,6 +242,52 @@ fn scan_maps_the_device_folders_and_reports_every_skip() {
     .map(|(p, r)| (p.to_string(), r))
     .collect();
     assert_eq!(skips, want);
+}
+
+#[test]
+fn import_reports_progress_phases_and_ends_with_the_total() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (backup, files, _) = backup_tree(tmp.path());
+    let data = data_with_account();
+    let journal = Journal::open(data.path()).unwrap();
+    let mut events = Vec::new();
+    import::import(
+        data.path(),
+        "jordi",
+        &backup,
+        &ImportOptions::default(),
+        &journal,
+        &mut |p| events.push(p),
+    )
+    .unwrap();
+    let total = files.len() as u64;
+    // fewer files than PROGRESS_EVERY: one Imported at the end, then the verification
+    assert_eq!(
+        events,
+        [
+            ImportProgress::Imported { done: total, total },
+            ImportProgress::Verifying
+        ]
+    );
+    // a second run with --replace first moves the files to the recycle bin
+    let mut events = Vec::new();
+    import::import(
+        data.path(),
+        "jordi",
+        &backup,
+        &ImportOptions {
+            replace: true,
+            ..ImportOptions::default()
+        },
+        &journal,
+        &mut |p| events.push(p),
+    )
+    .unwrap();
+    assert_eq!(
+        events.first(),
+        Some(&ImportProgress::Recycling { files: total })
+    );
+    assert_eq!(events.len(), 3);
 }
 
 #[test]

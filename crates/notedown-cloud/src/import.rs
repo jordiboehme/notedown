@@ -503,6 +503,17 @@ pub struct ImportReport {
 /// How often [`import`] reports progress, in files.
 pub const PROGRESS_EVERY: u64 = 100;
 
+/// What [`import`] reports while it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportProgress {
+    /// `--replace`: the account's files are moved to the recycle bin.
+    Recycling { files: u64 },
+    /// Files copied so far, every [`PROGRESS_EVERY`] files and once at the end.
+    Imported { done: u64, total: u64 },
+    /// Every file is compared with the backup.
+    Verifying,
+}
+
 fn failed(message: String) -> Error {
     Error::Invalid {
         what: "import",
@@ -511,7 +522,7 @@ fn failed(message: String) -> Error {
 }
 
 /// Import the backup folder into the account (see the module docs). `progress` gets one line
-/// for people every [`PROGRESS_EVERY`] files and for each phase. Any problem returns an error
+/// an [`ImportProgress`] every [`PROGRESS_EVERY`] files and for each phase. Any problem returns an error
 /// and leaves the `imported` marker unset (so the protect gate stays closed).
 pub fn import(
     data: &Path,
@@ -519,7 +530,7 @@ pub fn import(
     backup: &Path,
     options: &ImportOptions,
     journal: &Journal,
-    progress: &mut dyn FnMut(&str),
+    progress: &mut dyn FnMut(ImportProgress),
 ) -> Result<ImportReport> {
     let accounts = Accounts::new(data);
     if accounts.get(slug)?.is_none() {
@@ -579,9 +590,7 @@ pub fn import(
     set_marker(&accounts, slug, None)?;
     let mut replaced = 0;
     if present > 0 {
-        progress(&format!(
-            "moving the {present} files of account {slug} to the recycle bin"
-        ));
+        progress(ImportProgress::Recycling { files: present });
         replaced = replace_all(&store, &guard, journal)?;
     }
 
@@ -613,7 +622,7 @@ pub fn import(
     let _ = std::fs::remove_dir_all(&staging);
     let (files, bytes) = copied?;
 
-    progress("verifying every file against the backup");
+    progress(ImportProgress::Verifying);
     verify(&store, &guard, &scan)?;
 
     let imported = Imported {
@@ -713,10 +722,11 @@ fn copy_items(
     scan: &Scan,
     staging: &Path,
     folders_created: &mut u64,
-    progress: &mut dyn FnMut(&str),
+    progress: &mut dyn FnMut(ImportProgress),
 ) -> Result<(u64, u64)> {
     let total = scan.files();
     let (mut files, mut bytes) = (0u64, 0u64);
+    let mut reported = None;
     for item in &scan.items {
         let fail = |e: Error| failed(format!("{}: {e}", item.target));
         match item.kind {
@@ -730,10 +740,14 @@ fn copy_items(
                 files += 1;
                 bytes += item.size;
                 if files % PROGRESS_EVERY == 0 {
-                    progress(&format!("imported {files} of {total} files"));
+                    progress(ImportProgress::Imported { done: files, total });
+                    reported = Some(files);
                 }
             }
         }
+    }
+    if reported != Some(files) {
+        progress(ImportProgress::Imported { done: files, total });
     }
     Ok((files, bytes))
 }

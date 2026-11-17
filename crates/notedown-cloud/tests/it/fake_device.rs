@@ -375,7 +375,7 @@ async fn a_whole_device_sync_runs_against_serve() {
         &source,
         &ImportOptions::default(),
         &journal,
-        &mut |_: &str| {},
+        &mut |_| {},
     )
     .unwrap();
     assert_eq!(report.files, 5);
@@ -560,7 +560,7 @@ async fn diagnose_runs_while_a_device_syncs() {
         &source,
         &ImportOptions::default(),
         &journal,
-        &mut |_: &str| {},
+        &mut |_| {},
     )
     .unwrap();
     drop(journal);

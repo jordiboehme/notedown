@@ -330,8 +330,8 @@ async fn account(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
         slug: a.slug,
         user_id: a.user_id,
         devices,
-        imported: a.imported.is_some(),
-        app_data_imported: a.app_data_imported.is_some(),
+        imported: Some(a.imported.is_some()),
+        app_data_imported: Some(a.app_data_imported.is_some()),
     })
     .into_response()
 }
@@ -346,8 +346,11 @@ async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     };
     let data = state.data_dir.clone();
     let slug = account.slug.clone();
+    let token_id = id.clone();
     match blocking(move || crate::auth::revoke_token(&data, &slug, &id)).await {
-        Ok(_) => Json(json!({"revoked": true})).into_response(),
+        Ok(true) => Json(json!({"revoked": true})).into_response(),
+        // A second logout that raced past `caller`: the token is gone already.
+        Ok(false) => refused(token_id),
         Err(r) => *r,
     }
 }

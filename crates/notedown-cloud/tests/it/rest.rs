@@ -696,7 +696,25 @@ fn logout_is_not_gated() {
     // Not imported, protect on: logout still works.
     let s = start();
     let token = writer(&s);
+    let (status, body) = s.get(Some(&token), "/tree");
+    assert_eq!((status, body), (423, json!({"error": "not_imported"})));
     assert_eq!(send_json(&s, &token, "POST", "/logout", None).0, 200);
+    // A scan holds the account: a file is gone from disk behind the store.
+    let s = start_imported();
+    let token = writer(&s);
+    let path = s.put("a.note", b"a");
+    std::fs::remove_file(s.data.join("accounts/jordi/files").join(&path)).unwrap();
+    let (status, body) = s.get(Some(&token), &format!("/tree?path={}", q("NOTE/Note")));
+    assert_eq!((status, body), (423, json!({"error": "scan_hold"})));
+    assert_eq!(send_json(&s, &token, "POST", "/logout", None).0, 200);
+}
+
+#[test]
+fn an_older_account_answer_reads_as_unknown() {
+    let a: read::ServerAccount =
+        serde_json::from_value(json!({"slug": "jordi", "userId": 5})).unwrap();
+    assert_eq!((a.imported, a.app_data_imported), (None, None));
+    assert!(a.devices.is_empty());
 }
 
 #[test]

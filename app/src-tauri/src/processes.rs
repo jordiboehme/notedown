@@ -54,6 +54,8 @@ pub struct Processes {
     serve_listeners: Arc<Mutex<Vec<ServeListener>>>,
     /// Serializes start, probe and stop, so a probe never undoes a stop.
     ops: Mutex<()>,
+    /// What the pipeline was last told to do; `None` before the first start and after a stop.
+    pipeline_launch: Mutex<Option<Launch>>,
     quitting: AtomicBool,
 }
 
@@ -110,6 +112,7 @@ impl Processes {
             serve_info,
             serve_listeners,
             ops: Mutex::new(()),
+            pipeline_launch: Mutex::new(None),
             quitting: AtomicBool::new(false),
         }
     }
@@ -178,6 +181,7 @@ impl Processes {
             }
         });
         let plan = process::plan(config, self.parent);
+        *lock(&self.pipeline_launch) = Some(plan.pipeline.clone());
         self.launch(&self.server, &plan.server, config);
         self.launch(&self.pipeline, &plan.pipeline, config);
     }
@@ -203,14 +207,38 @@ impl Processes {
             (&self.pipeline, &plan.pipeline),
         ] {
             if matches!(sup.state(), ChildState::Outside { .. }) {
+                if sup.kind() == ChildKind::Pipeline {
+                    *lock(&self.pipeline_launch) = Some(launch.clone());
+                }
                 self.launch(sup, launch, config);
             }
         }
     }
 
+    /// Starts the pipeline again when what it is to run changed (another Markdown folder, a log
+    /// in or a log out), with the config read inside the lock. The server runs on. Nothing
+    /// starts after a stop, before the first start or after Quit.
+    pub fn relaunch_pipeline_with(&self, read: impl FnOnce() -> AppConfig) {
+        let _ops = lock(&self.ops);
+        if self.quitting.load(Ordering::SeqCst) {
+            return;
+        }
+        let config = &read();
+        let launch = process::plan(config, self.parent).pipeline;
+        {
+            let mut last = lock(&self.pipeline_launch);
+            match &*last {
+                Some(before) if *before != launch => *last = Some(launch.clone()),
+                _ => return,
+            }
+        }
+        self.launch(&self.pipeline, &launch, config);
+    }
+
     /// Stops both children at once. They stay stopped until the next start.
     pub fn stop_all(&self) {
         let _ops = lock(&self.ops);
+        *lock(&self.pipeline_launch) = None;
         self.stop_both();
     }
 

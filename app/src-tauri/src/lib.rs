@@ -78,6 +78,8 @@ pub fn run() {
                 .macos_launcher(tauri_plugin_autostart::MacosLauncher::LaunchAgent)
                 .build(),
         )
+        // The folder picker of the Markdown folder; only the settings window may open it.
+        .plugin(tauri_plugin_dialog::init())
         .menu(tray::app_menu)
         .on_menu_event(|app, event| tray::on_menu_event(app, event.id().as_ref()))
         .on_window_event(windows::on_window_event)
@@ -199,7 +201,10 @@ pub fn run() {
             commands::note_open,
             commands::note_page_image,
             commands::note_close,
-            commands::note_page_drop
+            commands::note_page_drop,
+            commands::markdown_dir,
+            commands::set_markdown_dir,
+            commands::show_markdown_dir
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
@@ -560,7 +565,7 @@ mod tests {
         names.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    const SETTINGS_ONLY: [&str; 18] = [
+    const SETTINGS_ONLY: [&str; 21] = [
         "get_config",
         "set_mode",
         "set_start_view",
@@ -579,6 +584,9 @@ mod tests {
         "process_logs",
         "open_link",
         "process_states",
+        "markdown_dir",
+        "set_markdown_dir",
+        "show_markdown_dir",
     ];
 
     #[test]
@@ -663,10 +671,12 @@ mod tests {
             ])
         );
         // The settings follow events, name the window after the page and show the version.
+        // They alone open the folder picker of the Markdown folder.
         assert_eq!(
             core("settings"),
             set(&[
                 "core:app:allow-version",
+                "dialog:allow-open",
                 "core:event:allow-listen",
                 "core:event:allow-unlisten",
                 "core:window:allow-set-title",
@@ -697,7 +707,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 48);
+        assert_eq!(handler_commands().len(), 51);
     }
 
     #[test]
@@ -751,6 +761,9 @@ mod tests {
             "note_page_image",
             "note_close",
             "note_page_drop",
+            "markdown_dir",
+            "set_markdown_dir",
+            "show_markdown_dir",
         ]);
         assert_eq!(manifest_commands(), all);
         // Every granted command is a real one.

@@ -1,5 +1,6 @@
 //! The app config: a small JSON file in the app config dir.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -43,6 +44,9 @@ pub struct AppConfig {
     pub account: Option<String>,
     pub email: Option<String>,
     pub start_view: StartView,
+    /// The Markdown folder of each account, by its slug. An account without an entry uses
+    /// [`default_markdown_dir`].
+    pub markdown_dirs: BTreeMap<String, PathBuf>,
 }
 
 /// `~/notedown-data`, or `./notedown-data` when there is no home folder.
@@ -51,6 +55,34 @@ pub fn default_data_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_default()
         .join("notedown-data")
+}
+
+/// `~/Documents/Markdown`: the Markdown folder of an account without one of its own.
+pub fn default_markdown_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join("Documents")
+        .join("Markdown")
+}
+
+impl AppConfig {
+    /// The logged-in account's slug; `None` without one.
+    pub fn account_slug(&self) -> Option<&str> {
+        self.account.as_deref().filter(|a| !a.is_empty())
+    }
+
+    /// The Markdown folder of the logged-in account: its entry in `markdown_dirs`, else
+    /// [`default_markdown_dir`]. `None` without an account.
+    pub fn markdown_dir(&self) -> Option<PathBuf> {
+        let slug = self.account_slug()?;
+        Some(
+            self.markdown_dirs
+                .get(slug)
+                .cloned()
+                .unwrap_or_else(default_markdown_dir),
+        )
+    }
 }
 
 impl Default for AppConfig {
@@ -63,6 +95,7 @@ impl Default for AppConfig {
             account: None,
             email: None,
             start_view: StartView::Tree,
+            markdown_dirs: BTreeMap::new(),
         }
     }
 }
@@ -203,7 +236,39 @@ mod tests {
             account: Some("jordi".into()),
             email: Some("jordi@example.org".into()),
             start_view: StartView::Columns,
+            markdown_dirs: [("jordi".to_owned(), PathBuf::from("/notes/md"))].into(),
         }
+    }
+
+    #[test]
+    fn an_account_without_an_entry_writes_to_documents_markdown() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let mut config = AppConfig {
+            account: Some("jordi".into()),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            default_markdown_dir(),
+            home.join("Documents").join("Markdown")
+        );
+        assert_eq!(
+            config.markdown_dir(),
+            Some(home.join("Documents").join("Markdown"))
+        );
+        // An entry of another account changes nothing for this one.
+        config
+            .markdown_dirs
+            .insert("other".into(), PathBuf::from("/elsewhere"));
+        assert_eq!(config.markdown_dir(), Some(default_markdown_dir()));
+        config
+            .markdown_dirs
+            .insert("jordi".into(), PathBuf::from("/notes/md"));
+        assert_eq!(config.markdown_dir(), Some(PathBuf::from("/notes/md")));
+        // No account, no folder.
+        config.account = None;
+        assert_eq!(config.markdown_dir(), None);
+        config.account = Some(String::new());
+        assert_eq!(config.markdown_dir(), None);
     }
 
     #[test]

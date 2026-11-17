@@ -56,6 +56,18 @@ pub fn child_args(kind: ChildKind, data_dir: &Path, parent: u32) -> Vec<String> 
     ]
 }
 
+/// The pipeline's arguments: [`child_args`], and with a logged-in account
+/// `--markdown-dir <slug>=<dir>`, its Markdown folder ([`AppConfig::markdown_dir`]). The flag
+/// wins over `markdown_dirs` of the pipeline's own config for that account.
+fn pipeline_args(config: &AppConfig, parent: u32) -> Vec<String> {
+    let mut args = child_args(ChildKind::Pipeline, &config.data_dir, parent);
+    if let (Some(slug), Some(dir)) = (config.account_slug(), config.markdown_dir()) {
+        args.push("--markdown-dir".to_string());
+        args.push(format!("{slug}={}", dir.display()));
+    }
+    args
+}
+
 /// What a supervisor is to do with the config as it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Launch {
@@ -75,7 +87,9 @@ pub struct Plan {
 }
 
 /// Local mode runs both children; Remote mode runs the pipeline only, and only when
-/// `<data>/pipeline.toml` exists; no mode runs nothing. `parent` is the app's pid.
+/// `<data>/pipeline.toml` exists; no mode runs nothing. `parent` is the app's pid. In both
+/// modes the pipeline is a child of its own (never `serve --pipeline`), so it alone gets the
+/// Markdown folder.
 pub fn plan(config: &AppConfig, parent: u32) -> Plan {
     let data = &config.data_dir;
     match config.mode {
@@ -85,12 +99,12 @@ pub fn plan(config: &AppConfig, parent: u32) -> Plan {
         },
         Mode::Local => Plan {
             server: Launch::Start(child_args(ChildKind::Server, data, parent)),
-            pipeline: Launch::Start(child_args(ChildKind::Pipeline, data, parent)),
+            pipeline: Launch::Start(pipeline_args(config, parent)),
         },
         Mode::Remote => Plan {
             server: Launch::Off,
             pipeline: if config::existing_setup(data).pipeline {
-                Launch::Start(child_args(ChildKind::Pipeline, data, parent))
+                Launch::Start(pipeline_args(config, parent))
             } else {
                 Launch::NotConnected
             },
@@ -248,6 +262,44 @@ mod tests {
         assert_eq!(
             with.pipeline,
             Launch::Start(args("pipeline", dir.path(), 7))
+        );
+    }
+
+    #[test]
+    fn the_pipeline_gets_the_markdown_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pipeline.toml"), "").unwrap();
+        let flag = |dir: &str| vec!["--markdown-dir".to_string(), format!("jordi={dir}")];
+        let with_flag = |mode: Mode, dirs: &[(&str, &str)], want: &str| {
+            let config = AppConfig {
+                account: Some("jordi".into()),
+                markdown_dirs: dirs
+                    .iter()
+                    .map(|(s, d)| ((*s).to_owned(), PathBuf::from(d)))
+                    .collect(),
+                ..config(mode, dir.path())
+            };
+            let plan = plan(&config, 9);
+            let mut pipeline = args("pipeline", dir.path(), 9);
+            pipeline.extend(flag(want));
+            assert_eq!(plan.pipeline, Launch::Start(pipeline), "{mode:?}");
+            // The server never gets it.
+            if let Launch::Start(server) = plan.server {
+                assert!(!server.iter().any(|a| a == "--markdown-dir"));
+            }
+        };
+        let default = config::default_markdown_dir().display().to_string();
+        // Both modes run the pipeline as a child of its own.
+        for mode in [Mode::Local, Mode::Remote] {
+            with_flag(mode, &[], &default);
+            with_flag(mode, &[("other", "/x")], &default);
+            with_flag(mode, &[("jordi", "/notes/md")], "/notes/md");
+        }
+        // Without an account the pipeline gets no folder.
+        let plan = plan(&config(Mode::Local, dir.path()), 9);
+        assert_eq!(
+            plan.pipeline,
+            Launch::Start(args("pipeline", dir.path(), 9))
         );
     }
 

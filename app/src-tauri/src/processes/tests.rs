@@ -420,3 +420,48 @@ fn a_start_reads_the_config_inside_its_lock() {
     );
     p.stop_all();
 }
+
+#[test]
+fn changing_the_markdown_folder_restarts_the_pipeline() {
+    let rig = Rig::new();
+    rig.listen_on(free_port());
+    // The pipeline says what it got, then waits.
+    std::fs::write(
+        rig.dir.path().join("pipeline.sh"),
+        "echo \"got: $*\"\nexec /bin/sleep 320",
+    )
+    .unwrap();
+    let p = rig.processes(Path::new("/bin/sleep"));
+    let with = |dir: &str| AppConfig {
+        account: Some("jordi".into()),
+        markdown_dirs: [("jordi".to_owned(), PathBuf::from(dir))].into(),
+        ..rig.config()
+    };
+    let said = |dir: &str| {
+        let want = format!("--markdown-dir jordi={dir}");
+        let p = &p;
+        wait_until(move || p.pipeline().log().iter().any(|l| l.contains(&want)))
+    };
+    p.start_all(&with("/a"));
+    let server = running_pid(p.server());
+    let first = running_pid(p.pipeline());
+    assert!(said("/a"), "{:?}", p.pipeline().log());
+
+    // The same arguments start nothing again.
+    p.relaunch_pipeline_with(|| with("/a"));
+    assert_eq!(running_pid(p.pipeline()), first);
+
+    // Another folder: the pipeline starts again with it; the server runs on.
+    p.relaunch_pipeline_with(|| with("/b"));
+    assert!(said("/b"), "{:?}", p.pipeline().log());
+    let second = running_pid(p.pipeline());
+    assert_ne!(second, first);
+    assert!(!alive(first), "the old pipeline still runs");
+    assert_eq!(running_pid(p.server()), server);
+
+    // After Stop, a new folder starts nothing.
+    p.stop_all();
+    p.relaunch_pipeline_with(|| with("/c"));
+    assert_eq!(p.pipeline().state(), ChildState::Stopped);
+    assert_eq!(p.server().state(), ChildState::Stopped);
+}

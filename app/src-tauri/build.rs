@@ -53,6 +53,9 @@ const COMMANDS: &[&str] = &[
     "note_page_image",
     "note_close",
     "note_page_drop",
+    "markdown_dir",
+    "set_markdown_dir",
+    "show_markdown_dir",
 ];
 
 fn main() {

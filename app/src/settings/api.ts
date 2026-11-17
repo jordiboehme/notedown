@@ -13,6 +13,8 @@ export interface AppConfig {
   account: string | null;
   email: string | null;
   startView: StartView;
+  /** The Markdown folder of each account, by its slug. */
+  markdownDirs: Record<string, string>;
 }
 
 export interface Progress {
@@ -62,6 +64,12 @@ export const modelState = () => invoke<ModelState>("model_state");
 export const modelPull = () => invoke("model_pull");
 export const modelPause = () => invoke<ModelState>("model_pause");
 export const modelRemove = () => invoke<ModelState>("model_remove");
+/** The Markdown folder of the logged-in account; null without an account. */
+export const markdownDir = () => invoke<string | null>("markdown_dir");
+/** Saves the Markdown folder of the logged-in account; the pipeline starts again with it. */
+export const setMarkdownDir = (dir: string) => invoke<string | null>("set_markdown_dir", { dir });
+/** Opens the Markdown folder in the Finder (it is made first when it is not there yet). */
+export const showMarkdownDir = () => invoke("show_markdown_dir");
 
 /** The text of a failed command: Rust sends a string. */
 export function failure(error: unknown): string {

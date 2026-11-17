@@ -197,6 +197,26 @@ impl ConfigState {
         self.update(|c| c.start_view = view)
     }
 
+    /// Sets the Markdown folder of the logged-in account. The folder must be a full path (a
+    /// leading `~` is the home folder) outside the data folder: the pipeline refuses a folder
+    /// inside it (it compares the paths as written, with `.` and `..` resolved, as here).
+    pub fn set_markdown_dir(&self, dir: PathBuf) -> Result<AppConfig, String> {
+        let dir = without_dots(&expand_home(&dir)?);
+        self.try_update(|c| {
+            let slug = c.account_slug().ok_or(NEEDS_ACCOUNT)?.to_owned();
+            if dir.starts_with(without_dots(&c.data_dir)) {
+                return Err(OUTSIDE_DATA);
+            }
+            c.markdown_dirs.insert(slug, dir);
+            Ok(())
+        })
+        .map(|(_, next)| next)
+        .map_err(|e| match e {
+            TryUpdateError::Refused(text) => text.to_owned(),
+            TryUpdateError::NotSaved(why) => why,
+        })
+    }
+
     /// Forgets the account and the e-mail (Log out).
     pub fn forget_login(&self) -> Result<AppConfig, String> {
         self.update(|c| {
@@ -205,6 +225,11 @@ impl ConfigState {
         })
     }
 }
+
+/// What the Markdown folder refuses without an account.
+pub const NEEDS_ACCOUNT: &str = "Log in to choose the Markdown folder.";
+/// What the Markdown folder refuses inside the data folder: the pipeline would refuse it too.
+pub const OUTSIDE_DATA: &str = "Choose a folder outside the Notedown data folder.";
 
 /// What Set refuses for Another machine without a web address.
 pub const NEEDS_ADDRESS: &str =
@@ -294,6 +319,22 @@ pub fn log_in_to(
     let answer = login::log_in(gate, state, serve_info, store, email, password)?;
     library.relogin();
     Ok(answer)
+}
+
+/// An absolute path with `.` and `..` resolved as written, without asking the disk (as the
+/// pipeline's own check does).
+fn without_dots(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 pub fn allowed_link(url: &str) -> bool {
@@ -524,8 +565,20 @@ pub async fn log_in(
     })
     .await
     .map_err(|e| e.to_string())??;
+    relaunch_pipeline(config.inner(), processes.inner()).await;
     poller.poll_now();
     Ok(saved)
+}
+
+/// Starts the pipeline again when its arguments changed with the account (its Markdown
+/// folder belongs to the account), off the main thread.
+async fn relaunch_pipeline(config: &ConfigState, processes: &Arc<Processes>) {
+    let reader = config.reader();
+    let processes = processes.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        processes.relaunch_pipeline_with(|| reader.current());
+    })
+    .await;
 }
 
 /// Whether the Keychain keeps a login for the account in the config, off the main thread.
@@ -542,6 +595,7 @@ pub async fn has_login(config: State<'_, ConfigState>) -> Result<bool, String> {
 #[tauri::command]
 pub async fn log_out(
     config: State<'_, ConfigState>,
+    processes: State<'_, Arc<Processes>>,
     poller: State<'_, Poller>,
     gate: State<'_, Arc<LoginGate>>,
     library: State<'_, Library>,
@@ -554,8 +608,64 @@ pub async fn log_out(
     })
     .await
     .map_err(|e| e.to_string())??;
+    relaunch_pipeline(config.inner(), processes.inner()).await;
     poller.poll_now();
     Ok(after)
+}
+
+/// The Markdown folder of the logged-in account (the OCR page); `null` without an account.
+#[tauri::command]
+pub fn markdown_dir(config: State<'_, ConfigState>) -> Option<String> {
+    config
+        .current()
+        .markdown_dir()
+        .map(|dir| dir.display().to_string())
+}
+
+/// Sets the Markdown folder of the logged-in account (Choose... on the OCR page) and answers
+/// it. When the pipeline's arguments changed, the pipeline starts again with them, off the main
+/// thread; the server runs on.
+#[tauri::command]
+pub async fn set_markdown_dir(
+    config: State<'_, ConfigState>,
+    processes: State<'_, Arc<Processes>>,
+    dir: PathBuf,
+) -> Result<Option<String>, String> {
+    let state = config.inner().clone();
+    let processes = processes.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let saved = state.set_markdown_dir(dir)?;
+        let reader = state.reader();
+        processes.relaunch_pipeline_with(|| reader.current());
+        Ok(saved.markdown_dir().map(|dir| dir.display().to_string()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Show in Finder for the Markdown folder: makes it when it is not there yet (the pipeline
+/// makes it too, with its first note), then `/usr/bin/open -- <dir>`.
+fn finder_command(dir: &Path) -> Result<std::process::Command, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("The folder could not be made: {e}"))?;
+    let mut command = std::process::Command::new("/usr/bin/open");
+    command.arg("--").arg(dir);
+    Ok(command)
+}
+
+/// Opens the Markdown folder of the logged-in account in the Finder, off the main thread.
+#[tauri::command]
+pub async fn show_markdown_dir(config: State<'_, ConfigState>) -> Result<(), String> {
+    let dir = config.current().markdown_dir().ok_or(NEEDS_ACCOUNT)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let status = finder_command(&dir)?.status().map_err(|e| e.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("The Finder did not open.".to_owned())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// The state of the library, its text and its Settings page, for the library window when it
@@ -1076,6 +1186,89 @@ mod tests {
         assert!(!reader.was_reset());
         assert_eq!(reader.current().start_view, StartView::Columns);
         assert!(!ConfigState::load(dir.path().to_owned()).was_reset());
+    }
+
+    #[test]
+    fn the_markdown_folder_is_saved_for_the_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        state
+            .set_mode(Mode::Local, Some("/data/notes".into()), None)
+            .unwrap();
+        // It belongs to the account: none, no folder.
+        assert_eq!(
+            state.set_markdown_dir("/md".into()).unwrap_err(),
+            NEEDS_ACCOUNT
+        );
+        state
+            .try_update(|c| {
+                c.account = Some("jordi".into());
+                Ok::<(), ()>(())
+            })
+            .ok()
+            .unwrap();
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let cfg = state.set_markdown_dir("~/Notes/md/".into()).unwrap();
+        assert_eq!(cfg.markdown_dir(), Some(home.join("Notes/md")));
+        let cfg = state.set_markdown_dir("/data/notes/../md".into()).unwrap();
+        assert_eq!(cfg.markdown_dirs["jordi"], PathBuf::from("/data/md"));
+        assert_eq!(
+            config::load(dir.path()).markdown_dir(),
+            Some(PathBuf::from("/data/md"))
+        );
+        // A folder next to the data folder with a longer name is outside it.
+        state.set_markdown_dir("/data/notes-md".into()).unwrap();
+    }
+
+    #[test]
+    fn show_in_finder_makes_the_markdown_folder_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("Documents").join("Markdown");
+        let command = finder_command(&folder).unwrap();
+        assert!(folder.is_dir(), "the folder was not made");
+        assert_eq!(command.get_program(), "/usr/bin/open");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, [std::ffi::OsStr::new("--"), folder.as_os_str()]);
+        // A folder that is there already is fine.
+        finder_command(&folder).unwrap();
+        // A file in the way is an error, said plainly.
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        let err = finder_command(&file.join("md")).unwrap_err();
+        assert!(err.starts_with("The folder could not be made:"), "{err}");
+    }
+
+    #[test]
+    fn a_markdown_folder_inside_the_data_folder_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        state
+            .set_mode(Mode::Local, Some("/data/notes".into()), None)
+            .unwrap();
+        state
+            .try_update(|c| {
+                c.account = Some("jordi".into());
+                Ok::<(), ()>(())
+            })
+            .ok()
+            .unwrap();
+        for inside in [
+            "/data/notes",
+            "/data/notes/",
+            "/data/notes/md",
+            "/data/./notes/x/../md",
+        ] {
+            assert_eq!(
+                state.set_markdown_dir(inside.into()).unwrap_err(),
+                OUTSIDE_DATA,
+                "{inside}"
+            );
+        }
+        assert_eq!(
+            state.set_markdown_dir("md".into()).unwrap_err(),
+            NEEDS_FULL_PATH
+        );
+        assert!(state.current().markdown_dirs.is_empty());
     }
 
     #[test]

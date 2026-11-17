@@ -834,6 +834,7 @@ fn the_sync_state_is_the_check_of_the_login() {
         key: "local|me".into(),
         seq: 4,
         at_ms: 1,
+        sync_at_mark: None,
     });
     config.setup.sync_checked = Some(SyncCheck {
         files: 2,

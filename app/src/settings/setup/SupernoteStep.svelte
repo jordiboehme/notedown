@@ -71,9 +71,10 @@
 />
 <Row title="Log in" note="Log in with the e-mail and the password from step 2." />
 <Row title="Folders" note="Select the folders Note, Document, MyStyle, EXPORT, SCREENSHOT and INBOX." />
+<!-- The Supernote page (check off) leaves the first-sync rows out: they hold only in setup. -->
 {#if check && done}
   <Row title="Auto Sync" note="Turn Auto Sync on, on the Supernote." />
-{:else}
+{:else if check}
   <Row title="Auto Sync" note="Leave Auto Sync off for now." />
   <Row title="Sync" note="Sync once by hand." />
 {/if}

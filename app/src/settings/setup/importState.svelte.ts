@@ -127,7 +127,6 @@ async function ended(end: Ended): Promise<void> {
   flow.last = end;
   switch (end.kind) {
     case "backup":
-      if (end.ok && flow.backup !== null) flow.backup.madeThisRun = true;
       await readBackup();
       if (end.ok) await check();
       break;
@@ -170,11 +169,18 @@ export async function makeBackup(url: string, dir: string): Promise<void> {
     flow.error = failure(error);
     return;
   }
-  flow.backup = { dir, state: { state: "empty" }, madeThisRun: false };
+  // This run's backup from its start: a pause or an error keeps it this run's (Resume).
+  flow.backup = { dir, state: { state: "empty" }, madeThisRun: true };
   flow.dryRun = null;
   flow.last = null;
+  // A Replace ticked for an earlier backup does not carry over.
+  flow.replace = false;
   await run("backup", () => backupStart(url, dir, false));
-  if (flow.error !== null) await readBackup(dir);
+  if (flow.error !== null) {
+    // Refused: what the folder holds is not this run's (an earlier backup there).
+    flow.backup = null;
+    await readBackup(dir);
+  }
 }
 
 /** Continues the backup that did not finish, into the same folder. */
@@ -200,6 +206,7 @@ export async function pauseBackup(): Promise<void> {
 /** Forgets the backup of this run: the next one goes into a new folder, which this finds. */
 export async function newBackup(today: Date): Promise<string> {
   flow.backup = null;
+  flow.replace = false;
   flow.dryRun = null;
   flow.last = null;
   flow.error = null;
@@ -215,10 +222,10 @@ export async function newBackup(today: Date): Promise<string> {
   return newBackupDir(today, 20);
 }
 
-/** The dry run of the files import. */
+/** The dry run of the files import, always without Replace: then it says whether the server
+ * holds files (needsReplace), and the review shows what Replace would move. */
 export async function check(): Promise<void> {
-  const replace = flow.replace || flow.again;
-  await run("importDryRun", () => importDryRun(replace, false));
+  await run("importDryRun", () => importDryRun(false, false));
 }
 
 /** The files import; `allowEmpty` for a Supernote without files. */

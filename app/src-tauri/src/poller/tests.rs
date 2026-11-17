@@ -863,6 +863,7 @@ fn the_poller_takes_the_mark_of_an_import_on_another_machine() {
             key: key.clone(),
             seq: 813,
             at_ms: T0 + 60 * SEC,
+            sync_at_mark: None,
         }]
     );
     assert_eq!(
@@ -874,6 +875,7 @@ fn the_poller_takes_the_mark_of_an_import_on_another_machine() {
         key,
         seq: 813,
         at_ms: T0,
+        sync_at_mark: None,
     });
     rig.poller.poll_now();
     rig.settle();
@@ -948,6 +950,7 @@ fn the_first_sync_is_checked_once() {
         key: "local|me".into(),
         seq: 10,
         at_ms: T0,
+        sync_at_mark: Some(T0),
     });
     // The app saves the check into the config, as lib.rs does.
     let saved: Arc<Mutex<Vec<(String, SyncCheck)>>> = Arc::default();
@@ -1019,6 +1022,7 @@ fn a_mark_of_another_login_is_not_checked() {
         key: "local|anna".into(),
         seq: 10,
         at_ms: T0,
+        sync_at_mark: None,
     });
     rig.poller.on_sync_checked(|_, _| {});
     *lock(&rig.fake.check_answer) = Some(Ok(SyncCheck::default()));
@@ -1026,4 +1030,49 @@ fn a_mark_of_another_login_is_not_checked() {
     rig.poller.poll_now();
     rig.settle();
     assert!(lock(&rig.fake.check_calls).is_empty());
+}
+
+#[test]
+fn the_first_sync_is_found_by_server_times_only() {
+    use crate::config::SyncMark;
+    let url = "https://n.example.org";
+    let key = format!("{url}|me");
+    let rig = Rig::new(AppConfig {
+        mode: Mode::Remote,
+        server_url: Some(url.into()),
+        account: Some("me".into()),
+        ..AppConfig::default()
+    });
+    rig.tokens.set(&key, &Token::new("t")).unwrap();
+    // The mark keeps the newest device sync the server reported when it was taken.
+    let marks: Arc<Mutex<Vec<SyncMark>>> = Arc::default();
+    let (seen, inputs) = (marks.clone(), rig.inputs.clone());
+    rig.poller.on_sync_mark(move |mark| {
+        lock(&seen).push(mark.clone());
+        lock(&inputs).config.setup.sync_mark = Some(mark);
+    });
+    let checks: Arc<Mutex<Vec<SyncCheck>>> = Arc::default();
+    let keep = checks.clone();
+    rig.poller
+        .on_sync_checked(move |_, check| lock(&keep).push(check));
+    *lock(&rig.fake.events_answer) = Some(Ok(50));
+    *lock(&rig.fake.check_answer) = Some(Ok(SyncCheck::default()));
+    // The server's clock is far behind the Mac's: its times are all before `at_ms`.
+    let server = T0 - 3_600 * SEC;
+    *lock(&rig.fake.account_answer) = Some(synced(Some(server)));
+    rig.poller.poll_now();
+    rig.settle();
+    assert_eq!(lock(&marks).len(), 1);
+    assert_eq!(lock(&marks)[0].sync_at_mark, Some(server));
+    // The same sync again is no first sync.
+    rig.advance(120 * SEC);
+    rig.poller.poll_now();
+    rig.settle();
+    assert!(lock(&rig.fake.check_calls).is_empty());
+    // A later sync by the server's clock is, though it is before the Mac's `at_ms`.
+    *lock(&rig.fake.account_answer) = Some(synced(Some(server + SEC)));
+    rig.poller.poll_now();
+    rig.settle();
+    assert_eq!(*lock(&rig.fake.check_calls), vec![(Mode::Remote, 50)]);
+    assert_eq!(lock(&checks).len(), 1);
 }

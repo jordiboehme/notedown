@@ -10,6 +10,7 @@ import {
   importFailure,
   importPanel,
   importProgressText,
+  importRefusal,
   importStage,
   importStatusText,
   importAgainOffered,
@@ -141,6 +142,32 @@ describe("importStage", () => {
     expect(importFailure(done).text).toBe("The import did not finish: the disk is full");
   });
 
+  it("a failed import of a backup now older than 24 hours goes to tooOld", () => {
+    const last = { kind: "import" as const, ok: false, json: null, text: "the import was stopped" };
+    expect(importStage(flow({ last, nowMs: BACKUP.getTime() + 25 * HOUR }))).toBe("tooOld");
+    // Or one older than a device sync since.
+    expect(importStage(flow({ last, lastSyncMs: BACKUP.getTime() + HOUR }))).toBe("tooOld");
+  });
+
+  it("a failed app data import of a .snbak now older than 24 hours goes back to the snbak choice", () => {
+    const account = { imported: true, appDataImported: false };
+    const appData = { dryRun: true, digests: 4, groups: 1, marks: 2, leftToDevice: [], withoutGroup: [], skipped: [], replaced: 0 };
+    const last = { kind: "appData" as const, ok: false, json: null, text: "x" };
+    const snbak = { timeMs: NOW - 25 * HOUR, chosenThisRun: true };
+    expect(importStage(flow({ account, snbak, appData, last }))).toBe("snbak");
+  });
+
+  it("import again without a known last sync refuses the import", () => {
+    const account = { imported: true, appDataImported: true };
+    const made = { state: { state: "complete" as const, time: iso(new Date(NOW - HOUR)) }, madeThisRun: true };
+    expect(importRefusal(flow({ again: true, account, lastSyncMs: null, backup: made }))).toBe(
+      "Notedown cannot see the last sync of the Supernote. Wait until the server answers.",
+    );
+    expect(importRefusal(flow({ again: true, account, lastSyncMs: NOW - 2 * HOUR, backup: made }))).toBeNull();
+    // The first import: no device synced yet, nothing to wait for.
+    expect(importRefusal(flow({ lastSyncMs: null }))).toBeNull();
+  });
+
   it("the app data review comes after the files import", () => {
     const account = { imported: true, appDataImported: false };
     expect(importStage(flow({ account }))).toBe("snbak");
@@ -224,6 +251,18 @@ describe("the review", () => {
     ]);
     const yesterday = reviewLines(dryRun(), new Date(2026, 10, 16, 21, 40).getTime(), NOW);
     expect(yesterday[0]).toBe("Backup made yesterday at 21:40.");
+  });
+
+  it("import again says what Replace moves, from the files on the server", () => {
+    // The dry run runs without --replace, so needsReplace tells the server's files; in Import
+    // again Replace is always on and the note keys on filesPresent.
+    const run = dryRun({ filesPresent: 7, needsReplace: false });
+    expect(reviewLines(run, BACKUP.getTime(), NOW, true)).toContain(
+      "The server already holds 7 files. Replace moves them to the recycle bin first.",
+    );
+    expect(reviewLines(run, BACKUP.getTime(), NOW)).not.toContain(
+      "The server already holds 7 files. Replace moves them to the recycle bin first.",
+    );
   });
 
   it("an empty supernote offers the empty choice", () => {

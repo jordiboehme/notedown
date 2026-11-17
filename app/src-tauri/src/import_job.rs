@@ -341,10 +341,143 @@ pub fn take_journal_mark(state: &ConfigState) -> Result<bool, String> {
     let Some(seq) = journal_end(&config.data_dir) else {
         return Ok(false);
     };
-    let at_ms = std::time::SystemTime::now()
+    let sync_at_mark = config
+        .account_slug()
+        .and_then(|slug| newest_device_sync(&config.data_dir, slug));
+    state.set_sync_mark(SyncMark {
+        key,
+        seq,
+        at_ms: now_ms(),
+        sync_at_mark,
+    })
+}
+
+/// The wall clock in milliseconds since 1970.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-    state.set_sync_mark(SyncMark { key, seq, at_ms })
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// The `last_sync_ms` of a device file, as far as the mark reads it.
+#[derive(Deserialize)]
+struct DeviceFile {
+    #[serde(default)]
+    last_sync_ms: Option<u64>,
+}
+
+/// The newest `last_sync_ms` (the server's clock) of the devices of the account `slug` in
+/// `<data>/accounts/<slug>/devices/*.json`; `None` when none synced. A file that cannot be read
+/// is left out.
+pub fn newest_device_sync(data_dir: &Path, slug: &str) -> Option<u64> {
+    let dir = data_dir.join("accounts").join(slug).join("devices");
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter_map(|p| std::fs::read(p).ok())
+        .filter_map(|text| serde_json::from_slice::<DeviceFile>(&text).ok())
+        .filter_map(|d| d.last_sync_ms)
+        .max()
+}
+
+/// What the import refuses for a backup older than 24 hours or not newer than the last sync.
+pub const BACKUP_TOO_OLD: &str = "This backup is too old. Make a new backup.";
+/// What the app data import refuses for a `.snbak` file older than 24 hours.
+pub const SNBAK_TOO_OLD: &str = "This .snbak file is too old. Make a new one on the Supernote.";
+/// How old a backup or a `.snbak` file may be.
+const FRESH_MS: u64 = 24 * 3_600_000;
+
+/// The import's own guard (the Setup page checks this as well): the backup in `dir` was made
+/// within 24 hours of `now_ms` and after the newest device sync `last_sync_ms` (a file missing
+/// on the server is deleted on the Supernote). A backup whose time cannot be read is refused.
+pub fn backup_fresh(dir: &Path, now_ms: u64, last_sync_ms: Option<u64>) -> Result<(), String> {
+    let time = std::fs::read(dir.join("backup.json"))
+        .ok()
+        .and_then(|text| serde_json::from_slice::<BackupFile>(&text).ok())
+        .and_then(|file| rfc3339_ms(&file.time));
+    let fresh = time.is_some_and(|made| {
+        now_ms.saturating_sub(made) <= FRESH_MS && last_sync_ms.is_none_or(|sync| made > sync)
+    });
+    if fresh {
+        Ok(())
+    } else {
+        Err(BACKUP_TOO_OLD.to_owned())
+    }
+}
+
+/// The app data import's own guard: the `.snbak` file was written within 24 hours of `now_ms`.
+pub fn snbak_fresh(path: &Path, now_ms: u64) -> Result<(), String> {
+    let written = crate::commands::file_time_ms(path)?;
+    if now_ms.saturating_sub(written) <= FRESH_MS {
+        Ok(())
+    } else {
+        Err(SNBAK_TOO_OLD.to_owned())
+    }
+}
+
+/// Milliseconds since 1970 of an RFC 3339 time (`backup.json`'s `time`): `YYYY-MM-DDTHH:MM:SS`,
+/// an optional fraction, and `Z` or `+HH:MM` / `-HH:MM`.
+pub fn rfc3339_ms(text: &str) -> Option<u64> {
+    let b = text.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't') {
+        return None;
+    }
+    if b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<i64> {
+        let part = text.get(from..to)?;
+        part.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| part.parse().ok())?
+    };
+    let (year, month, day) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (hour, minute, second) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+        return None;
+    }
+    if second > 60 {
+        return None;
+    }
+    let mut rest = &text[19..];
+    let mut millis: i64 = 0;
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        let shown = &fraction[..digits.min(3)];
+        millis = shown.parse::<i64>().ok()? * 10_i64.pow(3 - u32::try_from(shown.len()).ok()?);
+        rest = &fraction[digits..];
+    }
+    let offset_s: i64 = match rest {
+        "Z" | "z" => 0,
+        _ => {
+            let sign = match rest.as_bytes().first()? {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            if rest.len() != 6 || rest.as_bytes()[3] != b':' {
+                return None;
+            }
+            let h: i64 = rest[1..3].parse().ok()?;
+            let m: i64 = rest[4..6].parse().ok()?;
+            sign * (h * 3600 + m * 60)
+        }
+    };
+    // Days from 1970-01-01 of the civil date (Howard Hinnant's days_from_civil).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let seconds = days * 86_400 + hour * 3600 + minute * 60 + second - offset_s;
+    u64::try_from(seconds * 1000 + millis).ok()
 }
 
 /// What a job that failed says: its last `error:` line (the CLI prints one), else its last

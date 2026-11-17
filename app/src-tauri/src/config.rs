@@ -131,10 +131,16 @@ pub struct SyncMark {
     pub key: String,
     /// The highest journal number at the mark.
     pub seq: u64,
-    /// When the mark was taken, in ms since 1970: only a device sync after it is the first
-    /// sync. A mark saved before this field has 0.
+    /// When the mark was taken, by this Mac's clock, in ms since 1970. Shown only; the first
+    /// sync is found by the server's times ([`sync_at_mark`](Self::sync_at_mark)). A mark saved
+    /// before this field has 0.
     #[serde(default)]
     pub at_ms: u64,
+    /// The newest device `lastSyncMs` of the account when the mark was taken (the server's
+    /// clock), `None` when no device had synced. The first sync after the mark is a device sync
+    /// with a greater `lastSyncMs`: the Mac's clock is never held against the server's.
+    #[serde(default)]
+    pub sync_at_mark: Option<u64>,
 }
 
 /// What the first sync after the mark deleted on the server.
@@ -438,6 +444,7 @@ mod tests {
                     key: "https://notes.example.org|jordi".into(),
                     seq: 813,
                     at_ms: 1_763_300_000_000,
+                    sync_at_mark: Some(1_763_299_000_000),
                 }),
                 sync_checked: Some(SyncCheck {
                     files: 2,
@@ -464,6 +471,7 @@ mod tests {
             "\"autostartOffered\"",
             "\"syncMark\"",
             "\"atMs\"",
+            "\"syncAtMark\"",
             "\"syncChecked\"",
             "\"cannotTell\"",
             "\"syncAcknowledged\"",
@@ -496,7 +504,8 @@ mod tests {
             Some(SyncMark {
                 key: "local|me".into(),
                 seq: 3,
-                at_ms: 0
+                at_ms: 0,
+                sync_at_mark: None,
             })
         );
         let mut record = sample().setup;

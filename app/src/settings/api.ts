@@ -31,8 +31,9 @@ export interface SetupRecord {
   /** The first Local mode turned Start at login on once. */
   autostartOffered: boolean;
   /** The journal end when the import was done, by the token key of the account; atMs is when
-   * the mark was taken (only a device sync after it is the first sync). */
-  syncMark: { key: string; seq: number; atMs: number } | null;
+   * the mark was taken (the Mac's clock, shown only); syncAtMark is the newest device
+   * lastSyncMs then (the server's clock): a later sync is the first sync. */
+  syncMark: { key: string; seq: number; atMs: number; syncAtMark: number | null } | null;
   /** What the first sync after the mark deleted. */
   syncChecked: SyncCheck | null;
   /** The user saw the deletes of the first sync. */

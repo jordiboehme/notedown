@@ -416,10 +416,12 @@ impl Inner {
         let had_token = token.is_some();
         // The mark and the check of the first sync are saved before the status with this
         // answer goes out: no status shows the import done without its mark, or the first sync
-        // without its check. Each call is bounded and runs at most once a minute when it fails.
+        // without its check. Each runs once (and at most once a minute while it fails) and is
+        // bounded: the mark by one REST call (8 s), the check by REST calls of 8 s each and, on
+        // this Mac, `journal tail` (`setup::CHECK_TIMEOUT`, 30 s). The status waits that long.
         if let Some(token) = token.as_ref() {
             if self.wants_mark(config, &answer) {
-                self.mark_remote(config, base, token);
+                self.mark_remote(config, base, token, &answer);
             } else if let Some(mark) = self.wants_check(config, &answer) {
                 self.check_first_sync(config, base, token, &mark);
             }
@@ -480,16 +482,28 @@ impl Inner {
 
     /// Asks the server for the journal end and hands the mark out. A failed call is tried
     /// again at most once in [`MARK_RETRY_MS`].
-    fn mark_remote(&self, config: &AppConfig, base: &str, token: &Token) {
+    fn mark_remote(&self, config: &AppConfig, base: &str, token: &Token, answer: &AccountAnswer) {
         let Some(key) = token_key(config) else {
             return;
+        };
+        // The newest device sync the server reported: a later one is the first sync.
+        let sync_at_mark = match answer {
+            AccountAnswer::Account(info) => {
+                info.devices.iter().filter_map(|d| d.last_sync_ms).max()
+            }
+            _ => None,
         };
         match self.sources.events_end(base, token) {
             Ok(seq) => {
                 lock(&self.state).mark_failed_ms = None;
                 let at_ms = (self.clock)();
                 if let Some(cb) = lock(&self.marks).as_ref() {
-                    cb(SyncMark { key, seq, at_ms });
+                    cb(SyncMark {
+                        key,
+                        seq,
+                        at_ms,
+                        sync_at_mark,
+                    });
                 }
             }
             Err(_) => lock(&self.state).mark_failed_ms = Some((self.clock)()),
@@ -497,7 +511,8 @@ impl Inner {
     }
 
     /// The mark to check the first sync after (design note 6): the config has a mark of the
-    /// login and no check yet, and a device of the account synced after the mark was taken.
+    /// login and no check yet, and a device of the account synced after the mark: its
+    /// `lastSyncMs` is greater than the newest one at the mark. Both are the server's times.
     fn wants_check(&self, config: &AppConfig, answer: &AccountAnswer) -> Option<SyncMark> {
         let AccountAnswer::Account(info) = answer else {
             return None;
@@ -507,10 +522,10 @@ impl Inner {
         if config.setup.sync_checked.is_some() || lock(&self.checks).is_none() {
             return None;
         }
-        let synced = info
-            .devices
-            .iter()
-            .any(|d| d.last_sync_ms.is_some_and(|at| at > mark.at_ms));
+        let synced = info.devices.iter().any(|d| {
+            d.last_sync_ms
+                .is_some_and(|at| mark.sync_at_mark.is_none_or(|m| at > m))
+        });
         let now = (self.clock)();
         let tried = lock(&self.state).check_failed_ms;
         (synced && tried.is_none_or(|at| now >= at.saturating_add(MARK_RETRY_MS)))

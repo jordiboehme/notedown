@@ -144,7 +144,7 @@ describe("checklist", () => {
     const all = sampleStatus(NOW);
     all.agents = [];
     const config = sampleConfig();
-    config.setup.syncMark = { key: "local|me", seq: 40, atMs: 1 };
+    config.setup.syncMark = { key: "local|me", seq: 40, atMs: 1, syncAtMark: null };
     config.setup.syncChecked = { files: 0, folders: 0, digests: 0, cannotTell: false };
     steps = byId(checklist(input({ status: all, config })));
     expect(steps.agent.state).toBe("optional");
@@ -304,7 +304,7 @@ describe("checklist", () => {
           for (const job of [null, "import", "backup"] as (JobKind | null)[]) {
             for (const connection of ["reached", "refused", "unreachable"] as const) {
               const changed: Status = { ...status, connection };
-              const synced = { ...config, setup: { ...config.setup, syncMark: { key: "local|me", seq: 1, atMs: 1 } } };
+              const synced = { ...config, setup: { ...config.setup, syncMark: { key: "local|me", seq: 1, atMs: 1, syncAtMark: null } } };
               for (const cfg of [config, synced]) {
                 fixtures.push(input({ status: changed, config: cfg, hasLogin, job, model: null }));
               }
@@ -340,7 +340,7 @@ describe("checklist", () => {
   it("the first sync is done once its check is clean or seen", () => {
     const status = sampleStatus(NOW);
     const config = sampleConfig();
-    config.setup.syncMark = { key: "local|me", seq: 40, atMs: 1 };
+    config.setup.syncMark = { key: "local|me", seq: 40, atMs: 1, syncAtMark: null };
     // The mark is there, the check not yet.
     let steps = byId(checklist(input({ status, config })));
     expect(steps.supernote.state).toBe("todo");
@@ -367,7 +367,7 @@ describe("checklist", () => {
     expect(byId(checklist(input({ status, config }))).supernote.state).toBe("todo");
     // A mark of another account does not count as this one's.
     status.device.lastSyncMs = NOW;
-    config.setup.syncMark = { key: "local|other", seq: 4, atMs: 1 };
+    config.setup.syncMark = { key: "local|other", seq: 4, atMs: 1, syncAtMark: null };
     config.setup.syncChecked = { files: 0, folders: 0, digests: 0, cannotTell: false };
     expect(byId(checklist(input({ status, config }))).supernote.state).toBe("done");
   });
@@ -381,7 +381,7 @@ describe("checklist", () => {
     let steps = byId(checklist(input({ status, config })));
     expect(steps.import.state).toBe("done");
     expect(steps.supernote.state).toBe("todo");
-    config.setup.syncMark = { key: "http://pi.local:19072|me", seq: 4, atMs: NOW };
+    config.setup.syncMark = { key: "http://pi.local:19072|me", seq: 4, atMs: NOW, syncAtMark: null };
     expect(byId(checklist(input({ status, config }))).supernote.state).toBe("todo");
     config.setup.syncChecked = { files: 0, folders: 0, digests: null, cannotTell: false };
     steps = byId(checklist(input({ status, config })));

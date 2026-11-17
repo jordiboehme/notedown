@@ -15,6 +15,7 @@
     importFailure,
     importPanel,
     importProgressText,
+    importRefusal,
     importStage,
     reviewActions,
     reviewLines,
@@ -73,6 +74,7 @@
     appDataThisRun: flow.appDataThisRun,
   });
   const stage = $derived(importStage(input));
+  const refusal = $derived(importRefusal(input));
   const panel = $derived(importPanel({ state: step.state, job: flow.job, last: flow.last, mode, server: serverState }));
   const actions = $derived(flow.dryRun ? reviewActions(flow.dryRun) : null);
   const lastText = $derived(flow.last && !flow.last.ok ? endedText(flow.last) : null);
@@ -147,6 +149,9 @@
   {/if}
 
   {#if stage === "address"}
+    {#if flow.again}
+      <Banner message="Turn Auto Sync off on the Supernote before you make the new backup." />
+    {/if}
     <form onsubmit={backupNow}>
       <Row
         title="Supernote address"
@@ -166,6 +171,11 @@
           Make a backup
         </button>
       </Row>
+      {#if flow.backup !== null}
+        <Row title="New folder" note="Make the backup into a new, empty folder.">
+          <button type="button" class="button" onclick={freshBackup}>Make a new backup</button>
+        </Row>
+      {/if}
     </form>
   {:else if stage === "backingUp"}
     <Row
@@ -202,7 +212,7 @@
     {#if flow.job === "importDryRun"}
       <Row title="Review" note="Checking the backup." />
     {:else if flow.dryRun && actions}
-      {#each reviewLines(flow.dryRun, backupTimeMs, now) as line, i (i)}
+      {#each reviewLines(flow.dryRun, backupTimeMs, now, flow.again) as line, i (i)}
         <Row title={i === 0 ? "Review" : ""} note={line} tone={line.startsWith("Error:") ? "bad" : "secondary"} />
       {/each}
       {#if actions.replace && !flow.again}
@@ -210,17 +220,17 @@
           <input type="checkbox" bind:checked={flow.replace} aria-label="Replace" />
         </Row>
       {/if}
-      <Row title="Import" note="Until the import is done, the Supernote cannot sync with this server.">
-        {#if actions.empty}
-          <button type="button" class="button strong" onclick={() => void importFiles(true)}>My Supernote is empty</button>
-        {:else}
-          <button
-            type="button"
-            class="button strong"
-            disabled={!actions.canImport || (actions.replace && !flow.replace && !flow.again)}
-            onclick={() => void importFiles(false)}>Import</button
-          >
-        {/if}
+      <Row
+        title="Import"
+        note={refusal ?? "Until the import is done, the Supernote cannot sync with this server."}
+        tone={refusal ? "bad" : "secondary"}
+      >
+        <button
+          type="button"
+          class="button strong"
+          disabled={refusal !== null || !actions.canImport || (actions.replace && !flow.replace && !flow.again)}
+          onclick={() => void importFiles(actions.empty)}>{actions.empty ? "My Supernote is empty" : "Import"}</button
+        >
       </Row>
       {#if !actions.canImport}
         <Row title="New backup" note="The import refuses this backup. Make a new one into a new folder.">
@@ -240,8 +250,13 @@
     />
   {:else if stage === "failed" && flow.last}
     {@const failed = importFailure(flow.last)}
-    <Row title="Import" note={failed.text} tone="bad">
-      <button type="button" class="button strong" onclick={() => void importFiles(flow.dryRun?.files === 0, failed.replace)}>
+    <Row title="Import" note={refusal ?? failed.text} tone="bad">
+      <button
+        type="button"
+        class="button strong"
+        disabled={refusal !== null}
+        onclick={() => void importFiles(flow.dryRun?.files === 0, failed.replace)}
+      >
         Try again with Replace
       </button>
     </Row>

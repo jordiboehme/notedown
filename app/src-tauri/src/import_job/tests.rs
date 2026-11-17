@@ -585,12 +585,21 @@ fn the_mark_is_the_end_of_the_journal() {
     assert_eq!(take_journal_mark(&state), Ok(true));
     let mark = state.current().setup.sync_mark.unwrap();
     assert_eq!((mark.key.as_str(), mark.seq), ("local|me", 7));
-    // Taken now: a device sync before it is no first sync.
     assert!(mark.at_ms > 1_700_000_000_000, "{}", mark.at_ms);
-    // An import again takes the new end.
+    // No device synced yet.
+    assert_eq!(mark.sync_at_mark, None);
+    // An import again takes the new end, with the last sync of the Supernote on disk.
     journal(&data, "journal-000000000008.jsonl", "{\"seq\":8}\n");
+    let devices = data.join("accounts/me/devices");
+    fs::create_dir_all(&devices).unwrap();
+    fs::write(
+        devices.join("SN1.json"),
+        r#"{"serial":"SN1","token_generation":1,"last_login_ms":5,"last_sync_ms":4242}"#,
+    )
+    .unwrap();
     assert_eq!(take_journal_mark(&state), Ok(true));
-    assert_eq!(state.current().setup.sync_mark.unwrap().seq, 8);
+    let mark = state.current().setup.sync_mark.unwrap();
+    assert_eq!((mark.seq, mark.sync_at_mark), (8, Some(4242)));
     // A data folder without a journal takes none and keeps the old one.
     state
         .set_mode(Mode::Local, Some(dir.path().join("empty")), None)
@@ -912,4 +921,114 @@ fn the_events_carry_the_names_the_page_reads() {
         serde_json::to_value(&done).unwrap(),
         serde_json::json!({"kind": "appDataDryRun", "ok": true, "json": {}})
     );
+}
+
+#[test]
+fn rfc3339_times_are_read() {
+    assert_eq!(rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
+    assert_eq!(rfc3339_ms("2026-11-17T14:05:00Z"), Some(1_794_924_300_000));
+    assert_eq!(
+        rfc3339_ms("2026-11-17T14:05:00.25Z"),
+        Some(1_794_924_300_250)
+    );
+    assert_eq!(
+        rfc3339_ms("2026-11-17T15:05:00+01:00"),
+        Some(1_794_924_300_000)
+    );
+    for bad in ["", "2026-11-17", "2026-13-01T00:00:00Z", "yesterday"] {
+        assert_eq!(rfc3339_ms(bad), None, "{bad}");
+    }
+}
+
+const HOUR_MS: u64 = 3_600_000;
+/// 2026-11-17T14:05:00Z.
+const MADE: u64 = 1_794_924_300_000;
+
+fn backup_made(dir: &Path, time: &str) {
+    fs::write(
+        dir.join("backup.json"),
+        format!(r#"{{"url":"http://x","time":"{time}","complete":true}}"#),
+    )
+    .unwrap();
+}
+
+#[test]
+fn the_import_refuses_an_old_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    backup_made(dir.path(), "2026-11-17T14:05:00Z");
+    assert_eq!(backup_fresh(dir.path(), MADE + HOUR_MS, None), Ok(()));
+    assert_eq!(backup_fresh(dir.path(), MADE + 24 * HOUR_MS, None), Ok(()));
+    // Older than 24 hours.
+    assert_eq!(
+        backup_fresh(dir.path(), MADE + 24 * HOUR_MS + 1, None),
+        Err(BACKUP_TOO_OLD.to_owned())
+    );
+    // Not newer than the last device sync: a file missing on the server would be deleted on
+    // the Supernote.
+    assert_eq!(
+        backup_fresh(dir.path(), MADE + HOUR_MS, Some(MADE)),
+        Err(BACKUP_TOO_OLD.to_owned())
+    );
+    assert_eq!(
+        backup_fresh(dir.path(), MADE + HOUR_MS, Some(MADE - 1)),
+        Ok(())
+    );
+    // A backup whose time cannot be read is refused as well.
+    let other = tempfile::tempdir().unwrap();
+    assert_eq!(
+        backup_fresh(other.path(), MADE, None),
+        Err(BACKUP_TOO_OLD.to_owned())
+    );
+    backup_made(other.path(), "not a time");
+    assert_eq!(
+        backup_fresh(other.path(), MADE, None),
+        Err(BACKUP_TOO_OLD.to_owned())
+    );
+}
+
+#[test]
+fn the_app_data_import_refuses_an_old_snbak() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Supernote_1.snbak");
+    fs::write(&path, b"x").unwrap();
+    let made = std::time::UNIX_EPOCH + Duration::from_millis(MADE);
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(made)
+        .unwrap();
+    assert_eq!(snbak_fresh(&path, MADE + 23 * HOUR_MS), Ok(()));
+    assert_eq!(
+        snbak_fresh(&path, MADE + 25 * HOUR_MS),
+        Err(SNBAK_TOO_OLD.to_owned())
+    );
+    assert!(snbak_fresh(&dir.path().join("gone.snbak"), MADE).is_err());
+}
+
+#[test]
+fn the_mark_keeps_the_newest_device_sync_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(newest_device_sync(dir.path(), "me"), None);
+    let devices = dir.path().join("accounts/me/devices");
+    fs::create_dir_all(&devices).unwrap();
+    fs::write(
+        devices.join("SN1.json"),
+        r#"{"serial":"SN1","token_generation":1,"last_login_ms":5,"last_sync_ms":700}"#,
+    )
+    .unwrap();
+    fs::write(
+        devices.join("SN2.json"),
+        r#"{"serial":"SN2","token_generation":1,"last_login_ms":5,"last_sync_ms":900}"#,
+    )
+    .unwrap();
+    // Never synced, and a broken file: neither counts.
+    fs::write(
+        devices.join("SN3.json"),
+        r#"{"serial":"SN3","token_generation":1,"last_login_ms":5}"#,
+    )
+    .unwrap();
+    fs::write(devices.join("SN4.json"), "{").unwrap();
+    assert_eq!(newest_device_sync(dir.path(), "me"), Some(900));
+    assert_eq!(newest_device_sync(dir.path(), "anna"), None);
 }

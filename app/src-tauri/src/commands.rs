@@ -1500,19 +1500,26 @@ pub async fn import_dry_run(
 }
 
 /// Imports the backup folder of the setup record, with the app's server stopped. Off the main
-/// thread: the stop can take the children's grace.
+/// thread: the stop can take the children's grace. A backup older than 24 hours, or not newer
+/// than the last device sync the status knows, is refused (design note 12; the Setup page
+/// checks it too).
 #[tauri::command]
 pub async fn import_run(
     config: State<'_, ConfigState>,
     jobs: State<'_, ImportJobs>,
+    poller: State<'_, Poller>,
     replace: bool,
     allow_empty: bool,
 ) -> Result<(), String> {
     let dir = backup_dir(&config)?;
     let jobs = jobs.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || jobs.import(&dir, replace, allow_empty))
-        .await
-        .map_err(|e| e.to_string())?
+    let last_sync_ms = poller.status().device.last_sync_ms;
+    tauri::async_runtime::spawn_blocking(move || {
+        import_job::backup_fresh(&dir, import_job::now_ms(), last_sync_ms)?;
+        jobs.import(&dir, replace, allow_empty)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Checks the import of the app data: the `.snbak` of the setup record, or none with `empty`.
@@ -1530,7 +1537,7 @@ pub async fn app_data_dry_run(
         .map_err(|e| e.to_string())?
 }
 
-/// Imports the app data, with the app's server stopped; then the sync mark is taken.
+/// Imports the app data, with the app's server stopped.
 #[tauri::command]
 pub async fn app_data_run(
     config: State<'_, ConfigState>,
@@ -1540,9 +1547,15 @@ pub async fn app_data_run(
 ) -> Result<(), String> {
     let snbak = snbak(&config, empty)?;
     let jobs = jobs.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || jobs.app_data(snbak.as_deref(), replace))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        // A .snbak older than 24 hours is refused (design note 12; the Setup page checks it too).
+        if let Some(path) = snbak.as_deref() {
+            import_job::snbak_fresh(path, import_job::now_ms())?;
+        }
+        jobs.app_data(snbak.as_deref(), replace)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// The step that runs, if any.
@@ -2258,6 +2271,7 @@ mod tests {
             key: key.to_owned(),
             seq,
             at_ms: 5,
+            sync_at_mark: None,
         };
         let checked = |state: &ConfigState| {
             state
@@ -2334,6 +2348,7 @@ mod tests {
                     key: "local|me".into(),
                     seq: 4,
                     at_ms: 5,
+                    sync_at_mark: None,
                 });
                 Ok::<(), ()>(())
             })

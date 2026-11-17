@@ -103,29 +103,37 @@ export function importStage(input: FlowInput): ImportStage {
   if (filesDone && appDataDone) return "done";
   const last = input.last;
   if (filesDone) {
-    if (last?.kind === "appData" && !last.ok) return "appDataFailed";
+    // The age of the .snbak is checked before any import of it, also a try again.
     const snbak = input.snbak;
     if (snbak === null || (input.again && !snbak.chosenThisRun)) return "snbak";
     if (snbakRefusal(snbak.timeMs, input.nowMs) !== null) return "snbak";
+    if (last?.kind === "appData" && !last.ok) return "appDataFailed";
     if (last?.kind === "appDataDryRun" && !last.ok) return "snbak";
     return input.appData !== null ? "appDataReview" : "snbak";
   }
-  if (last?.kind === "import" && !last.ok) return "failed";
   const backup = input.backup;
-  if (backup === null || (input.again && !backup.madeThisRun)) return "address";
-  const state = backup.state;
-  if (state.state !== "complete" && state.state !== "resumable") return "address";
-  const old = backupTooOld(Date.parse(state.time), input.nowMs, input.lastSyncMs);
+  const state = backup?.state ?? null;
+  const timed = state !== null && (state.state === "complete" || state.state === "resumable");
+  const old = timed && backupTooOld(Date.parse(state.time), input.nowMs, input.lastSyncMs);
+  // The age of the backup is checked before any import of it, also a try again.
+  if (last?.kind === "import" && !last.ok) return old ? "tooOld" : "failed";
+  if (backup === null || state === null || (input.again && !backup.madeThisRun)) return "address";
+  if (!timed) return "address";
   if (last?.kind === "backup" && !last.ok) {
     // Resume only within the 24 hours, and never over files the Supernote no longer has.
     return staleIn(last.json) || old ? "tooOld" : "backupDone";
   }
-  switch (state.state) {
-    case "resumable":
-      return old ? "tooOld" : "paused";
-    case "complete":
-      return old ? "tooOld" : "review";
+  if (old) return "tooOld";
+  return state.state === "resumable" ? "paused" : "review";
+}
+
+/** Why the files import may not run now, though the stage offers it: in Import again the last
+ * device sync must be known, else a backup older than it cannot be told. null when it may. */
+export function importRefusal(input: FlowInput): string | null {
+  if (input.again && input.lastSyncMs === null) {
+    return "Notedown cannot see the last sync of the Supernote. Wait until the server answers.";
   }
+  return null;
 }
 
 /** A backup report (backup.json, snake_case) that lists files the Supernote no longer has:
@@ -195,14 +203,16 @@ export function backupTimeLine(timeMs: number, nowMs: number): string {
 
 /** The lines of the files review: the backup time, one line per device folder, what is
  * skipped, the errors, the files the server already holds and an empty Supernote. */
-export function reviewLines(dryRun: DryRun, backupTimeMs: number, nowMs: number): string[] {
+export function reviewLines(dryRun: DryRun, backupTimeMs: number, nowMs: number, again = false): string[] {
   const lines = [backupTimeLine(backupTimeMs, nowMs)];
   for (const folder of dryRun.folders) {
     lines.push(`${folder.source}: ${files(folder.files)}, ${megabytes(folder.bytes)}`);
   }
   for (const skip of dryRun.skipped) lines.push(`Skipped ${skip.path} (${skip.reason}).`);
   for (const error of dryRun.errors) lines.push(`Error: ${error}`);
-  if (dryRun.needsReplace) {
+  // The dry run runs without Replace: needsReplace tells the files on the server. Import again
+  // always replaces, so there the note keys on them.
+  if (dryRun.needsReplace || (again && dryRun.filesPresent > 0)) {
     lines.push(
       `The server already holds ${files(dryRun.filesPresent)}. Replace moves them to the recycle bin first.`,
     );

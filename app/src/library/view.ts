@@ -244,3 +244,98 @@ export function sizeText(entry: Entry): string {
 export function dateText(ms: number): string {
   return new Date(ms).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
+
+/** The two ways to show the library's folders. Same names as the config's start view. */
+export type LibraryView = "tree" | "columns";
+
+export type ViewButton = { id: LibraryView; label: string; pressed: boolean };
+
+/** The view button of the toolbar: Tree and Columns, the shown one pressed. */
+export function viewButtons(view: LibraryView): ViewButton[] {
+  return [
+    { id: "tree", label: "Tree", pressed: view === "tree" },
+    { id: "columns", label: "Columns", pressed: view === "columns" },
+  ];
+}
+
+/** The device trees as flat rows (the sidebar of the columns view has no tree below them). */
+export function rootRows(selected: string | null): TreeRow[] {
+  return ROOTS.map((root) => ({
+    path: root.path,
+    name: root.name,
+    depth: 0,
+    open: false,
+    loading: false,
+    empty: true,
+    error: null,
+    selected: selected !== null && (selected === root.path || selected.startsWith(`${root.path}/`)),
+  }));
+}
+
+export type ColumnRow = { path: string; name: string; kind: "file" | "folder"; selected: boolean };
+
+export type Column = {
+  /** The folder the column lists; null for the first column, the device trees. */
+  path: string | null;
+  /** The last column is the selected folder and lists files too; the others list folders. */
+  last: boolean;
+  rows: ColumnRow[];
+  /** Not listed yet, or more pages to come. */
+  loading: boolean;
+  /** Listed, complete and without rows. */
+  empty: boolean;
+  error: string | null;
+};
+
+/**
+ * The columns of the selected folder, as in the Finder: the device trees, then one column per
+ * level of the path. A folder is listed only when it is shown (`shown`, for `library_shown`);
+ * the ones without a listing yet are `missing`. The columns before the last list folders only
+ * and mark the folder the next column shows; the last lists the folder with its files.
+ */
+export function columnsView(
+  path: string | null,
+  listings: Record<string, FolderState>,
+): { columns: Column[]; shown: ShownListing[]; missing: ShownListing[] } {
+  const crumbs = path === null ? [] : pathBar(path);
+  const columns: Column[] = [
+    {
+      path: null,
+      last: false,
+      rows: ROOTS.map((root) => ({ path: root.path, name: root.name, kind: "folder", selected: root.path === crumbs[0]?.path })),
+      loading: false,
+      empty: false,
+      error: null,
+    },
+  ];
+  const shown: ShownListing[] = [];
+  const missing: ShownListing[] = [];
+  crumbs.forEach((crumb, i) => {
+    const last = i === crumbs.length - 1;
+    const foldersOnly = !last;
+    const listing = listings[listingKey(crumb.path, foldersOnly)];
+    const next = crumbs[i + 1]?.path ?? null;
+    shown.push({ path: crumb.path, foldersOnly });
+    if (!listing) missing.push({ path: crumb.path, foldersOnly });
+    const entries = !listing
+      ? []
+      : last
+        ? listRows(listing, { by: "name", ascending: true }).rows
+        : ordered(listing).filter((e) => e.kind === "folder");
+    columns.push({
+      path: crumb.path,
+      last,
+      rows: entries.map((e) => ({ path: e.path, name: e.name, kind: e.kind, selected: e.path === next })),
+      loading: !listing || (!listing.complete && listing.error === null),
+      empty: listing !== undefined && listing.complete && entries.length === 0,
+      error: listing?.error ?? null,
+    });
+  });
+  return { columns, shown, missing };
+}
+
+/** The listings the window shows in a view, for `library_shown`. */
+export function shownFor(view: LibraryView, selection: Selection, open: ReadonlySet<string>): ShownListing[] {
+  if (view === "tree") return shownListings(selection, open);
+  return selection.kind === "folder" ? columnsView(selection.path, {}).shown : [];
+}

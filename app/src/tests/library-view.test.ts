@@ -2,12 +2,16 @@ import { describe, expect, it } from "vitest";
 import type { Entry, FolderState, LibraryState, LibraryStateView } from "../lib/library-types";
 import {
   ROOTS,
+  columnsView,
   folderLabel,
   listRows,
   listingKey,
   needsNextPage,
   pathBar,
+  rootRows,
+  shownFor,
   shownListings,
+  viewButtons,
   sidebarItems,
   stateView,
   treeView,
@@ -308,5 +312,123 @@ describe("the state notice", () => {
     }).body;
     expect(body).not.toContain("<img");
     expect(body).toContain("&lt;img");
+  });
+});
+
+describe("the columns", () => {
+  const path = "DOCUMENT/Document/Books/Sci-Fi";
+  const document = folder("DOCUMENT/Document", [
+    entry("DOCUMENT/Document/Papers", "folder"),
+    entry("DOCUMENT/Document/Books", "folder"),
+    entry("DOCUMENT/Document/Manual.pdf", "file"),
+  ]);
+  const books = folder("DOCUMENT/Document/Books", [
+    entry("DOCUMENT/Document/Books/Tech", "folder"),
+    entry("DOCUMENT/Document/Books/Sci-Fi", "folder"),
+  ]);
+  const scifi = folder(path, [
+    entry(`${path}/Neuromancer.epub`, "file"),
+    entry(`${path}/Classics`, "folder"),
+    entry(`${path}/Dune.pdf`, "file"),
+  ]);
+
+  it("has the device trees as the first column and one column per level of the path", () => {
+    const view = columnsView(path, {
+      [listingKey("DOCUMENT/Document", true)]: document,
+      [listingKey("DOCUMENT/Document/Books", true)]: books,
+      [listingKey(path, false)]: scifi,
+    });
+    expect(view.columns.map((c) => c.path)).toEqual([null, "DOCUMENT/Document", "DOCUMENT/Document/Books", path]);
+    expect(view.columns[0].rows.map((r) => [r.name, r.selected])).toEqual(
+      ROOTS.map((r) => [r.name, r.path === "DOCUMENT/Document"]),
+    );
+    // The middle columns show folders, with the next level selected, in natural order.
+    expect(view.columns[1].rows.map((r) => [r.name, r.selected])).toEqual([
+      ["Books", true],
+      ["Papers", false],
+    ]);
+    expect(view.columns[2].rows.map((r) => [r.name, r.selected])).toEqual([
+      ["Sci-Fi", true],
+      ["Tech", false],
+    ]);
+    // The last column is the folder itself: folders first, then files, nothing selected.
+    expect(view.columns[3].rows.map((r) => [r.name, r.kind, r.selected])).toEqual([
+      ["Classics", "folder", false],
+      ["Dune.pdf", "file", false],
+      ["Neuromancer.epub", "file", false],
+    ]);
+    expect(view.columns.map((c) => c.last)).toEqual([false, false, false, true]);
+  });
+
+  it("lists a folder only when it is opened: the columns of the path, folders only except the last", () => {
+    const view = columnsView(path, {});
+    expect(view.shown).toEqual([
+      { path: "DOCUMENT/Document", foldersOnly: true },
+      { path: "DOCUMENT/Document/Books", foldersOnly: true },
+      { path: path, foldersOnly: false },
+    ]);
+    expect(view.missing).toEqual(view.shown);
+    expect(view.columns.slice(1).every((c) => c.loading)).toBe(true);
+    expect(columnsView(null, {}).shown).toEqual([]);
+    expect(columnsView(null, {}).columns).toHaveLength(1);
+  });
+
+  it("lists a missing column once its parent has a listing, and no other", () => {
+    const view = columnsView(path, { [listingKey("DOCUMENT/Document", true)]: document });
+    expect(view.missing.map((m) => m.path)).toEqual(["DOCUMENT/Document/Books", path]);
+  });
+
+  it("pages lazily: a column that has more pages loads, a failed one shows its error", () => {
+    const part = folder("DOCUMENT/Document", [entry("DOCUMENT/Document/Books", "folder")], false);
+    const failed: FolderState = { ...folder(path, []), complete: false, error: "The server does not answer." };
+    const view = columnsView(path, {
+      [listingKey("DOCUMENT/Document", true)]: part,
+      [listingKey(path, false)]: failed,
+    });
+    expect(view.columns[1].loading).toBe(true);
+    expect(view.columns[3].loading).toBe(false);
+    expect(view.columns[3].error).toBe("The server does not answer.");
+    expect(view.missing.map((m) => m.path)).toEqual(["DOCUMENT/Document/Books"]);
+  });
+
+  it("marks an empty complete folder", () => {
+    const view = columnsView("INBOX", { [listingKey("INBOX", false)]: folder("INBOX", []) });
+    expect(view.columns.map((c) => c.path)).toEqual([null, "INBOX"]);
+    expect(view.columns[1].empty).toBe(true);
+    expect(view.columns[1].last).toBe(true);
+  });
+
+  it("keeps a root as one level", () => {
+    const view = columnsView("NOTE/Note", {});
+    expect(view.columns.map((c) => c.path)).toEqual([null, "NOTE/Note"]);
+    expect(view.columns[0].rows.find((r) => r.selected)?.name).toBe("Note");
+  });
+});
+
+describe("the view button", () => {
+  it("shows Tree and Columns with the shown one pressed", () => {
+    expect(viewButtons("tree")).toEqual([
+      { id: "tree", label: "Tree", pressed: true },
+      { id: "columns", label: "Columns", pressed: false },
+    ]);
+    expect(viewButtons("columns").map((b) => b.pressed)).toEqual([false, true]);
+  });
+
+  it("shows the open tree folders in the tree and the columns of the path in the columns", () => {
+    const open = new Set(["INBOX"]);
+    const sel = { kind: "folder", path: "NOTE/Note/Work" } as const;
+    expect(shownFor("tree", sel, open)).toEqual(shownListings(sel, open));
+    expect(shownFor("columns", sel, open)).toEqual([
+      { path: "NOTE/Note", foldersOnly: true },
+      { path: "NOTE/Note/Work", foldersOnly: false },
+    ]);
+    expect(shownFor("columns", { kind: "all" }, open)).toEqual([]);
+  });
+
+  it("lists the device trees as flat rows in the sidebar of the columns", () => {
+    const rows = rootRows("INBOX");
+    expect(rows.map((r) => [r.name, r.depth, r.open, r.empty, r.selected])).toEqual(
+      ROOTS.map((r) => [r.name, 0, false, true, r.path === "INBOX"]),
+    );
   });
 });

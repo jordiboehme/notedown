@@ -598,6 +598,9 @@ mod tests {
             granted("library"),
             set(&[
                 "get_status",
+                // The view button reads the saved start view and saves a new one.
+                "get_config",
+                "set_start_view",
                 "library_state",
                 "library_list",
                 "library_entry",
@@ -632,10 +635,13 @@ mod tests {
         assert_eq!(granted("settings"), settings);
         for command in SETTINGS_ONLY {
             assert!(!granted("panel").contains(command), "panel has {command}");
-            assert!(
-                !granted("library").contains(command),
-                "library has {command}"
-            );
+            // The library shares only the start view with the settings.
+            if !["get_config", "set_start_view"].contains(&command) {
+                assert!(
+                    !granted("library").contains(command),
+                    "library has {command}"
+                );
+            }
         }
     }
 

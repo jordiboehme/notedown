@@ -1,0 +1,44 @@
+<script lang="ts">
+  import { tick } from "svelte";
+  import { isBusy, library, listNext } from "../lib/library.svelte";
+  import ColumnList from "./ColumnList.svelte";
+  import PathBar from "./PathBar.svelte";
+  import { columnsView, listingKey } from "./view";
+
+  // The columns view: the path bar and one column per level of the selected folder, the device
+  // trees first. The columns hold a folder each; the window lists them when they are shown.
+  let { path, onSelect }: { path: string; onSelect: (path: string) => void } = $props();
+
+  const view = $derived(columnsView(path, library.listings));
+  let strip: HTMLDivElement | undefined = $state();
+
+  // A new level opens at the right: keep the last column in view.
+  $effect(() => {
+    void view.columns.length;
+    void tick().then(() => strip?.scrollTo({ left: strip.scrollWidth }));
+  });
+</script>
+
+<PathBar {path} onOpen={onSelect} />
+<div class="columns" bind:this={strip}>
+  {#each view.columns as column (column.path ?? "")}
+    {@const folders = !column.last}
+    <ColumnList
+      {column}
+      next={column.path === null ? null : (library.next[listingKey(column.path, folders)] ?? null)}
+      busy={column.path === null ? false : isBusy(column.path, folders)}
+      {onSelect}
+      onMore={() => column.path !== null && void listNext(column.path, folders)}
+    />
+  {/each}
+</div>
+
+<style>
+  .columns {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+</style>

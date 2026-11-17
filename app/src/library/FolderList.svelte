@@ -1,8 +1,9 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import type { Entry, FolderState } from "../lib/library-types";
+  import PathBar from "./PathBar.svelte";
   import VirtualRows from "./VirtualRows.svelte";
-  import { dateText, listRows, needsNextPage, pathBar, sizeText, type Range, type Sort } from "./view";
+  import { dateText, listRows, needsNextPage, sizeText, type Range, type Sort } from "./view";
 
   // The selected folder: the path bar, the column heads and the rows. The first page shows at
   // once; the next page is asked for when the rows near its end come into view.
@@ -27,7 +28,6 @@
   } = $props();
 
   const ROW = 24;
-  const crumbs = $derived(pathBar(path));
   const view = $derived(folder ? listRows(folder, sort) : { rows: [], sortable: false });
 
   function sortBy(by: Sort["by"]) {
@@ -50,16 +50,7 @@
   }
 </script>
 
-<nav class="path" aria-label="Path">
-  {#each crumbs as crumb, i (crumb.path)}
-    {#if i > 0}<span class="sep" aria-hidden="true">/</span>{/if}
-    {#if i === crumbs.length - 1}
-      <span class="crumb current" aria-current="page">{crumb.label}</span>
-    {:else}
-      <button type="button" class="crumb" onclick={() => onOpen(crumb.path)}>{crumb.label}</button>
-    {/if}
-  {/each}
-</nav>
+<PathBar {path} {onOpen} />
 
 <div class="heads" role="group" aria-label="Sort">
   {#each [["name", "Name"], ["size", "Size"], ["date", "Changed"]] as const as [by, title] (by)}
@@ -113,38 +104,6 @@
 {/if}
 
 <style>
-  .path {
-    flex: none;
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 4px;
-    padding: 8px 14px;
-    border-bottom: 1px solid var(--separator);
-  }
-
-  .crumb {
-    font: inherit;
-    color: var(--secondary);
-    padding: 0 2px;
-    border: 0;
-    background: none;
-    border-radius: 4px;
-  }
-
-  button.crumb:hover {
-    color: var(--primary);
-  }
-
-  .crumb.current {
-    color: var(--primary);
-    font-weight: 600;
-  }
-
-  .sep {
-    color: var(--tertiary);
-  }
-
   .heads,
   .row {
     display: grid;

@@ -23,7 +23,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 const store = await import("../lib/library.svelte");
-const { library, applyEvent, startLibrary, listFolder, listNext, isBusy, showListings, resetLibrary } = store;
+const { library, applyEvent, startLibrary, listFolder, listNext, isBusy, showListings, resetLibrary, loadView, chooseView } = store;
 
 /** The next call of `command` answers what `answer` gives; it waits until `release` is called. */
 function answerLater(command: string) {
@@ -274,5 +274,54 @@ describe("the library store", () => {
     showListings([{ path: "INBOX", foldersOnly: false }]);
     showListings([{ path: "INBOX", foldersOnly: false }]);
     expect(calls.filter((c) => c.command === "library_shown")).toHaveLength(4);
+  });
+});
+
+describe("the view of the window", () => {
+  beforeEach(() => {
+    resetLibrary();
+    calls.length = 0;
+  });
+
+  it("starts in the saved view", async () => {
+    expect(library.viewMode).toBe("tree");
+    answerNow("get_config", { startView: "columns" });
+    await loadView();
+    expect(library.viewMode).toBe("columns");
+    expect(calls.filter((c) => c.command === "get_config")).toHaveLength(1);
+  });
+
+  it("keeps the tree when the config cannot be read", async () => {
+    answers.set("get_config", [() => Promise.reject("no")]);
+    await loadView();
+    expect(library.viewMode).toBe("tree");
+  });
+
+  it("switches at once and saves the choice", async () => {
+    answerNow("set_start_view", { startView: "columns" });
+    const saving = chooseView("columns");
+    expect(library.viewMode).toBe("columns");
+    await saving;
+    expect(calls.find((c) => c.command === "set_start_view")?.args).toEqual({ startView: "columns" });
+  });
+
+  it("does not save a view that is already shown", async () => {
+    await chooseView("tree");
+    expect(calls.some((c) => c.command === "set_start_view")).toBe(false);
+  });
+
+  it("stays in the chosen view when saving fails", async () => {
+    answers.set("set_start_view", [() => Promise.reject("disk full")]);
+    await chooseView("columns");
+    expect(library.viewMode).toBe("columns");
+  });
+
+  it("does not let a late config read undo a choice", async () => {
+    const read = answerLater("get_config");
+    const loading = loadView();
+    await chooseView("columns");
+    read.release({ startView: "tree" });
+    await loading;
+    expect(library.viewMode).toBe("columns");
   });
 });

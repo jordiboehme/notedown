@@ -3,18 +3,22 @@
   import { SvelteSet } from "svelte/reactivity";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
-  import { isBusy, library, listFolder, listNext, showListings, startLibrary } from "../lib/library.svelte";
+  import { chooseView, isBusy, library, listFolder, listNext, loadView, showListings, startLibrary } from "../lib/library.svelte";
   import { NOTES_EVENT, type NoteSummary } from "../lib/library-types";
   import { startStatus, status } from "../lib/status.svelte";
+  import ColumnsView from "./ColumnsView.svelte";
   import FolderList from "./FolderList.svelte";
   import NotesList from "./NotesList.svelte";
   import Sidebar from "./Sidebar.svelte";
   import StateNotice from "./StateNotice.svelte";
   import StatusLine from "./StatusLine.svelte";
+  import Toolbar from "./Toolbar.svelte";
   import {
+    columnsView,
     listingKey,
     pathBar,
-    shownListings,
+    rootRows,
+    shownFor,
     sidebarItems,
     treeView,
     type Selection,
@@ -36,6 +40,8 @@
   const ready = $derived(library.view?.state === "ready");
   const selectedPath = $derived(selection.kind === "folder" ? selection.path : null);
   const tree = $derived(treeView(library.listings, open, selectedPath));
+  const columns = $derived(columnsView(selectedPath, library.listings));
+  const inTree = $derived(library.viewMode === "tree");
   const items = $derived(
     sidebarItems(library.view, { newNotes: newNotes?.length ?? null, allNotes: allNotes?.length ?? null }, selection),
   );
@@ -48,13 +54,13 @@
   // binding (the generation moves).
   $effect(() => {
     void library.generation;
-    const shown = shownListings(selection, open);
+    const shown = shownFor(library.viewMode, selection, open);
     untrack(() => showListings(shown));
   });
 
   // The tree lists a folder when it opens, and the rest of its pages after the first.
   $effect(() => {
-    if (!ready) return;
+    if (!ready || !inTree) return;
     const { missing, more } = tree;
     untrack(() => {
       for (const path of missing) void listFolder(path, true);
@@ -64,9 +70,18 @@
 
   // The selected folder: its first page at once (again after a new binding).
   $effect(() => {
-    if (!ready || selection.kind !== "folder") return;
+    if (!ready || !inTree || selection.kind !== "folder") return;
     const path = selection.path;
     if (library.listings[listingKey(path, false)] === undefined) untrack(() => void listFolder(path, false));
+  });
+
+  // The columns list a folder when they show it; the next pages come as a column scrolls.
+  $effect(() => {
+    if (!ready || inTree) return;
+    const { missing } = columns;
+    untrack(() => {
+      for (const item of missing) void listFolder(item.path, item.foldersOnly);
+    });
   });
 
   function loadNotes() {
@@ -81,6 +96,7 @@
   onMount(() => {
     const stops = [startLibrary(), startStatus(), listen(NOTES_EVENT, loadNotes)];
     loadNotes();
+    void loadView();
     const clock = setInterval(() => (now = Date.now()), 30_000);
     return () => {
       clearInterval(clock);
@@ -116,11 +132,12 @@
 
 <div class="library window">
   <StatusLine status={status.current} {now} onSetUp={() => settings("setup")} />
+  <Toolbar view={library.viewMode} onView={(view) => void chooseView(view)} />
   <div class="body">
     <Sidebar
       notes={items.notes}
       tree={items.tree}
-      rows={tree.rows}
+      rows={inTree ? tree.rows : rootRows(selectedPath)}
       bin={items.bin}
       view={library.view}
       onPick={pick}
@@ -140,18 +157,24 @@
         <p class="note">The recycle bin is not shown yet.</p>
       {:else}
         {@const path = selection.path}
-        {#key `${path}:${library.generation}`}
-          <FolderList
-            {path}
-            folder={library.listings[listingKey(path, false)]}
-            next={library.next[listingKey(path, false)] ?? null}
-            busy={isBusy(path, false)}
-            {sort}
-            onSort={(next) => (sort = next)}
-            onOpen={select}
-            onMore={() => void listNext(path, false)}
-          />
-        {/key}
+        {#if !inTree}
+          {#key library.generation}
+            <ColumnsView {path} onSelect={select} />
+          {/key}
+        {:else}
+          {#key `${path}:${library.generation}`}
+            <FolderList
+              {path}
+              folder={library.listings[listingKey(path, false)]}
+              next={library.next[listingKey(path, false)] ?? null}
+              busy={isBusy(path, false)}
+              {sort}
+              onSort={(next) => (sort = next)}
+              onOpen={select}
+              onMore={() => void listNext(path, false)}
+            />
+          {/key}
+        {/if}
       {/if}
     </main>
   </div>

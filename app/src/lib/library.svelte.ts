@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { listingKey } from "../library/view";
+import { listingKey, type LibraryView } from "../library/view";
 import {
   LIBRARY_EVENT,
   type FolderState,
@@ -32,6 +32,8 @@ type Store = {
   recycle: number;
   /** The listings with a `library_list` call running (kept in the state so the list sees it). */
   busy: Record<string, true>;
+  /** The folders are shown as a tree or as columns; saved as the start view. */
+  viewMode: LibraryView;
 };
 
 export const library = $state<Store>({
@@ -42,6 +44,7 @@ export const library = $state<Store>({
   generation: 0,
   recycle: 0,
   busy: {},
+  viewMode: "tree",
 });
 
 /** What `library_shown` was last told, to call it only on a change. */
@@ -52,6 +55,8 @@ let lastShown: string | null = null;
  * the folder opened again is listed fresh.
  */
 let shownKeys: Set<string> | null = null;
+/** Whether the user chose a view in this window: a config read that answers later is stale. */
+let chosen = false;
 
 function isShown(key: string): boolean {
   return shownKeys === null || shownKeys.has(key);
@@ -66,8 +71,10 @@ export function resetLibrary() {
   library.generation = 0;
   library.recycle = 0;
   library.busy = {};
+  library.viewMode = "tree";
   lastShown = null;
   shownKeys = null;
+  chosen = false;
 }
 
 function report(command: string) {
@@ -184,4 +191,26 @@ export function showListings(listings: ShownListing[]) {
   for (const old of Object.keys(library.listings)) if (!kept.has(old)) delete library.listings[old];
   for (const old of Object.keys(library.next)) if (!kept.has(old)) delete library.next[old];
   invoke("library_shown", { listings }).catch(report("library_shown"));
+}
+
+/** Reads the saved start view; the window starts in it. Stays in the tree when it cannot be read. */
+export async function loadView(): Promise<void> {
+  try {
+    const config = await invoke<{ startView: LibraryView }>("get_config");
+    if (!chosen && (config.startView === "tree" || config.startView === "columns")) library.viewMode = config.startView;
+  } catch (error) {
+    report("get_config")(error);
+  }
+}
+
+/** Shows the folders in this view at once and saves the choice as the start view. */
+export async function chooseView(view: LibraryView): Promise<void> {
+  chosen = true;
+  if (library.viewMode === view) return;
+  library.viewMode = view;
+  try {
+    await invoke("set_start_view", { startView: view });
+  } catch (error) {
+    report("set_start_view")(error);
+  }
 }

@@ -10,7 +10,7 @@ export type Point = { x: number; y: number };
 
 /** What a drop on a folder that the app may not change says. */
 export const NOT_WRITABLE = "This folder cannot be changed.";
-/** What a drop says when no folder is under it and none is shown. */
+/** What a drop says when no folder is under it. */
 export const NO_FOLDER = "Drop the files on a folder.";
 
 /**
@@ -38,11 +38,13 @@ export function takesFiles(path: string): boolean {
 
 export type DropPlan = { upload: string } | { refuse: string };
 
-/** Where a drop goes: the folder it was dropped on, else the folder that is shown. */
-export function dropPlan(hit: string | null, shown: string | null): DropPlan {
-  const folder = hit ?? shown;
-  if (folder === null) return { refuse: NO_FOLDER };
-  return takesFiles(folder) ? { upload: folder } : { refuse: NOT_WRITABLE };
+/**
+ * Where a drop goes: the folder it was dropped on. A drop on no folder (the sidebar's notes,
+ * the toolbar, the job area) goes nowhere; the shown folder's listing carries its own path.
+ */
+export function dropPlan(hit: string | null): DropPlan {
+  if (hit === null) return { refuse: NO_FOLDER };
+  return takesFiles(hit) ? { upload: hit } : { refuse: NOT_WRITABLE };
 }
 
 /** The arguments of `library_upload`; the answers to its questions add `packages` and `many`. */
@@ -92,8 +94,9 @@ export const DRAG_SLOP = 4;
 
 export type Drag = { dragged: Dragged; from: Point; active: boolean; over: string | null };
 
-/** A press on a row: a drag once the pointer moves far enough. */
-export function pressRow(dragged: Dragged, at: Point): Drag {
+/** A press on a row: a drag once the pointer moves far enough; null for a row that cannot be changed. */
+export function pressRow(dragged: Dragged, at: Point): Drag | null {
+  if (!dragged.writable) return null;
   return { dragged, from: at, active: false, over: null };
 }
 
@@ -103,10 +106,13 @@ export function dragTo(drag: Drag, at: Point, over: string | null): Drag {
   return { ...drag, active, over: active ? moveTarget(drag.dragged, over) : null };
 }
 
+/** A move of the entry `id` at the path `from` into the folder `toFolder`. */
+export type Move = { id: number; from: string; toFolder: string };
+
 /** The pointer was let go: the move to make, if any. */
-export function release(drag: Drag): { id: number; toFolder: string } | null {
+export function release(drag: Drag): Move | null {
   if (!drag.active || drag.over === null) return null;
-  return { id: drag.dragged.id, toFolder: drag.over };
+  return { id: drag.dragged.id, from: drag.dragged.path, toFolder: drag.over };
 }
 
 /** The entry of `path` in any listing (the list's or the tree's); null for a device tree. */
@@ -244,9 +250,15 @@ export const QUEUED_SHOWN = 3;
  * drop together (with Cancel all while two or more of them can be stopped, and Retry all for
  * two or more failed ones), every other job on its own. Of a big drop only the first
  * {@link QUEUED_SHOWN} waiting uploads are rows; `more` counts the others. `ended` holds when
- * each job ended; done and cancelled rows go after a while.
+ * each job ended; done and cancelled rows go after a while. `totals` counts every job a drop
+ * had, so its title stays the same while its done rows go.
  */
-export function jobRows(jobs: Record<number, Job>, ended: Record<number, number>, now: number): JobGroup[] {
+export function jobRows(
+  jobs: Record<number, Job>,
+  ended: Record<number, number>,
+  now: number,
+  totals: Record<number, number> = {},
+): JobGroup[] {
   const groups: JobGroup[] = [];
   const byDrop = new Map<number, { group: JobGroup; jobs: Job[] }>();
   const ordered = Object.values(jobs).sort((a, b) => a.id - b.id);
@@ -264,7 +276,7 @@ export function jobRows(jobs: Record<number, Job>, ended: Record<number, number>
     }
     found.jobs.push(job);
   }
-  for (const { group, jobs: all } of byDrop.values()) {
+  for (const [drop, { group, jobs: all }] of byDrop) {
     let queued = 0;
     for (const job of all) {
       if (job.state === "queued" && ++queued > QUEUED_SHOWN) group.more += 1;
@@ -274,7 +286,8 @@ export function jobRows(jobs: Record<number, Job>, ended: Record<number, number>
     const failed = all.filter((j) => j.state === "failed").map((j) => j.id);
     group.cancelAll = live >= 2;
     group.retryAll = failed.length >= 2 ? failed : [];
-    group.title = all.length >= 2 ? `${all.length.toLocaleString("en-US")} dropped items` : null;
+    const total = Math.max(totals[drop] ?? 0, all.length);
+    group.title = total >= 2 ? `${total.toLocaleString("en-US")} dropped items` : null;
   }
   return groups;
 }
@@ -294,4 +307,22 @@ export function clearedJobs(jobs: Record<number, Job>, ended: Record<number, num
 export function shownAfter(shown: string, from: string, to: string | null): string {
   if (shown !== from && !shown.startsWith(`${from}/`)) return shown;
   return to === null ? parentOf(from) : `${to}${shown.slice(from.length)}`;
+}
+
+/** A rename or a move of `from` to `to`, or its delete (`to` null). */
+export type Change = { from: string; to: string | null };
+
+/** What the window shows and has picked. */
+export type Shown = { shown: string | null; picked: string | null };
+
+/**
+ * What the window shows after a change: the shown folder follows it (a folder shown anew has
+ * no picked row), and the picked row follows its own rename or move and is let go when deleted.
+ */
+export function followChange(view: Shown, change: Change): Shown {
+  if (view.shown !== null) {
+    const shown = shownAfter(view.shown, change.from, change.to);
+    if (shown !== view.shown) return { shown, picked: null };
+  }
+  return { shown: view.shown, picked: view.picked === change.from ? change.to : view.picked };
 }

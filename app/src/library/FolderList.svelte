@@ -77,62 +77,72 @@
   {/each}
 </div>
 
-{#if folder?.error}
-  <p class="note problem" role="status">{folder.error}</p>
-{/if}
-
-{#if !folder || (folder.entries.length === 0 && !folder.complete && !folder.error)}
-  <p class="note">Loading...</p>
-{:else if folder.entries.length === 0 && folder.complete}
-  <p class="note">This folder is empty.</p>
-{:else}
-  <VirtualRows items={view.rows} rowHeight={ROW} key={(entry: Entry) => entry.id} label="Files and folders" onRange={seen}>
-    {#snippet row(entry: Entry)}
-      {#snippet name()}
-        <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
-          {#if entry.kind === "folder"}
-            <path class="folder" d="M1.5 4.5v8.5h13V5.5H7.5L6 3.5H2z" />
-          {:else}
-            <path class="file" d="M3.5 1.5h6l3 3v10h-9z M9.5 1.5v3h3" />
-          {/if}
-        </svg>
-      {/snippet}
-      {#if renaming === entry.path}
-        <div class="row picked" data-folder={entry.kind === "folder" ? entry.path : undefined}>
-          <span class="name">
-            {@render name()}
-            <NameField name={entry.name} label="New name" onDone={(typed) => onRename(entry, typed)} />
-          </span>
-          <span class="size">{sizeText(entry)}</span>
-          <span class="date">{dateText(entry.mtimeMs)}</span>
-        </div>
-      {:else}
-        <button
-          type="button"
-          class="row"
-          class:picked={picked === entry.path}
-          class:target={drag.current?.over === entry.path}
-          data-folder={entry.kind === "folder" ? entry.path : undefined}
-          onclick={() => onPick(entry.path)}
-          ondblclick={() => entry.kind === "folder" && onOpen(entry.path)}
-          onpointerdown={(event) => pressOn(entry, event)}
-        >
-          <span class="name">
-            {@render name()}
-            <span class="text">{entry.name}</span>
-          </span>
-          <span class="size">{sizeText(entry)}</span>
-          <span class="date">{dateText(entry.mtimeMs)}</span>
-        </button>
-      {/if}
-    {/snippet}
-  </VirtualRows>
-  {#if busy && next}
-    <p class="note more">Loading more...</p>
+<!-- The rows of the shown folder: a drop anywhere here that is not on a folder row goes into it. -->
+<div class="body" data-folder={path}>
+  {#if folder?.error}
+    <p class="note problem" role="status">{folder.error}</p>
   {/if}
-{/if}
+
+  {#if !folder || (folder.entries.length === 0 && !folder.complete && !folder.error)}
+    <p class="note">Loading...</p>
+  {:else if folder.entries.length === 0 && folder.complete}
+    <p class="note">This folder is empty.</p>
+  {:else}
+    <VirtualRows items={view.rows} rowHeight={ROW} key={(entry: Entry) => entry.id} label="Files and folders" onRange={seen}>
+      {#snippet row(entry: Entry)}
+        {#snippet name()}
+          <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+            {#if entry.kind === "folder"}
+              <path class="folder" d="M1.5 4.5v8.5h13V5.5H7.5L6 3.5H2z" />
+            {:else}
+              <path class="file" d="M3.5 1.5h6l3 3v10h-9z M9.5 1.5v3h3" />
+            {/if}
+          </svg>
+        {/snippet}
+        {#if renaming === entry.path}
+          <div class="row picked" data-folder={entry.kind === "folder" ? entry.path : undefined}>
+            <span class="name">
+              {@render name()}
+              <NameField name={entry.name} label="New name" onDone={(typed) => onRename(entry, typed)} />
+            </span>
+            <span class="size">{sizeText(entry)}</span>
+            <span class="date">{dateText(entry.mtimeMs)}</span>
+          </div>
+        {:else}
+          <button
+            type="button"
+            class="row"
+            class:picked={picked === entry.path}
+            class:target={drag.current?.over === entry.path}
+            data-folder={entry.kind === "folder" ? entry.path : undefined}
+            onclick={() => onPick(entry.path)}
+            ondblclick={() => entry.kind === "folder" && onOpen(entry.path)}
+            onpointerdown={(event) => pressOn(entry, event)}
+          >
+            <span class="name">
+              {@render name()}
+              <span class="text">{entry.name}</span>
+            </span>
+            <span class="size">{sizeText(entry)}</span>
+            <span class="date">{dateText(entry.mtimeMs)}</span>
+          </button>
+        {/if}
+      {/snippet}
+    </VirtualRows>
+    {#if busy && next}
+      <p class="note more">Loading more...</p>
+    {/if}
+  {/if}
+</div>
 
 <style>
+  .body {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
   .heads,
   .row {
     display: grid;

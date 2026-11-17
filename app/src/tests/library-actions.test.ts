@@ -11,6 +11,7 @@ import {
   entryActions,
   entryAt,
   folderAt,
+  followChange,
   jobRows,
   moveTarget,
   newName,
@@ -57,23 +58,23 @@ describe("folderAt", () => {
 });
 
 describe("a drop", () => {
-  it("goes into the folder it was dropped on, else the folder that is shown", () => {
-    expect(dropPlan("NOTE/Note/Work", "INBOX")).toEqual({ upload: "NOTE/Note/Work" });
-    expect(dropPlan(null, "INBOX")).toEqual({ upload: "INBOX" });
+  it("goes into the folder it was dropped on", () => {
+    expect(dropPlan("NOTE/Note/Work")).toEqual({ upload: "NOTE/Note/Work" });
+    expect(dropPlan("INBOX")).toEqual({ upload: "INBOX" });
     // A device tree takes files, though it cannot be renamed.
-    expect(dropPlan("DOCUMENT/Document", null)).toEqual({ upload: "DOCUMENT/Document" });
+    expect(dropPlan("DOCUMENT/Document")).toEqual({ upload: "DOCUMENT/Document" });
   });
 
   it("on a folder that is not writable says so", () => {
     expect(NOT_WRITABLE).toBe("This folder cannot be changed.");
-    expect(dropPlan("NOTE", null)).toEqual({ refuse: NOT_WRITABLE });
-    expect(dropPlan("NOTE/Other/x", null)).toEqual({ refuse: NOT_WRITABLE });
-    expect(dropPlan("NOTE/Note/.hidden", null)).toEqual({ refuse: NOT_WRITABLE });
-    expect(dropPlan(null, "NOTE/Other")).toEqual({ refuse: NOT_WRITABLE });
+    expect(dropPlan("NOTE")).toEqual({ refuse: NOT_WRITABLE });
+    expect(dropPlan("NOTE/Other/x")).toEqual({ refuse: NOT_WRITABLE });
+    expect(dropPlan("NOTE/Note/.hidden")).toEqual({ refuse: NOT_WRITABLE });
   });
 
-  it("without any folder asks for one", () => {
-    expect(dropPlan(null, null)).toEqual({ refuse: NO_FOLDER });
+  it("on no folder asks for one, even while a folder is shown", () => {
+    expect(NO_FOLDER).toBe("Drop the files on a folder.");
+    expect(dropPlan(null)).toEqual({ refuse: NO_FOLDER });
   });
 
   it("takes files only inside the device trees", () => {
@@ -125,7 +126,7 @@ describe("a pointer drag of a row", () => {
   const folder = { id: 8, path: "NOTE/Note/Work", kind: "folder" as const, writable: true };
 
   it("onto a folder gives a move", () => {
-    let drag = pressRow(file, { x: 10, y: 10 });
+    let drag = pressRow(file, { x: 10, y: 10 })!;
     expect(drag.active).toBe(false);
     // A small shake is a click, not a drag.
     drag = dragTo(drag, { x: 12, y: 11 }, "NOTE/Note/Home");
@@ -133,14 +134,14 @@ describe("a pointer drag of a row", () => {
     expect(release(drag)).toBeNull();
     drag = dragTo(drag, { x: 30, y: 40 }, "NOTE/Note/Home");
     expect(drag).toMatchObject({ active: true, over: "NOTE/Note/Home" });
-    expect(release(drag)).toEqual({ id: 7, toFolder: "NOTE/Note/Home" });
+    expect(release(drag)).toEqual({ id: 7, from: "NOTE/Note/Work/a.note", toFolder: "NOTE/Note/Home" });
     // Once it moved, it stays a drag when it comes back near where it started.
     drag = dragTo(drag, { x: 11, y: 10 }, "DOCUMENT/Document");
-    expect(release(drag)).toEqual({ id: 7, toFolder: "DOCUMENT/Document" });
+    expect(release(drag)).toEqual({ id: 7, from: "NOTE/Note/Work/a.note", toFolder: "DOCUMENT/Document" });
   });
 
   it("onto the same folder, a folder that is not writable or nothing does nothing", () => {
-    const drag = dragTo(pressRow(file, { x: 0, y: 0 }), { x: 50, y: 0 }, null);
+    const drag = dragTo(pressRow(file, { x: 0, y: 0 })!, { x: 50, y: 0 }, null);
     expect(drag.active).toBe(true);
     expect(release(drag)).toBeNull();
     expect(release(dragTo(drag, { x: 60, y: 0 }, "NOTE/Note/Work"))).toBeNull();
@@ -156,6 +157,11 @@ describe("a pointer drag of a row", () => {
     expect(moveTarget(folder, "NOTE/Note/Workshop")).toBe("NOTE/Note/Workshop");
     expect(moveTarget(folder, "NOTE/Note")).toBeNull();
     expect(moveTarget({ ...file, writable: false }, "INBOX")).toBeNull();
+  });
+
+  it("does not start on a row that cannot be changed", () => {
+    expect(pressRow({ ...file, writable: false }, { x: 0, y: 0 })).toBeNull();
+    expect(pressRow(file, { x: 0, y: 0 })).not.toBeNull();
   });
 });
 
@@ -223,6 +229,29 @@ describe("the shown folder after a change", () => {
     expect(shownAfter("NOTE/Note/Workshop", "NOTE/Note/Work", "NOTE/Note/Jobs")).toBe("NOTE/Note/Workshop");
     expect(shownAfter("NOTE/Note/Work/A", "NOTE/Note/Work", null)).toBe("NOTE/Note");
     expect(shownAfter("INBOX", "NOTE/Note/Work", null)).toBe("INBOX");
+  });
+
+  it("moves the shown folder and the picked row along with the change", () => {
+    // The shown folder follows; a new folder shown has no picked row.
+    expect(followChange({ shown: "NOTE/Note/Work/A", picked: "NOTE/Note/Work/A/x.pdf" }, { from: "NOTE/Note/Work", to: "INBOX/Work" })).toEqual({
+      shown: "INBOX/Work/A",
+      picked: null,
+    });
+    // The picked row itself was renamed in the shown folder.
+    expect(followChange({ shown: "NOTE/Note", picked: "NOTE/Note/a.pdf" }, { from: "NOTE/Note/a.pdf", to: "NOTE/Note/b.pdf" })).toEqual({
+      shown: "NOTE/Note",
+      picked: "NOTE/Note/b.pdf",
+    });
+    // A deleted picked row is no longer picked; another picked row stays.
+    expect(followChange({ shown: "NOTE/Note", picked: "NOTE/Note/a.pdf" }, { from: "NOTE/Note/a.pdf", to: null })).toEqual({
+      shown: "NOTE/Note",
+      picked: null,
+    });
+    expect(followChange({ shown: "NOTE/Note", picked: "NOTE/Note/c.pdf" }, { from: "NOTE/Note/a.pdf", to: null })).toEqual({
+      shown: "NOTE/Note",
+      picked: "NOTE/Note/c.pdf",
+    });
+    expect(followChange({ shown: null, picked: null }, { from: "NOTE/Note/a.pdf", to: "INBOX/a.pdf" })).toEqual({ shown: null, picked: null });
   });
 });
 
@@ -318,6 +347,14 @@ describe("jobRows", () => {
     // One failed job has its own Retry.
     const one = jobRows({ 1: job(1, { dropId: 9, state: "failed" }), 2: job(2, { dropId: 9 }) }, {}, 0);
     expect(one[0]).toMatchObject({ more: 0, retryAll: [] });
+  });
+
+  it("names a drop by all its items, also when done rows of it were cleared", () => {
+    const left = { 3: job(3, { dropId: 5, state: "running" }) };
+    expect(jobRows(left, {}, 0, { 5: 3 })[0].title).toBe("3 dropped items");
+    // Without a total the jobs there are counted.
+    expect(jobRows(left, {}, 0)[0].title).toBeNull();
+    expect(jobRows(left, {}, 0, { 5: 1 })[0].title).toBeNull();
   });
 
   it("clears done and cancelled rows after a while; a done download shows Show in Finder for longer", () => {

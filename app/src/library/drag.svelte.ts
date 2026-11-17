@@ -1,4 +1,4 @@
-import { dragTo, pressRow, release, type Drag, type Dragged, type Point } from "./actions";
+import { dragTo, pressRow, release, type Drag, type Dragged, type Move, type Point } from "./actions";
 
 // A row dragged onto a folder with the pointer (no HTML5 drag and drop: the web view hands
 // file drops to Rust). The rows start it on a press; the window follows the pointer and makes
@@ -12,10 +12,12 @@ export function folderUnder(x: number, y: number): string | null {
   return found?.dataset.folder ?? null;
 }
 
-/** A press on a row that can be moved: a drag once the pointer moves far enough. */
+/** A press on a row: a drag once the pointer moves far enough; none for a row that cannot be changed. */
 export function pressOn(dragged: Dragged, event: PointerEvent) {
   if (event.button !== 0 || event.ctrlKey || event.metaKey) return;
-  drag.current = pressRow(dragged, { x: event.clientX, y: event.clientY });
+  const pressed = pressRow(dragged, { x: event.clientX, y: event.clientY });
+  if (!pressed) return;
+  drag.current = pressed;
   drag.at = { x: event.clientX, y: event.clientY };
 }
 
@@ -35,7 +37,7 @@ export function moveTo(event: PointerEvent) {
  * The pointer was let go: the move to make, if any. A drag swallows the click that follows,
  * so the row under the pointer is not picked or opened.
  */
-export function letGo(): { id: number; toFolder: string } | null {
+export function letGo(): Move | null {
   const current = drag.current;
   drag.current = null;
   if (!current) return null;

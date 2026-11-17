@@ -44,6 +44,7 @@
   class="column"
   role="group"
   aria-label={column.path === null ? "Device folders" : "Folder"}
+  class:target={column.path !== null && drag.current?.over === column.path}
   data-folder={column.path ?? undefined}
 >
   {#if column.error}
@@ -134,7 +135,8 @@
     font-weight: 600;
   }
 
-  /* The folder a dragged row goes into when it is let go. */
+  /* The folder a dragged row goes into when it is let go: its row or its column. */
+  .column.target,
   .row.target {
     outline: 2px solid var(--brand);
     outline-offset: -2px;

@@ -25,6 +25,8 @@ vi.mock("@tauri-apps/api/core", () => ({
 const store = await import("../lib/library.svelte");
 const { library, applyEvent, startLibrary, listFolder, listNext, isBusy, showListings, resetLibrary, loadView, chooseView } = store;
 const { setDropTarget, answerUpload, jobAction, moveEntry, renameEntry, newFolder, deleteEntry, downloadEntry, clearJobs, retryJobs } = store;
+const { moveRow, renameRow, makeFolder, deleteRow } = store;
+const { followChange, jobRows } = await import("../library/actions");
 
 /** The next call of `command` answers what `answer` gives; it waits until `release` is called. */
 function answerLater(command: string) {
@@ -408,6 +410,18 @@ describe("drops", () => {
     expect(cancels()).toEqual([]);
   });
 
+  it("forgets the questions on a new binding: Rust forgot their drops", async () => {
+    setDropTarget(() => "INBOX");
+    answerNow("library_upload", { ask: "many", text: "Upload 1,234 files?" });
+    applyEvent(drop(9));
+    await flush();
+    expect(library.asks).toHaveLength(1);
+    applyEvent({ type: "relist" });
+    expect(library.asks).toEqual([]);
+    // Rust forgot the drop already: nothing is let go.
+    expect(cancels()).toEqual([]);
+  });
+
   it("lets the drop go when a question is cancelled or the upload fails", async () => {
     setDropTarget(() => "INBOX");
     answerNow("library_upload", { ask: "many", text: "Upload 1,234 files?" });
@@ -487,6 +501,22 @@ describe("jobs", () => {
     expect(library.jobs[11]).toBeUndefined();
   });
 
+  it("keeps the title of a drop while its done rows are cleared", () => {
+    for (const id of [41, 42, 43]) applyEvent({ type: "job", job: { ...upload, id, dropId: 9, state: "running" } });
+    // A later event of a job already counted counts once.
+    applyEvent({ type: "job", job: { ...upload, id: 41, dropId: 9, state: "done" } });
+    applyEvent({ type: "job", job: { ...upload, id: 42, dropId: 9, state: "done" } });
+    const title = () => jobRows(library.jobs, library.ended, Date.now() + 60_000 * 10, library.dropTotals)[0]?.title;
+    expect(library.dropTotals[9]).toBe(3);
+    clearJobs(Date.now() + 60_000 * 10);
+    expect(Object.keys(library.jobs).map(Number)).toEqual([43]);
+    expect(title()).toBe("3 dropped items");
+    // Once the last job of the drop is gone, so is its total.
+    applyEvent({ type: "job", job: { ...upload, id: 43, dropId: 9, state: "done" } });
+    clearJobs(Date.now() + 60_000 * 10);
+    expect(library.dropTotals[9]).toBeUndefined();
+  });
+
   it("shows the error of an action", async () => {
     answers.set("library_reveal", [() => Promise.reject("This file is not there anymore.")]);
     await jobAction({ ...job, state: "done", result: "/x" }, "reveal");
@@ -529,3 +559,56 @@ describe("jobs", () => {
   });
 });
 
+describe("file actions and the shown folder", () => {
+  const changed = (id: number, state: Job["state"], result: string | null): Job => ({
+    ...job,
+    id,
+    kind: "change",
+    total: null,
+    state,
+    result,
+  });
+
+  it("follows a moved folder to the new path Rust answers", async () => {
+    answerNow("library_move", changed(50, "done", "INBOX/Work"));
+    const change = await moveRow(8, "NOTE/Note/Work", "INBOX");
+    expect(calls.map((c) => [c.command, c.args])).toEqual([["library_move", { id: 8, toFolder: "INBOX" }]]);
+    expect(change).toEqual({ from: "NOTE/Note/Work", to: "INBOX/Work" });
+    expect(followChange({ shown: "NOTE/Note/Work/A", picked: null }, change!)).toEqual({ shown: "INBOX/Work/A", picked: null });
+  });
+
+  it("changes nothing shown when the job did not end done", async () => {
+    answerNow("library_move", changed(51, "failed", null));
+    expect(await moveRow(8, "NOTE/Note/Work", "INBOX")).toBeNull();
+    answers.set("library_rename", [() => Promise.reject("The name is taken.")]);
+    expect(await renameRow({ ...folder("NOTE/Note", ["a.pdf"], true).entries[0] }, "b.pdf")).toBeNull();
+    expect(library.notice).toBe("The name is taken.");
+  });
+
+  it("renames only to a new name, and follows the rename", async () => {
+    const entry = folder("NOTE/Note", ["a.pdf"], true).entries[0];
+    expect(await renameRow(entry, null)).toBeNull();
+    expect(await renameRow(entry, "  a.pdf ")).toBeNull();
+    expect(calls).toEqual([]);
+    answerNow("library_rename", changed(52, "done", "NOTE/Note/b.pdf"));
+    expect(await renameRow(entry, " b.pdf ")).toEqual({ from: "NOTE/Note/a.pdf", to: "NOTE/Note/b.pdf" });
+    expect(calls.map((c) => [c.command, c.args])).toEqual([["library_rename", { id: 1, name: "b.pdf" }]]);
+  });
+
+  it("makes a folder only with a name and a shown folder", async () => {
+    await makeFolder(null, "Plans");
+    await makeFolder("NOTE/Note", "  ");
+    await makeFolder("NOTE/Note", null);
+    expect(calls).toEqual([]);
+    await makeFolder("NOTE/Note", " Plans ");
+    expect(calls.map((c) => [c.command, c.args])).toEqual([["library_new_folder", { parent: "NOTE/Note", name: "Plans" }]]);
+  });
+
+  it("deletes an entry and reports it gone once done", async () => {
+    const entry = folder("NOTE/Note", ["a.pdf"], true).entries[0];
+    answerNow("library_delete", changed(53, "done", null));
+    expect(await deleteRow(entry)).toEqual({ from: "NOTE/Note/a.pdf", to: null });
+    answerNow("library_delete", changed(54, "failed", null));
+    expect(await deleteRow(entry)).toBeNull();
+  });
+});

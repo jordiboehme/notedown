@@ -1,6 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { answerAsk, clearedJobs, dropPlan, type AskChoice, type JobAction, type Point, type UploadArgs } from "../library/actions";
+import {
+  answerAsk,
+  clearedJobs,
+  dropPlan,
+  entryAt,
+  newName,
+  type AskChoice,
+  type Change,
+  type JobAction,
+  type Point,
+  type UploadArgs,
+} from "../library/actions";
 import { listingKey, type LibraryView } from "../library/view";
 import {
   LIBRARY_EVENT,
@@ -8,6 +19,7 @@ import {
   type Job,
   type LibraryEvent,
   type LibraryStateView,
+  type Entry,
   type Listing,
   type ShownListing,
   type UploadAsk,
@@ -42,6 +54,8 @@ type Store = {
   asks: Ask[];
   /** A short text about the last action that did not work (a drop, a download); null when none. */
   notice: string | null;
+  /** How many jobs each drop had, while any of them is kept: its title does not shrink. */
+  dropTotals: Record<number, number>;
 };
 
 /** An upload that asks before it starts: the next call of `library_upload` and its question. */
@@ -59,13 +73,17 @@ export const library = $state<Store>({
   ended: {},
   asks: [],
   notice: null,
+  dropTotals: {},
 });
 
 /**
- * Finds the folder under a drop (physical pixels of the web view), or the folder that is
- * shown; null when there is none. The window sets it: it needs the DOM.
+ * Finds the folder under a drop (physical pixels of the web view); null when there is none.
+ * The window sets it: it needs the DOM.
  */
 let dropTarget: ((position: Point) => string | null) | null = null;
+
+/** The jobs counted for each drop (by drop id), for `dropTotals`. */
+const counted = new Map<number, Set<number>>();
 
 /** What `library_shown` was last told, to call it only on a change. */
 let lastShown: string | null = null;
@@ -95,6 +113,8 @@ export function resetLibrary() {
   library.ended = {};
   library.asks = [];
   library.notice = null;
+  library.dropTotals = {};
+  counted.clear();
   dropTarget = null;
   lastShown = null;
   shownKeys = null;
@@ -128,6 +148,8 @@ export function applyEvent(event: LibraryEvent) {
       library.next = {};
       library.busy = {};
       library.generation += 1;
+      // Rust forgot the drops of the old binding: their questions cannot be answered.
+      library.asks = [];
       lastShown = null;
       shownKeys = null;
       break;
@@ -149,14 +171,38 @@ function keepJob(job: Job) {
   if (!ended && library.ended[job.id] !== undefined) return;
   library.jobs[job.id] = job;
   if (ended && library.ended[job.id] === undefined) library.ended[job.id] = Date.now();
+  if (job.dropId !== null) countJob(job.dropId, job.id);
+}
+
+function countJob(dropId: number, id: number) {
+  let ids = counted.get(dropId);
+  if (!ids) {
+    ids = new Set();
+    counted.set(dropId, ids);
+  }
+  if (ids.has(id)) return;
+  ids.add(id);
+  library.dropTotals[dropId] = ids.size;
+}
+
+/** Forgets the jobs `ids`, and the total of a drop none of whose jobs is kept anymore. */
+function forgetJobs(ids: number[]) {
+  if (ids.length === 0) return;
+  for (const id of ids) {
+    delete library.jobs[id];
+    delete library.ended[id];
+  }
+  const kept = new Set(Object.values(library.jobs).map((job) => job.dropId));
+  for (const dropId of [...counted.keys()]) {
+    if (kept.has(dropId)) continue;
+    counted.delete(dropId);
+    delete library.dropTotals[dropId];
+  }
 }
 
 /** Forgets the jobs whose rows are cleared at `now`. */
 export function clearJobs(now: number) {
-  for (const id of clearedJobs(library.jobs, library.ended, now)) {
-    delete library.jobs[id];
-    delete library.ended[id];
-  }
+  forgetJobs(clearedJobs(library.jobs, library.ended, now));
 }
 
 /** Sets how the window finds the folder of a drop (null: the window is gone). */
@@ -174,7 +220,7 @@ async function startDrop(dropId: number, folder: string | null, located: boolean
     await letGo(dropId);
     return;
   }
-  const plan = dropPlan(folder, null);
+  const plan = dropPlan(folder);
   if ("refuse" in plan) {
     library.notice = plan.refuse;
     await letGo(dropId);
@@ -236,8 +282,7 @@ export async function jobAction(job: Job, action: JobAction | "cancelAll") {
       if (job.result) await run("library_reveal", { path: job.result });
       break;
     case "clear":
-      delete library.jobs[job.id];
-      delete library.ended[job.id];
+      forgetJobs([job.id]);
       break;
   }
 }
@@ -272,6 +317,42 @@ export function deleteEntry(id: number) {
 
 export function downloadEntry(id: number) {
   return change("library_download", { id });
+}
+
+/** The change a done job made to `from`: Rust answers the new path in `result`. */
+function changed(job: Job | undefined, from: string, deleted = false): Change | null {
+  if (job?.state !== "done") return null;
+  if (deleted) return { from, to: null };
+  return job.result ? { from, to: job.result } : null;
+}
+
+/** Moves the entry `id` at `from` into `toFolder`; the change once it is done. */
+export async function moveRow(id: number, from: string, toFolder: string): Promise<Change | null> {
+  return changed(await moveEntry(id, toFolder), from);
+}
+
+/** Renames an entry to the typed name (null: given up); the change once it is done. */
+export async function renameRow(entry: Entry, typed: string | null): Promise<Change | null> {
+  const name = typed === null ? null : newName(typed, entry.name);
+  if (name === null) return null;
+  return changed(await renameEntry(entry.id, name), entry.path);
+}
+
+/** Makes a folder with the typed name (null: given up) in `parent`. */
+export async function makeFolder(parent: string | null, typed: string | null): Promise<void> {
+  const name = typed === null ? null : newName(typed, "");
+  if (parent === null || name === null) return;
+  await newFolder(parent, name);
+}
+
+/** Deletes an entry; the change once it is done. */
+export async function deleteRow(entry: Entry): Promise<Change | null> {
+  return changed(await deleteEntry(entry.id), entry.path, true);
+}
+
+/** The entry at `path` in any listing; null for none or a device tree. */
+export function entryOf(path: string | null): Entry | null {
+  return path === null ? null : entryAt(path, library.listings);
 }
 
 /**

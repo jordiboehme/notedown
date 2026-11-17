@@ -7,17 +7,18 @@
     answerUpload,
     chooseView,
     clearJobs,
-    deleteEntry,
+    deleteRow,
     downloadEntry,
+    entryOf,
     isBusy,
     jobAction,
     library,
     listFolder,
     listNext,
     loadView,
-    moveEntry,
-    newFolder,
-    renameEntry,
+    makeFolder,
+    moveRow,
+    renameRow,
     retryJobs,
     setDropTarget,
     showListings,
@@ -47,7 +48,7 @@
     type SidebarItem,
     type Sort,
   } from "./view";
-  import { entryActions, entryAt, folderAt, jobRows, newName, shownAfter } from "./actions";
+  import { entryActions, folderAt, followChange, jobRows, type Change } from "./actions";
   import { drag, folderUnder, letGo, moveTo, stopDrag } from "./drag.svelte";
   import "../lib/system.css";
   import "./library.css";
@@ -80,8 +81,8 @@
 
   // The file actions work on the picked row; in the columns, without one, on the shown folder.
   const actedOn = $derived(picked ?? (inTree ? null : selectedPath));
-  const actions = $derived(entryActions(actedOn ? entryAt(actedOn, library.listings) : null, selectedPath));
-  const groups = $derived(jobRows(library.jobs, library.ended, tick));
+  const actions = $derived(entryActions(entryOf(actedOn), selectedPath));
+  const groups = $derived(jobRows(library.jobs, library.ended, tick, library.dropTotals));
 
   function report(command: string) {
     return (error: unknown) => console.error(`notedown: ${command} failed`, error);
@@ -132,8 +133,8 @@
 
   onMount(() => {
     // A drop goes into the folder under it (the position is physical pixels of the web
-    // view), else into the folder that is shown.
-    setDropTarget((position) => folderAt(position, window.devicePixelRatio, folderUnder) ?? selectedPath);
+    // view); the shown folder's listing carries its path, so a drop there goes into it.
+    setDropTarget((position) => folderAt(position, window.devicePixelRatio, folderUnder));
     const stops = [startLibrary(), startStatus(), listen(NOTES_EVENT, loadNotes)];
     loadNotes();
     void loadView();
@@ -165,64 +166,37 @@
     picked = file;
   }
 
-  /** After a change of `from` (to `to`, null: deleted): the shown folder follows it. */
-  function follow(from: string, to: string | null) {
-    if (picked === from) picked = to;
-    if (selectedPath !== null) {
-      const shown = shownAfter(selectedPath, from, to);
-      if (shown !== selectedPath) select(shown);
-    }
+  /** After a change, the shown folder and the picked row follow it. */
+  function follow(change: Change | null) {
+    if (!change) return;
+    const next = followChange({ shown: selectedPath, picked }, change);
+    if (next.shown !== null && next.shown !== selectedPath) select(next.shown);
+    picked = next.picked;
   }
 
-  async function move(id: number, toFolder: string) {
-    const from = entryById(id)?.path;
-    const job = await moveEntry(id, toFolder);
-    if (from && job?.state === "done" && job.result) follow(from, job.result);
-  }
-
-  function entryById(id: number): Entry | null {
-    for (const listing of Object.values(library.listings)) {
-      const found = listing.entries.find((e) => e.id === id);
-      if (found) return found;
-    }
-    return null;
-  }
-
-  async function renamed(entry: Entry, typed: string | null) {
+  function rename(entry: Entry, typed: string | null) {
     renaming = null;
-    const name = typed === null ? null : newName(typed, entry.name);
-    if (name === null) return;
-    const job = await renameEntry(entry.id, name);
-    if (job?.state === "done" && job.result) follow(entry.path, job.result);
+    void renameRow(entry, typed).then(follow);
   }
 
-  async function named(typed: string | null) {
+  function named(typed: string | null) {
     naming = false;
-    const parent = selectedPath;
-    const name = typed === null ? null : newName(typed, "");
-    if (parent === null || name === null) return;
-    await newFolder(parent, name);
-  }
-
-  function acted(): Entry | null {
-    return actedOn ? entryAt(actedOn, library.listings) : null;
+    void makeFolder(selectedPath, typed);
   }
 
   async function remove() {
-    const entry = acted();
-    if (!entry) return;
-    const job = await deleteEntry(entry.id);
-    if (job?.state === "done") follow(entry.path, null);
+    const entry = entryOf(actedOn);
+    if (entry) follow(await deleteRow(entry));
   }
 
   function download() {
-    const entry = acted();
+    const entry = entryOf(actedOn);
     if (entry) void downloadEntry(entry.id);
   }
 
   function released() {
     const wanted = letGo();
-    if (wanted) void move(wanted.id, wanted.toFolder);
+    if (wanted) void moveRow(wanted.id, wanted.from, wanted.toFolder).then(follow);
   }
 
   function toggle(path: string) {
@@ -283,7 +257,7 @@
           {actions}
           {naming}
           onNewFolder={() => (naming = true)}
-          onNamed={(typed) => void named(typed)}
+          onNamed={named}
           onRename={() => (renaming = actedOn)}
           onDelete={() => void remove()}
           onDownload={download}
@@ -296,7 +270,7 @@
               {renaming}
               onSelect={select}
               onFile={pickFile}
-              onRename={(entry, typed) => void renamed(entry, typed)}
+              onRename={rename}
             />
           {/key}
         {:else}
@@ -313,7 +287,7 @@
               onOpen={select}
               onMore={() => void listNext(path, false)}
               onPick={(row) => (picked = row)}
-              onRename={(entry, typed) => void renamed(entry, typed)}
+              onRename={rename}
             />
           {/key}
         {/if}

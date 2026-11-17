@@ -199,11 +199,14 @@ pub enum LibraryEvent {
     /// child folders) or the list's (everything); the window may show the same path in both.
     /// `next` is the cursor of its next page (`None` once complete): a folder listed again from
     /// page 1 by the library itself (a gap, a long pause, a retry) pages on from it.
+    /// `revision` grows with every change of any listing; the window keeps the folder of the
+    /// higher one of an event and a `library_list` answer.
     #[serde(rename_all = "camelCase")]
     Folder {
         folder: FolderState,
         folders_only: bool,
         next: Option<String>,
+        revision: u64,
     },
     /// A job moved on.
     Job { job: Job },

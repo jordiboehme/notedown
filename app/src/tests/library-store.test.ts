@@ -98,8 +98,8 @@ describe("the library store", () => {
     applyEvent({ type: "state", state: "unreachable", text: "The server does not answer.", page: "server" });
     expect(library.view).toEqual({ state: "unreachable", text: "The server does not answer.", page: "server" });
 
-    applyEvent({ type: "folder", folder: folder("INBOX", ["a"], true), foldersOnly: false, next: null });
-    applyEvent({ type: "folder", folder: folder("INBOX", [], true), foldersOnly: true, next: null });
+    applyEvent({ type: "folder", folder: folder("INBOX", ["a"], true), foldersOnly: false, next: null, revision: 0 });
+    applyEvent({ type: "folder", folder: folder("INBOX", [], true), foldersOnly: true, next: null, revision: 0 });
     // The tree's listing and the list's of the same path stay apart.
     expect(library.listings["list:INBOX"].entries).toHaveLength(1);
     expect(library.listings["tree:INBOX"].entries).toHaveLength(0);
@@ -157,22 +157,49 @@ describe("the library store", () => {
     expect(library.back).toEqual({ kind: "new" });
   });
 
+  it("keeps the folder of the higher revision", async () => {
+    // An answer that comes after a newer event is older: it is not taken.
+    const late = answerLater("library_list");
+    const listing = listFolder("INBOX", false);
+    applyEvent({ type: "folder", folder: folder("INBOX", ["a", "b"], true), foldersOnly: false, next: null, revision: 8 });
+    late.release({ folder: folder("INBOX", ["a"], false), next: "t1:a", revision: 7 } satisfies Listing);
+    await listing;
+    expect(library.listings["list:INBOX"].entries.map((e) => e.name)).toEqual(["a", "b"]);
+    expect(library.next["list:INBOX"]).toBeNull();
+    // An older event neither; one as new as the kept folder is taken.
+    applyEvent({ type: "folder", folder: folder("INBOX", [], true), foldersOnly: false, next: null, revision: 6 });
+    expect(library.listings["list:INBOX"].entries).toHaveLength(2);
+    answerNow("library_list", { folder: folder("INBOX", ["c"], true), next: null, revision: 8 } satisfies Listing);
+    await listFolder("INBOX", false);
+    expect(library.listings["list:INBOX"].entries.map((e) => e.name)).toEqual(["c"]);
+    // A new binding starts over: Rust's revisions go on, the window forgets the old ones.
+    applyEvent({ type: "relist" });
+    applyEvent({ type: "folder", folder: folder("INBOX", ["d"], true), foldersOnly: false, next: null, revision: 9 });
+    expect(library.listings["list:INBOX"].entries.map((e) => e.name)).toEqual(["d"]);
+    // A listing the window stops showing forgets its revision: a lower one after it is taken
+    // (Rust's revisions only grow, so this is a test of the forgetting).
+    showListings([]);
+    showListings([{ path: "INBOX", foldersOnly: false }]);
+    applyEvent({ type: "folder", folder: folder("INBOX", ["e"], true), foldersOnly: false, next: null, revision: 1 });
+    expect(library.listings["list:INBOX"].entries.map((e) => e.name)).toEqual(["e"]);
+  });
+
   it("forgets the cursor of a folder that an event shows complete", async () => {
-    answerNow("library_list", { folder: folder("INBOX", ["a"], false), next: "t1:a" } satisfies Listing);
+    answerNow("library_list", { folder: folder("INBOX", ["a"], false), next: "t1:a", revision: 0 } satisfies Listing);
     await listFolder("INBOX", false);
     expect(library.next["list:INBOX"]).toBe("t1:a");
-    applyEvent({ type: "folder", folder: folder("INBOX", ["a", "b"], true), foldersOnly: false, next: null });
+    applyEvent({ type: "folder", folder: folder("INBOX", ["a", "b"], true), foldersOnly: false, next: null, revision: 0 });
     expect(library.next["list:INBOX"]).toBeNull();
   });
 
   it("pages on with the cursor of a folder Rust listed again by itself", async () => {
     showListings([{ path: "INBOX", foldersOnly: false }]);
-    answerNow("library_list", { folder: folder("INBOX", ["a", "b"], true), next: null } satisfies Listing);
+    answerNow("library_list", { folder: folder("INBOX", ["a", "b"], true), next: null, revision: 0 } satisfies Listing);
     await listFolder("INBOX", false);
     // A gap: Rust lists page 1 again and sends it with its cursor.
-    applyEvent({ type: "folder", folder: folder("INBOX", ["a"], false), foldersOnly: false, next: "t2:a" });
+    applyEvent({ type: "folder", folder: folder("INBOX", ["a"], false), foldersOnly: false, next: "t2:a", revision: 0 });
     expect(library.next["list:INBOX"]).toBe("t2:a");
-    answerNow("library_list", { folder: folder("INBOX", ["a", "b"], true), next: null } satisfies Listing);
+    answerNow("library_list", { folder: folder("INBOX", ["a", "b"], true), next: null, revision: 0 } satisfies Listing);
     await listNext("INBOX", false);
     expect(calls.at(-1)).toEqual({
       command: "library_list",
@@ -200,7 +227,7 @@ describe("the library store", () => {
   });
 
   it("lists a folder page by page, one call at a time", async () => {
-    answerNow("library_list", { folder: folder("INBOX", ["a"], false), next: "t1:a" } satisfies Listing);
+    answerNow("library_list", { folder: folder("INBOX", ["a"], false), next: "t1:a", revision: 0 } satisfies Listing);
     await listFolder("INBOX", false);
     expect(calls.at(-1)).toEqual({
       command: "library_list",
@@ -212,7 +239,7 @@ describe("the library store", () => {
     expect(isBusy("INBOX", false)).toBe(true);
     void listNext("INBOX", false);
     expect(calls.filter((c) => c.command === "library_list")).toHaveLength(2);
-    second.release({ folder: folder("INBOX", ["a", "b"], true), next: null } satisfies Listing);
+    second.release({ folder: folder("INBOX", ["a", "b"], true), next: null, revision: 0 } satisfies Listing);
     await going;
     expect(isBusy("INBOX", false)).toBe(false);
     expect(library.listings["list:INBOX"].entries.map((e) => e.name)).toEqual(["a", "b"]);
@@ -227,7 +254,7 @@ describe("the library store", () => {
     const going = listFolder("EXPORT", true);
     applyEvent({ type: "relist" });
     expect(isBusy("EXPORT", true)).toBe(false);
-    late.release({ folder: folder("EXPORT", ["old"], true), next: null } satisfies Listing);
+    late.release({ folder: folder("EXPORT", ["old"], true), next: null, revision: 0 } satisfies Listing);
     await going;
     expect(library.listings["tree:EXPORT"]).toBeUndefined();
   });
@@ -250,7 +277,7 @@ describe("the library store", () => {
   it("takes no listing that is not shown, so a folder opened again is listed fresh", async () => {
     showListings([]);
     // A follower event that was on its way when the folder closed.
-    applyEvent({ type: "folder", folder: folder("EXPORT", ["a"], false), foldersOnly: true, next: null });
+    applyEvent({ type: "folder", folder: folder("EXPORT", ["a"], false), foldersOnly: true, next: null, revision: 0 });
     expect(library.listings["tree:EXPORT"]).toBeUndefined();
     showListings([{ path: "EXPORT", foldersOnly: true }]);
     expect(library.listings["tree:EXPORT"]).toBeUndefined();
@@ -259,7 +286,7 @@ describe("the library store", () => {
     const late = answerLater("library_list");
     const going = listFolder("EXPORT", true);
     showListings([]);
-    late.release({ folder: folder("EXPORT", ["a"], true), next: null } satisfies Listing);
+    late.release({ folder: folder("EXPORT", ["a"], true), next: null, revision: 0 } satisfies Listing);
     await going;
     expect(library.listings["tree:EXPORT"]).toBeUndefined();
     const failing = answerLater("library_list");
@@ -294,8 +321,8 @@ describe("the library store", () => {
     ]);
     // A listing that is not shown any more is not followed by Rust: the store forgets it, so
     // opening the folder again lists it again.
-    applyEvent({ type: "folder", folder: folder("NOTE/Note", [], true), foldersOnly: true, next: null });
-    applyEvent({ type: "folder", folder: folder("INBOX", ["a"], false), foldersOnly: false, next: null });
+    applyEvent({ type: "folder", folder: folder("NOTE/Note", [], true), foldersOnly: true, next: null, revision: 0 });
+    applyEvent({ type: "folder", folder: folder("INBOX", ["a"], false), foldersOnly: false, next: null, revision: 0 });
     library.next["list:INBOX"] = "t1:a";
     showListings([{ path: "INBOX", foldersOnly: false }]);
     expect(Object.keys(library.listings)).toEqual(["list:INBOX"]);

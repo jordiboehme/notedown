@@ -134,6 +134,20 @@ let lastShown: string | null = null;
  * the folder opened again is listed fresh.
  */
 let shownKeys: Set<string> | null = null;
+/**
+ * The revision of each kept listing (Rust's, from its folder events and `library_list`
+ * answers): an event or an answer with a lower one is older than what is kept and is dropped.
+ */
+const revisions = new Map<string, number>();
+
+/** Keeps `folder` as the listing `key` unless what is kept has a higher revision. */
+function keepListing(key: string, folder: FolderState, next: string | null, revision: number) {
+  if (revision < (revisions.get(key) ?? -1)) return;
+  revisions.set(key, revision);
+  library.listings[key] = folder;
+  library.next[key] = next;
+}
+
 /** Counts the bin's page 1 calls: an answer of an older one is dropped. */
 let binEpoch = 0;
 /** Whether the user chose a view in this window: a config read that answers later is stale. */
@@ -164,6 +178,7 @@ export function resetLibrary() {
   library.selection = { kind: "new" };
   library.back = { kind: "new" };
   binEpoch += 1;
+  revisions.clear();
   counted.clear();
   dropTarget = null;
   lastShown = null;
@@ -186,8 +201,7 @@ export function applyEvent(event: LibraryEvent) {
     case "folder": {
       const key = listingKey(event.folder.path, event.foldersOnly);
       if (!isShown(key)) break;
-      library.listings[key] = event.folder;
-      library.next[key] = event.next;
+      keepListing(key, event.folder, event.next, event.revision);
       break;
     }
     case "job":
@@ -197,6 +211,7 @@ export function applyEvent(event: LibraryEvent) {
       library.listings = {};
       library.next = {};
       library.busy = {};
+      revisions.clear();
       library.generation += 1;
       // Rust forgot the drops of the old binding: their questions cannot be answered.
       library.asks = [];
@@ -454,8 +469,7 @@ async function list(path: string, foldersOnly: boolean, cursor: string | null) {
   try {
     const listing = await invoke<Listing>("library_list", { path, cursor, foldersOnly });
     if (library.generation !== generation || !isShown(key)) return;
-    library.listings[key] = listing.folder;
-    library.next[key] = listing.next;
+    keepListing(key, listing.folder, listing.next, listing.revision);
   } catch (error) {
     const text = String(error);
     if (library.generation !== generation || text === CHANGED || !isShown(key)) return;
@@ -496,6 +510,7 @@ export function showListings(listings: ShownListing[], binShown = false) {
   shownKeys = kept;
   for (const old of Object.keys(library.listings)) if (!kept.has(old)) delete library.listings[old];
   for (const old of Object.keys(library.next)) if (!kept.has(old)) delete library.next[old];
+  for (const old of [...revisions.keys()]) if (!kept.has(old)) revisions.delete(old);
   invoke("library_shown", { listings, binShown }).catch(report("library_shown"));
 }
 

@@ -86,12 +86,14 @@ pub struct Event {
     pub size: Option<u64>,
 }
 
-/// A folder as the window gets it, with the cursor of its next page.
+/// A folder as the window gets it, with the cursor of its next page and its revision (see
+/// [`Cache`]): the window keeps the higher one of an answer and an event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Listed {
     pub folder: FolderState,
     pub next: Option<String>,
+    pub revision: u64,
 }
 
 /// Allows a fetched page to be merged: the binding and the listing it was asked for.
@@ -150,6 +152,8 @@ struct Folder {
     /// later. Only during [`Cache::apply`].
     covered: bool,
     error: Option<String>,
+    /// The revision of its last change the window heard of.
+    revision: u64,
 }
 
 impl Folder {
@@ -213,6 +217,10 @@ pub struct Cache {
     fresh: BTreeSet<Key>,
     /// Waiting folders: when to try again, and the wait after the next failure.
     retry: HashMap<Key, (u64, u64)>,
+    /// The last revision given out. Every folder event takes the next one, so a later change
+    /// of a listing always has a higher revision than an earlier one, also after the listing
+    /// was dropped and listed again or the library bound again (it never starts over).
+    revision: u64,
 }
 
 /// The folder of `path`: everything before its last `/`, or the root.
@@ -233,7 +241,7 @@ pub fn at_or_below(path: &str, top: &str) -> bool {
 }
 
 /// The folder event of a listing that is not there: no entries and `text`.
-fn gone_event(key: &Key, text: &str) -> LibraryEvent {
+fn gone_event(key: &Key, text: &str, revision: u64) -> LibraryEvent {
     LibraryEvent::Folder {
         folder: FolderState {
             path: key.path.clone(),
@@ -244,6 +252,7 @@ fn gone_event(key: &Key, text: &str) -> LibraryEvent {
         },
         folders_only: key.folders_only,
         next: None,
+        revision,
     }
 }
 
@@ -331,6 +340,7 @@ impl Cache {
         self.folders.get(key).map(|f| Listed {
             folder: f.state(&key.path),
             next: f.next.clone(),
+            revision: f.revision,
         })
     }
 
@@ -376,6 +386,7 @@ impl Cache {
             return Continue::Current(Listed {
                 folder: folder.state(&key.path),
                 next: folder.next.clone(),
+                revision: folder.revision,
             });
         }
         let before = folder.state(&key.path);
@@ -413,7 +424,10 @@ impl Cache {
             self.folders.remove(key);
             return None;
         }
-        let before = self.folders.get(key).map(|f| f.state(&key.path));
+        let before = self
+            .folders
+            .get(key)
+            .map(|f| (f.state(&key.path), f.revision));
         let mut folder = Folder {
             entries: Vec::new(),
             seq: page.seq,
@@ -425,6 +439,7 @@ impl Cache {
             relist_error: false,
             covered: false,
             error: None,
+            revision: before.as_ref().map_or(0, |(_, revision)| *revision),
         };
         for entry in page.entries {
             if !key.folders_only || entry.kind == EntryKind::Folder {
@@ -433,8 +448,11 @@ impl Cache {
         }
         self.folders.insert(key.clone(), folder);
         match before {
-            Some(before) => self.announce(key, before, out),
-            None => out.push(self.event(key)),
+            Some((before, _)) => self.announce(key, before, out),
+            None => {
+                let event = self.event(key);
+                out.push(event);
+            }
         }
         self.listed(key)
     }
@@ -547,7 +565,8 @@ impl Cache {
             None => {
                 let told = self.pending.insert(key.clone(), Some(text.to_owned()));
                 if told.flatten().as_deref() != Some(text) {
-                    out.push(gone_event(key, text));
+                    let event = gone_event(key, text, self.next_revision());
+                    out.push(event);
                 }
             }
         }
@@ -561,7 +580,8 @@ impl Cache {
         self.folders.remove(key);
         self.pending.remove(key);
         self.retry.remove(key);
-        out.push(gone_event(key, text));
+        let event = gone_event(key, text, self.next_revision());
+        out.push(event);
     }
 
     /// Applies a page of events read from `from` in order. It covers only the folders that
@@ -610,24 +630,30 @@ impl Cache {
         let mut keys: Vec<&Key> = before.keys().collect();
         keys.sort();
         for key in keys {
-            if let Some(folder) = self.folders.get(key)
-                && folder.state(&key.path) != before[key]
+            if self
+                .folders
+                .get(key)
+                .is_some_and(|folder| folder.state(&key.path) != before[key])
             {
-                out.push(self.event(key));
+                let event = self.event(key);
+                out.push(event);
             }
         }
-        let mut added: Vec<&Key> = self
+        let mut added: Vec<Key> = self
             .folders
             .keys()
             .filter(|k| !before.contains_key(*k))
+            .cloned()
             .collect();
         added.sort();
-        for key in added {
-            out.push(self.event(key));
+        for key in &added {
+            let event = self.event(key);
+            out.push(event);
         }
         for key in &applied.gone {
             if !self.folders.contains_key(key) {
-                out.push(gone_event(key, GONE));
+                let event = gone_event(key, GONE, self.next_revision());
+                out.push(event);
             }
         }
         for key in &applied.relist {
@@ -840,20 +866,34 @@ impl Cache {
         }
     }
 
-    fn event(&self, key: &Key) -> LibraryEvent {
+    /// The next revision.
+    fn next_revision(&mut self) -> u64 {
+        self.revision += 1;
+        self.revision
+    }
+
+    /// The folder event of `key`, with the next revision (the folder keeps it).
+    fn event(&mut self, key: &Key) -> LibraryEvent {
+        let revision = self.next_revision();
+        let folder = self.folders.get_mut(key).expect("a listed folder");
+        folder.revision = revision;
         LibraryEvent::Folder {
-            folder: self.folders[key].state(&key.path),
+            folder: folder.state(&key.path),
             folders_only: key.folders_only,
-            next: self.folders[key].next.clone(),
+            next: folder.next.clone(),
+            revision,
         }
     }
 
     /// Sends the folder when it changed.
-    fn announce(&self, key: &Key, before: FolderState, out: &mut Vec<LibraryEvent>) {
-        if let Some(folder) = self.folders.get(key)
-            && folder.state(&key.path) != before
+    fn announce(&mut self, key: &Key, before: FolderState, out: &mut Vec<LibraryEvent>) {
+        if self
+            .folders
+            .get(key)
+            .is_some_and(|folder| folder.state(&key.path) != before)
         {
-            out.push(self.event(key));
+            let event = self.event(key);
+            out.push(event);
         }
     }
 }
@@ -1002,6 +1042,64 @@ mod tests {
         cache.merge_next(t, &c, "t1:c", page(15, vec![file(4, "C/x")], None), out);
         cache.insert_fetched(1, applied.end, vec![(file(5, "C/b"), 12)], out);
         assert_eq!(names(&cache, &c), ["b", "c", "x"]);
+    }
+
+    fn revision_of(event: &LibraryEvent) -> u64 {
+        match event {
+            LibraryEvent::Folder { revision, .. } => *revision,
+            other => panic!("not a folder event: {other:?}"),
+        }
+    }
+
+    /// Every change of a listing gets a higher revision than any before it, also after the
+    /// listing was dropped and listed again: the window keeps the higher one, so an answer
+    /// that comes after a newer event is not taken.
+    #[test]
+    fn every_change_of_a_listing_has_a_higher_revision() {
+        let mut cache = Cache::default();
+        cache.clear(1);
+        let out = &mut Vec::new();
+        let a = Key::new("A", false);
+        let t = cache.begin_first(1, &a);
+        let answered = cache
+            .merge_first(
+                t,
+                &a,
+                page(10, vec![file(1, "A/a"), file(2, "A/b")], None),
+                true,
+                out,
+            )
+            .unwrap();
+        assert_eq!(revision_of(&out[0]), answered.revision);
+        // The follower deletes one: the event is newer than the answer.
+        out.clear();
+        cache.apply(1, 11, &batch(vec![deleted(12, 2, "A/b")], 13), out);
+        let changed = revision_of(&out[0]);
+        assert!(changed > answered.revision);
+        assert_eq!(cache.listed(&a).unwrap().revision, changed);
+        // A batch that changes nothing keeps it.
+        out.clear();
+        cache.apply(1, 13, &batch(vec![], 14), out);
+        assert!(out.is_empty());
+        assert_eq!(cache.listed(&a).unwrap().revision, changed);
+        // Gone, then listed again: still higher.
+        cache.gone(1, &a, GONE, out);
+        let gone = revision_of(out.last().unwrap());
+        assert!(gone > changed);
+        out.clear();
+        let t = cache.begin_first(1, &a);
+        let again = cache
+            .merge_first(t, &a, page(20, vec![file(1, "A/a")], None), true, out)
+            .unwrap();
+        assert!(again.revision > gone);
+        // A new binding does not start over.
+        cache.clear(2);
+        out.clear();
+        let t = cache.begin_first(2, &a);
+        let bound = cache
+            .merge_first(t, &a, page(30, vec![], None), true, out)
+            .unwrap();
+        assert!(bound.revision > again.revision);
     }
 
     #[test]

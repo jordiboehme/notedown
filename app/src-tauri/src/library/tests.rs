@@ -602,6 +602,7 @@ fn no_library_event_holds_the_token() {
         },
         folders_only: true,
         next: Some("t1:a.note".into()),
+        revision: 6,
     };
     let job = LibraryEvent::Job {
         job: Job {
@@ -629,7 +630,7 @@ fn no_library_event_holds_the_token() {
                 "size": 12, "md5": "0123456789abcdef0123456789abcdef",
                 "mtimeMs": 1_763_300_000_000_i64, "writable": true }],
             "complete": false, "loading": true, "error": "The server does not answer." },
-            "foldersOnly": true, "next": "t1:a.note" })
+            "foldersOnly": true, "next": "t1:a.note", "revision": 6 })
     );
     assert_eq!(
         serde_json::to_value(&job).unwrap(),

@@ -216,6 +216,8 @@ impl Library {
                         error: None,
                     },
                     next: page.next.clone(),
+                    // Not kept: any revision the window holds is newer.
+                    revision: 0,
                 };
                 let merged = self.with_cache(|c, out| {
                     (c.generation() == generation)

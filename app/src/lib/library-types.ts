@@ -22,9 +22,11 @@ export type FolderState = {
 
 /**
  * The answer of `library_list`: the folder as loaded so far (it replaces what the window shows)
- * and the cursor of its next page, or null once it is complete.
+ * and the cursor of its next page, or null once it is complete. `revision` grows with every
+ * change Rust sends (folder events carry it too): the window keeps the folder of the higher one,
+ * so an answer that comes after a newer event is dropped.
  */
-export type Listing = { folder: FolderState; next: string | null };
+export type Listing = { folder: FolderState; next: string | null; revision: number };
 
 /**
  * A listing the window shows, for `library_shown(listings, binShown)`: the library keeps and
@@ -95,7 +97,7 @@ export type Job = {
  */
 export type LibraryEvent =
   | { type: "state"; state: LibraryState; text: string | null; page: string | null }
-  | { type: "folder"; folder: FolderState; foldersOnly: boolean; next: string | null }
+  | { type: "folder"; folder: FolderState; foldersOnly: boolean; next: string | null; revision: number }
   | { type: "job"; job: Job }
   | { type: "relist" }
   | { type: "recycle" }

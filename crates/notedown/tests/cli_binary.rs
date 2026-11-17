@@ -3145,3 +3145,26 @@ read x || true"#,
     }
     drop(stream);
 }
+
+#[test]
+fn cloud_backup_device_json_ends_with_the_report_and_one_error_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("b");
+    let out = notedown(&[
+        "cloud",
+        "backup-device",
+        "http://127.0.0.1:1",
+        target.to_str().unwrap(),
+        "--utc-offset",
+        "+02:00",
+        "--json",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    let text = stdout(&out);
+    let last = text.lines().last().expect("a report line");
+    let v: serde_json::Value = serde_json::from_str(last).unwrap();
+    assert_eq!(v["report"]["errors"].as_array().unwrap().len(), 1);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let errors = stderr.lines().filter(|l| l.starts_with("error: ")).count();
+    assert_eq!(errors, 1, "{stderr}");
+}

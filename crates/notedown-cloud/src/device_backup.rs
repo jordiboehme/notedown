@@ -433,7 +433,7 @@ impl Run<'_> {
                         (self.progress)(BackupProgress::Downloaded {
                             files: self.report.files,
                             bytes: self.report.bytes,
-                            path: &here.join("/"),
+                            path: &path,
                         });
                     }
                     Err(e) => self.error(path, e),

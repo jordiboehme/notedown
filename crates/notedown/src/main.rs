@@ -1557,7 +1557,7 @@ fn backup_device_command(args: BackupDeviceArgs) -> Result<ExitCode> {
     // SIGTERM ends the run as it is; the .part files stay and --resume continues.
     exit_with_parent(args.exit_with_parent);
     let json = args.json;
-    let mut last = std::time::Instant::now() - Duration::from_secs(10);
+    let mut last: Option<std::time::Instant> = None;
     // the newest progress not yet printed (json mode), printed at the end at the latest
     let mut pending: Option<(u64, u64, String)> = None;
     let printed = |files: u64, bytes: u64, path: &str| {
@@ -1570,8 +1570,8 @@ fn backup_device_command(args: BackupDeviceArgs) -> Result<ExitCode> {
         use notedown_cloud::device_backup::BackupProgress as P;
         match event {
             P::Downloaded { files, bytes, path } if json => {
-                if last.elapsed() >= Duration::from_millis(250) {
-                    last = std::time::Instant::now();
+                if last.is_none_or(|t| t.elapsed() >= Duration::from_millis(250)) {
+                    last = Some(std::time::Instant::now());
                     pending = None;
                     printed(files, bytes, path);
                 } else {

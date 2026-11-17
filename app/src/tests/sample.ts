@@ -1,4 +1,5 @@
 import type { Status } from "../lib/api";
+import type { AppConfig, ModelState } from "../settings/api";
 
 /** A Local setup where everything runs, as a base for the tests to change. */
 export function sampleStatus(now: number): Status {
@@ -39,4 +40,33 @@ export function notSetUp(): Status {
     account: null,
     connection: "unknown",
   };
+}
+
+/** A Local config logged in as "me", as a base for the tests to change. */
+export function sampleConfig(): AppConfig {
+  return {
+    version: 1,
+    mode: "local",
+    dataDir: "/Users/me/notedown-data",
+    serverUrl: null,
+    account: "me",
+    email: "me@example.org",
+    startView: "tree",
+    markdownDirs: {},
+    setup: {
+      backupUrl: null,
+      backupDir: null,
+      snbak: null,
+      setupShown: true,
+      autostartOffered: true,
+      syncMark: null,
+      syncChecked: null,
+      syncAcknowledged: false,
+    },
+  };
+}
+
+/** The model on disk and ready. */
+export function readyModel(): ModelState {
+  return { installed: true, sizeBytes: 3_400_000_000, path: "/m/model", pulling: false, progress: null, problem: null };
 }

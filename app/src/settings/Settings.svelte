@@ -112,7 +112,7 @@
       {:else if page === "ocr"}<OcrPage {now} />
       {:else if page === "server"}<ServerPage />
       {:else if page === "account"}<AccountPage />
-      {:else if page === "setup"}<SetupPage onServer={() => show("server")} />
+      {:else if page === "setup"}<SetupPage onOpen={open} />
       {:else}<AboutPage {version} onOpen={open} />
       {/if}
     {/key}

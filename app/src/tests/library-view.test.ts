@@ -270,7 +270,7 @@ describe("the state of the library", () => {
     ["notSetUp", "Choose where the server runs in Settings.", "server"],
     ["loggedOut", "Log in to see your library.", "account"],
     ["unreachable", "The server does not answer.", "server"],
-    ["notImported", "The Supernote has not been imported yet.", "supernote"],
+    ["notImported", "The Supernote has not been imported yet.", "setup"],
     ["refused", "The server refused the login. Log in again.", "account"],
   ];
 

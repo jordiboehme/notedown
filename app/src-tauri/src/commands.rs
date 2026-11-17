@@ -294,6 +294,22 @@ impl ConfigState {
         }
     }
 
+    /// Whether this is the first start that opens Settings at Setup: no mode yet and Setup
+    /// not shown before. Answers true once; `setupShown` is saved with it.
+    pub fn take_first_start(&self) -> Result<bool, String> {
+        match self.try_update(|c| {
+            if c.mode != Mode::NotSet || c.setup.setup_shown {
+                return Err(());
+            }
+            c.setup.setup_shown = true;
+            Ok(())
+        }) {
+            Ok(_) => Ok(true),
+            Err(TryUpdateError::Refused(())) => Ok(false),
+            Err(TryUpdateError::NotSaved(why)) => Err(why),
+        }
+    }
+
     /// Both imports are done: the backup folder and the `.snbak` are no longer needed.
     pub fn imports_done(&self) -> Result<AppConfig, String> {
         self.update(|c| {
@@ -2112,6 +2128,27 @@ mod tests {
             .unwrap();
         assert_eq!(cfg.data_dir, PathBuf::from("/data/x"));
         assert_eq!(cfg.server_url.as_deref(), Some("https://n.example.org"));
+    }
+
+    #[test]
+    fn setup_opens_once_on_the_first_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        assert!(state.take_first_start().unwrap());
+        assert!(state.current().setup.setup_shown);
+        assert!(!state.take_first_start().unwrap());
+        // Also after the next start.
+        let again = ConfigState::load(dir.path().to_owned());
+        assert!(!again.take_first_start().unwrap());
+
+        // A Mac with a mode (an older config) does not get the setup at its first start.
+        let set = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(set.path().to_owned());
+        state
+            .set_mode(Mode::Local, Some("/data/a".into()), None)
+            .unwrap();
+        assert!(!state.take_first_start().unwrap());
+        assert!(!state.current().setup.setup_shown);
     }
 
     #[test]

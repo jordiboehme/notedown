@@ -43,7 +43,7 @@ use status::Status;
 use supervisor::ChildState;
 use token::KeychainStore;
 use tray::{TrayIconKind, tray_icon_for};
-use windows::Shown;
+use windows::{Opening, Shown, WindowKind};
 
 /// The bundle identifier of the app, as `tauri.conf.json` names it. The app's config, data and
 /// Keychain entries are filed under it.
@@ -175,6 +175,21 @@ pub fn run() {
             app.manage(poller.clone());
             supervise(app.handle().clone());
             poll(poller);
+            // The first start opens Settings at Setup, once. Last: showing a window tells the
+            // poller, the library and the notes, which are all managed by now.
+            match app.state::<commands::ConfigState>().take_first_start() {
+                Ok(true) => {
+                    if let Err(why) = windows::show_window(
+                        app.handle(),
+                        WindowKind::Settings,
+                        Opening::Page("setup".into()),
+                    ) {
+                        eprintln!("notedown: the setup did not open: {why}");
+                    }
+                }
+                Ok(false) => {}
+                Err(why) => eprintln!("notedown: the first start was not saved: {why}"),
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

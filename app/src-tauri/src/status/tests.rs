@@ -485,6 +485,11 @@ fn outside_and_not_connected_are_not_attention() {
         OUTSIDE_LINE,
         "Notedown runs outside the app. Stop it there, then press Start."
     );
+    // Step 1 of the setup checklist says it too.
+    assert!(
+        include_str!("../../../src/settings/checklist.ts")
+            .contains(&format!("OUTSIDE_LINE = \"{OUTSIDE_LINE}\"")),
+    );
     assert!(s.attention.is_empty(), "{:?}", s.attention);
 
     let mut remote = local();

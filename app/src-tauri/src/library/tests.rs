@@ -428,6 +428,14 @@ fn a_login_binds_the_library() {
 }
 
 #[test]
+fn not_imported_opens_setup() {
+    // The import is step 5 of the setup checklist, not a row of the Supernote page.
+    assert_eq!(LibraryState::NotImported.settings_page(), Some("setup"));
+    let view = serde_json::to_value(state_event(LibraryState::NotImported)).unwrap();
+    assert_eq!(view["page"], json!("setup"));
+}
+
+#[test]
 fn each_state_has_its_text_and_settings_page() {
     use LibraryState::*;
     let table = [
@@ -453,7 +461,7 @@ fn each_state_has_its_text_and_settings_page() {
             NotImported,
             "notImported",
             Some("The Supernote has not been imported yet."),
-            Some("supernote"),
+            Some("setup"),
         ),
         (
             Refused,

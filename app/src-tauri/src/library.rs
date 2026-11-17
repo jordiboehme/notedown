@@ -71,7 +71,8 @@ impl LibraryState {
         match self {
             Self::NotSetUp | Self::Unreachable => Some("server"),
             Self::LoggedOut | Self::Refused => Some("account"),
-            Self::NotImported => Some("supernote"),
+            // The import is step 5 of the setup checklist.
+            Self::NotImported => Some("setup"),
             Self::Ready => None,
         }
     }

@@ -295,6 +295,9 @@ impl Deliver for MacDeliver {
             UNAuthorizationOptions::Alert,
             &done,
         );
+        // The system keeps its own copy of the block. Without ours, a block the system drops
+        // without calling it closes the channel, and the wait below ends with Unknown.
+        drop(done);
         // The user answers a system dialog: no short timeout. Then the state as the settings
         // say it, so Provisional and a denial map as in `authorization`.
         match rx.recv() {

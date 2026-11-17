@@ -1,7 +1,8 @@
 //! How a notice reaches the user: the [`Deliver`] trait, the macOS backend behind it
-//! (`notify::macos`), and [`FakeDeliver`] for tests. The real notification center is never
+//! (`notify::macos`), and `FakeDeliver` for tests. The real notification center is never
 //! called in a test.
 
+#[cfg(test)]
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -34,7 +35,8 @@ pub trait Deliver: Send + Sync {
     fn request(&self) -> Authorization;
 }
 
-/// A [`Deliver`] that only records: the notices shown and the requests made.
+/// A [`Deliver`] that only records: the notices shown and the requests made. Tests only.
+#[cfg(test)]
 #[derive(Debug)]
 pub struct FakeDeliver {
     shown: Mutex<Vec<Notice>>,
@@ -44,6 +46,7 @@ pub struct FakeDeliver {
     requests: Mutex<u32>,
 }
 
+#[cfg(test)]
 impl FakeDeliver {
     /// A fake whose authorization is `now` and whose request answers `answer`.
     pub fn new(now: Authorization, answer: Authorization) -> Self {
@@ -66,12 +69,14 @@ impl FakeDeliver {
     }
 }
 
+#[cfg(test)]
 impl Default for FakeDeliver {
     fn default() -> Self {
         Self::new(Authorization::Allowed, Authorization::Allowed)
     }
 }
 
+#[cfg(test)]
 impl Deliver for FakeDeliver {
     fn show(&self, n: &Notice) {
         self.shown

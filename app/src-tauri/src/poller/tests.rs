@@ -39,6 +39,12 @@ struct Fake {
     account_calls: Mutex<Vec<(String, bool)>>,
     pipeline_answer: Mutex<Option<PipelineCall>>,
     account_answer: Mutex<Option<AccountAnswer>>,
+    /// The bases `events_end` was asked for, and its answer.
+    events_calls: Mutex<Vec<String>>,
+    events_answer: Mutex<Option<Result<u64, String>>>,
+    /// The marks `first_sync` was asked for (mode and seq), and its answer.
+    check_calls: Mutex<Vec<(Mode, u64)>>,
+    check_answer: Mutex<Option<Result<SyncCheck, String>>>,
     /// While true, every call waits.
     held: Mutex<bool>,
     released: Condvar,
@@ -96,6 +102,26 @@ impl Sources for Fake {
             .unwrap_or(AccountAnswer::Refused);
         self.leave();
         answer
+    }
+
+    fn events_end(&self, base: &str, _token: &Token) -> Result<u64, String> {
+        lock(&self.events_calls).push(base.to_owned());
+        lock(&self.events_answer)
+            .clone()
+            .unwrap_or_else(|| Err("no answer".to_owned()))
+    }
+
+    fn first_sync(
+        &self,
+        config: &AppConfig,
+        _base: &str,
+        _token: &Token,
+        mark: u64,
+    ) -> Result<SyncCheck, String> {
+        lock(&self.check_calls).push((config.mode, mark));
+        lock(&self.check_answer)
+            .clone()
+            .unwrap_or_else(|| Err("no answer".to_owned()))
     }
 }
 
@@ -784,4 +810,284 @@ fn an_address_in_a_line_has_no_credentials() {
         "http://127.0.0.1:19072/rest/v1"
     );
     assert_eq!(shown("not a url"), "the server");
+}
+
+#[test]
+fn the_poller_takes_the_mark_of_an_import_on_another_machine() {
+    use crate::config::SyncMark;
+    let url = "https://n.example.org";
+    let key = format!("{url}|jordi");
+    let rig = Rig::new(AppConfig {
+        mode: Mode::Remote,
+        server_url: Some(url.into()),
+        account: Some("jordi".into()),
+        ..AppConfig::default()
+    });
+    rig.tokens.set(&key, &Token::new("t")).unwrap();
+    let marks: Arc<Mutex<Vec<SyncMark>>> = Arc::default();
+    let seen = marks.clone();
+    rig.poller.on_sync_mark(move |mark| lock(&seen).push(mark));
+    let account = |imported: Option<bool>| {
+        AccountAnswer::Account(AccountInfo {
+            slug: "jordi".into(),
+            imported,
+            ..AccountInfo::default()
+        })
+    };
+    *lock(&rig.fake.events_answer) = Some(Ok(813));
+    // Not imported yet, or an older server that does not say: no mark.
+    for imported in [Some(false), None] {
+        *lock(&rig.fake.account_answer) = Some(account(imported));
+        rig.poller.poll_now();
+        rig.settle();
+    }
+    assert!(lock(&rig.fake.events_calls).is_empty());
+    // A failed call is tried again, but at most once a minute.
+    *lock(&rig.fake.account_answer) = Some(account(Some(true)));
+    *lock(&rig.fake.events_answer) = Some(Err("no answer".into()));
+    rig.poller.poll_now();
+    rig.settle();
+    assert!(lock(&marks).is_empty());
+    *lock(&rig.fake.events_answer) = Some(Ok(813));
+    rig.advance(30 * SEC);
+    rig.poller.poll_now();
+    rig.settle();
+    assert!(lock(&marks).is_empty());
+    assert_eq!(lock(&rig.fake.events_calls).len(), 1);
+    rig.advance(30 * SEC);
+    rig.poller.poll_now();
+    rig.settle();
+    assert_eq!(
+        *lock(&marks),
+        vec![SyncMark {
+            key: key.clone(),
+            seq: 813,
+            at_ms: T0 + 60 * SEC,
+            sync_at_mark: None,
+        }]
+    );
+    assert_eq!(
+        *lock(&rig.fake.events_calls),
+        vec![format!("{url}/rest/v1"); 2]
+    );
+    // With the mark in the config, no second one.
+    lock(&rig.inputs).config.setup.sync_mark = Some(SyncMark {
+        key,
+        seq: 813,
+        at_ms: T0,
+        sync_at_mark: None,
+    });
+    rig.poller.poll_now();
+    rig.settle();
+    assert_eq!(lock(&marks).len(), 1);
+    // This Mac's server takes its mark when the app imports, not from the poll.
+    lock(&rig.inputs).config = local_config(Some("jordi"));
+    rig.tokens.set("local|jordi", &Token::new("t")).unwrap();
+    rig.poller.poll_now();
+    rig.settle();
+    assert_eq!(lock(&marks).len(), 1);
+    assert_eq!(lock(&rig.fake.events_calls).len(), 2);
+}
+
+#[test]
+fn the_remote_mark_is_saved_before_the_status_shows_the_import() {
+    use crate::config::SyncMark;
+    let url = "https://n.example.org";
+    let rig = Rig::new(AppConfig {
+        mode: Mode::Remote,
+        server_url: Some(url.into()),
+        account: Some("jordi".into()),
+        ..AppConfig::default()
+    });
+    rig.tokens
+        .set(&format!("{url}|jordi"), &Token::new("t"))
+        .unwrap();
+    let marks: Arc<Mutex<Vec<SyncMark>>> = Arc::default();
+    let seen = marks.clone();
+    rig.poller.on_sync_mark(move |mark| lock(&seen).push(mark));
+    // Each status that shows the files imported comes after the mark.
+    let early: Arc<Mutex<usize>> = Arc::default();
+    let (watch, count) = (marks.clone(), early.clone());
+    rig.poller.on_status(move |status| {
+        let imported = status.account.as_ref().and_then(|a| a.imported) == Some(true);
+        if imported && lock(&watch).is_empty() {
+            *lock(&count) += 1;
+        }
+    });
+    *lock(&rig.fake.events_answer) = Some(Ok(900));
+    *lock(&rig.fake.account_answer) = Some(AccountAnswer::Account(AccountInfo {
+        slug: "jordi".into(),
+        imported: Some(true),
+        ..AccountInfo::default()
+    }));
+    rig.poller.poll_now();
+    rig.settle();
+    assert_eq!(lock(&marks).len(), 1);
+    assert_eq!(*lock(&early), 0);
+}
+
+/// An `/account` answer of the account `me` whose Supernote last synced at `sync`.
+fn synced(sync: Option<u64>) -> AccountAnswer {
+    AccountAnswer::Account(AccountInfo {
+        slug: "me".into(),
+        imported: Some(true),
+        app_data_imported: Some(true),
+        devices: vec![crate::status::Device {
+            serial: "SN1".into(),
+            last_sync_ms: sync,
+            ..crate::status::Device::default()
+        }],
+        ..AccountInfo::default()
+    })
+}
+
+#[test]
+fn the_first_sync_is_checked_once() {
+    use crate::config::SyncMark;
+    let rig = Rig::new(local_config(Some("me")));
+    rig.tokens.set("local|me", &Token::new("t")).unwrap();
+    lock(&rig.inputs).config.setup.sync_mark = Some(SyncMark {
+        key: "local|me".into(),
+        seq: 10,
+        at_ms: T0,
+        sync_at_mark: Some(T0),
+    });
+    // The app saves the check into the config, as lib.rs does.
+    let saved: Arc<Mutex<Vec<(String, SyncCheck)>>> = Arc::default();
+    let (keep, inputs) = (saved.clone(), rig.inputs.clone());
+    rig.poller.on_sync_checked(move |key, check| {
+        lock(&keep).push((key.clone(), check.clone()));
+        lock(&inputs).config.setup.sync_checked = Some(check);
+    });
+    // Each status with the first sync comes after its check is saved.
+    let early: Arc<Mutex<usize>> = Arc::default();
+    let (watch, count) = (saved.clone(), early.clone());
+    rig.poller.on_status(move |status| {
+        if status.device.last_sync_ms.is_some_and(|s| s > T0) && lock(&watch).is_empty() {
+            *lock(&count) += 1;
+        }
+    });
+    let deleted = SyncCheck {
+        files: 2,
+        digests: Some(0),
+        ..SyncCheck::default()
+    };
+    *lock(&rig.fake.check_answer) = Some(Ok(deleted.clone()));
+    // No sync yet, or one from before the import: no check.
+    for sync in [None, Some(T0 - SEC)] {
+        *lock(&rig.fake.account_answer) = Some(synced(sync));
+        rig.poller.poll_now();
+        rig.settle();
+    }
+    assert!(lock(&rig.fake.check_calls).is_empty());
+    // A failed check is tried again, at most once a minute.
+    *lock(&rig.fake.check_answer) = Some(Err("no answer".into()));
+    *lock(&rig.fake.account_answer) = Some(synced(Some(T0 + 5 * SEC)));
+    rig.poller.poll_now();
+    rig.settle();
+    rig.advance(30 * SEC);
+    rig.poller.poll_now();
+    rig.settle();
+    assert_eq!(lock(&rig.fake.check_calls).len(), 1);
+    assert!(lock(&saved).is_empty());
+    // The status says why, for step 6 of the Setup page.
+    assert_eq!(
+        rig.poller.status().first_sync_error.as_deref(),
+        Some("no answer")
+    );
+    // A new mark of the same login (Import again) does not carry the old reason.
+    let first = lock(&rig.inputs).config.setup.sync_mark.clone();
+    lock(&rig.inputs).config.setup.sync_mark = Some(SyncMark {
+        seq: 20,
+        ..first.clone().unwrap()
+    });
+    assert_eq!(rig.poller.status().first_sync_error, None);
+    lock(&rig.inputs).config.setup.sync_mark = first;
+    // A status went out with the sync but without a check: the check failed. The next sync
+    // is checked before its status goes out.
+    *lock(&early) = 0;
+    *lock(&rig.fake.check_answer) = Some(Ok(deleted.clone()));
+    *lock(&rig.fake.account_answer) = Some(synced(Some(T0 + 6 * SEC)));
+    rig.advance(30 * SEC);
+    rig.poller.poll_now();
+    rig.settle();
+    assert_eq!(
+        *lock(&rig.fake.check_calls),
+        vec![(Mode::Local, 10), (Mode::Local, 10)]
+    );
+    assert_eq!(*lock(&saved), vec![("local|me".to_owned(), deleted)]);
+    assert_eq!(*lock(&early), 0);
+    // Checked: the error is gone.
+    assert_eq!(rig.poller.status().first_sync_error, None);
+    // Checked: later syncs are not checked again.
+    *lock(&rig.fake.account_answer) = Some(synced(Some(T0 + 600 * SEC)));
+    rig.advance(120 * SEC);
+    rig.poller.poll_now();
+    rig.settle();
+    assert_eq!(lock(&rig.fake.check_calls).len(), 2);
+    assert_eq!(lock(&saved).len(), 1);
+}
+
+#[test]
+fn a_mark_of_another_login_is_not_checked() {
+    use crate::config::SyncMark;
+    let rig = Rig::new(local_config(Some("me")));
+    rig.tokens.set("local|me", &Token::new("t")).unwrap();
+    lock(&rig.inputs).config.setup.sync_mark = Some(SyncMark {
+        key: "local|anna".into(),
+        seq: 10,
+        at_ms: T0,
+        sync_at_mark: None,
+    });
+    rig.poller.on_sync_checked(|_, _| {});
+    *lock(&rig.fake.check_answer) = Some(Ok(SyncCheck::default()));
+    *lock(&rig.fake.account_answer) = Some(synced(Some(T0 + 5 * SEC)));
+    rig.poller.poll_now();
+    rig.settle();
+    assert!(lock(&rig.fake.check_calls).is_empty());
+}
+
+#[test]
+fn the_first_sync_is_found_by_server_times_only() {
+    use crate::config::SyncMark;
+    let url = "https://n.example.org";
+    let key = format!("{url}|me");
+    let rig = Rig::new(AppConfig {
+        mode: Mode::Remote,
+        server_url: Some(url.into()),
+        account: Some("me".into()),
+        ..AppConfig::default()
+    });
+    rig.tokens.set(&key, &Token::new("t")).unwrap();
+    // The mark keeps the newest device sync the server reported when it was taken.
+    let marks: Arc<Mutex<Vec<SyncMark>>> = Arc::default();
+    let (seen, inputs) = (marks.clone(), rig.inputs.clone());
+    rig.poller.on_sync_mark(move |mark| {
+        lock(&seen).push(mark.clone());
+        lock(&inputs).config.setup.sync_mark = Some(mark);
+    });
+    let checks: Arc<Mutex<Vec<SyncCheck>>> = Arc::default();
+    let keep = checks.clone();
+    rig.poller
+        .on_sync_checked(move |_, check| lock(&keep).push(check));
+    *lock(&rig.fake.events_answer) = Some(Ok(50));
+    *lock(&rig.fake.check_answer) = Some(Ok(SyncCheck::default()));
+    // The server's clock is far behind the Mac's: its times are all before `at_ms`.
+    let server = T0 - 3_600 * SEC;
+    *lock(&rig.fake.account_answer) = Some(synced(Some(server)));
+    rig.poller.poll_now();
+    rig.settle();
+    assert_eq!(lock(&marks).len(), 1);
+    assert_eq!(lock(&marks)[0].sync_at_mark, Some(server));
+    // The same sync again is no first sync.
+    rig.advance(120 * SEC);
+    rig.poller.poll_now();
+    rig.settle();
+    assert!(lock(&rig.fake.check_calls).is_empty());
+    // A later sync by the server's clock is, though it is before the Mac's `at_ms`.
+    *lock(&rig.fake.account_answer) = Some(synced(Some(server + SEC)));
+    rig.poller.poll_now();
+    rig.settle();
+    assert_eq!(*lock(&rig.fake.check_calls), vec![(Mode::Remote, 50)]);
+    assert_eq!(lock(&checks).len(), 1);
 }

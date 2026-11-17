@@ -1,13 +1,15 @@
 //! The two children the app runs, `notedown serve` and `notedown pipeline`: what each is, the
 //! arguments each gets from the config, and how a child is spawned and signalled.
 
-use std::io;
+use std::io::{self, Write as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use crate::config::{self, AppConfig, Mode};
+use crate::login;
 
 /// Which child a supervisor runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,19 +137,59 @@ pub fn spawn_program(program: PathBuf) -> SpawnFn {
 }
 
 /// Runs a short `notedown` call to its end and returns what it printed. A call that takes
-/// longer than `timeout` gets SIGKILL and is an error.
+/// longer than `timeout` gets SIGKILL and is an error. The call runs in a process group of its
+/// own, and the SIGKILL goes to the whole group: a process it started that still holds its
+/// output cannot keep the wait open.
 pub fn run_bounded(spawn: &SpawnFn, args: &[String], timeout: Duration) -> Result<Output, String> {
+    run_feeding(spawn, args, None, timeout)
+}
+
+/// Runs a `notedown` call that reads a password with `--password-stdin`: the password and a
+/// `\n` go to its stdin, which is then closed, so the password is never in its arguments. The
+/// same bound as [`run_bounded`]. A child that ends before it reads (it refused the call, for
+/// example "account already exists") breaks the pipe; that write error is not the answer, the
+/// child's own output is. A password that is not one line is refused before the spawn.
+pub fn run_with_password(
+    spawn: &SpawnFn,
+    args: &[String],
+    password: &login::Password,
+    timeout: Duration,
+) -> Result<Output, String> {
+    let line = password.one_line()?;
+    run_feeding(spawn, args, Some(format!("{line}\n")), timeout)
+}
+
+/// [`run_bounded`] with `input` written to the child's stdin (else stdin is empty). The write
+/// runs on the waiting thread, so a child that does not read cannot hold the bound up: its
+/// SIGKILL closes the pipe and ends the write.
+fn run_feeding(
+    spawn: &SpawnFn,
+    args: &[String],
+    input: Option<String>,
+    timeout: Duration,
+) -> Result<Output, String> {
     let mut command: Command = spawn(args);
     command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let child = command
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command
         .spawn()
         .map_err(|e| format!("the notedown program could not start: {e}"))?;
     let pid = child.id();
+    let stdin = child.stdin.take();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
+        if let (Some(mut stdin), Some(input)) = (stdin, input) {
+            // A child that ended before it read breaks the pipe: its own output tells why.
+            let _ = stdin.write_all(input.as_bytes());
+            // Dropped here: the child reads the end of its input.
+        }
         let _ = tx.send(child.wait_with_output());
     });
     match rx.recv_timeout(timeout) {
@@ -155,11 +197,9 @@ pub fn run_bounded(spawn: &SpawnFn, args: &[String], timeout: Duration) -> Resul
             output.map_err(|e| format!("the answer of the notedown program could not be read: {e}"))
         }
         Err(_) => {
-            // The waiter has not reaped the child yet, so the pid is still this child's.
-            if let Ok(pid) = i32::try_from(pid) {
-                // SAFETY: kill only sends a signal; the pid belongs to our unreaped child.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-            }
+            // The waiter has not reaped the child yet, so the group (its pid) is still this
+            // call's.
+            let _ = signal_group(pid, libc::SIGKILL);
             let _ = rx.recv();
             Err("it did not answer in time".to_owned())
         }

@@ -50,6 +50,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(&path("/login/code"), json_body(post(login_code)))
         .route(&path("/login"), json_body(post(login)))
         .route(&path("/account"), get_only(get(account)))
+        .route(&path("/logout"), json_body(post(logout)))
         .route(&path("/records"), get_only(get(records)))
         .route(&path("/records/{key}"), get_only(get(record)))
         .route(&path("/note"), get_only(get(note)))
@@ -329,8 +330,29 @@ async fn account(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
         slug: a.slug,
         user_id: a.user_id,
         devices,
+        imported: Some(a.imported.is_some()),
+        app_data_imported: Some(a.app_data_imported.is_some()),
     })
     .into_response()
+}
+
+/// `POST /logout`: revokes the token that calls it, whatever its scope. No body. A revoked or
+/// unknown token is 401 `token_refused` before this runs. The gates of the store do not apply.
+async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let (account, id) = match caller(&state, &headers).await {
+        Ok((Caller::Live(account, _), id)) => (account, id),
+        Ok((Caller::Removed { user_id, seq, .. }, id)) => return removed(id, user_id, seq),
+        Err(r) => return *r,
+    };
+    let data = state.data_dir.clone();
+    let slug = account.slug.clone();
+    let token_id = id.clone();
+    match blocking(move || crate::auth::revoke_token(&data, &slug, &id)).await {
+        Ok(true) => Json(json!({"revoked": true})).into_response(),
+        // A second logout that raced past `caller`: the token is gone already.
+        Ok(false) => refused(token_id),
+        Err(r) => *r,
+    }
 }
 
 /// `GET /records`: [`read::Records`].

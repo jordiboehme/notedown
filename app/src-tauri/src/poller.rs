@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use crate::config::{self, AppConfig, ExistingSetup, Mode};
+use crate::config::{self, AppConfig, ExistingSetup, Mode, SyncCheck, SyncMark};
 use crate::process::{self, SpawnFn};
 use crate::processes::ProcessStates;
 use crate::serve_info::{self, ServeInfo};
@@ -90,6 +90,18 @@ pub trait Sources: Send + Sync {
     fn pipeline_status(&self, args: &[String]) -> PipelineCall;
     /// `GET <base>/account`, with the token when there is one.
     fn account(&self, base: &str, token: Option<&Token>) -> AccountAnswer;
+    /// The highest journal number of the token's account: the `end` of `GET <base>/events`.
+    fn events_end(&self, base: &str, token: &Token) -> Result<u64, String>;
+    /// What the first sync after the journal number `mark` deleted: the journal end now, then
+    /// the device deletes of the config's account up to it (this Mac: the journal on disk,
+    /// another machine: `GET /events`).
+    fn first_sync(
+        &self,
+        config: &AppConfig,
+        base: &str,
+        token: &Token,
+        mark: u64,
+    ) -> Result<SyncCheck, String>;
 }
 
 /// What the poller reads from the rest of the app at each tick.
@@ -104,6 +116,8 @@ pub struct Inputs {
 pub type InputsFn = Arc<dyn Fn() -> Inputs + Send + Sync>;
 
 type Listener = Box<dyn Fn(&Status) + Send + Sync>;
+type MarkListener = Box<dyn Fn(SyncMark) + Send + Sync>;
+type CheckListener = Box<dyn Fn(String, SyncCheck) + Send + Sync>;
 
 /// The status poller. Cheap to share: clones use the same state.
 #[derive(Clone)]
@@ -120,6 +134,10 @@ struct Inner {
     /// Taken before `state` while a status is made and handed out, so listeners see the
     /// statuses in order.
     listeners: Mutex<Vec<Listener>>,
+    /// Gets the sync mark of an account on another machine (see [`Poller::on_sync_mark`]).
+    marks: Mutex<Option<MarkListener>>,
+    /// Gets the check of the first sync (see [`Poller::on_sync_checked`]).
+    checks: Mutex<Option<CheckListener>>,
     stopped: AtomicBool,
 }
 
@@ -130,7 +148,17 @@ struct State {
     account: Slot<AccountPoll>,
     status: Option<Status>,
     existing: Option<Existing>,
+    /// When the last call for the mark of a server on another machine failed.
+    mark_failed_ms: Option<u64>,
+    /// When the last check of the first sync failed.
+    check_failed_ms: Option<u64>,
+    /// Why it failed, with the mark it was for (shown in the status while that mark holds).
+    check_error: Option<(SyncMark, String)>,
 }
+
+/// The least time between two failed calls for the mark of a server on another machine, and
+/// between two failed checks of the first sync.
+const MARK_RETRY_MS: u64 = 60_000;
 
 /// What the data folder held when it was last looked at.
 struct Existing {
@@ -233,6 +261,8 @@ impl Poller {
                 clock,
                 state: Mutex::new(State::default()),
                 listeners: Mutex::new(Vec::new()),
+                marks: Mutex::new(None),
+                checks: Mutex::new(None),
                 stopped: AtomicBool::new(false),
             }),
         }
@@ -275,6 +305,21 @@ impl Poller {
     /// [`Poller::on_status`].
     pub fn on_status(&self, cb: impl Fn(&Status) + Send + Sync + 'static) {
         lock(&self.inner.listeners).push(Box::new(cb));
+    }
+
+    /// `cb` gets the sync mark of an account on another machine: the journal end when a poll
+    /// first sees its files imported while the config has no mark for it. It runs on a poller
+    /// thread; the config checks again that the mark still belongs to the account.
+    pub fn on_sync_mark(&self, cb: impl Fn(SyncMark) + Send + Sync + 'static) {
+        *lock(&self.inner.marks) = Some(Box::new(cb));
+    }
+
+    /// `cb` gets the check of the first sync after the import, with the key of the mark it
+    /// belongs to: once, when a poll first sees a device sync after the mark of the login and
+    /// the config has no check yet. It runs on a poller thread, before the status with that
+    /// sync goes out; the config checks again that the mark is still the login's.
+    pub fn on_sync_checked(&self, cb: impl Fn(String, SyncCheck) + Send + Sync + 'static) {
+        *lock(&self.inner.checks) = Some(Box::new(cb));
     }
 
     /// No poll runs.
@@ -362,11 +407,27 @@ impl Inner {
 
     fn poll_account(&self, config: &AppConfig, base: &str) {
         // The token is read here, on the poll's thread: the Keychain may take its time.
-        let (had_token, answer) = match token_key(config).map(|k| self.tokens.get(&k)) {
-            None | Some(Ok(None)) => (false, self.sources.account(base, None)),
-            Some(Ok(Some(token))) => (true, self.sources.account(base, Some(&token))),
-            Some(Err(e)) => (false, AccountAnswer::Failed(e.to_string())),
+        let (token, answer) = match token_key(config).map(|k| self.tokens.get(&k)) {
+            None | Some(Ok(None)) => (None, self.sources.account(base, None)),
+            Some(Ok(Some(token))) => {
+                let answer = self.sources.account(base, Some(&token));
+                (Some(token), answer)
+            }
+            Some(Err(e)) => (None, AccountAnswer::Failed(e.to_string())),
         };
+        let had_token = token.is_some();
+        // The mark and the check of the first sync are saved before the status with this
+        // answer goes out: no status shows the import done without its mark, or the first sync
+        // without its check. Each runs once (and at most once a minute while it fails) and is
+        // bounded: the mark by one REST call (8 s), the check by REST calls of 8 s each and, on
+        // this Mac, `journal tail` (`setup::CHECK_TIMEOUT`, 30 s). The status waits that long.
+        if let Some(token) = token.as_ref() {
+            if self.wants_mark(config, &answer) {
+                self.mark_remote(config, base, token, &answer);
+            } else if let Some(mark) = self.wants_check(config, &answer) {
+                self.check_first_sync(config, base, token, &mark);
+            }
+        }
         let key = Key::of(config);
         let current = self.current_key();
         {
@@ -396,6 +457,108 @@ impl Inner {
         lock(&self.state).account.busy = false;
     }
 
+    /// On another machine the import is done there: the first poll that sees the files
+    /// imported, with no mark for the account yet, takes the mark (see [`mark_remote`]).
+    ///
+    /// [`mark_remote`]: Self::mark_remote
+    fn wants_mark(&self, config: &AppConfig, answer: &AccountAnswer) -> bool {
+        let AccountAnswer::Account(info) = answer else {
+            return false;
+        };
+        if config.mode != Mode::Remote || info.imported != Some(true) {
+            return false;
+        }
+        let Some(key) = token_key(config) else {
+            return false;
+        };
+        let now = (self.clock)();
+        let tried = lock(&self.state).mark_failed_ms;
+        !config
+            .setup
+            .sync_mark
+            .as_ref()
+            .is_some_and(|m| m.key == key)
+            && lock(&self.marks).is_some()
+            && tried.is_none_or(|at| now >= at.saturating_add(MARK_RETRY_MS))
+    }
+
+    /// Asks the server for the journal end and hands the mark out. A failed call is tried
+    /// again at most once in [`MARK_RETRY_MS`].
+    fn mark_remote(&self, config: &AppConfig, base: &str, token: &Token, answer: &AccountAnswer) {
+        let Some(key) = token_key(config) else {
+            return;
+        };
+        // The newest device sync the server reported: a later one is the first sync.
+        let sync_at_mark = match answer {
+            AccountAnswer::Account(info) => {
+                info.devices.iter().filter_map(|d| d.last_sync_ms).max()
+            }
+            _ => None,
+        };
+        match self.sources.events_end(base, token) {
+            Ok(seq) => {
+                lock(&self.state).mark_failed_ms = None;
+                let at_ms = (self.clock)();
+                if let Some(cb) = lock(&self.marks).as_ref() {
+                    cb(SyncMark {
+                        key,
+                        seq,
+                        at_ms,
+                        sync_at_mark,
+                    });
+                }
+            }
+            Err(_) => lock(&self.state).mark_failed_ms = Some((self.clock)()),
+        }
+    }
+
+    /// The mark to check the first sync after (design note 6): the config has a mark of the
+    /// login and no check yet, and a device of the account synced after the mark: its
+    /// `lastSyncMs` is greater than the newest one at the mark. Both are the server's times.
+    fn wants_check(&self, config: &AppConfig, answer: &AccountAnswer) -> Option<SyncMark> {
+        let AccountAnswer::Account(info) = answer else {
+            return None;
+        };
+        let key = token_key(config)?;
+        let mark = config.setup.sync_mark.as_ref().filter(|m| m.key == key)?;
+        if config.setup.sync_checked.is_some() || lock(&self.checks).is_none() {
+            return None;
+        }
+        let synced = info.devices.iter().any(|d| {
+            d.last_sync_ms
+                .is_some_and(|at| mark.sync_at_mark.is_none_or(|m| at > m))
+        });
+        let now = (self.clock)();
+        let tried = lock(&self.state).check_failed_ms;
+        (synced && tried.is_none_or(|at| now >= at.saturating_add(MARK_RETRY_MS)))
+            .then(|| mark.clone())
+    }
+
+    /// Counts what the first sync deleted and hands the check out. A failed check is tried
+    /// again at most once in [`MARK_RETRY_MS`].
+    fn check_first_sync(&self, config: &AppConfig, base: &str, token: &Token, mark: &SyncMark) {
+        match self.sources.first_sync(config, base, token, mark.seq) {
+            Ok(check) => {
+                {
+                    let mut state = lock(&self.state);
+                    state.check_failed_ms = None;
+                    state.check_error = None;
+                }
+                if let Some(cb) = lock(&self.checks).as_ref() {
+                    cb(mark.key.clone(), check);
+                }
+            }
+            Err(why) => {
+                eprintln!("notedown: the first sync could not be checked: {why}");
+                let mut state = lock(&self.state);
+                state.check_failed_ms = Some((self.clock)());
+                // The first line, for the Setup page.
+                let line = why.trim().lines().next().unwrap_or_default().to_owned();
+                state.check_error = Some((mark.clone(), line));
+            }
+        }
+    }
+
     fn current_key(&self) -> Key {
         Key::of(&(self.inputs)().config)
     }
@@ -403,9 +566,9 @@ impl Inner {
     /// The status from `inputs` and the last answers that belong to its config.
     fn make(&self, inputs: &Inputs) -> Status {
         let key = Key::of(&inputs.config);
-        let parts = {
+        let (parts, check_error) = {
             let state = lock(&self.state);
-            Parts {
+            let parts = Parts {
                 config: inputs.config.clone(),
                 config_reset: inputs.config_reset,
                 existing: match &state.existing {
@@ -418,9 +581,21 @@ impl Inner {
                 device_urls: inputs.serve_info.device_urls.clone(),
                 pipeline_status: state.pipeline.of(&key).cloned(),
                 account: state.account.of(&key).cloned(),
-            }
+            };
+            (parts, state.check_error.clone())
         };
-        status_from(&parts, (self.clock)())
+        let mut status = status_from(&parts, (self.clock)());
+        // Only for the mark of the login, and only while its first sync is not checked.
+        let setup = &inputs.config.setup;
+        let login = token_key(&inputs.config);
+        status.first_sync_error = check_error
+            .filter(|(mark, _)| {
+                setup.sync_checked.is_none()
+                    && login.as_ref() == Some(&mark.key)
+                    && setup.sync_mark.as_ref() == Some(mark)
+            })
+            .map(|(_, why)| why);
+        status
     }
 
     /// Makes the status and hands it to the listeners when it changed. The listener lock is
@@ -467,6 +642,31 @@ impl RealSources {
 impl Sources for RealSources {
     fn pipeline_status(&self, args: &[String]) -> PipelineCall {
         run_status(&self.spawn, args, STATUS_TIMEOUT)
+    }
+
+    fn events_end(&self, base: &str, token: &Token) -> Result<u64, String> {
+        crate::import_job::events_end(base, token.clone())
+    }
+
+    fn first_sync(
+        &self,
+        config: &AppConfig,
+        base: &str,
+        token: &Token,
+        mark: u64,
+    ) -> Result<SyncCheck, String> {
+        let rest = crate::rest::Rest::with_timeout(base, Some(token.clone()), REQUEST_TIMEOUT)
+            .map_err(|e| e.to_string())?;
+        let end = crate::setup::journal_end(&rest).map_err(|e| e.to_string())?;
+        match (config.mode, config.account_slug()) {
+            (Mode::Local, Some(slug)) => {
+                crate::setup::sync_check_local(&self.spawn, &config.data_dir, slug, mark, end)
+            }
+            (Mode::Remote, Some(_)) => {
+                crate::setup::sync_check_remote(&rest, mark, end).map_err(|e| e.to_string())
+            }
+            _ => Err("no account to check".to_owned()),
+        }
     }
 
     fn account(&self, base: &str, token: Option<&Token>) -> AccountAnswer {

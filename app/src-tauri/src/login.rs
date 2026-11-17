@@ -3,6 +3,7 @@
 //! hash of the challenge, and no type that holds it or the token derives `Debug`.
 
 use std::fmt;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -17,13 +18,36 @@ use crate::token::{Token, TokenStore, token_key};
 pub const CLIENT_NAME: &str = "Notedown for Mac";
 /// What a login without a mode answers.
 pub const NO_MODE: &str = "Choose where the server runs first.";
+/// How long a log out waits for the server to revoke the token, in all.
+pub(crate) const LOGOUT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The password as the settings window sent it. It has no `Debug` and no `Display`.
+/// What a password with a line break or without any text answers.
+pub const NOT_ONE_LINE: &str = "The password must be one line.";
+
+/// The password as the settings window sent it. Its `Debug` prints `***`; it has no
+/// `Display`.
 pub struct Password(String);
 
 impl Password {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+
+    /// The password as one line of text, as the sidecar reads it from stdin
+    /// (`--password-stdin` takes the first line only). An empty password, or one with a `\n`
+    /// or a `\r`, is refused before any request or spawn.
+    pub fn one_line(&self) -> Result<&str, &'static str> {
+        if self.0.is_empty() || self.0.contains(['\n', '\r']) {
+            Err(NOT_ONE_LINE)
+        } else {
+            Ok(&self.0)
+        }
+    }
+}
+
+impl fmt::Debug for Password {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("***")
     }
 }
 
@@ -46,6 +70,8 @@ pub enum LoginError {
     ServerChanged,
     /// The server answered a token that may not write.
     NoWriteAccess,
+    /// The password is empty or has a line break.
+    NotOneLine,
     /// A failed login whose new token could not be deleted again.
     Rollback {
         error: Box<LoginError>,
@@ -87,6 +113,7 @@ impl fmt::Display for LoginError {
                 f.write_str("The server changed during the login. Log in again.")
             }
             Self::NoWriteAccess => f.write_str("The server gave this Mac no write access."),
+            Self::NotOneLine => f.write_str(NOT_ONE_LINE),
             Self::Rollback { error, keychain } => write!(
                 f,
                 "{error} The new login could not be removed from the Keychain ({keychain})."
@@ -150,6 +177,17 @@ struct LoginAnswer {
     scope: String,
 }
 
+/// Asks the server at `base` to revoke `token` (`POST /logout`, no body): once, within
+/// [`LOGOUT_TIMEOUT`]. A token the server refuses (401) or whose account is gone (410) is
+/// revoked already. The error holds neither the token nor the address.
+pub(crate) fn revoke(base: &str, token: Token) -> Result<(), RestError> {
+    let rest = Rest::with_timeout(base, Some(token), LOGOUT_TIMEOUT)?;
+    match rest.post_empty_once::<serde::de::IgnoredAny>("/logout") {
+        Ok(_) | Err(RestError::TokenRefused | RestError::AccountRemoved) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// The sentence for a token of an old login that the Keychain did not let go.
 pub fn old_login_kept(why: &str) -> String {
     format!("The old login could not be removed from the Keychain ({why}).")
@@ -202,6 +240,7 @@ pub fn log_in(
     if email.is_empty() || password.0.is_empty() {
         return Err(LoginError::Missing);
     }
+    password.one_line().map_err(|_| LoginError::NotOneLine)?;
     let rest = Rest::new(&base, None)?;
     let code: CodeAnswer = rest.post_json_once("/login/code", &CodeBody { email })?;
     let body = LoginBody {

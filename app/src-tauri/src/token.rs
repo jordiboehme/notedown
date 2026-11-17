@@ -190,6 +190,24 @@ mod tests {
     }
 
     #[test]
+    fn the_setup_checklist_makes_the_same_key() {
+        // checklist.ts tokenKey tells the sync mark of the login from an older one; its test
+        // expects these keys.
+        let test = include_str!("../../src/tests/checklist.test.ts");
+        let remote = config(
+            Mode::Remote,
+            Some("https://user:secret@notes.example.org/x"),
+            Some("me"),
+        );
+        for key in [
+            token_key(&config(Mode::Local, None, Some("me"))).unwrap(),
+            token_key(&remote).unwrap(),
+        ] {
+            assert!(test.contains(&format!("\"{key}\"")), "{key}");
+        }
+    }
+
+    #[test]
     fn memory_token_store_sets_gets_and_deletes() {
         let store = MemoryStore::new();
         assert_eq!(store.get("local|jordi").unwrap(), None);

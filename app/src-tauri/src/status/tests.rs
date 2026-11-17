@@ -25,7 +25,7 @@ const FACTS: &str = r#"{
 
 /// `GET /account` with two devices, the newer sync listed second.
 const ACCOUNT: &str = r#"{
-  "slug": "jordi", "userId": 1000001,
+  "slug": "jordi", "userId": 1000001, "imported": true, "appDataImported": false,
   "devices": [
     {"serial": "SN1", "name": "Old Nomad", "bound": true, "lastLoginMs": 1763200000000,
      "lastSyncMs": 1763200000000, "syncing": false, "online": false},
@@ -485,6 +485,11 @@ fn outside_and_not_connected_are_not_attention() {
         OUTSIDE_LINE,
         "Notedown runs outside the app. Stop it there, then press Start."
     );
+    // Step 1 of the setup checklist says it too.
+    assert!(
+        include_str!("../../../src/settings/checklist.ts")
+            .contains(&format!("OUTSIDE_LINE = \"{OUTSIDE_LINE}\"")),
+    );
     assert!(s.attention.is_empty(), "{:?}", s.attention);
 
     let mut remote = local();
@@ -559,6 +564,118 @@ fn the_status_serializes_for_the_webview() {
     assert_eq!(v["agents"][1]["notesBehind"], 50);
     assert_eq!(v["attention"], serde_json::json!([]));
     assert_eq!(v["existing"]["server"], true);
+    assert_eq!(v["connection"], "reached");
+    assert_eq!(
+        v["account"],
+        serde_json::json!({"imported": true, "appDataImported": false})
+    );
     let attention = serde_json::to_value(Attention::ServerUnreachable).unwrap();
     assert_eq!(attention, "serverUnreachable");
+}
+
+#[test]
+fn account_info_reads_the_import_state() {
+    let info = account(ACCOUNT);
+    assert_eq!(info.imported, Some(true));
+    assert_eq!(info.app_data_imported, Some(false));
+    let other =
+        account(r#"{"slug": "jordi", "userId": 1, "imported": false, "appDataImported": true}"#);
+    assert_eq!(other.imported, Some(false));
+    assert_eq!(other.app_data_imported, Some(true));
+}
+
+#[test]
+fn an_older_server_gives_unknown_import_state() {
+    let info = account(r#"{"slug": "jordi", "userId": 1000001, "devices": []}"#);
+    assert_eq!(info.imported, None);
+    assert_eq!(info.app_data_imported, None);
+    let parts = Parts {
+        account: Some(AccountPoll {
+            had_token: true,
+            answer: AccountAnswer::Account(info),
+            unreachable_since_ms: None,
+        }),
+        ..local()
+    };
+    let s = status_from(&parts, NOW);
+    assert_eq!(s.connection, Connection::Reached);
+    assert_eq!(
+        s.account,
+        Some(ImportState {
+            imported: None,
+            app_data_imported: None
+        })
+    );
+    let v = serde_json::to_value(&s).unwrap();
+    assert_eq!(
+        v["account"],
+        serde_json::json!({"imported": null, "appDataImported": null})
+    );
+}
+
+#[test]
+fn connection_follows_the_last_account_answer() {
+    let with = |answer: Option<AccountAnswer>| {
+        status_from(
+            &Parts {
+                account: answer.map(|answer| AccountPoll {
+                    had_token: true,
+                    answer,
+                    unreachable_since_ms: Some(NOW),
+                }),
+                ..local()
+            },
+            NOW,
+        )
+    };
+    let reached = with(Some(AccountAnswer::Account(account(ACCOUNT))));
+    assert_eq!(reached.connection, Connection::Reached);
+    assert_eq!(
+        reached.account,
+        Some(ImportState {
+            imported: Some(true),
+            app_data_imported: Some(false)
+        })
+    );
+    for (answer, connection) in [
+        (Some(AccountAnswer::Refused), Connection::Refused),
+        (
+            Some(AccountAnswer::Unreachable("connection refused".into())),
+            Connection::Unreachable,
+        ),
+        (
+            Some(AccountAnswer::Failed("the server answered 500".into())),
+            Connection::Failed,
+        ),
+        (None, Connection::Unknown),
+    ] {
+        let s = with(answer.clone());
+        assert_eq!(s.connection, connection, "{answer:?}");
+        assert_eq!(s.account, None, "{answer:?}");
+    }
+    // Without a mode nothing is polled.
+    let not_set = status_from(
+        &Parts {
+            config: AppConfig::default(),
+            account: None,
+            ..local()
+        },
+        NOW,
+    );
+    assert_eq!(not_set.connection, Connection::Unknown);
+    assert_eq!(not_set.account, None);
+    let names: Vec<serde_json::Value> = [
+        Connection::Unknown,
+        Connection::Reached,
+        Connection::Refused,
+        Connection::Unreachable,
+        Connection::Failed,
+    ]
+    .iter()
+    .map(|c| serde_json::to_value(c).unwrap())
+    .collect();
+    assert_eq!(
+        names,
+        ["unknown", "reached", "refused", "unreachable", "failed"]
+    );
 }

@@ -8,16 +8,18 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::config::{self, AppConfig, Mode, StartView};
+use crate::import_job::{self, BackupFolder, ImportJobs, JobKind};
 use crate::library::{Choice, Entry, Job, Key, Library, Listed, RecyclePage, StateView, UploadAsk};
 use crate::login::{self, LoginError, LoginGate, Password};
 use crate::model::{ModelControl, ModelState};
 use crate::notes::{NoteSummary, Notes};
-use crate::poller::Poller;
+use crate::poller::{Poller, rest_base};
 use crate::processes::{ProcessStates, Processes};
 use crate::review::{DataUrl, NoteView, Review};
 use crate::serve_info::ServeInfo;
+use crate::setup::{self, ExistingFolder, Sidecar};
 use crate::status::Status;
-use crate::token::{KeychainStore, TokenStore, token_key};
+use crate::token::{KeychainStore, Token, TokenStore, token_key};
 use crate::windows::{self, Opening, WindowKind};
 
 /// How the config is written to its folder: [`config::save`], or a slow one in tests.
@@ -185,6 +187,10 @@ impl ConfigState {
                 c.account = None;
                 c.email = None;
             }
+            // The first change to this Mac turns Start at login on, once ([`set_mode_then`]).
+            if before.0 != Mode::Local && c.mode == Mode::Local && !c.setup.autostart_offered {
+                c.setup.autostart_offered = true;
+            }
             // A kept account without a Markdown folder in the app gets the pipeline's, before
             // the children start again with `--markdown-dir`.
             c.seed_markdown_dir();
@@ -241,6 +247,98 @@ impl ConfigState {
         })
     }
 
+    /// Saves what the settings window chose for the backup and the import, and that the user
+    /// saw the deletes of the first sync. A folder or a file must be a full path (a leading `~`
+    /// is the home folder).
+    pub fn set_setup_record(&self, mut change: config::SetupChange) -> Result<AppConfig, String> {
+        for path in [&mut change.backup_dir, &mut change.snbak] {
+            if let Some(Some(p)) = path {
+                *p = expand_home(p)?;
+            }
+        }
+        self.update(|c| change.apply(&mut c.setup))
+    }
+
+    /// Saves the sync mark of a new import of the logged-in account (`mark.key` must be its
+    /// token key). It replaces an older mark, also of the same account, and the check of the
+    /// first sync after the old one. Answers whether it was saved.
+    pub fn set_sync_mark(&self, mark: config::SyncMark) -> Result<bool, String> {
+        self.save_mark(mark, true)
+    }
+
+    /// [`set_sync_mark`](Self::set_sync_mark) only when there is no mark for that account
+    /// yet (the import on another machine, seen by the poller). A mark of another key is
+    /// replaced; a mark is kept over a log out and used only while its key is the login's.
+    pub fn take_sync_mark(&self, mark: config::SyncMark) -> Result<bool, String> {
+        self.save_mark(mark, false)
+    }
+
+    fn save_mark(&self, mark: config::SyncMark, replace_own: bool) -> Result<bool, String> {
+        match self.try_update(|c| {
+            let same = token_key(c).as_deref() == Some(mark.key.as_str());
+            let has = c
+                .setup
+                .sync_mark
+                .as_ref()
+                .is_some_and(|m| m.key == mark.key);
+            if !same || (has && !replace_own) {
+                return Err(());
+            }
+            c.setup.forget_sync();
+            c.setup.sync_mark = Some(mark);
+            Ok(())
+        }) {
+            Ok(_) => Ok(true),
+            Err(TryUpdateError::Refused(())) => Ok(false),
+            Err(TryUpdateError::NotSaved(why)) => Err(why),
+        }
+    }
+
+    /// Saves the check of the first sync after the mark with the key `key`: only while that
+    /// mark is the login's and has no check yet (the check runs once). Answers whether it was
+    /// saved.
+    pub fn set_sync_checked(&self, key: &str, check: config::SyncCheck) -> Result<bool, String> {
+        match self.try_update(|c| {
+            let own = token_key(c).as_deref() == Some(key)
+                && c.setup.sync_mark.as_ref().is_some_and(|m| m.key == key);
+            if !own || c.setup.sync_checked.is_some() {
+                return Err(());
+            }
+            c.setup.sync_checked = Some(check);
+            c.setup.sync_acknowledged = false;
+            Ok(())
+        }) {
+            Ok(_) => Ok(true),
+            Err(TryUpdateError::Refused(())) => Ok(false),
+            Err(TryUpdateError::NotSaved(why)) => Err(why),
+        }
+    }
+
+    /// Whether this is the first start that opens Settings at Setup: no mode yet and Setup
+    /// not shown before. Answers true once; `setupShown` is saved with it. An error means it
+    /// was due but the save failed.
+    pub fn take_first_start(&self) -> Result<bool, String> {
+        match self.try_update(|c| {
+            if c.mode != Mode::NotSet || c.setup.setup_shown {
+                return Err(());
+            }
+            c.setup.setup_shown = true;
+            Ok(())
+        }) {
+            Ok(_) => Ok(true),
+            Err(TryUpdateError::Refused(())) => Ok(false),
+            Err(TryUpdateError::NotSaved(why)) => Err(why),
+        }
+    }
+
+    /// Both imports are done: the backup folder and the `.snbak` are no longer needed.
+    pub fn imports_done(&self) -> Result<AppConfig, String> {
+        self.update(|c| {
+            c.setup.backup_dir = None;
+            c.setup.snbak = None;
+        })
+    }
+
     /// Forgets the account and the e-mail (Log out).
     pub fn forget_login(&self) -> Result<AppConfig, String> {
         self.update(|c| {
@@ -265,6 +363,14 @@ pub const NEEDS_FULL_PATH: &str = "The folder must be a full path, such as ~/not
 pub const ABOUT_LINKS: [&str; 2] = [
     "https://ko-fi.com/V7V31T6CL9",
     "https://github.com/jordiboehme/notedown",
+];
+
+/// The setup's links to the instructions on GitHub: getting started, the server on another
+/// machine and the pipeline on a Mac.
+pub const SETUP_LINKS: [&str; 3] = [
+    "https://github.com/jordiboehme/notedown/blob/main/docs/getting-started.md",
+    "https://github.com/jordiboehme/notedown/blob/main/docs/getting-started.md#the-server-on-another-machine",
+    "https://github.com/jordiboehme/notedown/blob/main/docs/getting-started.md#a-pipeline-on-a-mac",
 ];
 
 /// How many lines of each child's log the Server page shows.
@@ -310,24 +416,45 @@ fn expand_home(dir: &Path) -> Result<PathBuf, String> {
 /// Log out: deletes the token of the account in the config, then forgets the account and
 /// the e-mail. The answer is the config without them. It takes the login lock: a log out
 /// during a login waits for it and then removes the token it left, so none stays behind.
-/// The library binds again: its jobs end and it is logged out.
+/// The library binds again: its jobs end and it is logged out. Then the server the token
+/// belongs to (`serve_info` finds the app's own) is asked to revoke it, best effort, on a
+/// thread of its own and within [`login::LOGOUT_TIMEOUT`]: the answer does not wait for it,
+/// and a server that is off or too old still leaves this Mac logged out.
 pub fn log_out_of(
     gate: &LoginGate,
     store: &dyn TokenStore,
     state: &ConfigState,
     library: &Library,
+    serve_info: &ServeInfo,
 ) -> Result<AppConfig, String> {
-    let forgotten = {
+    let (forgotten, revoking) = {
         let _no_login = gate.hold();
-        if let Some(key) = token_key(&state.current()) {
+        let before = state.current();
+        let mut revoking = None;
+        if let Some(key) = token_key(&before) {
+            // A token the Keychain cannot read is not revoked; the delete still runs.
+            let token = store.get(&key).ok().flatten();
             store.delete(&key).map_err(|e| e.to_string())?;
+            revoking = token.zip(rest_base(&before, serve_info));
         }
-        state.forget_login()
+        (state.forget_login(), revoking)
     };
     // The token is gone also when the config was not saved. After the login lock, as after a
     // login: the binding reads the Keychain.
     library.relogin();
+    // On a thread of its own: this Mac is logged out already, and a silent server must not
+    // hold the answer up. The call itself ends within the bound.
+    if revoking.is_some() {
+        std::thread::spawn(move || revoke_quietly(revoking));
+    }
     forgotten
+}
+
+/// Revokes a token that this Mac let go of; the outcome is not shown and never logged.
+fn revoke_quietly(revoking: Option<(Token, String)>) {
+    if let Some((token, base)) = revoking {
+        let _ = login::revoke(&base, token);
+    }
 }
 
 /// Log in ([`login::log_in`]), then bind the library to the new login.
@@ -388,7 +515,7 @@ fn resolved(path: &Path) -> PathBuf {
 }
 
 pub fn allowed_link(url: &str) -> bool {
-    ABOUT_LINKS.contains(&url)
+    ABOUT_LINKS.contains(&url) || SETUP_LINKS.contains(&url)
 }
 
 pub fn last_lines(mut lines: Vec<String>, n: usize) -> Vec<String> {
@@ -408,7 +535,9 @@ pub fn get_config(state: State<'_, ConfigState>) -> Result<AppConfig, String> {
 
 /// Saves the new place of the server off the calling thread ([`change_place`]); when the
 /// mode, the folder or the address changed, runs `restart` on a blocking thread of its own and
-/// waits for it. A refused change restarts nothing.
+/// waits for it. A refused change restarts nothing. `serve_info` is the app's own server as it
+/// runs now: the old place, whose token a new server revokes before the restart stops it.
+/// `autostart` turns Start at login on; it runs once, after the first change to Local mode.
 #[allow(clippy::too_many_arguments)]
 pub async fn set_mode_then(
     state: &ConfigState,
@@ -419,11 +548,21 @@ pub async fn set_mode_then(
     data_dir: Option<PathBuf>,
     server_url: Option<String>,
     restart: impl FnOnce() + Send + 'static,
+    serve_info: &ServeInfo,
+    autostart: impl FnOnce() + Send + 'static,
 ) -> Result<ConfigAnswer, String> {
     let placing = state.clone();
+    let serve_info = serve_info.clone();
     let (before, answer) = tauri::async_runtime::spawn_blocking(move || {
         change_place(
-            &gate, &*store, &placing, &library, mode, data_dir, server_url,
+            &gate,
+            &*store,
+            &placing,
+            &library,
+            mode,
+            data_dir,
+            server_url,
+            &serve_info,
         )
     })
     .await
@@ -436,13 +575,23 @@ pub async fn set_mode_then(
             .await
             .map_err(|e| e.to_string())?;
     }
+    // This change was the first to this Mac: Start at login goes on, once.
+    if !before.setup.autostart_offered && config.setup.autostart_offered {
+        tauri::async_runtime::spawn_blocking(autostart)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     Ok(answer)
 }
 
 /// Saves the new place. When that forgets the account (another server), its token goes too,
 /// so no write token stays where Log out cannot reach it. It takes the login lock, so it never
 /// meets a running login half way. Answers the config it replaced and the new one. The library
-/// binds again when its server or its account changed.
+/// binds again when its server or its account changed. The old server (`serve_info` finds the
+/// app's own) is asked to revoke the token, best effort, as by Log out. Unlike Log out it
+/// waits for the revoke (at most [`login::LOGOUT_TIMEOUT`]): the restart that follows stops
+/// the app's own server, which must hear of it first.
+#[allow(clippy::too_many_arguments)]
 pub fn change_place(
     gate: &LoginGate,
     store: &dyn TokenStore,
@@ -451,22 +600,28 @@ pub fn change_place(
     mode: Mode,
     data_dir: Option<PathBuf>,
     server_url: Option<String>,
+    serve_info: &ServeInfo,
 ) -> Result<(AppConfig, ConfigAnswer), String> {
-    let (replaced, config, keychain) = {
+    let (replaced, config, keychain, revoking) = {
         let _no_login = gate.hold();
         let (replaced, config) = state.set_mode_replacing(mode, data_dir, server_url)?;
         let mut keychain = None;
+        let mut revoking = None;
         if replaced.account.is_some()
             && config.account.is_none()
             && let Some(key) = token_key(&replaced)
-            && let Err(e) = store.delete(&key)
         {
-            keychain = Some(login::old_login_kept(&e.0));
+            let token = store.get(&key).ok().flatten();
+            revoking = token.zip(rest_base(&replaced, serve_info));
+            if let Err(e) = store.delete(&key) {
+                keychain = Some(login::old_login_kept(&e.0));
+            }
         }
-        (replaced, config, keychain)
+        (replaced, config, keychain, revoking)
     };
     // After the login lock, as after a login: the binding reads the Keychain.
     library.refresh();
+    revoke_quietly(revoking);
     Ok((replaced, ConfigAnswer { config, keychain }))
 }
 
@@ -474,16 +629,21 @@ pub fn change_place(
 /// or the address changed, both children start afresh for it, off the main thread: the start
 /// first stops what runs.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn set_mode(
+    app: AppHandle,
     state: State<'_, ConfigState>,
     processes: State<'_, Arc<Processes>>,
     gate: State<'_, Arc<LoginGate>>,
     library: State<'_, Library>,
+    jobs: State<'_, ImportJobs>,
     mode: Mode,
     data_dir: Option<PathBuf>,
     server_url: Option<String>,
 ) -> Result<ConfigAnswer, String> {
+    let _server = jobs.use_server()?;
     let processes = processes.inner().clone();
+    let serve_info = processes.serve_info();
     let reader = state.reader();
     // The start reads the config inside its lock: the newest place wins.
     set_mode_then(
@@ -495,6 +655,13 @@ pub async fn set_mode(
         data_dir,
         server_url,
         move || processes.start_with(|| reader.current()),
+        &serve_info,
+        move || {
+            use tauri_plugin_autostart::ManagerExt;
+            if let Err(e) = app.autolaunch().enable() {
+                eprintln!("notedown: Start at login could not be turned on: {e}");
+            }
+        },
     )
     .await
 }
@@ -517,7 +684,9 @@ pub async fn set_start_view(
 pub async fn start_processes(
     config: State<'_, ConfigState>,
     processes: State<'_, Arc<Processes>>,
+    jobs: State<'_, ImportJobs>,
 ) -> Result<ProcessStates, String> {
+    let _server = jobs.use_server()?;
     let config = config.reader();
     let processes = processes.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -587,15 +756,18 @@ pub fn request_quit(app: AppHandle) {
 /// and the token never come back. Then the library binds to the new login and the status polls
 /// again.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn log_in(
     config: State<'_, ConfigState>,
     processes: State<'_, Arc<Processes>>,
     poller: State<'_, Poller>,
     gate: State<'_, Arc<LoginGate>>,
     library: State<'_, Library>,
+    jobs: State<'_, ImportJobs>,
     email: String,
     password: String,
 ) -> Result<ConfigAnswer, String> {
+    let server = jobs.use_server()?;
     let state = config.inner().clone();
     let gate = gate.inner().clone();
     let library = library.inner().clone();
@@ -615,7 +787,7 @@ pub async fn log_in(
     })
     .await
     .map_err(|e| e.to_string())??;
-    relaunch_pipeline(config.inner(), processes.inner());
+    relaunch_pipeline(config.inner(), processes.inner(), server);
     poller.poll_now();
     Ok(saved)
 }
@@ -624,11 +796,19 @@ pub async fn log_in(
 /// account: the folder belongs to it), on a blocking thread that nobody waits for: the stop of
 /// the old pipeline can take its grace. The config is read inside the start's lock, so the
 /// newest wins.
-pub(crate) fn relaunch_pipeline(config: &ConfigState, processes: &Arc<Processes>) {
+///
+/// `server` is the command's use of the server ([`ImportJobs::use_server`]): it lasts until the
+/// relaunch is over, so no import stops the children in the middle of it.
+pub(crate) fn relaunch_pipeline(
+    config: &ConfigState,
+    processes: &Arc<Processes>,
+    server: import_job::UseGuard,
+) {
     let reader = config.reader();
     let processes = processes.clone();
     tauri::async_runtime::spawn_blocking(move || {
         processes.relaunch_pipeline_with(|| reader.current());
+        drop(server);
     });
 }
 
@@ -641,8 +821,9 @@ pub async fn has_login(config: State<'_, ConfigState>) -> Result<bool, String> {
         .map_err(|e| e.to_string())?
 }
 
-/// Log out: deletes the token from the Keychain, forgets the account and stops the library,
-/// off the main thread (where it may wait for a running login), then polls again.
+/// Log out: deletes the token from the Keychain, forgets the account, stops the library and
+/// asks the server to revoke the token (without waiting for it), off the main thread (where
+/// it may wait for a running login), then polls again.
 #[tauri::command]
 pub async fn log_out(
     config: State<'_, ConfigState>,
@@ -650,18 +831,126 @@ pub async fn log_out(
     poller: State<'_, Poller>,
     gate: State<'_, Arc<LoginGate>>,
     library: State<'_, Library>,
+    jobs: State<'_, ImportJobs>,
 ) -> Result<AppConfig, String> {
+    let server = jobs.use_server()?;
     let state = config.inner().clone();
     let gate = gate.inner().clone();
     let library = library.inner().clone();
+    let serve_info = processes.serve_info();
     let after = tauri::async_runtime::spawn_blocking(move || {
-        log_out_of(&gate, &KeychainStore::new(), &state, &library)
+        log_out_of(&gate, &KeychainStore::new(), &state, &library, &serve_info)
     })
     .await
     .map_err(|e| e.to_string())??;
-    relaunch_pipeline(config.inner(), processes.inner());
+    relaunch_pipeline(config.inner(), processes.inner(), server);
     poller.poll_now();
     Ok(after)
+}
+
+/// Polls the server and the pipeline now (Check again on the Setup page). The new status
+/// comes as an event.
+#[tauri::command]
+pub async fn recheck(poller: State<'_, Poller>) -> Result<(), String> {
+    let poller = poller.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || poller.poll_now())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Makes an account on this Mac's server (Local mode only) with the sidecar, then logs in with
+/// it as Log in does, off the main thread. The password goes to the sidecar over stdin only.
+/// When the account was made but the login failed, the error says to log in with it.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn create_account(
+    config: State<'_, ConfigState>,
+    processes: State<'_, Arc<Processes>>,
+    poller: State<'_, Poller>,
+    gate: State<'_, Arc<LoginGate>>,
+    library: State<'_, Library>,
+    sidecar: State<'_, Sidecar>,
+    jobs: State<'_, ImportJobs>,
+    slug: String,
+    email: String,
+    password: String,
+) -> Result<ConfigAnswer, String> {
+    let server = jobs.use_server()?;
+    let state = config.inner().clone();
+    let gate = gate.inner().clone();
+    let library = library.inner().clone();
+    let spawn = sidecar.0.clone();
+    let serve_info = processes.serve_info();
+    let password = Password::new(password);
+    let answer = tauri::async_runtime::spawn_blocking(move || {
+        setup::create_and_log_in(
+            &spawn,
+            &gate,
+            &state,
+            &serve_info,
+            &KeychainStore::new(),
+            &library,
+            &slug,
+            &email,
+            &password,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    // Also after a failed login: the server has the account now.
+    relaunch_pipeline(config.inner(), processes.inner(), server);
+    poller.poll_now();
+    answer
+}
+
+/// Connects this Mac's pipeline to the server on another machine (Remote mode only) with the
+/// config's address, folder and e-mail, off the main thread; then the pipeline starts and the
+/// status polls again. The password goes to the sidecar over stdin only.
+#[tauri::command]
+pub async fn connect_pipeline(
+    config: State<'_, ConfigState>,
+    processes: State<'_, Arc<Processes>>,
+    poller: State<'_, Poller>,
+    sidecar: State<'_, Sidecar>,
+    jobs: State<'_, ImportJobs>,
+    password: String,
+) -> Result<ConfigAnswer, String> {
+    let server = jobs.use_server()?;
+    let current = config.current();
+    let spawn = sidecar.0.clone();
+    let password = Password::new(password);
+    tauri::async_runtime::spawn_blocking(move || {
+        setup::connect_configured(&spawn, &current, &password)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    relaunch_pipeline(config.inner(), processes.inner(), server);
+    poller.poll_now();
+    Ok(ConfigAnswer {
+        config: config.current(),
+        keychain: None,
+    })
+}
+
+/// The home folder of this Mac's user, for the setup to write paths with `~`; null when the
+/// app has none.
+#[tauri::command]
+pub fn home_dir() -> Option<String> {
+    std::env::var_os("HOME")
+        .map(|home| home.to_string_lossy().into_owned())
+        .filter(|home| !home.is_empty())
+}
+
+/// What the config's data folder, `~/notedown-data` and `~/notedown-mac` hold (a server with
+/// its accounts, a pipeline with its server), off the main thread.
+#[tauri::command]
+pub async fn existing_details(
+    config: State<'_, ConfigState>,
+) -> Result<Vec<ExistingFolder>, String> {
+    let dirs = setup::setup_folders(&config.current());
+    tauri::async_runtime::spawn_blocking(move || setup::existing_details(&dirs))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// The Markdown folder of the logged-in account (the OCR page); `null` without an account.
@@ -680,13 +969,15 @@ pub fn markdown_dir(config: State<'_, ConfigState>) -> Option<String> {
 pub async fn set_markdown_dir(
     config: State<'_, ConfigState>,
     processes: State<'_, Arc<Processes>>,
+    jobs: State<'_, ImportJobs>,
     dir: PathBuf,
 ) -> Result<Option<String>, String> {
+    let server = jobs.use_server()?;
     let state = config.inner().clone();
     let saved = tauri::async_runtime::spawn_blocking(move || state.set_markdown_dir(dir))
         .await
         .map_err(|e| e.to_string())??;
-    relaunch_pipeline(config.inner(), processes.inner());
+    relaunch_pipeline(config.inner(), processes.inner(), server);
     Ok(saved.markdown_dir().map(|dir| dir.display().to_string()))
 }
 
@@ -1050,7 +1341,7 @@ pub fn mcp_info(config: State<'_, ConfigState>) -> Result<McpInfo, String> {
     })
 }
 
-/// Opens one of the About links in the browser. No other address opens.
+/// Opens one of the About links or the setup's links in the browser. No other address opens.
 #[tauri::command]
 pub async fn open_link(url: String) -> Result<(), String> {
     if !allowed_link(&url) {
@@ -1129,6 +1420,202 @@ pub async fn model_remove(model: State<'_, ModelControl>) -> Result<ModelState, 
     tauri::async_runtime::spawn_blocking(move || model.remove())
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// What the import commands refuse without a backup folder in the setup record.
+pub const NO_BACKUP_DIR: &str = "Choose the backup folder first.";
+/// What the app data commands refuse without a `.snbak` file (and without the empty choice).
+pub const NO_SNBAK: &str = "Choose the .snbak file first.";
+
+/// Backs the Supernote at `url` up into `dir` (Make a backup, or Resume with `resume`). The
+/// folder is checked first; progress and the end come as events. Off the main thread: the
+/// check reads the folder.
+#[tauri::command]
+pub async fn backup_start(
+    jobs: State<'_, ImportJobs>,
+    url: String,
+    dir: PathBuf,
+    resume: bool,
+) -> Result<(), String> {
+    let jobs = jobs.inner().clone();
+    let dir = expand_home(&dir)?;
+    tauri::async_runtime::spawn_blocking(move || jobs.backup(&url, &dir, resume))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Stops the running backup; Resume continues it. Returns when it is gone.
+#[tauri::command]
+pub async fn backup_pause(jobs: State<'_, ImportJobs>) -> Result<(), String> {
+    let jobs = jobs.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || jobs.pause())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// What a backup folder holds, off the main thread.
+#[tauri::command]
+pub async fn backup_folder(dir: PathBuf) -> Result<BackupFolder, String> {
+    let dir = expand_home(&dir)?;
+    tauri::async_runtime::spawn_blocking(move || import_job::backup_folder_state(&dir))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The backup folder of the setup record.
+fn backup_dir(config: &ConfigState) -> Result<PathBuf, String> {
+    config
+        .current()
+        .setup
+        .backup_dir
+        .ok_or_else(|| NO_BACKUP_DIR.to_owned())
+}
+
+/// The `.snbak` of the setup record, or none for the empty choice.
+fn snbak(config: &ConfigState, empty: bool) -> Result<Option<PathBuf>, String> {
+    if empty {
+        return Ok(None);
+    }
+    config
+        .current()
+        .setup
+        .snbak
+        .map(Some)
+        .ok_or_else(|| NO_SNBAK.to_owned())
+}
+
+/// Checks the import of the backup folder of the setup record (`cloud import --dry-run`).
+#[tauri::command]
+pub async fn import_dry_run(
+    config: State<'_, ConfigState>,
+    jobs: State<'_, ImportJobs>,
+    replace: bool,
+    allow_empty: bool,
+) -> Result<(), String> {
+    let dir = backup_dir(&config)?;
+    let jobs = jobs.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || jobs.import_dry_run(&dir, replace, allow_empty))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Imports the backup folder of the setup record, with the app's server stopped. Off the main
+/// thread: the stop can take the children's grace. A backup older than 24 hours, or not newer
+/// than the last device sync (the status or the device files on disk), is refused (design note 12; the Setup page
+/// checks it too).
+#[tauri::command]
+pub async fn import_run(
+    config: State<'_, ConfigState>,
+    jobs: State<'_, ImportJobs>,
+    poller: State<'_, Poller>,
+    replace: bool,
+    allow_empty: bool,
+) -> Result<(), String> {
+    let dir = backup_dir(&config)?;
+    let jobs = jobs.inner().clone();
+    let from_status = poller.status().device.last_sync_ms;
+    let current = config.current();
+    tauri::async_runtime::spawn_blocking(move || {
+        // The status knows no sync while the server is not running: the disk is read too.
+        let last_sync_ms = import_job::last_device_sync(&current, from_status);
+        import_job::backup_fresh(&dir, import_job::now_ms(), last_sync_ms)?;
+        jobs.import(&dir, replace, allow_empty)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Checks the import of the app data: the `.snbak` of the setup record, or none with `empty`.
+#[tauri::command]
+pub async fn app_data_dry_run(
+    config: State<'_, ConfigState>,
+    jobs: State<'_, ImportJobs>,
+    empty: bool,
+    replace: bool,
+) -> Result<(), String> {
+    let snbak = snbak(&config, empty)?;
+    let jobs = jobs.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || jobs.app_data_dry_run(snbak.as_deref(), replace))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Imports the app data, with the app's server stopped.
+#[tauri::command]
+pub async fn app_data_run(
+    config: State<'_, ConfigState>,
+    jobs: State<'_, ImportJobs>,
+    empty: bool,
+    replace: bool,
+) -> Result<(), String> {
+    let snbak = snbak(&config, empty)?;
+    let jobs = jobs.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // A .snbak older than 24 hours is refused (design note 12; the Setup page checks it too).
+        if let Some(path) = snbak.as_deref() {
+            import_job::snbak_fresh(path, import_job::now_ms())?;
+        }
+        jobs.app_data(snbak.as_deref(), replace)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The step that runs, if any.
+#[tauri::command]
+pub fn job_state(jobs: State<'_, ImportJobs>) -> Option<JobKind> {
+    jobs.state()
+}
+
+/// Saves the backup address, the backup folder, the `.snbak` file or that the deletes of the
+/// first sync were seen, off the main thread.
+#[tauri::command]
+pub async fn set_setup_record(
+    config: State<'_, ConfigState>,
+    change: config::SetupChange,
+) -> Result<AppConfig, String> {
+    let state = config.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || state.set_setup_record(change))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The check of the first sync of the login and whether its deletes were seen.
+#[tauri::command]
+pub fn sync_state(config: State<'_, ConfigState>) -> crate::setup::SyncState {
+    crate::setup::sync_state(&config.current())
+}
+
+/// Opens the library window at the recycle bin (the deletes of the first sync are there).
+#[tauri::command]
+pub async fn open_recycle_bin(app: AppHandle) -> Result<(), String> {
+    windows::show_window(
+        &app,
+        WindowKind::Library,
+        Opening::At(windows::LibraryAt::Bin),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// When a `.snbak` file was last written, in milliseconds since 1970.
+#[tauri::command]
+pub async fn snbak_time(path: PathBuf) -> Result<u64, String> {
+    let path = expand_home(&path)?;
+    tauri::async_runtime::spawn_blocking(move || file_time_ms(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The modification time of `path` in milliseconds since 1970.
+pub fn file_time_ms(path: &Path) -> Result<u64, String> {
+    let modified = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map_err(|e| format!("{} cannot be read: {e}", path.display()))?;
+    let ms = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| format!("{} has a time before 1970", path.display()))?
+        .as_millis();
+    Ok(u64::try_from(ms).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -1598,6 +2085,8 @@ mod tests {
                 Some(dir.into()),
                 None,
                 restart(&state),
+                &ServeInfo::default(),
+                || {},
             ))
             .unwrap()
             .config
@@ -1624,7 +2113,9 @@ mod tests {
                 Mode::Remote,
                 None,
                 None,
-                restart(&state)
+                restart(&state),
+                &ServeInfo::default(),
+                || {},
             ))
             .is_err()
         );
@@ -1638,6 +2129,7 @@ mod tests {
             mode: Mode::Local,
             account: Some("jordi".into()),
             email: Some("me@example.org".into()),
+            data_dir: dir.path().join("data"),
             ..AppConfig::default()
         };
         config::save(dir.path(), &config).unwrap();
@@ -1646,7 +2138,14 @@ mod tests {
         store.set("local|jordi", &Token::new("secret")).unwrap();
         store.set("local|other", &Token::new("other")).unwrap();
         let gate = LoginGate::default();
-        let after = log_out_of(&gate, &store, &state, &crate::library::idle()).unwrap();
+        // No server answers there: the revoke fails and the log out still happens.
+        let serve_info = ServeInfo {
+            // Port 1: no test binds it (macOS would allow it), so the connection is refused.
+            listen: vec!["127.0.0.1:1".parse().unwrap()],
+            ..ServeInfo::default()
+        };
+        let after =
+            log_out_of(&gate, &store, &state, &crate::library::idle(), &serve_info).unwrap();
         assert_eq!(store.get("local|jordi").unwrap(), None);
         assert!(store.get("local|other").unwrap().is_some());
         assert_eq!(after.account, None);
@@ -1655,13 +2154,19 @@ mod tests {
         assert_eq!(state.current(), after);
         assert_eq!(config::load(dir.path()), after);
         // Without an account there is nothing to delete.
-        log_out_of(&gate, &store, &state, &crate::library::idle()).unwrap();
+        log_out_of(&gate, &store, &state, &crate::library::idle(), &serve_info).unwrap();
     }
 
     #[test]
-    fn only_the_about_links_open() {
+    fn only_the_about_and_setup_links_open() {
         assert!(allowed_link("https://ko-fi.com/V7V31T6CL9"));
         assert!(allowed_link("https://github.com/jordiboehme/notedown"));
+        for link in SETUP_LINKS {
+            assert!(allowed_link(link), "{link}");
+        }
+        assert!(!allowed_link(
+            "https://github.com/jordiboehme/notedown/blob/main/docs/other.md"
+        ));
         assert!(!allowed_link("https://example.org"));
         assert!(!allowed_link("file:///etc/passwd"));
     }
@@ -1686,5 +2191,241 @@ mod tests {
             .unwrap();
         assert_eq!(cfg.data_dir, PathBuf::from("/data/x"));
         assert_eq!(cfg.server_url.as_deref(), Some("https://n.example.org"));
+    }
+
+    #[test]
+    fn setup_opens_once_on_the_first_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        assert!(state.take_first_start().unwrap());
+        assert!(state.current().setup.setup_shown);
+        assert!(!state.take_first_start().unwrap());
+        // Also after the next start.
+        let again = ConfigState::load(dir.path().to_owned());
+        assert!(!again.take_first_start().unwrap());
+
+        // A Mac with a mode (an older config) does not get the setup at its first start.
+        let set = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(set.path().to_owned());
+        state
+            .set_mode(Mode::Local, Some("/data/a".into()), None)
+            .unwrap();
+        assert!(!state.take_first_start().unwrap());
+        assert!(!state.current().setup.setup_shown);
+    }
+
+    #[test]
+    fn the_first_local_mode_turns_autostart_on_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        let turned_on = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let set = |mode, url: Option<&str>| {
+            let turned_on = turned_on.clone();
+            tauri::async_runtime::block_on(set_mode_then(
+                &state,
+                Arc::new(LoginGate::default()),
+                Arc::new(crate::token::MemoryStore::new()),
+                crate::library::idle(),
+                mode,
+                Some("/data/a".into()),
+                url.map(str::to_owned),
+                || {},
+                &ServeInfo::default(),
+                move || {
+                    turned_on.fetch_add(1, Ordering::SeqCst);
+                },
+            ))
+            .unwrap()
+            .config
+        };
+        let count = || turned_on.load(Ordering::SeqCst);
+        // Another machine is no reason to start at login.
+        let config = set(Mode::Remote, Some("https://n.example.org"));
+        assert!(!config.setup.autostart_offered);
+        assert_eq!(count(), 0);
+        let config = set(Mode::Local, None);
+        assert!(config.setup.autostart_offered);
+        assert!(config::load(dir.path()).setup.autostart_offered);
+        assert_eq!(count(), 1);
+        // Never again, also when General turned it off and the mode changes back and forth.
+        set(Mode::Remote, Some("https://n.example.org"));
+        set(Mode::Local, None);
+        assert_eq!(count(), 1);
+    }
+
+    #[test]
+    fn the_mark_is_kept_with_its_key() {
+        use config::{SyncCheck, SyncMark};
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        state
+            .set_mode(Mode::Local, Some("/data/a".into()), None)
+            .unwrap();
+        let log_in = |slug: &str| {
+            state
+                .try_update(|c| {
+                    c.account = Some(slug.to_owned());
+                    Ok::<(), ()>(())
+                })
+                .ok()
+                .unwrap();
+        };
+        let mark = |key: &str, seq| SyncMark {
+            key: key.to_owned(),
+            seq,
+            at_ms: 5,
+            sync_at_mark: None,
+        };
+        let checked = |state: &ConfigState| {
+            state
+                .try_update(|c| {
+                    c.setup.sync_checked = Some(SyncCheck::default());
+                    c.setup.sync_acknowledged = true;
+                    Ok::<(), ()>(())
+                })
+                .ok()
+                .unwrap();
+        };
+        // No login: no mark.
+        assert_eq!(state.take_sync_mark(mark("local|jordi", 7)), Ok(false));
+        log_in("jordi");
+        // A mark of another account is not taken.
+        assert_eq!(state.take_sync_mark(mark("local|other", 7)), Ok(false));
+        assert_eq!(state.take_sync_mark(mark("local|jordi", 7)), Ok(true));
+        checked(&state);
+        // The poller takes no second one for the same account.
+        assert_eq!(state.take_sync_mark(mark("local|jordi", 9)), Ok(false));
+        // Log out and log in again: the mark and its check stay.
+        state.forget_login().unwrap();
+        assert_eq!(
+            state.current().setup.sync_mark,
+            Some(mark("local|jordi", 7))
+        );
+        log_in("jordi");
+        let setup = state.current().setup;
+        assert_eq!(setup.sync_mark, Some(mark("local|jordi", 7)));
+        assert!(setup.sync_checked.is_some() && setup.sync_acknowledged);
+        // Another server keeps it too, but it is not that account's.
+        state
+            .set_mode(Mode::Local, Some("/data/b".into()), None)
+            .unwrap();
+        assert_eq!(
+            state.current().setup.sync_mark,
+            Some(mark("local|jordi", 7))
+        );
+        // A mark of another key replaces it, and the old check goes with it.
+        log_in("anna");
+        assert_eq!(state.take_sync_mark(mark("local|anna", 3)), Ok(true));
+        let setup = state.current().setup;
+        assert_eq!(setup.sync_mark, Some(mark("local|anna", 3)));
+        assert_eq!((setup.sync_checked, setup.sync_acknowledged), (None, false));
+        // A new import of the same account replaces its mark.
+        checked(&state);
+        assert_eq!(state.set_sync_mark(mark("local|anna", 20)), Ok(true));
+        let setup = config::load(dir.path()).setup;
+        assert_eq!(setup.sync_mark, Some(mark("local|anna", 20)));
+        assert_eq!((setup.sync_checked, setup.sync_acknowledged), (None, false));
+        // Never for an account that is not logged in.
+        assert_eq!(state.set_sync_mark(mark("local|jordi", 30)), Ok(false));
+    }
+
+    #[test]
+    fn the_check_is_saved_once_for_its_mark() {
+        use config::{SyncCheck, SyncMark};
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        state
+            .set_mode(Mode::Local, Some("/data/a".into()), None)
+            .unwrap();
+        let check = |files| SyncCheck {
+            files,
+            digests: Some(0),
+            ..SyncCheck::default()
+        };
+        // No mark: nothing to save.
+        assert_eq!(state.set_sync_checked("local|me", check(1)), Ok(false));
+        state
+            .try_update(|c| {
+                c.account = Some("me".into());
+                c.setup.sync_mark = Some(SyncMark {
+                    key: "local|me".into(),
+                    seq: 4,
+                    at_ms: 5,
+                    sync_at_mark: None,
+                });
+                Ok::<(), ()>(())
+            })
+            .ok()
+            .unwrap();
+        // A check of another mark is not this one's.
+        assert_eq!(state.set_sync_checked("local|anna", check(1)), Ok(false));
+        assert_eq!(state.set_sync_checked("local|me", check(2)), Ok(true));
+        // Once: a later check does not replace the first one.
+        assert_eq!(state.set_sync_checked("local|me", check(3)), Ok(false));
+        assert_eq!(config::load(dir.path()).setup.sync_checked, Some(check(2)));
+        // Not after a log out: the mark is not the login's then.
+        state.forget_login().unwrap();
+        state
+            .try_update(|c| {
+                c.setup.sync_checked = None;
+                Ok::<(), ()>(())
+            })
+            .ok()
+            .unwrap();
+        assert_eq!(state.set_sync_checked("local|me", check(4)), Ok(false));
+    }
+
+    #[test]
+    fn the_setup_record_takes_only_what_the_window_sends() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        let change = |json: &str| {
+            state
+                .set_setup_record(serde_json::from_str(json).unwrap())
+                .map(|c| c.setup)
+        };
+        let setup = change(
+            r#"{"backupUrl":" http://192.168.1.20:8089 ","backupDir":"~/supernote-backup-2026-11-17","snbak":"/x/a.snbak"}"#,
+        )
+        .unwrap();
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(
+            setup.backup_url.as_deref(),
+            Some("http://192.168.1.20:8089")
+        );
+        assert_eq!(
+            setup.backup_dir,
+            Some(home.join("supernote-backup-2026-11-17"))
+        );
+        assert_eq!(setup.snbak, Some(PathBuf::from("/x/a.snbak")));
+        // A field that is left out stays; null clears it.
+        let setup = change(r#"{"snbak":null}"#).unwrap();
+        assert_eq!(setup.snbak, None);
+        assert!(setup.backup_dir.is_some() && setup.backup_url.is_some());
+        // A folder must be a full path.
+        assert_eq!(
+            change(r#"{"backupDir":"backup"}"#).unwrap_err(),
+            NEEDS_FULL_PATH
+        );
+        // The window cannot set what Rust keeps.
+        assert!(serde_json::from_str::<config::SetupChange>(r#"{"syncMark":null}"#).is_err());
+        assert!(serde_json::from_str::<config::SetupChange>(r#"{"setupShown":true}"#).is_err());
+        assert_eq!(config::load(dir.path()).setup, state.current().setup);
+    }
+
+    #[test]
+    fn the_snbak_time_is_the_file_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.snbak");
+        std::fs::write(&file, "x").unwrap();
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_763_300_000_123);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        assert_eq!(file_time_ms(&file), Ok(1_763_300_000_123));
+        assert!(file_time_ms(&dir.path().join("missing.snbak")).is_err());
     }
 }

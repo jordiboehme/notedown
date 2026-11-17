@@ -39,6 +39,8 @@ The server shows the token only now. Keep it private. Send it with every request
 
 A wrong email, password or code and a locked account all give 401 `login_failed`. Too many requests from one address give 429 `too_many`.
 
+Log out with `POST /logout`; it revokes only the token that calls it.
+
 Example:
 
 ```sh
@@ -63,7 +65,8 @@ A refused token gets 401 `token_refused` with `WWW-Authenticate: Bearer`. A toke
 | --- | --- | --- |
 | `POST /login/code` | none | A random code for the login |
 | `POST /login` | none | A new token |
-| `GET /account` | read | `{"slug", "userId", "devices"}` |
+| `POST /logout` | any | Revoke the token that calls it |
+| `GET /account` | read | `{"slug", "userId", "devices", "imported", "appDataImported"}` |
 | `GET /tree` | read | List a folder |
 | `GET /entries/{id}` | read | One file or folder |
 | `GET /entries?path=` | read | One file or folder, found by its path |
@@ -119,9 +122,13 @@ Tells whose token this is and which devices the account has.
     {"serial": "SN078C10000000", "name": "Jordis Nomad", "bound": true,
      "lastLoginMs": 1763290000000, "lastSyncMs": 1763290900000,
      "syncing": false, "online": true}
-  ]
+  ],
+  "imported": true,
+  "appDataImported": false
 }
 ```
+
+- `imported` is true when the files of the account are imported. `appDataImported` is true when its app data (digests and handwritten comments) is imported. Servers of an older version do not send them; treat a missing field as unknown.
 
 - `lastSyncMs` is the time of the last sync that the device ended with success. It is `null` until then. Servers of an older version do not record it, so it stays `null` until the device syncs once on a server of this version. An app that talks to an older server gets no `devices` at all and treats that as an empty list.
 - `lastLoginMs` is the last login of the device. A device keeps its token across syncs, so this is not the time of a sync.
@@ -129,6 +136,16 @@ Tells whose token this is and which devices the account has.
 - `online` is true while the device has an open auto-sync connection that is alive.
 - The list is sorted by `lastSyncMs`, newest first. Devices that never synced come last.
 - `name` is `null` for a device that never told its name.
+
+### `POST /logout`
+
+Revokes the token of the request. No body. Any token may do it, read or write.
+
+```json
+{"revoked": true}
+```
+
+The token is refused from then on and the other tokens of the account keep working. It does not wait for a scan, a device sync or the import. A second call with the same token is 401 `token_refused`, a token of a removed account gets 410 `account_removed`.
 
 ## Browse
 

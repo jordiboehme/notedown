@@ -56,6 +56,23 @@ const COMMANDS: &[&str] = &[
     "markdown_dir",
     "set_markdown_dir",
     "show_markdown_dir",
+    "recheck",
+    "create_account",
+    "connect_pipeline",
+    "existing_details",
+    "home_dir",
+    "backup_start",
+    "backup_pause",
+    "backup_folder",
+    "import_dry_run",
+    "import_run",
+    "app_data_dry_run",
+    "app_data_run",
+    "job_state",
+    "set_setup_record",
+    "snbak_time",
+    "sync_state",
+    "open_recycle_bin",
 ];
 
 fn main() {

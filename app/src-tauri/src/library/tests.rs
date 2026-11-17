@@ -258,6 +258,16 @@ fn local_state(dir: &std::path::Path) -> ConfigState {
     ConfigState::load(dir.to_path_buf())
 }
 
+/// The app's own server as listening where nobody does: a revoke on log out fails at once
+/// and never reaches a real server of this Mac.
+fn nobody_listens() -> crate::serve_info::ServeInfo {
+    crate::serve_info::ServeInfo {
+        // Port 1: no test binds it (macOS would allow it), so the connection is refused.
+        listen: vec!["127.0.0.1:1".parse().unwrap()],
+        ..crate::serve_info::ServeInfo::default()
+    }
+}
+
 /// The library of a [`ConfigState`], as the app makes it.
 fn library_of(state: &ConfigState, store: Arc<dyn TokenStore>) -> (Library, Events) {
     let reader = state.reader();
@@ -277,7 +287,14 @@ fn log_out_stops_the_library() {
     library.refresh();
     let session = library.session().unwrap();
 
-    log_out_of(&LoginGate::default(), &*store, &state, &library).unwrap();
+    log_out_of(
+        &LoginGate::default(),
+        &*store,
+        &state,
+        &library,
+        &nobody_listens(),
+    )
+    .unwrap();
 
     assert!(session.is_cancelled(), "the jobs of the login end");
     assert_eq!(
@@ -327,6 +344,7 @@ fn a_new_place_rebinds_the_library() {
         Mode::Local,
         Some(data),
         None,
+        &nobody_listens(),
     )
     .unwrap();
     assert!(!session.is_cancelled());
@@ -341,6 +359,7 @@ fn a_new_place_rebinds_the_library() {
         Mode::Remote,
         None,
         Some("http://127.0.0.1:41003".into()),
+        &nobody_listens(),
     )
     .unwrap();
     assert!(session.is_cancelled());
@@ -409,6 +428,14 @@ fn a_login_binds_the_library() {
 }
 
 #[test]
+fn not_imported_opens_setup() {
+    // The import is step 5 of the setup checklist, not a row of the Supernote page.
+    assert_eq!(LibraryState::NotImported.settings_page(), Some("setup"));
+    let view = serde_json::to_value(state_event(LibraryState::NotImported)).unwrap();
+    assert_eq!(view["page"], json!("setup"));
+}
+
+#[test]
 fn each_state_has_its_text_and_settings_page() {
     use LibraryState::*;
     let table = [
@@ -434,7 +461,7 @@ fn each_state_has_its_text_and_settings_page() {
             NotImported,
             "notImported",
             Some("The Supernote has not been imported yet."),
-            Some("supernote"),
+            Some("setup"),
         ),
         (
             Refused,

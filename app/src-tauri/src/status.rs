@@ -85,6 +85,10 @@ pub struct AccountInfo {
     pub user_id: u64,
     /// An older server sends no list; that is an empty one.
     pub devices: Vec<Device>,
+    /// Whether the Supernote's files were imported; `None` from an older server.
+    pub imported: Option<bool>,
+    /// Whether the Supernote's app data was imported; `None` from an older server.
+    pub app_data_imported: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -167,6 +171,54 @@ pub struct Status {
     pub agents: Vec<AgentStatus>,
     pub attention: Vec<Attention>,
     pub existing: ExistingSetup,
+    /// The import state of the account; only when the last `/account` poll answered it.
+    pub account: Option<ImportState>,
+    /// How the server answered the last `/account` poll.
+    pub connection: Connection,
+    /// Why the last check of the first sync of the login failed; `None` when it did not fail
+    /// or the sync is checked. The poller fills it in and tries again every minute.
+    pub first_sync_error: Option<String>,
+}
+
+/// What `GET /account` says about the import; `None` where an older server says nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportState {
+    pub imported: Option<bool>,
+    pub app_data_imported: Option<bool>,
+}
+
+/// How the server answered the last `/account` poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Connection {
+    /// No poll yet (or none for this config).
+    Unknown,
+    /// The server answered the account.
+    Reached,
+    /// 401: no token, or the token was refused.
+    Refused,
+    /// No answer at all.
+    Unreachable,
+    /// Any other answer.
+    Failed,
+}
+
+/// The connection and the import state from the last `/account` poll.
+fn account_state(poll: Option<&AccountPoll>) -> (Connection, Option<ImportState>) {
+    match poll.map(|p| &p.answer) {
+        None => (Connection::Unknown, None),
+        Some(AccountAnswer::Account(info)) => (
+            Connection::Reached,
+            Some(ImportState {
+                imported: info.imported,
+                app_data_imported: info.app_data_imported,
+            }),
+        ),
+        Some(AccountAnswer::Refused) => (Connection::Refused, None),
+        Some(AccountAnswer::Unreachable(_)) => (Connection::Unreachable, None),
+        Some(AccountAnswer::Failed(_)) => (Connection::Failed, None),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -264,6 +316,7 @@ pub fn status_from(parts: &Parts, now_ms: u64) -> Status {
     }
     let device = device_status(parts, now_ms, &mut attention);
     let (ocr, agents) = ocr_status(parts, no_account, &mut attention);
+    let (connection, account) = account_state(parts.account.as_ref());
 
     Status {
         setup,
@@ -274,12 +327,16 @@ pub fn status_from(parts: &Parts, now_ms: u64) -> Status {
         agents,
         attention,
         existing: parts.existing,
+        account,
+        connection,
+        first_sync_error: None,
     }
 }
 
 const NOT_SET_UP: &str = "Not set up yet";
 
 fn not_set_up(parts: &Parts, note: Option<String>) -> Status {
+    let (connection, account) = account_state(parts.account.as_ref());
     Status {
         setup: Setup {
             mode: Mode::NotSet,
@@ -301,6 +358,9 @@ fn not_set_up(parts: &Parts, note: Option<String>) -> Status {
         agents: Vec::new(),
         attention: Vec::new(),
         existing: parts.existing,
+        account,
+        connection,
+        first_sync_error: None,
     }
 }
 

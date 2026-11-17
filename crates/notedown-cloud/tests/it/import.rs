@@ -14,8 +14,8 @@ use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request, StatusCode};
 use md5::{Digest, Md5};
 use notedown_cloud::auth::{Accounts, expected_login_hash, md5_hex};
-use notedown_cloud::device_backup::{self, BackupOptions};
-use notedown_cloud::import::{self, ImportOptions, SkipReason};
+use notedown_cloud::device_backup::{self, BackupOptions, BackupProgress};
+use notedown_cloud::import::{self, ImportOptions, ImportProgress, SkipReason};
 use notedown_cloud::journal::{Event, EventBody, Journal, Origin};
 use notedown_cloud::put::{self, PutOutcome};
 use notedown_cloud::server::{AppState, router};
@@ -122,7 +122,11 @@ fn data_with_account() -> tempfile::TempDir {
     dir
 }
 
-fn quiet() -> impl FnMut(&str) {
+fn quiet() -> impl FnMut(ImportProgress) {
+    |_| {}
+}
+
+fn quiet_backup() -> impl FnMut(BackupProgress<'_>) {
     |_| {}
 }
 
@@ -238,6 +242,52 @@ fn scan_maps_the_device_folders_and_reports_every_skip() {
     .map(|(p, r)| (p.to_string(), r))
     .collect();
     assert_eq!(skips, want);
+}
+
+#[test]
+fn import_reports_progress_phases_and_ends_with_the_total() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (backup, files, _) = backup_tree(tmp.path());
+    let data = data_with_account();
+    let journal = Journal::open(data.path()).unwrap();
+    let mut events = Vec::new();
+    import::import(
+        data.path(),
+        "jordi",
+        &backup,
+        &ImportOptions::default(),
+        &journal,
+        &mut |p| events.push(p),
+    )
+    .unwrap();
+    let total = files.len() as u64;
+    // fewer files than PROGRESS_EVERY: one Imported at the end, then the verification
+    assert_eq!(
+        events,
+        [
+            ImportProgress::Imported { done: total, total },
+            ImportProgress::Verifying
+        ]
+    );
+    // a second run with --replace first moves the files to the recycle bin
+    let mut events = Vec::new();
+    import::import(
+        data.path(),
+        "jordi",
+        &backup,
+        &ImportOptions {
+            replace: true,
+            ..ImportOptions::default()
+        },
+        &journal,
+        &mut |p| events.push(p),
+    )
+    .unwrap();
+    assert_eq!(
+        events.first(),
+        Some(&ImportProgress::Recycling { files: total })
+    );
+    assert_eq!(events.len(), 3);
 }
 
 #[test]
@@ -1107,10 +1157,30 @@ fn backup_device_copies_byte_exact_names_and_fails_on_a_short_file() {
         resume: false,
         utc_offset: UtcOffset::from_hms(2, 0, 0).unwrap(),
     };
-    let report = device_backup::backup(&url, &dir, &opts, &mut quiet()).unwrap();
+    let mut downloaded = Vec::new();
+    let mut errors = Vec::new();
+    let report = device_backup::backup(&url, &dir, &opts, &mut |p: BackupProgress<'_>| match p {
+        BackupProgress::Downloaded { files, bytes, path } => {
+            downloaded.push((files, bytes, path.to_string()))
+        }
+        BackupProgress::Error { path, .. } => errors.push(path.to_string()),
+        _ => {}
+    })
+    .unwrap();
     assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
     assert_eq!(report.errors[0].path, "Note/Short.note");
     assert_eq!(report.files, 3);
+    assert_eq!(errors, ["Note/Short.note"]);
+    // one Downloaded per file, the running totals grow by one file each, the last is the report's
+    assert_eq!(downloaded.len(), 3, "{downloaded:?}");
+    for (i, (files, bytes, path)) in downloaded.iter().enumerate() {
+        assert_eq!(*files, i as u64 + 1);
+        assert!(!path.is_empty());
+        if i > 0 {
+            assert!(*bytes >= downloaded[i - 1].1);
+        }
+    }
+    assert_eq!(downloaded[2].1, report.bytes);
 
     let top = names(&dir);
     let want: BTreeSet<Vec<u8>> = ["Document", "Note", "INBOX", "backup.json"]
@@ -1162,7 +1232,7 @@ fn backup_device_copies_byte_exact_names_and_fails_on_a_short_file() {
         .unwrap();
 
     // a rerun into the same folder needs --resume
-    assert!(device_backup::backup(&url, &dir, &opts, &mut quiet()).is_err());
+    assert!(device_backup::backup(&url, &dir, &opts, &mut quiet_backup()).is_err());
     // leftovers of a killed run: a short temp name, a file the device no longer lists, and a
     // .part of a file that is still listed
     for p in [
@@ -1181,7 +1251,7 @@ fn backup_device_copies_byte_exact_names_and_fails_on_a_short_file() {
             include_sd: true,
             ..opts
         },
-        &mut quiet(),
+        &mut quiet_backup(),
     )
     .unwrap();
     assert_eq!(resumed.skipped_existing, 2);
@@ -1232,7 +1302,7 @@ fn backup_device_refuses_names_that_leave_the_folder() {
         resume: false,
         utc_offset: UtcOffset::UTC,
     };
-    let report = device_backup::backup(&url, &dir, &opts, &mut quiet()).unwrap();
+    let report = device_backup::backup(&url, &dir, &opts, &mut quiet_backup()).unwrap();
     assert_eq!(report.errors.len(), 3, "{:?}", report.errors);
     assert_eq!(
         names(tmp.path()),
@@ -1303,7 +1373,7 @@ fn a_killed_backup_run_is_marked_incomplete_and_the_import_refuses_it() {
             resume: false,
             utc_offset: UtcOffset::UTC,
         };
-        device_backup::backup(&u, &d, &opts, &mut quiet()).unwrap()
+        device_backup::backup(&u, &d, &opts, &mut quiet_backup()).unwrap()
     });
     // while the download hangs, the report on disk says the run is not complete
     let report = dir.join("backup.json");
@@ -1345,7 +1415,7 @@ fn a_date_that_does_not_parse_is_counted_in_the_report() {
         resume: false,
         utc_offset: UtcOffset::UTC,
     };
-    let report = device_backup::backup(&url, &dir, &opts, &mut quiet()).unwrap();
+    let report = device_backup::backup(&url, &dir, &opts, &mut quiet_backup()).unwrap();
     assert!(report.errors.is_empty());
     assert_eq!(report.date_warnings, 1);
     let json: Value =
@@ -1465,7 +1535,7 @@ fn a_resumed_backup_reports_local_files_the_device_no_longer_lists() {
         resume: false,
         utc_offset: UtcOffset::from_hms(2, 0, 0).unwrap(),
     };
-    let first = device_backup::backup(&url, &dir, &opts, &mut quiet()).unwrap();
+    let first = device_backup::backup(&url, &dir, &opts, &mut quiet_backup()).unwrap();
     assert!(first.stale.is_empty());
     // Deleted or renamed on the device since the first run.
     write(&dir.join("Note/Deleted.note"), b"old");
@@ -1480,19 +1550,18 @@ fn a_resumed_backup_reports_local_files_the_device_no_longer_lists() {
             resume: true,
             ..opts
         },
-        &mut |l: &str| lines.push(l.to_string()),
+        &mut |p: BackupProgress<'_>| {
+            if let BackupProgress::Stale { path } = p {
+                lines.push(path.to_string());
+            }
+        },
     )
     .unwrap();
     assert_eq!(
         resumed.stale,
         ["Note/Deleted.note", "Note/Empty/", "Note/Old/x.note"]
     );
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("stale: Note/Deleted.note")),
-        "{lines:?}"
-    );
+    assert!(lines.iter().any(|l| l == "Note/Deleted.note"), "{lines:?}");
     let json: Value =
         serde_json::from_slice(&std::fs::read(dir.join("backup.json")).unwrap()).unwrap();
     assert_eq!(

@@ -4,12 +4,12 @@
   import { status } from "../../lib/status.svelte";
   import { failure, processLogs, setMode, startProcesses, stopProcesses } from "../api";
   import { config } from "../config.svelte";
-  import Banner from "../kit/Banner.svelte";
   import Form from "../kit/Form.svelte";
   import Row from "../kit/Row.svelte";
   import Section from "../kit/Section.svelte";
   import Segmented from "../kit/Segmented.svelte";
   import StatusDot from "../kit/StatusDot.svelte";
+  import DeviceAddress from "../parts/DeviceAddress.svelte";
 
   // Settings > Server: where the server runs, the state of the server and the OCR pipeline,
   // Start and Stop, the address for the Supernote and the last lines of their output.
@@ -154,14 +154,7 @@
 
   {#if current?.mode === "local"}
     <Section title="Address for the Supernote">
-      {#each server?.deviceUrls ?? [] as url (url)}
-        <Row title={url} note="Enter this address in the private cloud settings of the Supernote." />
-      {:else}
-        <Row title="No address yet" note="The address shows while the server runs." />
-      {/each}
-      <Banner
-        message="Give this Mac a fixed address in your router. The Supernote finds the server only at this address."
-      />
+      <DeviceAddress urls={server?.deviceUrls ?? []} />
     </Section>
   {/if}
 

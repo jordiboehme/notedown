@@ -37,6 +37,8 @@ use import_job::{AppHost as ImportHost, ImportJobs, JobEvent};
 use library::{LIBRARY_EVENT, Library, LibraryEvent};
 use model::{ModelControl, ModelEvent};
 use notes::{NOTES_EVENT, NOTES_EVERY, Notes};
+use notify::deliver::Deliver;
+use notify::notifier::{self, Notifier, Reads, StopNotifier};
 use poller::{Inputs, Poller, RealSources, TICK_EVERY};
 use process::ChildKind;
 use processes::{Options, Processes, REPROBE_EVERY};
@@ -104,6 +106,17 @@ pub fn run() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             tray::build(app.handle())?;
             app.manage(windows::PollerVisibility::start(app.handle()));
+            // The notification center's delegate, on every start and whatever the choices
+            // say: a click on a notice of an earlier run reaches it too. Kept for the app's
+            // life (the center holds it weakly); its clicks wait in the channel until the
+            // end of the setup.
+            #[cfg(target_os = "macos")]
+            let clicks = {
+                let (tx, rx) = mpsc::channel::<notify::Target>();
+                let deliver: Arc<dyn Deliver> = Arc::new(notify::macos::MacDeliver::start(tx));
+                app.manage(deliver);
+                rx
+            };
             let config_dir = app.path().app_config_dir()?;
             let config = commands::ConfigState::load(config_dir.clone());
             // Before the pipeline first starts with `--markdown-dir`: an account without a
@@ -195,6 +208,8 @@ pub fn run() {
             );
             // The first binding reads the Keychain: on the library's own thread.
             let _ = rebind.send(());
+            #[cfg(target_os = "macos")]
+            notify_statuses(app.handle(), &poller);
             report_status(app.handle().clone(), &poller);
             app.manage(processes);
             app.manage(poller.clone());
@@ -221,6 +236,9 @@ pub fn run() {
             {
                 eprintln!("notedown: the setup did not open: {why}");
             }
+            // Last: a click opens a window, which tells the poller, the library and the notes.
+            #[cfg(target_os = "macos")]
+            route_clicks(app.handle().clone(), clicks);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -527,6 +545,10 @@ fn stop_for_good(app: &AppHandle) {
     if let Some(poller) = app.try_state::<Poller>() {
         poller.stop();
     }
+    // Quitting the children makes statuses that look like problems: no notice for them.
+    if let Some(notifier) = app.try_state::<StopNotifier>() {
+        notifier.stop();
+    }
     // Kills the running renders; it does not wait.
     if let Some(review) = app.try_state::<review::Review>() {
         review.quit();
@@ -645,6 +667,44 @@ fn poll(poller: Poller) {
         loop {
             poller.tick();
             std::thread::sleep(TICK_EVERY);
+        }
+    });
+}
+
+/// The notifier thread: the poller's listener only puts each status into its channel. Needs
+/// the deliverer, the config, the import jobs and the notes managed.
+#[cfg(target_os = "macos")]
+fn notify_statuses(app: &AppHandle, poller: &Poller) {
+    let config = app.state::<commands::ConfigState>().reader();
+    let jobs = app.state::<ImportJobs>().inner().clone();
+    let notes = app.state::<Notes>().inner().clone();
+    let reads = Reads {
+        config: Box::new(move || config.current()),
+        holds_server: Box::new(move || jobs.holds_server()),
+        notes_newer_than: Box::new(move |seq| notes.notes_newer_than(seq)),
+        now_ms: Box::new(import_job::now_ms),
+    };
+    let (tx, rx) = mpsc::channel();
+    let (notifier, stop) = Notifier::new(
+        app.state::<Arc<notify::store::NotifyStore>>()
+            .inner()
+            .clone(),
+        app.state::<Arc<dyn Deliver>>().inner().clone(),
+        reads,
+        tx.clone(),
+    );
+    poller.on_status(notifier::listener(tx));
+    std::thread::spawn(move || notifier.run(rx));
+    app.manage(stop);
+}
+
+/// Opens what each clicked notice points to. The delegate only sends the target; this thread
+/// calls the window API.
+#[cfg(target_os = "macos")]
+fn route_clicks(app: AppHandle, clicks: mpsc::Receiver<notify::Target>) {
+    std::thread::spawn(move || {
+        for target in clicks {
+            windows::route(&app, &target);
         }
     });
 }

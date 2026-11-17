@@ -163,7 +163,9 @@ describe("openAt", () => {
     expect(openAt({ at: "new" })).toEqual({ kind: "new" });
     // The setup opens it at the recycle bin after a first sync that deleted files.
     expect(openAt({ at: "bin" })).toEqual({ kind: "bin" });
-    for (const odd of [null, undefined, "new", "bin", { at: "note" }, { at: "note", path: 3 }, { at: "trash" }]) {
+    // A click on a sync notification opens it at All notes.
+    expect(openAt({ at: "all" })).toEqual({ kind: "all" });
+    for (const odd of [null, undefined, "new", "bin", { at: "note" }, { at: "note", path: 3 }, { at: "trash" }, "all"]) {
       expect(openAt(odd)).toBeNull();
     }
   });

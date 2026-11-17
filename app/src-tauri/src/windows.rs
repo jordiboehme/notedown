@@ -12,6 +12,7 @@ use tauri::{
     AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
 
+use crate::notify::Target;
 use crate::poller::Poller;
 use crate::tray::{self, Area, PanelAction, Screen};
 
@@ -105,6 +106,24 @@ pub enum Opening {
     Plain,
     Page(String),
     At(LibraryAt),
+}
+
+/// The window and the place a click on a notice opens: the library at its place, or the
+/// settings at a page.
+pub fn opening_for(target: &Target) -> (WindowKind, Opening) {
+    match target {
+        Target::Library(at) => (WindowKind::Library, Opening::At(at.clone())),
+        Target::Settings(page) => (WindowKind::Settings, Opening::Page(page.clone())),
+    }
+}
+
+/// Opens what a clicked notice points to, through [`show_window`]: the window comes to the
+/// front with the Dock icon, also when none was open.
+pub fn route(app: &AppHandle, target: &Target) {
+    let (kind, opening) = opening_for(target);
+    if let Err(why) = show_window(app, kind, opening) {
+        eprintln!("notedown: a notification click opened nothing: {why}");
+    }
 }
 
 /// What a window is told about its opening: a new window by its init script (it runs before
@@ -567,6 +586,20 @@ mod tests {
                 serde_json::json!({"at": "bin"})
             ))
         );
+        // A click on a sync notification opens it at All notes.
+        assert_eq!(
+            tell(Library, &Opening::At(LibraryAt::All), true),
+            Some(Tell::Emit(
+                LIBRARY_AT_EVENT,
+                serde_json::json!({"at": "all"})
+            ))
+        );
+        assert_eq!(
+            tell(Library, &Opening::At(LibraryAt::All), false),
+            Some(Tell::Script(
+                r#"window.__NOTEDOWN_AT__ = {"at":"all"};"#.into()
+            ))
+        );
         // Open Library keeps an open window as it is; a new one starts where it starts.
         assert_eq!(tell(Library, &Opening::Plain, true), None);
         assert_eq!(
@@ -610,6 +643,36 @@ mod tests {
         );
         assert_eq!(library_opening(None, Some(false)), Opening::Plain);
         assert_eq!(library_opening(None, None), Opening::Plain);
+    }
+
+    #[test]
+    fn a_click_on_a_notice_opens_its_window_and_place() {
+        use crate::notify::Target;
+        assert_eq!(
+            opening_for(&Target::Library(LibraryAt::All)),
+            (Library, Opening::At(LibraryAt::All))
+        );
+        assert_eq!(
+            opening_for(&Target::Library(LibraryAt::New)),
+            (Library, Opening::At(LibraryAt::New))
+        );
+        assert_eq!(
+            opening_for(&Target::Library(LibraryAt::Note {
+                path: "NOTE/Note/A.note".into()
+            })),
+            (
+                Library,
+                Opening::At(LibraryAt::Note {
+                    path: "NOTE/Note/A.note".into()
+                })
+            )
+        );
+        for page in ["agents", "server", "ocr", "supernote"] {
+            assert_eq!(
+                opening_for(&Target::Settings(page.into())),
+                (Settings, Opening::Page(page.into()))
+            );
+        }
     }
 
     #[test]

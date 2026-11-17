@@ -8,10 +8,10 @@ use crate::status::{
 };
 use store::SyncCount;
 
-const MIN: u64 = 60_000;
-const NOW: u64 = 1_763_300_000_000;
+pub(super) const MIN: u64 = 60_000;
+pub(super) const NOW: u64 = 1_763_300_000_000;
 
-fn base_status() -> Status {
+pub(super) fn base_status() -> Status {
     Status {
         setup: Setup {
             mode: Mode::Local,

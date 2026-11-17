@@ -10,6 +10,7 @@
 pub mod deliver;
 #[cfg(target_os = "macos")]
 pub mod macos;
+pub mod notifier;
 pub mod store;
 
 use std::path::{Path, PathBuf};

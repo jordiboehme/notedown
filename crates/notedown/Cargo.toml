@@ -11,6 +11,50 @@ rust-version.workspace = true
 name = "notedown"
 path = "src/main.rs"
 
+[package.metadata.deb]
+maintainer = "Jordi Böhme <jordi@boehme-lopez.de>"
+copyright = "2026, Jordi Böhme <jordi@boehme-lopez.de>"
+license-file = "../../LICENSE"
+section = "utils"
+priority = "optional"
+# Static musl binary: no shared-library dependencies to detect, so no "$auto".
+# The postinst cargo-deb writes calls systemd-sysusers, which comes with systemd
+# or as the standalone systemd-sysusers package.
+depends = "systemd | systemd-sysusers"
+extended-description = """
+Notedown turns Supernote handwritten notes into Markdown. This Linux build \
+has the sync server your Supernote talks to and the other tools, without \
+OCR. It installs a notedown system user and a systemd unit that is not \
+enabled or started."""
+# The units dir defaults to this folder. cargo-deb 3.8.0 installs from it:
+# notedown.service to usr/lib/systemd/system/, notedown.tmpfile to
+# usr/lib/tmpfiles.d/notedown.conf and notedown.sysusers to
+# usr/lib/sysusers.d/notedown.conf. There is no postinst here: cargo-deb
+# writes the maintainer scripts itself (systemd-sysusers, then
+# systemd-tmpfiles, then the unit lines).
+maintainer-scripts = "debian/"
+# dist/THIRD-PARTY-NOTICES.txt (workspace root) is the Linux notices file. The
+# release stages it there before cargo deb; the CI smoke writes a placeholder.
+assets = [
+    ["target/release/notedown", "usr/bin/", "755"],
+    ["../../README.md", "usr/share/doc/notedown/README.md", "644"],
+    ["../../LICENSE", "usr/share/doc/notedown/LICENSE", "644"],
+    ["../../NOTICE", "usr/share/doc/notedown/NOTICE", "644"],
+    ["../../dist/THIRD-PARTY-NOTICES.txt", "usr/share/doc/notedown/THIRD-PARTY-NOTICES.txt", "644"],
+    ["debian/notedown.default", "etc/default/notedown", "644"],
+]
+
+# The unit ships installed but disabled: enable = false leaves activation to
+# the admin (systemctl enable --now notedown) and start = false never starts
+# it on install. restart-after-upgrade stays true on purpose: with
+# start = false cargo-deb emits a try-restart guarded by "upgrade only", so a
+# unit the admin runs is restarted onto the new binary and a disabled unit is
+# never touched.
+[package.metadata.deb.systemd-units]
+enable = false
+start = false
+restart-after-upgrade = true
+
 [features]
 # The OCR side: convert, model, pipeline and mcp. Without it the binary is the sync server
 # and the other tools, with no llama.cpp (the Raspberry Pi build).

@@ -32,12 +32,27 @@ jobs:
   # force push, a git error or an empty file list all set code=true. A
   # failed classifier skips the Rust jobs, and ci-passed reports the failure
   # of this job itself.
+  #
+  # The tested-tree skip: on a push to main, a pull request run that passed
+  # every gated job on the same tree (the same files, so the same build) left
+  # an artifact tested-tree-<tree> (see ci-passed). With tested=true the
+  # clippy, test, pi, app and musl jobs only compile and lint (so main still
+  # saves the caches pull requests restore) and skip their tests; fmt and deb
+  # are skipped; cargo-deny and workflow-lint still run. Any error, an empty
+  # answer or anything unclear leaves tested=false, and the checks read
+  # `!= 'true'`, so a missing output runs everything.
   changes:
     name: changes
     timeout-minutes: 10
     runs-on: ubuntu-latest
+    # The artifact lookup needs actions: read. Naming one permission drops the
+    # rest to none, so checkout's contents: read is named as well.
+    permissions:
+      contents: read
+      actions: read
     outputs:
       rust: ${{ steps.decide.outputs.rust }}
+      tested: ${{ steps.tested.outputs.tested }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -137,11 +152,63 @@ jobs:
             echo "rust=true" >>"$GITHUB_OUTPUT"
           fi
 
+      # Only artifacts of runs whose head is in this repository count: a fork's
+      # pull request runs its own copy of this file and could upload any name.
+      # A branch of this repository was pushed by someone with write access,
+      # who could change this file anyway.
+      - name: Look for a green pull request run of this tree
+        id: tested
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REPO_ID: ${{ github.repository_id }}
+        run: |
+          # As in the classifier: every failure in here has to end in
+          # tested=false and exit 0, never in a red job.
+          set +e
+          set -u
+
+          run_the_tests() {
+            echo "tested: $1, so the gated jobs run."
+            echo "tested=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          case "$REPO_ID" in
+            ''|*[!0-9]*) run_the_tests "the repository id '$REPO_ID' is not a number" ;;
+          esac
+
+          if ! tree=$(git rev-parse 'HEAD^{tree}'); then
+            run_the_tests "git could not name the tree of HEAD"
+          fi
+          case "$tree" in
+            ''|*[!0-9a-f]*) run_the_tests "'$tree' is not a tree sha" ;;
+          esac
+
+          name="tested-tree-$tree"
+          echo "tested: looking for the artifact $name"
+          if ! runs=$(gh api "repos/$REPO/actions/artifacts?name=$name&per_page=100" \
+            --jq "[.artifacts[] | select(.name == \"$name\" and .expired == false and .workflow_run.repository_id == $REPO_ID and .workflow_run.head_repository_id == $REPO_ID) | .workflow_run.id] | unique | map(tostring) | join(\" \")"); then
+            run_the_tests "the artifact lookup for $name failed"
+          fi
+          if [ -z "$runs" ]; then
+            # The usual reason: main moved while the pull request was open
+            # and it merged without being brought up to date, so the merge
+            # commit's tree is one no pull request run has seen.
+            echo "::notice title=tree skip missed::no green pull request run of the tree $tree (no unexpired $name). Likely the pull request was not up to date with main when it merged, so the gated jobs run again here."
+            run_the_tests "no pull request run of this repository left an unexpired $name"
+          fi
+
+          echo "tested: the pull request run(s) $runs passed every gated job on the tree $tree, so the Rust jobs only compile and lint, and fmt is skipped."
+          echo "tested=true" >>"$GITHUB_OUTPUT"
+
   fmt:
     name: fmt
     timeout-minutes: 10
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' && needs.changes.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -163,7 +230,7 @@ jobs:
     name: clippy (${{ matrix.os }})
     timeout-minutes: 45
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -212,7 +279,7 @@ jobs:
     name: test (${{ matrix.os }})
     timeout-minutes: 60
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -251,13 +318,21 @@ jobs:
           shared-key: test
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # A pull request run tested this tree: compile the tests only, so the
+      # cache main saves holds them.
+      - name: Compile the tests only (the pull request tested this tree)
+        if: ${{ needs.changes.outputs.tested == 'true' }}
+        run: cargo nextest run --workspace --locked --no-run
+
       # --no-tests=warn: a workspace whose crates have no tests yet is not an
       # error.
       - name: cargo nextest run
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: cargo nextest run --workspace --locked --no-tests=warn
 
       # nextest does not run doctests.
       - name: cargo test --doc
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: cargo test --workspace --doc --locked
 
   # Linux on arm64, the Raspberry Pi. This job is the spec's Pi build check:
@@ -267,7 +342,7 @@ jobs:
     name: pi (arm64)
     timeout-minutes: 30
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -293,19 +368,25 @@ jobs:
         run: cargo build -p notedown-cloud --locked
 
       - name: cargo nextest run -p notedown-cloud
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: cargo nextest run -p notedown-cloud --locked --no-tests=warn
 
       - name: cargo test --doc -p notedown-cloud
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: cargo test -p notedown-cloud --doc --locked
 
       - name: cargo clippy -p notedown --no-default-features
         run: cargo clippy -p notedown --no-default-features --all-targets --locked -- -D warnings
 
-      - name: cargo nextest run -p notedown --no-default-features
-        run: cargo nextest run -p notedown --no-default-features --locked --no-tests=warn
+      - name: Compile the tests only (the pull request tested this tree)
+        if: ${{ needs.changes.outputs.tested == 'true' }}
+        run: |
+          cargo nextest run -p notedown-cloud --locked --no-run
+          cargo nextest run -p notedown --no-default-features --locked --no-run
 
-      - name: cargo build --release -p notedown --no-default-features
-        run: cargo build --release -p notedown --no-default-features --locked
+      - name: cargo nextest run -p notedown --no-default-features
+        if: ${{ needs.changes.outputs.tested != 'true' }}
+        run: cargo nextest run -p notedown --no-default-features --locked --no-tests=warn
 
       - name: The Pi build has no OCR in its dependency tree
         run: |
@@ -319,6 +400,244 @@ jobs:
             exit 1
           fi
 
+  # The Linux release build: a static musl binary of notedown without its
+  # `ocr` feature, for amd64 and arm64, each on a native runner (the release
+  # builds the same way). Checks that the binary is static and that
+  # --version names the workspace version. It runs on a tested main push too
+  # (it is a build and saves its cache there). The amd64 binary is uploaded as
+  # the artifact musl-amd64 for the .deb and image smoke tests (upload-artifact
+  # does not keep the exec bit, so a user of it runs chmod first).
+  musl:
+    name: musl (${{ matrix.arch }})
+    timeout-minutes: 30
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-24.04, not ubuntu-latest: the ubuntu-latest image (26.04) has no
+          # Ubuntu archive in its apt sources, so musl-tools is not found there.
+          - {arch: amd64, os: ubuntu-24.04, target: x86_64-unknown-linux-musl}
+          - {arch: arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl}
+    # The matrix reaches the shell steps as environment variables, never as
+    # `${{ }}` text pasted into a script.
+    env:
+      LEG_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          bash scripts/ci/retry.sh 3 rustup toolchain install
+          rustup show active-toolchain
+
+      - name: Add the musl target
+        run: bash scripts/ci/retry.sh 3 rustup target add "$LEG_TARGET"
+
+      # aws-lc-sys (rustls) is C and needs the musl C compiler.
+      - name: Install musl-tools
+        run: |
+          bash scripts/ci/retry.sh 3 sudo apt-get update
+          bash scripts/ci/retry.sh 3 sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: musl-${{ matrix.arch }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: cargo build --release --target musl -p notedown --no-default-features
+        run: cargo build --release --locked --target "$LEG_TARGET" -p notedown --no-default-features
+
+      - name: The binary is static and names the workspace version
+        run: bash scripts/ci/check-linux-binary.sh "target/$LEG_TARGET/release/notedown"
+
+      - name: Upload the amd64 binary
+        if: ${{ matrix.arch == 'amd64' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: musl-amd64
+          path: target/x86_64-unknown-linux-musl/release/notedown
+          retention-days: 3
+          overwrite: true
+          if-no-files-found: error
+
+  # The .deb smoke test: packages the musl amd64 binary of the musl job (the
+  # artifact musl-amd64) the way the release does, installs it on the runner
+  # and checks the notedown user, its home, the unit (installed, not enabled,
+  # not running) and that `sudo -u notedown notedown cloud ...` writes into
+  # /var/lib/notedown/notedown-data. Skipped on a tested main push, like the
+  # other checks.
+  deb:
+    name: deb
+    timeout-minutes: 20
+    needs: [changes, musl]
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' && needs.changes.outputs.tested != 'true' && needs.musl.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # cargo deb runs through cargo, which wants the pinned toolchain.
+      - name: Install Rust toolchain
+        run: |
+          bash scripts/ci/retry.sh 3 rustup toolchain install
+          rustup show active-toolchain
+
+      # Where cargo deb --target x86_64-unknown-linux-musl --no-build looks.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: musl-amd64
+          path: target/x86_64-unknown-linux-musl/release
+
+      # upload-artifact does not keep the exec bit.
+      - name: Make the binary executable
+        run: chmod +x target/x86_64-unknown-linux-musl/release/notedown
+
+      # The install-action download can fail on a bad network day. The second
+      # step is the same install and runs only after the first one failed.
+      # fallback: none fails the step rather than building or downloading
+      # anything else.
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        id: cargo-deb
+        continue-on-error: true
+        with:
+          tool: cargo-deb@3.8.0
+          fallback: none
+
+      - name: Wait before the second try
+        if: ${{ steps.cargo-deb.outcome == 'failure' }}
+        run: sleep 30
+
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        if: ${{ steps.cargo-deb.outcome == 'failure' }}
+        with:
+          tool: cargo-deb@3.8.0
+          fallback: none
+
+      # The release puts the Linux notices at dist/THIRD-PARTY-NOTICES.txt;
+      # here an empty file stands in for it.
+      - name: Build the .deb
+        run: |
+          set -euo pipefail
+          version="$(bash scripts/ci/workspace-version.sh)"
+          mkdir -p dist
+          : >dist/THIRD-PARTY-NOTICES.txt
+          cargo deb -p notedown --target x86_64-unknown-linux-musl --no-build \
+            --deb-version "$version" --output "dist/notedown_${version}_amd64.deb"
+          deb="dist/notedown_${version}_amd64.deb"
+          dpkg-deb --info "$deb"
+          # cargo-deb writes the postinst (no debian/postinst): systemd-sysusers
+          # must be in it, and the upgrade try-restart exactly once (a doubled
+          # fragment block would restart a running server twice).
+          echo "--- postinst"
+          postinst="$(dpkg-deb --info "$deb" postinst)"
+          echo "$postinst"
+          echo "--- contents"
+          contents="$(dpkg-deb --contents "$deb")"
+          echo "$contents"
+          missing=0
+          for path in \
+            ./usr/bin/notedown \
+            ./usr/lib/systemd/system/notedown.service \
+            ./usr/lib/sysusers.d/notedown.conf \
+            ./usr/lib/tmpfiles.d/notedown.conf \
+            ./etc/default/notedown \
+            ./usr/share/doc/notedown/README.md \
+            ./usr/share/doc/notedown/LICENSE \
+            ./usr/share/doc/notedown/NOTICE \
+            ./usr/share/doc/notedown/THIRD-PARTY-NOTICES.txt; do
+            if ! awk '{print $NF}' <<<"$contents" | grep -qxF "$path"; then
+              echo "::error::the .deb has no $path"
+              missing=1
+            fi
+          done
+          if ! dpkg-deb --info "$deb" conffiles | grep -qxF /etc/default/notedown; then
+            echo "::error::/etc/default/notedown is not a conffile"
+            missing=1
+          fi
+          if ! grep -q 'systemd-sysusers' <<<"$postinst"; then
+            echo "::error::the postinst does not call systemd-sysusers"
+            missing=1
+          fi
+          restarts="$(grep -c 'deb-systemd-invoke try-restart' <<<"$postinst" || true)"
+          if [ "$restarts" != 1 ]; then
+            echo "::error::the postinst has $restarts try-restart lines, want 1"
+            missing=1
+          fi
+          got="$(dpkg-deb --field "$deb" Version)"
+          if [ "$got" != "$version" ]; then
+            echo "::error::the .deb has the version '$got', want '$version'"
+            missing=1
+          fi
+          exit "$missing"
+
+      # Depends is systemd, which the runner has, so the install needs no
+      # package index.
+      - name: Install the .deb
+        run: sudo apt-get install -y ./dist/notedown_*_amd64.deb
+
+      # systemctl is-enabled prints disabled with exit 1 and is-active exits 3
+      # when the unit is not running, so both answers are captured with
+      # `|| true` and compared.
+      - name: The package set up the user, its home and the unit
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+
+          # verify also prints warnings about the runner's own units (for
+          # example walinuxagent.service); those lines are not ours. Only a
+          # line that names notedown.service fails the step.
+          verify="$(systemd-analyze verify /usr/lib/systemd/system/notedown.service 2>&1 || true)"
+          echo "$verify"
+          if grep -q 'notedown\.service' <<<"$verify"; then
+            fail "systemd-analyze verify complains about notedown.service"
+          fi
+
+          state="$(systemctl is-enabled notedown || true)"
+          echo "is-enabled: $state"
+          [ "$state" = disabled ] || fail "the unit is '$state', want disabled"
+          state="$(systemctl is-active notedown || true)"
+          echo "is-active: $state"
+          [ "$state" != active ] || fail "the unit runs after the install"
+
+          id notedown || fail "there is no notedown user"
+          home="$(getent passwd notedown | cut -d: -f6 || true)"
+          [ "$home" = /var/lib/notedown ] || fail "the home of notedown is '$home'"
+          test -f /usr/lib/sysusers.d/notedown.conf || fail "no /usr/lib/sysusers.d/notedown.conf"
+          test -f /usr/lib/tmpfiles.d/notedown.conf || fail "no /usr/lib/tmpfiles.d/notedown.conf"
+          owner="$(stat -c %U:%a /var/lib/notedown || true)"
+          [ "$owner" = notedown:750 ] || fail "/var/lib/notedown is $owner, want notedown:750"
+
+          # sudo sets HOME to the target user's home, which is how the CLI
+          # finds the service's data folder.
+          sudo_home="$(sudo -u notedown printenv HOME)"
+          [ "$sudo_home" = /var/lib/notedown ] || fail "sudo -u notedown has HOME=$sudo_home"
+          version="$(bash scripts/ci/workspace-version.sh)"
+          got="$(sudo -u notedown notedown --version)"
+          [ "$got" = "notedown $version" ] || fail "notedown --version printed '$got'"
+
+          printf 'pw-for-ci\n' | sudo -u notedown notedown cloud account add t \
+            --email t@example.org --password-stdin
+          sudo test -f /var/lib/notedown/notedown-data/accounts/t/account.json \
+            || fail "the account is not in /var/lib/notedown/notedown-data"
+          echo "deb: user, home, unit and data folder are as expected"
+
+      - name: Removing the package keeps the data and the user
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          sudo apt-get remove -y notedown
+          test ! -e /usr/bin/notedown || fail "/usr/bin/notedown is still there"
+          sudo test -f /var/lib/notedown/notedown-data/accounts/t/account.json \
+            || fail "the remove deleted the data"
+          id notedown || fail "the remove deleted the notedown user"
+          echo "deb: the remove kept the data and the user"
+
   # Dependency audit: advisories (RustSec), licenses (the allowlist in
   # deny.toml), sources and bans. security.yml also checks advisories every
   # week, since a new advisory appears without any change here.
@@ -326,7 +645,7 @@ jobs:
     name: cargo-deny
     timeout-minutes: 15
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -364,7 +683,7 @@ jobs:
     name: app
     timeout-minutes: 45
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -393,10 +712,12 @@ jobs:
         working-directory: app
 
       - name: npm run check
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: npm run check
         working-directory: app
 
       - name: vitest
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: npx vitest run
         working-directory: app
 
@@ -412,8 +733,12 @@ jobs:
           mkdir -p binaries
           printf '#!/bin/sh\nexit 0\n' >"binaries/notedown-$triple"
           chmod 755 "binaries/notedown-$triple"
+          # tauri-build also needs the notices resource of tauri.conf.json.
+          mkdir -p resources
+          printf 'Placeholder of a CI build.\n' >resources/THIRD-PARTY-NOTICES.txt
 
       - name: cargo fmt --check
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: cargo fmt --check
         working-directory: app/src-tauri
 
@@ -421,7 +746,13 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
         working-directory: app/src-tauri
 
+      - name: Compile the tests only (the pull request tested this tree)
+        if: ${{ needs.changes.outputs.tested == 'true' }}
+        run: cargo test --locked --no-run
+        working-directory: app/src-tauri
+
       - name: cargo test
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: cargo test --locked
         working-directory: app/src-tauri
 
@@ -452,26 +783,201 @@ jobs:
           advanced-security: false
           annotations: true
 
+      # The fixture tests of the CI and release scripts (jq, git and python3
+      # with PyYAML are on the runner image).
+      - name: Script tests
+        run: |
+          set -euo pipefail
+          bash scripts/ci/test-release-check.sh
+          bash scripts/ci/test-version-pins.sh
+          bash scripts/ci/test-jobs-passed.sh
+          bash scripts/ci/test-notices.sh
+          bash scripts/ci/test-permissions-fit.sh
+          bash scripts/ci/test-app-sbom.sh
+          bash scripts/ci/test-check-linux-binary.sh
+          bash scripts/ci/test-notarize.sh
+          bash scripts/ci/test-updater-key-id.sh
+          bash scripts/ci/test-homebrew.sh
+          bash scripts/ci/test-latest-json.sh
+
+      # A called workflow that asks for a scope its caller does not grant
+      # fails the whole calling run at startup, on every push. release.yml's
+      # job permissions must fit inside what release-rehearsal.yml (and the
+      # release job of this file) grant.
+      - name: Permissions fit
+        run: bash scripts/ci/permissions-fit.sh
+
+      # Every place that names the version names the same one, so a version
+      # bump that left a pin behind fails its pull request.
+      - name: Version pins
+        run: bash scripts/ci/version-pins.sh
+
+      # A release pull request learns here, not after its merge, when its
+      # notes file has no H1. Without a notes file this needs no network;
+      # with one it asks the remote for the tag, hence the retries.
+      - name: Release check
+        run: bash scripts/ci/retry.sh 3 bash scripts/release-check.sh
+
   # The one check a branch protection rule requires. It always runs and
   # passes when every job above passed or was skipped (a documentation-only
-  # change). Any failure or cancellation fails
-  # it. A job `if` without always() would skip this job when a need is
-  # skipped, and a skipped required check is not a reliable signal.
+  # change, or a main push whose tree a pull request run tested). Any
+  # failure or cancellation fails it. A job `if` without always() would skip
+  # this job when a need is skipped, and a skipped required check is not a
+  # reliable signal.
+  #
+  # Two checks. The first reads the needs results. The second reads every
+  # leg of the run from the API: a matrix job's result in `needs` sums up its
+  # legs, and a leg that was cancelled or timed out must fail this check too.
+  # Only completed jobs are judged, since the release jobs that wait for this
+  # one are still queued.
+  #
+  # On a pull request where no need was skipped it then uploads the proof
+  # tested-tree-<tree>, which lets the push to main skip the gated jobs on
+  # the same tree (see changes).
   ci-passed:
     name: ci-passed
-    timeout-minutes: 5
-    needs: [changes, fmt, clippy, test, pi, cargo-deny, app, workflow-lint]
+    timeout-minutes: 10
+    needs: [changes, fmt, clippy, test, pi, musl, deb, cargo-deny, app, workflow-lint]
     if: ${{ always() }}
     runs-on: ubuntu-latest
+    # actions: read for the jobs list of this run.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Every job passed or was skipped
         env:
-          RESULTS: ${{ toJSON(needs.*.result) }}
-          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+          RESULTS: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
-          echo "ci-passed: job results $RESULTS"
-          if [ "$FAILED" = "true" ]; then
-            echo "::error::at least one CI job failed or was cancelled"
+          bad=$(jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | "\(.key): \(.value.result)"' <<<"$RESULTS")
+          jq -r 'to_entries[] | "  \(.value.result)  \(.key)"' <<<"$RESULTS"
+          if [ -n "$bad" ]; then
+            echo "::error::not every job passed: $(tr '\n' ' ' <<<"$bad")"
             exit 1
           fi
+          echo "ci-passed: every job passed or was skipped"
+
+      # The commit every job above checked out: refs/pull/N/merge at
+      # github.sha on a pull request, the pushed commit on main.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Every leg passed or was skipped
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          jobs="$RUNNER_TEMP/jobs.json"
+          # The redirect sits inside the retried command, so a failed try
+          # leaves no partial output behind.
+          bash scripts/ci/retry.sh 3 bash -c \
+            'gh api "repos/$REPO/actions/runs/$RUN_ID/jobs?filter=latest&per_page=100" --paginate >"$1"' \
+            _ "$jobs"
+          bash scripts/ci/jobs-passed.sh <"$jobs"
+
+      - name: Name the tested tree
+        id: tree
+        if: ${{ github.event_name == 'pull_request' && !contains(needs.*.result, 'skipped') }}
+        run: |
+          set -euo pipefail
+          tree=$(git rev-parse 'HEAD^{tree}')
+          echo "ci-passed: every gated job passed on the tree $tree (commit $GITHUB_SHA)"
+          echo "tree=$tree" >>"$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/tested-tree"
+          printf 'tree %s\ncommit %s\nrun %s\n' "$tree" "$GITHUB_SHA" "$GITHUB_RUN_ID" \
+            >"$RUNNER_TEMP/tested-tree/tested-tree.txt"
+
+      # A re-run of this job uploads the same name again, hence overwrite.
+      - name: Upload the proof
+        if: ${{ github.event_name == 'pull_request' && !contains(needs.*.result, 'skipped') }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tested-tree-${{ steps.tree.outputs.tree }}
+          path: ${{ runner.temp }}/tested-tree/tested-tree.txt
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: error
+
+  # Release on merge. The release notes file is the switch: the pull request
+  # of a release bumps the version and adds release-notes/v<version>.md, and
+  # once its merge passes ci-passed on main, release-check answers
+  # release=true and the release job calls release.yml with the tag. Without
+  # a notes file, or with the tag already there, release-check answers
+  # release=false and the run stays green (scripts/release-check.sh).
+  #
+  # Both jobs wait for ci-passed and stay out of its needs. Its per-leg check
+  # judges only completed jobs, so these two, still queued, do not count.
+  #
+  # Only the release job holds a concurrency group, never cancelled in
+  # progress, so two releases never run at once and a check never waits. A
+  # second release queued behind a running one finds its tag in release.yml's
+  # notes job and stops green. A third that queues while one waits replaces
+  # the waiting one, which shows as cancelled; re-run a cancelled release job
+  # by hand.
+  release-check:
+    name: release-check
+    timeout-minutes: 10
+    needs: [ci-passed]
+    # !cancelled(): without a status function the condition gets an implicit
+    # success(), which is false when any job up the needs chain was skipped,
+    # and on a main push whose tree a pull request tested, jobs are skipped on
+    # purpose.
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.ci-passed.result == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      release: ${{ steps.check.outputs.release }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # With a notes file in place the script asks the remote for the tag,
+      # hence the retries. A retry writes the same output lines again, and
+      # the last one wins.
+      - name: Is this version new
+        id: check
+        run: bash scripts/ci/retry.sh 3 bash scripts/release-check.sh
+
+  # The release itself: release.yml called with the tag. A called workflow
+  # gets no more than this job grants, so this is the union of what
+  # release.yml's jobs ask for (scripts/ci/permissions-fit.sh checks it in
+  # workflow-lint). release-rehearsal.yml grants the same.
+  release:
+    name: release
+    needs: release-check
+    # !cancelled() for the same reason as release-check above.
+    if: ${{ !cancelled() && needs.release-check.result == 'success' && needs.release-check.outputs.release == 'true' }}
+    concurrency:
+      group: release-main
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    # A local reusable workflow resolves at the commit this run started on.
+    # actionlint 1.7.12 does not parse the self-repository syntax `$/` yet,
+    # so zizmor's self-repository finding is ignored here.
+    uses: ./.github/workflows/release.yml # zizmor: ignore[self-repository]
+    with:
+      tag: ${{ needs.release-check.outputs.tag }}
+    # By name, never `inherit`. The secrets live only in the `release`
+    # environment and this job has none, so these resolve to nothing here by
+    # design: the called jobs that declare `environment: release` read the
+    # environment's values. Do not move the secrets to the repository to
+    # "fix" the empty values.
+    secrets:
+      APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+      TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}

@@ -1,0 +1,35 @@
+[Unit]
+Description=Notedown sync server for Supernote devices
+Documentation=https://github.com/jordiboehme/notedown
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# A fixed system user (usr/lib/sysusers.d/notedown.conf) with its home in
+# /var/lib/notedown (usr/lib/tmpfiles.d/notedown.conf). A fixed user and not
+# DynamicUser=, so that `sudo -u notedown notedown cloud ...` works on the
+# same files as the service.
+User=notedown
+Group=notedown
+WorkingDirectory=/var/lib/notedown
+# notedown finds its data folder as $HOME/notedown-data, so the service and
+# `sudo -u notedown notedown ...` (sudo sets HOME to the user's home) both use
+# /var/lib/notedown/notedown-data. The listen address and every other server
+# setting are in server.toml in that folder.
+Environment=HOME=/var/lib/notedown
+EnvironmentFile=-/etc/default/notedown
+ExecStart=/usr/bin/notedown serve
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+# The service writes only below /var/lib/notedown. A render_dir in server.toml
+# outside it needs a ReadWritePaths= drop-in (sudo systemctl edit notedown).
+ReadWritePaths=/var/lib/notedown
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

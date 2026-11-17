@@ -270,7 +270,6 @@ fn model_verify_fails_for_empty_cache() {
 }
 
 fn cloud(data: &std::path::Path, args: &[&str], stdin: Option<&str>) -> std::process::Output {
-    use std::io::Write;
     use std::process::Stdio;
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
         .args(["cloud", "account", "--data"])
@@ -283,10 +282,24 @@ fn cloud(data: &std::path::Path, args: &[&str], stdin: Option<&str>) -> std::pro
         .unwrap();
     let mut pipe = child.stdin.take().unwrap();
     if let Some(text) = stdin {
-        pipe.write_all(text.as_bytes()).unwrap();
+        write_stdin(&mut pipe, text.as_bytes());
     }
     drop(pipe);
     child.wait_with_output().unwrap()
+}
+
+/// Writes to a child's stdin. The child may exit before it reads (an error
+/// that ends the command early), which closes the pipe: that BrokenPipe is
+/// ignored, and the caller judges the child's exit and output as before.
+fn write_stdin(pipe: &mut std::process::ChildStdin, bytes: &[u8]) {
+    use std::io::Write;
+    if let Err(e) = pipe.write_all(bytes) {
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "writing to the child's stdin: {e}"
+        );
+    }
 }
 
 #[test]
@@ -2769,7 +2782,6 @@ fn running_server(data: &std::path::Path) -> Server {
 
 #[cfg(feature = "ocr")]
 fn connect_cmd(url: &str, local: &std::path::Path, password: &str) -> std::process::Output {
-    use std::io::Write;
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
         .args(["connect", url, "--data"])
         .arg(local)
@@ -2780,7 +2792,7 @@ fn connect_cmd(url: &str, local: &std::path::Path, password: &str) -> std::proce
         .spawn()
         .unwrap();
     let mut pipe = child.stdin.take().unwrap();
-    pipe.write_all(format!("{password}\n").as_bytes()).unwrap();
+    write_stdin(&mut pipe, format!("{password}\n").as_bytes());
     drop(pipe);
     child.wait_with_output().unwrap()
 }
@@ -3409,4 +3421,62 @@ fn cloud_import_json_real_run_of_a_bad_backup_prints_one_sentence() {
         ["error: the backup cannot be imported completely"],
         "{out:?}"
     );
+}
+
+#[test]
+fn cloud_account_list_uses_the_default_folder() {
+    let home = tempfile::tempdir().unwrap();
+    let data = home.path().join("notedown-data");
+    std::fs::create_dir(&data).unwrap();
+    let out = cloud(
+        &data,
+        &[
+            "add",
+            "jordi",
+            "--email",
+            "jordi@example.org",
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(out.status.success());
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .env("HOME", home.path())
+        .env_remove("NOTEDOWN_DATA")
+        .args(["cloud", "account", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("jordi@example.org"));
+}
+
+#[test]
+fn cloud_account_list_prefers_data_over_the_environment() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let out = cloud(
+        b.path(),
+        &[
+            "add",
+            "jordi",
+            "--email",
+            "b@example.org",
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(out.status.success());
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .env("NOTEDOWN_DATA", a.path())
+        .args(["cloud", "account", "--data"])
+        .arg(b.path())
+        .arg("list")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("b@example.org"));
 }

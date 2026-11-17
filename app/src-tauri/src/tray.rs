@@ -14,6 +14,7 @@ pub const TRAY_ID: &str = "main";
 /// Menu item ids. The app menu's own Quit uses [`QUIT_ID`] too.
 pub const OPEN_LIBRARY_ID: &str = "open-library";
 pub const SETTINGS_ID: &str = "settings";
+pub const CHECK_UPDATES_ID: &str = "check-updates";
 pub const QUIT_ID: &str = "quit";
 
 // The 2x images: tray-icon draws any image 18 pt high, so these stay sharp on a Retina
@@ -96,6 +97,13 @@ pub fn build(app: &AppHandle) -> tauri::Result<TrayIcon> {
         &[
             &MenuItem::with_id(app, OPEN_LIBRARY_ID, "Open Library", true, None::<&str>)?,
             &MenuItem::with_id(app, SETTINGS_ID, "Settings...", true, None::<&str>)?,
+            &MenuItem::with_id(
+                app,
+                CHECK_UPDATES_ID,
+                "Check for Updates...",
+                true,
+                None::<&str>,
+            )?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, QUIT_ID, "Quit Notedown", true, None::<&str>)?,
         ],
@@ -158,6 +166,7 @@ pub fn on_menu_event(app: &AppHandle, id: &str) {
             let _ =
                 windows::show_window(app, windows::WindowKind::Settings, windows::Opening::Plain);
         }
+        CHECK_UPDATES_ID => crate::check_update_from_menu(app),
         QUIT_ID => crate::request_quit(app),
         _ => {}
     }

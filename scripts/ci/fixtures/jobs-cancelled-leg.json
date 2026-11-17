@@ -1,0 +1,6 @@
+{"total_count":4,"jobs":[
+{"name":"changes","status":"completed","conclusion":"success"},
+{"name":"musl (amd64)","status":"completed","conclusion":"success"},
+{"name":"musl (arm64)","status":"completed","conclusion":"cancelled"},
+{"name":"ci-passed","status":"in_progress","conclusion":null}
+]}

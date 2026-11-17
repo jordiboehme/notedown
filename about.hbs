@@ -1,0 +1,25 @@
+{{!--
+  Plain text template for cargo-about (scripts/third-party-notices.sh).
+  Triple braces: cargo-about does not turn off HTML escaping, so double braces
+  would write &quot; into the license texts.
+  The @@notedown lines are markers for the script. It drops a block without
+  any crate line (a license used only by Notedown's own path crates, which
+  have no registry source) and turns "@@notedown-crate" into a list item.
+--}}
+{{#each licenses}}
+@@notedown-block
+========================================================================
+{{{name}}} ({{{id}}})
+========================================================================
+
+Used by:
+{{#each used_by}}
+{{#if crate.source}}
+@@notedown-crate {{{crate.name}}} {{{crate.version}}}
+{{/if}}
+{{/each}}
+
+{{{text}}}
+
+@@notedown-end
+{{/each}}

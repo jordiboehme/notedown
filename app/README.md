@@ -25,7 +25,9 @@ npm run tauri dev
 `npm run tauri dev` first runs `npm run prepare-sidecar`. It builds `notedown` in release mode
 in the root workspace (with OCR) and copies it to `src-tauri/binaries/notedown-<target>`, the
 name that Tauri's `externalBin` needs. The first build takes a while, because llama.cpp is
-built with it. You can run the step on its own:
+built with it. It also writes a placeholder `src-tauri/resources/THIRD-PARTY-NOTICES.txt` when
+there is none: the bundle carries that file, and only the release build writes the real
+notices. Cargo in `src-tauri` needs both files. You can run the step on its own:
 
 ```sh
 npm run prepare-sidecar
@@ -36,6 +38,32 @@ A release build of the app, with the sidecar in the bundle:
 ```sh
 npm run tauri build
 ```
+
+The bundle also makes the updater files (`createUpdaterArtifacts`), and Tauri signs them with
+the updater key. Without `TAURI_SIGNING_PRIVATE_KEY` the build fails with "A public key has
+been found, but no private key". A local build does not need the release key. Turn the updater
+files off:
+
+```sh
+npm run tauri build -- --config '{"bundle":{"createUpdaterArtifacts":false}}'
+```
+
+Or sign with a throwaway key. Nobody's updater installs a local build:
+
+```sh
+npx tauri signer generate --ci -w /tmp/throwaway.key
+export TAURI_SIGNING_PRIVATE_KEY="$(cat /tmp/throwaway.key)"
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=''
+npm run tauri build
+```
+
+## Updates
+
+The app checks for a new version at start and then once a day. It reads `latest.json` of the
+newest GitHub release and checks the signature of the update with the public key in
+`tauri.conf.json`. A new version opens Settings on the About page, which shows its notes and
+asks. "Check for Updates..." in the menu bar menu and the button on the About page check at
+once. The install stops the server and the pipeline and starts Notedown again.
 
 ## Checks
 

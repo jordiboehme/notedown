@@ -123,7 +123,7 @@ title: "Test 2"
 description: "Handwritten Supernote note, 1 page, read by OCR."
 resource: "Test 2.note"
 tags: [supernote]
-generated: { by: notedown/0.1.0, model: "chandra-ocr-2 Q4_K_M", at: 2026-10-05T23:10:00Z }
+generated: { by: notedown/<version>, model: "chandra-ocr-2 Q4_K_M", at: 2026-10-05T23:10:00Z }
 source_date: 2026-10-05
 sources:
   - { id: note, resource: "Test 2.note", last_modified: 2026-10-05T22:55:35Z }
@@ -256,6 +256,12 @@ error line.
 records. `--empty` gives zeros and empty lists.
 
 Both commands take a hidden `--exit-with-parent <pid>`, like `backup-device`.
+
+## The data folder
+
+Every command with a `--data` option uses `$NOTEDOWN_DATA` when you leave the option out and the
+variable is set and not empty. Without both it uses `~/notedown-data`. A command stops with "no data
+folder: pass --data or set NOTEDOWN_DATA" when there is no home folder either.
 
 ## Pipeline settings
 

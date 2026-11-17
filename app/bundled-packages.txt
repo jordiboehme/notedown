@@ -1,0 +1,8 @@
+# npm packages compiled into app/dist besides the production dependencies of
+# package.json (scripts/third-party-notices.sh, variant app, and the app SBOM).
+# These are devDependencies, but Vite builds their code into the app:
+# svelte (the runtime, marker "__svelte" in the JS) and tailwindcss (the
+# preflight CSS, banner "/*! tailwindcss v..."). One package name per line.
+# The script fails when dist/ shows a banner or runtime that is not in the set.
+svelte
+tailwindcss

@@ -45,8 +45,18 @@
       "icons/icon.icns",
       "icons/icon.png"
     ],
+    "resources": {
+      "resources/THIRD-PARTY-NOTICES.txt": "THIRD-PARTY-NOTICES.txt"
+    },
+    "createUpdaterArtifacts": true,
     "macOS": {
       "minimumSystemVersion": "13.0"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYwNDE0N0EwNEY5QzM0REEKUldUYU5KeFBvRWRCOEJuMmJYODBmb2NKK2ZXa3hkSmRPTVozVkppMzBqVW1qTmM3Q2ZXY0gvVjQK",
+      "endpoints": ["https://github.com/jordiboehme/notedown/releases/latest/download/latest.json"]
     }
   }
 }

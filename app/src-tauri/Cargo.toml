@@ -29,6 +29,12 @@ tauri-plugin-autostart = "=2.7.0"
 # The folder picker of the Markdown folder on the OCR page. Only the settings window may open it
 # (capabilities/settings.json).
 tauri-plugin-dialog = "=2.8.4"
+# The self-updater: checks GitHub's latest.json, verifies the minisign signature of the update
+# and installs it. Only Rust calls it (update.rs); no window has its permissions. native-tls as
+# the app's reqwest, so no second TLS stack; the macOS .app.tar.gz needs no `zip` feature.
+tauri-plugin-updater = { version = "=2.14.1", default-features = false, features = ["native-tls"] }
+# Compares a found version with the one About opened for last. Already in the tree through Tauri.
+semver = "=1.0.28"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 # The token lives in the macOS Keychain; without apple-native keyring can fall back to a mock.

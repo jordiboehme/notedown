@@ -1,0 +1,8 @@
+{"total_count":4,"jobs":[
+{"name":"changes","status":"completed","conclusion":"success"},
+{"name":"clippy (ubuntu-latest)","status":"completed","conclusion":"success"}
+]}
+{"total_count":4,"jobs":[
+{"name":"clippy (macos-latest)","status":"completed","conclusion":"failure"},
+{"name":"ci-passed","status":"in_progress","conclusion":null}
+]}

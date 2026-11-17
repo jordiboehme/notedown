@@ -1,0 +1,7 @@
+{"total_count":3,"jobs":[
+{"name":"changes","status":"completed","conclusion":"success"}
+]}
+{"total_count":3,"jobs":[
+{"name":"app","status":"completed","conclusion":"skipped"},
+{"name":"ci-passed","status":"in_progress","conclusion":null}
+]}

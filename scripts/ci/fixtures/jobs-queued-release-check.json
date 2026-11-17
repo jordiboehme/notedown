@@ -1,0 +1,6 @@
+{"total_count":4,"jobs":[
+{"name":"changes","status":"completed","conclusion":"success"},
+{"name":"test (ubuntu-latest)","status":"completed","conclusion":"success"},
+{"name":"ci-passed","status":"in_progress","conclusion":null},
+{"name":"release-check","status":"queued","conclusion":null}
+]}

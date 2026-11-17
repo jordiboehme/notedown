@@ -5,7 +5,15 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { createLastPage, firstPage } from "../lib/lastPage";
   import { startStatus } from "../lib/status.svelte";
-  import { SETTINGS_PAGE_EVENT, openLink } from "./api";
+  import {
+    SETTINGS_PAGE_EVENT,
+    UPDATE_STATE_EVENT,
+    checkForUpdate,
+    failure,
+    installUpdateAndRestart,
+    openLink,
+    updateState,
+  } from "./api";
   import { loadConfig } from "./config.svelte";
   import PageIcon from "./kit/PageIcon.svelte";
   import { GROUPS, isPageId, pageById, type PageId } from "./pages";
@@ -18,6 +26,7 @@
   import ServerPage from "./pages/ServerPage.svelte";
   import SetupPage from "./pages/SetupPage.svelte";
   import SupernotePage from "./pages/SupernotePage.svelte";
+  import type { UpdateState } from "./update";
   import "../lib/system.css";
   import "./settings.css";
 
@@ -37,6 +46,7 @@
   let page = $state<PageId>(firstPage(requested, last.load()));
   let now = $state(Date.now());
   let version = $state<string | null>(null);
+  let update = $state<UpdateState>({ kind: "idle" });
 
   function show(next: PageId) {
     page = next;
@@ -60,6 +70,7 @@
       listen<string | null>(SETTINGS_PAGE_EVENT, (event) => {
         if (isPageId(event.payload)) show(event.payload);
       }),
+      followUpdates(),
     ];
     const clock = setInterval(() => (now = Date.now()), 30_000);
     return () => {
@@ -67,6 +78,28 @@
       for (const stop of stops) void stop.then((unlisten) => unlisten());
     };
   });
+
+  // Rust may have told a state before this window listened (it opens the window for a found
+  // update), so the state is read once the listener is there.
+  async function followUpdates() {
+    const unlisten = await listen<UpdateState>(UPDATE_STATE_EVENT, (event) => (update = event.payload));
+    updateState()
+      .then((state) => (update = state))
+      .catch((error: unknown) => console.error("notedown: the update state could not be read", error));
+    return unlisten;
+  }
+
+  // The answer comes as update-state too; a failure there is already shown.
+  function checkUpdate() {
+    checkForUpdate().catch((error: unknown) => console.error("notedown: the update check failed", failure(error)));
+  }
+
+  // On success Notedown ends and starts again; a failure comes as update-state.
+  function installUpdate() {
+    installUpdateAndRestart().catch((error: unknown) =>
+      console.error("notedown: the update was not installed", failure(error)),
+    );
+  }
 
   function refresh() {
     now = Date.now();
@@ -113,7 +146,7 @@
       {:else if page === "server"}<ServerPage />
       {:else if page === "account"}<AccountPage />
       {:else if page === "setup"}<SetupPage onOpen={open} />
-      {:else}<AboutPage {version} onOpen={open} />
+      {:else}<AboutPage {version} {update} onOpen={open} onCheck={checkUpdate} onInstall={installUpdate} />
       {/if}
     {/key}
   </main>

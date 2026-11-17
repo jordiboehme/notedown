@@ -1,10 +1,24 @@
 <script lang="ts">
   import icon from "../../../src-tauri/icons/128x128@2x.png";
   import { ABOUT } from "../about";
+  import { canCheck, canInstall, updateLines, type UpdateState } from "../update";
 
-  // Settings > About, centred like Roger's: icon, name, version, motto, the two links and the
-  // credits. The texts come from about.ts.
-  let { version, onOpen }: { version: string | null; onOpen: (url: string) => void } = $props();
+  // Settings > About, centred like Roger's: icon, name, version, motto, the two links, the
+  // updater and the credits. The texts come from about.ts and update.ts. Rust opens this page
+  // when it finds an update; the release notes show as they are written.
+  let {
+    version,
+    update,
+    onOpen,
+    onCheck,
+    onInstall,
+  }: {
+    version: string | null;
+    update: UpdateState;
+    onOpen: (url: string) => void;
+    onCheck: () => void;
+    onInstall: () => void;
+  } = $props();
 </script>
 
 <div class="about">
@@ -34,6 +48,16 @@
       </button>
     {/each}
   </div>
+  <section class="update" aria-live="polite">
+    {#each updateLines(update) as line (line)}<p>{line}</p>{/each}
+    {#if update.kind === "found" && update.notes}<div class="notes">{update.notes}</div>{/if}
+    <div class="update-buttons">
+      {#if canInstall(update)}
+        <button type="button" class="button strong" onclick={onInstall}>Install</button>
+      {/if}
+      <button type="button" class="button" disabled={!canCheck(update)} onclick={onCheck}>Check for Updates</button>
+    </div>
+  </section>
   <span class="spacer"></span>
   <footer>
     {#each ABOUT.footer as line (line)}<p>{line}</p>{/each}
@@ -117,6 +141,38 @@
   svg .fill {
     fill: currentColor;
     stroke: none;
+  }
+
+  .update {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    max-width: 440px;
+    font-size: 12px;
+  }
+
+  .update p {
+    margin: 0;
+  }
+
+  .notes {
+    width: 100%;
+    max-height: 120px;
+    overflow-y: auto;
+    padding: 6px 8px;
+    box-sizing: border-box;
+    font-size: 11px;
+    text-align: left;
+    white-space: pre-wrap;
+    user-select: text;
+    border: 1px solid var(--separator);
+    border-radius: 6px;
+  }
+
+  .update-buttons {
+    display: flex;
+    gap: 8px;
   }
 
   footer {

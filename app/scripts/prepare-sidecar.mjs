@@ -12,6 +12,7 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -20,6 +21,18 @@ import { fileURLToPath } from "node:url";
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const appDir = resolve(scriptDir, "..");
 const repoRoot = resolve(appDir, "..");
+
+// The bundle resource of tauri.conf.json. A placeholder never replaces a real
+// file; the release checks that the bundle carries the real one.
+const notices = join(appDir, "src-tauri", "resources", "THIRD-PARTY-NOTICES.txt");
+if (!existsSync(notices)) {
+  mkdirSync(dirname(notices), { recursive: true });
+  writeFileSync(
+    notices,
+    "Placeholder of a local build. The release build of Notedown puts the third-party notices here.\n",
+  );
+  console.log(`[prepare-sidecar] wrote a placeholder to ${notices}`);
+}
 
 // cargo: $CARGO, then PATH, then ~/.cargo/bin and the rustup toolchains, for
 // shells that do not put cargo on PATH.

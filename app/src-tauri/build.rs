@@ -74,6 +74,9 @@ const COMMANDS: &[&str] = &[
     "snbak_time",
     "sync_state",
     "open_recycle_bin",
+    "update_state",
+    "check_for_update",
+    "install_update_and_restart",
 ];
 
 fn main() {

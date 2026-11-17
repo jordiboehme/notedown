@@ -1,0 +1,44 @@
+# cargo-about configuration for THIRD-PARTY-NOTICES.txt of the notedown archives
+# (variants macos and linux of scripts/third-party-notices.sh). The script runs
+# cargo-about on crates/notedown/Cargo.toml, so the graph is what the notedown
+# binary links, and passes --target per variant (that overrides `targets`).
+# The app has its own file: app/src-tauri/about.toml.
+
+# The allow list of deny.toml, in the same order. cargo-about picks the first
+# entry that satisfies a crate's license expression, so "MIT OR Apache-2.0"
+# lists the MIT text.
+accepted = [
+    "AGPL-3.0-or-later",
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+]
+
+# The release targets: macOS with OCR, Linux musl without. The script passes
+# the targets of each variant on the command line.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
+
+# Build dependencies and dev dependencies do not ship in the binary.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Notedown's own crates are AGPL-3.0-or-later like the whole project (LICENSE
+# ships next to the binary). They have no publish = false, so this does not
+# drop them; the template leaves them out by their missing registry source.
+private = { ignore = true }
+
+# Built-in clarifications for crates in the graph whose license files confuse
+# the scan: chrono (two license texts in one file, through rmcp), cocoa
+# (core-foundation on macOS, through rustls-platform-verifier) and rustls
+# (three licenses in one file).
+workarounds = ["chrono", "cocoa", "rustls"]

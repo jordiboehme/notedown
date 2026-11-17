@@ -1,0 +1,31 @@
+# cargo-about configuration for the Rust part of THIRD-PARTY-NOTICES.txt in the
+# Notedown app (variant app of scripts/third-party-notices.sh). The app is its
+# own Cargo workspace with its own allow list, so it has its own file.
+
+# The allow list of app/src-tauri/deny.toml, in the same order. cargo-about
+# picks the first entry that satisfies a crate's license expression.
+accepted = [
+    "AGPL-3.0-or-later",
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+# The app ships for Apple Silicon only. Without this the GTK and WebView2 trees
+# of the other platforms would be listed.
+targets = ["aarch64-apple-darwin"]
+
+# Build dependencies and dev dependencies do not ship in the app.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# notedown-app has publish = false and is AGPL-3.0-or-later like the project.
+private = { ignore = true }
+
+# Built-in clarifications for crates in the graph whose license files confuse
+# the scan: cocoa (core-foundation and core-graphics-types) and rustix (through
+# tempfile; rustix and linux-raw-sys ship a COPYRIGHT file).
+workarounds = ["cocoa", "rustix"]

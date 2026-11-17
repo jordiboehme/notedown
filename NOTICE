@@ -11,4 +11,9 @@ notedown is not affiliated with Ratta or Supernote.
 The Supernote .note format was documented from sample files and public
 community research, see docs/note-format.md. The .note parser in
 crates/notedown-note is a clean-room implementation of that document.
-No third-party code is included.
+The source code in this repository includes no third-party code.
+
+The binary releases (the notedown archives and packages, the Notedown app
+and the container image) are built with third-party code: Rust crates, and
+in the macOS builds llama.cpp and the code it bundles. Their licenses are
+listed in THIRD-PARTY-NOTICES.txt, which ships with each release.

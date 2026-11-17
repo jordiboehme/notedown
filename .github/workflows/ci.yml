@@ -37,8 +37,8 @@ jobs:
   # every gated job on the same tree (the same files, so the same build) left
   # an artifact tested-tree-<tree> (see ci-passed). With tested=true the
   # clippy, test, pi, app and musl jobs only compile and lint (so main still
-  # saves the caches pull requests restore) and skip their tests; fmt is
-  # skipped; cargo-deny and workflow-lint still run. Any error, an empty
+  # saves the caches pull requests restore) and skip their tests; fmt and deb
+  # are skipped; cargo-deny and workflow-lint still run. Any error, an empty
   # answer or anything unclear leaves tested=false, and the checks read
   # `!= 'true'`, so a missing output runs everything.
   changes:
@@ -481,6 +481,158 @@ jobs:
           overwrite: true
           if-no-files-found: error
 
+  # The .deb smoke test: packages the musl amd64 binary of the musl job (the
+  # artifact musl-amd64) the way the release does, installs it on the runner
+  # and checks the notedown user, its home, the unit (installed, not enabled,
+  # not running) and that `sudo -u notedown notedown cloud ...` writes into
+  # /var/lib/notedown/notedown-data. Skipped on a tested main push, like the
+  # other checks.
+  deb:
+    name: deb
+    timeout-minutes: 20
+    needs: [changes, musl]
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' && needs.changes.outputs.tested != 'true' && needs.musl.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # cargo deb runs through cargo, which wants the pinned toolchain.
+      - name: Install Rust toolchain
+        run: |
+          bash scripts/ci/retry.sh 3 rustup toolchain install
+          rustup show active-toolchain
+
+      # Where cargo deb --target x86_64-unknown-linux-musl --no-build looks.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: musl-amd64
+          path: target/x86_64-unknown-linux-musl/release
+
+      # upload-artifact does not keep the exec bit.
+      - name: Make the binary executable
+        run: chmod +x target/x86_64-unknown-linux-musl/release/notedown
+
+      # The install-action download can fail on a bad network day. The second
+      # step is the same install and runs only after the first one failed.
+      # fallback: none fails the step rather than building or downloading
+      # anything else.
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        id: cargo-deb
+        continue-on-error: true
+        with:
+          tool: cargo-deb@3.8.0
+          fallback: none
+
+      - name: Wait before the second try
+        if: ${{ steps.cargo-deb.outcome == 'failure' }}
+        run: sleep 30
+
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        if: ${{ steps.cargo-deb.outcome == 'failure' }}
+        with:
+          tool: cargo-deb@3.8.0
+          fallback: none
+
+      # The release puts the Linux notices at dist/THIRD-PARTY-NOTICES.txt;
+      # here an empty file stands in for it.
+      - name: Build the .deb
+        run: |
+          set -euo pipefail
+          version="$(bash scripts/ci/workspace-version.sh)"
+          mkdir -p dist
+          : >dist/THIRD-PARTY-NOTICES.txt
+          cargo deb -p notedown --target x86_64-unknown-linux-musl --no-build \
+            --deb-version "$version" --output "dist/notedown_${version}_amd64.deb"
+          deb="dist/notedown_${version}_amd64.deb"
+          dpkg-deb --info "$deb"
+          echo "--- postinst"
+          dpkg-deb --info "$deb" postinst
+          echo "--- contents"
+          contents="$(dpkg-deb --contents "$deb")"
+          echo "$contents"
+          missing=0
+          for path in \
+            ./usr/bin/notedown \
+            ./usr/lib/systemd/system/notedown.service \
+            ./usr/lib/sysusers.d/notedown.conf \
+            ./usr/lib/tmpfiles.d/notedown.conf \
+            ./etc/default/notedown \
+            ./usr/share/doc/notedown/README.md \
+            ./usr/share/doc/notedown/LICENSE \
+            ./usr/share/doc/notedown/NOTICE \
+            ./usr/share/doc/notedown/THIRD-PARTY-NOTICES.txt; do
+            if ! awk '{print $NF}' <<<"$contents" | grep -qxF "$path"; then
+              echo "::error::the .deb has no $path"
+              missing=1
+            fi
+          done
+          if ! dpkg-deb --info "$deb" conffiles | grep -qxF /etc/default/notedown; then
+            echo "::error::/etc/default/notedown is not a conffile"
+            missing=1
+          fi
+          got="$(dpkg-deb --field "$deb" Version)"
+          if [ "$got" != "$version" ]; then
+            echo "::error::the .deb has the version '$got', want '$version'"
+            missing=1
+          fi
+          exit "$missing"
+
+      # Depends is empty, so the install needs no package index.
+      - name: Install the .deb
+        run: sudo apt-get install -y ./dist/notedown_*_amd64.deb
+
+      # systemctl is-enabled prints disabled with exit 1 and is-active exits 3
+      # when the unit is not running, so both answers are captured with
+      # `|| true` and compared.
+      - name: The package set up the user, its home and the unit
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+
+          systemd-analyze verify /usr/lib/systemd/system/notedown.service
+
+          state="$(systemctl is-enabled notedown || true)"
+          echo "is-enabled: $state"
+          [ "$state" = disabled ] || fail "the unit is '$state', want disabled"
+          state="$(systemctl is-active notedown || true)"
+          echo "is-active: $state"
+          [ "$state" != active ] || fail "the unit runs after the install"
+
+          id notedown || fail "there is no notedown user"
+          home="$(getent passwd notedown | cut -d: -f6)"
+          [ "$home" = /var/lib/notedown ] || fail "the home of notedown is '$home'"
+          test -f /usr/lib/sysusers.d/notedown.conf || fail "no /usr/lib/sysusers.d/notedown.conf"
+          test -f /usr/lib/tmpfiles.d/notedown.conf || fail "no /usr/lib/tmpfiles.d/notedown.conf"
+          owner="$(stat -c %U:%a /var/lib/notedown)"
+          [ "$owner" = notedown:750 ] || fail "/var/lib/notedown is $owner, want notedown:750"
+
+          # sudo sets HOME to the target user's home, which is how the CLI
+          # finds the service's data folder.
+          sudo_home="$(sudo -u notedown printenv HOME)"
+          [ "$sudo_home" = /var/lib/notedown ] || fail "sudo -u notedown has HOME=$sudo_home"
+          version="$(bash scripts/ci/workspace-version.sh)"
+          got="$(sudo -u notedown notedown --version)"
+          [ "$got" = "notedown $version" ] || fail "notedown --version printed '$got'"
+
+          printf 'pw-for-ci\n' | sudo -u notedown notedown cloud account add t \
+            --email t@example.org --password-stdin
+          sudo test -f /var/lib/notedown/notedown-data/accounts/t/account.json \
+            || fail "the account is not in /var/lib/notedown/notedown-data"
+          echo "deb: user, home, unit and data folder are as expected"
+
+      - name: Removing the package keeps the data and the user
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          sudo apt-get remove -y notedown
+          test ! -e /usr/bin/notedown || fail "/usr/bin/notedown is still there"
+          sudo test -f /var/lib/notedown/notedown-data/accounts/t/account.json \
+            || fail "the remove deleted the data"
+          id notedown || fail "the remove deleted the notedown user"
+          echo "deb: the remove kept the data and the user"
+
   # Dependency audit: advisories (RustSec), licenses (the allowlist in
   # deny.toml), sources and bans. security.yml also checks advisories every
   # week, since a new advisory appears without any change here.
@@ -666,7 +818,7 @@ jobs:
   ci-passed:
     name: ci-passed
     timeout-minutes: 10
-    needs: [changes, fmt, clippy, test, pi, musl, cargo-deny, app, workflow-lint]
+    needs: [changes, fmt, clippy, test, pi, musl, deb, cargo-deny, app, workflow-lint]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     # actions: read for the jobs list of this run.

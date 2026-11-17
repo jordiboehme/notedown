@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+# The notedown user must exist before the lines cargo-deb puts at #DEBHELPER#:
+# the tmpfiles line there creates /var/lib/notedown owned by notedown. cargo-deb
+# 3.8.0 also adds a systemd-sysusers call for usr/lib/sysusers.d/notedown.conf;
+# this one makes the order independent of where cargo-deb puts it. Running it
+# twice changes nothing.
+if [ "$1" = "configure" ]; then
+    systemd-sysusers notedown.conf
+fi
+
+#DEBHELPER#

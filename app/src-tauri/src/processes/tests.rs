@@ -478,6 +478,30 @@ fn changing_the_markdown_folder_restarts_the_pipeline() {
 }
 
 #[test]
+fn a_quit_during_the_stop_of_the_old_pipeline_starts_none() {
+    let rig = Rig::new();
+    rig.listen_on(free_port());
+    rig.hold_the_writer_lock(328);
+    let p = rig.processes(Path::new("/bin/sleep"));
+    let with = |dir: &str| AppConfig {
+        account: Some("jordi".into()),
+        markdown_dirs: [("jordi".to_owned(), PathBuf::from(dir))].into(),
+        ..rig.config()
+    };
+    p.start_all(&with("/a"));
+    let first = running_pid(p.pipeline());
+    // Quit sets its flag at once and then waits for the relaunch to end: here it comes after
+    // the relaunch read the config, while the old pipeline stops.
+    p.relaunch_pipeline_with(|| {
+        p.quitting.store(true, Ordering::SeqCst);
+        with("/b")
+    });
+    assert!(!alive(first), "the old pipeline still runs");
+    assert_eq!(p.pipeline().state(), ChildState::Stopped);
+    p.quit();
+}
+
+#[test]
 fn a_log_in_and_a_log_out_restart_the_pipeline() {
     use crate::commands::{ConfigState, log_out_of, relaunch_pipeline};
     use crate::login::LoginGate;

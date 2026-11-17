@@ -235,6 +235,11 @@ impl Processes {
         // The app's own pipeline holds the writer lock for its whole run: stop it first, or
         // the probe would take it for another Notedown.
         self.pipeline.stop();
+        // Quit sets its flag before it waits for this lock: one that came during the stop
+        // (it can take the grace) starts nothing.
+        if self.quitting.load(Ordering::SeqCst) {
+            return;
+        }
         self.launch(&self.pipeline, &launch, config);
     }
 

@@ -15,7 +15,7 @@
     column: Column;
     next: string | null;
     busy: boolean;
-    onSelect: (path: string) => void;
+    onSelect: (path: string, kind: "file" | "folder") => void;
     onMore: () => void;
   } = $props();
 
@@ -39,29 +39,27 @@
   {#if column.rows.length > 0}
     <VirtualRows items={column.rows} rowHeight={ROW} key={(row: ColumnRow) => row.path} {label} onRange={seen}>
       {#snippet row(entry: ColumnRow)}
-        {#if entry.kind === "folder"}
-          <button
-            type="button"
-            class="row"
-            class:selected={entry.selected}
-            data-folder={entry.path}
-            aria-current={entry.selected ? "true" : undefined}
-            onclick={() => onSelect(entry.path)}
-          >
-            <svg class="icon folder" viewBox="0 0 16 16" aria-hidden="true">
+        <button
+          type="button"
+          class="row"
+          class:selected={entry.selected}
+          class:file={entry.kind === "file"}
+          data-folder={entry.kind === "folder" ? entry.path : undefined}
+          aria-current={entry.selected ? "true" : undefined}
+          onclick={() => onSelect(entry.path, entry.kind)}
+        >
+          <svg class="icon" class:folder={entry.kind === "folder"} viewBox="0 0 16 16" aria-hidden="true">
+            {#if entry.kind === "folder"}
               <path d="M1.5 4.5v8.5h13V5.5H7.5L6 3.5H2z" />
-            </svg>
-            <span class="text">{entry.name}</span>
-            <svg class="more" viewBox="0 0 10 10" aria-hidden="true"><path d="M3 1.5 7 5 3 8.5z" /></svg>
-          </button>
-        {:else}
-          <div class="row file">
-            <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+            {:else}
               <path d="M3.5 1.5h6l3 3v10h-9z M9.5 1.5v3h3" />
-            </svg>
-            <span class="text">{entry.name}</span>
-          </div>
-        {/if}
+            {/if}
+          </svg>
+          <span class="text">{entry.name}</span>
+          {#if entry.kind === "folder"}
+            <svg class="more" viewBox="0 0 10 10" aria-hidden="true"><path d="M3 1.5 7 5 3 8.5z" /></svg>
+          {/if}
+        </button>
       {/snippet}
     </VirtualRows>
   {:else if column.loading}

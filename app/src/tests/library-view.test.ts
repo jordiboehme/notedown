@@ -334,37 +334,38 @@ describe("the columns", () => {
 
   it("has the device trees as the first column and one column per level of the path", () => {
     const view = columnsView(path, {
-      [listingKey("DOCUMENT/Document", true)]: document,
-      [listingKey("DOCUMENT/Document/Books", true)]: books,
+      [listingKey("DOCUMENT/Document", false)]: document,
+      [listingKey("DOCUMENT/Document/Books", false)]: books,
       [listingKey(path, false)]: scifi,
-    });
+    }, `${path}/Dune.pdf`);
     expect(view.columns.map((c) => c.path)).toEqual([null, "DOCUMENT/Document", "DOCUMENT/Document/Books", path]);
     expect(view.columns[0].rows.map((r) => [r.name, r.selected])).toEqual(
       ROOTS.map((r) => [r.name, r.path === "DOCUMENT/Document"]),
     );
-    // The middle columns show folders, with the next level selected, in natural order.
+    // Every column lists folders then files, with the next level selected.
     expect(view.columns[1].rows.map((r) => [r.name, r.selected])).toEqual([
       ["Books", true],
       ["Papers", false],
+      ["Manual.pdf", false],
     ]);
     expect(view.columns[2].rows.map((r) => [r.name, r.selected])).toEqual([
       ["Sci-Fi", true],
       ["Tech", false],
     ]);
-    // The last column is the folder itself: folders first, then files, nothing selected.
+    // The last column is the folder itself; a picked file is selected, no column follows it.
     expect(view.columns[3].rows.map((r) => [r.name, r.kind, r.selected])).toEqual([
       ["Classics", "folder", false],
-      ["Dune.pdf", "file", false],
+      ["Dune.pdf", "file", true],
       ["Neuromancer.epub", "file", false],
     ]);
     expect(view.columns.map((c) => c.last)).toEqual([false, false, false, true]);
   });
 
-  it("lists a folder only when it is opened: the columns of the path, folders only except the last", () => {
+  it("lists a folder only when it is opened: every column of the path, files too", () => {
     const view = columnsView(path, {});
     expect(view.shown).toEqual([
-      { path: "DOCUMENT/Document", foldersOnly: true },
-      { path: "DOCUMENT/Document/Books", foldersOnly: true },
+      { path: "DOCUMENT/Document", foldersOnly: false },
+      { path: "DOCUMENT/Document/Books", foldersOnly: false },
       { path: path, foldersOnly: false },
     ]);
     expect(view.missing).toEqual(view.shown);
@@ -374,7 +375,7 @@ describe("the columns", () => {
   });
 
   it("lists a missing column once its parent has a listing, and no other", () => {
-    const view = columnsView(path, { [listingKey("DOCUMENT/Document", true)]: document });
+    const view = columnsView(path, { [listingKey("DOCUMENT/Document", false)]: document });
     expect(view.missing.map((m) => m.path)).toEqual(["DOCUMENT/Document/Books", path]);
   });
 
@@ -382,7 +383,7 @@ describe("the columns", () => {
     const part = folder("DOCUMENT/Document", [entry("DOCUMENT/Document/Books", "folder")], false);
     const failed: FolderState = { ...folder(path, []), complete: false, error: "The server does not answer." };
     const view = columnsView(path, {
-      [listingKey("DOCUMENT/Document", true)]: part,
+      [listingKey("DOCUMENT/Document", false)]: part,
       [listingKey(path, false)]: failed,
     });
     expect(view.columns[1].loading).toBe(true);
@@ -419,7 +420,7 @@ describe("the view button", () => {
     const sel = { kind: "folder", path: "NOTE/Note/Work" } as const;
     expect(shownFor("tree", sel, open)).toEqual(shownListings(sel, open));
     expect(shownFor("columns", sel, open)).toEqual([
-      { path: "NOTE/Note", foldersOnly: true },
+      { path: "NOTE/Note", foldersOnly: false },
       { path: "NOTE/Note/Work", foldersOnly: false },
     ]);
     expect(shownFor("columns", { kind: "all" }, open)).toEqual([]);

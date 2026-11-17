@@ -277,7 +277,7 @@ export type ColumnRow = { path: string; name: string; kind: "file" | "folder"; s
 export type Column = {
   /** The folder the column lists; null for the first column, the device trees. */
   path: string | null;
-  /** The last column is the selected folder and lists files too; the others list folders. */
+  /** The last column is the selected folder; a file picked in it selects the file only. */
   last: boolean;
   rows: ColumnRow[];
   /** Not listed yet, or more pages to come. */
@@ -290,12 +290,14 @@ export type Column = {
 /**
  * The columns of the selected folder, as in the Finder: the device trees, then one column per
  * level of the path. A folder is listed only when it is shown (`shown`, for `library_shown`);
- * the ones without a listing yet are `missing`. The columns before the last list folders only
- * and mark the folder the next column shows; the last lists the folder with its files.
+ * the ones without a listing yet are `missing`. Every column lists folders and files (folders
+ * first) and marks the folder the next column shows; in the last column it marks `file`, the
+ * file picked there.
  */
 export function columnsView(
   path: string | null,
   listings: Record<string, FolderState>,
+  file: string | null = null,
 ): { columns: Column[]; shown: ShownListing[]; missing: ShownListing[] } {
   const crumbs = path === null ? [] : pathBar(path);
   const columns: Column[] = [
@@ -312,20 +314,16 @@ export function columnsView(
   const missing: ShownListing[] = [];
   crumbs.forEach((crumb, i) => {
     const last = i === crumbs.length - 1;
-    const foldersOnly = !last;
+    const foldersOnly = false;
     const listing = listings[listingKey(crumb.path, foldersOnly)];
     const next = crumbs[i + 1]?.path ?? null;
     shown.push({ path: crumb.path, foldersOnly });
     if (!listing) missing.push({ path: crumb.path, foldersOnly });
-    const entries = !listing
-      ? []
-      : last
-        ? listRows(listing, { by: "name", ascending: true }).rows
-        : ordered(listing).filter((e) => e.kind === "folder");
+    const entries = listing ? listRows(listing, { by: "name", ascending: true }).rows : [];
     columns.push({
       path: crumb.path,
       last,
-      rows: entries.map((e) => ({ path: e.path, name: e.name, kind: e.kind, selected: e.path === next })),
+      rows: entries.map((e) => ({ path: e.path, name: e.name, kind: e.kind, selected: e.path === next || (last && e.kind === "file" && e.path === file) })),
       loading: !listing || (!listing.complete && listing.error === null),
       empty: listing !== undefined && listing.complete && entries.length === 0,
       error: listing?.error ?? null,

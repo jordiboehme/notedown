@@ -35,12 +35,13 @@
   let sort = $state<Sort>({ by: "name", ascending: true });
   let newNotes = $state<NoteSummary[] | null>(null);
   let allNotes = $state<NoteSummary[] | null>(null);
+  let pickedFile = $state<string | null>(null);
   let now = $state(Date.now());
 
   const ready = $derived(library.view?.state === "ready");
   const selectedPath = $derived(selection.kind === "folder" ? selection.path : null);
   const tree = $derived(treeView(library.listings, open, selectedPath));
-  const columns = $derived(columnsView(selectedPath, library.listings));
+  const columns = $derived(columnsView(selectedPath, library.listings, pickedFile));
   const inTree = $derived(library.viewMode === "tree");
   const items = $derived(
     sidebarItems(library.view, { newNotes: newNotes?.length ?? null, allNotes: allNotes?.length ?? null }, selection),
@@ -107,6 +108,7 @@
   /** Shows a folder and opens the folders above it in the tree. */
   function select(path: string) {
     selection = { kind: "folder", path };
+    pickedFile = null;
     for (const crumb of pathBar(path).slice(0, -1)) open.add(crumb.path);
   }
 
@@ -159,7 +161,7 @@
         {@const path = selection.path}
         {#if !inTree}
           {#key library.generation}
-            <ColumnsView {path} onSelect={select} />
+            <ColumnsView {path} file={pickedFile} onSelect={select} onFile={(file) => (pickedFile = file)} />
           {/key}
         {:else}
           {#key `${path}:${library.generation}`}

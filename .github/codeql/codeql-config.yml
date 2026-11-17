@@ -1,0 +1,4 @@
+name: Notedown CodeQL
+paths-ignore:
+  - '**/tests/**'
+  - '**/tests.rs'

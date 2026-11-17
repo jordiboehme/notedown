@@ -7,6 +7,9 @@
 //! facts yet, no account answer yet) never moves or clears a field, and a field seen for the
 //! first time is a baseline without a notice.
 
+pub mod deliver;
+#[cfg(target_os = "macos")]
+pub mod macos;
 pub mod store;
 
 use std::path::{Path, PathBuf};

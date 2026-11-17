@@ -92,14 +92,12 @@ repo=https://github.com/jordiboehme/notedown
 bundle_id=io.github.jordiboehme.notedown
 
 if [ "$mode" = formula ]; then
-  # The url names the version as is, so the formula does not depend on the
-  # order of `version` and `url`.
+  # The url names the version as is; Homebrew reads the version from it.
   cat <<FORMULA
 class Notedown < Formula
   desc "Turn Supernote handwritten notes into Markdown"
   homepage "${repo}"
   url "${repo}/releases/download/v${version}/${asset}"
-  version "${version}"
   sha256 "${sha}"
   license "AGPL-3.0-or-later"
 
@@ -112,7 +110,7 @@ class Notedown < Formula
   end
 
   test do
-    assert_match "notedown", shell_output("#{bin}/notedown --version")
+    assert_match version.to_s, shell_output("#{bin}/notedown --version")
   end
 end
 FORMULA
@@ -142,6 +140,7 @@ cask "notedown-app" do
   zap trash: [
     "~/Library/Application Support/${bundle_id}",
     "~/Library/Caches/${bundle_id}",
+    "~/Library/HTTPStorages/${bundle_id}",
     "~/Library/LaunchAgents/Notedown.plist",
     "~/Library/Preferences/${bundle_id}.plist",
     "~/Library/Saved Application State/${bundle_id}.savedState",

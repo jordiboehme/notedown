@@ -14,7 +14,8 @@
 #
 # - release-notes/v<version>.md does not exist: nothing to release. One line,
 #   release=false, exit 0. No tag lookup.
-# - the notes file exists but is empty or does not open with an H1: exit 1.
+# - the notes file exists but is empty, does not open with an H1, or has no
+#   text after the H1: exit 1.
 # - the notes file is in place and the tag v<version> exists, here or on the
 #   remote: the version was released already. release=false, exit 0.
 # - the notes file is in place and the tag is new: release=true, exit 0.
@@ -88,6 +89,12 @@ if [ ! -f "$root/$notes" ]; then
 fi
 if ! head -1 "$root/$notes" | grep -qE '^# .*[^[:space:]]'; then
   echo "::error file=$notes::$notes must open with an H1 (a line starting with '# ' followed by text), the release's motto." >&2
+  exit 1
+fi
+# The text after the H1 becomes the update notes in latest.json, which
+# refuses an empty one.
+if ! tail -n +2 "$root/$notes" | grep -q '[^[:space:]]'; then
+  echo "::error file=$notes::$notes has no text after its H1. It needs the line about the release and the sections." >&2
   exit 1
 fi
 

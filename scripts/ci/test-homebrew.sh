@@ -61,11 +61,12 @@ if [ "$rc" = 0 ]; then pass "formula renders"; else fail "formula renders (exit 
 printf '%s\n' "$out" >"$tmp/notedown.rb"
 has "formula class" 'class Notedown < Formula'
 has "formula url" 'url "https://github.com/jordiboehme/notedown/releases/download/v0.1.0/notedown-v0.1.0-macos.tar.gz"'
-has "formula version" 'version "0.1.0"'
+if grep -q '^  version ' <<<"$out"; then fail "formula has no version line (the url names it)"; else pass "formula has no version line (the url names it)"; fi
 has "formula sum" "sha256 \"$cli_sum\""
 has "formula arm64 only" 'depends_on arch: :arm64'
 has "formula macOS 13" 'depends_on macos: :ventura'
 has "formula installs the binary" 'bin.install "notedown"'
+has "formula test checks the version" 'assert_match version.to_s, shell_output("#{bin}/notedown --version")'
 ruby_check formula "$tmp/notedown.rb"
 
 run cask 0.1.0 "$tmp/SHA256SUMS"
@@ -83,6 +84,7 @@ has "cask stops the autostart agent" 'launchctl: "Notedown"'
 has "cask quits the app" 'quit:      "io.github.jordiboehme.notedown"'
 has "cask zaps the autostart plist" '"~/Library/LaunchAgents/Notedown.plist"'
 has "cask zaps Application Support" '"~/Library/Application Support/io.github.jordiboehme.notedown"'
+has "cask zaps HTTPStorages" '"~/Library/HTTPStorages/io.github.jordiboehme.notedown"'
 if grep -qF notedown-data <<<"$out"; then fail "the cask never names notedown-data"; else pass "the cask never names notedown-data"; fi
 ruby_check cask "$tmp/notedown-app.rb"
 

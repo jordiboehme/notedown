@@ -214,6 +214,12 @@ jobs:
             echo "::error file=$file::$file must open with an H1 (a line starting with '# ' followed by text), the release's motto."
             exit 1
           fi
+          # The text after the H1 becomes the notes of latest.json, which
+          # refuses an empty one; fail here, before the build.
+          if ! tail -n +2 "$file" | grep -q '[^[:space:]]'; then
+            echo "::error file=$file::$file has no text after its H1. It needs the line about the release and the sections."
+            exit 1
+          fi
           echo "release notes: $file"
 
   # THIRD-PARTY-NOTICES.txt in three variants (scripts/third-party-notices.sh),
@@ -1469,7 +1475,7 @@ jobs:
             [ -x "$dir/$name/notedown" ] || err "$archive: $name/notedown is not executable"
           done
           app="downloads/macos/notedown-app-v${NAME_VER}-macos.app.tar.gz"
-          tops="$(tar -tzf "$app" | sed 's|^\./||' | cut -d/ -f1 | LC_ALL=C sort -u | tr '\n' ' ')"
+          tops="$(tar -tzf "$app" | sed -e 's|^\./||' -e '/^$/d' | cut -d/ -f1 | LC_ALL=C sort -u | tr '\n' ' ')"
           [ "$tops" = "Notedown.app " ] || err "$app holds '$tops', expected only Notedown.app"
           exit "$bad"
 

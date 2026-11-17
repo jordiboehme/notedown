@@ -2,7 +2,8 @@
 # Fixture test of scripts/release-check.sh: a temporary repository with a
 # bare `origin`, a copy of the script and a Cargo.toml at 1.2.3. Checks the
 # notes-as-switch rule of the default mode (no notes: release=false; notes
-# with an H1 and no tag: release=true; notes without an H1: exit 1; the tag
+# with an H1 and no tag: release=true; notes without an H1 or with nothing
+# after it: exit 1; the tag
 # on the remote: release=false; a remote that does not answer: exit 1) and
 # the tag-commit contract (the peeled commit, nothing and exit 0 for a
 # missing tag, exit 1 on a lookup error).
@@ -93,6 +94,17 @@ else
   fail "notes without an H1: exit $rc, want 1; output: $out"
 fi
 
+# Notes with only the H1: fails (latest.json needs the text after it).
+w="$(fixture notes-h1-only)"
+mkdir -p "$w/release-notes"
+printf '# A motto\n\n  \n' >"$w/release-notes/v1.2.3.md"
+check "$w"
+if [ "$rc" = 1 ] && grep -q "no text after its H1" <<<"$out"; then
+  pass "notes with only an H1 fail"
+else
+  fail "notes with only an H1: exit $rc, want 1; output: $out"
+fi
+
 # An empty notes file: fails as well (it has no H1).
 w="$(fixture notes-empty)"
 mkdir -p "$w/release-notes"
@@ -107,7 +119,7 @@ fi
 # The tag exists on the remote only (a CI checkout has no tags): no release.
 w="$(fixture tag-remote)"
 mkdir -p "$w/release-notes"
-printf '# A motto\n' >"$w/release-notes/v1.2.3.md"
+printf '# A motto\n\nText.\n' >"$w/release-notes/v1.2.3.md"
 g -C "$w" tag -a v1.2.3 -m v1.2.3
 g -C "$w" push -q origin v1.2.3
 g -C "$w" tag -d v1.2.3 >/dev/null
@@ -117,7 +129,7 @@ expect_outputs "a tag on the remote answers release=false" "$(printf 'tag=v1.2.3
 # The tag exists here: no release.
 w="$(fixture tag-local)"
 mkdir -p "$w/release-notes"
-printf '# A motto\n' >"$w/release-notes/v1.2.3.md"
+printf '# A motto\n\nText.\n' >"$w/release-notes/v1.2.3.md"
 g -C "$w" tag v1.2.3
 check "$w"
 expect_outputs "a local tag answers release=false" "$(printf 'tag=v1.2.3\nrelease=false')"
@@ -125,7 +137,7 @@ expect_outputs "a local tag answers release=false" "$(printf 'tag=v1.2.3\nreleas
 # Notes in place and a remote that does not answer: fails, never "no tag".
 w="$(fixture unreachable)"
 mkdir -p "$w/release-notes"
-printf '# A motto\n' >"$w/release-notes/v1.2.3.md"
+printf '# A motto\n\nText.\n' >"$w/release-notes/v1.2.3.md"
 rc=0
 out="$(RELEASE_CHECK_REMOTE="$tmp/nowhere.git" bash "$w/scripts/release-check.sh" 2>&1)" || rc=$?
 if [ "$rc" = 1 ]; then

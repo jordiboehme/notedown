@@ -1187,3 +1187,92 @@ fn the_window_keeps_what_it_listed_until_it_says_otherwise() {
         ]
     );
 }
+
+/// How many `recycle` events came since the last call (the other events are dropped).
+fn recycles(s: &Setup) -> usize {
+    std::mem::take(&mut *s.events.0.lock().unwrap())
+        .into_iter()
+        .filter(|e| *e == LibraryEvent::Recycle)
+        .count()
+}
+
+fn head(end: u64) -> String {
+    answer(
+        "200 OK",
+        &json!({"events": [], "next": 1, "end": end, "more": false, "gap": false}).to_string(),
+    )
+}
+
+#[test]
+fn the_follower_runs_while_only_the_bin_is_shown() {
+    let s = setup(vec![
+        head(40),
+        events(&[ev(41, "file.deleted", 5, "NOTE/Note/x.note")], 42),
+        events(&[], 42),
+        events(&[ev(42, "folder.deleted", 6, "NOTE/Note/p")], 43),
+    ]);
+    // Nothing shown: no read.
+    s.library.set_shown(&[]);
+    s.follow();
+    assert_eq!(s.targets(), Vec::<String>::new());
+
+    // Only the bin: the follower takes the end of the journal and reads on from there; a
+    // delete from elsewhere may have changed the bin.
+    s.library.set_bin_shown(true);
+    s.events.0.lock().unwrap().clear();
+    s.follow();
+    assert_eq!(s.targets(), ["/events?from=0&limit=1", "/events?from=41"]);
+    assert_eq!(recycles(&s), 1);
+    s.follow();
+    assert_eq!(s.targets(), ["/events?from=42"]);
+    assert_eq!(recycles(&s), 0);
+
+    // Hidden: no read.
+    s.library.set_visible(false);
+    s.library.follow_step();
+    assert_eq!(s.targets(), Vec::<String>::new());
+
+    s.follow();
+    assert_eq!(s.targets(), ["/events?from=42"]);
+    assert_eq!(recycles(&s), 1);
+}
+
+#[test]
+fn the_bin_follows_on_from_where_the_folders_were_read() {
+    let s = setup(vec![
+        tree(10, &[file(1, "NOTE/Note/a.note", MD5_A)], None),
+        events(&[], 20),
+        events(&[ev(20, "file.deleted", 5, "NOTE/Other/x.note")], 21),
+        events(&[], 21),
+    ]);
+    s.list(NOTE, None);
+    s.library.set_shown(&[Key::new(NOTE, false)]);
+    s.follow();
+    // The folder goes, the bin is shown: it reads on from the last page, without the head.
+    s.library.set_bin_shown(true);
+    s.library.set_shown(&[]);
+    s.events.0.lock().unwrap().clear();
+    s.follow();
+    assert_eq!(recycles(&s), 1);
+    // The bin goes too: nothing is read, and the place is forgotten.
+    s.library.set_bin_shown(false);
+    s.follow();
+    assert_eq!(
+        s.targets(),
+        [
+            "/tree?path=NOTE%2FNote",
+            "/events?from=11",
+            "/events?from=20"
+        ]
+    );
+}
+
+#[test]
+fn a_new_binding_forgets_that_the_bin_is_shown() {
+    let s = setup(vec![head(40), events(&[], 41)]);
+    s.library.set_bin_shown(true);
+    s.follow();
+    s.library.relogin();
+    s.follow();
+    assert_eq!(s.targets(), ["/events?from=0&limit=1", "/events?from=41"]);
+}

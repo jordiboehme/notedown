@@ -13,6 +13,7 @@ import {
   type UploadArgs,
 } from "../library/actions";
 import { listingKey, type LibraryView } from "../library/view";
+import { mergeBin, restorePath, type Bin } from "../library/recycle";
 import {
   LIBRARY_EVENT,
   type FolderState,
@@ -21,6 +22,8 @@ import {
   type LibraryStateView,
   type Entry,
   type Listing,
+  type RecycleItem,
+  type RecyclePage,
   type ShownListing,
   type UploadAsk,
 } from "./library-types";
@@ -56,7 +59,22 @@ type Store = {
   notice: string | null;
   /** How many jobs each drop had, while any of them is kept: its title does not shrink. */
   dropTotals: Record<number, number>;
+  /** The recycle bin as listed so far. */
+  bin: Bin;
+  /** The restores that run or ask for another name, by the key of their item. */
+  restores: Record<string, Restore>;
 };
+
+/**
+ * A restore of an item of the bin: it runs (`busy`), or the place is taken and it asks for
+ * another name (`asking`, with the job's text and the name that is taken). `path` is where the
+ * item was.
+ */
+export type Restore = { job: number | null; state: "busy" | "asking"; text: string | null; name: string; path: string };
+
+function noBin(): Bin {
+  return { items: [], next: null, loaded: false, busy: false, error: null };
+}
 
 /** An upload that asks before it starts: the next call of `library_upload` and its question. */
 export type Ask = UploadArgs & { ask: UploadAsk };
@@ -74,6 +92,8 @@ export const library = $state<Store>({
   asks: [],
   notice: null,
   dropTotals: {},
+  bin: noBin(),
+  restores: {},
 });
 
 /**
@@ -93,6 +113,8 @@ let lastShown: string | null = null;
  * the folder opened again is listed fresh.
  */
 let shownKeys: Set<string> | null = null;
+/** Counts the bin's page 1 calls: an answer of an older one is dropped. */
+let binEpoch = 0;
 /** Whether the user chose a view in this window: a config read that answers later is stale. */
 let chosen = false;
 
@@ -114,6 +136,9 @@ export function resetLibrary() {
   library.asks = [];
   library.notice = null;
   library.dropTotals = {};
+  library.bin = noBin();
+  library.restores = {};
+  binEpoch += 1;
   counted.clear();
   dropTarget = null;
   lastShown = null;
@@ -150,6 +175,9 @@ export function applyEvent(event: LibraryEvent) {
       library.generation += 1;
       // Rust forgot the drops of the old binding: their questions cannot be answered.
       library.asks = [];
+      // The bin is listed again; Rust ends the restores that ask (their job events follow).
+      library.bin = noBin();
+      binEpoch += 1;
       lastShown = null;
       shownKeys = null;
       break;
@@ -171,6 +199,7 @@ function keepJob(job: Job) {
   if (!ended && library.ended[job.id] !== undefined) return;
   library.jobs[job.id] = job;
   if (ended && library.ended[job.id] === undefined) library.ended[job.id] = Date.now();
+  if (job.kind === "change") followRestore(job);
   if (job.dropId !== null) countJob(job.dropId, job.id);
 }
 
@@ -422,15 +451,108 @@ export function listNext(path: string, foldersOnly: boolean): Promise<void> {
  * Tells Rust which listings the window shows, when they changed since the last time. Rust
  * follows only these, so the store forgets the others: a folder opened again is listed again.
  */
-export function showListings(listings: ShownListing[]) {
-  const key = JSON.stringify(listings);
+export function showListings(listings: ShownListing[], binShown = false) {
+  const key = JSON.stringify([listings, binShown]);
   if (key === lastShown) return;
   lastShown = key;
   const kept = new Set(listings.map((l) => listingKey(l.path, l.foldersOnly)));
   shownKeys = kept;
   for (const old of Object.keys(library.listings)) if (!kept.has(old)) delete library.listings[old];
   for (const old of Object.keys(library.next)) if (!kept.has(old)) delete library.next[old];
-  invoke("library_shown", { listings }).catch(report("library_shown"));
+  invoke("library_shown", { listings, binShown }).catch(report("library_shown"));
+}
+
+/** Lists the bin from page 1; an answer of an older call (page 1 or a next page) is dropped. */
+export async function listBin(): Promise<void> {
+  const epoch = ++binEpoch;
+  library.bin.busy = true;
+  try {
+    const answer = await invoke<RecyclePage>("library_recycle", { cursor: null });
+    if (epoch !== binEpoch) return;
+    library.bin = { items: mergeBin([], answer.items), next: answer.next, loaded: true, busy: false, error: null };
+  } catch (error) {
+    if (epoch !== binEpoch) return;
+    library.bin = { ...library.bin, loaded: true, busy: false, error: String(error) };
+  }
+}
+
+/** Lists the bin's next page, when it has one and no call runs. */
+export async function listBinNext(): Promise<void> {
+  const cursor = library.bin.next;
+  if (cursor === null || library.bin.busy) return;
+  const epoch = binEpoch;
+  library.bin.busy = true;
+  try {
+    const answer = await invoke<RecyclePage>("library_recycle", { cursor });
+    if (epoch !== binEpoch) return;
+    library.bin = { items: mergeBin(library.bin.items, answer.items), next: answer.next, loaded: true, busy: false, error: null };
+  } catch (error) {
+    if (epoch !== binEpoch) return;
+    library.bin = { ...library.bin, busy: false, error: String(error) };
+  }
+}
+
+/** The restore of `key` follows its job: it asks, runs, or is over (done, failed, cancelled). */
+function followRestore(job: Job, key?: string) {
+  const at = key ?? Object.keys(library.restores).find((k) => library.restores[k].job === job.id);
+  if (at === undefined) return;
+  const restore = library.restores[at];
+  if (!restore) return;
+  if (job.state === "asking") {
+    library.restores[at] = {
+      ...restore,
+      job: job.id,
+      state: "asking",
+      text: job.text,
+      name: job.question?.name ?? restore.name,
+    };
+  } else if (job.state === "done" || job.state === "failed" || job.state === "cancelled") {
+    delete library.restores[at];
+  } else {
+    library.restores[at] = { ...restore, job: job.id, state: "busy" };
+  }
+}
+
+/**
+ * Restores an item of the bin at `path`, or where it was. A done restore sends `recycle`, so the
+ * bin lists again; one that failed (its text is the job's) lists the bin again here.
+ */
+async function restore(key: string, path: string | null, at: Restore) {
+  library.restores[key] = { ...at, state: "busy" };
+  const job = await change("library_restore", { key, path });
+  if (job) followRestore(job, key);
+  else delete library.restores[key];
+  if (!job || job.state === "failed") await listBin();
+}
+
+/** The Restore button of a row. */
+export function restoreItem(item: RecycleItem): Promise<void> {
+  if (library.restores[item.key]) return Promise.resolve();
+  return restore(item.key, null, { job: null, state: "busy", text: null, name: item.name, path: item.path });
+}
+
+/** The name typed for a restore that asks: null (Escape) is Cancel; an empty or the taken name keeps asking. */
+export async function answerRestore(key: string, typed: string | null): Promise<void> {
+  const at = library.restores[key];
+  if (at?.state !== "asking") return;
+  if (typed === null) return cancelRestore(key);
+  const path = restorePath(at.path, typed, at.name);
+  if (path === null) return;
+  await restore(key, path, at);
+}
+
+/** Cancel of a restore that asks: Rust ends its job. */
+export async function cancelRestore(key: string): Promise<void> {
+  const at = library.restores[key];
+  if (at?.state !== "asking" || at.job === null) return;
+  delete library.restores[key];
+  await run("library_cancel", { job: at.job });
+}
+
+/** Empty: removes every item of the bin for good. A done Empty sends `recycle`. */
+export async function emptyBin(): Promise<void> {
+  const job = await change("library_empty", {});
+  if (job?.state !== "done") await listBin();
 }
 
 /** Reads the saved start view; the window starts in it. Stays in the tree when it cannot be read. */

@@ -587,18 +587,22 @@ pub struct ShownListing {
     pub folders_only: bool,
 }
 
-/// The listings the library window shows now. The library keeps and follows only these, and
-/// lists only these again after a gap or a long pause. Async, so it never waits on the main
-/// thread.
+/// The listings the library window shows now, and whether it shows the recycle bin. The
+/// library keeps and follows only these, and lists only these again after a gap or a long
+/// pause; while the bin is shown it follows the events even without a listing, so a delete
+/// from elsewhere sends `recycle`. Async, so it never waits on the main thread.
 #[tauri::command]
 pub async fn library_shown(
     library: State<'_, Library>,
     listings: Vec<ShownListing>,
+    bin_shown: bool,
 ) -> Result<(), String> {
     let keys: Vec<Key> = listings
         .iter()
         .map(|l| Key::new(&l.path, l.folders_only))
         .collect();
+    // The bin first: a step between the two calls never sees neither.
+    library.set_bin_shown(bin_shown);
     library.set_shown(&keys);
     Ok(())
 }

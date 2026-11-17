@@ -27,8 +27,10 @@ export type FolderState = {
 export type Listing = { folder: FolderState; next: string | null };
 
 /**
- * A listing the window shows, for `library_shown`: the library keeps and follows only these, and
- * lists only these again after a gap or a long pause.
+ * A listing the window shows, for `library_shown(listings, binShown)`: the library keeps and
+ * follows only these, and lists only these again after a gap or a long pause. While `binShown`
+ * is true it follows the events even without a listing, so a delete from elsewhere sends
+ * `recycle`.
  */
 export type ShownListing = { path: string; foldersOnly: boolean };
 

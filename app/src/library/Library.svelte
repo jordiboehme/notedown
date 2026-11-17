@@ -4,21 +4,27 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import {
+    answerRestore,
     answerUpload,
+    cancelRestore,
     chooseView,
     clearJobs,
     deleteRow,
     downloadEntry,
+    emptyBin,
     entryOf,
     isBusy,
     jobAction,
     library,
+    listBin,
+    listBinNext,
     listFolder,
     listNext,
     loadView,
     makeFolder,
     moveRow,
     renameRow,
+    restoreItem,
     retryJobs,
     setDropTarget,
     showListings,
@@ -31,6 +37,7 @@
   import FolderList from "./FolderList.svelte";
   import Jobs from "./Jobs.svelte";
   import NotesList from "./NotesList.svelte";
+  import RecycleBin from "./RecycleBin.svelte";
   import Sidebar from "./Sidebar.svelte";
   import StateNotice from "./StateNotice.svelte";
   import StatusLine from "./StatusLine.svelte";
@@ -49,6 +56,7 @@
     type Sort,
   } from "./view";
   import { entryActions, folderAt, followChange, jobRows, type Change } from "./actions";
+  import { recycleRows } from "./recycle";
   import { drag, folderUnder, letGo, moveTo, stopDrag } from "./drag.svelte";
   import "../lib/system.css";
   import "./library.css";
@@ -83,6 +91,7 @@
   const actedOn = $derived(picked ?? (inTree ? null : selectedPath));
   const actions = $derived(entryActions(entryOf(actedOn), selectedPath));
   const groups = $derived(jobRows(library.jobs, library.ended, tick, library.dropTotals));
+  const binRows = $derived(recycleRows(library.bin.items, now));
 
   function report(command: string) {
     return (error: unknown) => console.error(`notedown: ${command} failed`, error);
@@ -93,7 +102,17 @@
   $effect(() => {
     void library.generation;
     const shown = shownFor(library.viewMode, selection, open);
-    untrack(() => showListings(shown));
+    const binShown = selection.kind === "bin";
+    untrack(() => showListings(shown, binShown));
+  });
+
+  // The bin lists from page 1 when it is shown, on a `recycle` event while it is shown, and
+  // after a new binding.
+  $effect(() => {
+    void library.recycle;
+    void library.generation;
+    if (!ready || selection.kind !== "bin") return;
+    untrack(() => void listBin());
   });
 
   // The tree lists a folder when it opens, and the rest of its pages after the first.
@@ -249,8 +268,16 @@
       {:else if !ready}
         <StateNotice view={library.view} onSettings={settings} />
       {:else if selection.kind === "bin"}
-        <h1 class="title">Recycle bin</h1>
-        <p class="note">The recycle bin is not shown yet.</p>
+        <RecycleBin
+          bin={library.bin}
+          rows={binRows}
+          restores={library.restores}
+          onMore={() => void listBinNext()}
+          onRestore={(item) => void restoreItem(item)}
+          onAnswer={(key, typed) => void answerRestore(key, typed)}
+          onCancel={(key) => void cancelRestore(key)}
+          onEmpty={() => void emptyBin()}
+        />
       {:else}
         {@const path = selection.path}
         <FileActions
@@ -345,19 +372,5 @@
     background: var(--brand);
     border-radius: 5px;
     opacity: 0.9;
-  }
-
-  .title {
-    margin: 0;
-    padding: 8px 14px;
-    font-size: 13px;
-    font-weight: 600;
-    border-bottom: 1px solid var(--separator);
-  }
-
-  .note {
-    margin: 0;
-    padding: 10px 14px;
-    color: var(--secondary);
   }
 </style>

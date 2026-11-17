@@ -61,6 +61,9 @@ pub struct TreePage {
 pub struct EventPage {
     pub events: Vec<Event>,
     pub next: u64,
+    /// The highest `seq` of the journal as far as the server can tell.
+    #[serde(default)]
+    pub end: u64,
     #[serde(default)]
     pub more: bool,
     #[serde(default)]
@@ -894,6 +897,7 @@ mod tests {
         EventPage {
             events,
             next,
+            end: next.saturating_sub(1),
             more: false,
             gap: false,
         }

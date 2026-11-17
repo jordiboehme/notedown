@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { FolderState, Job, LibraryEvent, Listing } from "../lib/library-types";
+import type { FolderState, Job, LibraryEvent, Listing, RecycleItem, RecyclePage } from "../lib/library-types";
 
 type Handler = (event: { payload: unknown }) => void;
 const handlers = new Map<string, Handler>();
@@ -26,6 +26,7 @@ const store = await import("../lib/library.svelte");
 const { library, applyEvent, startLibrary, listFolder, listNext, isBusy, showListings, resetLibrary, loadView, chooseView } = store;
 const { setDropTarget, answerUpload, jobAction, moveEntry, renameEntry, newFolder, deleteEntry, downloadEntry, clearJobs, retryJobs } = store;
 const { moveRow, renameRow, makeFolder, deleteRow } = store;
+const { listBin, listBinNext, restoreItem, answerRestore, cancelRestore, emptyBin } = store;
 const { followChange, jobRows } = await import("../library/actions");
 
 /** The next call of `command` answers what `answer` gives; it waits until `release` is called. */
@@ -258,6 +259,7 @@ describe("the library store", () => {
             { path: "NOTE/Note", foldersOnly: true },
             { path: "INBOX", foldersOnly: false },
           ],
+          binShown: false,
         },
       },
     ]);
@@ -278,6 +280,13 @@ describe("the library store", () => {
     showListings([{ path: "INBOX", foldersOnly: false }]);
     showListings([{ path: "INBOX", foldersOnly: false }]);
     expect(calls.filter((c) => c.command === "library_shown")).toHaveLength(4);
+
+    // The bin is told too: the same folders with the bin shown are a change.
+    showListings([{ path: "INBOX", foldersOnly: false }], true);
+    showListings([{ path: "INBOX", foldersOnly: false }], true);
+    const last = calls.filter((c) => c.command === "library_shown");
+    expect(last).toHaveLength(5);
+    expect(last[4].args).toEqual({ listings: [{ path: "INBOX", foldersOnly: false }], binShown: true });
   });
 });
 
@@ -610,5 +619,154 @@ describe("file actions and the shown folder", () => {
     expect(await deleteRow(entry)).toEqual({ from: "NOTE/Note/a.pdf", to: null });
     answerNow("library_delete", changed(54, "failed", null));
     expect(await deleteRow(entry)).toBeNull();
+  });
+});
+
+function binItem(path: string, deletedAt = 1_000): RecycleItem {
+  return { key: `${deletedAt}/${path}`, path, name: path.slice(path.lastIndexOf("/") + 1), kind: "file", deletedAt, size: 10, files: null };
+}
+
+function page(items: RecycleItem[], next: string | null): RecyclePage {
+  return { items, next };
+}
+
+function changeJob(id: number, state: Job["state"], rest: Partial<Job> = {}): Job {
+  return { id, kind: "change", label: "Restore b.note", done: 0, total: null, state, text: null, question: null, result: null, dropId: null, ...rest };
+}
+
+const B = binItem("NOTE/Note/b.note");
+const C = binItem("NOTE/Note/c.note", 500);
+
+describe("the recycle bin", () => {
+  it("lists page by page and from page 1 again, and drops an older answer", async () => {
+    answerNow("library_recycle", page([B], "r1:b"));
+    await listBin();
+    expect(library.bin).toMatchObject({ items: [B], next: "r1:b", loaded: true, busy: false, error: null });
+    expect(calls.at(-1)).toEqual({ command: "library_recycle", args: { cursor: null } });
+
+    // The next page; one that overlaps shows each item once.
+    answerNow("library_recycle", page([B, C], null));
+    await listBinNext();
+    expect(calls.at(-1)).toEqual({ command: "library_recycle", args: { cursor: "r1:b" } });
+    expect(library.bin.items.map((i) => i.key)).toEqual([B.key, C.key]);
+    expect(library.bin.next).toBeNull();
+    // No next page: no call.
+    await listBinNext();
+    expect(calls.filter((c) => c.command === "library_recycle")).toHaveLength(2);
+
+    // A next page that answers after page 1 was asked again is dropped.
+    library.bin.next = "r1:b";
+    const late = answerLater("library_recycle");
+    const nextCall = listBinNext();
+    const fresh = answerLater("library_recycle");
+    const first = listBin();
+    fresh.release(page([C], null));
+    await first;
+    late.release(page([B], null));
+    await nextCall;
+    expect(library.bin.items).toEqual([C]);
+
+    // An error keeps what was shown and says why.
+    const failing = answerLater("library_recycle");
+    const failed = listBin();
+    failing.fail("The server does not answer.");
+    await failed;
+    expect(library.bin).toMatchObject({ items: [C], error: "The server does not answer.", busy: false, loaded: true });
+
+    // A new binding forgets the bin.
+    applyEvent({ type: "relist" });
+    expect(library.bin).toEqual({ items: [], next: null, loaded: false, busy: false, error: null });
+  });
+
+  it("restores an item, and asks for another name when the place is taken", async () => {
+    answerNow("library_recycle", page([B, C], null));
+    await listBin();
+
+    // A plain restore: done, and the recycle event lists the bin again.
+    answerNow("library_restore", changeJob(7, "done", { result: "NOTE/Note/c.note" }));
+    await restoreItem(C);
+    expect(calls.at(-1)).toEqual({ command: "library_restore", args: { key: C.key, path: null } });
+    expect(library.restores).toEqual({});
+    expect(library.jobs[7].state).toBe("done");
+
+    // The place is taken: the row asks for another name.
+    const clash = { name: "b.note", existing: "B.note", canReplace: false };
+    answerNow("library_restore", changeJob(8, "asking", { text: "There is already B.note here.", question: clash }));
+    await restoreItem(B);
+    expect(library.restores[B.key]).toEqual({
+      job: 8,
+      state: "asking",
+      text: "There is already B.note here.",
+      name: "b.note",
+      path: "NOTE/Note/b.note",
+    });
+
+    // The same name or no name is no answer: it keeps asking.
+    await answerRestore(B.key, "b.note");
+    await answerRestore(B.key, "  ");
+    expect(calls.filter((c) => c.command === "library_restore")).toHaveLength(2);
+
+    // A name that is not allowed asks again with the new text.
+    answerNow(
+      "library_restore",
+      changeJob(8, "asking", { text: "This name cannot be used.", question: clash }),
+    );
+    await answerRestore(B.key, ".b.note");
+    expect(calls.at(-1)).toEqual({ command: "library_restore", args: { key: B.key, path: "NOTE/Note/.b.note" } });
+    expect(library.restores[B.key]).toMatchObject({ job: 8, state: "asking", text: "This name cannot be used." });
+
+    // Another name goes on with the same job.
+    const going = answerLater("library_restore");
+    const answered = answerRestore(B.key, "b 2.note");
+    expect(library.restores[B.key]).toMatchObject({ state: "busy" });
+    going.release(changeJob(8, "done", { result: "NOTE/Note/b 2.note" }));
+    await answered;
+    expect(calls.at(-1)).toEqual({ command: "library_restore", args: { key: B.key, path: "NOTE/Note/b 2.note" } });
+    expect(library.restores).toEqual({});
+  });
+
+  it("ends a restore that asks with Cancel, here or in the job rows", async () => {
+    const clash = { name: "b.note", existing: "B.note", canReplace: false };
+    answerNow("library_restore", changeJob(9, "asking", { text: "There is already B.note here.", question: clash }));
+    await restoreItem(B);
+    await cancelRestore(B.key);
+    expect(calls.at(-1)).toEqual({ command: "library_cancel", args: { job: 9 } });
+    expect(library.restores).toEqual({});
+
+    // Cancelled from the job rows (or by a new binding): the job event ends the question.
+    answerNow("library_restore", changeJob(10, "asking", { text: "There is already B.note here.", question: clash }));
+    await restoreItem(B);
+    applyEvent({ type: "job", job: changeJob(10, "cancelled") });
+    expect(library.restores).toEqual({});
+    // Escape in the name field is Cancel too.
+    answerNow("library_restore", changeJob(11, "asking", { text: "There is already B.note here.", question: clash }));
+    await restoreItem(B);
+    await answerRestore(B.key, null);
+    expect(calls.at(-1)).toEqual({ command: "library_cancel", args: { job: 11 } });
+  });
+
+  it("lists the bin again after a restore that failed; the error is the job's text", async () => {
+    answerNow("library_recycle", page([B], null));
+    await listBin();
+    answerNow("library_restore", changeJob(12, "failed", { text: "This item is not in the recycle bin anymore." }));
+    answerNow("library_recycle", page([], null));
+    await restoreItem(B);
+    expect(library.jobs[12].text).toBe("This item is not in the recycle bin anymore.");
+    expect(library.restores).toEqual({});
+    expect(calls.at(-1)).toEqual({ command: "library_recycle", args: { cursor: null } });
+    expect(library.bin.items).toEqual([]);
+  });
+
+  it("empties the bin", async () => {
+    answerNow("library_empty", changeJob(13, "done", { label: "Empty the recycle bin" }));
+    await emptyBin();
+    expect(calls.at(-1)).toEqual({ command: "library_empty", args: {} });
+    expect(library.jobs[13].state).toBe("done");
+
+    // A failed Empty lists the bin again: some items may be gone.
+    answerNow("library_empty", changeJob(14, "failed", { text: "The server does not answer." }));
+    answerNow("library_recycle", page([B], null));
+    await emptyBin();
+    expect(calls.at(-1)).toEqual({ command: "library_recycle", args: { cursor: null } });
   });
 });

@@ -4,7 +4,9 @@
 //! Calls run outside the cache's lock; what they bring is merged under it (see `cache.rs`).
 //! The follower reads `GET /events` every 2 s while the library window is visible and not at
 //! all while it is hidden. When the window shows again and the last read is older than a
-//! minute, the listed folders are listed again instead of read up.
+//! minute, the listed folders are listed again instead of read up. While the window shows the
+//! recycle bin, the follower also runs when no folder is listed: a delete from elsewhere may
+//! have changed the bin.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
@@ -38,6 +40,12 @@ pub struct Follow {
     /// The `seqs` of the app's own writes that the follower has not read yet: their deletes
     /// were announced to the bin view already.
     pub(super) own: std::collections::BTreeSet<u64>,
+    /// The window shows the recycle bin.
+    bin_shown: bool,
+    /// Where the events are read on from while no folder is listed: the `next` of the last
+    /// page read. `None` until a page was read, and after a pause or a step that followed
+    /// nothing.
+    bin_from: Option<u64>,
 }
 
 /// An item of the recycle bin.
@@ -102,6 +110,8 @@ impl Library {
         follow.stopped = false;
         follow.generation = generation;
         follow.own.clear();
+        follow.bin_shown = false;
+        follow.bin_from = None;
     }
 
     /// The account is gone (`account.removed` or a 410): no more reads until the next
@@ -311,35 +321,57 @@ impl Library {
             self.polled(now);
             // Deletes of the pause are not read, so the bin may have changed; the own seqs of
             // the pause are not read either.
-            lock(&self.inner.follow).own.clear();
+            {
+                let mut follow = lock(&self.inner.follow);
+                follow.own.clear();
+                follow.bin_from = None;
+            }
             (self.inner.emit)(LibraryEvent::Recycle);
             return;
         }
+        // A `recycle` is sent at most once a step.
+        let mut announce = false;
         loop {
             if session.is_cancelled() {
                 return;
             }
-            let Some(seq) = lock(&self.inner.cache).min_seq() else {
-                self.polled(now);
+            let folder_seq = lock(&self.inner.cache).min_seq();
+            let from = match folder_seq {
+                Some(seq) => seq + 1,
+                None => match self.bin_from(&session) {
+                    Ok(Some((from, fresh))) => {
+                        announce |= fresh;
+                        from
+                    }
+                    Ok(None) => {
+                        self.polled(now);
+                        return;
+                    }
+                    Err(()) => return,
+                },
+            };
+            let from_text = from.to_string();
+            let Some(page) = self.read_events(&session, &[("from", from_text.as_str())]) else {
                 return;
             };
-            let from = (seq + 1).to_string();
-            let result = session
-                .rest()
-                .get_json::<EventPage>("/events", &[("from", from.as_str())]);
-            self.settle(&session, &result);
-            let page = match result {
-                Ok(page) => page,
-                Err(RestError::AccountRemoved) => {
+            self.polled(now);
+            lock(&self.inner.follow).bin_from = Some(page.next);
+            let fresh = std::mem::take(&mut announce);
+            if self.bin_changed(&page) || fresh {
+                (self.inner.emit)(LibraryEvent::Recycle);
+            }
+            if folder_seq.is_none() {
+                // Only the bin is followed: nothing to apply.
+                if page.events.iter().any(|e| e.kind == "account.removed") {
                     self.stop_following(&session);
                     return;
                 }
-                Err(_) => return,
-            };
-            self.polled(now);
-            if self.bin_changed(&page) {
-                (self.inner.emit)(LibraryEvent::Recycle);
+                if !page.more {
+                    return;
+                }
+                continue;
             }
+            let seq = from - 1;
             if page.gap {
                 // A listing that cannot be read now waits and is tried again later; the others
                 // are followed meanwhile.
@@ -373,6 +405,45 @@ impl Library {
                 return;
             }
         }
+    }
+
+    /// One page of `GET /events`; `None` when it cannot be read (an account that is gone stops
+    /// the follower).
+    fn read_events(&self, session: &Session, query: &[(&str, &str)]) -> Option<EventPage> {
+        let result = session.rest().get_json::<EventPage>("/events", query);
+        self.settle(session, &result);
+        match result {
+            Ok(page) => Some(page),
+            Err(RestError::AccountRemoved) => {
+                self.stop_following(session);
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Where the follower reads on from while no folder is listed: `None` when the bin is not
+    /// shown either (the place is then forgotten). Without a place yet, the end of the journal
+    /// is read first (`fresh`: the bin may have changed since the window listed it). `Err` when
+    /// that read fails.
+    fn bin_from(&self, session: &Session) -> Result<Option<(u64, bool)>, ()> {
+        {
+            let mut follow = lock(&self.inner.follow);
+            if !follow.bin_shown {
+                follow.bin_from = None;
+                return Ok(None);
+            }
+            if let Some(from) = follow.bin_from {
+                return Ok(Some((from, false)));
+            }
+        }
+        // Only `end` of this page counts: its events are old.
+        let page = self
+            .read_events(session, &[("from", "0"), ("limit", "1")])
+            .ok_or(())?;
+        let from = page.end + 1;
+        lock(&self.inner.follow).bin_from = Some(from);
+        Ok(Some((from, true)))
     }
 
     fn polled(&self, now: u64) {
@@ -418,6 +489,12 @@ impl Library {
     /// these again.
     pub fn set_shown(&self, keys: &[Key]) {
         lock(&self.inner.cache).set_shown(keys);
+    }
+
+    /// Whether the window shows the recycle bin: while it does, the follower also runs when no
+    /// folder is listed, so a delete from elsewhere sends `recycle`.
+    pub fn set_bin_shown(&self, shown: bool) {
+        lock(&self.inner.follow).bin_shown = shown;
     }
 }
 

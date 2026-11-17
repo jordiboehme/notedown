@@ -337,3 +337,8 @@ export function shownFor(view: LibraryView, selection: Selection, open: Readonly
   if (view === "tree") return shownListings(selection, open);
   return selection.kind === "folder" ? columnsView(selection.path, {}).shown : [];
 }
+
+/** The folder that holds a path. */
+export function parentOf(path: string): string {
+  return path.slice(0, Math.max(0, path.lastIndexOf("/")));
+}

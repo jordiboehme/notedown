@@ -75,6 +75,8 @@ export function resetLibrary() {
   lastShown = null;
   shownKeys = null;
   chosen = false;
+  saved = null;
+  saving = null;
 }
 
 function report(command: string) {
@@ -203,14 +205,37 @@ export async function loadView(): Promise<void> {
   }
 }
 
+/** The view Rust has (or is being told); null before any save. */
+let saved: LibraryView | null = null;
+let saving: Promise<void> | null = null;
+
+/** One save at a time: after it, the latest choice is saved when it differs from what was saved. */
+async function saveView(): Promise<void> {
+  if (saving) return saving;
+  saving = (async () => {
+    try {
+      while (saved !== library.viewMode) {
+        const view = library.viewMode;
+        saved = view;
+        try {
+          await invoke("set_start_view", { startView: view });
+        } catch (error) {
+          report("set_start_view")(error);
+          saved = null;
+          return;
+        }
+      }
+    } finally {
+      saving = null;
+    }
+  })();
+  return saving;
+}
+
 /** Shows the folders in this view at once and saves the choice as the start view. */
 export async function chooseView(view: LibraryView): Promise<void> {
   chosen = true;
-  if (library.viewMode === view) return;
+  if (library.viewMode === view && (saving === null || saved === view)) return;
   library.viewMode = view;
-  try {
-    await invoke("set_start_view", { startView: view });
-  } catch (error) {
-    report("set_start_view")(error);
-  }
+  await saveView();
 }

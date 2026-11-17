@@ -7,6 +7,7 @@ import {
   listRows,
   listingKey,
   needsNextPage,
+  parentOf,
   pathBar,
   rootRows,
   shownFor,
@@ -374,7 +375,7 @@ describe("the columns", () => {
     expect(columnsView(null, {}).columns).toHaveLength(1);
   });
 
-  it("lists a missing column once its parent has a listing, and no other", () => {
+  it("lists the columns without a listing as missing, the ones listed are not", () => {
     const view = columnsView(path, { [listingKey("DOCUMENT/Document", false)]: document });
     expect(view.missing.map((m) => m.path)).toEqual(["DOCUMENT/Document/Books", path]);
   });
@@ -397,6 +398,14 @@ describe("the columns", () => {
     expect(view.columns.map((c) => c.path)).toEqual([null, "INBOX"]);
     expect(view.columns[1].empty).toBe(true);
     expect(view.columns[1].last).toBe(true);
+  });
+
+  it("closes the columns right of a file picked in a middle column", () => {
+    const file = "DOCUMENT/Document/Manual.pdf";
+    expect(parentOf(file)).toBe("DOCUMENT/Document");
+    const view = columnsView(parentOf(file), { [listingKey("DOCUMENT/Document", false)]: document }, file);
+    expect(view.columns.map((c) => c.path)).toEqual([null, "DOCUMENT/Document"]);
+    expect(view.columns[1].rows.filter((r) => r.selected).map((r) => r.name)).toEqual(["Manual.pdf"]);
   });
 
   it("keeps a root as one level", () => {

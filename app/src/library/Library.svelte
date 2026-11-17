@@ -16,6 +16,7 @@
   import {
     columnsView,
     listingKey,
+    parentOf,
     pathBar,
     rootRows,
     shownFor,
@@ -112,6 +113,12 @@
     for (const crumb of pathBar(path).slice(0, -1)) open.add(crumb.path);
   }
 
+  /** A file picked in a column: the columns right of it close, and the file is marked. */
+  function pickFile(file: string) {
+    select(parentOf(file));
+    pickedFile = file;
+  }
+
   function toggle(path: string) {
     if (open.has(path)) {
       // Closing a folder closes the folders below it too: they are not shown.
@@ -161,7 +168,7 @@
         {@const path = selection.path}
         {#if !inTree}
           {#key library.generation}
-            <ColumnsView {path} file={pickedFile} onSelect={select} onFile={(file) => (pickedFile = file)} />
+            <ColumnsView {path} columns={columns.columns} onSelect={select} onFile={pickFile} />
           {/key}
         {:else}
           {#key `${path}:${library.generation}`}

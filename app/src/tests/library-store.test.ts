@@ -324,4 +324,25 @@ describe("the view of the window", () => {
     await loading;
     expect(library.viewMode).toBe("columns");
   });
+
+  it("keeps one save in flight and then saves the latest choice", async () => {
+    const first = answerLater("set_start_view");
+    const one = chooseView("columns");
+    const two = chooseView("tree");
+    await flush();
+    expect(calls.filter((c) => c.command === "set_start_view")).toHaveLength(1);
+    first.release({});
+    await Promise.all([one, two]);
+    const saves = calls.filter((c) => c.command === "set_start_view").map((c) => c.args);
+    expect(saves).toEqual([{ startView: "columns" }, { startView: "tree" }]);
+    expect(library.viewMode).toBe("tree");
+  });
+
+  it("does not save again when the latest choice is the one that was saved", async () => {
+    const first = answerLater("set_start_view");
+    const all = [chooseView("columns"), chooseView("tree"), chooseView("columns")];
+    first.release({});
+    await Promise.all(all);
+    expect(calls.filter((c) => c.command === "set_start_view")).toHaveLength(1);
+  });
 });

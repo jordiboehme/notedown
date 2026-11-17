@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::config::SyncMark;
 use crate::config::{AppConfig, Mode};
 use crate::process::spawn_program;
 use crate::test_procs::{gone, kill_in, left_in, tagged_sleep};
@@ -584,13 +583,10 @@ fn the_mark_is_the_end_of_the_journal() {
         .ok()
         .unwrap();
     assert_eq!(take_journal_mark(&state), Ok(true));
-    assert_eq!(
-        state.current().setup.sync_mark,
-        Some(SyncMark {
-            key: "local|me".into(),
-            seq: 7
-        })
-    );
+    let mark = state.current().setup.sync_mark.unwrap();
+    assert_eq!((mark.key.as_str(), mark.seq), ("local|me", 7));
+    // Taken now: a device sync before it is no first sync.
+    assert!(mark.at_ms > 1_700_000_000_000, "{}", mark.at_ms);
     // An import again takes the new end.
     journal(&data, "journal-000000000008.jsonl", "{\"seq\":8}\n");
     assert_eq!(take_journal_mark(&state), Ok(true));

@@ -144,7 +144,7 @@ describe("checklist", () => {
     const all = sampleStatus(NOW);
     all.agents = [];
     const config = sampleConfig();
-    config.setup.syncMark = { key: "local|me", seq: 40 };
+    config.setup.syncMark = { key: "local|me", seq: 40, atMs: 1 };
     config.setup.syncChecked = { files: 0, folders: 0, digests: 0, cannotTell: false };
     steps = byId(checklist(input({ status: all, config })));
     expect(steps.agent.state).toBe("optional");
@@ -304,7 +304,7 @@ describe("checklist", () => {
           for (const job of [null, "import", "backup"] as (JobKind | null)[]) {
             for (const connection of ["reached", "refused", "unreachable"] as const) {
               const changed: Status = { ...status, connection };
-              const synced = { ...config, setup: { ...config.setup, syncMark: { key: "local|me", seq: 1 } } };
+              const synced = { ...config, setup: { ...config.setup, syncMark: { key: "local|me", seq: 1, atMs: 1 } } };
               for (const cfg of [config, synced]) {
                 fixtures.push(input({ status: changed, config: cfg, hasLogin, job, model: null }));
               }
@@ -340,7 +340,7 @@ describe("checklist", () => {
   it("the first sync is done once its check is clean or seen", () => {
     const status = sampleStatus(NOW);
     const config = sampleConfig();
-    config.setup.syncMark = { key: "local|me", seq: 40 };
+    config.setup.syncMark = { key: "local|me", seq: 40, atMs: 1 };
     // The mark is there, the check not yet.
     let steps = byId(checklist(input({ status, config })));
     expect(steps.supernote.state).toBe("todo");
@@ -358,14 +358,35 @@ describe("checklist", () => {
   it("an adopted setup without a mark is done after the first device sync", () => {
     const status = sampleStatus(NOW);
     const config = sampleConfig();
-    expect(byId(checklist(input({ status, config }))).supernote.state).toBe("done");
+    const steps = byId(checklist(input({ status, config })));
+    expect(steps.supernote.state).toBe("done");
+    expect(steps.supernote.line).toBe(
+      "Notedown did not check this first sync for deletes, because the import was done outside the app.",
+    );
     status.device.lastSyncMs = null;
     expect(byId(checklist(input({ status, config }))).supernote.state).toBe("todo");
     // A mark of another account does not count as this one's.
     status.device.lastSyncMs = NOW;
-    config.setup.syncMark = { key: "local|other", seq: 4 };
+    config.setup.syncMark = { key: "local|other", seq: 4, atMs: 1 };
     config.setup.syncChecked = { files: 0, folders: 0, digests: 0, cannotTell: false };
     expect(byId(checklist(input({ status, config }))).supernote.state).toBe("done");
+  });
+
+  it("another machine waits for its mark: an earlier sync never makes step 6 done", () => {
+    const status = sampleStatus(NOW);
+    status.setup.mode = "remote";
+    status.server.state = null;
+    const config = { ...sampleConfig(), mode: "remote" as const, serverUrl: "http://pi.local:19072" };
+    // The poll that sees the import takes the mark; until then a sync does not count.
+    let steps = byId(checklist(input({ status, config })));
+    expect(steps.import.state).toBe("done");
+    expect(steps.supernote.state).toBe("todo");
+    config.setup.syncMark = { key: "http://pi.local:19072|me", seq: 4, atMs: NOW };
+    expect(byId(checklist(input({ status, config }))).supernote.state).toBe("todo");
+    config.setup.syncChecked = { files: 0, folders: 0, digests: null, cannotTell: false };
+    steps = byId(checklist(input({ status, config })));
+    expect(steps.supernote.state).toBe("done");
+    expect(steps.supernote.line).toBe("The first sync worked. Nothing was deleted.");
   });
 });
 

@@ -71,6 +71,8 @@ const COMMANDS: &[&str] = &[
     "job_state",
     "set_setup_record",
     "snbak_time",
+    "sync_state",
+    "open_recycle_bin",
 ];
 
 fn main() {

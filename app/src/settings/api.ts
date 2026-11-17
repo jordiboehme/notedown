@@ -30,8 +30,9 @@ export interface SetupRecord {
   setupShown: boolean;
   /** The first Local mode turned Start at login on once. */
   autostartOffered: boolean;
-  /** The journal end when the import was done, by the token key of the account. */
-  syncMark: { key: string; seq: number } | null;
+  /** The journal end when the import was done, by the token key of the account; atMs is when
+   * the mark was taken (only a device sync after it is the first sync). */
+  syncMark: { key: string; seq: number; atMs: number } | null;
   /** What the first sync after the mark deleted. */
   syncChecked: SyncCheck | null;
   /** The user saw the deletes of the first sync. */
@@ -97,6 +98,9 @@ export const SETUP_JOB_DONE_EVENT = "setup-job-done";
 export const SETUP_JOB_FAILED_EVENT = "setup-job-failed";
 /** Pause stopped the backup ({kind}); the next step may start. */
 export const SETUP_JOB_PAUSED_EVENT = "setup-job-paused";
+
+/** Rust saved a sync mark or the check of the first sync: read the config again. */
+export const SETUP_RECORD_EVENT = "setup-record";
 
 /** What the commands that touch the server answer while an import runs. */
 export const WAIT_FOR_IMPORT = "Wait until the import is done.";
@@ -214,6 +218,10 @@ export const appDataRun = (empty: boolean, replace: boolean) => invoke<void>("ap
 /** The step that runs, if any. */
 export const jobState = () => invoke<JobKind | null>("job_state");
 export const setSetupRecord = (change: SetupChange) => invoke<AppConfig>("set_setup_record", { change });
+/** The check of the first sync of the login and whether its deletes were seen. */
+export const syncState = () => invoke<{ checked: SyncCheck | null; acknowledged: boolean }>("sync_state");
+/** Opens the library window at the recycle bin. */
+export const openRecycleBin = () => invoke<void>("open_recycle_bin");
 /** When a .snbak file was last written, in ms since 1970. */
 export const snbakTime = (path: string) => invoke<number>("snbak_time", { path });
 /** The Markdown folder of the logged-in account; null without an account. */

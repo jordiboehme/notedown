@@ -107,7 +107,7 @@
     {#key page}
       {#if page === "general"}<GeneralPage />
       {:else if page === "notifications"}<NotificationsPage />
-      {:else if page === "supernote"}<SupernotePage {now} />
+      {:else if page === "supernote"}<SupernotePage {now} onSetup={() => show("setup")} />
       {:else if page === "agents"}<AgentsPage {now} />
       {:else if page === "ocr"}<OcrPage {now} />
       {:else if page === "server"}<ServerPage />

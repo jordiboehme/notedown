@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { listen } from "@tauri-apps/api/event";
   import { status } from "../../lib/status.svelte";
   import {
     type ConfigAnswer,
@@ -8,15 +7,8 @@
     existingDetails,
     hasLogin,
     homeDir,
-    type JobKind,
-    type JobProgress,
-    jobState,
     type ModelState,
     modelState,
-    SETUP_JOB_DONE_EVENT,
-    SETUP_JOB_FAILED_EVENT,
-    SETUP_JOB_PAUSED_EVENT,
-    SETUP_JOB_PROGRESS_EVENT,
   } from "../api";
   import type { LogInOutcome } from "../account";
   import { checklist, type ChecklistInput, type Step, type StepId, startOffered, stepDot } from "../checklist";
@@ -29,7 +21,10 @@
   import ModelDownload from "../parts/ModelDownload.svelte";
   import AccountStep from "../setup/AccountStep.svelte";
   import ConnectionStep from "../setup/ConnectionStep.svelte";
+  import ImportStep from "../setup/ImportStep.svelte";
+  import { flow, startImportFlow } from "../setup/importState.svelte";
   import ServerStep from "../setup/ServerStep.svelte";
+  import SupernoteStep from "../setup/SupernoteStep.svelte";
 
   // Settings > Setup: the seven steps from a new Mac to a working setup. Each step shows its
   // state from the checklist (checklist.ts) and its controls; a step that waits for an
@@ -39,7 +34,6 @@
   let details = $state<ExistingFolder[]>([]);
   let home = $state<string | null>(null);
   let model = $state<ModelState | null>(null);
-  let job = $state<JobKind | null>(null);
   let loggedIn = $state(false);
   const startEmail = config.current?.email ?? "";
   let email = $state(startEmail);
@@ -53,8 +47,9 @@
           model,
           existing: status.current.existing,
           details,
-          job,
+          job: flow.job,
           hasLogin: loggedIn,
+          dryRun: flow.dryRun && { filesPresent: flow.dryRun.filesPresent },
         }
       : null,
   );
@@ -102,19 +97,8 @@
     modelState()
       .then((m) => (model = m))
       .catch(() => {});
-    jobState()
-      .then((kind) => (job = kind))
-      .catch(() => {});
-    const ended = () => (job = null);
-    const stops = [
-      listen<JobProgress>(SETUP_JOB_PROGRESS_EVENT, (event) => (job = event.payload.kind)),
-      listen(SETUP_JOB_DONE_EVENT, ended),
-      listen(SETUP_JOB_FAILED_EVENT, ended),
-      listen(SETUP_JOB_PAUSED_EVENT, ended),
-    ];
-    return () => {
-      for (const stop of stops) void stop.then((unlisten) => unlisten());
-    };
+    // The steps' events are followed for the life of the window (importState.svelte.ts).
+    startImportFlow();
   });
 
   function saved(answer: ConfigAnswer, found?: string) {
@@ -175,13 +159,17 @@
       <ModelDownload onchange={(m) => (model = m)} />
     </Section>
 
-    <!-- The backup and the import, and the first sync of the Supernote, get their own parts. -->
     <Section title={`${number("import")}. ${step("import")?.title}`}>
       {@render head("import")}
+      {@const imports = step("import")}
+      {#if imports}<ImportStep step={imports} {onOpen} />{/if}
     </Section>
 
     <Section title={`${number("supernote")}. ${step("supernote")?.title}`}>
       {@render head("supernote")}
+      {#if open("supernote")}
+        <SupernoteStep done={step("supernote")?.state === "done"} />
+      {/if}
     </Section>
 
     <Section title={`${number("agent")}. ${step("agent")?.title}`}>

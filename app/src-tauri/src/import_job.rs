@@ -272,19 +272,12 @@ pub fn backup_folder_state(dir: &Path) -> BackupFolder {
     }
 }
 
-/// The `end` of `GET /events`: the highest journal number.
-#[derive(Deserialize)]
-struct EventsEnd {
-    end: u64,
-}
-
-/// The highest journal number of the account the token belongs to, from
-/// `GET <base>/events?from=0&limit=1` (the mark of a server on another machine).
+/// The highest journal number of the server, by the token of an account
+/// ([`crate::setup::journal_end`]), within a short bound (the mark of a server on another
+/// machine and the end of the check of the first sync).
 pub fn events_end(base: &str, token: crate::token::Token) -> Result<u64, String> {
     let rest = Rest::with_timeout(base, Some(token), MARK_TIMEOUT).map_err(|e| e.to_string())?;
-    rest.get_json::<EventsEnd>("/events", &[("from", "0"), ("limit", "1")])
-        .map(|page| page.end)
-        .map_err(|e| e.to_string())
+    crate::setup::journal_end(&rest).map_err(|e| e.to_string())
 }
 
 /// The `seq` of a journal line.
@@ -348,7 +341,10 @@ pub fn take_journal_mark(state: &ConfigState) -> Result<bool, String> {
     let Some(seq) = journal_end(&config.data_dir) else {
         return Ok(false);
     };
-    state.set_sync_mark(SyncMark { key, seq })
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    state.set_sync_mark(SyncMark { key, seq, at_ms })
 }
 
 /// What a job that failed says: its last `error:` line (the CLI prints one), else its last

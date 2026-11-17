@@ -125,9 +125,23 @@ pub fn run() {
             app.manage(setup::Sidecar(sidecar_spawn.clone()));
             let poller = status_poller(sidecar_spawn.clone(), reader, processes.clone());
             let marking = app.state::<commands::ConfigState>().inner().clone();
-            poller.on_sync_mark(move |mark| {
-                if let Err(why) = marking.take_sync_mark(mark) {
-                    eprintln!("notedown: the import mark was not saved: {why}");
+            let told = app.handle().clone();
+            poller.on_sync_mark(move |mark| match marking.take_sync_mark(mark) {
+                Ok(true) => {
+                    let _ = told.emit(setup::SETUP_RECORD_EVENT, ());
+                }
+                Ok(false) => {}
+                Err(why) => eprintln!("notedown: the import mark was not saved: {why}"),
+            });
+            let checking = app.state::<commands::ConfigState>().inner().clone();
+            let told = app.handle().clone();
+            poller.on_sync_checked(move |key, check| {
+                match checking.set_sync_checked(&key, check) {
+                    Ok(true) => {
+                        let _ = told.emit(setup::SETUP_RECORD_EVENT, ());
+                    }
+                    Ok(false) => {}
+                    Err(why) => eprintln!("notedown: the first sync check was not saved: {why}"),
                 }
             });
             app.manage(import_jobs(
@@ -262,7 +276,9 @@ pub fn run() {
             commands::app_data_run,
             commands::job_state,
             commands::set_setup_record,
-            commands::snbak_time
+            commands::snbak_time,
+            commands::sync_state,
+            commands::open_recycle_bin
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
@@ -667,7 +683,7 @@ mod tests {
         names.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    const SETTINGS_ONLY: [&str; 36] = [
+    const SETTINGS_ONLY: [&str; 38] = [
         "get_config",
         "set_mode",
         "set_start_view",
@@ -704,6 +720,8 @@ mod tests {
         "job_state",
         "set_setup_record",
         "snbak_time",
+        "sync_state",
+        "open_recycle_bin",
     ];
 
     #[test]
@@ -825,7 +843,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 66);
+        assert_eq!(handler_commands().len(), 68);
     }
 
     #[test]
@@ -897,6 +915,8 @@ mod tests {
             "job_state",
             "set_setup_record",
             "snbak_time",
+            "sync_state",
+            "open_recycle_bin",
         ]);
         assert_eq!(manifest_commands(), all);
         // Every granted command is a real one.

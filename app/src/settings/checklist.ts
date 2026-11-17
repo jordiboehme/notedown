@@ -205,9 +205,12 @@ function supernote({ status, config }: ChecklistInput): Own {
   const mark = record.syncMark;
   const own = mark !== null && mark.key === tokenKey(config);
   if (!own) {
+    // Another machine: the poll that first sees the import takes the mark, and only a sync
+    // after it counts.
+    if (config.mode !== "local") return { done: false, line: "Connect the Supernote and sync it once." };
     // A setup imported without the app (no mark of this login): the first sync is enough.
     return status.device.lastSyncMs !== null
-      ? { done: true, line: "The Supernote syncs." }
+      ? { done: true, line: ADOPTED_LINE }
       : { done: false, line: "Connect the Supernote and sync it once." };
   }
   const checked = record.syncChecked;
@@ -224,6 +227,10 @@ function supernote({ status, config }: ChecklistInput): Own {
       : "The first sync deleted files on the server. Look at the recycle bin.",
   };
 }
+
+/** Step 6 of a setup imported without the app: no mark, so no check. */
+export const ADOPTED_LINE =
+  "Notedown did not check this first sync for deletes, because the import was done outside the app.";
 
 function agent({ status }: ChecklistInput): Own {
   const names = status.agents.map((a) => a.name);

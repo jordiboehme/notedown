@@ -10,12 +10,13 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::commands::{ConfigAnswer, ConfigState, log_in_to};
-use crate::config::{AppConfig, Mode, existing_setup, pipeline_server_url};
+use crate::config::{AppConfig, Mode, SyncCheck, existing_setup, pipeline_server_url};
 use crate::library::Library;
 use crate::login::{self, LoginGate, Password};
 use crate::process::{self, SpawnFn};
+use crate::rest::{Rest, RestError};
 use crate::serve_info::ServeInfo;
-use crate::token::TokenStore;
+use crate::token::{TokenStore, token_key};
 
 /// How long `cloud account add` and `connect` may take.
 pub const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -271,6 +272,174 @@ pub fn setup_folders(config: &AppConfig) -> Vec<PathBuf> {
         dirs.push(PathBuf::from(home).join("notedown-mac"));
     }
     dirs
+}
+
+/// Rust saved a sync mark or the check of the first sync: the settings window reads the
+/// config again.
+pub const SETUP_RECORD_EVENT: &str = "setup-record";
+
+/// How long `cloud journal tail` for the check of the first sync may take.
+pub const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The deletes a device sync can make on the server.
+const FILE_DELETED: &str = "file.deleted";
+const FOLDER_DELETED: &str = "folder.deleted";
+const DIGEST_DELETED: &str = "digest.deleted";
+
+/// The `end` of `GET /events`: the highest journal number of the server.
+#[derive(Deserialize)]
+struct EventsEnd {
+    end: u64,
+}
+
+/// The highest journal number of the server, from `GET /events?from=0&limit=1`.
+pub fn journal_end(rest: &Rest) -> Result<u64, RestError> {
+    rest.get_json::<EventsEnd>("/events", &[("from", "0"), ("limit", "1")])
+        .map(|page| page.end)
+}
+
+/// One line of `cloud journal tail`, as far as the check reads it.
+#[derive(Deserialize)]
+struct JournalLine {
+    seq: u64,
+    #[serde(default)]
+    account: String,
+    #[serde(default)]
+    origin: String,
+    #[serde(rename = "type", default)]
+    kind: String,
+}
+
+/// What the first sync deleted on this Mac's server: the device deletes of the account
+/// `slug` in `(mark, end]`, read with `cloud journal tail --data <dir> --from <mark+1>`
+/// within [`CHECK_TIMEOUT`]. Files, folders and digests. The journal numbers follow one
+/// another, so a first line after `mark + 1` (or none while `end` is past the mark) means
+/// lines are gone: then what the sync did cannot be told.
+pub fn sync_check_local(
+    spawn: &SpawnFn,
+    data_dir: &Path,
+    slug: &str,
+    mark: u64,
+    end: u64,
+) -> Result<SyncCheck, String> {
+    let from = mark.saturating_add(1);
+    let args = vec![
+        "cloud".to_owned(),
+        "journal".to_owned(),
+        "tail".to_owned(),
+        "--data".to_owned(),
+        data_dir.display().to_string(),
+        "--from".to_owned(),
+        from.to_string(),
+    ];
+    let output = process::run_bounded(spawn, &args, CHECK_TIMEOUT)?;
+    if !output.status.success() {
+        return Err(process::error_text(&output.stderr, output.status));
+    }
+    let mut check = SyncCheck {
+        digests: Some(0),
+        ..SyncCheck::default()
+    };
+    let mut first: Option<u64> = None;
+    for text in String::from_utf8_lossy(&output.stdout).lines() {
+        let Ok(line) = serde_json::from_str::<JournalLine>(text) else {
+            continue;
+        };
+        if line.seq < from {
+            continue;
+        }
+        first.get_or_insert(line.seq);
+        if line.seq > end {
+            break;
+        }
+        if line.account != slug || line.origin != "device" {
+            continue;
+        }
+        match line.kind.as_str() {
+            FILE_DELETED => check.files += 1,
+            FOLDER_DELETED => check.folders += 1,
+            DIGEST_DELETED => check.digests = check.digests.map(|n| n + 1),
+            _ => {}
+        }
+    }
+    if end >= from && first != Some(from) {
+        check.cannot_tell = true;
+    }
+    Ok(check)
+}
+
+/// One page of `GET /events`, as far as the check reads it.
+#[derive(Deserialize)]
+struct EventsPage {
+    events: Vec<FileEvent>,
+    next: u64,
+    more: bool,
+    gap: bool,
+}
+
+#[derive(Deserialize)]
+struct FileEvent {
+    seq: u64,
+    #[serde(rename = "type")]
+    kind: String,
+    origin: String,
+}
+
+/// What the first sync deleted on a server on another machine: the device deletes of the
+/// login's account in `(mark, end]`, page by page from `GET /events?from=<mark+1>`. Files and
+/// folders only: digest events are not in `/events` (`digests` is `None`). A page with `gap`
+/// means events are missing: then what the sync did cannot be told.
+pub fn sync_check_remote(rest: &Rest, mark: u64, end: u64) -> Result<SyncCheck, RestError> {
+    let mut check = SyncCheck::default();
+    let mut from = mark.saturating_add(1);
+    while from <= end {
+        let query = from.to_string();
+        let page = rest.get_json::<EventsPage>("/events", &[("from", query.as_str())])?;
+        check.cannot_tell |= page.gap;
+        for event in page.events.iter().filter(|e| e.seq > mark && e.seq <= end) {
+            if event.origin != "device" {
+                continue;
+            }
+            match event.kind.as_str() {
+                FILE_DELETED => check.files += 1,
+                FOLDER_DELETED => check.folders += 1,
+                _ => {}
+            }
+        }
+        // A page that does not move on would be asked again for ever.
+        if !page.more || page.next <= from {
+            break;
+        }
+        from = page.next;
+    }
+    Ok(check)
+}
+
+/// The check of the first sync of the login, for the Setup page.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncState {
+    pub checked: Option<SyncCheck>,
+    pub acknowledged: bool,
+}
+
+/// The check of the first sync, when the mark is the login's; a mark of another server or
+/// account is not this login's.
+pub fn sync_state(config: &AppConfig) -> SyncState {
+    let key = token_key(config);
+    let own = key.is_some()
+        && config
+            .setup
+            .sync_mark
+            .as_ref()
+            .is_some_and(|m| Some(&m.key) == key.as_ref());
+    if !own {
+        return SyncState::default();
+    }
+    SyncState {
+        checked: config.setup.sync_checked.clone(),
+        acknowledged: config.setup.sync_acknowledged,
+    }
 }
 
 #[cfg(test)]

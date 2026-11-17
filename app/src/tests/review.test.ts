@@ -161,7 +161,9 @@ describe("openAt", () => {
   it("reads where Rust opens the library, and nothing else", () => {
     expect(openAt({ at: "note", path: PATH })).toEqual({ kind: "note", path: PATH });
     expect(openAt({ at: "new" })).toEqual({ kind: "new" });
-    for (const odd of [null, undefined, "new", { at: "note" }, { at: "note", path: 3 }, { at: "bin" }]) {
+    // The setup opens it at the recycle bin after a first sync that deleted files.
+    expect(openAt({ at: "bin" })).toEqual({ kind: "bin" });
+    for (const odd of [null, undefined, "new", "bin", { at: "note" }, { at: "note", path: 3 }, { at: "trash" }]) {
       expect(openAt(odd)).toBeNull();
     }
   });

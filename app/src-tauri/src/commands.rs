@@ -294,6 +294,26 @@ impl ConfigState {
         }
     }
 
+    /// Saves the check of the first sync after the mark with the key `key`: only while that
+    /// mark is the login's and has no check yet (the check runs once). Answers whether it was
+    /// saved.
+    pub fn set_sync_checked(&self, key: &str, check: config::SyncCheck) -> Result<bool, String> {
+        match self.try_update(|c| {
+            let own = token_key(c).as_deref() == Some(key)
+                && c.setup.sync_mark.as_ref().is_some_and(|m| m.key == key);
+            if !own || c.setup.sync_checked.is_some() {
+                return Err(());
+            }
+            c.setup.sync_checked = Some(check);
+            c.setup.sync_acknowledged = false;
+            Ok(())
+        }) {
+            Ok(_) => Ok(true),
+            Err(TryUpdateError::Refused(())) => Ok(false),
+            Err(TryUpdateError::NotSaved(why)) => Err(why),
+        }
+    }
+
     /// Whether this is the first start that opens Settings at Setup: no mode yet and Setup
     /// not shown before. Answers true once; `setupShown` is saved with it. An error means it
     /// was due but the save failed.
@@ -1544,6 +1564,23 @@ pub async fn set_setup_record(
         .map_err(|e| e.to_string())?
 }
 
+/// The check of the first sync of the login and whether its deletes were seen.
+#[tauri::command]
+pub fn sync_state(config: State<'_, ConfigState>) -> crate::setup::SyncState {
+    crate::setup::sync_state(&config.current())
+}
+
+/// Opens the library window at the recycle bin (the deletes of the first sync are there).
+#[tauri::command]
+pub async fn open_recycle_bin(app: AppHandle) -> Result<(), String> {
+    windows::show_window(
+        &app,
+        WindowKind::Library,
+        Opening::At(windows::LibraryAt::Bin),
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// When a `.snbak` file was last written, in milliseconds since 1970.
 #[tauri::command]
 pub async fn snbak_time(path: PathBuf) -> Result<u64, String> {
@@ -2220,6 +2257,7 @@ mod tests {
         let mark = |key: &str, seq| SyncMark {
             key: key.to_owned(),
             seq,
+            at_ms: 5,
         };
         let checked = |state: &ConfigState| {
             state
@@ -2272,6 +2310,51 @@ mod tests {
         assert_eq!((setup.sync_checked, setup.sync_acknowledged), (None, false));
         // Never for an account that is not logged in.
         assert_eq!(state.set_sync_mark(mark("local|jordi", 30)), Ok(false));
+    }
+
+    #[test]
+    fn the_check_is_saved_once_for_its_mark() {
+        use config::{SyncCheck, SyncMark};
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        state
+            .set_mode(Mode::Local, Some("/data/a".into()), None)
+            .unwrap();
+        let check = |files| SyncCheck {
+            files,
+            digests: Some(0),
+            ..SyncCheck::default()
+        };
+        // No mark: nothing to save.
+        assert_eq!(state.set_sync_checked("local|me", check(1)), Ok(false));
+        state
+            .try_update(|c| {
+                c.account = Some("me".into());
+                c.setup.sync_mark = Some(SyncMark {
+                    key: "local|me".into(),
+                    seq: 4,
+                    at_ms: 5,
+                });
+                Ok::<(), ()>(())
+            })
+            .ok()
+            .unwrap();
+        // A check of another mark is not this one's.
+        assert_eq!(state.set_sync_checked("local|anna", check(1)), Ok(false));
+        assert_eq!(state.set_sync_checked("local|me", check(2)), Ok(true));
+        // Once: a later check does not replace the first one.
+        assert_eq!(state.set_sync_checked("local|me", check(3)), Ok(false));
+        assert_eq!(config::load(dir.path()).setup.sync_checked, Some(check(2)));
+        // Not after a log out: the mark is not the login's then.
+        state.forget_login().unwrap();
+        state
+            .try_update(|c| {
+                c.setup.sync_checked = None;
+                Ok::<(), ()>(())
+            })
+            .ok()
+            .unwrap();
+        assert_eq!(state.set_sync_checked("local|me", check(4)), Ok(false));
     }
 
     #[test]

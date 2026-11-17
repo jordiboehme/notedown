@@ -89,8 +89,12 @@ pub const LIBRARY_AT_EVENT: &str = "library-at";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "at", rename_all = "camelCase")]
 pub enum LibraryAt {
-    Note { path: String },
+    Note {
+        path: String,
+    },
     New,
+    /// The recycle bin (Settings > Setup, after a first sync that deleted files).
+    Bin,
 }
 
 /// How a window is opened: as it is, at a settings page, or at a place of the library.
@@ -551,6 +555,14 @@ mod tests {
             Some(Tell::Emit(
                 LIBRARY_AT_EVENT,
                 serde_json::json!({"at": "new"})
+            ))
+        );
+        // The setup opens it at the recycle bin.
+        assert_eq!(
+            tell(Library, &Opening::At(LibraryAt::Bin), true),
+            Some(Tell::Emit(
+                LIBRARY_AT_EVENT,
+                serde_json::json!({"at": "bin"})
             ))
         );
         // Open Library keeps an open window as it is; a new one starts where it starts.

@@ -613,3 +613,237 @@ fn the_setup_looks_in_the_config_folder_and_the_two_usual_ones() {
         ]
     );
 }
+
+// The check of the first sync after the import.
+
+fn events_page(events: &str, next: u64, end: u64, more: bool, gap: bool) -> String {
+    answer(
+        "200 OK",
+        &format!(r#"{{"events":[{events}],"next":{next},"end":{end},"more":{more},"gap":{gap}}}"#),
+    )
+}
+
+fn event(seq: u64, kind: &str, origin: &str) -> String {
+    format!(
+        r#"{{"seq":{seq},"ts":1,"type":"{kind}","origin":"{origin}","device":"SN1","opId":"o{seq}","path":"/Note/a.note"}}"#
+    )
+}
+
+fn rest_on(server: &Scripted) -> Rest {
+    Rest::new(&server.base(), Some(crate::token::Token::new("t"))).unwrap()
+}
+
+#[test]
+fn journal_end_reads_the_events_end() {
+    let server = Scripted::start(vec![events_page("", 0, 41, false, false)]);
+    assert_eq!(journal_end(&rest_on(&server)).unwrap(), 41);
+    let request = server.next();
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.target, "/rest/v1/events?from=0&limit=1");
+}
+
+/// A journal line of `cloud journal tail`.
+fn line(seq: u64, account: &str, origin: &str, kind: &str) -> String {
+    format!(
+        r#"{{"seq":{seq},"ts":1,"account":"{account}","origin":"{origin}","device":"SN1","type":"{kind}","path":"/Note/a.note","opId":"o{seq}"}}"#
+    )
+}
+
+/// A sidecar that prints `lines` as `journal tail` does.
+fn tail_sidecar(dir: &Path, lines: &[String]) -> SpawnFn {
+    let text = lines.join("\n");
+    fs::write(dir.join("tail.jsonl"), format!("{text}\n")).unwrap();
+    sidecar(dir, r#"cat "$D/tail.jsonl""#)
+}
+
+#[test]
+fn sync_check_local_counts_device_deletes_of_the_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let spawn = tail_sidecar(
+        dir.path(),
+        &[
+            line(11, "me", "device", "file.deleted"),
+            line(12, "me", "cli", "file.deleted"),
+            line(13, "anna", "device", "file.deleted"),
+            line(14, "me", "device", "digest.deleted"),
+            line(15, "me", "device", "file.modified"),
+            line(16, "me", "device", "folder.deleted"),
+            line(17, "me", "device", "file.deleted"),
+        ],
+    );
+    let data = dir.path().join("data");
+    let check = sync_check_local(&spawn, &data, "me", 10, 16).unwrap();
+    assert_eq!(
+        check,
+        SyncCheck {
+            files: 1,
+            folders: 1,
+            digests: Some(1),
+            cannot_tell: false
+        }
+    );
+    let argv = argv(dir.path()).unwrap();
+    assert_eq!(
+        argv,
+        strings(&[
+            "cloud",
+            "journal",
+            "tail",
+            "--data",
+            &data.display().to_string(),
+            "--from",
+            "11"
+        ])
+    );
+}
+
+#[test]
+fn the_event_at_the_mark_is_not_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    // A tail that starts at the mark (as an older CLI might): the mark's own line is the
+    // import's, never the first sync's.
+    let spawn = tail_sidecar(
+        dir.path(),
+        &[
+            line(10, "me", "device", "file.deleted"),
+            line(11, "me", "device", "file.modified"),
+        ],
+    );
+    let check = sync_check_local(&spawn, dir.path(), "me", 10, 11).unwrap();
+    assert_eq!(
+        check,
+        SyncCheck {
+            digests: Some(0),
+            ..SyncCheck::default()
+        }
+    );
+    // Over REST the same: the page from the mark is not counted.
+    let server = Scripted::start(vec![events_page(
+        &[
+            event(10, "file.deleted", "device"),
+            event(11, "file.modified", "device"),
+        ]
+        .join(","),
+        12,
+        11,
+        false,
+        false,
+    )]);
+    let check = sync_check_remote(&rest_on(&server), 10, 11).unwrap();
+    assert_eq!(check, SyncCheck::default());
+    assert_eq!(server.next().target, "/rest/v1/events?from=11");
+}
+
+#[test]
+fn a_missing_line_after_the_mark_cannot_tell() {
+    let dir = tempfile::tempdir().unwrap();
+    // The journal was cut since the mark: the lines after it are gone.
+    let spawn = tail_sidecar(dir.path(), &[line(20, "me", "device", "file.modified")]);
+    let check = sync_check_local(&spawn, dir.path(), "me", 10, 20).unwrap();
+    assert!(check.cannot_tell);
+    // Nothing at all while the end is past the mark: no line can be read.
+    let spawn = tail_sidecar(dir.path(), &[]);
+    let check = sync_check_local(&spawn, dir.path(), "me", 10, 20).unwrap();
+    assert!(check.cannot_tell);
+    // Nothing changed since the mark: nothing to tell.
+    let check = sync_check_local(&spawn, dir.path(), "me", 10, 10).unwrap();
+    assert_eq!(
+        check,
+        SyncCheck {
+            digests: Some(0),
+            ..SyncCheck::default()
+        }
+    );
+}
+
+#[test]
+fn a_failed_tail_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let spawn = sidecar(
+        dir.path(),
+        r#"echo "error: data folder /x does not exist" >&2; exit 1"#,
+    );
+    let error = sync_check_local(&spawn, dir.path(), "me", 10, 20).unwrap_err();
+    assert!(error.contains("data folder /x does not exist"), "{error}");
+}
+
+#[test]
+fn sync_check_remote_pages_events() {
+    let server = Scripted::start(vec![
+        events_page(
+            &[
+                event(11, "file.deleted", "device"),
+                event(12, "file.deleted", "app"),
+            ]
+            .join(","),
+            13,
+            20,
+            true,
+            false,
+        ),
+        events_page(
+            &[
+                event(13, "folder.deleted", "device"),
+                event(19, "file.deleted", "device"),
+                event(21, "file.deleted", "device"),
+            ]
+            .join(","),
+            22,
+            21,
+            false,
+            false,
+        ),
+    ]);
+    let check = sync_check_remote(&rest_on(&server), 10, 20).unwrap();
+    assert_eq!(
+        check,
+        SyncCheck {
+            files: 2,
+            folders: 1,
+            digests: None,
+            cannot_tell: false
+        }
+    );
+    assert_eq!(server.next().target, "/rest/v1/events?from=11");
+    assert_eq!(server.next().target, "/rest/v1/events?from=13");
+}
+
+#[test]
+fn a_gap_cannot_tell() {
+    let server = Scripted::start(vec![events_page(
+        &event(15, "file.modified", "device"),
+        16,
+        16,
+        false,
+        true,
+    )]);
+    let check = sync_check_remote(&rest_on(&server), 10, 16).unwrap();
+    assert!(check.cannot_tell);
+    assert_eq!(check.digests, None);
+}
+
+#[test]
+fn the_sync_state_is_the_check_of_the_login() {
+    use crate::config::SyncMark;
+    let mut config = AppConfig {
+        mode: Mode::Local,
+        account: Some("me".into()),
+        ..AppConfig::default()
+    };
+    config.setup.sync_mark = Some(SyncMark {
+        key: "local|me".into(),
+        seq: 4,
+        at_ms: 1,
+    });
+    config.setup.sync_checked = Some(SyncCheck {
+        files: 2,
+        ..SyncCheck::default()
+    });
+    config.setup.sync_acknowledged = true;
+    let state = sync_state(&config);
+    assert_eq!(state.checked.map(|c| c.files), Some(2));
+    assert!(state.acknowledged);
+    // The mark of another login is not this one's.
+    config.account = Some("anna".into());
+    assert_eq!(sync_state(&config), SyncState::default());
+}

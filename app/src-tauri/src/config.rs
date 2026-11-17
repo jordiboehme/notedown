@@ -131,6 +131,10 @@ pub struct SyncMark {
     pub key: String,
     /// The highest journal number at the mark.
     pub seq: u64,
+    /// When the mark was taken, in ms since 1970: only a device sync after it is the first
+    /// sync. A mark saved before this field has 0.
+    #[serde(default)]
+    pub at_ms: u64,
 }
 
 /// What the first sync after the mark deleted on the server.
@@ -433,6 +437,7 @@ mod tests {
                 sync_mark: Some(SyncMark {
                     key: "https://notes.example.org|jordi".into(),
                     seq: 813,
+                    at_ms: 1_763_300_000_000,
                 }),
                 sync_checked: Some(SyncCheck {
                     files: 2,
@@ -458,6 +463,7 @@ mod tests {
             "\"setupShown\"",
             "\"autostartOffered\"",
             "\"syncMark\"",
+            "\"atMs\"",
             "\"syncChecked\"",
             "\"cannotTell\"",
             "\"syncAcknowledged\"",
@@ -477,6 +483,22 @@ mod tests {
         assert!(setup.setup_shown);
         assert!(!setup.autostart_offered);
         assert_eq!(setup.sync_mark, None);
+        // A mark saved before it had its time keeps the config and gets 0.
+        fs::write(
+            dir.path().join(FILE),
+            r#"{"mode":"local","setup":{"syncMark":{"key":"local|me","seq":3}}}"#,
+        )
+        .unwrap();
+        let loaded = load_checked(dir.path());
+        assert!(!loaded.reset);
+        assert_eq!(
+            loaded.config.setup.sync_mark,
+            Some(SyncMark {
+                key: "local|me".into(),
+                seq: 3,
+                at_ms: 0
+            })
+        );
         let mut record = sample().setup;
         record.forget_sync();
         assert_eq!(

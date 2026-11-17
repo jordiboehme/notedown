@@ -13,7 +13,7 @@ import {
   type UploadArgs,
 } from "../library/actions";
 import { listingKey, type LibraryView } from "../library/view";
-import { binView, mergeBin, restorePath, type Bin } from "../library/recycle";
+import { binView, mergeBin, restoreTarget, type Bin } from "../library/recycle";
 import {
   LIBRARY_EVENT,
   type FolderState,
@@ -72,9 +72,18 @@ type Store = {
 /**
  * A restore of an item of the bin: it runs (`busy`), or the place is taken and it asks for
  * another name (`asking`, with the job's text and the name that is taken). `path` is where the
- * item was.
+ * item was. `draft` is the name typed so far and `focused` says the field took the focus once:
+ * both survive the row scrolling out of view.
  */
-export type Restore = { job: number | null; state: "busy" | "asking"; text: string | null; name: string; path: string };
+export type Restore = {
+  job: number | null;
+  state: "busy" | "asking";
+  text: string | null;
+  name: string;
+  path: string;
+  draft: string;
+  focused: boolean;
+};
 
 function noBin(): Bin {
   return { items: [], next: null, loaded: false, busy: false, error: null };
@@ -510,12 +519,16 @@ function followRestore(job: Job, key?: string) {
   const restore = library.restores[at];
   if (!restore) return;
   if (job.state === "asking") {
+    const name = job.question?.name ?? restore.name;
+    // The first ask fills the field with the name that is taken; later ones keep what was typed.
+    const first = restore.job === null;
     library.restores[at] = {
       ...restore,
       job: job.id,
       state: "asking",
       text: job.text,
-      name: job.question?.name ?? restore.name,
+      name,
+      draft: first ? name : restore.draft,
     };
   } else if (job.state === "done" || job.state === "failed" || job.state === "cancelled") {
     delete library.restores[at];
@@ -539,17 +552,43 @@ async function restore(key: string, path: string | null, at: Restore) {
 /** The Restore button of a row. */
 export function restoreItem(item: RecycleItem): Promise<void> {
   if (library.restores[item.key]) return Promise.resolve();
-  return restore(item.key, null, { job: null, state: "busy", text: null, name: item.name, path: item.path });
+  return restore(item.key, null, {
+    job: null,
+    state: "busy",
+    text: null,
+    name: item.name,
+    path: item.path,
+    draft: item.name,
+    focused: false,
+  });
 }
 
-/** The name typed for a restore that asks: null (Escape) is Cancel; an empty or the taken name keeps asking. */
+/**
+ * The name typed for a restore that asks: null (Escape) is Cancel. An empty name, the taken
+ * name or one with a slash keeps asking, and the row says why.
+ */
 export async function answerRestore(key: string, typed: string | null): Promise<void> {
   const at = library.restores[key];
   if (at?.state !== "asking") return;
   if (typed === null) return cancelRestore(key);
-  const path = restorePath(at.path, typed, at.name);
-  if (path === null) return;
-  await restore(key, path, at);
+  const target = restoreTarget(at.path, typed, at.name);
+  if ("refuse" in target) {
+    library.restores[key] = { ...at, text: target.refuse };
+    return;
+  }
+  await restore(key, target.path, at);
+}
+
+/** The name typed so far in a restore that asks. */
+export function restoreDraft(key: string, draft: string) {
+  const at = library.restores[key];
+  if (at?.state === "asking") library.restores[key] = { ...at, draft };
+}
+
+/** The field of a restore that asks took the focus: it does not take it again. */
+export function restoreFocused(key: string) {
+  const at = library.restores[key];
+  if (at) library.restores[key] = { ...at, focused: true };
 }
 
 /** Cancel of a restore that asks: Rust ends its job. */

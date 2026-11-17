@@ -1295,3 +1295,110 @@ fn the_bin_hears_of_the_head_read_even_when_the_next_read_fails() {
         ]
     );
 }
+
+#[test]
+fn a_bin_read_of_the_old_binding_does_not_set_the_place_of_the_new_one() {
+    let s = setup_hooked(
+        vec![head(40), head(60), events(&[], 61)],
+        |n, _, library| {
+            // A login while the old binding's head read waits for its answer.
+            if n == 0 {
+                library.relogin();
+            }
+        },
+    );
+    s.library.set_bin_shown(true);
+    s.follow();
+    s.library.set_bin_shown(true);
+    s.follow();
+    assert_eq!(
+        s.targets(),
+        [
+            "/events?from=0&limit=1",
+            "/events?from=0&limit=1",
+            "/events?from=61"
+        ]
+    );
+}
+
+#[test]
+fn the_bin_alone_follows_gaps_pages_and_the_end_of_the_account() {
+    let s = setup(vec![
+        head(40),
+        events(&[], 41),
+        gap(900, 950),
+        answer(
+            "200 OK",
+            &json!({"events": [], "next": 905, "end": 950, "more": true, "gap": false}).to_string(),
+        ),
+        events(&[ev(905, "file.deleted", 5, "NOTE/Note/x.note")], 906),
+        events(
+            &[
+                json!({"seq": 906, "ts": 1, "type": "account.removed", "origin": "cli", "userId": 7}),
+            ],
+            907,
+        ),
+    ]);
+    s.library.set_bin_shown(true);
+    s.events.0.lock().unwrap().clear();
+    s.follow();
+    assert_eq!(recycles(&s), 1);
+    // A gap: the bin may have changed; it reads on from the gap's next.
+    s.follow();
+    assert_eq!(recycles(&s), 1);
+    // More pages are read at once, in one step.
+    s.follow();
+    assert_eq!(recycles(&s), 1);
+    // The account is gone: no more reads.
+    s.follow();
+    s.follow();
+    assert_eq!(
+        s.targets(),
+        [
+            "/events?from=0&limit=1",
+            "/events?from=41",
+            "/events?from=41",
+            "/events?from=900",
+            "/events?from=905",
+            "/events?from=906",
+        ]
+    );
+}
+
+#[test]
+fn the_bin_alone_stops_on_a_410() {
+    let s = setup(vec![
+        head(40),
+        answer(
+            "410 Gone",
+            r#"{"error":"account_removed","userId":7,"seq":40}"#,
+        ),
+    ]);
+    s.library.set_bin_shown(true);
+    s.follow();
+    s.follow();
+    assert_eq!(s.targets(), ["/events?from=0&limit=1", "/events?from=41"]);
+}
+
+#[test]
+fn the_bin_alone_forgets_its_place_after_a_long_pause() {
+    let s = setup(vec![head(40), events(&[], 41), head(70), events(&[], 71)]);
+    s.library.set_bin_shown(true);
+    s.follow();
+    s.library.set_visible(false);
+    s.time.pass(60_001);
+    s.events.0.lock().unwrap().clear();
+    // Shown again after a minute: the bin lists again, and the end is read anew.
+    s.follow();
+    assert_eq!(recycles(&s), 1);
+    s.follow();
+    assert_eq!(
+        s.targets(),
+        [
+            "/events?from=0&limit=1",
+            "/events?from=41",
+            "/events?from=0&limit=1",
+            "/events?from=71",
+        ]
+    );
+}

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { RecycleItem } from "../lib/library-types";
-import { binView, emptyQuestion, mergeBin, recycleRows, restorePath } from "../library/recycle";
+import { binNeedsNext, binView, emptyQuestion, mergeBin, recycleRows, restoreTarget } from "../library/recycle";
 
 const NOW = Date.UTC(2026, 10, 17, 12, 0, 0);
 
@@ -96,11 +96,24 @@ describe("the recycle bin view", () => {
   });
 
   it("restores under a new name in the folder the item was in", () => {
-    expect(restorePath("NOTE/Note/Work/b.note", " c.note ", "b.note")).toBe("NOTE/Note/Work/c.note");
-    expect(restorePath("INBOX/a.pdf", "a 2.pdf", "a.pdf")).toBe("INBOX/a 2.pdf");
-    // An empty name, or the name that is taken, is no answer.
-    expect(restorePath("INBOX/a.pdf", "  ", "a.pdf")).toBeNull();
-    expect(restorePath("INBOX/a.pdf", "a.pdf", "a.pdf")).toBeNull();
-    expect(restorePath("a.pdf", "b.pdf", "a.pdf")).toBe("b.pdf");
+    expect(restoreTarget("NOTE/Note/Work/b.note", " c.note ", "b.note")).toEqual({ path: "NOTE/Note/Work/c.note" });
+    expect(restoreTarget("INBOX/a.pdf", "a 2.pdf", "a.pdf")).toEqual({ path: "INBOX/a 2.pdf" });
+    expect(restoreTarget("a.pdf", "b.pdf", "a.pdf")).toEqual({ path: "b.pdf" });
+    // An empty name, or the name that is taken, is no answer: the row says so.
+    expect(restoreTarget("INBOX/a.pdf", "  ", "a.pdf")).toEqual({ refuse: "Type another name." });
+    expect(restoreTarget("INBOX/a.pdf", "a.pdf", "a.pdf")).toEqual({ refuse: "Type another name." });
+    // A name with a slash would put the item in another (new) folder.
+    const own = { refuse: "Restore keeps the item in its folder. Type a name without /." };
+    expect(restoreTarget("NOTE/Note/Work/b.note", "sub/b.note", "b.note")).toEqual(own);
+    expect(restoreTarget("NOTE/Note/Work/b.note", "/b.note", "b.note")).toEqual(own);
+  });
+
+  it("asks for the next page only while the bin can be read", () => {
+    const bin = { items: [], next: "r1:x", loaded: true, busy: false, error: null };
+    expect(binNeedsNext(bin, 0, 0)).toBe(true);
+    expect(binNeedsNext({ ...bin, busy: true }, 0, 0)).toBe(false);
+    expect(binNeedsNext({ ...bin, next: null }, 0, 0)).toBe(false);
+    // A next page that failed is not asked for again at once (no loop without a wait).
+    expect(binNeedsNext({ ...bin, error: "The server does not answer." }, 0, 0)).toBe(false);
   });
 });

@@ -360,7 +360,9 @@ impl Library {
                 return;
             };
             self.polled(now);
-            lock(&self.inner.follow).bin_from = Some(page.next);
+            if !self.set_bin_from(&session, page.next) {
+                return;
+            }
             if self.bin_changed(&page) && !sent {
                 (self.inner.emit)(LibraryEvent::Recycle);
                 sent = true;
@@ -446,8 +448,21 @@ impl Library {
             .read_events(session, &[("from", "0"), ("limit", "1")])
             .ok_or(())?;
         let from = page.end + 1;
-        lock(&self.inner.follow).bin_from = Some(from);
+        if !self.set_bin_from(session, from) {
+            return Err(());
+        }
         Ok(Some((from, true)))
+    }
+
+    /// Keeps where the events are read on from; false (nothing kept) when the answer belongs
+    /// to an older binding.
+    fn set_bin_from(&self, session: &Session, from: u64) -> bool {
+        let mut follow = lock(&self.inner.follow);
+        if follow.generation != session.generation() {
+            return false;
+        }
+        follow.bin_from = Some(from);
+        true
     }
 
     fn polled(&self, now: u64) {

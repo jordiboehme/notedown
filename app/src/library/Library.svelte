@@ -26,6 +26,8 @@
     makeFolder,
     moveRow,
     renameRow,
+    restoreDraft,
+    restoreFocused,
     restoreItem,
     retryJobs,
     setDropTarget,
@@ -280,6 +282,8 @@
           onRestore={(item) => void restoreItem(item)}
           onAnswer={(key, typed) => void answerRestore(key, typed)}
           onCancel={(key) => void cancelRestore(key)}
+          onDraft={restoreDraft}
+          onFocused={restoreFocused}
           onAskEmpty={askEmpty}
           onDropEmpty={dropEmpty}
           onEmpty={() => void confirmEmpty()}

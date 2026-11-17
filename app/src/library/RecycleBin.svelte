@@ -3,8 +3,8 @@
   import type { RecycleItem } from "../lib/library-types";
   import type { Restore } from "../lib/library.svelte";
   import VirtualRows from "./VirtualRows.svelte";
-  import { binView, type Bin, type RecycleRow } from "./recycle";
-  import { needsNextPage, type Range } from "./view";
+  import { binNeedsNext, binView, type Bin, type RecycleRow } from "./recycle";
+  import type { Range } from "./view";
 
   // The recycle bin: Empty in its toolbar (asked in the window first), and a row per item with
   // Restore. A restore into a taken place asks for another name in its row. The first page shows
@@ -19,6 +19,8 @@
     onRestore,
     onAnswer,
     onCancel,
+    onDraft,
+    onFocused,
     onAskEmpty,
     onDropEmpty,
     onEmpty,
@@ -34,6 +36,8 @@
     onRestore: (item: RecycleItem) => void;
     onAnswer: (key: string, typed: string | null) => void;
     onCancel: (key: string) => void;
+    onDraft: (key: string, draft: string) => void;
+    onFocused: (key: string) => void;
     onAskEmpty: () => void;
     onDropEmpty: () => void;
     onEmpty: () => void;
@@ -43,19 +47,26 @@
   const view = $derived(binView(bin));
 
   function seen(range: Range) {
-    if (needsNextPage({ end: range.end, count: rows.length, next: bin.next, busy: bin.busy })) onMore();
+    if (binNeedsNext(bin, range.end, rows.length)) onMore();
   }
 
   // A page without rows shows no rows to come near: the next page is asked for at once.
   $effect(() => {
-    if (bin.loaded && rows.length === 0 && needsNextPage({ end: 0, count: 0, next: bin.next, busy: bin.busy })) untrack(onMore);
+    if (bin.loaded && rows.length === 0 && binNeedsNext(bin, 0, 0)) untrack(onMore);
   });
 
-  /** The new name is typed in place, the name before the extension selected. */
-  function start(field: HTMLInputElement) {
-    field.focus();
-    const dot = field.value.lastIndexOf(".");
-    field.setSelectionRange(0, dot > 0 ? dot : field.value.length);
+  /**
+   * The new name is typed in place, the name before the extension selected. Only on the first
+   * ask: a row that scrolls back into view does not take the focus again.
+   */
+  function start(at: string) {
+    return (field: HTMLInputElement) => {
+      if (restores[at]?.focused) return;
+      field.focus();
+      const dot = field.value.lastIndexOf(".");
+      field.setSelectionRange(0, dot > 0 ? dot : field.value.length);
+      onFocused(at);
+    };
   }
 
   function key(event: KeyboardEvent & { currentTarget: HTMLInputElement }, at: string) {
@@ -66,10 +77,6 @@
     event.stopPropagation();
   }
 
-  function answer(event: MouseEvent & { currentTarget: HTMLButtonElement }, at: string) {
-    const field = event.currentTarget.closest(".row")?.querySelector("input");
-    if (field) onAnswer(at, field.value);
-  }
 </script>
 
 <h1 class="title">Recycle bin</h1>
@@ -118,11 +125,12 @@
               <input
                 class="field"
                 type="text"
-                value={restore.name}
+                value={restore.draft}
                 aria-label="Restore as"
                 spellcheck="false"
                 autocomplete="off"
-                {@attach start}
+                {@attach start(row.key)}
+                oninput={(event) => onDraft(row.key, event.currentTarget.value)}
                 onkeydown={(event) => key(event, row.key)}
               />
             {:else}
@@ -132,7 +140,7 @@
           {#if restore?.state === "asking"}
             <span class="clash" role="status">{restore.text ?? ""}</span>
             <span class="buttons">
-              <button type="button" class="button" onclick={(event) => answer(event, row.key)}>Restore</button>
+              <button type="button" class="button" onclick={() => onAnswer(row.key, restore.draft)}>Restore</button>
               <button type="button" class="button" onclick={() => onCancel(row.key)}>Cancel</button>
             </span>
           {:else}

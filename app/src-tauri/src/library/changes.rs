@@ -30,6 +30,9 @@ use super::cache::{name_of, parent_of};
 use super::{Clash, Entry, Job, JobKind, JobState, Library, LibraryEvent, Session, lock};
 use crate::rest::{Rest, RestError, SYNC_WAIT};
 
+/// A restore under a path in another folder: only the name may change.
+const OWN_FOLDER: &str = "Restore keeps the item in its folder. Type a name without /.";
+
 /// The text of a change job while a Supernote syncs; it goes on when the sync ends.
 pub const WAITING: &str = "The Supernote is syncing. Notedown waits.";
 /// The longest single sleep of a wait: a new binding ends a wait within it.
@@ -389,6 +392,14 @@ impl Library {
             let target = match path {
                 Some(path) => {
                     let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+                    // Only the name may change: the server would make the missing folders of
+                    // another path.
+                    if parent != parent_of(old_path) {
+                        return Err(match &asked {
+                            Some(clash) => Stop::Asking(clash.clone(), OWN_FOLDER.to_owned()),
+                            None => Stop::Failed(OWN_FOLDER.to_owned()),
+                        });
+                    }
                     join(parent, &typed_name(name).map_err(ask_again)?)
                 }
                 None => old_path.to_owned(),

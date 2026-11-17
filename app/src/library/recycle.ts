@@ -1,7 +1,7 @@
 import { relativeTime } from "../lib/format";
 import type { RecycleItem } from "../lib/library-types";
 import { formatBytes } from "../settings/format";
-import { folderLabel, parentOf } from "./view";
+import { folderLabel, needsNextPage, parentOf } from "./view";
 
 // The view models of the recycle bin view: pure functions of what the store holds.
 
@@ -82,13 +82,26 @@ export function emptyConfirm(bin: Bin, asked: boolean): string | null {
   return asked && binView(bin).canEmpty ? emptyQuestion(bin) : null;
 }
 
+/** The answer to a restore that asks for a name with a slash: the item stays in its folder. */
+export const OWN_FOLDER = "Restore keeps the item in its folder. Type a name without /.";
+
 /**
- * The path a restore goes to with the typed name: the folder the item was in. Null for an
- * empty name or the name that is taken (`taken`).
+ * Where a restore goes with the typed name: the folder the item was in. Refused, with the text
+ * the row shows, for an empty name, the name that is taken (`taken`), or a name with a slash
+ * (the server would make the folders on the way).
  */
-export function restorePath(path: string, typed: string, taken: string): string | null {
+export function restoreTarget(path: string, typed: string, taken: string): { path: string } | { refuse: string } {
   const name = typed.trim();
-  if (name === "" || name === taken) return null;
+  if (name === "" || name === taken) return { refuse: "Type another name." };
+  if (name.includes("/")) return { refuse: OWN_FOLDER };
   const folder = parentOf(path);
-  return folder === "" ? name : `${folder}/${name}`;
+  return { path: folder === "" ? name : `${folder}/${name}` };
+}
+
+/**
+ * Whether the bin asks for its next page: as a folder list does, and not after a page that
+ * failed (a first page without rows would ask again at once, without a wait).
+ */
+export function binNeedsNext(bin: Bin, end: number, count: number): boolean {
+  return bin.error === null && needsNextPage({ end, count, next: bin.next, busy: bin.busy });
 }

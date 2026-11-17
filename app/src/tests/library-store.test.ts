@@ -700,11 +700,27 @@ describe("the recycle bin", () => {
       text: "There is already B.note here.",
       name: "b.note",
       path: "NOTE/Note/b.note",
+      draft: "b.note",
+      focused: false,
     });
 
-    // The same name or no name is no answer: it keeps asking.
+    // The field takes the focus once; the typed name is kept (it survives scrolling).
+    store.restoreFocused(B.key);
+    store.restoreDraft(B.key, "b 3");
+    expect(library.restores[B.key]).toMatchObject({ focused: true, draft: "b 3" });
+
+    // The same name or no name is no answer: it keeps asking and says so.
     await answerRestore(B.key, "b.note");
+    expect(library.restores[B.key]).toMatchObject({ state: "asking", text: "Type another name." });
     await answerRestore(B.key, "  ");
+    // A name with a slash would leave the folder.
+    await answerRestore(B.key, "sub/b.note");
+    expect(library.restores[B.key]).toMatchObject({
+      state: "asking",
+      text: "Restore keeps the item in its folder. Type a name without /.",
+      draft: "b 3",
+      focused: true,
+    });
     expect(calls.filter((c) => c.command === "library_restore")).toHaveLength(2);
 
     // A name that is not allowed asks again with the new text.
@@ -714,7 +730,7 @@ describe("the recycle bin", () => {
     );
     await answerRestore(B.key, ".b.note");
     expect(calls.at(-1)).toEqual({ command: "library_restore", args: { key: B.key, path: "NOTE/Note/.b.note" } });
-    expect(library.restores[B.key]).toMatchObject({ job: 8, state: "asking", text: "This name cannot be used." });
+    expect(library.restores[B.key]).toMatchObject({ job: 8, state: "asking", text: "This name cannot be used.", focused: true });
 
     // Another name goes on with the same job.
     const going = answerLater("library_restore");

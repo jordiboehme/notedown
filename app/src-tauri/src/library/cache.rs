@@ -61,7 +61,9 @@ pub struct TreePage {
 pub struct EventPage {
     pub events: Vec<Event>,
     pub next: u64,
-    /// The highest `seq` of the journal as far as the server can tell.
+    /// The highest `seq` of the journal as far as the server can tell. An older server that
+    /// sends no `end` reads as 0: the bin-only follower then starts at `seq` 1 and reads the
+    /// whole journal once (correct, only slower; its old deletes send one more `recycle`).
     #[serde(default)]
     pub end: u64,
     #[serde(default)]

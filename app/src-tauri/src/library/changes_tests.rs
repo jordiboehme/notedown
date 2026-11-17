@@ -195,11 +195,13 @@ fn names_are_sent_in_nfc() {
         json!({"id": 5, "to": format!("{parent}/N\u{e9}e.note")})
     );
 
+    // An item of that folder, restored under a new name in it.
+    let key = format!("1763290000000/{parent}/b.note");
     s.library
-        .restore(KEY, Some(&format!("{parent}/b 2 e\u{301}.note")));
+        .restore(&key, Some(&format!("{parent}/b 2 e\u{301}.note")));
     assert_eq!(
         json_body(&request(&s).2),
-        json!({"key": KEY, "path": format!("{parent}/b 2 \u{e9}.note")})
+        json!({"key": key, "path": format!("{parent}/b 2 \u{e9}.note")})
     );
 }
 
@@ -428,6 +430,20 @@ fn restore_into_a_taken_path_asks_for_a_name() {
             ..asked.clone()
         }
     );
+    assert!(s.server.received().is_empty());
+
+    // A path in another folder: the item stays in its folder, the job asks again, nothing is
+    // sent (the server would make the missing folders).
+    for path in ["NOTE/Note/sub/b.note", "NOTE/b.note", "b.note"] {
+        let again = s.library.restore(KEY, Some(path));
+        assert_eq!(
+            again,
+            Job {
+                text: Some("Restore keeps the item in its folder. Type a name without /.".into()),
+                ..asked.clone()
+            }
+        );
+    }
     assert!(s.server.received().is_empty());
 
     // A name that is taken too: the job asks again for it.

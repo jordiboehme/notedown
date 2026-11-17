@@ -3,7 +3,7 @@
   import type { RecycleItem } from "../lib/library-types";
   import type { Restore } from "../lib/library.svelte";
   import VirtualRows from "./VirtualRows.svelte";
-  import { binView, emptyQuestion, type Bin, type RecycleRow } from "./recycle";
+  import { binView, type Bin, type RecycleRow } from "./recycle";
   import { needsNextPage, type Range } from "./view";
 
   // The recycle bin: Empty in its toolbar (asked in the window first), and a row per item with
@@ -13,25 +13,34 @@
     bin,
     rows,
     restores,
+    question,
+    emptying,
     onMore,
     onRestore,
     onAnswer,
     onCancel,
+    onAskEmpty,
+    onDropEmpty,
     onEmpty,
   }: {
     bin: Bin;
     rows: RecycleRow[];
     restores: Record<string, Restore>;
+    /** The question before Empty while it is asked; null when not. */
+    question: string | null;
+    /** An Empty runs. */
+    emptying: boolean;
     onMore: () => void;
     onRestore: (item: RecycleItem) => void;
     onAnswer: (key: string, typed: string | null) => void;
     onCancel: (key: string) => void;
+    onAskEmpty: () => void;
+    onDropEmpty: () => void;
     onEmpty: () => void;
   } = $props();
 
   const ROW = 28;
   const view = $derived(binView(bin));
-  let confirming = $state(false);
 
   function seen(range: Range) {
     if (needsNextPage({ end: range.end, count: rows.length, next: bin.next, busy: bin.busy })) onMore();
@@ -41,16 +50,6 @@
   $effect(() => {
     if (bin.loaded && rows.length === 0 && needsNextPage({ end: 0, count: 0, next: bin.next, busy: bin.busy })) untrack(onMore);
   });
-
-  // Nothing to empty any more: the question goes.
-  $effect(() => {
-    if (!view.canEmpty) confirming = false;
-  });
-
-  function empty() {
-    confirming = false;
-    onEmpty();
-  }
 
   /** The new name is typed in place, the name before the extension selected. */
   function start(field: HTMLInputElement) {
@@ -76,12 +75,12 @@
 <h1 class="title">Recycle bin</h1>
 
 <div class="actions" role="toolbar" aria-label="Recycle bin actions">
-  {#if confirming}
-    <span class="question" role="alert">{emptyQuestion(bin)}</span>
-    <button type="button" class="button danger" onclick={empty}>Empty</button>
-    <button type="button" class="button" onclick={() => (confirming = false)}>Cancel</button>
+  {#if question !== null}
+    <span class="question" role="alert">{question}</span>
+    <button type="button" class="button danger" onclick={onEmpty}>Empty</button>
+    <button type="button" class="button" onclick={onDropEmpty}>Cancel</button>
   {:else}
-    <button type="button" class="button" disabled={!view.canEmpty} onclick={() => (confirming = true)}>Empty Recycle Bin</button>
+    <button type="button" class="button" disabled={!view.canEmpty || emptying} onclick={onAskEmpty}>Empty Recycle Bin</button>
   {/if}
 </div>
 

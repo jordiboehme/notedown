@@ -26,7 +26,8 @@ const store = await import("../lib/library.svelte");
 const { library, applyEvent, startLibrary, listFolder, listNext, isBusy, showListings, resetLibrary, loadView, chooseView } = store;
 const { setDropTarget, answerUpload, jobAction, moveEntry, renameEntry, newFolder, deleteEntry, downloadEntry, clearJobs, retryJobs } = store;
 const { moveRow, renameRow, makeFolder, deleteRow } = store;
-const { listBin, listBinNext, restoreItem, answerRestore, cancelRestore, emptyBin } = store;
+const { listBin, listBinNext, restoreItem, answerRestore, cancelRestore, emptyBin, askEmpty, dropEmpty, confirmEmpty } = store;
+const { emptyConfirm } = await import("../library/recycle");
 const { followChange, jobRows } = await import("../library/actions");
 
 /** The next call of `command` answers what `answer` gives; it waits until `release` is called. */
@@ -768,5 +769,45 @@ describe("the recycle bin", () => {
     answerNow("library_recycle", page([B], null));
     await emptyBin();
     expect(calls.at(-1)).toEqual({ command: "library_recycle", args: { cursor: null } });
+  });
+});
+
+describe("Empty with the confirm", () => {
+  it("asks in the window first; only Empty empties", async () => {
+    answerNow("library_recycle", page([B, C], null));
+    await listBin();
+    expect(emptyConfirm(library.bin, library.emptyAsked)).toBeNull();
+
+    // Asking sends nothing; Cancel closes the question and sends nothing.
+    askEmpty();
+    expect(emptyConfirm(library.bin, library.emptyAsked)).toBe("Delete 2 items for good? This cannot be undone.");
+    dropEmpty();
+    expect(emptyConfirm(library.bin, library.emptyAsked)).toBeNull();
+    await confirmEmpty();
+    expect(calls.filter((c) => c.command === "library_empty")).toHaveLength(0);
+
+    // Empty runs once and closes the question; the button waits while it runs.
+    askEmpty();
+    const running = answerLater("library_empty");
+    const emptied = confirmEmpty();
+    expect(library.emptyAsked).toBe(false);
+    expect(library.emptying).toBe(true);
+    await confirmEmpty();
+    running.release(changeJob(15, "done", { label: "Empty the recycle bin" }));
+    await emptied;
+    expect(library.emptying).toBe(false);
+    expect(calls.filter((c) => c.command === "library_empty")).toHaveLength(1);
+  });
+
+  it("closes the question when the bin turns empty", async () => {
+    answerNow("library_recycle", page([B], null));
+    await listBin();
+    askEmpty();
+    answerNow("library_recycle", page([], null));
+    await listBin();
+    expect(emptyConfirm(library.bin, library.emptyAsked)).toBeNull();
+    // Nothing to empty: asking does nothing.
+    askEmpty();
+    expect(library.emptyAsked).toBe(false);
   });
 });

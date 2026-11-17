@@ -77,6 +77,11 @@ export function emptyQuestion(bin: Pick<Bin, "items" | "next">): string {
   return `Delete ${what} for good? This cannot be undone.`;
 }
 
+/** The question before Empty while it is asked and the bin has something to empty; else null. */
+export function emptyConfirm(bin: Bin, asked: boolean): string | null {
+  return asked && binView(bin).canEmpty ? emptyQuestion(bin) : null;
+}
+
 /**
  * The path a restore goes to with the typed name: the folder the item was in. Null for an
  * empty name or the name that is taken (`taken`).

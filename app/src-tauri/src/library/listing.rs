@@ -330,7 +330,7 @@ impl Library {
             return;
         }
         // A `recycle` is sent at most once a step.
-        let mut announce = false;
+        let mut sent = false;
         loop {
             if session.is_cancelled() {
                 return;
@@ -340,7 +340,12 @@ impl Library {
                 Some(seq) => seq + 1,
                 None => match self.bin_from(&session) {
                     Ok(Some((from, fresh))) => {
-                        announce |= fresh;
+                        // The bin may have changed since the window listed it: said at once,
+                        // so a read that fails next does not lose it.
+                        if fresh && !sent {
+                            (self.inner.emit)(LibraryEvent::Recycle);
+                            sent = true;
+                        }
                         from
                     }
                     Ok(None) => {
@@ -356,9 +361,9 @@ impl Library {
             };
             self.polled(now);
             lock(&self.inner.follow).bin_from = Some(page.next);
-            let fresh = std::mem::take(&mut announce);
-            if self.bin_changed(&page) || fresh {
+            if self.bin_changed(&page) && !sent {
                 (self.inner.emit)(LibraryEvent::Recycle);
+                sent = true;
             }
             if folder_seq.is_none() {
                 // Only the bin is followed: nothing to apply.
@@ -424,8 +429,7 @@ impl Library {
 
     /// Where the follower reads on from while no folder is listed: `None` when the bin is not
     /// shown either (the place is then forgotten). Without a place yet, the end of the journal
-    /// is read first (`fresh`: the bin may have changed since the window listed it). `Err` when
-    /// that read fails.
+    /// is read first (`fresh`). `Err` when that read fails.
     fn bin_from(&self, session: &Session) -> Result<Option<(u64, bool)>, ()> {
         {
             let mut follow = lock(&self.inner.follow);

@@ -13,7 +13,7 @@ import {
   type UploadArgs,
 } from "../library/actions";
 import { listingKey, type LibraryView } from "../library/view";
-import { mergeBin, restorePath, type Bin } from "../library/recycle";
+import { binView, mergeBin, restorePath, type Bin } from "../library/recycle";
 import {
   LIBRARY_EVENT,
   type FolderState,
@@ -63,6 +63,10 @@ type Store = {
   bin: Bin;
   /** The restores that run or ask for another name, by the key of their item. */
   restores: Record<string, Restore>;
+  /** Empty was pressed: the window asks before it empties. */
+  emptyAsked: boolean;
+  /** An Empty runs. */
+  emptying: boolean;
 };
 
 /**
@@ -94,6 +98,8 @@ export const library = $state<Store>({
   dropTotals: {},
   bin: noBin(),
   restores: {},
+  emptyAsked: false,
+  emptying: false,
 });
 
 /**
@@ -138,6 +144,8 @@ export function resetLibrary() {
   library.dropTotals = {};
   library.bin = noBin();
   library.restores = {};
+  library.emptyAsked = false;
+  library.emptying = false;
   binEpoch += 1;
   counted.clear();
   dropTarget = null;
@@ -177,6 +185,7 @@ export function applyEvent(event: LibraryEvent) {
       library.asks = [];
       // The bin is listed again; Rust ends the restores that ask (their job events follow).
       library.bin = noBin();
+      library.emptyAsked = false;
       binEpoch += 1;
       lastShown = null;
       shownKeys = null;
@@ -470,6 +479,8 @@ export async function listBin(): Promise<void> {
     const answer = await invoke<RecyclePage>("library_recycle", { cursor: null });
     if (epoch !== binEpoch) return;
     library.bin = { items: mergeBin([], answer.items), next: answer.next, loaded: true, busy: false, error: null };
+    // Nothing left to empty: the question goes.
+    if (!binView(library.bin).canEmpty) library.emptyAsked = false;
   } catch (error) {
     if (epoch !== binEpoch) return;
     library.bin = { ...library.bin, loaded: true, busy: false, error: String(error) };
@@ -551,8 +562,30 @@ export async function cancelRestore(key: string): Promise<void> {
 
 /** Empty: removes every item of the bin for good. A done Empty sends `recycle`. */
 export async function emptyBin(): Promise<void> {
-  const job = await change("library_empty", {});
-  if (job?.state !== "done") await listBin();
+  library.emptying = true;
+  try {
+    const job = await change("library_empty", {});
+    if (job?.state !== "done") await listBin();
+  } finally {
+    library.emptying = false;
+  }
+}
+
+/** The Empty Recycle Bin button: the window asks first (nothing to empty: nothing to ask). */
+export function askEmpty() {
+  if (binView(library.bin).canEmpty && !library.emptying) library.emptyAsked = true;
+}
+
+/** Cancel of the question before Empty. */
+export function dropEmpty() {
+  library.emptyAsked = false;
+}
+
+/** Empty in the question: empties once. */
+export async function confirmEmpty(): Promise<void> {
+  if (!library.emptyAsked) return;
+  library.emptyAsked = false;
+  await emptyBin();
 }
 
 /** Reads the saved start view; the window starts in it. Stays in the tree when it cannot be read. */

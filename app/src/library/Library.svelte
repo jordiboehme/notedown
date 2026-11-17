@@ -10,8 +10,10 @@
     chooseView,
     clearJobs,
     deleteRow,
+    askEmpty,
+    confirmEmpty,
     downloadEntry,
-    emptyBin,
+    dropEmpty,
     entryOf,
     isBusy,
     jobAction,
@@ -56,7 +58,7 @@
     type Sort,
   } from "./view";
   import { entryActions, folderAt, followChange, jobRows, type Change } from "./actions";
-  import { recycleRows } from "./recycle";
+  import { emptyConfirm, recycleRows } from "./recycle";
   import { drag, folderUnder, letGo, moveTo, stopDrag } from "./drag.svelte";
   import "../lib/system.css";
   import "./library.css";
@@ -272,11 +274,15 @@
           bin={library.bin}
           rows={binRows}
           restores={library.restores}
+          question={emptyConfirm(library.bin, library.emptyAsked)}
+          emptying={library.emptying}
           onMore={() => void listBinNext()}
           onRestore={(item) => void restoreItem(item)}
           onAnswer={(key, typed) => void answerRestore(key, typed)}
           onCancel={(key) => void cancelRestore(key)}
-          onEmpty={() => void emptyBin()}
+          onAskEmpty={askEmpty}
+          onDropEmpty={dropEmpty}
+          onEmpty={() => void confirmEmpty()}
         />
       {:else}
         {@const path = selection.path}

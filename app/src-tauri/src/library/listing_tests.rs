@@ -1276,3 +1276,22 @@ fn a_new_binding_forgets_that_the_bin_is_shown() {
     s.follow();
     assert_eq!(s.targets(), ["/events?from=0&limit=1", "/events?from=41"]);
 }
+
+#[test]
+fn the_bin_hears_of_the_head_read_even_when_the_next_read_fails() {
+    let s = setup(vec![head(40), unreachable(), events(&[], 41)]);
+    s.library.set_bin_shown(true);
+    s.events.0.lock().unwrap().clear();
+    s.follow();
+    assert_eq!(recycles(&s), 1);
+    s.follow();
+    assert_eq!(recycles(&s), 0);
+    assert_eq!(
+        s.targets(),
+        [
+            "/events?from=0&limit=1",
+            "/events?from=41",
+            "/events?from=41"
+        ]
+    );
+}

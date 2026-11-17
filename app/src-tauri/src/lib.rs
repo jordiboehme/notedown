@@ -425,8 +425,13 @@ pub fn check_update_from_menu(app: &AppHandle) {
 /// Downloads and installs the update found last, then restarts into it. A download or install
 /// that fails leaves everything running and says why.
 pub async fn install_update_and_restart(app: AppHandle) -> Result<(), String> {
-    let Some((_, found)) = app.state::<AppUpdates>().start_install() else {
-        return Err("there is no update to install".to_owned());
+    let updates = app.state::<AppUpdates>();
+    let Some((_, found)) = updates.start_install() else {
+        return Err(if updates.is_installing() {
+            "the update is being installed already".to_owned()
+        } else {
+            "there is no update to install".to_owned()
+        });
     };
     if let Err(why) = found.download_and_install(|_, _| {}, || {}).await {
         let reason = why.to_string();

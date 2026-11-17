@@ -252,3 +252,25 @@ fn the_state_reaches_the_webview_in_its_names() {
         serde_json::json!({ "kind": "upToDate" })
     );
 }
+
+#[test]
+fn a_second_install_while_one_runs_gets_nothing() {
+    let (updates, told) = updates();
+    updates.check_now(|| found("0.2.0")).unwrap();
+    assert!(updates.start_install().is_some());
+    let before = told.lock().unwrap().len();
+    // A double click on Install: no second download over the same bundle.
+    assert_eq!(updates.start_install(), None);
+    assert!(updates.is_installing());
+    assert_eq!(
+        updates.state(),
+        UpdateState::Installing {
+            version: "0.2.0".into()
+        }
+    );
+    assert_eq!(told.lock().unwrap().len(), before);
+    // After a failed install the next try may start.
+    updates.install_failed("x");
+    assert!(!updates.is_installing());
+    assert!(updates.start_install().is_some());
+}

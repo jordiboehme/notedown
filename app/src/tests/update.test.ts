@@ -66,7 +66,7 @@ describe("the update on the About page", () => {
     const body = page(found);
     expect(body).toContain("Notedown 0.2.0 is ready. Install it now? Notedown starts again after the update.");
     expect(body).toContain("Faster sync.");
-    expect(body).toContain("Install");
+    expect(body).toContain(">Install<");
     expect(body).toContain("Check for Updates");
   });
 

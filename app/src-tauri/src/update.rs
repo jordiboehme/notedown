@@ -174,10 +174,20 @@ impl<P: Clone> Updates<P> {
         result
     }
 
-    /// The found update for the install, now Installing. `None` when nothing was found.
+    /// An install runs (between [`start_install`](Self::start_install) and the restart or
+    /// [`install_failed`](Self::install_failed)).
+    pub fn is_installing(&self) -> bool {
+        matches!(self.lock().state, UpdateState::Installing { .. })
+    }
+
+    /// The found update for the install, now Installing. `None` when nothing was found, and
+    /// while an install runs: a second click never downloads over the same bundle.
     pub fn start_install(&self) -> Option<(UpdateInfo, P)> {
         let mut taken = None;
         self.tell(|inner| {
+            if matches!(inner.state, UpdateState::Installing { .. }) {
+                return None;
+            }
             let (info, handle) = inner.found.clone()?;
             inner.state = UpdateState::Installing {
                 version: info.version.clone(),

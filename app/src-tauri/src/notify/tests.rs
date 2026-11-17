@@ -870,3 +870,42 @@ fn a_withheld_sync_without_a_number_makes_the_sum_unknown() {
         assert_eq!(rig.bodies(), [SYNC_UNKNOWN]);
     }
 }
+
+#[test]
+fn a_late_withheld_sum_is_dropped_before_a_new_notice() {
+    // A new sync comes first, long after the gap with 3 withheld files ended.
+    let mut rig = Rig::seen();
+    let first = rig.now;
+    rig.synced(rig.now, Some(12));
+    assert_eq!(rig.bodies(), ["12 files changed."]);
+    rig.later(MIN);
+    rig.synced(rig.now, Some(3));
+    assert!(rig.run().is_empty());
+    rig.now = first + GAP_MS + STALE_MS + 1;
+    rig.synced(rig.now, Some(5));
+    assert_eq!(rig.bodies(), ["5 files changed."]);
+
+    // A late sum without a number does not hide the number of the new sync.
+    let mut rig = Rig::seen();
+    let first = rig.now;
+    rig.synced(rig.now, Some(12));
+    rig.run();
+    rig.later(MIN);
+    rig.synced(rig.now, None);
+    rig.run();
+    rig.now = first + GAP_MS + STALE_MS + 1;
+    rig.synced(rig.now, Some(5));
+    assert_eq!(rig.bodies(), ["5 files changed."]);
+
+    // The same for the OCR.
+    let mut rig = Rig::seen();
+    let first = rig.now;
+    rig.pass(3, 40);
+    assert_eq!(rig.bodies(), ["3 notes are ready."]);
+    rig.later(MIN);
+    rig.pass(2, 42);
+    assert!(rig.run().is_empty());
+    rig.now = first + GAP_MS + STALE_MS + 1;
+    rig.pass(1, 43);
+    assert_eq!(rig.bodies(), ["1 note is ready."]);
+}

@@ -206,10 +206,21 @@ fn gap_ended(sum: &mut u64, last_notice_ms: Option<u64>, on: bool, now_ms: u64) 
     if *sum == 0 || in_gap(last_notice_ms, now_ms) {
         return None;
     }
-    let late =
-        last_notice_ms.is_none_or(|at| now_ms > at.saturating_add(GAP_MS).saturating_add(STALE_MS));
     let shown = std::mem::take(sum);
-    (on && !late).then_some(shown)
+    (on && !late(last_notice_ms, now_ms)).then_some(shown)
+}
+
+/// The gap of `last_notice_ms` ended more than [`STALE_MS`] ago: a sum withheld in it is an
+/// old event (the app was not running, or the Mac slept).
+fn late(last_notice_ms: Option<u64>, now_ms: u64) -> bool {
+    last_notice_ms.is_none_or(|at| now_ms > at.saturating_add(GAP_MS).saturating_add(STALE_MS))
+}
+
+/// Drops a withheld `sum` whose gap ended long ago, before a new count is added to it.
+fn drop_late(sum: &mut u64, last_notice_ms: Option<u64>, now_ms: u64) {
+    if *sum > 0 && late(last_notice_ms, now_ms) {
+        *sum = 0;
+    }
 }
 
 fn sync_gap_end(next: &mut KeyRecord, on: bool, now_ms: u64) -> Option<Notice> {
@@ -282,6 +293,7 @@ fn sync(next: &mut KeyRecord, input: &NotifyInput, on: bool, now_ms: u64) -> Opt
     if stale(count.at_ms, now_ms) {
         return None;
     }
+    drop_late(&mut next.unshown_files, next.sync_last_notice_ms, now_ms);
     let files = add_files(next.unshown_files, count.files);
     if in_gap(next.sync_last_notice_ms, now_ms) {
         next.unshown_files = files;
@@ -332,6 +344,7 @@ fn ocr(next: &mut KeyRecord, input: &NotifyInput, on: bool, now_ms: u64) -> Opti
     if o.last_run_ms.is_some_and(|at| stale(at, now_ms)) {
         return None;
     }
+    drop_late(&mut next.unshown_notes, next.ocr_last_notice_ms, now_ms);
     if in_gap(next.ocr_last_notice_ms, now_ms) {
         next.unshown_notes = next.unshown_notes.saturating_add(count);
         return None;

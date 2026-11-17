@@ -3417,3 +3417,30 @@ fn cloud_account_list_uses_the_default_folder() {
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("jordi@example.org"));
 }
+
+#[test]
+fn cloud_account_list_prefers_data_over_the_environment() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let out = cloud(
+        b.path(),
+        &[
+            "add",
+            "jordi",
+            "--email",
+            "b@example.org",
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(out.status.success());
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .env("NOTEDOWN_DATA", a.path())
+        .args(["cloud", "account", "--data"])
+        .arg(b.path())
+        .arg("list")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("b@example.org"));
+}

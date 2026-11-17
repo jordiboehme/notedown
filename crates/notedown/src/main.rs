@@ -184,7 +184,7 @@ struct McpArgs {
 
 #[derive(clap::Args)]
 struct ServeArgs {
-    /// The data folder (server.toml, accounts, logs) (default: $NOTEDOWN_DATA, else ~/notedown-data)
+    /// The data folder (server.toml, accounts, logs); default: $NOTEDOWN_DATA, else ~/notedown-data
     #[arg(long, value_name = "DIR")]
     data: Option<PathBuf>,
     /// Also write every request and frame, masked, to <data>/capture/ (this run only)
@@ -2611,7 +2611,7 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
 struct ConnectArgs {
     /// The server, for example http://pi.local:19072
     url: String,
-    /// The pipeline's own data folder (it gets pipeline.toml and tokens/) (default: $NOTEDOWN_DATA, else ~/notedown-data)
+    /// The pipeline's own data folder (it gets pipeline.toml and tokens/); default: $NOTEDOWN_DATA, else ~/notedown-data
     #[arg(long, value_name = "DIR")]
     data: Option<PathBuf>,
     /// The email of the account

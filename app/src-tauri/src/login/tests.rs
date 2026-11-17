@@ -990,6 +990,9 @@ fn assert_revoked(server: &Scripted, token: &str) {
     );
 }
 
+/// A loopback port below 1024: tests cannot listen there, so a connection is refused at once.
+const NOBODY_LISTENS: u16 = 1;
+
 /// What a server answers that revoked the token.
 fn revoked_answer() -> String {
     answer("200 OK", r#"{"revoked":true}"#)
@@ -1053,7 +1056,8 @@ fn log_out_revokes_the_token_on_the_server() {
 
 #[test]
 fn log_out_without_a_server_still_logs_out() {
-    let port = free_port();
+    // Below 1024: no test can listen there, so the connection is refused.
+    let port = NOBODY_LISTENS;
     let dir = tempfile::tempdir().unwrap();
     let (state, store) = kept_login(dir.path(), port);
 
@@ -1065,7 +1069,7 @@ fn log_out_without_a_server_still_logs_out() {
 }
 
 #[test]
-fn log_out_waits_for_a_silent_server_no_longer_than_the_bound() {
+fn log_out_does_not_wait_for_a_silent_server() {
     // The connection opens (the system accepts it), but nobody ever answers.
     let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = silent.local_addr().unwrap().port();
@@ -1075,8 +1079,29 @@ fn log_out_waits_for_a_silent_server_no_longer_than_the_bound() {
     let started = std::time::Instant::now();
     log_out_now(&state, &store, &ServeInfo::default());
 
-    assert!(started.elapsed() < LOGOUT_TIMEOUT + std::time::Duration::from_secs(1));
+    // The revoke runs on a thread of its own: the log out answers at once.
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
     assert_logged_out(dir.path(), &state, &store, port);
+}
+
+#[test]
+fn revoke_waits_for_a_silent_server_no_longer_than_the_bound() {
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!(
+        "http://127.0.0.1:{}/rest/v1",
+        silent.local_addr().unwrap().port()
+    );
+    let started = std::time::Instant::now();
+    assert_eq!(
+        revoke(&base, Token::new("tok-123")),
+        Err(RestError::Unreachable)
+    );
+    let took = started.elapsed();
+    assert!(took >= LOGOUT_TIMEOUT, "{took:?}");
+    assert!(
+        took < LOGOUT_TIMEOUT + std::time::Duration::from_secs(1),
+        "{took:?}"
+    );
     drop(silent);
 }
 

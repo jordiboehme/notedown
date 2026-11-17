@@ -262,11 +262,8 @@ fn local_state(dir: &std::path::Path) -> ConfigState {
 /// and never reaches a real server of this Mac.
 fn nobody_listens() -> crate::serve_info::ServeInfo {
     crate::serve_info::ServeInfo {
-        listen: vec![
-            format!("127.0.0.1:{}", crate::probe::test_server::free_port())
-                .parse()
-                .unwrap(),
-        ],
+        // Below 1024: no test listens there, so the connection is refused.
+        listen: vec!["127.0.0.1:1".parse().unwrap()],
         ..crate::serve_info::ServeInfo::default()
     }
 }

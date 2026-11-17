@@ -311,9 +311,9 @@ fn expand_home(dir: &Path) -> Result<PathBuf, String> {
 /// the e-mail. The answer is the config without them. It takes the login lock: a log out
 /// during a login waits for it and then removes the token it left, so none stays behind.
 /// The library binds again: its jobs end and it is logged out. Then the server the token
-/// belongs to (`serve_info` finds the app's own) is asked to revoke it, best effort and
-/// within [`login::LOGOUT_TIMEOUT`]: a server that is off or too old still leaves this Mac
-/// logged out.
+/// belongs to (`serve_info` finds the app's own) is asked to revoke it, best effort, on a
+/// thread of its own and within [`login::LOGOUT_TIMEOUT`]: the answer does not wait for it,
+/// and a server that is off or too old still leaves this Mac logged out.
 pub fn log_out_of(
     gate: &LoginGate,
     store: &dyn TokenStore,
@@ -336,7 +336,11 @@ pub fn log_out_of(
     // The token is gone also when the config was not saved. After the login lock, as after a
     // login: the binding reads the Keychain.
     library.relogin();
-    revoke_quietly(revoking);
+    // On a thread of its own: this Mac is logged out already, and a silent server must not
+    // hold the answer up. The call itself ends within the bound.
+    if revoking.is_some() {
+        std::thread::spawn(move || revoke_quietly(revoking));
+    }
     forgotten
 }
 
@@ -470,7 +474,9 @@ pub async fn set_mode_then(
 /// so no write token stays where Log out cannot reach it. It takes the login lock, so it never
 /// meets a running login half way. Answers the config it replaced and the new one. The library
 /// binds again when its server or its account changed. The old server (`serve_info` finds the
-/// app's own) is asked to revoke the token, best effort, as by Log out.
+/// app's own) is asked to revoke the token, best effort, as by Log out. Unlike Log out it
+/// waits for the revoke (at most [`login::LOGOUT_TIMEOUT`]): the restart that follows stops
+/// the app's own server, which must hear of it first.
 #[allow(clippy::too_many_arguments)]
 pub fn change_place(
     gate: &LoginGate,
@@ -679,8 +685,8 @@ pub async fn has_login(config: State<'_, ConfigState>) -> Result<bool, String> {
 }
 
 /// Log out: deletes the token from the Keychain, forgets the account, stops the library and
-/// asks the server to revoke the token, off the main thread (where it may wait for a running
-/// login and for the server), then polls again.
+/// asks the server to revoke the token (without waiting for it), off the main thread (where
+/// it may wait for a running login), then polls again.
 #[tauri::command]
 pub async fn log_out(
     config: State<'_, ConfigState>,
@@ -1700,11 +1706,8 @@ mod tests {
         let gate = LoginGate::default();
         // No server answers there: the revoke fails and the log out still happens.
         let serve_info = ServeInfo {
-            listen: vec![
-                format!("127.0.0.1:{}", crate::probe::test_server::free_port())
-                    .parse()
-                    .unwrap(),
-            ],
+            // Below 1024: no test listens there, so the connection is refused.
+            listen: vec!["127.0.0.1:1".parse().unwrap()],
             ..ServeInfo::default()
         };
         let after =

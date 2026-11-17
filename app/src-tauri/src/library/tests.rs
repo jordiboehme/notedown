@@ -350,6 +350,7 @@ fn a_login_binds_the_library() {
     let config = AppConfig {
         mode: Mode::Remote,
         server_url: Some(format!("http://127.0.0.1:{}", server.port)),
+        data_dir: dir.path().join("data"),
         ..AppConfig::default()
     };
     config::save(dir.path(), &config).unwrap();

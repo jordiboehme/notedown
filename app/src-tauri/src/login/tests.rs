@@ -50,6 +50,7 @@ fn remote_config(dir: &Path, port: u16, account: Option<&str>) -> ConfigState {
         mode: Mode::Remote,
         server_url: Some(server_url(port)),
         account: account.map(str::to_owned),
+        data_dir: dir.join("data"),
         ..AppConfig::default()
     };
     config::save(dir, &config).unwrap();
@@ -128,6 +129,7 @@ fn a_failed_save_removes_the_token() {
     let config = AppConfig {
         mode: Mode::Remote,
         server_url: Some(server_url(server.port)),
+        data_dir: dir.path().join("data"),
         ..AppConfig::default()
     };
     config::save(dir.path(), &config).unwrap();
@@ -597,6 +599,7 @@ fn a_failed_rollback_is_named() {
     let config = AppConfig {
         mode: Mode::Remote,
         server_url: Some(server_url(server.port)),
+        data_dir: dir.path().join("data"),
         ..AppConfig::default()
     };
     config::save(dir.path(), &config).unwrap();
@@ -883,6 +886,7 @@ fn a_failed_save_on_a_new_login_of_the_same_account_keeps_the_old_token() {
         mode: Mode::Remote,
         server_url: Some(server_url(server.port)),
         account: Some("jordi".into()),
+        data_dir: dir.path().join("data"),
         ..AppConfig::default()
     };
     config::save(dir.path(), &config).unwrap();

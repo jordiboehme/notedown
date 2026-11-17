@@ -85,8 +85,9 @@ export type Job = {
 };
 
 /**
- * A binding sends `state` and then `relist` (drop what is shown and list again); the answer of a
- * call sends `state` alone. `folder` carries a listing of the folder: the tree's (`foldersOnly`,
+ * A binding sends `state` and then `relist` (drop what is shown and list again; with `leave`
+ * the account changed and the window leaves the review); the answer of a call sends `state`
+ * alone. `folder` carries a listing of the folder: the tree's (`foldersOnly`,
  * only its child folders) or the list's; the window may show the same path in both. `next` is
  * the cursor of its next page (null once complete): a folder Rust listed again by itself after
  * a gap or a long pause pages on from it. `recycle` says the bin may have changed (the app's own delete,
@@ -99,7 +100,7 @@ export type LibraryEvent =
   | { type: "state"; state: LibraryState; text: string | null; page: string | null }
   | { type: "folder"; folder: FolderState; foldersOnly: boolean; next: string | null; revision: number }
   | { type: "job"; job: Job }
-  | { type: "relist" }
+  | { type: "relist"; leave: boolean }
   | { type: "recycle" }
   | { type: "drop"; dropId: number; position: { x: number; y: number }; count: number };
 

@@ -418,12 +418,12 @@ fn library_for(
     let (tx, rx) = mpsc::channel::<LibraryEvent>();
     std::thread::spawn(move || {
         for event in rx {
-            if event == LibraryEvent::Relist {
+            if let LibraryEvent::Relist { leave } = &event {
                 notes.wake();
-                // A new binding (a login, a log out, another server) leaves the review: the
+                // Another account (a login, a log out, another server) leaves the review: the
                 // window shows another place, and no render of the old one runs on. Looked up
                 // per event, so the review is not held here (it holds the library).
-                if let Some(review) = app.try_state::<review::Review>() {
+                if *leave && let Some(review) = app.try_state::<review::Review>() {
                     review.close_all();
                 }
             }

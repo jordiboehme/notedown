@@ -148,6 +148,23 @@ fn state_event(state: LibraryState) -> LibraryEvent {
     LibraryEvent::State(StateView::of(state))
 }
 
+/// The `relist` of a binding; `leave` when the account changed.
+fn relist(leave: bool) -> LibraryEvent {
+    LibraryEvent::Relist { leave }
+}
+
+/// The `leave` of each `relist` sent so far.
+fn leaves(events: &Events) -> Vec<bool> {
+    events
+        .all()
+        .into_iter()
+        .filter_map(|e| match e {
+            LibraryEvent::Relist { leave } => Some(leave),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn the_library_is_bound_to_base_account_and_token() {
     let server = Scripted::start(vec![ok(), ok()]);
@@ -161,7 +178,8 @@ fn the_library_is_bound_to_base_account_and_token() {
     // A binding says its state, then has the window list again.
     assert_eq!(
         events.all(),
-        vec![state_event(LibraryState::Ready), LibraryEvent::Relist]
+        // The first binding leaves no review: there was no account before it.
+        vec![state_event(LibraryState::Ready), relist(false)]
     );
     assert_eq!(store.gets(), 1);
     let first = library.session().unwrap();
@@ -185,7 +203,8 @@ fn the_library_is_bound_to_base_account_and_token() {
     library.relogin();
     assert_eq!(store.gets(), 2);
     assert!(first.is_cancelled());
-    assert_eq!(events.all().last(), Some(&LibraryEvent::Relist));
+    // The same account: the review stays.
+    assert_eq!(events.all().last(), Some(&relist(false)));
     assert_eq!(events.states(), [LibraryState::Ready, LibraryState::Ready]);
     get_account(&library).unwrap();
     assert_eq!(server.next().header("authorization"), Some("Bearer tok-2"));
@@ -201,7 +220,7 @@ fn the_library_is_bound_to_base_account_and_token() {
     );
     assert_eq!(
         events.all()[events.all().len() - 2..],
-        [state_event(LibraryState::LoggedOut), LibraryEvent::Relist]
+        [state_event(LibraryState::LoggedOut), relist(true)]
     );
 
     // Another base with the same key: the app's own server on a new port.
@@ -221,6 +240,8 @@ fn the_library_is_bound_to_base_account_and_token() {
     );
     assert_eq!(store.gets(), 2);
     assert_eq!(events.states(), [LibraryState::Ready, LibraryState::Ready]);
+    // The same key at a new address: the review stays.
+    assert_eq!(leaves(&events), [false, false]);
 }
 
 /// A config in Local mode with the account `jordi`, saved in `dir`.
@@ -271,9 +292,9 @@ fn log_out_stops_the_library() {
         events.all(),
         vec![
             state_event(LibraryState::Ready),
-            LibraryEvent::Relist,
+            relist(false),
             state_event(LibraryState::LoggedOut),
-            LibraryEvent::Relist,
+            relist(true),
         ]
     );
     assert_eq!(
@@ -327,6 +348,7 @@ fn a_new_place_rebinds_the_library() {
         events.states(),
         [LibraryState::Ready, LibraryState::LoggedOut]
     );
+    assert_eq!(leaves(&events), [false, true]);
 }
 
 fn code_answer() -> String {
@@ -375,6 +397,8 @@ fn a_login_binds_the_library() {
         events.states(),
         [LibraryState::LoggedOut, LibraryState::Ready]
     );
+    // A login gives the place an account: the review leaves.
+    assert_eq!(leaves(&events), [false, true]);
     server.next();
     server.next();
     get_account(&library).unwrap();
@@ -551,7 +575,7 @@ fn the_state_follows_the_answers() {
         events.all(),
         [
             state_event(LibraryState::Ready),
-            LibraryEvent::Relist,
+            relist(false),
             state_event(LibraryState::Unreachable),
             state_event(LibraryState::Ready),
             state_event(LibraryState::NotImported),
@@ -640,8 +664,8 @@ fn no_library_event_holds_the_token() {
             "result": null, "dropId": 4 } })
     );
     assert_eq!(
-        serde_json::to_value(LibraryEvent::Relist).unwrap(),
-        json!({ "type": "relist" })
+        serde_json::to_value(relist(true)).unwrap(),
+        json!({ "type": "relist", "leave": true })
     );
     assert_eq!(
         serde_json::to_value(LibraryEvent::Recycle).unwrap(),
@@ -656,13 +680,7 @@ fn no_library_event_holds_the_token() {
         serde_json::to_value(&dropped).unwrap(),
         json!({ "type": "drop", "dropId": 4, "position": { "x": 120, "y": 48 }, "count": 2 })
     );
-    all.extend([
-        folder,
-        job,
-        LibraryEvent::Relist,
-        LibraryEvent::Recycle,
-        dropped,
-    ]);
+    all.extend([folder, job, relist(true), LibraryEvent::Recycle, dropped]);
 
     let token = TOKEN;
     for event in &all {
@@ -736,6 +754,8 @@ fn a_keychain_that_cannot_be_read_says_so_and_is_tried_again() {
         events.states(),
         [LibraryState::LoggedOut, LibraryState::Ready]
     );
+    // A failed binding records no place: binding again after it leaves no review.
+    assert_eq!(leaves(&events), [false, false]);
     for event in events.all() {
         assert!(!serde_json::to_string(&event).unwrap().contains(TOKEN));
     }

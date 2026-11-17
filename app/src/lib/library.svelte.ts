@@ -221,7 +221,7 @@ export function applyEvent(event: LibraryEvent) {
       binEpoch += 1;
       lastShown = null;
       shownKeys = null;
-      leaveReview();
+      if (event.leave) leaveReview();
       break;
     case "recycle":
       library.recycle += 1;
@@ -234,9 +234,10 @@ export function applyEvent(event: LibraryEvent) {
 }
 
 /**
- * A new binding (a login, a log out, another server) leaves the review: the note may belong to
- * another account. It goes back to the folder it came from, else to New. Rust closes the
- * review itself.
+ * A new binding for another account (a login, a log out, another server: `relist` with
+ * `leave`) leaves the review: the note may belong to another account. It goes back to the
+ * folder it came from, else to New. Rust closes the review itself. The first binding and one
+ * for the same account at a new address keep it.
  */
 function leaveReview() {
   if (library.selection.kind !== "note") return;

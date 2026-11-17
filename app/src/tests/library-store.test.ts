@@ -118,7 +118,7 @@ describe("the library store", () => {
 
     // A new binding drops what is shown.
     const generation = library.generation;
-    applyEvent({ type: "relist" });
+    applyEvent({ type: "relist", leave: true });
     expect(library.listings).toEqual({});
     expect(library.next).toEqual({});
     expect(library.generation).toBe(generation + 1);
@@ -133,19 +133,27 @@ describe("the library store", () => {
     // Back is a folder: the review goes back to it.
     library.back = { kind: "folder", path: "INBOX" };
     library.selection = { kind: "note", path: "NOTE/Note/a.note" };
-    applyEvent({ type: "relist" });
+    applyEvent({ type: "relist", leave: true });
     expect(library.selection).toEqual({ kind: "folder", path: "INBOX" });
 
     // Back is not a folder: the review goes to New.
     library.back = { kind: "all" };
     library.selection = { kind: "note", path: "NOTE/Note/a.note" };
-    applyEvent({ type: "relist" });
+    applyEvent({ type: "relist", leave: true });
     expect(library.selection).toEqual({ kind: "new" });
 
     // No review: what is shown stays.
     library.selection = { kind: "bin" };
-    applyEvent({ type: "relist" });
+    applyEvent({ type: "relist", leave: true });
     expect(library.selection).toEqual({ kind: "bin" });
+
+    // A binding for the same account (the first one, or a new address) keeps the review.
+    library.back = { kind: "folder", path: "INBOX" };
+    library.selection = { kind: "note", path: "NOTE/Note/a.note" };
+    const generation = library.generation;
+    applyEvent({ type: "relist", leave: false });
+    expect(library.selection).toEqual({ kind: "note", path: "NOTE/Note/a.note" });
+    expect(library.generation).toBe(generation + 1);
 
     // A state event alone is no new binding: the review stays.
     library.selection = { kind: "note", path: "NOTE/Note/a.note" };
@@ -173,7 +181,7 @@ describe("the library store", () => {
     await listFolder("INBOX", false);
     expect(library.listings["list:INBOX"].entries.map((e) => e.name)).toEqual(["c"]);
     // A new binding starts over: Rust's revisions go on, the window forgets the old ones.
-    applyEvent({ type: "relist" });
+    applyEvent({ type: "relist", leave: true });
     applyEvent({ type: "folder", folder: folder("INBOX", ["d"], true), foldersOnly: false, next: null, revision: 9 });
     expect(library.listings["list:INBOX"].entries.map((e) => e.name)).toEqual(["d"]);
     // A listing the window stops showing forgets its revision: a lower one after it is taken
@@ -252,7 +260,7 @@ describe("the library store", () => {
   it("drops an answer that comes after a new binding", async () => {
     const late = answerLater("library_list");
     const going = listFolder("EXPORT", true);
-    applyEvent({ type: "relist" });
+    applyEvent({ type: "relist", leave: true });
     expect(isBusy("EXPORT", true)).toBe(false);
     late.release({ folder: folder("EXPORT", ["old"], true), next: null, revision: 0 } satisfies Listing);
     await going;
@@ -332,7 +340,7 @@ describe("the library store", () => {
     expect(library.next).toEqual({});
 
     // After a new binding Rust starts over: tell it again.
-    applyEvent({ type: "relist" });
+    applyEvent({ type: "relist", leave: true });
     showListings([{ path: "INBOX", foldersOnly: false }]);
     showListings([{ path: "INBOX", foldersOnly: false }]);
     expect(calls.filter((c) => c.command === "library_shown")).toHaveLength(4);
@@ -481,7 +489,7 @@ describe("drops", () => {
     applyEvent(drop(9));
     await flush();
     expect(library.asks).toHaveLength(1);
-    applyEvent({ type: "relist" });
+    applyEvent({ type: "relist", leave: true });
     expect(library.asks).toEqual([]);
     // Rust forgot the drop already: nothing is let go.
     expect(cancels()).toEqual([]);
@@ -730,7 +738,7 @@ describe("the recycle bin", () => {
     expect(library.bin).toMatchObject({ items: [C], error: "The server does not answer.", busy: false, loaded: true });
 
     // A new binding forgets the bin.
-    applyEvent({ type: "relist" });
+    applyEvent({ type: "relist", leave: true });
     expect(library.bin).toEqual({ items: [], next: null, loaded: false, busy: false, error: null });
   });
 

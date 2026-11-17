@@ -211,8 +211,10 @@ pub enum LibraryEvent {
     /// A job moved on.
     Job { job: Job },
     /// The library bound again (or must list again): the window drops what it shows and lists
-    /// its folders again.
-    Relist,
+    /// its folders again. `leave` says the account changed (a login, a log out, another
+    /// server): the window leaves the review and Rust closes it. The first binding, one after a
+    /// failed binding and one for the same account at a new address keep the review.
+    Relist { leave: bool },
     /// The recycle bin may have changed (the app's own delete, restore or Empty, a replace by
     /// an upload, or a `file.deleted` or `folder.deleted` the follower read): the window lists
     /// the bin again when it shows it, and ignores this otherwise.
@@ -427,18 +429,20 @@ impl Library {
         let key = token_key(&config);
         let place = Some((base.clone(), key.clone()));
         // Stop what the old binding does before the Keychain is read.
-        let (old, still_refused, generation) = {
+        let (old, still_refused, generation, leave) = {
             let mut bound = lock(&inner.bound);
             if !again && bound.place == place {
                 return;
             }
             let same_key = bound.place.as_ref().is_some_and(|(_, k)| *k == key);
+            // Only a binding that had a place, for another key: the account changed.
+            let leave = bound.place.is_some() && !same_key;
             let still_refused = !again && bound.refused && same_key;
             bound.cancelled.store(true, Ordering::SeqCst);
             bound.cancelled = Arc::new(AtomicBool::new(false));
             bound.generation += 1;
             bound.place = place;
-            (bound.rest.take(), still_refused, bound.generation)
+            (bound.rest.take(), still_refused, bound.generation, leave)
         };
         // The client goes outside the lock: its end waits for its thread.
         drop(old);
@@ -491,7 +495,7 @@ impl Library {
         bound.view = Some(view.clone());
         // Under the same guard: no settled state comes between the two.
         (inner.emit)(LibraryEvent::State(view));
-        (inner.emit)(LibraryEvent::Relist);
+        (inner.emit)(LibraryEvent::Relist { leave });
     }
 
     /// The client of the binding, for a call made outside the library.

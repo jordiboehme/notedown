@@ -229,7 +229,7 @@ Do step 1 of part 1 first (clone the repository and install rustup). Then build 
 cargo install --path crates/notedown --no-default-features
 ```
 
-This build has `serve`, `cloud` and `render`. It has no OCR, so there is no `pipeline`, `convert`, `model` or `mcp`, and `serve` has no `--pipeline`. The build needs a C compiler (on Debian and Raspberry Pi OS: `sudo apt install build-essential`). It does not need the C++ toolchain for llama.cpp that the OCR build needs. There are no release binaries yet.
+This build has `serve`, `cloud` and `render`. It has no OCR, so there is no `pipeline`, `convert`, `model` or `mcp`, and `serve` has no `--pipeline`. The build needs a C compiler (on Debian and Raspberry Pi OS: `sudo apt install build-essential`). It does not need the C++ toolchain for llama.cpp that the OCR build needs. There are no release binaries yet. Ready-made packages (a `.deb`, a plain archive and a container image) come with the first release, and docs/install.md will describe them.
 
 Set up the account, the import and the server as in part 2, with the installed `notedown`. Two things to know:
 

@@ -55,6 +55,8 @@ The device can sync with a "Private Cloud" instead of Ratta's cloud. Notedown ca
 
 Notes, documents and the other device folders sync. Digests and to-dos sync too (see "What to expect").
 
+The Mac app does these steps for you in Settings, Setup. It makes the account, backs up the device, imports the backup and checks the first sync. One rule holds in the app as well: never write on the Supernote between the backup and the first sync. Stop writing before you make the backup.
+
 Before you start:
 
 - The computer and the device must be on the same network.

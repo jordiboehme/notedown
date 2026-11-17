@@ -470,10 +470,12 @@ mod tests {
     #[test]
     fn a_stop_ends_the_thread_before_a_waiting_status_shows() {
         let rig = rig(synced());
-        rig.stop.stop();
+        // A status waits in the channel when the app quits: it makes no round.
         rig.tx.send(Msg::Status(Box::new(base_status()))).unwrap();
+        rig.stop.stop();
         rig.notifier.run(rig.rx);
         assert!(rig.deliver.shown().is_empty());
+        assert!(rig.records.saves.lock().unwrap().is_empty());
     }
 
     #[test]

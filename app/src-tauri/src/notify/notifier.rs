@@ -313,6 +313,7 @@ mod tests {
             last_count: Some(SyncCount {
                 at_ms: NOW - MIN,
                 files: Some(12),
+                counted_at_ms: None,
             }),
             sync_shown_at: Some(NOW - 60 * MIN),
             ocr_text_seq: Some(10),
@@ -572,6 +573,7 @@ mod tests {
             last_count: Some(SyncCount {
                 at_ms: NOW - MIN,
                 files: Some(3),
+                counted_at_ms: None,
             }),
             sync_shown_at: Some(NOW - MIN),
             ..synced()
@@ -616,6 +618,7 @@ mod tests {
                 k.last_count = Some(SyncCount {
                     at_ms: NOW,
                     files: Some(5),
+                    counted_at_ms: None,
                 });
             })
             .unwrap();
@@ -711,6 +714,7 @@ mod tests {
         rig.records.record.lock().unwrap().last_count = Some(SyncCount {
             at_ms: NOW,
             files: Some(2),
+            counted_at_ms: None,
         });
         rig.notifier.round(&base_status(), Some(KEY));
         assert_eq!(said.lock().unwrap().len(), 2);

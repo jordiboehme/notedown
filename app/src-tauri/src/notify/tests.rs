@@ -138,7 +138,11 @@ impl Rig {
     fn synced(&mut self, at_ms: u64, files: Option<u64>) {
         self.record.last_sync_ms = Some(at_ms);
         self.record.cursor = self.record.cursor.map(|c| c + 1);
-        self.record.last_count = Some(SyncCount { at_ms, files });
+        self.record.last_count = Some(SyncCount {
+            at_ms,
+            files,
+            counted_at_ms: None,
+        });
     }
 
     /// A pass of the pipeline ended now, with nothing left to do.
@@ -908,4 +912,28 @@ fn a_late_withheld_sum_is_dropped_before_a_new_notice() {
     rig.now = first + GAP_MS + STALE_MS + 1;
     rig.pass(1, 43);
     assert_eq!(rig.bodies(), ["1 note is ready."]);
+}
+
+#[test]
+fn the_old_event_test_of_a_sync_uses_this_macs_clock() {
+    // The server's clock is 40 minutes behind; the poller stored the count just now.
+    let mut rig = Rig::seen();
+    rig.synced(NOW - 40 * MIN, Some(4));
+    rig.record.last_count.as_mut().unwrap().counted_at_ms = Some(NOW);
+    assert_eq!(rig.bodies(), ["4 files changed."]);
+
+    // The server's clock is ahead; the count was stored 40 minutes ago (the app was not
+    // running since): an old event.
+    let mut rig = Rig::seen();
+    rig.later(45 * MIN);
+    rig.synced(rig.now + 60 * MIN, Some(4));
+    rig.record.last_count.as_mut().unwrap().counted_at_ms = Some(rig.now - 40 * MIN);
+    assert!(rig.run().is_empty());
+
+    // Without the time (an older notify.json, or a sync seen first after a start), the
+    // server's lastSyncMs counts as before: a sync of 3 hours ago is old.
+    let mut rig = Rig::seen();
+    rig.later(4 * 60 * MIN);
+    rig.synced(rig.now - 3 * 60 * MIN, Some(4));
+    assert!(rig.run().is_empty());
 }

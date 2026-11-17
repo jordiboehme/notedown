@@ -35,6 +35,8 @@ export interface SyncCount {
   /** The lastSyncMs of the sync (the server's clock). */
   atMs: number;
   files: number | null;
+  /** When the app stored the count (this Mac's clock); missing when it cannot tell. */
+  countedAtMs?: number;
 }
 
 export interface LastError {

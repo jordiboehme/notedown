@@ -290,7 +290,8 @@ fn sync(next: &mut KeyRecord, input: &NotifyInput, on: bool, now_ms: u64) -> Opt
         next.unshown_files = 0;
         return None;
     }
-    if stale(count.at_ms, now_ms) {
+    // This Mac's clock when the poller can vouch for it; the server's clock otherwise.
+    if stale(count.counted_at_ms.unwrap_or(count.at_ms), now_ms) {
         return None;
     }
     drop_late(&mut next.unshown_files, next.sync_last_notice_ms, now_ms);

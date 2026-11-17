@@ -691,6 +691,7 @@ fn the_files_changed_show_only_for_the_shown_sync() {
                 sync_count: Some(SyncCount {
                     at_ms,
                     files: Some(12),
+                    counted_at_ms: None,
                 }),
                 ..local()
             },
@@ -702,7 +703,8 @@ fn the_files_changed_show_only_for_the_shown_sync() {
         shown.device.files_changed,
         Some(SyncCount {
             at_ms: 1_763_290_900_000,
-            files: Some(12)
+            files: Some(12),
+            counted_at_ms: None
         })
     );
     // A count of an older sync is not this one's.
@@ -713,6 +715,7 @@ fn the_files_changed_show_only_for_the_shown_sync() {
     parts.sync_count = Some(SyncCount {
         at_ms: 1_763_290_900_000,
         files: None,
+        counted_at_ms: None,
     });
     parts.account = unreachable(NOW - MIN, true);
     assert_eq!(status_from(&parts, NOW).device.files_changed, None);

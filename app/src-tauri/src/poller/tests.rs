@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::Instant;
 
 use super::*;
+use crate::notify::STALE_MS;
 use crate::notify::store::{KeyRecord, SyncCount};
 use crate::probe::test_server::{TestServer, accept_within, free_port, http};
 use crate::status::Attention;
@@ -1259,6 +1260,7 @@ fn a_new_sync_is_counted_before_its_status_goes_out() {
     let count = SyncCount {
         at_ms: S + SEC,
         files: Some(3),
+        counted_at_ms: None,
     };
     assert_eq!(
         rig.record(),
@@ -1277,6 +1279,7 @@ fn a_new_sync_is_counted_before_its_status_goes_out() {
         Some(SyncCount {
             at_ms: S + 2 * SEC,
             files: Some(0),
+            counted_at_ms: Some(T0 + 60 * SEC)
         })
     );
 }
@@ -1301,6 +1304,7 @@ fn a_baseline_before_any_sync_counts_the_first_one() {
             Some(SyncCount {
                 at_ms: S,
                 files: Some(2),
+                counted_at_ms: Some(T0 + 60 * SEC)
             })
         )
     );
@@ -1329,6 +1333,7 @@ fn a_device_that_syncs_holds_the_count() {
         Some(SyncCount {
             at_ms: S + 2 * SEC,
             files: Some(1),
+            counted_at_ms: Some(T0 + 60 * SEC)
         })
     );
 }
@@ -1375,6 +1380,7 @@ fn a_failed_count_is_tried_again_once_a_minute() {
     let count = SyncCount {
         at_ms: S + SEC,
         files: Some(12),
+        counted_at_ms: None,
     };
     assert_eq!(
         rig.record(),
@@ -1402,6 +1408,7 @@ fn five_minutes_of_failures_store_no_number_once() {
     let count = SyncCount {
         at_ms: S + SEC,
         files: None,
+        counted_at_ms: None,
     };
     assert_eq!(
         rig.record(),
@@ -1440,6 +1447,7 @@ fn a_sync_without_a_cursor_has_no_number() {
             Some(SyncCount {
                 at_ms: S + SEC,
                 files: None,
+                counted_at_ms: None
             })
         )
     );
@@ -1487,6 +1495,7 @@ fn the_import_mark_is_the_baseline() {
             Some(SyncCount {
                 at_ms: S + SEC,
                 files: Some(7),
+                counted_at_ms: Some(T0 + 120 * SEC)
             })
         )
     );
@@ -1627,6 +1636,7 @@ fn a_give_up_takes_the_journal_end_as_the_cursor() {
     let count = SyncCount {
         at_ms: S + SEC,
         files: None,
+        counted_at_ms: None,
     };
     assert_eq!(
         rig.record(),
@@ -1679,6 +1689,7 @@ fn a_new_sync_starts_its_own_five_minutes() {
         Some(SyncCount {
             at_ms: S + 2 * SEC,
             files: None,
+            counted_at_ms: Some(T0 + 540 * SEC)
         })
     );
     assert_eq!(rig.record().count_failing_since, None);
@@ -1698,4 +1709,32 @@ fn a_journal_end_without_a_count_ends_the_failure() {
     rig.poll();
     assert_eq!(rig.record().cursor, Some(50));
     assert_eq!(rig.record().count_failing_since, None);
+}
+
+#[test]
+fn a_count_carries_this_macs_clock_only_after_a_recent_poll() {
+    let rig = Rig::me();
+    rig.set_record(|r| *r = poller_fields(Some(S), Some(40), None));
+    let counted_at = |rig: &Rig| rig.record().last_count.and_then(|c| c.counted_at_ms);
+    // The first poll of the run sees a new sync: it may be hours old, no time of this Mac.
+    rig.changes(changed(Some(3), 45));
+    rig.answer(synced(Some(S + SEC)));
+    rig.poll();
+    assert_eq!(rig.record().last_count.map(|c| c.files), Some(Some(3)));
+    assert_eq!(counted_at(&rig), None);
+    // A sync between two polls a minute apart: the count carries the time it was stored.
+    rig.changes(changed(Some(2), 47));
+    rig.answer(synced(Some(S + 2 * SEC)));
+    rig.advance(60 * SEC);
+    let now = rig.now.load(Ordering::SeqCst);
+    rig.poll();
+    assert_eq!(rig.record().last_count.map(|c| c.files), Some(Some(2)));
+    assert_eq!(counted_at(&rig), Some(now));
+    // After a long pause (the Mac slept) the sync may be old again.
+    rig.changes(changed(Some(1), 48));
+    rig.answer(synced(Some(S + 3 * SEC)));
+    rig.advance(STALE_MS + SEC);
+    rig.poll();
+    assert_eq!(rig.record().last_count.map(|c| c.files), Some(Some(1)));
+    assert_eq!(counted_at(&rig), None);
 }

@@ -68,6 +68,12 @@ pub struct SyncCount {
     /// The `lastSyncMs` of the sync (the server's clock).
     pub at_ms: u64,
     pub files: Option<u64>,
+    /// When the poller stored the count (this Mac's clock), for the old-event test of the
+    /// notice. `None` when the poller cannot tell the sync is recent (its first poll of the
+    /// login in this run, or after a long pause such as a sleep), and in an older notify.json:
+    /// the test then takes `at_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counted_at_ms: Option<u64>,
 }
 
 /// What the notifier knows of one consumer.

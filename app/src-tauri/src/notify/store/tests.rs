@@ -14,6 +14,7 @@ fn full() -> NotifyRecord {
         last_count: Some(SyncCount {
             at_ms: 1_763_290_900_000,
             files: Some(12),
+            counted_at_ms: None,
         }),
         count_failing_since: Some(1_763_291_000_000),
         sync_shown_at: Some(1_763_290_000_000),

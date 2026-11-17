@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::config::{self, AppConfig, ExistingSetup, Mode, SyncCheck, SyncMark};
+use crate::notify::STALE_MS;
 use crate::notify::store::{KeyRecord, NotifyStore, SyncCount};
 use crate::process::{self, SpawnFn};
 use crate::processes::ProcessStates;
@@ -181,6 +182,20 @@ struct State {
     /// The `lastSyncMs` whose count fails since `count_failing_since`. Another sync (or none
     /// known, after a start) starts its own [`COUNT_GIVE_UP_MS`].
     failing_sync: Option<u64>,
+    /// What the last `/account` answer in this run said of the device syncs.
+    sync_seen: Option<SyncSeen>,
+}
+
+/// The newest device sync of one `/account` answer, for `SyncCount::counted_at_ms`.
+struct SyncSeen {
+    /// The token key of the login.
+    key: String,
+    newest: Option<u64>,
+    /// When the answer came (this Mac's clock).
+    polled_ms: u64,
+    /// The newest sync came up since an answer at most [`STALE_MS`] before it: the sync is
+    /// recent on this Mac's clock.
+    recent: bool,
 }
 
 /// The least time between two failed calls for the mark of a server on another machine, and
@@ -597,6 +612,26 @@ impl Inner {
         }
     }
 
+    /// Keeps the newest device sync of this `/account` answer. True when that sync is recent on
+    /// this Mac's clock: it came up since an answer of the same login at most [`STALE_MS`]
+    /// before. The first answer of a run, or one after a long pause (a sleep), cannot tell:
+    /// the sync may be hours old.
+    fn see_syncs(&self, key: &str, newest: Option<u64>, now: u64) -> bool {
+        let mut state = lock(&self.state);
+        let recent = match state.sync_seen.as_ref().filter(|seen| seen.key == key) {
+            Some(seen) if seen.newest == newest => seen.recent,
+            Some(seen) => now <= seen.polled_ms.saturating_add(STALE_MS),
+            None => false,
+        };
+        state.sync_seen = Some(SyncSeen {
+            key: key.to_owned(),
+            newest,
+            polled_ms: now,
+            recent,
+        });
+        recent
+    }
+
     /// Counts the files of a new device sync into notify.json (design note 3 of plan E). Runs
     /// with notifications off too: the Supernote page shows the count.
     ///
@@ -624,6 +659,9 @@ impl Inner {
                 eprintln!("notedown: {what} was not saved: {e}");
             }
         };
+        let now = (self.clock)();
+        let newest = info.devices.iter().filter_map(|d| d.last_sync_ms).max();
+        let recent = self.see_syncs(&key, newest, now);
         // The import mark: the first sync after it is checked first, then counted from it.
         if let Some(mark) = config.setup.sync_mark.as_ref().filter(|m| m.key == key)
             && config.setup.sync_checked.is_none()
@@ -637,14 +675,13 @@ impl Inner {
         if info.devices.iter().any(|d| d.syncing) {
             return;
         }
-        let newest = info.devices.iter().filter_map(|d| d.last_sync_ms).max();
         let record = notify.read().keys.get(&key).cloned().unwrap_or_default();
         let first_sight = record.last_sync_ms.is_none() && record.cursor.is_none();
         let rose = newest.is_some_and(|n| record.last_sync_ms.is_none_or(|last| n > last));
         if !first_sight && !rose {
             return;
         }
-        let now = (self.clock)();
+        let counted_at_ms = recent.then_some(now);
         let tried = lock(&self.state).count_failed_ms;
         if tried.is_some_and(|at| now < at.saturating_add(MARK_RETRY_MS)) {
             return;
@@ -663,7 +700,11 @@ impl Inner {
                         r.cursor = Some(end);
                         r.count_failing_since = None;
                         if !first_sight && let Some(at_ms) = newest {
-                            r.last_count = Some(SyncCount { at_ms, files: None });
+                            r.last_count = Some(SyncCount {
+                                at_ms,
+                                files: None,
+                                counted_at_ms,
+                            });
                         }
                     });
                 }
@@ -683,6 +724,7 @@ impl Inner {
                             r.last_count = Some(SyncCount {
                                 at_ms,
                                 files: changes.files,
+                                counted_at_ms,
                             });
                             r.count_failing_since = None;
                         });
@@ -712,7 +754,11 @@ impl Inner {
                                 if let Some(end) = end {
                                     r.cursor = Some(end);
                                 }
-                                r.last_count = Some(SyncCount { at_ms, files: None });
+                                r.last_count = Some(SyncCount {
+                                    at_ms,
+                                    files: None,
+                                    counted_at_ms,
+                                });
                                 r.count_failing_since = None;
                             } else {
                                 r.count_failing_since = Some(since);

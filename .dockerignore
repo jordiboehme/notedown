@@ -1,0 +1,4 @@
+# The image is built from files the release's images job stages in dist/
+# (see the Dockerfile). Nothing else of the checkout goes to the builder.
+*
+!dist/

@@ -1792,6 +1792,10 @@ jobs:
       # the only release of it. The tag already at this commit is a re-run;
       # at another commit it is an error and is never moved. The lookup
       # prints nothing for a missing tag and fails on a lookup error.
+      # Each API call is retried. A second tag object from a retried first
+      # call stays unused. A retried ref call can find the ref that an
+      # earlier try made (422 "Reference already exists"): it counts when
+      # the tag points at this commit.
       - name: Create the tag at the tested commit
         if: ${{ needs.notes.outputs.called == 'true' && needs.notes.outputs.publish == 'true' }}
         env:
@@ -1810,18 +1814,34 @@ jobs:
             echo "release: $RELEASE_TAG already points at $GITHUB_SHA"
             exit 0
           fi
-          object="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags" \
-            -f tag="$RELEASE_TAG" -f message="$RELEASE_TAG" -f object="$GITHUB_SHA" -f type=commit \
-            --jq .sha)"
-          gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
-            -f ref="refs/tags/$RELEASE_TAG" -f sha="$object" >/dev/null
+          made="$RUNNER_TEMP/tag-object.txt"
+          # shellcheck disable=SC2016
+          bash scripts/ci/retry.sh 3 bash -c \
+            'gh api "repos/$GITHUB_REPOSITORY/git/tags" -f tag="$1" -f message="$1" \
+              -f object="$GITHUB_SHA" -f type=commit --jq .sha >"$2"' _ "$RELEASE_TAG" "$made"
+          object="$(cat "$made")"
+          [ -n "$object" ] || { echo "::error::the API gave no tag object for $RELEASE_TAG"; exit 1; }
+          # shellcheck disable=SC2016
+          bash scripts/ci/retry.sh 3 bash -c '
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$1" -f sha="$2" >/dev/null && exit 0
+            at="$(bash scripts/release-check.sh tag-commit "$1")" || exit 1
+            if [ "$at" = "$GITHUB_SHA" ]; then
+              echo "the ref refs/tags/$1 is there from an earlier try"
+              exit 0
+            fi
+            exit 1' _ "$RELEASE_TAG" "$object"
           echo "release: tagged $GITHUB_SHA as $RELEASE_TAG"
 
       # The body is release-notes/<tag>.md (the notes job checked it), the
       # title the plain tag; the motto heading leads the page itself.
-      # gh uploads the assets to a draft and publishes it at the end, so a
-      # failed upload leaves a draft: a re-run deletes it and starts again.
-      # A published release of this tag is never touched.
+      # gh uploads the assets to a draft and publishes it at the end. On a
+      # failed upload or publish gh deletes its own draft; a draft is left
+      # only when the job is killed or that delete fails. A re-run deletes
+      # such a draft and starts again.
+      # A published release of this tag is never touched. It counts as done
+      # when its asset names are exactly the files in release/: the job
+      # ended after GitHub published it (a timeout, a lost runner), and the
+      # re-run goes on so images and homebrew can run. Other names fail.
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1838,10 +1858,25 @@ jobs:
             none) ;;
             draft)
               echo "::warning::deleting the draft release of $RELEASE_TAG that an earlier try left"
-              gh release delete "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --yes
+              # A retried delete can find the draft gone after a try that
+              # landed: done when no release of the tag is left.
+              # shellcheck disable=SC2016
+              bash scripts/ci/retry.sh 3 bash -c '
+                gh release delete "$1" --repo "$GITHUB_REPOSITORY" --yes && exit 0
+                gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName >"$2" || exit 1
+                jq -e --arg t "$1" "map(select(.tagName == \$t)) | length == 0" "$2" >/dev/null' \
+                _ "$RELEASE_TAG" "$RUNNER_TEMP/after-delete.json"
               ;;
             *)
-              echo "::error::the release $RELEASE_TAG is already published"
+              names="$RUNNER_TEMP/published-assets.txt"
+              bash scripts/ci/retry.sh 3 bash -c \
+                'gh release view "$1" --repo "$GITHUB_REPOSITORY" --json assets --jq ".assets[].name" >"$2"' \
+                _ "$RELEASE_TAG" "$names"
+              if diff -u <(LC_ALL=C sort "$names") <(find release -mindepth 1 -maxdepth 1 -printf '%P\n' | LC_ALL=C sort); then
+                echo "release: $RELEASE_TAG is already published with every asset, nothing to do"
+                exit 0
+              fi
+              echo "::error::the release $RELEASE_TAG is already published with other assets (- published, + release/); fix it by hand"
               exit 1
               ;;
           esac
@@ -1854,7 +1889,9 @@ jobs:
   # The images ghcr.io/jordiboehme/notedown:<version> and :latest for
   # linux/amd64 and linux/arm64, after the release exists: an image of a
   # release that failed to publish would be a half release. A re-run pushes
-  # the same tags again.
+  # the same tags again. It also moves `latest` to this version: re-run an
+  # older release's images only before a newer release ships, or move
+  # `latest` back by hand afterwards.
   images:
     name: images
     needs: [notes, collect, publish]
@@ -1941,9 +1978,14 @@ jobs:
       # comes from the git ref, which in a call is refs/heads/main and gives
       # no version tag. latest=false keeps the default latest=auto from
       # adding a second `latest`; only the raw tag below moves it.
+      # The annotations go on the index too: for a multi-arch image
+      # ghcr.io shows the description from the index annotations, not from
+      # the image labels.
       - name: Image metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
         with:
           images: ghcr.io/jordiboehme/notedown
           flavor: |
@@ -1971,6 +2013,7 @@ jobs:
           [ "$got" = "$want" ] || { echo "::error::the image tags are '$got', expected '$want'"; exit 1; }
 
       # context: . so buildx sees dist/ (the default git context does not).
+      # .dockerignore keeps everything but dist/ out of the context.
       - name: Build and push
         id: push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -1984,6 +2027,7 @@ jobs:
           provenance: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
 
       # Provenance for the pushed image index, stored in the registry beside
       # it. Verify with
@@ -2074,6 +2118,8 @@ jobs:
       # Another push to the tap can land first: a rejected push rebases onto
       # the tap's newer commit and tries again, five times at most. What is
       # written does not change.
+      # A late re-run of an older release finds a newer version in the tap
+      # and stops with a notice instead of writing the old one back.
       - name: Push the files to the tap
         env:
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
@@ -2096,6 +2142,21 @@ jobs:
           git config credential.helper "$helper"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # The formula names its version in the url, the cask in `version`.
+          # Compared without a pre-release suffix, which sort -V would rank
+          # above its own release; only a higher x.y.z counts as newer.
+          for f in Formula/notedown.rb Casks/notedown-app.rb; do
+            [ -f "$f" ] || continue
+            have="$(sed -nE -e 's|.*/releases/download/v([0-9][^/]*)/.*|\1|p' -e 's|^[[:space:]]*version "([^"]+)".*|\1|p' "$f" | head -n 1)"
+            [ -n "$have" ] || continue
+            have_base="${have%%-*}"
+            new_base="${NAME_VER%%-*}"
+            if [ "$have_base" != "$new_base" ] \
+              && [ "$(printf '%s\n%s\n' "$have_base" "$new_base" | sort -V | tail -n 1)" = "$have_base" ]; then
+              echo "::notice::$f in the tap has $have, newer than $NAME_VER; the tap stays as it is"
+              exit 0
+            fi
+          done
           mkdir -p Formula Casks
           cp "$RUNNER_TEMP/homebrew/Formula/notedown.rb" Formula/notedown.rb
           cp "$RUNNER_TEMP/homebrew/Casks/notedown-app.rb" Casks/notedown-app.rb

@@ -4,7 +4,8 @@
 //! the config, the import state and the store, counts the notes the OCR made only when
 //! [`wants_ocr_count`] says so, runs [`decide`], saves the notifier's fields, and only then
 //! shows the notices. A failed save shows nothing: the notices come again with a later status
-//! instead of twice. When [`next_wake`] names a time, [`decide`] runs again then with the last
+//! instead of twice. It is logged once until a save works again, and the next wake waits at
+//! least [`SAVE_RETRY_MS`]. When [`next_wake`] names a time, [`decide`] runs again then with the last
 //! status, also when no new status came. Each status carries the token key of its login; a
 //! status for another login than the config's makes no round.
 
@@ -24,6 +25,10 @@ use crate::token::token_key;
 /// The shortest wait for a wake time. A wake that `decide` cannot settle yet (an agent waits
 /// for its quiet poll while the status has no pipeline facts) runs again at most this often.
 pub const WAKE_FLOOR: Duration = Duration::from_secs(5);
+
+/// After a failed save the next wake is at least this far away (60 s), so a disk that stays
+/// full does not make a round (and maybe a scan of the notes) every [`WAKE_FLOOR`].
+pub const SAVE_RETRY_MS: u64 = 60_000;
 
 /// What goes into the notifier's channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,7 +142,11 @@ pub struct Notifier {
     stopped: Arc<AtomicBool>,
     /// The denial was logged; said again only after it was allowed in between.
     denied_said: bool,
+    /// A failed save was logged; said again only after a save worked in between.
+    save_failed_said: bool,
     floor: Duration,
+    /// Writes a line to the log (stderr).
+    log: Box<dyn Fn(&str) + Send>,
 }
 
 impl Notifier {
@@ -159,7 +168,9 @@ impl Notifier {
             reads,
             stopped,
             denied_said: false,
+            save_failed_said: false,
             floor: WAKE_FLOOR,
+            log: Box::new(|line| eprintln!("{line}")),
         };
         (notifier, stop)
     }
@@ -233,16 +244,22 @@ impl Notifier {
         let now = (self.reads.now_ms)();
         let (notices, next) = decide(&record, &input, &config.notifications, now);
         if let Err(why) = self.records.save_notifier(&key, &next) {
-            eprintln!("notedown: notify.json was not saved, no notification shown: {why}");
-            return next_wake(&record);
+            if !self.save_failed_said {
+                (self.log)(&format!(
+                    "notedown: notify.json was not saved, no notification shown: {why}"
+                ));
+                self.save_failed_said = true;
+            }
+            return next_wake(&record).map(|at| at.max(now.saturating_add(SAVE_RETRY_MS)));
         }
+        self.save_failed_said = false;
         let wake = next_wake(&next);
         if notices.is_empty() || self.stopped() {
             return wake;
         }
         if self.deliver.authorization() == Authorization::Denied {
             if !self.denied_said {
-                eprintln!("notedown: notifications are turned off in System Settings");
+                (self.log)("notedown: notifications are turned off in System Settings");
                 self.denied_said = true;
             }
             return wake;
@@ -308,7 +325,7 @@ mod tests {
     /// A store in memory that records each save, with what was shown by then.
     struct FakeRecords {
         record: Mutex<KeyRecord>,
-        fail: bool,
+        fail: AtomicBool,
         deliver: Arc<FakeDeliver>,
         /// For each save: how many notices were shown before it.
         saves: Mutex<Vec<usize>>,
@@ -322,7 +339,7 @@ mod tests {
 
         fn save_notifier(&self, _key: &str, from: &KeyRecord) -> io::Result<()> {
             self.saves.lock().unwrap().push(self.deliver.shown().len());
-            if self.fail {
+            if self.fail.load(Ordering::SeqCst) {
                 return Err(io::Error::other("disk full"));
             }
             set_notifier_fields(&mut self.record.lock().unwrap(), from);
@@ -344,7 +361,7 @@ mod tests {
         let deliver = Arc::new(deliver);
         let records = Arc::new(FakeRecords {
             record: Mutex::new(record),
-            fail,
+            fail: AtomicBool::new(fail),
             deliver: deliver.clone(),
             saves: Mutex::new(Vec::new()),
         });
@@ -661,5 +678,41 @@ mod tests {
         assert_eq!(rig.notifier.round(&base_status(), None), None);
         assert!(rig.records.saves.lock().unwrap().is_empty());
         assert!(rig.deliver.shown().is_empty());
+    }
+
+    #[test]
+    fn a_failing_save_is_logged_once_and_backs_off_the_wake() {
+        // An agent waits for its quiet poll since 10 minutes: the wake is already due.
+        let record = KeyRecord {
+            consumers: [(
+                "claude".to_owned(),
+                crate::notify::store::ConsumerRecord {
+                    seq: 1,
+                    pending_seq: Some(2),
+                    rose_at: Some(NOW - 10 * MIN),
+                },
+            )]
+            .into(),
+            ..synced()
+        };
+        let mut rig = rig_with(record, true, FakeDeliver::default(), config());
+        let said: Arc<Mutex<Vec<String>>> = Arc::default();
+        let keep = said.clone();
+        rig.notifier.log = Box::new(move |line| keep.lock().unwrap().push(line.to_owned()));
+        for _ in 0..3 {
+            let wake = rig.notifier.round(&base_status(), Some(KEY));
+            assert!(wake.is_some_and(|at| at >= NOW + SAVE_RETRY_MS), "{wake:?}");
+        }
+        assert_eq!(said.lock().unwrap().len(), 1);
+        // A save works, then fails again: said again.
+        rig.records.fail.store(false, Ordering::SeqCst);
+        rig.notifier.round(&base_status(), Some(KEY));
+        rig.records.fail.store(true, Ordering::SeqCst);
+        rig.records.record.lock().unwrap().last_count = Some(SyncCount {
+            at_ms: NOW,
+            files: Some(2),
+        });
+        rig.notifier.round(&base_status(), Some(KEY));
+        assert_eq!(said.lock().unwrap().len(), 2);
     }
 }

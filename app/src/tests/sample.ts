@@ -20,6 +20,8 @@ export function sampleStatus(now: number): Status {
     ],
     attention: [],
     existing: { server: true, pipeline: true },
+    account: { imported: true, appDataImported: true },
+    connection: "reached",
   };
 }
 
@@ -34,5 +36,7 @@ export function notSetUp(): Status {
     agents: [],
     attention: [],
     existing: { server: false, pipeline: false },
+    account: null,
+    connection: "unknown",
   };
 }

@@ -694,13 +694,20 @@ fn a_log_out_during_a_login_leaves_no_token() {
     let leaving: Arc<Mutex<Option<LogOut>>> = Arc::default();
     let (hook_gate, hook_store, hook_slot, hook_leaving) =
         (gate.clone(), store.clone(), slot.clone(), leaving.clone());
-    let server = Scripted::start_with(vec![code_answer(), token_answer("jordi")], move |n, _| {
+    let answers = vec![code_answer(), token_answer("jordi"), revoked_answer()];
+    let server = Scripted::start_with(answers, move |n, _| {
         if n == 1 {
             // Log out is pressed while the login waits for its token.
             let (gate, store) = (hook_gate.clone(), hook_store.clone());
             let state = hook_slot.lock().unwrap().clone().unwrap();
             *hook_leaving.lock().unwrap() = Some(std::thread::spawn(move || {
-                crate::commands::log_out_of(&gate, &*store, &state, &crate::library::idle())
+                crate::commands::log_out_of(
+                    &gate,
+                    &*store,
+                    &state,
+                    &crate::library::idle(),
+                    &ServeInfo::default(),
+                )
             }));
         }
     });
@@ -728,6 +735,12 @@ fn a_log_out_during_a_login_leaves_no_token() {
     assert_eq!(after.email, None);
     assert_eq!(store.get(&key(server.port, "jordi")).unwrap(), None);
     assert_eq!(state.current().account, None);
+    // The token the login left is revoked on the server too.
+    server.next();
+    server.next();
+    let revoke = server.next();
+    assert_eq!(revoke.target, "/rest/v1/logout");
+    assert_eq!(revoke.header("authorization"), Some("Bearer tok-123"));
 }
 
 /// Logs in to a scripted server with `state`; the store keeps the token.
@@ -749,6 +762,7 @@ fn set_mode_now(
     mode: Mode,
     data_dir: Option<std::path::PathBuf>,
     server_url: Option<&str>,
+    serve_info: &ServeInfo,
 ) -> ConfigAnswer {
     tauri::async_runtime::block_on(set_mode_then(
         state,
@@ -759,13 +773,14 @@ fn set_mode_now(
         data_dir,
         server_url.map(str::to_owned),
         || {},
+        serve_info,
     ))
     .unwrap()
 }
 
 #[test]
 fn a_new_address_after_a_login_removes_its_token() {
-    let server = Scripted::start(vec![code_answer(), token_answer("jordi")]);
+    let server = Scripted::start(vec![code_answer(), token_answer("jordi"), revoked_answer()]);
     let dir = tempfile::tempdir().unwrap();
     let state = remote_config(dir.path(), server.port, None);
     let store = Arc::new(MemoryStore::new());
@@ -778,17 +793,19 @@ fn a_new_address_after_a_login_removes_its_token() {
         Mode::Remote,
         None,
         Some("http://other.example:19072"),
+        &ServeInfo::default(),
     );
     assert_eq!(answer.keychain, None);
     assert_eq!(answer.config.account, None);
     assert_eq!(answer.config.email, None);
     assert_eq!(store.get(&key(server.port, "jordi")).unwrap(), None);
     assert_eq!(state.current().account, None);
+    assert_revoked(&server, "tok-123");
 }
 
 #[test]
 fn a_new_local_folder_after_a_login_removes_its_token() {
-    let server = Scripted::start(vec![code_answer(), token_answer("jordi")]);
+    let server = Scripted::start(vec![code_answer(), token_answer("jordi"), revoked_answer()]);
     let dir = tempfile::tempdir().unwrap();
     let config = AppConfig {
         mode: Mode::Local,
@@ -811,10 +828,12 @@ fn a_new_local_folder_after_a_login_removes_its_token() {
         Mode::Local,
         Some(dir.path().join("other-data")),
         None,
+        &serve_info,
     );
     assert_eq!(answer.keychain, None);
     assert_eq!(answer.config.account, None);
     assert_eq!(store.get("local|jordi").unwrap(), None);
+    assert_revoked(&server, "tok-123");
     // The same place again keeps a login made after it.
     store.set("local|jordi", &Token::new("t")).unwrap();
     set_mode_now(
@@ -823,13 +842,14 @@ fn a_new_local_folder_after_a_login_removes_its_token() {
         Mode::Local,
         Some(dir.path().join("other-data")),
         None,
+        &serve_info,
     );
     assert!(store.get("local|jordi").unwrap().is_some());
 }
 
 #[test]
 fn a_token_that_set_mode_cannot_remove_is_named() {
-    let server = Scripted::start(vec![code_answer(), token_answer("jordi")]);
+    let server = Scripted::start(vec![code_answer(), token_answer("jordi"), revoked_answer()]);
     let dir = tempfile::tempdir().unwrap();
     let state = remote_config(dir.path(), server.port, None);
     let store = Arc::new(NoDelete(MemoryStore::new()));
@@ -840,6 +860,7 @@ fn a_token_that_set_mode_cannot_remove_is_named() {
         Mode::Remote,
         None,
         Some("http://other.example:19072"),
+        &ServeInfo::default(),
     );
     // The new place is kept; the answer names what stayed.
     assert_eq!(answer.config.account, None);
@@ -849,6 +870,8 @@ fn a_token_that_set_mode_cannot_remove_is_named() {
         "{text}"
     );
     assert!(!text.contains("tok-123"), "{text}");
+    // The token the Keychain kept is useless now: it is revoked all the same.
+    assert_revoked(&server, "tok-123");
 }
 
 #[test]
@@ -947,4 +970,222 @@ fn a_login_keeps_the_markdown_folder_of_the_pipeline() {
         Some(std::path::PathBuf::from("/notes/md"))
     );
     assert_eq!(config::load(dir.path()), saved.config);
+}
+
+#[test]
+fn the_password_shows_no_text_in_debug() {
+    assert_eq!(format!("{:?}", Password::new(PASSWORD)), "***");
+}
+
+/// The scripted server got the login (two calls), then the revoke of `token`.
+fn assert_revoked(server: &Scripted, token: &str) {
+    server.next();
+    server.next();
+    let revoke = server.next();
+    assert_eq!(revoke.method, "POST");
+    assert_eq!(revoke.target, "/rest/v1/logout");
+    assert_eq!(
+        revoke.header("authorization"),
+        Some(format!("Bearer {token}").as_str())
+    );
+}
+
+/// What a server answers that revoked the token.
+fn revoked_answer() -> String {
+    answer("200 OK", r#"{"revoked":true}"#)
+}
+
+/// A Remote config for `port` with the account `jordi` and its token `tok-123` in the store.
+fn kept_login(dir: &Path, port: u16) -> (ConfigState, MemoryStore) {
+    let config = AppConfig {
+        mode: Mode::Remote,
+        server_url: Some(server_url(port)),
+        account: Some("jordi".into()),
+        email: Some("me@example.org".into()),
+        data_dir: dir.join("data"),
+        ..AppConfig::default()
+    };
+    config::save(dir, &config).unwrap();
+    let state = ConfigState::load(dir.to_path_buf());
+    let store = MemoryStore::new();
+    store
+        .set(&key(port, "jordi"), &Token::new("tok-123"))
+        .unwrap();
+    (state, store)
+}
+
+/// Log out of `state` as the command does it.
+fn log_out_now(state: &ConfigState, store: &dyn TokenStore, serve_info: &ServeInfo) -> AppConfig {
+    crate::commands::log_out_of(
+        &LoginGate::default(),
+        store,
+        state,
+        &crate::library::idle(),
+        serve_info,
+    )
+    .unwrap()
+}
+
+/// The config, the Keychain and the file know no login of `jordi` at `port` anymore.
+fn assert_logged_out(dir: &Path, state: &ConfigState, store: &dyn TokenStore, port: u16) {
+    assert_eq!(store.get(&key(port, "jordi")).unwrap(), None);
+    assert_eq!(state.current().account, None);
+    assert_eq!(state.current().email, None);
+    assert_eq!(config::load(dir).account, None);
+}
+
+#[test]
+fn log_out_revokes_the_token_on_the_server() {
+    let server = Scripted::start(vec![revoked_answer()]);
+    let dir = tempfile::tempdir().unwrap();
+    let (state, store) = kept_login(dir.path(), server.port);
+
+    let after = log_out_now(&state, &store, &ServeInfo::default());
+
+    let request = server.next();
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.target, "/rest/v1/logout");
+    assert_eq!(request.header("authorization"), Some("Bearer tok-123"));
+    assert!(request.body.is_empty());
+    assert_eq!(after.account, None);
+    assert_logged_out(dir.path(), &state, &store, server.port);
+}
+
+#[test]
+fn log_out_without_a_server_still_logs_out() {
+    let port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let (state, store) = kept_login(dir.path(), port);
+
+    let started = std::time::Instant::now();
+    log_out_now(&state, &store, &ServeInfo::default());
+
+    assert!(started.elapsed() < LOGOUT_TIMEOUT + std::time::Duration::from_secs(1));
+    assert_logged_out(dir.path(), &state, &store, port);
+}
+
+#[test]
+fn log_out_waits_for_a_silent_server_no_longer_than_the_bound() {
+    // The connection opens (the system accepts it), but nobody ever answers.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = silent.local_addr().unwrap().port();
+    let dir = tempfile::tempdir().unwrap();
+    let (state, store) = kept_login(dir.path(), port);
+
+    let started = std::time::Instant::now();
+    log_out_now(&state, &store, &ServeInfo::default());
+
+    assert!(started.elapsed() < LOGOUT_TIMEOUT + std::time::Duration::from_secs(1));
+    assert_logged_out(dir.path(), &state, &store, port);
+    drop(silent);
+}
+
+#[test]
+fn log_out_on_an_older_server_still_logs_out() {
+    let server = Scripted::start(vec![answer("404 Not Found", r#"{"error":"no_route"}"#)]);
+    let dir = tempfile::tempdir().unwrap();
+    let (state, store) = kept_login(dir.path(), server.port);
+
+    log_out_now(&state, &store, &ServeInfo::default());
+
+    assert_eq!(server.next().target, "/rest/v1/logout");
+    assert_logged_out(dir.path(), &state, &store, server.port);
+}
+
+#[test]
+fn revoke_counts_a_token_that_is_gone_as_done() {
+    for (status, body) in [
+        ("200 OK", r#"{"revoked":true}"#),
+        ("401 Unauthorized", r#"{"error":"token_refused"}"#),
+        ("410 Gone", r#"{"error":"account_removed"}"#),
+    ] {
+        let server = Scripted::start(vec![answer(status, body)]);
+        assert_eq!(
+            revoke(&server.base(), Token::new("tok-123")),
+            Ok(()),
+            "{status}"
+        );
+    }
+    let older = Scripted::start(vec![answer("404 Not Found", r#"{"error":"no_route"}"#)]);
+    let error = revoke(&older.base(), Token::new("tok-123")).unwrap_err();
+    assert!(!error.to_string().contains("tok-123"), "{error}");
+    assert_eq!(
+        error,
+        RestError::Server {
+            status: 404,
+            code: Some("no_route".into())
+        }
+    );
+}
+
+#[test]
+fn a_new_server_revokes_the_old_token() {
+    // From one address to another: the old server hears of it.
+    let server = Scripted::start(vec![revoked_answer()]);
+    let dir = tempfile::tempdir().unwrap();
+    let (state, store) = kept_login(dir.path(), server.port);
+    let store = Arc::new(store);
+    let answer = set_mode_now(
+        &state,
+        store.clone(),
+        Mode::Remote,
+        None,
+        Some("http://other.example:19072"),
+        &ServeInfo::default(),
+    );
+    let request = server.next();
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.target, "/rest/v1/logout");
+    assert_eq!(request.header("authorization"), Some("Bearer tok-123"));
+    assert_eq!(answer.config.account, None);
+    assert_eq!(store.get(&key(server.port, "jordi")).unwrap(), None);
+
+    // From this Mac to another machine: the app's own server (from its start lines) hears of
+    // it before the restart stops it.
+    let heard = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_heard = heard.clone();
+    let server = Scripted::start_with(vec![revoked_answer()], move |_, _| {
+        hook_heard.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = AppConfig {
+        mode: Mode::Local,
+        account: Some("jordi".into()),
+        data_dir: dir.path().join("data"),
+        ..AppConfig::default()
+    };
+    config::save(dir.path(), &config).unwrap();
+    let state = ConfigState::load(dir.path().to_path_buf());
+    let store = Arc::new(MemoryStore::new());
+    store.set("local|jordi", &Token::new("tok-local")).unwrap();
+    let serve_info = ServeInfo {
+        listen: vec![format!("127.0.0.1:{}", server.port).parse().unwrap()],
+        ..ServeInfo::default()
+    };
+    let stopped_after: Arc<Mutex<Option<bool>>> = Arc::default();
+    let restart_saw = stopped_after.clone();
+    let answer = tauri::async_runtime::block_on(set_mode_then(
+        &state,
+        Arc::new(LoginGate::default()),
+        store.clone(),
+        crate::library::idle(),
+        Mode::Remote,
+        None,
+        Some("http://other.example:19072".to_owned()),
+        move || {
+            *restart_saw.lock().unwrap() = Some(heard.load(std::sync::atomic::Ordering::SeqCst));
+        },
+        &serve_info,
+    ))
+    .unwrap();
+    let request = server.next();
+    assert_eq!(request.target, "/rest/v1/logout");
+    assert_eq!(request.header("authorization"), Some("Bearer tok-local"));
+    assert_eq!(
+        *stopped_after.lock().unwrap(),
+        Some(true),
+        "the restart ran before the revoke"
+    );
+    assert_eq!(answer.config.account, None);
+    assert_eq!(store.get("local|jordi").unwrap(), None);
 }

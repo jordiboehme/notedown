@@ -29,6 +29,7 @@
     "allow-model-remove",
     "allow-markdown-dir",
     "allow-set-markdown-dir",
-    "allow-show-markdown-dir"
+    "allow-show-markdown-dir",
+    "allow-recheck"
   ]
 }

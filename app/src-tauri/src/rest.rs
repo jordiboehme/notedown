@@ -240,11 +240,32 @@ impl Rest {
         clock: Clock,
         sleeper: Sleeper,
     ) -> Result<Self, RestError> {
+        Self::build(base, token, JSON_TIMEOUT, clock, sleeper)
+    }
+
+    /// [`new`](Self::new) where a call may take `timeout` as a whole instead of
+    /// [`JSON_TIMEOUT`] (the log out, which must not hold the app up). The connection may take
+    /// no longer than that either.
+    pub fn with_timeout(
+        base: &str,
+        token: Option<Token>,
+        timeout: Duration,
+    ) -> Result<Self, RestError> {
+        Self::build(base, token, timeout, monotonic_clock(), real_sleeper())
+    }
+
+    fn build(
+        base: &str,
+        token: Option<Token>,
+        timeout: Duration,
+        clock: Clock,
+        sleeper: Sleeper,
+    ) -> Result<Self, RestError> {
         // No redirect is followed: a Notedown server never sends one, so the token never goes
         // to another address. The app's own server is on this Mac: no system proxy sees it.
         let mut builder = reqwest::blocking::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(JSON_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT.min(timeout))
+            .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none());
         if crate::poller::is_loopback(base) {
             builder = builder.no_proxy();

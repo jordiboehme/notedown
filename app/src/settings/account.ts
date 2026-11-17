@@ -19,10 +19,14 @@ export interface AccountState {
 
 export interface AccountActions {
   logIn: { enabled: boolean; note: string };
-  logOut: { enabled: boolean };
+  logOut: { enabled: boolean; note: string };
+  /** The value of the Write access row; null hides the row (no login). */
+  writeAccess: string | null;
 }
 
 export const NO_MODE = "Choose where the server runs first.";
+const LEAVES = "Deletes the login from this Mac and forgets the account. The notes stay where they are.";
+const OCR_STAYS = "Log out leaves the OCR connection to the other machine.";
 
 export function accountActions(state: AccountState): AccountActions {
   const ready = state.mode !== null && state.mode !== "notSet";
@@ -38,6 +42,12 @@ export function accountActions(state: AccountState): AccountActions {
   return {
     logIn: { enabled: state.busy === null && ready && filled, note },
     // An account in the config without a token can be logged out too: it forgets the account.
-    logOut: { enabled: state.busy === null && (state.loggedIn || state.account !== null) },
+    // The pipeline's own login on another machine (`connect`) is not the app's to end.
+    logOut: {
+      enabled: state.busy === null && (state.loggedIn || state.account !== null),
+      note: state.loggedIn && state.mode === "remote" ? `${LEAVES} ${OCR_STAYS}` : LEAVES,
+    },
+    // The app keeps only write tokens: a login refused write access is not kept.
+    writeAccess: state.loggedIn ? "Yes" : null,
   };
 }

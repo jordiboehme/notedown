@@ -258,6 +258,19 @@ fn local_state(dir: &std::path::Path) -> ConfigState {
     ConfigState::load(dir.to_path_buf())
 }
 
+/// The app's own server as listening where nobody does: a revoke on log out fails at once
+/// and never reaches a real server of this Mac.
+fn nobody_listens() -> crate::serve_info::ServeInfo {
+    crate::serve_info::ServeInfo {
+        listen: vec![
+            format!("127.0.0.1:{}", crate::probe::test_server::free_port())
+                .parse()
+                .unwrap(),
+        ],
+        ..crate::serve_info::ServeInfo::default()
+    }
+}
+
 /// The library of a [`ConfigState`], as the app makes it.
 fn library_of(state: &ConfigState, store: Arc<dyn TokenStore>) -> (Library, Events) {
     let reader = state.reader();
@@ -277,7 +290,14 @@ fn log_out_stops_the_library() {
     library.refresh();
     let session = library.session().unwrap();
 
-    log_out_of(&LoginGate::default(), &*store, &state, &library).unwrap();
+    log_out_of(
+        &LoginGate::default(),
+        &*store,
+        &state,
+        &library,
+        &nobody_listens(),
+    )
+    .unwrap();
 
     assert!(session.is_cancelled(), "the jobs of the login end");
     assert_eq!(
@@ -327,6 +347,7 @@ fn a_new_place_rebinds_the_library() {
         Mode::Local,
         Some(data),
         None,
+        &nobody_listens(),
     )
     .unwrap();
     assert!(!session.is_cancelled());
@@ -341,6 +362,7 @@ fn a_new_place_rebinds_the_library() {
         Mode::Remote,
         None,
         Some("http://127.0.0.1:41003".into()),
+        &nobody_listens(),
     )
     .unwrap();
     assert!(session.is_cancelled());

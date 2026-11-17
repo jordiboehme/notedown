@@ -8,7 +8,8 @@
   import Section from "../kit/Section.svelte";
 
   // Settings > Account: who is logged in where. Log in keeps a write token in the Keychain;
-  // Log out deletes the login of this Mac and forgets the account.
+  // Log out deletes the login of this Mac, forgets the account and revokes the token on the
+  // server.
   type Note = { text: string; tone: "secondary" | "good" | "bad" };
   let loginNote = $state<Note | null>(null);
   let logoutNote = $state<Note | null>(null);
@@ -80,9 +81,11 @@
     <Row title="Account"><span class="value">{current?.account ?? "None yet"}</span></Row>
     <Row title="E-mail"><span class="value">{current?.email ?? "None yet"}</span></Row>
     <Row title="Server"><span class="value">{server}</span></Row>
-    <Row title="Write access" note="The app may change files on the Supernote only with write access.">
-      <span class="value">Not known yet</span>
-    </Row>
+    {#if actions.writeAccess !== null}
+      <Row title="Write access" note="The app may change files on the Supernote only with write access.">
+        <span class="value">{actions.writeAccess}</span>
+      </Row>
+    {/if}
   </Section>
   <form onsubmit={enter}>
     <Section title="Log in">
@@ -100,7 +103,7 @@
   <Section>
     <Row
       title="Log out"
-      note={logoutNote?.text ?? "Deletes the login from this Mac and forgets the account. The notes stay where they are."}
+      note={logoutNote?.text ?? actions.logOut.note}
       tone={logoutNote?.tone ?? "secondary"}
     >
       <button type="button" class="button" disabled={!actions.logOut.enabled} onclick={leave}>Log out</button>

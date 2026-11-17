@@ -58,8 +58,11 @@ export const setAutostart = (on: boolean) => invoke<boolean>("set_autostart", { 
 export const logIn = (email: string, password: string) => invoke<ConfigAnswer>("log_in", { email, password });
 /** Whether the Keychain keeps a login for the account in the config. */
 export const hasLogin = () => invoke<boolean>("has_login");
-/** Deletes the login and forgets the account; answers the config without it. */
+/** Deletes the login, forgets the account and asks the server to revoke the token (best
+ * effort); answers the config without the account. */
 export const logOut = () => invoke<AppConfig>("log_out");
+/** Polls the server and the pipeline now; the new status comes as an event. */
+export const recheck = () => invoke<void>("recheck");
 export const modelState = () => invoke<ModelState>("model_state");
 export const modelPull = () => invoke("model_pull");
 export const modelPause = () => invoke<ModelState>("model_pause");

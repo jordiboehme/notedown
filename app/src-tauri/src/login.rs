@@ -3,6 +3,7 @@
 //! hash of the challenge, and no type that holds it or the token derives `Debug`.
 
 use std::fmt;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -17,13 +18,22 @@ use crate::token::{Token, TokenStore, token_key};
 pub const CLIENT_NAME: &str = "Notedown for Mac";
 /// What a login without a mode answers.
 pub const NO_MODE: &str = "Choose where the server runs first.";
+/// How long a log out waits for the server to revoke the token, in all.
+pub(crate) const LOGOUT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The password as the settings window sent it. It has no `Debug` and no `Display`.
+/// The password as the settings window sent it. Its `Debug` prints `***`; it has no
+/// `Display`.
 pub struct Password(String);
 
 impl Password {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+}
+
+impl fmt::Debug for Password {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("***")
     }
 }
 
@@ -148,6 +158,17 @@ struct LoginAnswer {
     token: String,
     slug: String,
     scope: String,
+}
+
+/// Asks the server at `base` to revoke `token` (`POST /logout`, no body): once, within
+/// [`LOGOUT_TIMEOUT`]. A token the server refuses (401) or whose account is gone (410) is
+/// revoked already. The error holds neither the token nor the address.
+pub(crate) fn revoke(base: &str, token: Token) -> Result<(), RestError> {
+    let rest = Rest::with_timeout(base, Some(token), LOGOUT_TIMEOUT)?;
+    match rest.post_empty_once::<serde::de::IgnoredAny>("/logout") {
+        Ok(_) | Err(RestError::TokenRefused | RestError::AccountRemoved) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// The sentence for a token of an old login that the Keychain did not let go.

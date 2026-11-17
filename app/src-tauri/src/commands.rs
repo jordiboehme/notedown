@@ -12,12 +12,12 @@ use crate::library::{Choice, Entry, Job, Key, Library, Listed, RecyclePage, Stat
 use crate::login::{self, LoginError, LoginGate, Password};
 use crate::model::{ModelControl, ModelState};
 use crate::notes::{NoteSummary, Notes};
-use crate::poller::Poller;
+use crate::poller::{Poller, rest_base};
 use crate::processes::{ProcessStates, Processes};
 use crate::review::{DataUrl, NoteView, Review};
 use crate::serve_info::ServeInfo;
 use crate::status::Status;
-use crate::token::{KeychainStore, TokenStore, token_key};
+use crate::token::{KeychainStore, Token, TokenStore, token_key};
 use crate::windows::{self, Opening, WindowKind};
 
 /// How the config is written to its folder: [`config::save`], or a slow one in tests.
@@ -310,24 +310,41 @@ fn expand_home(dir: &Path) -> Result<PathBuf, String> {
 /// Log out: deletes the token of the account in the config, then forgets the account and
 /// the e-mail. The answer is the config without them. It takes the login lock: a log out
 /// during a login waits for it and then removes the token it left, so none stays behind.
-/// The library binds again: its jobs end and it is logged out.
+/// The library binds again: its jobs end and it is logged out. Then the server the token
+/// belongs to (`serve_info` finds the app's own) is asked to revoke it, best effort and
+/// within [`login::LOGOUT_TIMEOUT`]: a server that is off or too old still leaves this Mac
+/// logged out.
 pub fn log_out_of(
     gate: &LoginGate,
     store: &dyn TokenStore,
     state: &ConfigState,
     library: &Library,
+    serve_info: &ServeInfo,
 ) -> Result<AppConfig, String> {
-    let forgotten = {
+    let (forgotten, revoking) = {
         let _no_login = gate.hold();
-        if let Some(key) = token_key(&state.current()) {
+        let before = state.current();
+        let mut revoking = None;
+        if let Some(key) = token_key(&before) {
+            // A token the Keychain cannot read is not revoked; the delete still runs.
+            let token = store.get(&key).ok().flatten();
             store.delete(&key).map_err(|e| e.to_string())?;
+            revoking = token.zip(rest_base(&before, serve_info));
         }
-        state.forget_login()
+        (state.forget_login(), revoking)
     };
     // The token is gone also when the config was not saved. After the login lock, as after a
     // login: the binding reads the Keychain.
     library.relogin();
+    revoke_quietly(revoking);
     forgotten
+}
+
+/// Revokes a token that this Mac let go of; the outcome is not shown and never logged.
+fn revoke_quietly(revoking: Option<(Token, String)>) {
+    if let Some((token, base)) = revoking {
+        let _ = login::revoke(&base, token);
+    }
 }
 
 /// Log in ([`login::log_in`]), then bind the library to the new login.
@@ -408,7 +425,8 @@ pub fn get_config(state: State<'_, ConfigState>) -> Result<AppConfig, String> {
 
 /// Saves the new place of the server off the calling thread ([`change_place`]); when the
 /// mode, the folder or the address changed, runs `restart` on a blocking thread of its own and
-/// waits for it. A refused change restarts nothing.
+/// waits for it. A refused change restarts nothing. `serve_info` is the app's own server as it
+/// runs now: the old place, whose token a new server revokes before the restart stops it.
 #[allow(clippy::too_many_arguments)]
 pub async fn set_mode_then(
     state: &ConfigState,
@@ -419,11 +437,20 @@ pub async fn set_mode_then(
     data_dir: Option<PathBuf>,
     server_url: Option<String>,
     restart: impl FnOnce() + Send + 'static,
+    serve_info: &ServeInfo,
 ) -> Result<ConfigAnswer, String> {
     let placing = state.clone();
+    let serve_info = serve_info.clone();
     let (before, answer) = tauri::async_runtime::spawn_blocking(move || {
         change_place(
-            &gate, &*store, &placing, &library, mode, data_dir, server_url,
+            &gate,
+            &*store,
+            &placing,
+            &library,
+            mode,
+            data_dir,
+            server_url,
+            &serve_info,
         )
     })
     .await
@@ -442,7 +469,9 @@ pub async fn set_mode_then(
 /// Saves the new place. When that forgets the account (another server), its token goes too,
 /// so no write token stays where Log out cannot reach it. It takes the login lock, so it never
 /// meets a running login half way. Answers the config it replaced and the new one. The library
-/// binds again when its server or its account changed.
+/// binds again when its server or its account changed. The old server (`serve_info` finds the
+/// app's own) is asked to revoke the token, best effort, as by Log out.
+#[allow(clippy::too_many_arguments)]
 pub fn change_place(
     gate: &LoginGate,
     store: &dyn TokenStore,
@@ -451,22 +480,28 @@ pub fn change_place(
     mode: Mode,
     data_dir: Option<PathBuf>,
     server_url: Option<String>,
+    serve_info: &ServeInfo,
 ) -> Result<(AppConfig, ConfigAnswer), String> {
-    let (replaced, config, keychain) = {
+    let (replaced, config, keychain, revoking) = {
         let _no_login = gate.hold();
         let (replaced, config) = state.set_mode_replacing(mode, data_dir, server_url)?;
         let mut keychain = None;
+        let mut revoking = None;
         if replaced.account.is_some()
             && config.account.is_none()
             && let Some(key) = token_key(&replaced)
-            && let Err(e) = store.delete(&key)
         {
-            keychain = Some(login::old_login_kept(&e.0));
+            let token = store.get(&key).ok().flatten();
+            revoking = token.zip(rest_base(&replaced, serve_info));
+            if let Err(e) = store.delete(&key) {
+                keychain = Some(login::old_login_kept(&e.0));
+            }
         }
-        (replaced, config, keychain)
+        (replaced, config, keychain, revoking)
     };
     // After the login lock, as after a login: the binding reads the Keychain.
     library.refresh();
+    revoke_quietly(revoking);
     Ok((replaced, ConfigAnswer { config, keychain }))
 }
 
@@ -484,6 +519,7 @@ pub async fn set_mode(
     server_url: Option<String>,
 ) -> Result<ConfigAnswer, String> {
     let processes = processes.inner().clone();
+    let serve_info = processes.serve_info();
     let reader = state.reader();
     // The start reads the config inside its lock: the newest place wins.
     set_mode_then(
@@ -495,6 +531,7 @@ pub async fn set_mode(
         data_dir,
         server_url,
         move || processes.start_with(|| reader.current()),
+        &serve_info,
     )
     .await
 }
@@ -641,8 +678,9 @@ pub async fn has_login(config: State<'_, ConfigState>) -> Result<bool, String> {
         .map_err(|e| e.to_string())?
 }
 
-/// Log out: deletes the token from the Keychain, forgets the account and stops the library,
-/// off the main thread (where it may wait for a running login), then polls again.
+/// Log out: deletes the token from the Keychain, forgets the account, stops the library and
+/// asks the server to revoke the token, off the main thread (where it may wait for a running
+/// login and for the server), then polls again.
 #[tauri::command]
 pub async fn log_out(
     config: State<'_, ConfigState>,
@@ -654,14 +692,25 @@ pub async fn log_out(
     let state = config.inner().clone();
     let gate = gate.inner().clone();
     let library = library.inner().clone();
+    let serve_info = processes.serve_info();
     let after = tauri::async_runtime::spawn_blocking(move || {
-        log_out_of(&gate, &KeychainStore::new(), &state, &library)
+        log_out_of(&gate, &KeychainStore::new(), &state, &library, &serve_info)
     })
     .await
     .map_err(|e| e.to_string())??;
     relaunch_pipeline(config.inner(), processes.inner());
     poller.poll_now();
     Ok(after)
+}
+
+/// Polls the server and the pipeline now (Check again on the Setup page). The new status
+/// comes as an event.
+#[tauri::command]
+pub async fn recheck(poller: State<'_, Poller>) -> Result<(), String> {
+    let poller = poller.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || poller.poll_now())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// The Markdown folder of the logged-in account (the OCR page); `null` without an account.
@@ -1598,6 +1647,7 @@ mod tests {
                 Some(dir.into()),
                 None,
                 restart(&state),
+                &ServeInfo::default(),
             ))
             .unwrap()
             .config
@@ -1624,7 +1674,8 @@ mod tests {
                 Mode::Remote,
                 None,
                 None,
-                restart(&state)
+                restart(&state),
+                &ServeInfo::default(),
             ))
             .is_err()
         );
@@ -1638,6 +1689,7 @@ mod tests {
             mode: Mode::Local,
             account: Some("jordi".into()),
             email: Some("me@example.org".into()),
+            data_dir: dir.path().join("data"),
             ..AppConfig::default()
         };
         config::save(dir.path(), &config).unwrap();
@@ -1646,7 +1698,17 @@ mod tests {
         store.set("local|jordi", &Token::new("secret")).unwrap();
         store.set("local|other", &Token::new("other")).unwrap();
         let gate = LoginGate::default();
-        let after = log_out_of(&gate, &store, &state, &crate::library::idle()).unwrap();
+        // No server answers there: the revoke fails and the log out still happens.
+        let serve_info = ServeInfo {
+            listen: vec![
+                format!("127.0.0.1:{}", crate::probe::test_server::free_port())
+                    .parse()
+                    .unwrap(),
+            ],
+            ..ServeInfo::default()
+        };
+        let after =
+            log_out_of(&gate, &store, &state, &crate::library::idle(), &serve_info).unwrap();
         assert_eq!(store.get("local|jordi").unwrap(), None);
         assert!(store.get("local|other").unwrap().is_some());
         assert_eq!(after.account, None);
@@ -1655,7 +1717,7 @@ mod tests {
         assert_eq!(state.current(), after);
         assert_eq!(config::load(dir.path()), after);
         // Without an account there is nothing to delete.
-        log_out_of(&gate, &store, &state, &crate::library::idle()).unwrap();
+        log_out_of(&gate, &store, &state, &crate::library::idle(), &serve_info).unwrap();
     }
 
     #[test]

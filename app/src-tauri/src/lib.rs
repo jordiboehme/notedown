@@ -209,7 +209,8 @@ pub fn run() {
             commands::note_page_drop,
             commands::markdown_dir,
             commands::set_markdown_dir,
-            commands::show_markdown_dir
+            commands::show_markdown_dir,
+            commands::recheck
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
@@ -576,7 +577,7 @@ mod tests {
         names.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    const SETTINGS_ONLY: [&str; 21] = [
+    const SETTINGS_ONLY: [&str; 22] = [
         "get_config",
         "set_mode",
         "set_start_view",
@@ -598,6 +599,7 @@ mod tests {
         "markdown_dir",
         "set_markdown_dir",
         "show_markdown_dir",
+        "recheck",
     ];
 
     #[test]
@@ -718,7 +720,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 51);
+        assert_eq!(handler_commands().len(), 52);
     }
 
     #[test]
@@ -775,6 +777,7 @@ mod tests {
             "markdown_dir",
             "set_markdown_dir",
             "show_markdown_dir",
+            "recheck",
         ]);
         assert_eq!(manifest_commands(), all);
         // Every granted command is a real one.

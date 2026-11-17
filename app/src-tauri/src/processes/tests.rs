@@ -554,6 +554,8 @@ fn a_log_in_and_a_log_out_restart_the_pipeline() {
         &MemoryStore::new(),
         &state,
         &crate::library::idle(),
+        // No token is kept, so nothing is revoked.
+        &crate::serve_info::ServeInfo::default(),
     )
     .unwrap();
     relaunch_pipeline(&state, &p);

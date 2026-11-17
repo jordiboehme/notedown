@@ -331,6 +331,17 @@ impl ConfigState {
         }
     }
 
+    /// Saves when the updater last got an answer. A save the user did not make: a config that
+    /// was reset at start stays reported until the next change of the user.
+    pub fn set_last_update_check(&self, at_ms: u64) -> Result<(), String> {
+        let _saving = self.saving.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut next = self.current();
+        next.last_update_check_ms = Some(at_ms);
+        (self.save)(&self.dir, &next).map_err(|e| format!("the config was not saved: {e}"))?;
+        *self.config.lock().unwrap_or_else(PoisonError::into_inner) = next;
+        Ok(())
+    }
+
     /// Both imports are done: the backup folder and the `.snbak` are no longer needed.
     pub fn imports_done(&self) -> Result<AppConfig, String> {
         self.update(|c| {
@@ -749,6 +760,30 @@ pub fn quit_app(app: AppHandle) {
 #[tauri::command]
 pub fn request_quit(app: AppHandle) {
     crate::request_quit(&app);
+}
+
+/// What the updater knows now; the About page reads it when it opens and then follows
+/// `update-state`.
+#[tauri::command]
+pub fn update_state(updates: State<'_, crate::AppUpdates>) -> crate::update::UpdateState {
+    updates.state()
+}
+
+/// Checks GitHub for a newer version now, off the main thread. The answer is also told as
+/// `update-state`.
+#[tauri::command]
+pub async fn check_for_update(app: AppHandle) -> Result<Option<crate::update::UpdateInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::check_update_now(&app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Downloads and installs the update found last, then stops the server and the pipeline and
+/// starts the new version. Async, so it never runs on the main thread: there a restart would
+/// skip the exit events and the stop would block the menu bar.
+#[tauri::command]
+pub async fn install_update_and_restart(app: AppHandle) -> Result<(), String> {
+    crate::install_update_and_restart(app).await
 }
 
 /// Log in with an e-mail and a password, off the main thread: the client is made, used and
@@ -1704,6 +1739,31 @@ mod tests {
             assert_eq!(config.start_view, StartView::Columns);
             assert_eq!(config.mode, Mode::Local);
         }
+    }
+
+    #[test]
+    fn the_update_check_time_is_saved_without_hiding_a_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), "{ not json").unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        assert!(state.was_reset());
+        // A save the user did not make keeps the note that the config was reset.
+        state.set_last_update_check(1_763_400_000_000).unwrap();
+        assert!(state.was_reset());
+        assert_eq!(
+            state.current().last_update_check_ms,
+            Some(1_763_400_000_000)
+        );
+        assert_eq!(
+            config::load(dir.path()).last_update_check_ms,
+            Some(1_763_400_000_000)
+        );
+        state.set_start_view(StartView::Columns).unwrap();
+        assert!(!state.was_reset());
+        assert_eq!(
+            state.current().last_update_check_ms,
+            Some(1_763_400_000_000)
+        );
     }
 
     #[test]

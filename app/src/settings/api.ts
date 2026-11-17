@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Mode } from "../lib/api";
+import type { UpdateState } from "./update";
 
 // The commands of the settings window (app/src-tauri/src/commands.rs).
 
@@ -131,6 +132,8 @@ export const MODEL_PROGRESS_EVENT = "model-progress";
 export const MODEL_READY_EVENT = "model-ready";
 export const MODEL_FAILED_EVENT = "model-failed";
 export const SETTINGS_PAGE_EVENT = "settings-page";
+/** A new state of the updater (update.rs). */
+export const UPDATE_STATE_EVENT = "update-state";
 
 /** The config after a change, and a sentence when an old login stayed in the Keychain. */
 export interface ConfigAnswer {
@@ -231,6 +234,13 @@ export const markdownDir = () => invoke<string | null>("markdown_dir");
 export const setMarkdownDir = (dir: string) => invoke<string | null>("set_markdown_dir", { dir });
 /** Opens the Markdown folder in the Finder (it is made first when it is not there yet). */
 export const showMarkdownDir = () => invoke("show_markdown_dir");
+
+/** What the updater knows now. */
+export const updateState = () => invoke<UpdateState>("update_state");
+/** Checks GitHub for a newer version now; the state follows as update-state. */
+export const checkForUpdate = () => invoke<{ version: string; notes: string | null } | null>("check_for_update");
+/** Installs the update found last and starts Notedown again; the server stops first. */
+export const installUpdateAndRestart = () => invoke<void>("install_update_and_restart");
 
 /** The text of a failed command: Rust sends a string. */
 export function failure(error: unknown): string {

@@ -24,6 +24,7 @@ mod test_procs;
 pub mod token;
 pub mod transfer;
 pub mod tray;
+pub mod update;
 pub mod windows;
 
 use std::path::PathBuf;
@@ -43,7 +44,11 @@ use status::Status;
 use supervisor::ChildState;
 use token::KeychainStore;
 use tray::{TrayIconKind, tray_icon_for};
+use update::{Round, UpdateInfo, UpdateState, Updates};
 use windows::{Opening, Shown, WindowKind};
+
+/// The updater's state, with the plugin's update handle.
+pub type AppUpdates = Updates<tauri_plugin_updater::Update>;
 
 /// The bundle identifier of the app, as `tauri.conf.json` names it. The app's config, data and
 /// Keychain entries are filed under it.
@@ -83,6 +88,8 @@ pub fn run() {
         )
         // The folder picker of the Markdown folder; only the settings window may open it.
         .plugin(tauri_plugin_dialog::init())
+        // The self-updater (update.rs). Only Rust calls it; no window has its permissions.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .menu(tray::app_menu)
         .on_menu_event(|app, event| tray::on_menu_event(app, event.id().as_ref()))
         .on_window_event(windows::on_window_event)
@@ -189,6 +196,8 @@ pub fn run() {
             app.manage(poller.clone());
             supervise(app.handle().clone());
             poll(poller);
+            app.manage(updates_for(app.handle().clone()));
+            check_updates(app.handle().clone());
             // The first start opens Settings at Setup, once. Last: showing a window tells the
             // poller, the library and the notes, which are all managed by now.
             // A config that cannot be saved still gets the setup (then at the next start too).
@@ -278,13 +287,16 @@ pub fn run() {
             commands::set_setup_record,
             commands::snbak_time,
             commands::sync_state,
-            commands::open_recycle_bin
+            commands::open_recycle_bin,
+            commands::update_state,
+            commands::check_for_update,
+            commands::install_update_and_restart
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
     app.run(|app, event| match event {
         // Any exit request waits for the Quit flow; closing the last window (no code) never
-        // quits a menu bar app.
+        // quits a menu bar app. The restart after an update is let through (quit.rs).
         RunEvent::ExitRequested { code, api, .. } => {
             match app.state::<Arc<QuitFlow>>().on_exit_request(code) {
                 ExitDecision::Allow => {}
@@ -311,6 +323,118 @@ pub fn quit_app(app: &AppHandle) {
     let exit_app = app.clone();
     windows::hide_all(app);
     flow.quit_with(move || stop_for_good(&stop_app), move || exit_app.exit(0));
+}
+
+/// The restart after an installed update: hides the windows, stops every child off the main
+/// thread like Quit, then starts the new version. Tauri's restart runs `RunEvent::Exit` and
+/// the plugins' cleanup (the single-instance socket) before it starts the app again. Nothing
+/// happens while the Quit flow runs: the app ends, and the next start is the new version.
+pub fn restart_app(app: &AppHandle) {
+    let flow = app.state::<Arc<QuitFlow>>().inner().clone();
+    let stop_app = app.clone();
+    let restart_app = app.clone();
+    windows::hide_all(app);
+    flow.restart_with(
+        move || stop_for_good(&stop_app),
+        // From this thread of the flow, Tauri asks the event loop to exit with the restart
+        // code and waits for it.
+        move || restart_app.restart(),
+    );
+}
+
+/// The updater's state; every new state goes to the settings window.
+fn updates_for(app: AppHandle) -> AppUpdates {
+    Updates::new(Arc::new(move |state: &UpdateState| {
+        let _ = app.emit_to(
+            WindowKind::Settings.label(),
+            update::UPDATE_STATE_EVENT,
+            state.clone(),
+        );
+    }))
+}
+
+/// Opens the settings window on the About page, which shows the update and asks.
+fn show_about(app: &AppHandle) {
+    if let Err(why) = windows::show_window(app, WindowKind::Settings, Opening::Page("about".into()))
+    {
+        eprintln!("notedown: the About page did not open: {why}");
+    }
+}
+
+/// Saves when the updater last got an answer.
+fn save_update_check(app: &AppHandle, at_ms: u64) {
+    if let Err(why) = app
+        .state::<commands::ConfigState>()
+        .set_last_update_check(at_ms)
+    {
+        eprintln!("notedown: the time of the update check was not saved: {why}");
+    }
+}
+
+/// The automatic check: at start, then every hour it checks when 24 hours have passed since
+/// the last answer. A found update opens Settings on About; a failure is only logged.
+fn check_updates(app: AppHandle) {
+    std::thread::spawn(move || {
+        let clock = supervisor::system_clock();
+        loop {
+            let last = app
+                .state::<commands::ConfigState>()
+                .current()
+                .last_update_check_ms;
+            let round = update::auto_round(
+                app.state::<AppUpdates>().inner(),
+                last,
+                clock(),
+                |at| save_update_check(&app, at),
+                || update::check_github(&app),
+            );
+            match round {
+                Round::Checked(Ok(Some(_))) => show_about(&app),
+                Round::Checked(Err(why)) => eprintln!("notedown: the update check failed: {why}"),
+                _ => {}
+            }
+            std::thread::sleep(update::WAKE_EVERY);
+        }
+    });
+}
+
+/// A check the user asked for (the tray item, the About page). It blocks: run it off the main
+/// thread.
+pub fn check_update_now(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
+    let answer = app
+        .state::<AppUpdates>()
+        .check_now(|| update::check_github(app));
+    if answer.is_ok() {
+        save_update_check(app, supervisor::system_clock()());
+    }
+    answer
+}
+
+/// "Check for Updates..." in the tray: opens Settings on About, which shows the check and its
+/// answer, and checks.
+pub fn check_update_from_menu(app: &AppHandle) {
+    show_about(app);
+    let app = app.clone();
+    std::thread::spawn(move || {
+        if let Err(why) = check_update_now(&app) {
+            eprintln!("notedown: the update check failed: {why}");
+        }
+    });
+}
+
+/// Downloads and installs the update found last, then restarts into it. A download or install
+/// that fails leaves everything running and says why.
+pub async fn install_update_and_restart(app: AppHandle) -> Result<(), String> {
+    let Some((_, found)) = app.state::<AppUpdates>().start_install() else {
+        return Err("there is no update to install".to_owned());
+    };
+    if let Err(why) = found.download_and_install(|_, _| {}, || {}).await {
+        let reason = why.to_string();
+        app.state::<AppUpdates>().install_failed(&reason);
+        return Err(reason);
+    }
+    restart_app(&app);
+    Ok(())
 }
 
 /// Quit as the user asks for it (the Quit items, Cmd+Q, the panel's Quit): while the app's own
@@ -683,7 +807,7 @@ mod tests {
         names.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    const SETTINGS_ONLY: [&str; 38] = [
+    const SETTINGS_ONLY: [&str; 41] = [
         "get_config",
         "set_mode",
         "set_start_view",
@@ -722,6 +846,9 @@ mod tests {
         "snbak_time",
         "sync_state",
         "open_recycle_bin",
+        "update_state",
+        "check_for_update",
+        "install_update_and_restart",
     ];
 
     #[test]
@@ -843,7 +970,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 68);
+        assert_eq!(handler_commands().len(), 71);
     }
 
     #[test]
@@ -917,6 +1044,9 @@ mod tests {
             "snbak_time",
             "sync_state",
             "open_recycle_bin",
+            "update_state",
+            "check_for_update",
+            "install_update_and_restart",
         ]);
         assert_eq!(manifest_commands(), all);
         // Every granted command is a real one.
@@ -980,6 +1110,35 @@ mod tests {
                 assert!(!granted(window).contains(command), "{window} has {command}");
             }
         }
+    }
+
+    #[test]
+    fn the_bundle_carries_the_notices_and_the_updater_files() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let bundle = &config["bundle"];
+        assert_eq!(bundle["createUpdaterArtifacts"], true);
+        assert_eq!(
+            bundle["resources"],
+            serde_json::json!({
+                "resources/THIRD-PARTY-NOTICES.txt": "THIRD-PARTY-NOTICES.txt"
+            })
+        );
+        let updater = &config["plugins"]["updater"];
+        assert_eq!(
+            updater["endpoints"],
+            serde_json::json!([
+                "https://github.com/jordiboehme/notedown/releases/latest/download/latest.json"
+            ])
+        );
+        // The minisign public key of the release key, base64 as `tauri signer` writes it.
+        assert_eq!(
+            updater["pubkey"],
+            concat!(
+                "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYwNDE0N0EwNEY5QzM0REEKUldU",
+                "YU5KeFBvRWRCOEJuMmJYODBmb2NKK2ZXa3hkSmRPTVozVkppMzBqVW1qTmM3Q2ZXY0gvVjQK"
+            )
+        );
     }
 
     #[test]

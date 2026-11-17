@@ -16,7 +16,9 @@ describe("the About page", () => {
   });
 
   it("renders what about.ts says", () => {
-    const body = render(AboutPage, { props: { version: "0.1.0", onOpen: () => {} } }).body;
+    const body = render(AboutPage, {
+      props: { version: "0.1.0", update: { kind: "idle" }, onOpen: () => {}, onCheck: () => {}, onInstall: () => {} },
+    }).body;
     for (const text of [ABOUT.name, ABOUT.motto, "Version 0.1.0", ...ABOUT.footer]) {
       expect(body).toContain(text);
     }

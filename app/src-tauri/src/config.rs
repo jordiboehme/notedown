@@ -49,6 +49,9 @@ pub struct AppConfig {
     pub markdown_dirs: BTreeMap<String, PathBuf>,
     /// What the setup checklist keeps between two starts.
     pub setup: SetupRecord,
+    /// When the updater last got an answer from GitHub, in ms since 1970 (this Mac's clock).
+    /// It checks again 24 hours later ([`crate::update::should_check`]).
+    pub last_update_check_ms: Option<u64>,
 }
 
 /// What the setup checklist keeps: the backup and import choices, what was shown or offered
@@ -293,6 +296,7 @@ impl Default for AppConfig {
             start_view: StartView::Tree,
             markdown_dirs: BTreeMap::new(),
             setup: SetupRecord::default(),
+            last_update_check_ms: None,
         }
     }
 }
@@ -454,7 +458,28 @@ mod tests {
                 }),
                 sync_acknowledged: true,
             },
+            last_update_check_ms: Some(1_763_300_000_000),
         }
+    }
+
+    #[test]
+    fn the_last_update_check_round_trips_and_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            last_update_check_ms: Some(1_763_400_000_000),
+            ..AppConfig::default()
+        };
+        save(dir.path(), &config).unwrap();
+        assert_eq!(
+            load(dir.path()).last_update_check_ms,
+            Some(1_763_400_000_000)
+        );
+        let text = fs::read_to_string(dir.path().join(FILE)).unwrap();
+        assert!(text.contains("\"lastUpdateCheckMs\""), "{text}");
+        // A config of an earlier version never checked.
+        fs::write(dir.path().join(FILE), r#"{"mode":"local"}"#).unwrap();
+        assert_eq!(load(dir.path()).last_update_check_ms, None);
+        assert_eq!(AppConfig::default().last_update_check_ms, None);
     }
 
     #[test]

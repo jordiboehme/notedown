@@ -412,6 +412,9 @@ jobs:
           mkdir -p binaries
           printf '#!/bin/sh\nexit 0\n' >"binaries/notedown-$triple"
           chmod 755 "binaries/notedown-$triple"
+          # tauri-build also needs the notices resource of tauri.conf.json.
+          mkdir -p resources
+          printf 'Placeholder of a CI build.\n' >resources/THIRD-PARTY-NOTICES.txt
 
       - name: cargo fmt --check
         run: cargo fmt --check

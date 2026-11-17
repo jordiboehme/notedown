@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ChildState } from "../lib/api";
-import { markdownRow, type MarkdownFolder } from "../settings/markdown";
+import { markdownRead, markdownRow, type MarkdownFolder } from "../settings/markdown";
 
 const base: MarkdownFolder = { path: "/Users/j/Documents/Markdown", error: null, busy: false, pipeline: null };
 const running: ChildState = { state: "running", pid: 7, sinceMs: 1 };
@@ -68,5 +68,14 @@ describe("the Markdown folder row of the OCR page", () => {
     expect(other.note).toBeNull();
     // Our own refusal comes first.
     expect(markdownRow({ ...base, pipeline, error: "Not saved." }).note).toBe("Not saved.");
+  });
+
+  it("clears an old error when the folder reads again", () => {
+    const failed = { ...base, path: undefined, error: "Notedown is quitting." };
+    const read = markdownRead(failed, { path: "/Users/j/md" });
+    expect(read).toEqual({ ...failed, path: "/Users/j/md", error: null });
+    expect(markdownRow(read).note).toBeNull();
+    // A failed read keeps the path it had and says why.
+    expect(markdownRead(base, { error: "No." })).toEqual({ ...base, error: "No." });
   });
 });

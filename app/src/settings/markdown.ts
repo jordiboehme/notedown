@@ -59,3 +59,11 @@ export function markdownRow(folder: MarkdownFolder): MarkdownRow {
     show: { label: "Show in Finder", enabled: ready },
   };
 }
+
+/** The folder after a read of `markdown_dir`: a read answer clears an older error. */
+export function markdownRead(
+  folder: MarkdownFolder,
+  answer: { path: string | null } | { error: string },
+): MarkdownFolder {
+  return "error" in answer ? { ...folder, error: answer.error } : { ...folder, path: answer.path, error: null };
+}

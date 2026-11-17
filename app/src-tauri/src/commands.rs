@@ -199,12 +199,12 @@ impl ConfigState {
 
     /// Sets the Markdown folder of the logged-in account. The folder must be a full path (a
     /// leading `~` is the home folder) outside the data folder: the pipeline refuses a folder
-    /// inside it (it compares the paths as written, with `.` and `..` resolved, as here).
+    /// inside it. The check is [`inside`]: as written, and with the links resolved.
     pub fn set_markdown_dir(&self, dir: PathBuf) -> Result<AppConfig, String> {
         let dir = without_dots(&expand_home(&dir)?);
         self.try_update(|c| {
             let slug = c.account_slug().ok_or(NEEDS_ACCOUNT)?.to_owned();
-            if dir.starts_with(without_dots(&c.data_dir)) {
+            if inside(&dir, &without_dots(&c.data_dir)) {
                 return Err(OUTSIDE_DATA);
             }
             c.markdown_dirs.insert(slug, dir);
@@ -335,6 +335,32 @@ fn without_dots(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// Whether `dir` is `data` or lies inside it: as written (`.` and `..` resolved, as the
+/// pipeline compares), or after the links are resolved (a symlinked folder, `/tmp` and
+/// `/private/tmp`, the case of an APFS name). Of a path that is not there yet, its deepest
+/// existing folder is resolved and the rest added as written.
+fn inside(dir: &Path, data: &Path) -> bool {
+    dir.starts_with(data) || resolved(dir).starts_with(resolved(data))
+}
+
+/// `path` with the links of its deepest existing part resolved; as it is when none resolves.
+fn resolved(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut part = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(part) {
+            return rest.iter().rev().fold(real, |acc, name| acc.join(name));
+        }
+        match (part.parent(), part.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                part = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 pub fn allowed_link(url: &str) -> bool {
@@ -574,7 +600,7 @@ pub async fn log_in(
 /// account: the folder belongs to it), on a blocking thread that nobody waits for: the stop of
 /// the old pipeline can take its grace. The config is read inside the start's lock, so the
 /// newest wins.
-fn relaunch_pipeline(config: &ConfigState, processes: &Arc<Processes>) {
+pub(crate) fn relaunch_pipeline(config: &ConfigState, processes: &Arc<Processes>) {
     let reader = config.reader();
     let processes = processes.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -1233,6 +1259,47 @@ mod tests {
         std::fs::write(&file, "").unwrap();
         let err = finder_command(&file.join("md")).unwrap_err();
         assert!(err.starts_with("The folder could not be made:"), "{err}");
+    }
+
+    #[test]
+    fn a_markdown_folder_inside_the_data_folder_is_refused_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("data").join("md")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let state = ConfigState::load(dir.path().join("config"));
+        let logged_in = |data: &Path| {
+            state
+                .set_mode(Mode::Local, Some(data.to_owned()), None)
+                .unwrap();
+            state
+                .try_update(|c| {
+                    c.account = Some("jordi".into());
+                    Ok::<(), ()>(())
+                })
+                .ok()
+                .unwrap();
+        };
+        // The data folder through the link, the choice by its real path, and the other way.
+        logged_in(&link.join("data"));
+        for inside in [real.join("data").join("md"), real.join("data").join("new")] {
+            assert_eq!(
+                state.set_markdown_dir(inside.clone()).unwrap_err(),
+                OUTSIDE_DATA,
+                "{inside:?}"
+            );
+        }
+        logged_in(&real.join("data"));
+        for inside in [link.join("data").join("md"), link.join("data/new/deeper")] {
+            assert_eq!(
+                state.set_markdown_dir(inside.clone()).unwrap_err(),
+                OUTSIDE_DATA,
+                "{inside:?}"
+            );
+        }
+        // Next to it is fine, through the link too.
+        state.set_markdown_dir(link.join("md")).unwrap();
     }
 
     #[test]

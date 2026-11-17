@@ -21,7 +21,7 @@
   } from "../api";
   import { config } from "../config.svelte";
   import { formatBytes, fraction } from "../format";
-  import { markdownRow } from "../markdown";
+  import { markdownRead, markdownRow } from "../markdown";
   import Form from "../kit/Form.svelte";
   import Row from "../kit/Row.svelte";
   import Section from "../kit/Section.svelte";
@@ -52,11 +52,16 @@
   );
 
   async function readMarkdownDir() {
-    try {
-      markdownPath = await markdownDir();
-    } catch (e) {
-      markdownError = failure(e);
-    }
+    const answer = await markdownDir().then(
+      (path) => ({ path }),
+      (e: unknown) => ({ error: failure(e) }),
+    );
+    const read = markdownRead(
+      { path: markdownPath, error: markdownError, busy: markdownBusy, pipeline: null },
+      answer,
+    );
+    markdownPath = read.path;
+    markdownError = read.error;
   }
 
   // The folder belongs to the account: read it again when the account changes.

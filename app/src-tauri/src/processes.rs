@@ -232,6 +232,9 @@ impl Processes {
                 _ => return,
             }
         }
+        // The app's own pipeline holds the writer lock for its whole run: stop it first, or
+        // the probe would take it for another Notedown.
+        self.pipeline.stop();
         self.launch(&self.pipeline, &launch, config);
     }
 

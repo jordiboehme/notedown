@@ -47,6 +47,102 @@ pub struct AppConfig {
     /// The Markdown folder of each account, by its slug. An account without an entry uses
     /// [`default_markdown_dir`].
     pub markdown_dirs: BTreeMap<String, PathBuf>,
+    /// What the setup checklist keeps between two starts.
+    pub setup: SetupRecord,
+}
+
+/// What the setup checklist keeps: the backup and import choices, what was shown or offered
+/// once, and the first sync after the import.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SetupRecord {
+    /// The address of the Supernote's Browse & Access page the backup reads from.
+    pub backup_url: Option<String>,
+    /// The folder of the device backup. Cleared once both imports are done.
+    pub backup_dir: Option<PathBuf>,
+    /// The device's own `.snbak` backup for the app data. Cleared once both imports are done.
+    pub snbak: Option<PathBuf>,
+    /// Settings opened at Setup once at the first start.
+    pub setup_shown: bool,
+    /// The first Local mode turned Start at login on once.
+    pub autostart_offered: bool,
+    /// The journal end when the import was done, for the check of the first sync.
+    pub sync_mark: Option<SyncMark>,
+    /// What the first sync after the mark deleted (filled by the first sync check).
+    pub sync_checked: Option<SyncCheck>,
+    /// The user saw the deletes of the first sync.
+    pub sync_acknowledged: bool,
+}
+
+impl SetupRecord {
+    /// Forgets the first sync of an account: another server or another account has its own.
+    pub fn forget_sync(&mut self) {
+        self.sync_mark = None;
+        self.sync_checked = None;
+        self.sync_acknowledged = false;
+    }
+}
+
+/// What the settings window may change of the [`SetupRecord`]. A field that is left out stays
+/// as it is; `null` clears it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct SetupChange {
+    #[serde(deserialize_with = "present")]
+    pub backup_url: Option<Option<String>>,
+    #[serde(deserialize_with = "present")]
+    pub backup_dir: Option<Option<PathBuf>>,
+    #[serde(deserialize_with = "present")]
+    pub snbak: Option<Option<PathBuf>>,
+    pub sync_acknowledged: Option<bool>,
+}
+
+/// A field that is there, `null` or not: only a missing one is `None` (by `default`).
+fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+impl SetupChange {
+    pub fn apply(self, record: &mut SetupRecord) {
+        if let Some(url) = self.backup_url {
+            record.backup_url = url.map(|u| u.trim().to_owned()).filter(|u| !u.is_empty());
+        }
+        if let Some(dir) = self.backup_dir {
+            record.backup_dir = dir;
+        }
+        if let Some(snbak) = self.snbak {
+            record.snbak = snbak;
+        }
+        if let Some(seen) = self.sync_acknowledged {
+            record.sync_acknowledged = seen;
+        }
+    }
+}
+
+/// The journal end when the import of an account was done.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncMark {
+    /// The account's token key ([`crate::token::token_key`]): the server and the account.
+    pub key: String,
+    /// The highest journal number at the mark.
+    pub seq: u64,
+}
+
+/// What the first sync after the mark deleted on the server.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SyncCheck {
+    pub files: u64,
+    pub folders: u64,
+    /// `None` where digests cannot be checked (a server on another machine).
+    pub digests: Option<u64>,
+    /// The journal had a gap: what the first sync changed is not known.
+    pub cannot_tell: bool,
 }
 
 /// `~/notedown-data`, or `./notedown-data` when there is no home folder.
@@ -186,6 +282,7 @@ impl Default for AppConfig {
             email: None,
             start_view: StartView::Tree,
             markdown_dirs: BTreeMap::new(),
+            setup: SetupRecord::default(),
         }
     }
 }
@@ -327,7 +424,70 @@ mod tests {
             email: Some("jordi@example.org".into()),
             start_view: StartView::Columns,
             markdown_dirs: [("jordi".to_owned(), PathBuf::from("/notes/md"))].into(),
+            setup: SetupRecord {
+                backup_url: Some("http://192.168.1.20:8089".into()),
+                backup_dir: Some(PathBuf::from("/Users/me/supernote-backup-2026-11-17")),
+                snbak: Some(PathBuf::from("/Users/me/Supernote_1.snbak")),
+                setup_shown: true,
+                autostart_offered: true,
+                sync_mark: Some(SyncMark {
+                    key: "https://notes.example.org|jordi".into(),
+                    seq: 813,
+                }),
+                sync_checked: Some(SyncCheck {
+                    files: 2,
+                    folders: 1,
+                    digests: None,
+                    cannot_tell: false,
+                }),
+                sync_acknowledged: true,
+            },
         }
+    }
+
+    #[test]
+    fn the_setup_record_round_trips_and_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), &sample()).unwrap();
+        assert_eq!(load(dir.path()).setup, sample().setup);
+        // The file uses the names the settings window reads.
+        let text = fs::read_to_string(dir.path().join(FILE)).unwrap();
+        for key in [
+            "\"backupUrl\"",
+            "\"backupDir\"",
+            "\"setupShown\"",
+            "\"autostartOffered\"",
+            "\"syncMark\"",
+            "\"syncChecked\"",
+            "\"cannotTell\"",
+            "\"syncAcknowledged\"",
+        ] {
+            assert!(text.contains(key), "{key} in {text}");
+        }
+        // A config of an earlier version has no record: all off and empty.
+        fs::write(dir.path().join(FILE), r#"{"mode":"local"}"#).unwrap();
+        assert_eq!(load(dir.path()).setup, SetupRecord::default());
+        // A record with only some fields keeps the others at their defaults.
+        fs::write(
+            dir.path().join(FILE),
+            r#"{"mode":"local","setup":{"setupShown":true}}"#,
+        )
+        .unwrap();
+        let setup = load(dir.path()).setup;
+        assert!(setup.setup_shown);
+        assert!(!setup.autostart_offered);
+        assert_eq!(setup.sync_mark, None);
+        let mut record = sample().setup;
+        record.forget_sync();
+        assert_eq!(
+            (
+                record.sync_mark,
+                record.sync_checked,
+                record.sync_acknowledged
+            ),
+            (None, None, false)
+        );
+        assert!(record.backup_dir.is_some());
     }
 
     #[test]

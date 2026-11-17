@@ -15,6 +15,92 @@ export interface AppConfig {
   startView: StartView;
   /** The Markdown folder of each account, by its slug. */
   markdownDirs: Record<string, string>;
+  /** What the setup checklist keeps between two starts. */
+  setup: SetupRecord;
+}
+
+/** What the setup checklist keeps (config.rs SetupRecord). */
+export interface SetupRecord {
+  /** The address of the Supernote's Browse & Access page. */
+  backupUrl: string | null;
+  /** The backup folder; cleared once both imports are done. */
+  backupDir: string | null;
+  /** The device's .snbak file; cleared once both imports are done. */
+  snbak: string | null;
+  setupShown: boolean;
+  /** The first Local mode turned Start at login on once. */
+  autostartOffered: boolean;
+  /** The journal end when the import was done, by the token key of the account. */
+  syncMark: { key: string; seq: number } | null;
+  /** What the first sync after the mark deleted. */
+  syncChecked: SyncCheck | null;
+  /** The user saw the deletes of the first sync. */
+  syncAcknowledged: boolean;
+}
+
+export interface SyncCheck {
+  files: number;
+  folders: number;
+  /** null where digests cannot be checked (a server on another machine). */
+  digests: number | null;
+  /** The journal had a gap: what the first sync changed is not known. */
+  cannotTell: boolean;
+}
+
+/** What set_setup_record may change; a field left out stays, null clears it. */
+export interface SetupChange {
+  backupUrl?: string | null;
+  backupDir?: string | null;
+  snbak?: string | null;
+  syncAcknowledged?: boolean;
+}
+
+/** The steps of the setup that run the notedown program. */
+export type JobKind = "backup" | "importDryRun" | "import" | "appDataDryRun" | "appData";
+
+/** A progress line of a step: a backup counts files and bytes, an import names its phase. */
+export interface JobProgress {
+  kind: JobKind;
+  files: number | null;
+  bytes: number | null;
+  done: number | null;
+  total: number | null;
+  phase: string | null;
+}
+
+/** A step that printed its result. json is the result (backup.json for a backup, the dry run,
+ * the import); when ok is false it also holds the error text as json.error. */
+export interface JobResult {
+  kind: JobKind;
+  ok: boolean;
+  json: Record<string, unknown> & { error?: string };
+}
+
+/** A step that ended without a result. */
+export interface JobFailed {
+  kind: JobKind;
+  text: string;
+}
+
+/** What a backup folder holds. time is backup.json's time (RFC 3339). */
+export type BackupFolder =
+  | { state: "missing" }
+  | { state: "empty" }
+  | { state: "resumable"; time: string }
+  | { state: "complete"; time: string }
+  | { state: "foreign" };
+
+export const SETUP_JOB_PROGRESS_EVENT = "setup-job-progress";
+export const SETUP_JOB_DONE_EVENT = "setup-job-done";
+export const SETUP_JOB_FAILED_EVENT = "setup-job-failed";
+
+/** What the commands that touch the server answer while a step runs. */
+export const WAIT_FOR_IMPORT = "Wait until the import is done.";
+
+/** The backup folder of a backup made on `today`: ~/supernote-backup-YYYY-MM-DD (local date). */
+export function defaultBackupDir(today: Date): string {
+  const two = (n: number) => String(n).padStart(2, "0");
+  return `~/supernote-backup-${today.getFullYear()}-${two(today.getMonth() + 1)}-${two(today.getDate())}`;
 }
 
 export interface Progress {
@@ -102,6 +188,28 @@ export const modelState = () => invoke<ModelState>("model_state");
 export const modelPull = () => invoke("model_pull");
 export const modelPause = () => invoke<ModelState>("model_pause");
 export const modelRemove = () => invoke<ModelState>("model_remove");
+/** Backs the Supernote at url up into dir; progress and the end come as events. */
+export const backupStart = (url: string, dir: string, resume: boolean) =>
+  invoke<void>("backup_start", { url, dir, resume });
+/** Stops the running backup; Resume continues it. */
+export const backupPause = () => invoke<void>("backup_pause");
+export const backupFolder = (dir: string) => invoke<BackupFolder>("backup_folder", { dir });
+/** The dry run of the import of setup.backupDir. */
+export const importDryRun = (replace: boolean, allowEmpty: boolean) =>
+  invoke<void>("import_dry_run", { replace, allowEmpty });
+/** Imports setup.backupDir with the app's server stopped. */
+export const importRun = (replace: boolean, allowEmpty: boolean) =>
+  invoke<void>("import_run", { replace, allowEmpty });
+/** The dry run of the app data import of setup.snbak, or of nothing with empty. */
+export const appDataDryRun = (empty: boolean, replace: boolean) =>
+  invoke<void>("app_data_dry_run", { empty, replace });
+/** Imports the app data with the app's server stopped. */
+export const appDataRun = (empty: boolean, replace: boolean) => invoke<void>("app_data_run", { empty, replace });
+/** The step that runs, if any. */
+export const jobState = () => invoke<JobKind | null>("job_state");
+export const setSetupRecord = (change: SetupChange) => invoke<AppConfig>("set_setup_record", { change });
+/** When a .snbak file was last written, in ms since 1970. */
+export const snbakTime = (path: string) => invoke<number>("snbak_time", { path });
 /** The Markdown folder of the logged-in account; null without an account. */
 export const markdownDir = () => invoke<string | null>("markdown_dir");
 /** Saves the Markdown folder of the logged-in account; the pipeline starts again with it. */

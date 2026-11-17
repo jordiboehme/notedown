@@ -8,6 +8,7 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::config::{self, AppConfig, Mode, StartView};
+use crate::import_job::{self, BackupFolder, ImportJobs, JobKind};
 use crate::library::{Choice, Entry, Job, Key, Library, Listed, RecyclePage, StateView, UploadAsk};
 use crate::login::{self, LoginError, LoginGate, Password};
 use crate::model::{ModelControl, ModelState};
@@ -136,6 +137,10 @@ impl ConfigState {
         let before = self.current();
         let mut next = before.clone();
         change(&mut next).map_err(TryUpdateError::Refused)?;
+        // The first sync belongs to one server and one account: another one has its own.
+        if token_key(&before) != token_key(&next) {
+            next.setup.forget_sync();
+        }
         (self.save)(&self.dir, &next)
             .map_err(|e| TryUpdateError::NotSaved(format!("the config was not saved: {e}")))?;
         *self.config.lock().unwrap_or_else(PoisonError::into_inner) = next.clone();
@@ -185,6 +190,10 @@ impl ConfigState {
             if new_server {
                 c.account = None;
                 c.email = None;
+            }
+            // The first change to this Mac turns Start at login on, once ([`set_mode_then`]).
+            if before.0 != Mode::Local && c.mode == Mode::Local && !c.setup.autostart_offered {
+                c.setup.autostart_offered = true;
             }
             // A kept account without a Markdown folder in the app gets the pipeline's, before
             // the children start again with `--markdown-dir`.
@@ -239,6 +248,48 @@ impl ConfigState {
         .map_err(|e| match e {
             TryUpdateError::Refused(text) => text.to_owned(),
             TryUpdateError::NotSaved(why) => why,
+        })
+    }
+
+    /// Saves what the settings window chose for the backup and the import, and that the user
+    /// saw the deletes of the first sync. A folder or a file must be a full path (a leading `~`
+    /// is the home folder).
+    pub fn set_setup_record(&self, mut change: config::SetupChange) -> Result<AppConfig, String> {
+        for path in [&mut change.backup_dir, &mut change.snbak] {
+            if let Some(Some(p)) = path {
+                *p = expand_home(p)?;
+            }
+        }
+        self.update(|c| change.apply(&mut c.setup))
+    }
+
+    /// Saves the sync mark when it belongs to the logged-in account and that account has none
+    /// yet; answers whether it was saved.
+    pub fn take_sync_mark(&self, mark: config::SyncMark) -> Result<bool, String> {
+        match self.try_update(|c| {
+            let same = token_key(c).as_deref() == Some(mark.key.as_str());
+            let has = c
+                .setup
+                .sync_mark
+                .as_ref()
+                .is_some_and(|m| m.key == mark.key);
+            if !same || has {
+                return Err(());
+            }
+            c.setup.sync_mark = Some(mark);
+            Ok(())
+        }) {
+            Ok(_) => Ok(true),
+            Err(TryUpdateError::Refused(())) => Ok(false),
+            Err(TryUpdateError::NotSaved(why)) => Err(why),
+        }
+    }
+
+    /// Both imports are done: the backup folder and the `.snbak` are no longer needed.
+    pub fn imports_done(&self) -> Result<AppConfig, String> {
+        self.update(|c| {
+            c.setup.backup_dir = None;
+            c.setup.snbak = None;
         })
     }
 
@@ -440,6 +491,7 @@ pub fn get_config(state: State<'_, ConfigState>) -> Result<AppConfig, String> {
 /// mode, the folder or the address changed, runs `restart` on a blocking thread of its own and
 /// waits for it. A refused change restarts nothing. `serve_info` is the app's own server as it
 /// runs now: the old place, whose token a new server revokes before the restart stops it.
+/// `autostart` turns Start at login on; it runs once, after the first change to Local mode.
 #[allow(clippy::too_many_arguments)]
 pub async fn set_mode_then(
     state: &ConfigState,
@@ -451,6 +503,7 @@ pub async fn set_mode_then(
     server_url: Option<String>,
     restart: impl FnOnce() + Send + 'static,
     serve_info: &ServeInfo,
+    autostart: impl FnOnce() + Send + 'static,
 ) -> Result<ConfigAnswer, String> {
     let placing = state.clone();
     let serve_info = serve_info.clone();
@@ -473,6 +526,12 @@ pub async fn set_mode_then(
         != (config.mode, &config.data_dir, &config.server_url);
     if changed {
         tauri::async_runtime::spawn_blocking(restart)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    // This change was the first to this Mac: Start at login goes on, once.
+    if !before.setup.autostart_offered && config.setup.autostart_offered {
+        tauri::async_runtime::spawn_blocking(autostart)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -524,15 +583,19 @@ pub fn change_place(
 /// or the address changed, both children start afresh for it, off the main thread: the start
 /// first stops what runs.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn set_mode(
+    app: AppHandle,
     state: State<'_, ConfigState>,
     processes: State<'_, Arc<Processes>>,
     gate: State<'_, Arc<LoginGate>>,
     library: State<'_, Library>,
+    jobs: State<'_, ImportJobs>,
     mode: Mode,
     data_dir: Option<PathBuf>,
     server_url: Option<String>,
 ) -> Result<ConfigAnswer, String> {
+    jobs.not_busy()?;
     let processes = processes.inner().clone();
     let serve_info = processes.serve_info();
     let reader = state.reader();
@@ -547,6 +610,12 @@ pub async fn set_mode(
         server_url,
         move || processes.start_with(|| reader.current()),
         &serve_info,
+        move || {
+            use tauri_plugin_autostart::ManagerExt;
+            if let Err(e) = app.autolaunch().enable() {
+                eprintln!("notedown: Start at login could not be turned on: {e}");
+            }
+        },
     )
     .await
 }
@@ -569,7 +638,9 @@ pub async fn set_start_view(
 pub async fn start_processes(
     config: State<'_, ConfigState>,
     processes: State<'_, Arc<Processes>>,
+    jobs: State<'_, ImportJobs>,
 ) -> Result<ProcessStates, String> {
+    jobs.not_busy()?;
     let config = config.reader();
     let processes = processes.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -639,15 +710,18 @@ pub fn request_quit(app: AppHandle) {
 /// and the token never come back. Then the library binds to the new login and the status polls
 /// again.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn log_in(
     config: State<'_, ConfigState>,
     processes: State<'_, Arc<Processes>>,
     poller: State<'_, Poller>,
     gate: State<'_, Arc<LoginGate>>,
     library: State<'_, Library>,
+    jobs: State<'_, ImportJobs>,
     email: String,
     password: String,
 ) -> Result<ConfigAnswer, String> {
+    jobs.not_busy()?;
     let state = config.inner().clone();
     let gate = gate.inner().clone();
     let library = library.inner().clone();
@@ -703,7 +777,9 @@ pub async fn log_out(
     poller: State<'_, Poller>,
     gate: State<'_, Arc<LoginGate>>,
     library: State<'_, Library>,
+    jobs: State<'_, ImportJobs>,
 ) -> Result<AppConfig, String> {
+    jobs.not_busy()?;
     let state = config.inner().clone();
     let gate = gate.inner().clone();
     let library = library.inner().clone();
@@ -740,10 +816,12 @@ pub async fn create_account(
     gate: State<'_, Arc<LoginGate>>,
     library: State<'_, Library>,
     sidecar: State<'_, Sidecar>,
+    jobs: State<'_, ImportJobs>,
     slug: String,
     email: String,
     password: String,
 ) -> Result<ConfigAnswer, String> {
+    jobs.not_busy()?;
     let state = config.inner().clone();
     let gate = gate.inner().clone();
     let library = library.inner().clone();
@@ -780,8 +858,10 @@ pub async fn connect_pipeline(
     processes: State<'_, Arc<Processes>>,
     poller: State<'_, Poller>,
     sidecar: State<'_, Sidecar>,
+    jobs: State<'_, ImportJobs>,
     password: String,
 ) -> Result<ConfigAnswer, String> {
+    jobs.not_busy()?;
     let current = config.current();
     let spawn = sidecar.0.clone();
     let password = Password::new(password);
@@ -1277,6 +1357,169 @@ pub async fn model_remove(model: State<'_, ModelControl>) -> Result<ModelState, 
         .map_err(|e| e.to_string())?
 }
 
+/// What the import commands refuse without a backup folder in the setup record.
+pub const NO_BACKUP_DIR: &str = "Choose the backup folder first.";
+/// What the app data commands refuse without a `.snbak` file (and without the empty choice).
+pub const NO_SNBAK: &str = "Choose the .snbak file first.";
+
+/// Backs the Supernote at `url` up into `dir` (Make a backup, or Resume with `resume`). The
+/// folder is checked first; progress and the end come as events. Off the main thread: the
+/// check reads the folder.
+#[tauri::command]
+pub async fn backup_start(
+    jobs: State<'_, ImportJobs>,
+    url: String,
+    dir: PathBuf,
+    resume: bool,
+) -> Result<(), String> {
+    let jobs = jobs.inner().clone();
+    let dir = expand_home(&dir)?;
+    tauri::async_runtime::spawn_blocking(move || jobs.backup(&url, &dir, resume))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Stops the running backup; Resume continues it. Returns when it is gone.
+#[tauri::command]
+pub async fn backup_pause(jobs: State<'_, ImportJobs>) -> Result<(), String> {
+    let jobs = jobs.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || jobs.pause())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// What a backup folder holds, off the main thread.
+#[tauri::command]
+pub async fn backup_folder(dir: PathBuf) -> Result<BackupFolder, String> {
+    let dir = expand_home(&dir)?;
+    tauri::async_runtime::spawn_blocking(move || import_job::backup_folder_state(&dir))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The backup folder of the setup record.
+fn backup_dir(config: &ConfigState) -> Result<PathBuf, String> {
+    config
+        .current()
+        .setup
+        .backup_dir
+        .ok_or_else(|| NO_BACKUP_DIR.to_owned())
+}
+
+/// The `.snbak` of the setup record, or none for the empty choice.
+fn snbak(config: &ConfigState, empty: bool) -> Result<Option<PathBuf>, String> {
+    if empty {
+        return Ok(None);
+    }
+    config
+        .current()
+        .setup
+        .snbak
+        .map(Some)
+        .ok_or_else(|| NO_SNBAK.to_owned())
+}
+
+/// Checks the import of the backup folder of the setup record (`cloud import --dry-run`).
+#[tauri::command]
+pub async fn import_dry_run(
+    config: State<'_, ConfigState>,
+    jobs: State<'_, ImportJobs>,
+    replace: bool,
+    allow_empty: bool,
+) -> Result<(), String> {
+    let dir = backup_dir(&config)?;
+    let jobs = jobs.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || jobs.import_dry_run(&dir, replace, allow_empty))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Imports the backup folder of the setup record, with the app's server stopped. Off the main
+/// thread: the stop can take the children's grace.
+#[tauri::command]
+pub async fn import_run(
+    config: State<'_, ConfigState>,
+    jobs: State<'_, ImportJobs>,
+    replace: bool,
+    allow_empty: bool,
+) -> Result<(), String> {
+    let dir = backup_dir(&config)?;
+    let jobs = jobs.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || jobs.import(&dir, replace, allow_empty))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Checks the import of the app data: the `.snbak` of the setup record, or none with `empty`.
+#[tauri::command]
+pub async fn app_data_dry_run(
+    config: State<'_, ConfigState>,
+    jobs: State<'_, ImportJobs>,
+    empty: bool,
+    replace: bool,
+) -> Result<(), String> {
+    let snbak = snbak(&config, empty)?;
+    let jobs = jobs.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || jobs.app_data_dry_run(snbak.as_deref(), replace))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Imports the app data, with the app's server stopped; then the sync mark is taken.
+#[tauri::command]
+pub async fn app_data_run(
+    config: State<'_, ConfigState>,
+    jobs: State<'_, ImportJobs>,
+    empty: bool,
+    replace: bool,
+) -> Result<(), String> {
+    let snbak = snbak(&config, empty)?;
+    let jobs = jobs.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || jobs.app_data(snbak.as_deref(), replace))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The step that runs, if any.
+#[tauri::command]
+pub fn job_state(jobs: State<'_, ImportJobs>) -> Option<JobKind> {
+    jobs.state()
+}
+
+/// Saves the backup address, the backup folder, the `.snbak` file or that the deletes of the
+/// first sync were seen, off the main thread.
+#[tauri::command]
+pub async fn set_setup_record(
+    config: State<'_, ConfigState>,
+    change: config::SetupChange,
+) -> Result<AppConfig, String> {
+    let state = config.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || state.set_setup_record(change))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// When a `.snbak` file was last written, in milliseconds since 1970.
+#[tauri::command]
+pub async fn snbak_time(path: PathBuf) -> Result<u64, String> {
+    let path = expand_home(&path)?;
+    tauri::async_runtime::spawn_blocking(move || file_time_ms(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The modification time of `path` in milliseconds since 1970.
+pub fn file_time_ms(path: &Path) -> Result<u64, String> {
+    let modified = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map_err(|e| format!("{} cannot be read: {e}", path.display()))?;
+    let ms = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| format!("{} has a time before 1970", path.display()))?
+        .as_millis();
+    Ok(u64::try_from(ms).unwrap_or(u64::MAX))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1745,6 +1988,7 @@ mod tests {
                 None,
                 restart(&state),
                 &ServeInfo::default(),
+                || {},
             ))
             .unwrap()
             .config
@@ -1773,6 +2017,7 @@ mod tests {
                 None,
                 restart(&state),
                 &ServeInfo::default(),
+                || {},
             ))
             .is_err()
         );
@@ -1848,5 +2093,170 @@ mod tests {
             .unwrap();
         assert_eq!(cfg.data_dir, PathBuf::from("/data/x"));
         assert_eq!(cfg.server_url.as_deref(), Some("https://n.example.org"));
+    }
+
+    #[test]
+    fn the_first_local_mode_turns_autostart_on_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        let turned_on = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let set = |mode, url: Option<&str>| {
+            let turned_on = turned_on.clone();
+            tauri::async_runtime::block_on(set_mode_then(
+                &state,
+                Arc::new(LoginGate::default()),
+                Arc::new(crate::token::MemoryStore::new()),
+                crate::library::idle(),
+                mode,
+                Some("/data/a".into()),
+                url.map(str::to_owned),
+                || {},
+                &ServeInfo::default(),
+                move || {
+                    turned_on.fetch_add(1, Ordering::SeqCst);
+                },
+            ))
+            .unwrap()
+            .config
+        };
+        let count = || turned_on.load(Ordering::SeqCst);
+        // Another machine is no reason to start at login.
+        let config = set(Mode::Remote, Some("https://n.example.org"));
+        assert!(!config.setup.autostart_offered);
+        assert_eq!(count(), 0);
+        let config = set(Mode::Local, None);
+        assert!(config.setup.autostart_offered);
+        assert!(config::load(dir.path()).setup.autostart_offered);
+        assert_eq!(count(), 1);
+        // Never again, also when General turned it off and the mode changes back and forth.
+        set(Mode::Remote, Some("https://n.example.org"));
+        set(Mode::Local, None);
+        assert_eq!(count(), 1);
+    }
+
+    #[test]
+    fn another_account_forgets_the_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        state
+            .set_mode(Mode::Local, Some("/data/a".into()), None)
+            .unwrap();
+        let log_in = |slug: &str| {
+            state
+                .try_update(|c| {
+                    c.account = Some(slug.to_owned());
+                    Ok::<(), ()>(())
+                })
+                .ok()
+                .unwrap();
+        };
+        let checked = |state: &ConfigState| {
+            let mark = config::SyncMark {
+                key: token_key(&state.current()).unwrap(),
+                seq: 7,
+            };
+            assert_eq!(state.take_sync_mark(mark), Ok(true));
+            state
+                .try_update(|c| {
+                    c.setup.sync_checked = Some(config::SyncCheck::default());
+                    Ok::<(), ()>(())
+                })
+                .ok()
+                .unwrap();
+            state
+                .set_setup_record(serde_json::from_str(r#"{"syncAcknowledged":true}"#).unwrap())
+                .unwrap();
+            let setup = state.current().setup;
+            assert!(setup.sync_mark.is_some() && setup.sync_checked.is_some());
+            assert!(setup.sync_acknowledged);
+        };
+        let forgotten = |state: &ConfigState| {
+            let setup = state.current().setup;
+            assert_eq!(
+                (setup.sync_mark, setup.sync_checked, setup.sync_acknowledged),
+                (None, None, false)
+            );
+        };
+        log_in("jordi");
+        // A mark of another account is not taken.
+        let other = config::SyncMark {
+            key: "local|other".into(),
+            seq: 7,
+        };
+        assert_eq!(state.take_sync_mark(other), Ok(false));
+        assert_eq!(state.current().setup.sync_mark, None);
+        checked(&state);
+        // Saving other things keeps it.
+        state.set_start_view(StartView::Columns).unwrap();
+        assert!(state.current().setup.sync_mark.is_some());
+        // A login to another account.
+        log_in("anna");
+        forgotten(&state);
+        // Log out.
+        checked(&state);
+        state.forget_login().unwrap();
+        forgotten(&state);
+        // Another server.
+        log_in("jordi");
+        checked(&state);
+        state
+            .set_mode(Mode::Local, Some("/data/b".into()), None)
+            .unwrap();
+        forgotten(&state);
+        assert!(config::load(dir.path()).setup.sync_mark.is_none());
+    }
+
+    #[test]
+    fn the_setup_record_takes_only_what_the_window_sends() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load(dir.path().to_owned());
+        let change = |json: &str| {
+            state
+                .set_setup_record(serde_json::from_str(json).unwrap())
+                .map(|c| c.setup)
+        };
+        let setup = change(
+            r#"{"backupUrl":" http://192.168.1.20:8089 ","backupDir":"~/supernote-backup-2026-11-17","snbak":"/x/a.snbak"}"#,
+        )
+        .unwrap();
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(
+            setup.backup_url.as_deref(),
+            Some("http://192.168.1.20:8089")
+        );
+        assert_eq!(
+            setup.backup_dir,
+            Some(home.join("supernote-backup-2026-11-17"))
+        );
+        assert_eq!(setup.snbak, Some(PathBuf::from("/x/a.snbak")));
+        // A field that is left out stays; null clears it.
+        let setup = change(r#"{"snbak":null}"#).unwrap();
+        assert_eq!(setup.snbak, None);
+        assert!(setup.backup_dir.is_some() && setup.backup_url.is_some());
+        // A folder must be a full path.
+        assert_eq!(
+            change(r#"{"backupDir":"backup"}"#).unwrap_err(),
+            NEEDS_FULL_PATH
+        );
+        // The window cannot set what Rust keeps.
+        assert!(serde_json::from_str::<config::SetupChange>(r#"{"syncMark":null}"#).is_err());
+        assert!(serde_json::from_str::<config::SetupChange>(r#"{"setupShown":true}"#).is_err());
+        assert_eq!(config::load(dir.path()).setup, state.current().setup);
+    }
+
+    #[test]
+    fn the_snbak_time_is_the_file_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.snbak");
+        std::fs::write(&file, "x").unwrap();
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_763_300_000_123);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        assert_eq!(file_time_ms(&file), Ok(1_763_300_000_123));
+        assert!(file_time_ms(&dir.path().join("missing.snbak")).is_err());
     }
 }

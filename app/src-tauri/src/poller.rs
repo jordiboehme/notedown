@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use crate::config::{self, AppConfig, ExistingSetup, Mode};
+use crate::config::{self, AppConfig, ExistingSetup, Mode, SyncMark};
 use crate::process::{self, SpawnFn};
 use crate::processes::ProcessStates;
 use crate::serve_info::{self, ServeInfo};
@@ -90,6 +90,8 @@ pub trait Sources: Send + Sync {
     fn pipeline_status(&self, args: &[String]) -> PipelineCall;
     /// `GET <base>/account`, with the token when there is one.
     fn account(&self, base: &str, token: Option<&Token>) -> AccountAnswer;
+    /// The highest journal number of the token's account: the `end` of `GET <base>/events`.
+    fn events_end(&self, base: &str, token: &Token) -> Result<u64, String>;
 }
 
 /// What the poller reads from the rest of the app at each tick.
@@ -104,6 +106,7 @@ pub struct Inputs {
 pub type InputsFn = Arc<dyn Fn() -> Inputs + Send + Sync>;
 
 type Listener = Box<dyn Fn(&Status) + Send + Sync>;
+type MarkListener = Box<dyn Fn(SyncMark) + Send + Sync>;
 
 /// The status poller. Cheap to share: clones use the same state.
 #[derive(Clone)]
@@ -120,6 +123,8 @@ struct Inner {
     /// Taken before `state` while a status is made and handed out, so listeners see the
     /// statuses in order.
     listeners: Mutex<Vec<Listener>>,
+    /// Gets the sync mark of an account on another machine (see [`Poller::on_sync_mark`]).
+    marks: Mutex<Option<MarkListener>>,
     stopped: AtomicBool,
 }
 
@@ -233,6 +238,7 @@ impl Poller {
                 clock,
                 state: Mutex::new(State::default()),
                 listeners: Mutex::new(Vec::new()),
+                marks: Mutex::new(None),
                 stopped: AtomicBool::new(false),
             }),
         }
@@ -275,6 +281,13 @@ impl Poller {
     /// [`Poller::on_status`].
     pub fn on_status(&self, cb: impl Fn(&Status) + Send + Sync + 'static) {
         lock(&self.inner.listeners).push(Box::new(cb));
+    }
+
+    /// `cb` gets the sync mark of an account on another machine: the journal end when a poll
+    /// first sees its files imported while the config has no mark for it. It runs on a poller
+    /// thread; the config checks again that the mark still belongs to the account.
+    pub fn on_sync_mark(&self, cb: impl Fn(SyncMark) + Send + Sync + 'static) {
+        *lock(&self.inner.marks) = Some(Box::new(cb));
     }
 
     /// No poll runs.
@@ -362,11 +375,18 @@ impl Inner {
 
     fn poll_account(&self, config: &AppConfig, base: &str) {
         // The token is read here, on the poll's thread: the Keychain may take its time.
-        let (had_token, answer) = match token_key(config).map(|k| self.tokens.get(&k)) {
-            None | Some(Ok(None)) => (false, self.sources.account(base, None)),
-            Some(Ok(Some(token))) => (true, self.sources.account(base, Some(&token))),
-            Some(Err(e)) => (false, AccountAnswer::Failed(e.to_string())),
+        let (token, answer) = match token_key(config).map(|k| self.tokens.get(&k)) {
+            None | Some(Ok(None)) => (None, self.sources.account(base, None)),
+            Some(Ok(Some(token))) => {
+                let answer = self.sources.account(base, Some(&token));
+                (Some(token), answer)
+            }
+            Some(Err(e)) => (None, AccountAnswer::Failed(e.to_string())),
         };
+        let had_token = token.is_some();
+        if let Some(token) = &token {
+            self.mark_remote(config, base, token, &answer);
+        }
         let key = Key::of(config);
         let current = self.current_key();
         {
@@ -394,6 +414,38 @@ impl Inner {
         }
         self.refresh();
         lock(&self.state).account.busy = false;
+    }
+
+    /// On another machine the import is done there: the first poll that sees the files
+    /// imported, with no mark for the account yet, takes the mark.
+    fn mark_remote(&self, config: &AppConfig, base: &str, token: &Token, answer: &AccountAnswer) {
+        let AccountAnswer::Account(info) = answer else {
+            return;
+        };
+        if config.mode != Mode::Remote || info.imported != Some(true) {
+            return;
+        }
+        let Some(key) = token_key(config) else {
+            return;
+        };
+        if config
+            .setup
+            .sync_mark
+            .as_ref()
+            .is_some_and(|m| m.key == key)
+        {
+            return;
+        }
+        if lock(&self.marks).is_none() {
+            return;
+        }
+        // A failed call is tried again at the next poll.
+        let Ok(seq) = self.sources.events_end(base, token) else {
+            return;
+        };
+        if let Some(cb) = lock(&self.marks).as_ref() {
+            cb(SyncMark { key, seq });
+        }
     }
 
     fn current_key(&self) -> Key {
@@ -467,6 +519,10 @@ impl RealSources {
 impl Sources for RealSources {
     fn pipeline_status(&self, args: &[String]) -> PipelineCall {
         run_status(&self.spawn, args, STATUS_TIMEOUT)
+    }
+
+    fn events_end(&self, base: &str, token: &Token) -> Result<u64, String> {
+        crate::import_job::events_end(base, token.clone())
     }
 
     fn account(&self, base: &str, token: Option<&Token>) -> AccountAnswer {

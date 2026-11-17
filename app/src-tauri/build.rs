@@ -60,6 +60,16 @@ const COMMANDS: &[&str] = &[
     "create_account",
     "connect_pipeline",
     "existing_details",
+    "backup_start",
+    "backup_pause",
+    "backup_folder",
+    "import_dry_run",
+    "import_run",
+    "app_data_dry_run",
+    "app_data_run",
+    "job_state",
+    "set_setup_record",
+    "snbak_time",
 ];
 
 fn main() {

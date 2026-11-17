@@ -39,6 +39,9 @@ struct Fake {
     account_calls: Mutex<Vec<(String, bool)>>,
     pipeline_answer: Mutex<Option<PipelineCall>>,
     account_answer: Mutex<Option<AccountAnswer>>,
+    /// The bases `events_end` was asked for, and its answer.
+    events_calls: Mutex<Vec<String>>,
+    events_answer: Mutex<Option<Result<u64, String>>>,
     /// While true, every call waits.
     held: Mutex<bool>,
     released: Condvar,
@@ -96,6 +99,13 @@ impl Sources for Fake {
             .unwrap_or(AccountAnswer::Refused);
         self.leave();
         answer
+    }
+
+    fn events_end(&self, base: &str, _token: &Token) -> Result<u64, String> {
+        lock(&self.events_calls).push(base.to_owned());
+        lock(&self.events_answer)
+            .clone()
+            .unwrap_or_else(|| Err("no answer".to_owned()))
     }
 }
 
@@ -784,4 +794,68 @@ fn an_address_in_a_line_has_no_credentials() {
         "http://127.0.0.1:19072/rest/v1"
     );
     assert_eq!(shown("not a url"), "the server");
+}
+
+#[test]
+fn the_poller_takes_the_mark_of_an_import_on_another_machine() {
+    use crate::config::SyncMark;
+    let url = "https://n.example.org";
+    let key = format!("{url}|jordi");
+    let rig = Rig::new(AppConfig {
+        mode: Mode::Remote,
+        server_url: Some(url.into()),
+        account: Some("jordi".into()),
+        ..AppConfig::default()
+    });
+    rig.tokens.set(&key, &Token::new("t")).unwrap();
+    let marks: Arc<Mutex<Vec<SyncMark>>> = Arc::default();
+    let seen = marks.clone();
+    rig.poller.on_sync_mark(move |mark| lock(&seen).push(mark));
+    let account = |imported: Option<bool>| {
+        AccountAnswer::Account(AccountInfo {
+            slug: "jordi".into(),
+            imported,
+            ..AccountInfo::default()
+        })
+    };
+    *lock(&rig.fake.events_answer) = Some(Ok(813));
+    // Not imported yet, or an older server that does not say: no mark.
+    for imported in [Some(false), None] {
+        *lock(&rig.fake.account_answer) = Some(account(imported));
+        rig.poller.poll_now();
+        rig.settle();
+    }
+    assert!(lock(&rig.fake.events_calls).is_empty());
+    // A failed call is tried again at the next poll.
+    *lock(&rig.fake.account_answer) = Some(account(Some(true)));
+    *lock(&rig.fake.events_answer) = Some(Err("no answer".into()));
+    rig.poller.poll_now();
+    rig.settle();
+    assert!(lock(&marks).is_empty());
+    *lock(&rig.fake.events_answer) = Some(Ok(813));
+    rig.poller.poll_now();
+    rig.settle();
+    assert_eq!(
+        *lock(&marks),
+        vec![SyncMark {
+            key: key.clone(),
+            seq: 813
+        }]
+    );
+    assert_eq!(
+        *lock(&rig.fake.events_calls),
+        vec![format!("{url}/rest/v1"); 2]
+    );
+    // With the mark in the config, no second one.
+    lock(&rig.inputs).config.setup.sync_mark = Some(SyncMark { key, seq: 813 });
+    rig.poller.poll_now();
+    rig.settle();
+    assert_eq!(lock(&marks).len(), 1);
+    // This Mac's server takes its mark when the app imports, not from the poll.
+    lock(&rig.inputs).config = local_config(Some("jordi"));
+    rig.tokens.set("local|jordi", &Token::new("t")).unwrap();
+    rig.poller.poll_now();
+    rig.settle();
+    assert_eq!(lock(&marks).len(), 1);
+    assert_eq!(lock(&rig.fake.events_calls).len(), 2);
 }

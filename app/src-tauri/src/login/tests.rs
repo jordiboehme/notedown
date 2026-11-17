@@ -774,6 +774,7 @@ fn set_mode_now(
         server_url.map(str::to_owned),
         || {},
         serve_info,
+        || {},
     ))
     .unwrap()
 }
@@ -1202,6 +1203,7 @@ fn a_new_server_revokes_the_old_token() {
             *restart_saw.lock().unwrap() = Some(heard.load(std::sync::atomic::Ordering::SeqCst));
         },
         &serve_info,
+        || {},
     ))
     .unwrap();
     let request = server.next();

@@ -2,6 +2,7 @@
 
 pub mod commands;
 pub mod config;
+pub mod import_job;
 pub mod library;
 pub mod login;
 pub mod model;
@@ -30,6 +31,7 @@ use std::sync::{Arc, mpsc};
 
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
 
+use import_job::{AppHost as ImportHost, ImportJobs, JobEvent};
 use library::{LIBRARY_EVENT, Library, LibraryEvent};
 use model::{ModelControl, ModelEvent};
 use notes::{NOTES_EVENT, NOTES_EVERY, Notes};
@@ -122,6 +124,22 @@ pub fn run() {
             app.manage(model_control(app.handle().clone(), sidecar_spawn.clone()));
             app.manage(setup::Sidecar(sidecar_spawn.clone()));
             let poller = status_poller(sidecar_spawn.clone(), reader, processes.clone());
+            let marking = app.state::<commands::ConfigState>().inner().clone();
+            poller.on_sync_mark(move |mark| {
+                if let Err(why) = marking.take_sync_mark(mark) {
+                    eprintln!("notedown: the import mark was not saved: {why}");
+                }
+            });
+            app.manage(import_jobs(
+                app.handle().clone(),
+                sidecar_spawn.clone(),
+                ImportHost {
+                    config: app.state::<commands::ConfigState>().inner().clone(),
+                    processes: processes.clone(),
+                    poller: poller.clone(),
+                    store: Arc::new(KeychainStore::new()),
+                },
+            ));
             let library = library_for(
                 app.handle().clone(),
                 library_reader,
@@ -215,7 +233,17 @@ pub fn run() {
             commands::recheck,
             commands::create_account,
             commands::connect_pipeline,
-            commands::existing_details
+            commands::existing_details,
+            commands::backup_start,
+            commands::backup_pause,
+            commands::backup_folder,
+            commands::import_dry_run,
+            commands::import_run,
+            commands::app_data_dry_run,
+            commands::app_data_run,
+            commands::job_state,
+            commands::set_setup_record,
+            commands::snbak_time
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
@@ -296,7 +324,8 @@ pub fn reprobe_outside(app: &AppHandle) {
     });
 }
 
-/// Stops both children and the model download for good, all at once.
+/// Stops both children, the model download and the setup's backup or import for good, all at
+/// once.
 fn stop_for_good(app: &AppHandle) {
     if let Some(poller) = app.try_state::<Poller>() {
         poller.stop();
@@ -306,9 +335,14 @@ fn stop_for_good(app: &AppHandle) {
         review.quit();
     }
     let model = app.try_state::<ModelControl>().map(|m| m.inner().clone());
+    let jobs = app.try_state::<ImportJobs>().map(|j| j.inner().clone());
     std::thread::scope(|s| {
         if let Some(model) = model {
             s.spawn(move || model.quit());
+        }
+        // An import that Quit ends does not start the server again.
+        if let Some(jobs) = jobs {
+            s.spawn(move || jobs.quit());
         }
         if let Some(processes) = app.try_state::<Arc<Processes>>() {
             processes.quit();
@@ -337,6 +371,34 @@ fn model_control(app: AppHandle, spawn: process::SpawnFn) -> ModelControl {
         Arc::new(move |event: &ModelEvent| {
             let _ = tx.send(event.clone());
         }),
+    )
+}
+
+/// The backup and the imports of the setup. Their events only go into a channel; a thread of
+/// its own emits them.
+fn import_jobs(app: AppHandle, spawn: process::SpawnFn, host: ImportHost) -> ImportJobs {
+    let (tx, rx) = mpsc::channel::<JobEvent>();
+    std::thread::spawn(move || {
+        for event in rx {
+            let _ = match event {
+                JobEvent::Progress(progress) => {
+                    app.emit(import_job::SETUP_JOB_PROGRESS_EVENT, progress)
+                }
+                JobEvent::Done(result) => app.emit(import_job::SETUP_JOB_DONE_EVENT, result),
+                JobEvent::Failed { kind, text } => app.emit(
+                    import_job::SETUP_JOB_FAILED_EVENT,
+                    serde_json::json!({ "kind": kind, "text": text }),
+                ),
+            };
+        }
+    });
+    ImportJobs::new(
+        spawn,
+        import_job::JOB_GRACE,
+        Arc::new(move |event: &JobEvent| {
+            let _ = tx.send(event.clone());
+        }),
+        Arc::new(host),
     )
 }
 
@@ -582,7 +644,7 @@ mod tests {
         names.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    const SETTINGS_ONLY: [&str; 25] = [
+    const SETTINGS_ONLY: [&str; 35] = [
         "get_config",
         "set_mode",
         "set_start_view",
@@ -608,6 +670,16 @@ mod tests {
         "create_account",
         "connect_pipeline",
         "existing_details",
+        "backup_start",
+        "backup_pause",
+        "backup_folder",
+        "import_dry_run",
+        "import_run",
+        "app_data_dry_run",
+        "app_data_run",
+        "job_state",
+        "set_setup_record",
+        "snbak_time",
     ];
 
     #[test]
@@ -692,7 +764,8 @@ mod tests {
             ])
         );
         // The settings follow events, name the window after the page and show the version.
-        // They alone open the folder picker of the Markdown folder.
+        // They alone open the folder picker (the Markdown folder, the backup folder, the
+        // `.snbak` file).
         assert_eq!(
             core("settings"),
             set(&[
@@ -728,7 +801,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 55);
+        assert_eq!(handler_commands().len(), 65);
     }
 
     #[test]
@@ -789,6 +862,16 @@ mod tests {
             "create_account",
             "connect_pipeline",
             "existing_details",
+            "backup_start",
+            "backup_pause",
+            "backup_folder",
+            "import_dry_run",
+            "import_run",
+            "app_data_dry_run",
+            "app_data_run",
+            "job_state",
+            "set_setup_record",
+            "snbak_time",
         ]);
         assert_eq!(manifest_commands(), all);
         // Every granted command is a real one.

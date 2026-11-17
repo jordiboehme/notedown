@@ -158,6 +158,16 @@ const config: AppConfig = {
   email: null,
   startView: "tree",
   markdownDirs: {},
+  setup: {
+    backupUrl: null,
+    backupDir: null,
+    snbak: null,
+    setupShown: false,
+    autostartOffered: false,
+    syncMark: null,
+    syncChecked: null,
+    syncAcknowledged: false,
+  },
 };
 
 const answer = (account: string): ConfigAnswer => ({

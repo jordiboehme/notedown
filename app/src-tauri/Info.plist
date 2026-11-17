@@ -12,5 +12,9 @@
 	<string>Notedown reads files you drop on the library and writes the Markdown of your notes when your Markdown folder is on the Desktop.</string>
 	<key>NSDocumentsFolderUsageDescription</key>
 	<string>Notedown reads files you drop on the library and writes the Markdown of your notes to your Markdown folder.</string>
+	<!-- macOS asks once before Notedown reaches devices on the local network (the backup of the
+	     Supernote, a server on another machine); this text says why. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Notedown talks to your Supernote and to your Notedown server on the local network.</string>
 </dict>
 </plist>

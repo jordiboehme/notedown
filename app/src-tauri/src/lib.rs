@@ -371,8 +371,19 @@ fn save_update_check(app: &AppHandle, at_ms: u64) {
     }
 }
 
+/// Saves the version a found update was shown for.
+fn save_update_shown(app: &AppHandle, version: &str) {
+    if let Err(why) = app
+        .state::<commands::ConfigState>()
+        .set_last_update_shown(version)
+    {
+        eprintln!("notedown: the update shown was not saved: {why}");
+    }
+}
+
 /// The automatic check: at start, then every hour it checks when 24 hours have passed since
-/// the last answer. A found update opens Settings on About; a failure is only logged.
+/// the last answer. A found update opens Settings on About once per new version
+/// ([`update::should_show`]); a failure is only logged.
 fn check_updates(app: AppHandle) {
     std::thread::spawn(move || {
         let clock = supervisor::system_clock();
@@ -389,7 +400,16 @@ fn check_updates(app: AppHandle) {
                 || update::check_github(&app),
             );
             match round {
-                Round::Checked(Ok(Some(_))) => show_about(&app),
+                Round::Checked(Ok(Some(found))) => {
+                    let shown = app
+                        .state::<commands::ConfigState>()
+                        .current()
+                        .last_update_shown;
+                    if update::should_show(&found.version, shown.as_deref()) {
+                        save_update_shown(&app, &found.version);
+                        show_about(&app);
+                    }
+                }
                 Round::Checked(Err(why)) => eprintln!("notedown: the update check failed: {why}"),
                 _ => {}
             }
@@ -404,8 +424,12 @@ pub fn check_update_now(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
     let answer = app
         .state::<AppUpdates>()
         .check_now(|| update::check_github(app));
-    if answer.is_ok() {
+    if let Ok(found) = &answer {
         save_update_check(app, supervisor::system_clock()());
+        // The user sees it now: the daily check does not open About for it again.
+        if let Some(found) = found {
+            save_update_shown(app, &found.version);
+        }
     }
     answer
 }
@@ -427,11 +451,15 @@ pub fn check_update_from_menu(app: &AppHandle) {
 pub async fn install_update_and_restart(app: AppHandle) -> Result<(), String> {
     let updates = app.state::<AppUpdates>();
     let Some((_, found)) = updates.start_install() else {
-        return Err(if updates.is_installing() {
-            "the update is being installed already".to_owned()
-        } else {
-            "there is no update to install".to_owned()
-        });
+        if updates.is_installing() {
+            // A second click: the first install runs on.
+            return Err("the update is being installed already".to_owned());
+        }
+        // The page showed an update that is no longer known: check again, so it shows the
+        // answer (up to date, a found update or why the check failed).
+        let checking = app.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || check_update_now(&checking)).await;
+        return Err("there is no update to install".to_owned());
     };
     if let Err(why) = found.download_and_install(|_, _| {}, || {}).await {
         let reason = why.to_string();

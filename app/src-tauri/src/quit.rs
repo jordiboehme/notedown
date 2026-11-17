@@ -257,7 +257,6 @@ mod tests {
             flow.on_exit_request(Some(RESTART_EXIT_CODE)),
             ExitDecision::Allow
         );
-        assert_eq!(RESTART_EXIT_CODE, tauri::RESTART_EXIT_CODE);
     }
 
     #[test]

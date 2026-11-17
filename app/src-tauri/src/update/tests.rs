@@ -274,3 +274,54 @@ fn a_second_install_while_one_runs_gets_nothing() {
     assert!(!updates.is_installing());
     assert!(updates.start_install().is_some());
 }
+
+#[test]
+fn about_opens_once_per_new_version() {
+    // Never shown: open.
+    assert!(should_show("0.2.0", None));
+    // Shown already: not again each day.
+    assert!(!should_show("0.2.0", Some("0.2.0")));
+    // A newer one opens again; an older one (a release taken back) does not.
+    assert!(should_show("0.2.1", Some("0.2.0")));
+    assert!(should_show("0.10.0", Some("0.9.0")));
+    assert!(!should_show("0.1.9", Some("0.2.0")));
+    // A version that is not semver: open when it is another one.
+    assert!(should_show("next", Some("0.2.0")));
+    assert!(!should_show("next", Some("next")));
+}
+
+#[test]
+fn a_quiet_check_without_an_update_clears_a_failed_install() {
+    let (updates, told) = updates();
+    updates.check_now(|| found("0.2.0")).unwrap();
+    updates.start_install().unwrap();
+    updates.install_failed("x");
+    assert_eq!(updates.check_quietly(|| Ok(None)), Ok(None));
+    // No Install button for an update that is gone.
+    assert_eq!(updates.state(), UpdateState::Idle);
+    assert_eq!(told.lock().unwrap().last(), Some(&UpdateState::Idle));
+}
+
+#[test]
+fn two_checks_never_run_at_once() {
+    let (updates, _) = updates();
+    let inner = Cell::new(None);
+    let outer = updates.check_now(|| {
+        // A second check (the timer, a second click) while this one runs.
+        inner.set(Some(updates.check_now(|| panic!("a second check"))));
+        assert!(
+            updates
+                .check_quietly(|| panic!("a second quiet check"))
+                .is_err()
+        );
+        Ok(None)
+    });
+    assert_eq!(outer, Ok(None));
+    assert!(inner.take().unwrap().is_err());
+    assert_eq!(updates.state(), UpdateState::UpToDate);
+    // Once it is done, the next check runs.
+    assert_eq!(
+        updates.check_now(|| found("0.2.0")).map(|f| f.is_some()),
+        Ok(true)
+    );
+}

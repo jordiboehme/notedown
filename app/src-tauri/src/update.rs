@@ -63,6 +63,19 @@ pub fn should_check(last_check_ms: Option<u64>, now_ms: u64) -> bool {
     }
 }
 
+/// Whether a found update opens Settings on About: once per new version, so a user who does
+/// not install it is not asked again each day. Only a newer version than the one shown last
+/// opens it again; a version that is not semver opens it when it is another one.
+pub fn should_show(found: &str, last_shown: Option<&str>) -> bool {
+    let Some(shown) = last_shown else {
+        return true;
+    };
+    match (semver::Version::parse(found), semver::Version::parse(shown)) {
+        (Ok(found), Ok(shown)) => found > shown,
+        _ => found != shown,
+    }
+}
+
 /// What one check answers: the update found with its handle for the install, none, or why it
 /// failed.
 pub type Checked<P> = Result<Option<(UpdateInfo, P)>, String>;
@@ -80,6 +93,8 @@ pub struct Updates<P> {
 struct Inner<P> {
     state: UpdateState,
     found: Option<(UpdateInfo, P)>,
+    /// A check runs: a second one does not start.
+    checking: bool,
 }
 
 impl<P: Clone> Updates<P> {
@@ -88,6 +103,7 @@ impl<P: Clone> Updates<P> {
             inner: Mutex::new(Inner {
                 state: UpdateState::Idle,
                 found: None,
+                checking: false,
             }),
             listener,
         }
@@ -109,7 +125,8 @@ impl<P: Clone> Updates<P> {
         }
     }
 
-    /// A check the user asked for: Checking, then the answer. Not while an install runs.
+    /// A check the user asked for: Checking, then the answer. Not while an install or another
+    /// check runs.
     pub fn check_now(
         &self,
         check: impl FnOnce() -> Checked<P>,
@@ -130,17 +147,27 @@ impl<P: Clone> Updates<P> {
         check: impl FnOnce() -> Checked<P>,
         quiet: bool,
     ) -> Result<Option<UpdateInfo>, String> {
-        let mut installing = false;
+        let mut busy = None;
         self.tell(|inner| {
-            installing = matches!(inner.state, UpdateState::Installing { .. });
-            (!installing && !quiet).then(|| {
+            if matches!(inner.state, UpdateState::Installing { .. }) {
+                busy = Some("Notedown is installing an update");
+                return None;
+            }
+            if inner.checking {
+                busy = Some("an update check runs already");
+                return None;
+            }
+            inner.checking = true;
+            (!quiet).then(|| {
                 inner.state = UpdateState::Checking;
                 inner.state.clone()
             })
         });
-        if installing {
-            return Err("Notedown is installing an update".to_owned());
+        if let Some(why) = busy {
+            return Err(why.to_owned());
         }
+        // Done even when the check panics, so later checks still run.
+        let _done = CheckDone(self);
         let answer = check();
         let result = answer
             .as_ref()
@@ -160,8 +187,11 @@ impl<P: Clone> Updates<P> {
                     inner.found = None;
                     match (&inner.state, quiet) {
                         (_, false) => UpdateState::UpToDate,
-                        // An update shown before is gone (a release taken back).
-                        (UpdateState::Found { .. }, true) => UpdateState::Idle,
+                        // An update shown before is gone (a release taken back): no
+                        // Install button for it, also after a failed install.
+                        (UpdateState::Found { .. } | UpdateState::InstallFailed { .. }, true) => {
+                            UpdateState::Idle
+                        }
                         (_, true) => return None,
                     }
                 }
@@ -225,6 +255,15 @@ pub fn check_github(app: &tauri::AppHandle) -> Checked<tauri_plugin_updater::Upd
         };
         (info, update)
     }))
+}
+
+/// Ends the running check of [`Updates::check`] on drop.
+struct CheckDone<'a, P: Clone>(&'a Updates<P>);
+
+impl<P: Clone> Drop for CheckDone<'_, P> {
+    fn drop(&mut self) {
+        self.0.lock().checking = false;
+    }
 }
 
 /// What a round of the automatic check did.

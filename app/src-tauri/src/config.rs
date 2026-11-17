@@ -52,6 +52,9 @@ pub struct AppConfig {
     /// When the updater last got an answer from GitHub, in ms since 1970 (this Mac's clock).
     /// It checks again 24 hours later ([`crate::update::should_check`]).
     pub last_update_check_ms: Option<u64>,
+    /// The newest version a found update opened Settings on About for. The daily check opens
+    /// it again only for a newer one ([`crate::update::should_show`]).
+    pub last_update_shown: Option<String>,
 }
 
 /// What the setup checklist keeps: the backup and import choices, what was shown or offered
@@ -297,6 +300,7 @@ impl Default for AppConfig {
             markdown_dirs: BTreeMap::new(),
             setup: SetupRecord::default(),
             last_update_check_ms: None,
+            last_update_shown: None,
         }
     }
 }
@@ -459,6 +463,7 @@ mod tests {
                 sync_acknowledged: true,
             },
             last_update_check_ms: Some(1_763_300_000_000),
+            last_update_shown: Some("0.2.0".into()),
         }
     }
 
@@ -480,6 +485,15 @@ mod tests {
         fs::write(dir.path().join(FILE), r#"{"mode":"local"}"#).unwrap();
         assert_eq!(load(dir.path()).last_update_check_ms, None);
         assert_eq!(AppConfig::default().last_update_check_ms, None);
+        assert_eq!(AppConfig::default().last_update_shown, None);
+        let config = AppConfig {
+            last_update_shown: Some("0.2.0".into()),
+            ..AppConfig::default()
+        };
+        save(dir.path(), &config).unwrap();
+        let text = fs::read_to_string(dir.path().join(FILE)).unwrap();
+        assert!(text.contains("\"lastUpdateShown\""), "{text}");
+        assert_eq!(load(dir.path()).last_update_shown.as_deref(), Some("0.2.0"));
     }
 
     #[test]

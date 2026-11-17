@@ -56,7 +56,7 @@ describe("the update lines", () => {
     expect(all.filter(canCheck).map((s) => s.kind)).toEqual(["idle", "found", "upToDate", "failed", "installFailed"]);
     expect(all.filter(canInstall).map((s) => s.kind)).toEqual(["found", "installFailed"]);
     for (const state of all) {
-      for (const line of updateLines(state)) expect(line).not.toMatch(/[–—]/);
+      for (const line of updateLines(state)) expect(line).not.toMatch(/[\u2013\u2014]/);
     }
   });
 });

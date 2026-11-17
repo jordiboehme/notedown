@@ -332,14 +332,27 @@ impl ConfigState {
     }
 
     /// Saves when the updater last got an answer. A save the user did not make: a config that
-    /// was reset at start stays reported until the next change of the user.
+    /// was reset at start stays reported until the next change of the user. The time stays in
+    /// memory when the save fails, so the timer does not ask GitHub again every hour.
     pub fn set_last_update_check(&self, at_ms: u64) -> Result<(), String> {
+        self.save_quietly(|c| c.last_update_check_ms = Some(at_ms))
+    }
+
+    /// Saves the version a found update opened About for, like
+    /// [`set_last_update_check`](Self::set_last_update_check).
+    pub fn set_last_update_shown(&self, version: &str) -> Result<(), String> {
+        self.save_quietly(|c| c.last_update_shown = Some(version.to_owned()))
+    }
+
+    /// A change of the updater's own: in memory first, then saved; the reset note stays.
+    fn save_quietly(&self, change: impl FnOnce(&mut AppConfig)) -> Result<(), String> {
         let _saving = self.saving.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut next = self.current();
-        next.last_update_check_ms = Some(at_ms);
-        (self.save)(&self.dir, &next).map_err(|e| format!("the config was not saved: {e}"))?;
-        *self.config.lock().unwrap_or_else(PoisonError::into_inner) = next;
-        Ok(())
+        let next = {
+            let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
+            change(&mut config);
+            config.clone()
+        };
+        (self.save)(&self.dir, &next).map_err(|e| format!("the config was not saved: {e}"))
     }
 
     /// Both imports are done: the backup folder and the `.snbak` are no longer needed.
@@ -1764,6 +1777,23 @@ mod tests {
             state.current().last_update_check_ms,
             Some(1_763_400_000_000)
         );
+    }
+
+    #[test]
+    fn the_updater_times_stay_in_memory_when_the_save_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ConfigState::load_with(
+            dir.path().to_owned(),
+            Arc::new(|_: &Path, _: &AppConfig| Err(std::io::Error::other("disk full"))),
+        );
+        // Else the timer would ask GitHub every hour and open About each time.
+        assert!(state.set_last_update_check(1_763_400_000_000).is_err());
+        assert_eq!(
+            state.current().last_update_check_ms,
+            Some(1_763_400_000_000)
+        );
+        assert!(state.set_last_update_shown("0.2.0").is_err());
+        assert_eq!(state.current().last_update_shown.as_deref(), Some("0.2.0"));
     }
 
     #[test]

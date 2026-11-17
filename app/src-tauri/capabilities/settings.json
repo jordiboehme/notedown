@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "settings",
-  "description": "The settings window: it names itself after the page it shows and is the only window that changes the config, the children, the login, the model and Start at login, and the only one that opens the folder picker (for the Markdown folder; the plugin has no folder-only permission, the window asks for a folder). Start at login goes through Rust commands, so no window gets the autostart plugin's permissions. It follows events and shows the app version on the About page.",
+  "description": "The settings window: it names itself after the page it shows and is the only window that changes the config, the children, the login, the setup's account and pipeline connection, the model and Start at login, and the only one that opens the folder picker (for the Markdown folder; the plugin has no folder-only permission, the window asks for a folder). Start at login goes through Rust commands, so no window gets the autostart plugin's permissions. It follows events and shows the app version on the About page.",
   "windows": ["settings"],
   "permissions": [
     "core:app:allow-version",
@@ -30,6 +30,9 @@
     "allow-markdown-dir",
     "allow-set-markdown-dir",
     "allow-show-markdown-dir",
-    "allow-recheck"
+    "allow-recheck",
+    "allow-create-account",
+    "allow-connect-pipeline",
+    "allow-existing-details"
   ]
 }

@@ -16,6 +16,7 @@ use crate::poller::{Poller, rest_base};
 use crate::processes::{ProcessStates, Processes};
 use crate::review::{DataUrl, NoteView, Review};
 use crate::serve_info::ServeInfo;
+use crate::setup::{self, ExistingFolder, Sidecar};
 use crate::status::Status;
 use crate::token::{KeychainStore, Token, TokenStore, token_key};
 use crate::windows::{self, Opening, WindowKind};
@@ -267,6 +268,14 @@ pub const ABOUT_LINKS: [&str; 2] = [
     "https://github.com/jordiboehme/notedown",
 ];
 
+/// The setup's links to the instructions on GitHub: getting started, the server on another
+/// machine and the pipeline on a Mac.
+pub const SETUP_LINKS: [&str; 3] = [
+    "https://github.com/jordiboehme/notedown/blob/main/docs/getting-started.md",
+    "https://github.com/jordiboehme/notedown/blob/main/docs/getting-started.md#the-server-on-another-machine",
+    "https://github.com/jordiboehme/notedown/blob/main/docs/getting-started.md#a-pipeline-on-a-mac",
+];
+
 /// How many lines of each child's log the Server page shows.
 pub const LOG_SHOWN: usize = 30;
 
@@ -409,7 +418,7 @@ fn resolved(path: &Path) -> PathBuf {
 }
 
 pub fn allowed_link(url: &str) -> bool {
-    ABOUT_LINKS.contains(&url)
+    ABOUT_LINKS.contains(&url) || SETUP_LINKS.contains(&url)
 }
 
 pub fn last_lines(mut lines: Vec<String>, n: usize) -> Vec<String> {
@@ -715,6 +724,88 @@ pub async fn log_out(
 pub async fn recheck(poller: State<'_, Poller>) -> Result<(), String> {
     let poller = poller.inner().clone();
     tauri::async_runtime::spawn_blocking(move || poller.poll_now())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Makes an account on this Mac's server (Local mode only) with the sidecar, then logs in with
+/// it as Log in does, off the main thread. The password goes to the sidecar over stdin only.
+/// When the account was made but the login failed, the error says to log in with it.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn create_account(
+    config: State<'_, ConfigState>,
+    processes: State<'_, Arc<Processes>>,
+    poller: State<'_, Poller>,
+    gate: State<'_, Arc<LoginGate>>,
+    library: State<'_, Library>,
+    sidecar: State<'_, Sidecar>,
+    slug: String,
+    email: String,
+    password: String,
+) -> Result<ConfigAnswer, String> {
+    let state = config.inner().clone();
+    let gate = gate.inner().clone();
+    let library = library.inner().clone();
+    let spawn = sidecar.0.clone();
+    let serve_info = processes.serve_info();
+    let password = Password::new(password);
+    let answer = tauri::async_runtime::spawn_blocking(move || {
+        setup::create_and_log_in(
+            &spawn,
+            &gate,
+            &state,
+            &serve_info,
+            &KeychainStore::new(),
+            &library,
+            &slug,
+            &email,
+            &password,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    // Also after a failed login: the server has the account now.
+    relaunch_pipeline(config.inner(), processes.inner());
+    poller.poll_now();
+    answer
+}
+
+/// Connects this Mac's pipeline to the server on another machine (Remote mode only) with the
+/// config's address, folder and e-mail, off the main thread; then the pipeline starts and the
+/// status polls again. The password goes to the sidecar over stdin only.
+#[tauri::command]
+pub async fn connect_pipeline(
+    config: State<'_, ConfigState>,
+    processes: State<'_, Arc<Processes>>,
+    poller: State<'_, Poller>,
+    sidecar: State<'_, Sidecar>,
+    password: String,
+) -> Result<ConfigAnswer, String> {
+    let current = config.current();
+    let spawn = sidecar.0.clone();
+    let password = Password::new(password);
+    tauri::async_runtime::spawn_blocking(move || {
+        setup::connect_configured(&spawn, &current, &password)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    relaunch_pipeline(config.inner(), processes.inner());
+    poller.poll_now();
+    Ok(ConfigAnswer {
+        config: config.current(),
+        keychain: None,
+    })
+}
+
+/// What the config's data folder, `~/notedown-data` and `~/notedown-mac` hold (a server with
+/// its accounts, a pipeline with its server), off the main thread.
+#[tauri::command]
+pub async fn existing_details(
+    config: State<'_, ConfigState>,
+) -> Result<Vec<ExistingFolder>, String> {
+    let dirs = setup::setup_folders(&config.current());
+    tauri::async_runtime::spawn_blocking(move || setup::existing_details(&dirs))
         .await
         .map_err(|e| e.to_string())
 }
@@ -1105,7 +1196,7 @@ pub fn mcp_info(config: State<'_, ConfigState>) -> Result<McpInfo, String> {
     })
 }
 
-/// Opens one of the About links in the browser. No other address opens.
+/// Opens one of the About links or the setup's links in the browser. No other address opens.
 #[tauri::command]
 pub async fn open_link(url: String) -> Result<(), String> {
     if !allowed_link(&url) {
@@ -1724,9 +1815,15 @@ mod tests {
     }
 
     #[test]
-    fn only_the_about_links_open() {
+    fn only_the_about_and_setup_links_open() {
         assert!(allowed_link("https://ko-fi.com/V7V31T6CL9"));
         assert!(allowed_link("https://github.com/jordiboehme/notedown"));
+        for link in SETUP_LINKS {
+            assert!(allowed_link(link), "{link}");
+        }
+        assert!(!allowed_link(
+            "https://github.com/jordiboehme/notedown/blob/main/docs/other.md"
+        ));
         assert!(!allowed_link("https://example.org"));
         assert!(!allowed_link("file:///etc/passwd"));
     }

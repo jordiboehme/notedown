@@ -43,6 +43,33 @@ export interface ConfigAnswer {
   keychain: string | null;
 }
 
+/** A data folder on this Mac that holds a server, a pipeline or both. */
+export interface ExistingFolder {
+  path: string;
+  /** The accounts of a server folder, by name. */
+  server: { accounts: ExistingAccount[] } | null;
+  /** The server a pipeline folder reads from; url is null when pipeline.toml names none. */
+  pipeline: { url: string | null } | null;
+}
+
+export interface ExistingAccount {
+  slug: string;
+  email: string;
+  /** The device backup is imported. */
+  imported: boolean;
+}
+
+/** What Create account answers when the account was made but the login after it failed. */
+export const ACCOUNT_MADE = "The account is made. Log in with it.";
+
+/** The links to the instructions that open_link opens besides the About links. */
+export const SETUP_LINKS = {
+  gettingStarted: "https://github.com/jordiboehme/notedown/blob/main/docs/getting-started.md",
+  otherMachine:
+    "https://github.com/jordiboehme/notedown/blob/main/docs/getting-started.md#the-server-on-another-machine",
+  pipelineOnMac: "https://github.com/jordiboehme/notedown/blob/main/docs/getting-started.md#a-pipeline-on-a-mac",
+};
+
 export const getConfig = () => invoke<AppConfig>("get_config");
 export const setMode = (mode: Mode, dataDir: string | null, serverUrl: string | null) =>
   invoke<ConfigAnswer>("set_mode", { mode, dataDir, serverUrl });
@@ -61,6 +88,14 @@ export const hasLogin = () => invoke<boolean>("has_login");
 /** Deletes the login, forgets the account and asks the server to revoke the token (best
  * effort); answers the config without the account. */
 export const logOut = () => invoke<AppConfig>("log_out");
+/** Makes an account on this Mac's server, then logs in with it; answers the config with the
+ * account. */
+export const createAccount = (slug: string, email: string, password: string) =>
+  invoke<ConfigAnswer>("create_account", { slug, email, password });
+/** Connects this Mac's pipeline to the server on another machine with the config's e-mail. */
+export const connectPipeline = (password: string) => invoke<ConfigAnswer>("connect_pipeline", { password });
+/** What the config's data folder, ~/notedown-data and ~/notedown-mac hold. */
+export const existingDetails = () => invoke<ExistingFolder[]>("existing_details");
 /** Polls the server and the pipeline now; the new status comes as an event. */
 export const recheck = () => invoke<void>("recheck");
 export const modelState = () => invoke<ModelState>("model_state");

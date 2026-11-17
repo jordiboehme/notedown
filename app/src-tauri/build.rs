@@ -57,6 +57,9 @@ const COMMANDS: &[&str] = &[
     "set_markdown_dir",
     "show_markdown_dir",
     "recheck",
+    "create_account",
+    "connect_pipeline",
+    "existing_details",
 ];
 
 fn main() {

@@ -15,6 +15,7 @@ pub mod quit;
 pub mod rest;
 pub mod review;
 pub mod serve_info;
+pub mod setup;
 pub mod status;
 pub mod supervisor;
 #[cfg(test)]
@@ -119,6 +120,7 @@ pub fn run() {
                 pipeline_grace: ChildKind::Pipeline.grace(),
             }));
             app.manage(model_control(app.handle().clone(), sidecar_spawn.clone()));
+            app.manage(setup::Sidecar(sidecar_spawn.clone()));
             let poller = status_poller(sidecar_spawn.clone(), reader, processes.clone());
             let library = library_for(
                 app.handle().clone(),
@@ -210,7 +212,10 @@ pub fn run() {
             commands::markdown_dir,
             commands::set_markdown_dir,
             commands::show_markdown_dir,
-            commands::recheck
+            commands::recheck,
+            commands::create_account,
+            commands::connect_pipeline,
+            commands::existing_details
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
@@ -577,7 +582,7 @@ mod tests {
         names.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    const SETTINGS_ONLY: [&str; 22] = [
+    const SETTINGS_ONLY: [&str; 25] = [
         "get_config",
         "set_mode",
         "set_start_view",
@@ -600,6 +605,9 @@ mod tests {
         "set_markdown_dir",
         "show_markdown_dir",
         "recheck",
+        "create_account",
+        "connect_pipeline",
+        "existing_details",
     ];
 
     #[test]
@@ -720,7 +728,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 52);
+        assert_eq!(handler_commands().len(), 55);
     }
 
     #[test]
@@ -778,6 +786,9 @@ mod tests {
             "set_markdown_dir",
             "show_markdown_dir",
             "recheck",
+            "create_account",
+            "connect_pipeline",
+            "existing_details",
         ]);
         assert_eq!(manifest_commands(), all);
         // Every granted command is a real one.

@@ -150,6 +150,31 @@ pub fn pipeline_markdown_dir(data_dir: &Path, slug: &str) -> Option<PathBuf> {
     Some(dir.components().collect())
 }
 
+/// `pipeline.toml` as far as the setup reads it: the server it connects to.
+#[derive(Deserialize)]
+struct PipelineServerFile {
+    #[serde(default)]
+    server: Option<PipelineServerTable>,
+}
+
+#[derive(Deserialize)]
+struct PipelineServerTable {
+    #[serde(default)]
+    url: Option<String>,
+}
+
+/// The server address that `<data>/pipeline.toml` names in `[server] url` (written by
+/// `notedown connect`); `None` without the file, a readable file or the key.
+pub fn pipeline_server_url(data_dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(data_dir.join("pipeline.toml")).ok()?;
+    let parsed: PipelineServerFile = toml::from_str(&text).ok()?;
+    parsed
+        .server?
+        .url
+        .map(|url| url.trim().to_owned())
+        .filter(|url| !url.is_empty())
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {

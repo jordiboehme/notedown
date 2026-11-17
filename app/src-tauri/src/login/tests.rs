@@ -1214,3 +1214,35 @@ fn a_new_server_revokes_the_old_token() {
     assert_eq!(answer.config.account, None);
     assert_eq!(store.get("local|jordi").unwrap(), None);
 }
+
+#[test]
+fn a_password_must_be_one_line() {
+    for bad in ["a\nb", "a\rb", "secret\n", ""] {
+        assert_eq!(
+            Password::new(bad).one_line(),
+            Err("The password must be one line."),
+            "{bad:?}"
+        );
+    }
+    assert_eq!(Password::new(PASSWORD).one_line(), Ok(PASSWORD));
+    assert!(!format!("{:?}", Password::new("x")).contains('x'));
+}
+
+#[test]
+fn a_password_of_two_lines_is_refused_before_any_request() {
+    let server = Scripted::start(vec![code_answer(), token_answer("jordi")]);
+    let dir = tempfile::tempdir().unwrap();
+    let state = remote_config(dir.path(), server.port, None);
+    let error = log_in(
+        &LoginGate::default(),
+        &state,
+        &ServeInfo::default(),
+        &MemoryStore::new(),
+        "me@example.org",
+        &Password::new("correct\nhorse"),
+    )
+    .unwrap_err();
+    assert_eq!(error, LoginError::NotOneLine);
+    assert_eq!(error.to_string(), "The password must be one line.");
+    assert!(server.received().is_empty());
+}

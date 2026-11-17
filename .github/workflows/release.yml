@@ -17,7 +17,10 @@ name: Release
 #
 # Jobs: notes, notices, build-linux, sbom, build-macos (the CLI and the app,
 # signed and notarized) and collect (every asset checked, SHA256SUMS,
-# latest.json, the Homebrew files) here; publish, images and homebrew follow.
+# latest.json, the Homebrew files) run on every run, the dry run included.
+# Only a run that publishes goes on: publish (cosign, attestations, the tag
+# in a call, the GitHub release), then images (ghcr.io) and homebrew (the
+# tap), each after publish succeeded and each fit to be re-run alone.
 # Release jobs use no build cache: a cache a pull request could have written
 # must never reach a release asset.
 on:
@@ -1617,5 +1620,512 @@ jobs:
           path: ${{ runner.temp }}/homebrew/
           if-no-files-found: error
 
-  # publish, images and homebrew go here, each gated on
-  # needs.notes.outputs.publish == 'true'.
+  # Publishes the release: signs SHA256SUMS with cosign, attests every asset,
+  # creates the tag at the tested commit in a call and creates the GitHub
+  # release with every asset collect checked. Only a run that publishes (a
+  # call that is not a dry run, or a tag push), never a dispatch or a
+  # rehearsal: cosign writes a public Rekor entry and the attestations are
+  # public too.
+  #
+  # Everything that can fail runs before the release is created, so a failure
+  # leaves no half release and the job can be re-run alone. A re-run finds
+  # the tag it made at this commit and goes on; a draft that a failed upload
+  # left behind is deleted first.
+  publish:
+    name: publish
+    needs: [notes, collect]
+    if: >-
+      ${{ !cancelled() && needs.notes.outputs.publish == 'true'
+      && needs.collect.result == 'success' }}
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    # deployment: false uses the environment for its branch rule without
+    # recording a deployment.
+    environment:
+      name: release
+      deployment: false
+    # contents: write creates the tag and the release. id-token: keyless
+    # signing of SHA256SUMS and of the attestations (Sigstore through
+    # GitHub's OIDC token). attestations: storing them. Nothing else.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      NAME_VER: ${{ needs.notes.outputs.name_ver }}
+      RELEASE_TAG: ${{ needs.notes.outputs.tag }}
+    steps:
+      # For scripts/release-check.sh and release-notes/<tag>.md. First,
+      # because a checkout cleans the workspace and would remove release/.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download release-assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: release
+
+      # What collect uploaded, unchanged: exactly the files SHA256SUMS lists
+      # and SHA256SUMS itself, every sum right.
+      - name: Check the release assets
+        run: |
+          set -euo pipefail
+          cd release
+          [ -s SHA256SUMS ] || { echo "::error::release/SHA256SUMS is missing or empty"; exit 1; }
+          {
+            awk '{ print $2 }' SHA256SUMS
+            echo SHA256SUMS
+          } | LC_ALL=C sort >"$RUNNER_TEMP/expected.txt"
+          find . -mindepth 1 -printf '%P\n' | LC_ALL=C sort >"$RUNNER_TEMP/found.txt"
+          if ! diff -u "$RUNNER_TEMP/expected.txt" "$RUNNER_TEMP/found.txt"; then
+            echo "::error::release/ differs from SHA256SUMS (- SHA256SUMS, + found)"
+            exit 1
+          fi
+          sha256sum -c SHA256SUMS
+          ls -la
+
+      # actions/attest fails only when a whole subject list matches nothing,
+      # so a renamed asset would drop out of its attestation without a sound.
+      # Every path the attest steps below name is checked here first.
+      - name: Check the attestation subjects exist
+        run: |
+          set -euo pipefail
+          v="$NAME_VER"
+          missing=0
+          for f in \
+            "notedown-v$v-macos.tar.gz" "notedown-v$v-macos.cdx.json" \
+            "notedown-app-v$v-macos.dmg" "notedown-app-v$v-macos.app.tar.gz" \
+            "notedown-app-v$v-macos.cdx.json" \
+            "notedown-v$v-linux-amd64.tar.gz" "notedown_${v}_amd64.deb" "notedown-v$v-linux-amd64.cdx.json" \
+            "notedown-v$v-linux-arm64.tar.gz" "notedown_${v}_arm64.deb" "notedown-v$v-linux-arm64.cdx.json"; do
+            [ -s "release/$f" ] || { echo "::error::missing attestation subject release/$f"; missing=1; }
+          done
+          exit "$missing"
+
+      # The same pins and the same two tries as the rehearsal in collect.
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        id: cosign
+        if: ${{ needs.notes.outputs.publish == 'true' }}
+        continue-on-error: true
+        with:
+          cosign-release: v3.1.4
+
+      - name: Wait before the second try
+        if: ${{ needs.notes.outputs.publish == 'true' && steps.cosign.outcome == 'failure' }}
+        run: sleep 30
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        if: ${{ needs.notes.outputs.publish == 'true' && steps.cosign.outcome == 'failure' }}
+        with:
+          cosign-release: v3.1.4
+
+      # A keyless Sigstore bundle (certificate, signature and transparency
+      # log proof in one file) for SHA256SUMS, checked right away. The
+      # certificate names the called file, release.yml, at GITHUB_REF: in a
+      # call that is the caller's refs/heads/main, on a tag push
+      # refs/tags/v<version>. Never GITHUB_WORKFLOW_REF: in a call it names
+      # ci.yml. docs/install.md gives users the regexp for both refs.
+      - name: Sign SHA256SUMS
+        if: ${{ needs.notes.outputs.publish == 'true' }}
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes --bundle release/SHA256SUMS.sigstore.json release/SHA256SUMS
+          cosign verify-blob release/SHA256SUMS \
+            --bundle release/SHA256SUMS.sigstore.json \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+      # Build provenance for every release asset in one attestation: the
+      # archives, the packages, the app files, latest.json, the SBOMs,
+      # SHA256SUMS and its signature bundle, so the attested files are
+      # exactly the uploaded ones. Verify with
+      # `gh attestation verify <file> --repo jordiboehme/notedown`.
+      - name: Attest build provenance
+        if: ${{ needs.notes.outputs.publish == 'true' }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release/*
+
+      # Each SBOM, attested against the assets that carry its tree. The .deb
+      # of an arch has the same tree as the archive of that arch.
+      - name: Attest the macOS CLI SBOM
+        if: ${{ needs.notes.outputs.publish == 'true' }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          sbom-path: release/notedown-v${{ needs.notes.outputs.name_ver }}-macos.cdx.json
+          subject-path: release/notedown-v${{ needs.notes.outputs.name_ver }}-macos.tar.gz
+
+      - name: Attest the macOS app SBOM
+        if: ${{ needs.notes.outputs.publish == 'true' }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          sbom-path: release/notedown-app-v${{ needs.notes.outputs.name_ver }}-macos.cdx.json
+          subject-path: |
+            release/notedown-app-v${{ needs.notes.outputs.name_ver }}-macos.dmg
+            release/notedown-app-v${{ needs.notes.outputs.name_ver }}-macos.app.tar.gz
+
+      - name: Attest the linux-amd64 SBOM
+        if: ${{ needs.notes.outputs.publish == 'true' }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          sbom-path: release/notedown-v${{ needs.notes.outputs.name_ver }}-linux-amd64.cdx.json
+          subject-path: |
+            release/notedown-v${{ needs.notes.outputs.name_ver }}-linux-amd64.tar.gz
+            release/notedown_${{ needs.notes.outputs.name_ver }}_amd64.deb
+
+      - name: Attest the linux-arm64 SBOM
+        if: ${{ needs.notes.outputs.publish == 'true' }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          sbom-path: release/notedown-v${{ needs.notes.outputs.name_ver }}-linux-arm64.cdx.json
+          subject-path: |
+            release/notedown-v${{ needs.notes.outputs.name_ver }}-linux-arm64.tar.gz
+            release/notedown_${{ needs.notes.outputs.name_ver }}_arm64.deb
+
+      # Only for a call from CI that publishes: a tag push brought its tag
+      # along, and the rehearsal is a call too (called is true there) but
+      # never publishes. An annotated tag, like one pushed by hand, made
+      # through the API because the checkout keeps no credentials. A tag made
+      # with the workflow's token starts no other workflow, so this run is
+      # the only release of it. The tag already at this commit is a re-run;
+      # at another commit it is an error and is never moved. The lookup
+      # prints nothing for a missing tag and fails on a lookup error.
+      - name: Create the tag at the tested commit
+        if: ${{ needs.notes.outputs.called == 'true' && needs.notes.outputs.publish == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          found="$RUNNER_TEMP/tag-commit.txt"
+          bash scripts/ci/retry.sh 3 bash -c \
+            'bash scripts/release-check.sh tag-commit "$1" >"$2"' _ "$RELEASE_TAG" "$found"
+          at="$(cat "$found")"
+          if [ -n "$at" ]; then
+            if [ "$at" != "$GITHUB_SHA" ]; then
+              echo "::error::$RELEASE_TAG already points at $at, not at the tested commit $GITHUB_SHA"
+              exit 1
+            fi
+            echo "release: $RELEASE_TAG already points at $GITHUB_SHA"
+            exit 0
+          fi
+          object="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags" \
+            -f tag="$RELEASE_TAG" -f message="$RELEASE_TAG" -f object="$GITHUB_SHA" -f type=commit \
+            --jq .sha)"
+          gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/tags/$RELEASE_TAG" -f sha="$object" >/dev/null
+          echo "release: tagged $GITHUB_SHA as $RELEASE_TAG"
+
+      # The body is release-notes/<tag>.md (the notes job checked it), the
+      # title the plain tag; the motto heading leads the page itself.
+      # gh uploads the assets to a draft and publishes it at the end, so a
+      # failed upload leaves a draft: a re-run deletes it and starts again.
+      # A published release of this tag is never touched.
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          notes="release-notes/${RELEASE_TAG}.md"
+          [ -s "$notes" ] || { echo "::error::$notes is missing or empty"; exit 1; }
+          list="$RUNNER_TEMP/releases.json"
+          bash scripts/ci/retry.sh 3 bash -c \
+            'gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,isDraft >"$1"' _ "$list"
+          state="$(jq -r --arg t "$RELEASE_TAG" \
+            'map(select(.tagName == $t)) | if length == 0 then "none" elif all(.isDraft) then "draft" else "published" end' "$list")"
+          case "$state" in
+            none) ;;
+            draft)
+              echo "::warning::deleting the draft release of $RELEASE_TAG that an earlier try left"
+              gh release delete "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --yes
+              ;;
+            *)
+              echo "::error::the release $RELEASE_TAG is already published"
+              exit 1
+              ;;
+          esac
+          gh release create "$RELEASE_TAG" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$RELEASE_TAG" \
+            --notes-file "$notes"
+
+  # The images ghcr.io/jordiboehme/notedown:<version> and :latest for
+  # linux/amd64 and linux/arm64, after the release exists: an image of a
+  # release that failed to publish would be a half release. A re-run pushes
+  # the same tags again.
+  images:
+    name: images
+    needs: [notes, collect, publish]
+    if: >-
+      ${{ !cancelled() && needs.notes.outputs.publish == 'true'
+      && needs.collect.result == 'success' && needs.publish.result == 'success' }}
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+      deployment: false
+    # packages: the push to ghcr.io. id-token and attestations: the image
+    # attestation (Sigstore through GitHub's OIDC token). Nothing else.
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      # For the Dockerfile and the doc files. First, because a checkout
+      # cleans the workspace and would remove downloads/ and dist/.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download linux-amd64
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux-amd64
+          path: downloads/linux-amd64
+
+      - name: Download linux-arm64
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux-arm64
+          path: downloads/linux-arm64
+
+      - name: Download notices-linux
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: notices-linux
+          path: downloads/notices-linux
+
+      # The build context the Dockerfile expects: the bare binary of each
+      # arch (the same file as in that arch's archive) and dist/doc/ with
+      # exactly the four doc files, none of them empty.
+      - name: Stage the build context
+        run: |
+          set -euo pipefail
+          bad=0
+          err() { echo "::error::$1"; bad=1; }
+          rm -rf dist
+          for arch in amd64 arm64; do
+            bin="downloads/linux-$arch/notedown"
+            [ -s "$bin" ] || { err "$bin is missing or empty (artifact linux-$arch)"; continue; }
+            mkdir -p "dist/linux-$arch"
+            cp "$bin" "dist/linux-$arch/notedown"
+          done
+          mkdir -p dist/doc
+          cp LICENSE NOTICE README.md downloads/notices-linux/THIRD-PARTY-NOTICES.txt dist/doc/
+          got="$(find dist/doc -mindepth 1 -printf '%P\n' | LC_ALL=C sort | tr '\n' ' ')"
+          want="$(printf '%s\n' LICENSE NOTICE README.md THIRD-PARTY-NOTICES.txt | LC_ALL=C sort | tr '\n' ' ')"
+          [ "$got" = "$want" ] || err "dist/doc holds '$got', expected '$want'"
+          for f in LICENSE NOTICE README.md THIRD-PARTY-NOTICES.txt; do
+            [ -s "dist/doc/$f" ] || err "dist/doc/$f is missing or empty"
+          done
+          find dist -type f -exec ls -l {} +
+          exit "$bad"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # No QEMU: the Dockerfile has no RUN step (it only copies the files
+      # staged above and sets metadata), so the linux/arm64 build runs
+      # nothing emulated. Add QEMU back together with any RUN step.
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # The semver tag reads the release tag through `value`: without it it
+      # comes from the git ref, which in a call is refs/heads/main and gives
+      # no version tag. latest=false keeps the default latest=auto from
+      # adding a second `latest`; only the raw tag below moves it.
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/jordiboehme/notedown
+          flavor: |
+            latest=false
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.notes.outputs.tag }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=Notedown
+            org.opencontainers.image.description=The Notedown sync server: Supernote handwritten notes as Markdown.
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+
+      # The metadata action must give exactly <name_ver> and latest: a tag
+      # it did not make would push an image without its version.
+      - name: Check the image tags
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+          NAME_VER: ${{ needs.notes.outputs.name_ver }}
+        run: |
+          set -euo pipefail
+          got="$(LC_ALL=C sort <<<"$IMAGE_TAGS" | sed '/^$/d' | tr '\n' ' ')"
+          want="$(printf '%s\n' "ghcr.io/jordiboehme/notedown:$NAME_VER" ghcr.io/jordiboehme/notedown:latest \
+            | LC_ALL=C sort | tr '\n' ' ')"
+          echo "tags: $got"
+          [ "$got" = "$want" ] || { echo "::error::the image tags are '$got', expected '$want'"; exit 1; }
+
+      # context: . so buildx sees dist/ (the default git context does not).
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # No buildx provenance: it adds unknown/unknown entries to the
+          # image index, which registry pages list next to the real
+          # platforms. The attestation below is stored beside the image.
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      # Provenance for the pushed image index, stored in the registry beside
+      # it. Verify with
+      # `gh attestation verify oci://ghcr.io/jordiboehme/notedown:<version> --repo jordiboehme/notedown`.
+      # No storage record: that needs another permission and an
+      # organisation-owned repository.
+      - name: Attest the image
+        if: ${{ needs.notes.outputs.publish == 'true' }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/jordiboehme/notedown
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+  # Writes Formula/notedown.rb and Casks/notedown-app.rb in the tap
+  # jordiboehme/homebrew-tap (jordiboehme/tap in brew) once the release
+  # exists. Both are rendered with the script collect runs on every dry run,
+  # now from the published SHA256SUMS, and must equal collect's homebrew
+  # artifact. Both files go in one commit; a re-run after a push that landed
+  # finds the tap current and stops green.
+  homebrew:
+    name: homebrew
+    needs: [notes, publish]
+    if: >-
+      ${{ !cancelled() && needs.notes.outputs.publish == 'true'
+      && needs.publish.result == 'success' }}
+    timeout-minutes: 10
+    # ubuntu-24.04: ruby is on its image.
+    runs-on: ubuntu-24.04
+    # The release environment holds TAP_GITHUB_TOKEN, a fine-grained token
+    # with contents write on jordiboehme/homebrew-tap only.
+    environment:
+      name: release
+      deployment: false
+    # Reading the release of this repository. The tap push uses the token.
+    permissions:
+      contents: read
+    env:
+      NAME_VER: ${{ needs.notes.outputs.name_ver }}
+      RELEASE_TAG: ${{ needs.notes.outputs.tag }}
+    steps:
+      # For scripts/ci. Nothing else from the tree runs here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # --clobber: a try after a failed one overwrites what it left.
+      - name: Download the published SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release"
+          bash scripts/ci/retry.sh 5 gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS \
+            --dir "$RUNNER_TEMP/release" --clobber
+
+      - name: Download homebrew
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: homebrew
+          path: ${{ runner.temp }}/collect
+
+      - name: Render the files from the published SHA256SUMS
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/homebrew"
+          mkdir -p "$out/Formula" "$out/Casks"
+          bash scripts/ci/homebrew.sh formula "$NAME_VER" "$RUNNER_TEMP/release/SHA256SUMS" >"$out/Formula/notedown.rb"
+          bash scripts/ci/homebrew.sh cask "$NAME_VER" "$RUNNER_TEMP/release/SHA256SUMS" >"$out/Casks/notedown-app.rb"
+          bad=0
+          for f in Formula/notedown.rb Casks/notedown-app.rb; do
+            ruby -c "$out/$f"
+            if ! diff -u "$RUNNER_TEMP/collect/$f" "$out/$f"; then
+              echo "::error::$f from the published SHA256SUMS differs from the one collect rendered (- collect, + published)"
+              bad=1
+            fi
+          done
+          cat "$out/Formula/notedown.rb" "$out/Casks/notedown-app.rb"
+          exit "$bad"
+
+      # The token never goes into a URL or onto a command line: retry.sh
+      # prints its command on a failed try, and a URL would keep the token
+      # in .git/config. Git asks the credential helper below, which reads the
+      # token from this step's environment when git runs it; the clone's
+      # config holds only the helper text. GitHub masks the secret in logs.
+      # Another push to the tap can land first: a rejected push rebases onto
+      # the tap's newer commit and tries again, five times at most. What is
+      # written does not change.
+      - name: Push the files to the tap
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_GITHUB_TOKEN:-}" ]; then
+            echo "::error::TAP_GITHUB_TOKEN is not set in the release environment"
+            exit 1
+          fi
+          tap="$RUNNER_TEMP/homebrew-tap"
+          # $1 and the token are expanded by git when it runs the helper.
+          # shellcheck disable=SC2016
+          helper='!f() { test "$1" = get || exit 0; echo username=x-access-token; echo "password=$TAP_GITHUB_TOKEN"; }; f'
+          # Each try starts without the folder a failed try may leave.
+          # shellcheck disable=SC2016
+          bash "$GITHUB_WORKSPACE"/scripts/ci/retry.sh 5 bash -c \
+            'rm -rf "$2" && git -c credential.helper="$1" clone https://github.com/jordiboehme/homebrew-tap.git "$2"' \
+            _ "$helper" "$tap"
+          cd "$tap"
+          git config credential.helper "$helper"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p Formula Casks
+          cp "$RUNNER_TEMP/homebrew/Formula/notedown.rb" Formula/notedown.rb
+          cp "$RUNNER_TEMP/homebrew/Casks/notedown-app.rb" Casks/notedown-app.rb
+          git add Formula/notedown.rb Casks/notedown-app.rb
+          if git diff --cached --quiet; then
+            echo "the tap already has notedown and notedown-app $NAME_VER, nothing to push"
+            exit 0
+          fi
+          git commit -m "notedown and notedown-app $NAME_VER"
+          tries=5
+          for attempt in $(seq "$tries"); do
+            if git push; then
+              exit 0
+            fi
+            if [ "$attempt" -eq "$tries" ]; then
+              break
+            fi
+            echo "::warning::push rejected (try $attempt of $tries), rebasing onto the tap and trying again"
+            sleep $((attempt * 5))
+            # The fetch is the network part and is retried; the rebase is
+            # local, so a failure there is a real conflict.
+            if ! bash "$GITHUB_WORKSPACE"/scripts/ci/retry.sh 3 git fetch origin; then
+              echo "::error::could not fetch the tap"
+              exit 1
+            fi
+            if ! git rebase '@{upstream}'; then
+              git rebase --abort || true
+              echo "::error::could not rebase the Homebrew files onto the tap"
+              exit 1
+            fi
+          done
+          echo "::error::could not push the Homebrew files to the tap after $tries tries"
+          exit 1

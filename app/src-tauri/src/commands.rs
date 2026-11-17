@@ -565,20 +565,21 @@ pub async fn log_in(
     })
     .await
     .map_err(|e| e.to_string())??;
-    relaunch_pipeline(config.inner(), processes.inner()).await;
+    relaunch_pipeline(config.inner(), processes.inner());
     poller.poll_now();
     Ok(saved)
 }
 
-/// Starts the pipeline again when its arguments changed with the account (its Markdown
-/// folder belongs to the account), off the main thread.
-async fn relaunch_pipeline(config: &ConfigState, processes: &Arc<Processes>) {
+/// Starts the pipeline again when its arguments changed (another Markdown folder, or another
+/// account: the folder belongs to it), on a blocking thread that nobody waits for: the stop of
+/// the old pipeline can take its grace. The config is read inside the start's lock, so the
+/// newest wins.
+fn relaunch_pipeline(config: &ConfigState, processes: &Arc<Processes>) {
     let reader = config.reader();
     let processes = processes.clone();
-    let _ = tauri::async_runtime::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || {
         processes.relaunch_pipeline_with(|| reader.current());
-    })
-    .await;
+    });
 }
 
 /// Whether the Keychain keeps a login for the account in the config, off the main thread.
@@ -608,7 +609,7 @@ pub async fn log_out(
     })
     .await
     .map_err(|e| e.to_string())??;
-    relaunch_pipeline(config.inner(), processes.inner()).await;
+    relaunch_pipeline(config.inner(), processes.inner());
     poller.poll_now();
     Ok(after)
 }
@@ -623,8 +624,8 @@ pub fn markdown_dir(config: State<'_, ConfigState>) -> Option<String> {
 }
 
 /// Sets the Markdown folder of the logged-in account (Choose... on the OCR page) and answers
-/// it. When the pipeline's arguments changed, the pipeline starts again with them, off the main
-/// thread; the server runs on.
+/// it. When the pipeline's arguments changed, the pipeline starts again with them on a thread of
+/// its own after the answer (its stop can take the grace); the server runs on.
 #[tauri::command]
 pub async fn set_markdown_dir(
     config: State<'_, ConfigState>,
@@ -632,15 +633,11 @@ pub async fn set_markdown_dir(
     dir: PathBuf,
 ) -> Result<Option<String>, String> {
     let state = config.inner().clone();
-    let processes = processes.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let saved = state.set_markdown_dir(dir)?;
-        let reader = state.reader();
-        processes.relaunch_pipeline_with(|| reader.current());
-        Ok(saved.markdown_dir().map(|dir| dir.display().to_string()))
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    let saved = tauri::async_runtime::spawn_blocking(move || state.set_markdown_dir(dir))
+        .await
+        .map_err(|e| e.to_string())??;
+    relaunch_pipeline(config.inner(), processes.inner());
+    Ok(saved.markdown_dir().map(|dir| dir.display().to_string()))
 }
 
 /// Show in Finder for the Markdown folder: makes it when it is not there yet (the pipeline

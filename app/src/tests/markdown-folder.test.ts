@@ -24,6 +24,13 @@ describe("the Markdown folder row of the OCR page", () => {
     expect(row.show.enabled).toBe(false);
   });
 
+  it("says when the folder could not be read", () => {
+    const row = markdownRow({ ...base, path: undefined, error: "Notedown is quitting." });
+    expect(row.note).toBe("Notedown is quitting.");
+    expect(row.tone).toBe("bad");
+    expect(row.choose.enabled).toBe(false);
+  });
+
   it("asks for a login first: the folder belongs to the account", () => {
     const row = markdownRow({ ...base, path: null });
     expect(row.path).toBeNull();

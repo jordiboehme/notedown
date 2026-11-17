@@ -40,12 +40,12 @@ export function markdownRow(folder: MarkdownFolder): MarkdownRow {
   const ready = path !== null && !folder.busy;
   let note: string | null = null;
   let tone: MarkdownRow["tone"] = "secondary";
-  if (folder.path === undefined) note = "Checking...";
-  else if (folder.path === null) note = NEEDS_LOGIN;
-  else if (folder.error !== null) {
+  if (folder.error !== null) {
     note = folder.error;
     tone = "bad";
-  } else {
+  } else if (folder.path === undefined) note = "Checking...";
+  else if (folder.path === null) note = NEEDS_LOGIN;
+  else {
     note = pipelineRefusal(folder.pipeline);
     if (note !== null) tone = "bad";
   }

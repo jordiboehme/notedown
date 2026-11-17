@@ -31,7 +31,7 @@ const LOCK_TRIES: usize = 5;
 const FIRST_USER_ID: u64 = 1_000_001;
 
 /// Field order is the file order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
     pub slug: String,
     pub email: String,
@@ -60,6 +60,25 @@ pub struct Account {
     /// ([`DEFAULT_QUOTA_BYTES`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_bytes: Option<u64>,
+}
+
+impl std::fmt::Debug for Account {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Account")
+            .field("slug", &self.slug)
+            .field("email", &self.email)
+            .field("user_id", &self.user_id)
+            .field("user_name", &self.user_name)
+            .field("password_md5", &"***")
+            .field("created", &self.created)
+            .field("locked", &self.locked)
+            .field("imported", &self.imported)
+            .field("app_data_imported", &self.app_data_imported)
+            .field("locked_at_ms", &self.locked_at_ms)
+            .field("failed_logins", &self.failed_logins)
+            .field("quota_bytes", &self.quota_bytes)
+            .finish()
+    }
 }
 
 /// The default storage quota when `account.json` has no `quota_bytes`: 64 GiB.
@@ -494,6 +513,16 @@ mod tests {
         let accounts = Accounts::new(dir.path());
         accounts.create("anna", "anna@example.org", "pw").unwrap();
         (dir, accounts)
+    }
+
+    #[test]
+    fn debug_output_hides_the_password_hash() {
+        let (_dir, accounts) = accounts();
+        let account = accounts.get("anna").unwrap().unwrap();
+        assert!(!account.password_md5.is_empty());
+        let shown = format!("{:?}", account);
+        assert!(!shown.contains(&account.password_md5));
+        assert!(shown.contains("***"));
     }
 
     fn journal_of(dir: &tempfile::TempDir) -> Journal {

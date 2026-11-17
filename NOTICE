@@ -13,7 +13,7 @@ community research, see docs/note-format.md. The .note parser in
 crates/notedown-note is a clean-room implementation of that document.
 The source code in this repository includes no third-party code.
 
-The binary releases (the notedown archives and packages, the Notedown app
-and the container image) are built with third-party code: Rust crates, and
-in the macOS builds llama.cpp and the code it bundles. Their licenses are
-listed in THIRD-PARTY-NOTICES.txt, which ships with each release.
+The binary releases do include third-party code. Every release has Rust
+crates. The macOS builds also have llama.cpp and the code it bundles. The
+app also has JavaScript and CSS packages for its window. Each release ships
+a THIRD-PARTY-NOTICES.txt file that lists this code and its licenses.

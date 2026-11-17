@@ -151,10 +151,12 @@ check_dist() {
 # npm_notices <set-file> <node_modules>
 # Prints one block per package: name, version, declared license, then the
 # license files of the package. A package without a license file is allowed
-# only when its license is MIT and/or Apache-2.0, whose texts the app notices
-# already carry; the block then names the copyright from LICENSE.spdx.
+# only when its license offers MIT (MIT, or MIT OR Apache-2.0): the block then
+# says it is used under MIT, names the copyright from LICENSE.spdx and sets
+# fallback=1, and main checks that part 1 has an MIT text.
 npm_notices() {
   local set="$1" modules="$2" name dir version license files copyright
+  fallback=0
   [ -d "$modules" ] || die "$modules does not exist (run npm ci in app first)"
   while read -r name; do
     dir="$modules/$name"
@@ -174,15 +176,17 @@ npm_notices() {
         echo
       done <<< "$files"
     else
-      if ! printf '%s\n' "$license" | grep -qE '^\(?(MIT|Apache-2\.0)( (OR|AND) (MIT|Apache-2\.0))*\)?$'; then
-        die "$name has no license file and its license $license is not MIT or Apache-2.0"
+      if ! printf '%s\n' "$license" | grep -qE '^\(?(MIT|Apache-2\.0)( OR (MIT|Apache-2\.0))*\)?$' \
+        || ! printf '%s\n' "$license" | grep -qw MIT; then
+        die "$name has no license file and its license $license does not offer MIT"
       fi
       copyright=""
       if [ -s "$dir/LICENSE.spdx" ]; then
         copyright="$(sed -n 's/^PackageCopyrightText: //p' "$dir/LICENSE.spdx" | head -n 1)"
       fi
-      echo "The package carries no license file. Its license is $license; the"
-      echo "MIT and Apache-2.0 texts are given in the Rust crate part above."
+      echo "The package has no license file. Its license is $license. Notedown"
+      echo "uses it under the MIT license. The MIT text is in part 1 above."
+      fallback=1
       if [ -n "$copyright" ]; then
         echo "Copyright $copyright"
       fi
@@ -261,6 +265,9 @@ main() {
       npm_notices "$set" "$modules" > "$work/npm.txt"
       cargo_notices "$app/src-tauri/Cargo.toml" "$app/src-tauri/about.toml" "$work/app.txt" \
         --target aarch64-apple-darwin
+      if [ "$fallback" -eq 1 ] && ! grep -qE '^.* \(MIT\)$' "$work/app.txt"; then
+        die "an npm package without a license file points to the MIT text, but part 1 has none"
+      fi
       macos_body "$work/macos.txt"
       {
         header

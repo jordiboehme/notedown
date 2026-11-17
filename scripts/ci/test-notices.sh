@@ -166,12 +166,21 @@ printf 'svelte\ntailwindcss\n' > "$app/bundled-packages.txt"
 # A package without a license file and a license other than MIT/Apache fails.
 mkpkg @scope/plugin 1.0.0 "BSD-2-Clause"
 run app "$tmp/app-bad.txt"
-if [ "$status" -ne 0 ] && grep -qF '@scope/plugin has no license file' "$tmp/run.log"; then
+if [ "$status" -ne 0 ] && grep -qF '@scope/plugin has no license file and its license BSD-2-Clause does not offer MIT' "$tmp/run.log"; then
   pass "app fails on a package without license text"
 else
   fail "app fails on a package without license text"
 fi
 mkpkg @scope/plugin 1.0.0 "MIT OR Apache-2.0"
+
+# The fallback for a package without a license file needs an MIT text in part 1.
+printf '@@notedown-block\nApache License 2.0 (Apache-2.0)\nUsed by:\n@@notedown-crate b 1.0.0\n\ntext\n@@notedown-end\n' > "$tmp/raw-apache.txt"
+STUB_RAW="$tmp/raw-apache.txt" run app "$tmp/app-bad.txt"
+if [ "$status" -ne 0 ] && grep -qF 'part 1 has none' "$tmp/run.log"; then
+  pass "app fails when the license-file fallback has no MIT text"
+else
+  fail "app fails when the license-file fallback has no MIT text"
+fi
 
 # No dist: a clear failure.
 mv "$app/dist" "$app/dist.off"

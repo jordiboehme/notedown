@@ -2480,6 +2480,30 @@ mod pipeline_and_mcp {
     }
 
     #[test]
+    fn pipeline_model_idle_flag_takes_a_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        std::fs::write(
+            data.join("server.toml"),
+            "[pipeline]\nmodel_idle = \"2h\"\n",
+        )
+        .unwrap();
+        let out = pipeline_cmd(data, &["--once", "--model-idle", "90s"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = pipeline_cmd(data, &["--once", "--model-idle", "soon"]);
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("--model-idle") && err.contains("soon"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn pipeline_once_without_the_model_says_so_once() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path();

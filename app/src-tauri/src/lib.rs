@@ -262,6 +262,7 @@ pub fn run() {
             commands::markdown_dir,
             commands::set_markdown_dir,
             commands::show_markdown_dir,
+            commands::set_model_idle,
             commands::recheck,
             commands::create_account,
             commands::connect_pipeline,
@@ -683,7 +684,7 @@ mod tests {
         names.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    const SETTINGS_ONLY: [&str; 38] = [
+    const SETTINGS_ONLY: [&str; 39] = [
         "get_config",
         "set_mode",
         "set_start_view",
@@ -705,6 +706,7 @@ mod tests {
         "markdown_dir",
         "set_markdown_dir",
         "show_markdown_dir",
+        "set_model_idle",
         "recheck",
         "create_account",
         "connect_pipeline",
@@ -843,7 +845,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 68);
+        assert_eq!(handler_commands().len(), 69);
     }
 
     #[test]
@@ -900,6 +902,7 @@ mod tests {
             "markdown_dir",
             "set_markdown_dir",
             "show_markdown_dir",
+            "set_model_idle",
             "recheck",
             "create_account",
             "connect_pipeline",

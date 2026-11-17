@@ -2,16 +2,19 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import { relativeTime } from "../../lib/format";
   import { status } from "../../lib/status.svelte";
-  import { failure, markdownDir, setMarkdownDir, showMarkdownDir } from "../api";
+  import { failure, markdownDir, setMarkdownDir, setModelIdle, showMarkdownDir } from "../api";
   import { config } from "../config.svelte";
   import { markdownRead, markdownRow } from "../markdown";
+  import { MODEL_IDLE, modelIdleMinutes, modelIdleOptions, modelIdleValue } from "../modelIdle";
   import Form from "../kit/Form.svelte";
   import Row from "../kit/Row.svelte";
   import Section from "../kit/Section.svelte";
+  import Segmented from "../kit/Segmented.svelte";
   import ModelDownload from "../parts/ModelDownload.svelte";
 
   // Settings > OCR: the queue, the page in work, the last error, the Markdown folder with
-  // Choose... and Show in Finder, and the model with Download, Pause and Remove.
+  // Choose... and Show in Finder, and the model with Download, Pause and Remove, and how long
+  // the model stays loaded without new pages.
   let { now }: { now: number } = $props();
 
   const ocr = $derived(status.current?.ocr ?? null);
@@ -69,6 +72,21 @@
     }
   }
 
+  let idleError = $state<string | null>(null);
+  let idleBusy = $state(false);
+
+  async function chooseModelIdle(value: string) {
+    idleBusy = true;
+    try {
+      config.current = await setModelIdle(modelIdleMinutes(value));
+      idleError = null;
+    } catch (e) {
+      idleError = failure(e);
+    } finally {
+      idleBusy = false;
+    }
+  }
+
   async function showMarkdown() {
     markdownError = null;
     try {
@@ -112,5 +130,14 @@
 
   <Section title="Model">
     <ModelDownload />
+    <Row title={MODEL_IDLE.title} note={idleError ?? MODEL_IDLE.note} tone={idleError ? "bad" : "secondary"}>
+      <Segmented
+        label={MODEL_IDLE.title}
+        value={modelIdleValue(config.current?.modelIdleMinutes)}
+        options={modelIdleOptions()}
+        disabled={config.current === null || idleBusy}
+        onchange={chooseModelIdle}
+      />
+    </Row>
   </Section>
 </Form>

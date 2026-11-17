@@ -36,6 +36,16 @@ if [ ! -f "$file" ]; then
   echo "notarize.sh: $file does not exist" >&2
   exit 2
 fi
+# A secret set from a file keeps its trailing newline; the ids lose all
+# whitespace and are masked again (GitHub masks only the exact secret).
+APPLE_API_KEY_ID="$(printf '%s' "${APPLE_API_KEY_ID:-}" | tr -d '[:space:]')"
+APPLE_API_ISSUER_ID="$(printf '%s' "${APPLE_API_ISSUER_ID:-}" | tr -d '[:space:]')"
+if [ -n "${GITHUB_ACTIONS:-}" ]; then
+  for value in "$APPLE_API_KEY_ID" "$APPLE_API_ISSUER_ID"; do
+    [ -z "$value" ] || echo "::add-mask::$value"
+  done
+fi
+
 for var in APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER_ID; do
   if [ -z "${!var:-}" ]; then
     echo "notarize.sh: $var is not set" >&2
@@ -65,7 +75,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/notarize.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 key="$work/api-key.p8"
-(umask 077 && printf '%s\n' "$APPLE_API_KEY_P8" >"$key")
+(umask 077 && printf '%s\n' "${APPLE_API_KEY_P8:?}" >"$key")
 sub="$work/submit.json"
 result="$work/wait.json"
 name="$(basename "$file")"

@@ -24,6 +24,7 @@ key=""
 prev=""
 for arg in "$@"; do
   [ "$prev" = --key ] && key="$arg"
+  [ "$prev" = --key-id ] && echo "$arg" >"$STUB_DIR/key-id-seen"
   prev="$arg"
 done
 echo "$cmd" >>"$STUB_DIR/calls"
@@ -44,6 +45,11 @@ case "$cmd" in
       invalid) echo '{"id":"abc-123","status":"Invalid","message":"Processing complete"}'; exit 1 ;;
       garbage) echo 'not json'; exit 1 ;;
       hang) exec sleep 10 ;;
+      progress) echo '{"id":"abc-123","status":"In Progress"}' ;;
+      fail-once)
+        [ "$(grep -c '^wait$' "$STUB_DIR/calls")" -gt 1 ] || { echo 'Error: timed out'; exit 1; }
+        echo '{"id":"abc-123","status":"Accepted"}'
+        ;;
     esac
     ;;
   log) echo '{"issues":[]}' ;;
@@ -59,8 +65,8 @@ expect() {
   mkdir -p "$tmp/stub"
   out="$(PATH="$tmp/bin:$PATH" STUB_DIR="$tmp/stub" STUB_SUBMIT="$submit" STUB_WAIT="$wait" \
     RUNNER_TEMP="$tmp/runner" APPLE_API_KEY_P8=$'-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----' \
-    APPLE_API_KEY_ID=KEYID APPLE_API_ISSUER_ID=issuer \
-    NOTARIZE_SUBMIT_TRIES="${TRIES:-1}" NOTARIZE_WAIT_TRIES=1 NOTARIZE_WAIT_CAP="${CAP:-120}" \
+    APPLE_API_KEY_ID=$'KEYID\n' APPLE_API_ISSUER_ID=issuer \
+    NOTARIZE_SUBMIT_TRIES="${TRIES:-1}" NOTARIZE_WAIT_TRIES="${WAIT_TRIES:-1}" NOTARIZE_WAIT_CAP="${CAP:-120}" \
     bash "$here/notarize.sh" "$tmp/app.zip" 2>&1)" || rc=$?
   if [ "$rc" != "$want" ]; then
     fail "$name: exit $rc, want $want"
@@ -81,6 +87,11 @@ if [ "$(cat "$tmp/stub/key-seen")" = $'-----BEGIN PRIVATE KEY-----\nkey\n-----EN
 else
   fail "the key reaches notarytool unchanged"
 fi
+if [ "$(cat "$tmp/stub/key-id-seen")" = KEYID ]; then
+  pass "the key id loses its trailing newline"
+else
+  fail "the key id loses its trailing newline"
+fi
 if [ -z "$(ls -A "$tmp/runner")" ]; then
   pass "the key folder is gone after the run"
 else
@@ -92,6 +103,8 @@ TRIES=2 expect "upload fails once, then works" 0 fail-once accepted "accepted"
 expect "invalid, with the log" 1 ok invalid "the status Invalid"
 if grep -qx log "$tmp/stub/calls"; then pass "the log is fetched on failure"; else fail "the log is fetched on failure"; fi
 expect "no JSON from wait" 1 ok garbage "gave no answer"
+WAIT_TRIES=2 expect "the first wait fails, the second is accepted" 0 ok fail-once "accepted (submission abc-123)"
+expect "wait exits 0 but not Accepted" 1 ok progress "the status In Progress"
 CAP=2 expect "wait hangs past the alarm" 1 ok hang "gave no answer"
 if [ -z "$(ls -A "$tmp/runner")" ]; then
   pass "the key folder is gone after a failure"

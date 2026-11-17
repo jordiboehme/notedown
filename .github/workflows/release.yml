@@ -757,15 +757,16 @@ jobs:
   # the rehearsal) must sign; a partial set of the six Apple secrets is
   # always an error.
   #
-  # Time, worst case of one step with the others typical: build 35 min,
-  # notarize steps 45 and 55 min caps (typical 5 each), tauri build 60 min
-  # cap (typical 20), the rest 10 min. One step at its worst still fits in
-  # 150 min; two at once meet the job cap instead of the step's own error.
+  # Time: build about 35 min, notarize steps capped at 45 and 55 min
+  # (typical 5 each), tauri build capped at 60 min (typical 20), the rest
+  # about 10 min. 35 + 45 + 60 + 55 + 10 = 205, so the job cap of 210 sits
+  # above every step cap at its worst at once, and a slow Apple day fails
+  # with the step's own error and the notary log, never the job cap.
   build-macos:
     name: build-macos
     needs: [notes, notices]
     if: ${{ !cancelled() && needs.notes.outputs.build == 'true' && needs.notices.result == 'success' }}
-    timeout-minutes: 150
+    timeout-minutes: 210
     runs-on: macos-latest
     # deployment: false uses the environment for its secrets and branch rule
     # without recording a deployment for every build.
@@ -781,6 +782,25 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # The bundle carries the app crate's version (tauri.conf.json has
+      # none), latest.json the tag's. If they differ, the updater offers
+      # every user the release they already run, again and again. It reads
+      # only files of the checkout, so it runs first and fails fast.
+      - name: The app version matches the tag
+        if: ${{ needs.notes.outputs.tag != '' }}
+        run: |
+          set -euo pipefail
+          app="$(awk '
+            /^\[/ { inside = ($0 ~ /^\[package\][[:space:]]*$/); next }
+            inside && /^version[[:space:]]*=/ {
+              sub(/^version[[:space:]]*=[[:space:]]*"/, ""); sub(/".*$/, ""); print; exit
+            }' app/src-tauri/Cargo.toml)"
+          if [ "$app" != "${RELEASE_TAG#v}" ]; then
+            echo "::error file=app/src-tauri/Cargo.toml::the app version is '$app', the tag is $RELEASE_TAG; the updater would offer this release forever"
+            exit 1
+          fi
+          echo "app version $app matches $RELEASE_TAG"
 
       - name: Install Rust toolchain
         run: |
@@ -879,6 +899,14 @@ jobs:
           set -euo pipefail
           missing=""
           count=0
+          # Whitespace only counts as missing.
+          for var in APPLE_CERTIFICATE_P12 APPLE_CERTIFICATE_PASSWORD APPLE_TEAM_ID \
+                     APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER_ID \
+                     TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
+            if [ -z "$(printf '%s' "${!var:-}" | tr -d '[:space:]')" ]; then
+              unset "$var"
+            fi
+          done
           for var in APPLE_CERTIFICATE_P12 APPLE_CERTIFICATE_PASSWORD APPLE_TEAM_ID \
                      APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER_ID; do
             if [ -z "${!var:-}" ]; then
@@ -936,12 +964,20 @@ jobs:
           keychain="$RUNNER_TEMP/notedown-cli.keychain-db"
           cert="$RUNNER_TEMP/notedown-cli.p12"
           trap 'rm -f "$cert"; if [ -f "$keychain" ]; then security delete-keychain "$keychain" || true; fi' EXIT
+          # A secret set from a file keeps its trailing newline: ids lose all
+          # whitespace, the password its CR and LF, and both are masked again.
+          team_id="$(printf '%s' "$APPLE_TEAM_ID" | tr -d '[:space:]')"
+          cert_password="$(printf '%s' "$APPLE_CERTIFICATE_PASSWORD" | tr -d '\r\n')"
+          echo "::add-mask::$team_id"
+          echo "::add-mask::$cert_password"
           keychain_password="$(openssl rand -base64 32)"
           (umask 077 && printf '%s' "$APPLE_CERTIFICATE_P12" | base64 --decode >"$cert")
           security create-keychain -p "$keychain_password" "$keychain"
           security set-keychain-settings -lut 900 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
-          security import "$cert" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          # The format named, as tauri-macos-sign does: security cannot infer
+          # it for a p12 with PBES2/AES encryption (the OpenSSL 3 default).
+          security import "$cert" -f pkcs12 -t agg -k "$keychain" -P "$cert_password" -T /usr/bin/codesign
           rm -f "$cert"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
           security list-keychains -d user -s "$keychain" login.keychain-db
@@ -960,7 +996,7 @@ jobs:
           info="$(codesign --display --verbose=4 "$bin" 2>&1)"
           echo "$info"
           bad=0
-          for want in "Identifier=$identifier" "TeamIdentifier=$APPLE_TEAM_ID" \
+          for want in "Identifier=$identifier" "TeamIdentifier=$team_id" \
                       "Authority=Developer ID Application" "(runtime)" "Timestamp="; do
             grep -qF -- "$want" <<<"$info" || { echo "::error::the CLI signature lacks '$want'"; bad=1; }
           done
@@ -1051,24 +1087,6 @@ jobs:
           cp "target/$TARGET/release/notedown" "app/src-tauri/binaries/notedown-$TARGET"
           chmod 755 "app/src-tauri/binaries/notedown-$TARGET"
 
-      # The bundle carries the app crate's version (tauri.conf.json has
-      # none), latest.json the tag's. If they differ, the updater offers
-      # every user the release they already run, again and again.
-      - name: The app version matches the tag
-        if: ${{ needs.notes.outputs.tag != '' }}
-        run: |
-          set -euo pipefail
-          app="$(awk '
-            /^\[/ { inside = ($0 ~ /^\[package\][[:space:]]*$/); next }
-            inside && /^version[[:space:]]*=/ {
-              sub(/^version[[:space:]]*=[[:space:]]*"/, ""); sub(/".*$/, ""); print; exit
-            }' app/src-tauri/Cargo.toml)"
-          if [ "$app" != "${RELEASE_TAG#v}" ]; then
-            echo "::error file=app/src-tauri/Cargo.toml::the app version is '$app', the tag is $RELEASE_TAG; the updater would offer this release forever"
-            exit 1
-          fi
-          echo "app version $app matches $RELEASE_TAG"
-
       # Tauri signs the .app and the sidecar inside it under the hardened
       # runtime, notarizes the .app and staples it, then makes the DMG and
       # the updater files (.app.tar.gz from the stapled .app, and its .sig).
@@ -1082,8 +1100,10 @@ jobs:
       #
       # The updater key passes verbatim: it can be the two-line minisign
       # file, and flattening it makes Tauri report "Missing encoded key in
-      # secret key". The throwaway key of a dry run has no password, so its
-      # (empty) password variable is set too.
+      # secret key". Ids lose all whitespace and passwords their CR and LF
+      # (a secret set from a file keeps its trailing newline), and the
+      # changed values are masked again. The throwaway key of a dry run has
+      # no password, so its (empty) password variable is set too.
       #
       # beforeBuildCommand is emptied (the frontend was built above, before
       # any secret) and cargo runs offline (the crates were fetched above).
@@ -1112,7 +1132,8 @@ jobs:
           case "$UPDATER" in
             real)
               updater_key="$IN_TAURI_SIGNING_PRIVATE_KEY"
-              updater_password="$IN_TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+              updater_password="$(printf '%s' "$IN_TAURI_SIGNING_PRIVATE_KEY_PASSWORD" | tr -d '\r\n')"
+              mask "$updater_password"
               ;;
             throwaway)
               ./node_modules/.bin/tauri signer generate -w "$work/updater.key" --ci >/dev/null
@@ -1127,14 +1148,21 @@ jobs:
           mask_lines "$updater_key"
 
           if [ "$SIGN" = true ]; then
-            certificate="$(printf '%s' "$IN_APPLE_CERTIFICATE_P12" | tr -d '[:space:]')"
-            mask "$certificate"
+            oneline() { printf '%s' "$1" | tr -d '[:space:]'; }
+            certificate="$(oneline "$IN_APPLE_CERTIFICATE_P12")"
+            cert_password="$(printf '%s' "$IN_APPLE_CERTIFICATE_PASSWORD" | tr -d '\r\n')"
+            team_id="$(oneline "$IN_APPLE_TEAM_ID")"
+            key_id="$(oneline "$IN_APPLE_API_KEY_ID")"
+            issuer="$(oneline "$IN_APPLE_API_ISSUER_ID")"
+            for value in "$certificate" "$cert_password" "$team_id" "$key_id" "$issuer"; do
+              mask "$value"
+            done
             (umask 077 && printf '%s\n' "$IN_APPLE_API_KEY_P8" >"$work/api-key.p8")
             export APPLE_CERTIFICATE="$certificate"
-            export APPLE_CERTIFICATE_PASSWORD="$IN_APPLE_CERTIFICATE_PASSWORD"
-            export APPLE_TEAM_ID="$IN_APPLE_TEAM_ID"
-            export APPLE_API_KEY="$IN_APPLE_API_KEY_ID"
-            export APPLE_API_ISSUER="$IN_APPLE_API_ISSUER_ID"
+            export APPLE_CERTIFICATE_PASSWORD="$cert_password"
+            export APPLE_TEAM_ID="$team_id"
+            export APPLE_API_KEY="$key_id"
+            export APPLE_API_ISSUER="$issuer"
             export APPLE_API_KEY_PATH="$work/api-key.p8"
           fi
           export TAURI_SIGNING_PRIVATE_KEY="$updater_key"
@@ -1170,11 +1198,22 @@ jobs:
           ls -la out
           echo "dmg=out/$base.dmg" >>"$GITHUB_OUTPUT"
 
+      # The released app trusts only plugins.updater.pubkey. A .sig made by
+      # another key passes every other check and strands every installed
+      # app, so the key ids must match. The throwaway key of a dry run never
+      # matches and is not checked.
+      - name: The updater key belongs to the app's public key
+        if: ${{ steps.signing.outputs.updater == 'real' }}
+        env:
+          SIG: out/notedown-app-v${{ needs.notes.outputs.name_ver }}-macos.app.tar.gz.sig
+        run: bash scripts/ci/updater-key-id.sh "$SIG" app/src-tauri/tauri.conf.json
+
       # Tauri notarizes the .app, not the DMG around it. Without a stapled
       # ticket Gatekeeper asks Apple on first open, or refuses offline.
       # Staple only fetches the ticket, which sometimes loses its connection
-      # (stapler exit 68): 5 tries, 30 s apart. Worst case 43.3 min
-      # (scripts/ci/notarize.sh) + 5 x (stapler + 30 s), cap 55.
+      # (stapler exit 68): 5 tries, 30 s apart. Every stapler and spctl call
+      # has a hard alarm. Worst case: 2600 s (scripts/ci/notarize.sh) +
+      # 5 x (60 + 30 s) + 4 x 30 s + 60 s = 3230 s, 53.8 min; cap 55.
       - name: Notarize and staple the DMG
         if: ${{ steps.signing.outputs.sign == 'true' }}
         timeout-minutes: 55
@@ -1187,7 +1226,8 @@ jobs:
           set -euo pipefail
           bash scripts/ci/notarize.sh "$DMG"
           for attempt in 1 2 3 4 5; do
-            if xcrun stapler staple "$DMG" && xcrun stapler validate "$DMG"; then
+            if perl -e 'alarm shift; exec @ARGV' 60 xcrun stapler staple "$DMG" \
+              && perl -e 'alarm shift; exec @ARGV' 30 xcrun stapler validate "$DMG"; then
               break
             fi
             if [ "$attempt" -eq 5 ]; then
@@ -1197,7 +1237,7 @@ jobs:
             echo "stapling or validating failed (try $attempt of 5), next try in 30 s"
             sleep 30
           done
-          spctl -a -t open --context context:primary-signature -vv "$DMG"
+          perl -e 'alarm shift; exec @ARGV' 60 spctl -a -t open --context context:primary-signature -vv "$DMG"
 
       # The checks run on the .app from the .app.tar.gz, the file the
       # updater installs; the DMG holds the same .app. The notices must be
@@ -1240,6 +1280,11 @@ jobs:
             || err "$notices has no npm part (not notices-app?)"
           cmp -s "$notices" app/src-tauri/resources/THIRD-PARTY-NOTICES.txt \
             || err "$notices differs from notices-app"
+          lsmin="$(plutil -extract LSMinimumSystemVersion raw "$plist")"
+          [ "$lsmin" = 13.0 ] || err "the app's LSMinimumSystemVersion is '$lsmin', want 13.0"
+          main="$app/Contents/MacOS/$(plutil -extract CFBundleExecutable raw "$plist")"
+          minos="$(otool -l "$main" | awk '/LC_BUILD_VERSION/ { found = 1 } found && $1 == "minos" { print $2; exit }')"
+          [ "$minos" = 13.0 ] || err "$main needs macOS '$minos', want 13.0"
           sidecar="$app/Contents/MacOS/notedown"
           version="$(bash scripts/ci/workspace-version.sh)"
           got="$("$sidecar" --version)" || got="(failed)"
@@ -1253,11 +1298,14 @@ jobs:
           # identifier is printed, not checked.
           info="$(codesign --display --verbose=4 "$sidecar" 2>&1)"
           echo "$info"
-          for w in "Authority=Developer ID Application" "TeamIdentifier=$APPLE_TEAM_ID" "(runtime)" "Timestamp="; do
+          team_id="$(printf '%s' "$APPLE_TEAM_ID" | tr -d '[:space:]')"
+          for w in "Authority=Developer ID Application" "TeamIdentifier=$team_id" "(runtime)" "Timestamp="; do
             grep -qF -- "$w" <<<"$info" || err "the sidecar's signature lacks '$w'"
           done
-          xcrun stapler validate "$app" || err "the app in the .app.tar.gz carries no valid stapled ticket"
-          spctl -a -t exec -vv "$app" || err "Gatekeeper does not accept the app"
+          perl -e 'alarm shift; exec @ARGV' 60 xcrun stapler validate "$app" \
+            || err "the app in the .app.tar.gz carries no valid stapled ticket"
+          perl -e 'alarm shift; exec @ARGV' 120 spctl -a -t exec -vv "$app" \
+            || err "Gatekeeper does not accept the app"
           exit "$bad"
 
       - name: Upload macos

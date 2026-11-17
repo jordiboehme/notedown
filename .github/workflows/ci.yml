@@ -796,6 +796,7 @@ jobs:
           bash scripts/ci/test-app-sbom.sh
           bash scripts/ci/test-check-linux-binary.sh
           bash scripts/ci/test-notarize.sh
+          bash scripts/ci/test-updater-key-id.sh
 
       # A called workflow that asks for a scope its caller does not grant
       # fails the whole calling run at startup, on every push. release.yml's

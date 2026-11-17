@@ -23,11 +23,11 @@ pub fn parse_utc_offset(text: &str) -> Option<UtcOffset> {
 }
 
 /// This computer's current offset from UTC. The time crate cannot read it safely once threads
-/// run; chrono reads `TZ` or the system zone data itself, without `localtime_r` and without a
+/// run; jiff reads `TZ` or the system zone data itself, without `localtime_r` and without a
 /// child process (a forked child would hold every open file lock of the process until it execs).
 pub fn local_utc_offset() -> Option<UtcOffset> {
-    use chrono::Offset;
-    UtcOffset::from_whole_seconds(chrono::Local::now().offset().fix().local_minus_utc()).ok()
+    let zone = jiff::tz::TimeZone::try_system().ok()?;
+    UtcOffset::from_whole_seconds(zone.to_offset(jiff::Timestamp::now()).seconds()).ok()
 }
 
 #[cfg(test)]
@@ -47,5 +47,11 @@ mod tests {
         for bad in ["", "02:00", "+2", "+02:0x", "CEST"] {
             assert_eq!(parse_utc_offset(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn the_local_offset_is_read_and_whole_minutes() {
+        let offset = local_utc_offset().expect("this computer has a time zone");
+        assert_eq!(offset.whole_seconds() % 60, 0);
     }
 }

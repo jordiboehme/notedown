@@ -23,5 +23,9 @@ allow = [
 multiple-versions = "warn"
 
 [advisories]
-# No advisory is ignored. When one has to be, list it here with the reason and when it goes.
-ignore = []
+# Each ignored advisory has its reason and when it goes.
+ignore = [
+    # chrono is unmaintained: no flaw, no fix. rmcp needs it (not optional) and turns on the
+    # chrono04 feature of schemars. Remove this when rmcp no longer depends on chrono.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained only; rmcp needs chrono" },
+]

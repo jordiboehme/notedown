@@ -214,6 +214,8 @@ exec "$S" 331"#;
         .unwrap();
     wait_for(&events, is_progress);
     assert_eq!(jobs.state(), Some(JobKind::Backup));
+    // A backup reads the Supernote: it does not hold the server.
+    assert!(!jobs.holds_server());
     jobs.pause();
     assert!(gone(dir.path()), "{}", left_in(dir.path()));
     // The event says the next step may start: Resume is not refused.
@@ -741,9 +743,11 @@ fn busy_blocks_the_commands_that_touch_the_server() {
 exec "$S" 335"#;
     let (jobs, events) = jobs(sidecar(dir.path(), body), FakeHost::new(dir.path()));
     assert!(jobs.use_server().is_ok());
+    assert!(!jobs.holds_server());
     jobs.import(&backup_dir(dir.path()), false, false).unwrap();
     wait_for(&events, is_progress);
     assert_eq!(jobs.use_server().err(), Some(WAIT_FOR_IMPORT.to_owned()));
+    assert!(jobs.holds_server());
     // A pause is for the backup only: the import runs on.
     jobs.pause();
     assert_eq!(jobs.state(), Some(JobKind::Import));
@@ -753,6 +757,7 @@ exec "$S" 335"#;
     assert!(ended);
     wait_idle(&jobs);
     assert!(jobs.use_server().is_ok());
+    assert!(!jobs.holds_server());
     // Each command that starts the children or changes the login holds the guard.
     let source = include_str!("../commands.rs");
     for command in [

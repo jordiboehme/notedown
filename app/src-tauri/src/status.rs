@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::{AppConfig, ExistingSetup, Mode};
+use crate::notify::store::SyncCount;
 use crate::supervisor::ChildState;
 
 /// The line of a child that another Notedown process replaces.
@@ -140,6 +141,8 @@ pub struct Parts {
     pub pipeline_status: Option<PipelineCall>,
     /// `None` until the first poll ended.
     pub account: Option<AccountPoll>,
+    /// The count of the files of the last device sync the poller counted.
+    pub sync_count: Option<SyncCount>,
 }
 
 /// A problem that lights the dot of the tray icon.
@@ -258,6 +261,8 @@ pub struct DeviceStatus {
     pub last_sync_ms: Option<u64>,
     pub syncing: bool,
     pub online: bool,
+    /// The files the shown sync changed; only when they were counted for that sync.
+    pub files_changed: Option<SyncCount>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -269,12 +274,19 @@ pub struct OcrStatus {
     pub queued: u64,
     pub pending: u64,
     pub waiting: u64,
+    /// When the last pass ended.
+    pub last_run_ms: Option<u64>,
+    /// This status has an answer of `pipeline status`; without it the fields above say
+    /// nothing about the pipeline.
+    pub facts: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentStatus {
     pub name: String,
+    /// The journal seq the consumer acked up to.
+    pub seq: u64,
     pub read_at_ms: Option<u64>,
     pub acked_at_ms: Option<u64>,
     pub notes_behind: u64,
@@ -462,6 +474,7 @@ fn device_line(line: &str) -> DeviceStatus {
         last_sync_ms: None,
         syncing: false,
         online: false,
+        files_changed: None,
     }
 }
 
@@ -507,6 +520,9 @@ fn device_status(parts: &Parts, now_ms: u64, attention: &mut Vec<Attention>) -> 
         last_sync_ms: device.last_sync_ms,
         syncing: device.syncing,
         online: device.online,
+        files_changed: parts
+            .sync_count
+            .filter(|c| device.last_sync_ms == Some(c.at_ms)),
     }
 }
 
@@ -518,6 +534,8 @@ fn ocr_line(line: &str) -> OcrStatus {
         queued: 0,
         pending: 0,
         waiting: 0,
+        last_run_ms: None,
+        facts: false,
     }
 }
 
@@ -564,6 +582,8 @@ fn ocr_status(
         queued: facts.queued,
         pending: facts.pending,
         waiting: facts.waiting,
+        last_run_ms: facts.last_run_ms,
+        facts: true,
     };
     let agents = facts.consumers.iter().map(agent).collect();
     (ocr, agents)
@@ -577,6 +597,7 @@ fn agent(c: &Consumer) -> AgentStatus {
     };
     AgentStatus {
         name: c.name.clone(),
+        seq: c.seq,
         read_at_ms: c.read_at,
         acked_at_ms: c.acked_at,
         notes_behind: c.notes_behind,

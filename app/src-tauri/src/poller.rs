@@ -581,6 +581,7 @@ impl Inner {
                 device_urls: inputs.serve_info.device_urls.clone(),
                 pipeline_status: state.pipeline.of(&key).cloned(),
                 account: state.account.of(&key).cloned(),
+                sync_count: None,
             };
             (parts, state.check_error.clone())
         };

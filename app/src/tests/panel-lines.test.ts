@@ -53,7 +53,7 @@ describe("panelLines", () => {
 
   it("shows the line of a device that has not synced as it is", () => {
     const status = sampleStatus(now);
-    status.device = { line: "No Supernote yet", name: null, lastSyncMs: null, syncing: false, online: false };
+    status.device = { line: "No Supernote yet", name: null, lastSyncMs: null, syncing: false, online: false, filesChanged: null };
     expect(panelLines(status, now)[0]).toMatchObject({ text: "No Supernote yet", when: null, tone: "off" });
   });
 
@@ -71,7 +71,7 @@ describe("panelLines", () => {
     expect(lines[0]).toMatchObject({ attention: true, tone: "problem", when: "3 min ago" });
 
     status.attention = ["ocrError", "tokenRefused"];
-    status.device = { line: "The server refused the login", name: null, lastSyncMs: null, syncing: false, online: false };
+    status.device = { line: "The server refused the login", name: null, lastSyncMs: null, syncing: false, online: false, filesChanged: null };
     lines = panelLines(status, now);
     expect(lines.map((l) => l.key)).toEqual(["supernote", "ocr", "agent:Claude"]);
     expect(lines[0]).toMatchObject({ attention: true, tone: "problem" });

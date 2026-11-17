@@ -20,6 +20,17 @@ export interface AppConfig {
   modelIdleMinutes: number;
   /** What the setup checklist keeps between two starts. */
   setup: SetupRecord;
+  /** Which desktop notifications to show; off by default. */
+  notifications: NotificationChoices;
+}
+
+/** The switch of the desktop notifications and the choice of each event (config.rs). */
+export interface NotificationChoices {
+  enabled: boolean;
+  sync: boolean;
+  ocr: boolean;
+  agent: boolean;
+  problems: boolean;
 }
 
 /** What the setup checklist keeps (config.rs SetupRecord). */

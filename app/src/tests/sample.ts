@@ -7,11 +7,28 @@ export function sampleStatus(now: number): Status {
     setup: { mode: "local", ready: true, line: null, note: null },
     server: { line: "Runs on this Mac", state: { state: "running", pid: 7, sinceMs: 1 }, deviceUrls: [] },
     pipeline: { line: "Runs", state: { state: "running", pid: 8, sinceMs: 1 } },
-    device: { line: null, name: "Nomad", lastSyncMs: now - 12 * 60_000, syncing: false, online: true },
-    ocr: { line: "Caught up", inWork: null, lastError: null, queued: 0, pending: 0, waiting: 0 },
+    device: {
+      line: null,
+      name: "Nomad",
+      lastSyncMs: now - 12 * 60_000,
+      syncing: false,
+      online: true,
+      filesChanged: { atMs: now - 12 * 60_000, files: 12 },
+    },
+    ocr: {
+      line: "Caught up",
+      inWork: null,
+      lastError: null,
+      queued: 0,
+      pending: 0,
+      waiting: 0,
+      lastRunMs: now - 5 * 60_000,
+      facts: true,
+    },
     agents: [
       {
         name: "Claude",
+        seq: 40,
         readAtMs: now - 2 * 3_600_000,
         ackedAtMs: now - 2 * 3_600_000,
         notesBehind: 3,
@@ -33,8 +50,17 @@ export function notSetUp(): Status {
     setup: { mode: "notSet", ready: false, line: "Notedown is not set up yet", note: null },
     server: { line: "Not set up yet", state: null, deviceUrls: [] },
     pipeline: { line: "Not set up yet", state: { state: "stopped" } },
-    device: { line: "Not set up yet", name: null, lastSyncMs: null, syncing: false, online: false },
-    ocr: { line: "Not set up yet", inWork: null, lastError: null, queued: 0, pending: 0, waiting: 0 },
+    device: { line: "Not set up yet", name: null, lastSyncMs: null, syncing: false, online: false, filesChanged: null },
+    ocr: {
+      line: "Not set up yet",
+      inWork: null,
+      lastError: null,
+      queued: 0,
+      pending: 0,
+      waiting: 0,
+      lastRunMs: null,
+      facts: false,
+    },
     agents: [],
     attention: [],
     existing: { server: false, pipeline: false },
@@ -66,6 +92,7 @@ export function sampleConfig(): AppConfig {
       syncChecked: null,
       syncAcknowledged: false,
     },
+    notifications: { enabled: false, sync: true, ocr: true, agent: true, problems: true },
   };
 }
 

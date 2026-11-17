@@ -7,9 +7,6 @@
 //! facts yet, no account answer yet) never moves or clears a field, and a field seen for the
 //! first time is a baseline without a notice.
 
-pub mod deliver;
-#[cfg(target_os = "macos")]
-pub mod macos;
 pub mod store;
 
 use std::path::{Path, PathBuf};
@@ -20,15 +17,23 @@ use crate::supervisor::ChildState;
 use crate::windows::LibraryAt;
 use store::{ConsumerRecord, KeyRecord, ProblemState};
 
-/// At most one Sync and one OCR notice per this time (10 minutes); counts within it add up.
+/// At most one Sync and one OCR notice per this time (10 minutes); counts within it add up
+/// and show when it ends.
 pub const GAP_MS: u64 = 10 * 60_000;
 /// No notice for an event older than this (30 minutes): the app was not running.
 pub const STALE_MS: u64 = 30 * 60_000;
 /// At most one notice per problem per this time (30 minutes).
 pub const PROBLEM_GAP_MS: u64 = 30 * 60_000;
-/// An agent whose seq rose and did not rise again for this time (one pipeline poll while no
-/// window is visible) read what it wanted.
-pub const AGENT_QUIET_MS: u64 = 60_000;
+/// An agent whose seq rose and did not rise again for this time read what it wanted. It must
+/// cover the next `pipeline status` poll after the rise: polls start at most
+/// `poller::pipeline_every(false, _)` (60 s) apart and one may run up to
+/// `poller::STATUS_TIMEOUT` (60 s), so 150 s leaves a margin. Statuses cannot count the polls:
+/// a poll that changes nothing sends no status, and an account poll sends one with the old
+/// facts.
+pub const AGENT_QUIET_MS: u64 = 150_000;
+/// In `unshown_files`: a sync within the gap had no number. No real sum reaches it, and
+/// `saturating_add` keeps it.
+const UNKNOWN_FILES: u64 = u64::MAX;
 
 /// The problem keys, as in `notedown.problem.<key>`.
 pub const PROBLEM_SERVER: &str = "server";
@@ -139,14 +144,19 @@ pub fn wants_ocr_count(record: &KeyRecord, status: &Status, data_dir: &Path) -> 
 }
 
 /// When [`decide`] should run again with the last status although no new status came: an
-/// agent whose seq rose waits for a quiet poll.
+/// agent whose seq rose waits for a quiet poll, and counts withheld in the gap show when it
+/// ends.
 pub fn next_wake(record: &KeyRecord) -> Option<u64> {
+    let gap_end =
+        |sum: u64, last: Option<u64>| last.filter(|_| sum > 0).map(|at| at.saturating_add(GAP_MS));
     record
         .consumers
         .values()
         .filter(|c| c.pending_seq.is_some())
         .filter_map(|c| c.rose_at)
         .map(|at| at.saturating_add(AGENT_QUIET_MS))
+        .chain(gap_end(record.unshown_files, record.sync_last_notice_ms))
+        .chain(gap_end(record.unshown_notes, record.ocr_last_notice_ms))
         .min()
 }
 
@@ -164,8 +174,14 @@ pub fn decide(
     let set_up = input.status.setup.mode != Mode::NotSet;
     let on = |kind: bool| choices.enabled && kind && set_up;
     let mut notices = Vec::new();
-    notices.extend(sync(&mut next, input, on(choices.sync), now_ms));
-    notices.extend(ocr(&mut next, input, on(choices.ocr), now_ms));
+    let (sync_on, ocr_on) = (on(choices.sync), on(choices.ocr));
+    notices.extend(
+        sync(&mut next, input, sync_on, now_ms)
+            .or_else(|| sync_gap_end(&mut next, sync_on, now_ms)),
+    );
+    notices.extend(
+        ocr(&mut next, input, ocr_on, now_ms).or_else(|| ocr_gap_end(&mut next, ocr_on, now_ms)),
+    );
     notices.extend(agents(&mut next, input, on(choices.agent), now_ms));
     let problems_on = on(choices.problems) && !input.import_holds_server;
     notices.extend(problems(&mut next, &input.status, problems_on, now_ms));
@@ -178,6 +194,65 @@ fn stale(at_ms: u64, now_ms: u64) -> bool {
 
 fn in_gap(last_notice_ms: Option<u64>, now_ms: u64) -> bool {
     last_notice_ms.is_some_and(|at| now_ms < at.saturating_add(GAP_MS))
+}
+
+/// The gap ended with counts withheld: they show now, unless the app was not running long
+/// after it (the sum is then dropped, as an old event).
+fn gap_ended(sum: &mut u64, last_notice_ms: Option<u64>, on: bool, now_ms: u64) -> Option<u64> {
+    if *sum == 0 || in_gap(last_notice_ms, now_ms) {
+        return None;
+    }
+    let late =
+        last_notice_ms.is_none_or(|at| now_ms > at.saturating_add(GAP_MS).saturating_add(STALE_MS));
+    let shown = std::mem::take(sum);
+    (on && !late).then_some(shown)
+}
+
+fn sync_gap_end(next: &mut KeyRecord, on: bool, now_ms: u64) -> Option<Notice> {
+    let sum = gap_ended(
+        &mut next.unshown_files,
+        next.sync_last_notice_ms,
+        on,
+        now_ms,
+    )?;
+    Some(sync_notice(next, sum, now_ms))
+}
+
+fn ocr_gap_end(next: &mut KeyRecord, on: bool, now_ms: u64) -> Option<Notice> {
+    let sum = gap_ended(&mut next.unshown_notes, next.ocr_last_notice_ms, on, now_ms)?;
+    Some(ocr_notice(next, sum, now_ms))
+}
+
+/// The files of a sync added to the withheld sum. When any count in the sum has no number,
+/// the sum has none either: the notice then says only that the Supernote synced.
+fn add_files(sum: u64, files: Option<u64>) -> u64 {
+    match files {
+        Some(files) => sum.saturating_add(files),
+        None => UNKNOWN_FILES,
+    }
+}
+
+/// The sync notice for `files` (with [`UNKNOWN_FILES`] for no number).
+fn sync_notice(next: &mut KeyRecord, files: u64, now_ms: u64) -> Notice {
+    next.unshown_files = 0;
+    next.sync_last_notice_ms = Some(now_ms);
+    let body = match files {
+        UNKNOWN_FILES => SYNC_UNKNOWN.to_owned(),
+        1 => "1 file changed.".to_owned(),
+        n => format!("{n} files changed."),
+    };
+    Notice::new(NoticeKind::Sync, body, Target::Library(LibraryAt::All))
+}
+
+fn ocr_notice(next: &mut KeyRecord, notes: u64, now_ms: u64) -> Notice {
+    next.unshown_notes = 0;
+    next.ocr_last_notice_ms = Some(now_ms);
+    let body = if notes == 1 {
+        "1 note is ready.".to_owned()
+    } else {
+        format!("{notes} notes are ready.")
+    };
+    Notice::new(NoticeKind::Ocr, body, Target::Library(LibraryAt::New))
 }
 
 fn sync(next: &mut KeyRecord, input: &NotifyInput, on: bool, now_ms: u64) -> Option<Notice> {
@@ -203,23 +278,12 @@ fn sync(next: &mut KeyRecord, input: &NotifyInput, on: bool, now_ms: u64) -> Opt
     if stale(count.at_ms, now_ms) {
         return None;
     }
+    let files = add_files(next.unshown_files, count.files);
     if in_gap(next.sync_last_notice_ms, now_ms) {
-        next.unshown_files = next.unshown_files.saturating_add(count.files.unwrap_or(0));
+        next.unshown_files = files;
         return None;
     }
-    let files = count.files.map(|f| f.saturating_add(next.unshown_files));
-    next.unshown_files = 0;
-    next.sync_last_notice_ms = Some(now_ms);
-    let body = match files {
-        Some(1) => "1 file changed.".to_owned(),
-        Some(n) => format!("{n} files changed."),
-        None => SYNC_UNKNOWN.to_owned(),
-    };
-    Some(Notice::new(
-        NoticeKind::Sync,
-        body,
-        Target::Library(LibraryAt::All),
-    ))
+    Some(sync_notice(next, files, now_ms))
 }
 
 fn ocr(next: &mut KeyRecord, input: &NotifyInput, on: bool, now_ms: u64) -> Option<Notice> {
@@ -243,8 +307,9 @@ fn ocr(next: &mut KeyRecord, input: &NotifyInput, on: bool, now_ms: u64) -> Opti
         return None;
     }
     let (count, newest) = input.ocr_new?;
+    // No notes yet is a baseline too: the first notes ever get their notice.
     if next.ocr_text_seq.is_none() {
-        next.ocr_text_seq = newest;
+        next.ocr_text_seq = Some(newest.unwrap_or(0));
         next.ocr_last_run_ms = o.last_run_ms;
         return None;
     }
@@ -252,7 +317,7 @@ fn ocr(next: &mut KeyRecord, input: &NotifyInput, on: bool, now_ms: u64) -> Opti
         return None;
     }
     next.ocr_last_run_ms = o.last_run_ms;
-    next.ocr_text_seq = next.ocr_text_seq.max(newest);
+    next.ocr_text_seq = next.ocr_text_seq.max(Some(newest.unwrap_or(0)));
     if count == 0 {
         return None;
     }
@@ -268,18 +333,7 @@ fn ocr(next: &mut KeyRecord, input: &NotifyInput, on: bool, now_ms: u64) -> Opti
         return None;
     }
     let notes = count.saturating_add(next.unshown_notes);
-    next.unshown_notes = 0;
-    next.ocr_last_notice_ms = Some(now_ms);
-    let body = if notes == 1 {
-        "1 note is ready.".to_owned()
-    } else {
-        format!("{notes} notes are ready.")
-    };
-    Some(Notice::new(
-        NoticeKind::Ocr,
-        body,
-        Target::Library(LibraryAt::New),
-    ))
+    Some(ocr_notice(next, notes, now_ms))
 }
 
 fn agents(next: &mut KeyRecord, input: &NotifyInput, on: bool, now_ms: u64) -> Vec<Notice> {

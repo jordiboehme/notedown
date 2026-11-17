@@ -493,10 +493,12 @@ fn an_agent_that_acks_part_gives_one_notice_after_a_quiet_poll() {
     let rose = rig.now;
     assert_eq!(next_wake(&rig.record), Some(rose + AGENT_QUIET_MS));
     // New notes come in while it reads: still behind, no further rise.
-    rig.later(30_000);
+    rig.later(MIN);
     rig.input.status.agents = vec![agent("claude", 15, 27, Some(rose))];
     assert!(rig.run().is_empty());
-    rig.later(30_000);
+    rig.now = rose + AGENT_QUIET_MS - 1;
+    assert!(rig.run().is_empty());
+    rig.now = rose + AGENT_QUIET_MS;
     assert_eq!(rig.bodies(), ["claude read the new notes."]);
     assert_eq!(rig.record.consumers["claude"].seq, 15);
     assert_eq!(next_wake(&rig.record), None);
@@ -665,12 +667,20 @@ fn nothing_while_not_set_up_or_while_an_import_holds_the_server() {
     assert!(rig.run().is_empty());
 
     let mut rig = Rig::seen();
+    rig.input.status.agents = vec![agent("claude", 10, 0, None)];
+    rig.run();
     rig.input.status.setup.mode = Mode::NotSet;
-    rig.input.status.attention = vec![Attention::OcrError];
-    rig.input.status.ocr.last_error = Some(LastError::default());
     rig.synced(NOW - MIN, Some(3));
+    rig.pass(3, 40);
+    rig.input.status.agents = vec![agent("claude", 20, 0, Some(NOW))];
     assert!(rig.run().is_empty());
     assert_eq!(rig.record.sync_shown_at, Some(NOW - MIN));
+    assert_eq!(rig.record.ocr_text_seq, Some(40));
+    assert_eq!(rig.record.consumers["claude"].seq, 20);
+    rig.input.status.attention = vec![Attention::OcrError];
+    rig.input.status.ocr.last_error = Some(LastError::default());
+    assert!(rig.run().is_empty());
+    assert!(rig.record.problems[PROBLEM_OCR].active);
 }
 
 #[test]
@@ -714,4 +724,149 @@ fn a_kind_turned_off_moves_its_record_and_clears_its_sum() {
     rig.later(11 * MIN);
     rig.synced(rig.now, Some(1));
     assert_eq!(rig.bodies(), ["1 file changed."]);
+}
+
+#[test]
+fn the_quiet_time_covers_the_next_pipeline_poll() {
+    let timeout = u64::try_from(crate::poller::STATUS_TIMEOUT.as_millis()).unwrap();
+    for (visible, queue) in [(false, false), (false, true), (true, false), (true, true)] {
+        let every =
+            u64::try_from(crate::poller::pipeline_every(visible, queue).as_millis()).unwrap();
+        assert!(AGENT_QUIET_MS > every + timeout);
+    }
+}
+
+#[test]
+fn a_wake_before_the_next_poll_gives_no_notice_for_a_part() {
+    // No window: the next poll comes about 60 s after the rise, and shows a further rise.
+    let mut rig = Rig::seen();
+    rig.input.status.agents = vec![agent("claude", 10, 30, None)];
+    rig.run();
+    rig.input.status.agents = vec![agent("claude", 20, 20, Some(rig.now))];
+    assert!(rig.run().is_empty());
+    let rose = rig.now;
+    rig.now = rose + 60_000;
+    assert!(rig.run().is_empty());
+    rig.now = rose + 65_000;
+    rig.input.status.agents = vec![agent("claude", 30, 10, Some(rig.now))];
+    assert!(rig.run().is_empty());
+    rig.later(65_000);
+    rig.input.status.agents = vec![agent("claude", 40, 0, Some(rig.now))];
+    assert_eq!(rig.bodies(), ["claude read the new notes."]);
+    rig.later(AGENT_QUIET_MS);
+    assert!(rig.run().is_empty());
+}
+
+#[test]
+fn a_consumer_that_starts_over_is_a_baseline() {
+    let mut rig = Rig::seen();
+    rig.input.status.agents = vec![agent("claude", 50, 0, None)];
+    rig.run();
+    rig.input.status.agents = vec![agent("claude", 3, 0, Some(rig.now))];
+    assert!(rig.run().is_empty());
+    assert_eq!(rig.record.consumers["claude"].seq, 3);
+    assert_eq!(rig.record.consumers["claude"].pending_seq, None);
+    rig.later(MIN);
+    rig.input.status.agents = vec![agent("claude", 8, 0, Some(rig.now))];
+    assert_eq!(rig.bodies(), ["claude read the new notes."]);
+}
+
+#[test]
+fn the_first_notes_ever_get_their_notice() {
+    let mut rig = Rig::new();
+    rig.input.ocr_new = Some((0, None));
+    assert!(rig.run().is_empty());
+    assert_eq!(rig.record.ocr_text_seq, Some(0));
+    assert!(!wants_ocr_count(
+        &rig.record,
+        &rig.input.status,
+        &rig.input.data_dir
+    ));
+    rig.later(MIN);
+    rig.pass(2, 5);
+    assert_eq!(rig.bodies(), ["2 notes are ready."]);
+    assert_eq!(rig.record.ocr_text_seq, Some(5));
+}
+
+#[test]
+fn withheld_counts_show_when_the_gap_ends() {
+    let mut rig = Rig::seen();
+    let first = rig.now;
+    rig.synced(rig.now, Some(12));
+    rig.pass(3, 40);
+    assert_eq!(rig.run().len(), 2);
+    assert_eq!(next_wake(&rig.record), None);
+    rig.later(2 * MIN);
+    rig.synced(rig.now, Some(3));
+    rig.pass(2, 42);
+    assert!(rig.run().is_empty());
+    rig.later(MIN);
+    rig.synced(rig.now, Some(4));
+    assert!(rig.run().is_empty());
+    assert_eq!(next_wake(&rig.record), Some(first + GAP_MS));
+    // Before the gap ends nothing; at its end the sums, with no new event.
+    rig.now = first + GAP_MS - 1;
+    assert!(rig.run().is_empty());
+    rig.now = first + GAP_MS;
+    assert_eq!(rig.bodies(), ["7 files changed.", "2 notes are ready."]);
+    assert_eq!(rig.record.unshown_files, 0);
+    assert_eq!(rig.record.unshown_notes, 0);
+    assert_eq!(next_wake(&rig.record), None);
+    assert!(rig.run().is_empty());
+
+    // Long after the gap (the app was not running): dropped as an old event.
+    let mut rig = Rig::seen();
+    let first = rig.now;
+    rig.synced(rig.now, Some(12));
+    rig.run();
+    rig.later(MIN);
+    rig.synced(rig.now, Some(3));
+    rig.run();
+    rig.now = first + GAP_MS + STALE_MS + 1;
+    assert!(rig.run().is_empty());
+    assert_eq!(rig.record.unshown_files, 0);
+
+    // Turned off within the gap: the sum is dropped.
+    let mut rig = Rig::seen();
+    let first = rig.now;
+    rig.synced(rig.now, Some(12));
+    rig.run();
+    rig.later(MIN);
+    rig.synced(rig.now, Some(3));
+    rig.run();
+    rig.choices.enabled = false;
+    rig.now = first + GAP_MS;
+    assert!(rig.run().is_empty());
+    rig.choices.enabled = true;
+    assert!(rig.run().is_empty());
+}
+
+#[test]
+fn a_withheld_sync_without_a_number_makes_the_sum_unknown() {
+    // At the gap end.
+    let mut rig = Rig::seen();
+    let first = rig.now;
+    rig.synced(rig.now, Some(12));
+    rig.run();
+    rig.later(MIN);
+    rig.synced(rig.now, None);
+    rig.run();
+    rig.later(MIN);
+    rig.synced(rig.now, Some(4));
+    rig.run();
+    rig.now = first + GAP_MS;
+    assert_eq!(rig.bodies(), [SYNC_UNKNOWN]);
+
+    // With the next sync after the gap, either way round.
+    for (withheld, last) in [(None, Some(4)), (Some(4), None)] {
+        let mut rig = Rig::seen();
+        rig.synced(rig.now, Some(12));
+        rig.run();
+        rig.later(MIN);
+        rig.synced(rig.now, withheld);
+        rig.run();
+        rig.later(GAP_MS);
+        rig.synced(rig.now, last);
+        assert_eq!(rig.bodies(), [SYNC_UNKNOWN]);
+    }
 }

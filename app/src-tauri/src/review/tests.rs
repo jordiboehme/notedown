@@ -987,7 +987,11 @@ fn a_page_dropped_while_it_waits_for_a_run_leaves_the_queue() {
     // It went far out of view before a run was free.
     s.review.drop_page(NOTE, 2);
     assert_eq!(third.join().unwrap().unwrap_err(), PAGE_DROPPED);
-    assert_eq!(s.review.queued(), 0);
+    // Its worker leaves the queue on its own thread, while both runs are still busy.
+    s.wait_until("the dropped page to leave the queue", || {
+        s.review.queued() == 0
+    });
+    assert_eq!(s.calls().len(), 2);
     s.flag("release", "");
     assert_eq!(first.join().unwrap().unwrap(), data_url(&png_of(1, BYTES)));
     assert_eq!(second.join().unwrap().unwrap(), data_url(&png_of(2, BYTES)));

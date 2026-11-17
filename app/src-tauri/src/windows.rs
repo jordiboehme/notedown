@@ -109,6 +109,16 @@ pub enum Tell {
     Emit(&'static str, serde_json::Value),
 }
 
+/// Where `open_library(note, new_notes)` opens the library: at the note (its path) when given,
+/// at New with `new_notes`, else as it is.
+pub fn library_opening(note: Option<String>, new_notes: Option<bool>) -> Opening {
+    match (note, new_notes) {
+        (Some(path), _) => Opening::At(LibraryAt::Note { path }),
+        (None, Some(true)) => Opening::At(LibraryAt::New),
+        (None, _) => Opening::Plain,
+    }
+}
+
 /// What the window `kind` is told when it opens as `opening`; `open` says it exists already.
 /// The value goes into the script as JSON, so a path is never code.
 pub fn tell(kind: WindowKind, opening: &Opening, open: bool) -> Option<Tell> {
@@ -570,6 +580,22 @@ mod tests {
         assert_eq!(tell(Library, &page, true), None);
         assert_eq!(tell(Settings, &at, true), None);
         assert_eq!(tell(Panel, &at, false), None);
+    }
+
+    #[test]
+    fn open_library_opens_at_the_note_at_new_or_as_it_is() {
+        assert_eq!(
+            library_opening(Some("NOTE/Note/A.note".into()), Some(true)),
+            Opening::At(LibraryAt::Note {
+                path: "NOTE/Note/A.note".into()
+            })
+        );
+        assert_eq!(
+            library_opening(None, Some(true)),
+            Opening::At(LibraryAt::New)
+        );
+        assert_eq!(library_opening(None, Some(false)), Opening::Plain);
+        assert_eq!(library_opening(None, None), Opening::Plain);
     }
 
     #[test]

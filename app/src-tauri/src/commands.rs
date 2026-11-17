@@ -18,7 +18,7 @@ use crate::review::{DataUrl, NoteView, Review};
 use crate::serve_info::ServeInfo;
 use crate::status::Status;
 use crate::token::{KeychainStore, TokenStore, token_key};
-use crate::windows::{self, LibraryAt, Opening, WindowKind};
+use crate::windows::{self, Opening, WindowKind};
 
 /// How the config is written to its folder: [`config::save`], or a slow one in tests.
 pub type SaveFn = Arc<dyn Fn(&Path, &AppConfig) -> std::io::Result<()> + Send + Sync>;
@@ -468,11 +468,7 @@ pub async fn open_library(
     note: Option<String>,
     new_notes: Option<bool>,
 ) -> Result<(), String> {
-    let opening = match (note, new_notes) {
-        (Some(path), _) => Opening::At(LibraryAt::Note { path }),
-        (None, Some(true)) => Opening::At(LibraryAt::New),
-        (None, _) => Opening::Plain,
-    };
+    let opening = windows::library_opening(note, new_notes);
     windows::show_window(&app, WindowKind::Library, opening).map_err(|e| e.to_string())
 }
 

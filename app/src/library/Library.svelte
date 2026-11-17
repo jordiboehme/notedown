@@ -75,6 +75,11 @@
   );
   /** Where Back in the review goes. */
   let back = $state<Selection>({ kind: "new" });
+  /**
+   * Counts the openings of a note: the review is keyed by it, so a note opened again (from the
+   * panel, while the hidden window still shows it) is read again and marked seen.
+   */
+  let openings = $state(0);
   const open = new SvelteSet<string>();
   let sort = $state<Sort>({ by: "name", ascending: true });
   let newNotes = $state<NoteSummary[] | null>(null);
@@ -194,6 +199,7 @@
   function openNote(path: string) {
     if (selection.kind !== "note") back = selection;
     selection = { kind: "note", path };
+    openings += 1;
   }
 
   /** Shows a folder and opens the folders above it in the tree. */
@@ -292,7 +298,7 @@
       {:else if selection.kind === "all"}
         <NotesList title="All notes" notes={allNotes} empty="No notes with text yet." onOpen={(note) => openNote(note.path)} />
       {:else if selection.kind === "note"}
-        {#key selection.path}
+        {#key `${openings}:${selection.path}`}
           <Review path={selection.path} onBack={() => (selection = back)} />
         {/key}
       {:else if !ready}

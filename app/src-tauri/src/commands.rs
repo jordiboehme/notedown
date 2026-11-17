@@ -295,7 +295,8 @@ impl ConfigState {
     }
 
     /// Whether this is the first start that opens Settings at Setup: no mode yet and Setup
-    /// not shown before. Answers true once; `setupShown` is saved with it.
+    /// not shown before. Answers true once; `setupShown` is saved with it. An error means it
+    /// was due but the save failed.
     pub fn take_first_start(&self) -> Result<bool, String> {
         match self.try_update(|c| {
             if c.mode != Mode::NotSet || c.setup.setup_shown {

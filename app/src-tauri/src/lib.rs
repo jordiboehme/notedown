@@ -177,18 +177,22 @@ pub fn run() {
             poll(poller);
             // The first start opens Settings at Setup, once. Last: showing a window tells the
             // poller, the library and the notes, which are all managed by now.
-            match app.state::<commands::ConfigState>().take_first_start() {
-                Ok(true) => {
-                    if let Err(why) = windows::show_window(
-                        app.handle(),
-                        WindowKind::Settings,
-                        Opening::Page("setup".into()),
-                    ) {
-                        eprintln!("notedown: the setup did not open: {why}");
-                    }
-                }
-                Ok(false) => {}
-                Err(why) => eprintln!("notedown: the first start was not saved: {why}"),
+            // A config that cannot be saved still gets the setup (then at the next start too).
+            let first = app
+                .state::<commands::ConfigState>()
+                .take_first_start()
+                .unwrap_or_else(|why| {
+                    eprintln!("notedown: the first start was not saved: {why}");
+                    true
+                });
+            if first
+                && let Err(why) = windows::show_window(
+                    app.handle(),
+                    WindowKind::Settings,
+                    Opening::Page("setup".into()),
+                )
+            {
+                eprintln!("notedown: the setup did not open: {why}");
             }
             Ok(())
         })

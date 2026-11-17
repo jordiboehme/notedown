@@ -15,8 +15,8 @@ name: Release
 #   version 0.0.0-dev and publishes nothing, also when it is started on a tag
 #   ref.
 #
-# Jobs: notes, notices, build-linux and sbom here; build-macos (the CLI and
-# the app, signed and notarized), collect (every asset checked, SHA256SUMS,
+# Jobs: notes, notices, build-linux, sbom and build-macos (the CLI and the
+# app, signed and notarized) here; collect (every asset checked, SHA256SUMS,
 # latest.json, the Homebrew files) and publish, images and homebrew follow.
 # Release jobs use no build cache: a cache a pull request could have written
 # must never reach a release asset.
@@ -726,12 +726,568 @@ jobs:
           path: sbom/*.cdx.json
           if-no-files-found: error
 
-  # build-macos (the CLI archive and the app, signed and notarized) goes
-  # here. It downloads notices-macos and notices-app.
+  # The macOS CLI and the app, Apple silicon only, minimum macOS 13.0. The
+  # artifact `macos` holds four files at its root:
+  #
+  # - notedown-v<name_ver>-macos.tar.gz: one top folder of the same name with
+  #   exactly notedown (signed and notarized, no stapled ticket: a bare
+  #   binary cannot carry one), LICENSE, NOTICE, README.md and
+  #   THIRD-PARTY-NOTICES.txt (notices-macos).
+  # - notedown-app-v<name_ver>-macos.dmg: notarized and stapled.
+  # - notedown-app-v<name_ver>-macos.app.tar.gz and its .sig: the updater
+  #   files of latest.json. The .app inside is signed, notarized and stapled
+  #   by Tauri and carries notices-app as THIRD-PARTY-NOTICES.txt.
+  #
+  # The app bundles the signed CLI as its sidecar (Contents/MacOS/notedown);
+  # Tauri signs it again inside the bundle.
+  #
+  # Secrets (design note 12): npm ci and the frontend build run before any
+  # secret or keychain exists in the job. The CLI keychain lives only inside
+  # the step that signs the CLI. The API key reaches only the two notarize
+  # steps and the Tauri build. Each step gets only the secrets it reads,
+  # through its own env, never $GITHUB_ENV. The cleanup at the end runs
+  # always.
+  #
+  # The job enters the release environment (and gets its secrets) only on
+  # main or a v tag; in a call the ref is the caller's, refs/heads/main.
+  # A dispatch on another branch gets no secret and builds everything
+  # unsigned, with a throwaway updater key. A run with a tag (a release or
+  # the rehearsal) must sign; a partial set of the six Apple secrets is
+  # always an error.
+  #
+  # Time, worst case of one step with the others typical: build 35 min,
+  # notarize steps 45 and 55 min caps (typical 5 each), tauri build 60 min
+  # cap (typical 20), the rest 10 min. One step at its worst still fits in
+  # 150 min; two at once meet the job cap instead of the step's own error.
+  build-macos:
+    name: build-macos
+    needs: [notes, notices]
+    if: ${{ !cancelled() && needs.notes.outputs.build == 'true' && needs.notices.result == 'success' }}
+    timeout-minutes: 150
+    runs-on: macos-latest
+    # deployment: false uses the environment for its secrets and branch rule
+    # without recording a deployment for every build.
+    environment:
+      name: ${{ (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main') && 'release' || '' }}
+      deployment: false
+    env:
+      NAME_VER: ${{ needs.notes.outputs.name_ver }}
+      RELEASE_TAG: ${{ needs.notes.outputs.tag }}
+      TARGET: aarch64-apple-darwin
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          bash scripts/ci/retry.sh 3 rustup toolchain install
+          bash scripts/ci/retry.sh 3 rustup target add "$TARGET"
+          rustup show active-toolchain
+
+      # Two tries, as in notices. The install action has a prebuilt binary
+      # for Apple silicon and checks it against its manifest.
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        id: auditable
+        continue-on-error: true
+        with:
+          tool: cargo-auditable@0.7.7
+          fallback: none
+
+      - name: Wait before the second try
+        if: ${{ steps.auditable.outcome == 'failure' }}
+        run: sleep 30
+
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        if: ${{ steps.auditable.outcome == 'failure' }}
+        with:
+          tool: cargo-auditable@0.7.7
+          fallback: none
+
+      # No package cache: this job makes release assets.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      # Before any secret: npm install scripts and Vite plugins never run
+      # next to a key or an unlocked keychain. The Tauri build below does not
+      # build the frontend again (beforeBuildCommand is emptied there).
+      - name: npm ci
+        working-directory: app
+        run: bash ../scripts/ci/retry.sh 3 npm ci
+
+      - name: npm run build
+        working-directory: app
+        run: npm run build
+
+      # The network part of both Rust builds, retried. The CLI build is
+      # --frozen and the Tauri build offline, so no crate is downloaded
+      # while a secret is in the environment.
+      - name: Fetch crates
+        run: |
+          set -euo pipefail
+          bash scripts/ci/retry.sh 3 cargo fetch --locked --target "$TARGET"
+          bash scripts/ci/retry.sh 3 cargo fetch --locked --manifest-path app/src-tauri/Cargo.toml
+
+      # Default features: the macOS CLI has OCR (llama.cpp with Metal).
+      - name: cargo auditable build --release --target aarch64-apple-darwin -p notedown
+        run: cargo auditable build --release --frozen --target "$TARGET" -p notedown
+
+      # --version against the workspace version, never name_ver: a dry run
+      # names its files 0.0.0-dev, the binary still says the real version.
+      # The load command's minos is the oldest macOS the binary runs on.
+      - name: The CLI names the workspace version and needs macOS 13.0
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/notedown"
+          version="$(bash scripts/ci/workspace-version.sh)"
+          got="$("$bin" --version)"
+          echo "--version: $got"
+          if [ "$got" != "notedown $version" ]; then
+            echo "::error::$bin --version printed '$got', want 'notedown $version'"
+            exit 1
+          fi
+          lipo -archs "$bin"
+          [ "$(lipo -archs "$bin")" = arm64 ] || { echo "::error::$bin is not arm64 only"; exit 1; }
+          minos="$(otool -l "$bin" | awk '/LC_BUILD_VERSION/ { found = 1 } found && $1 == "minos" { print $2; exit }')"
+          echo "minos: $minos"
+          if [ "$minos" != 13.0 ]; then
+            echo "::error::$bin needs macOS $minos, want 13.0"
+            exit 1
+          fi
+
+      # A run with a tag (a release or the rehearsal) must sign, notarize
+      # and sign its updater files. A run without a tag and without any of
+      # the eight secrets builds unsigned with a throwaway updater key. A
+      # partial set is always a mistake. Only presence is checked here.
+      - name: Decide whether to sign and notarize
+        id: signing
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=""
+          count=0
+          for var in APPLE_CERTIFICATE_P12 APPLE_CERTIFICATE_PASSWORD APPLE_TEAM_ID \
+                     APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER_ID; do
+            if [ -z "${!var:-}" ]; then
+              missing="$missing $var"
+              count=$((count + 1))
+            fi
+          done
+          if [ "$count" -eq 0 ]; then
+            sign=true
+          elif [ "$count" -eq 6 ] && [ -z "$RELEASE_TAG" ]; then
+            echo "::notice::the Apple secrets are not here (a dry run outside main); this run builds an UNSIGNED, unnotarized CLI and app"
+            sign=false
+          elif [ "$count" -eq 6 ]; then
+            echo "::error::the Apple secrets are not here, but $RELEASE_TAG must ship signed and notarized. Run from main or a v tag, where the release environment gives them."
+            exit 1
+          else
+            echo "::error::Apple secrets missing:$missing. A partial set is always a mistake."
+            exit 1
+          fi
+          if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            if [ -z "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]; then
+              echo "::error::TAURI_SIGNING_PRIVATE_KEY is set but its password is not; the updater key needs both"
+              exit 1
+            fi
+            updater=real
+          elif [ -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY_PASSWORD is set but the key is not; the updater key needs both"
+            exit 1
+          elif [ -n "$RELEASE_TAG" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not here, but $RELEASE_TAG must ship updater files the released app can verify"
+            exit 1
+          else
+            echo "::notice::the updater key is not here; this dry run signs the updater files with a throwaway key no released app trusts"
+            updater=throwaway
+          fi
+          echo "sign: $sign, updater key: $updater"
+          {
+            echo "sign=$sign"
+            echo "updater=$updater"
+          } >>"$GITHUB_OUTPUT"
+
+      # The keychain lives only inside this step: made, used and deleted
+      # here (the cleanup at the end deletes it too if this step dies).
+      # --force lets a retry sign a binary a failed try already signed.
+      - name: Sign the CLI
+        if: ${{ steps.signing.outputs.sign == 'true' }}
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/notedown"
+          identifier=io.github.jordiboehme.notedown.cli
+          keychain="$RUNNER_TEMP/notedown-cli.keychain-db"
+          cert="$RUNNER_TEMP/notedown-cli.p12"
+          trap 'rm -f "$cert"; if [ -f "$keychain" ]; then security delete-keychain "$keychain" || true; fi' EXIT
+          keychain_password="$(openssl rand -base64 32)"
+          (umask 077 && printf '%s' "$APPLE_CERTIFICATE_P12" | base64 --decode >"$cert")
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 900 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$cert" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm -f "$cert"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          if [ -z "$identity" ]; then
+            echo "::error::no Developer ID Application identity in the signing keychain"
+            exit 1
+          fi
+          bash scripts/ci/retry.sh 3 \
+            codesign --force --timestamp --options runtime \
+            --identifier "$identifier" --keychain "$keychain" --sign "$identity" "$bin"
+          security delete-keychain "$keychain"
+          security list-keychains -d user -s login.keychain-db
+          codesign --verify --strict --verbose=2 "$bin"
+          info="$(codesign --display --verbose=4 "$bin" 2>&1)"
+          echo "$info"
+          bad=0
+          for want in "Identifier=$identifier" "TeamIdentifier=$APPLE_TEAM_ID" \
+                      "Authority=Developer ID Application" "(runtime)" "Timestamp="; do
+            grep -qF -- "$want" <<<"$info" || { echo "::error::the CLI signature lacks '$want'"; bad=1; }
+          done
+          exit "$bad"
+
+      # Worst case 43.3 min (scripts/ci/notarize.sh), cap 45.
+      - name: Notarize the CLI
+        if: ${{ steps.signing.outputs.sign == 'true' }}
+        timeout-minutes: 45
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          zip="$RUNNER_TEMP/notedown-cli.zip"
+          ditto -c -k --keepParent "target/$TARGET/release/notedown" "$zip"
+          bash scripts/ci/notarize.sh "$zip"
+          rm -f "$zip"
+
+      # The hardened runtime must not break the program.
+      - name: Smoke test the signed CLI
+        if: ${{ steps.signing.outputs.sign == 'true' }}
+        run: |
+          set -euo pipefail
+          "target/$TARGET/release/notedown" --version
+          "target/$TARGET/release/notedown" --help >/dev/null
+
+      - name: Download notices-macos
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: notices-macos
+          path: dist/notices-macos
+
+      # The archive name is built here and only here. bsdtar: COPYFILE_DISABLE
+      # and --no-mac-metadata keep the ._* AppleDouble entries out,
+      # --no-xattrs the extended attributes; the files are owned by root and
+      # listed in a fixed order.
+      - name: Package the CLI archive
+        env:
+          COPYFILE_DISABLE: '1'
+        run: |
+          set -euo pipefail
+          notices=dist/notices-macos/THIRD-PARTY-NOTICES.txt
+          if [ ! -s "$notices" ]; then
+            echo "::error::$notices is missing or empty (artifact notices-macos)"
+            exit 1
+          fi
+          name="notedown-v${NAME_VER}-macos"
+          stage="dist/$name"
+          rm -rf "$stage" out
+          mkdir -p "$stage" out
+          cp "target/$TARGET/release/notedown" LICENSE NOTICE README.md "$notices" "$stage/"
+          # -n: no recursion, the folder and its five files in this order.
+          tar -C dist --no-mac-metadata --no-xattrs --uid 0 --gid 0 --uname root --gname wheel \
+            -n -czf "out/$name.tar.gz" "$name" "$name/LICENSE" "$name/NOTICE" "$name/README.md" \
+            "$name/THIRD-PARTY-NOTICES.txt" "$name/notedown"
+          want="$(printf '%s\n' "$name/" "$name/LICENSE" "$name/NOTICE" "$name/README.md" \
+            "$name/THIRD-PARTY-NOTICES.txt" "$name/notedown" | LC_ALL=C sort)"
+          got="$(tar -tzf "out/$name.tar.gz" | LC_ALL=C sort)"
+          if [ "$got" != "$want" ]; then
+            echo "::error::out/$name.tar.gz does not hold exactly the five files in $name/"
+            diff -u <(echo "$want") <(echo "$got") || true
+            exit 1
+          fi
+          tar -tvzf "out/$name.tar.gz"
+
+      # The sidecar is the signed CLI from above; tauri.conf.json's
+      # externalBin wants it as binaries/notedown-<target>. The bundle
+      # resource is notices-app (the app's crates, the macOS text for the
+      # program inside, the npm packages in app/dist), not the placeholder
+      # of a local build.
+      - name: Download notices-app
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: notices-app
+          path: app/src-tauri/resources
+
+      - name: Put the sidecar and the notices in place
+        run: |
+          set -euo pipefail
+          notices=app/src-tauri/resources/THIRD-PARTY-NOTICES.txt
+          if [ ! -s "$notices" ]; then
+            echo "::error::$notices is missing or empty (artifact notices-app)"
+            exit 1
+          fi
+          mkdir -p app/src-tauri/binaries
+          cp "target/$TARGET/release/notedown" "app/src-tauri/binaries/notedown-$TARGET"
+          chmod 755 "app/src-tauri/binaries/notedown-$TARGET"
+
+      # The bundle carries the app crate's version (tauri.conf.json has
+      # none), latest.json the tag's. If they differ, the updater offers
+      # every user the release they already run, again and again.
+      - name: The app version matches the tag
+        if: ${{ needs.notes.outputs.tag != '' }}
+        run: |
+          set -euo pipefail
+          app="$(awk '
+            /^\[/ { inside = ($0 ~ /^\[package\][[:space:]]*$/); next }
+            inside && /^version[[:space:]]*=/ {
+              sub(/^version[[:space:]]*=[[:space:]]*"/, ""); sub(/".*$/, ""); print; exit
+            }' app/src-tauri/Cargo.toml)"
+          if [ "$app" != "${RELEASE_TAG#v}" ]; then
+            echo "::error file=app/src-tauri/Cargo.toml::the app version is '$app', the tag is $RELEASE_TAG; the updater would offer this release forever"
+            exit 1
+          fi
+          echo "app version $app matches $RELEASE_TAG"
+
+      # Tauri signs the .app and the sidecar inside it under the hardened
+      # runtime, notarizes the .app and staples it, then makes the DMG and
+      # the updater files (.app.tar.gz from the stapled .app, and its .sig).
+      #
+      # Tauri signs when APPLE_CERTIFICATE exists, even empty, so absent must
+      # mean absent: the secrets come in under other names and the script
+      # exports Tauri's names only when signing. Tauri imports the p12 into a
+      # keychain of its own and finds the identity there (no
+      # APPLE_SIGNING_IDENTITY). Tauri decodes APPLE_CERTIFICATE strictly, so
+      # its whitespace goes; the changed value is masked again.
+      #
+      # The updater key passes verbatim: it can be the two-line minisign
+      # file, and flattening it makes Tauri report "Missing encoded key in
+      # secret key". The throwaway key of a dry run has no password, so its
+      # (empty) password variable is set too.
+      #
+      # beforeBuildCommand is emptied (the frontend was built above, before
+      # any secret) and cargo runs offline (the crates were fetched above).
+      - name: tauri build
+        timeout-minutes: 60
+        working-directory: app
+        env:
+          SIGN: ${{ steps.signing.outputs.sign }}
+          UPDATER: ${{ steps.signing.outputs.updater }}
+          CARGO_NET_OFFLINE: 'true'
+          IN_APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          IN_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          IN_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          IN_APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          IN_APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          IN_APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          IN_TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          IN_TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d "$RUNNER_TEMP/tauri.XXXXXX")"
+          trap 'rm -rf "$work"' EXIT
+          mask() { if [ -n "$1" ]; then echo "::add-mask::$1"; fi; }
+          mask_lines() { while IFS= read -r line; do mask "$line"; done <<<"$1"; }
+
+          case "$UPDATER" in
+            real)
+              updater_key="$IN_TAURI_SIGNING_PRIVATE_KEY"
+              updater_password="$IN_TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+              ;;
+            throwaway)
+              ./node_modules/.bin/tauri signer generate -w "$work/updater.key" --ci >/dev/null
+              updater_key="$(cat "$work/updater.key")"
+              updater_password=""
+              ;;
+            *)
+              echo "::error::unknown updater key mode '$UPDATER'"
+              exit 1
+              ;;
+          esac
+          mask_lines "$updater_key"
+
+          if [ "$SIGN" = true ]; then
+            certificate="$(printf '%s' "$IN_APPLE_CERTIFICATE_P12" | tr -d '[:space:]')"
+            mask "$certificate"
+            (umask 077 && printf '%s\n' "$IN_APPLE_API_KEY_P8" >"$work/api-key.p8")
+            export APPLE_CERTIFICATE="$certificate"
+            export APPLE_CERTIFICATE_PASSWORD="$IN_APPLE_CERTIFICATE_PASSWORD"
+            export APPLE_TEAM_ID="$IN_APPLE_TEAM_ID"
+            export APPLE_API_KEY="$IN_APPLE_API_KEY_ID"
+            export APPLE_API_ISSUER="$IN_APPLE_API_ISSUER_ID"
+            export APPLE_API_KEY_PATH="$work/api-key.p8"
+          fi
+          export TAURI_SIGNING_PRIVATE_KEY="$updater_key"
+          export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$updater_password"
+          unset IN_APPLE_CERTIFICATE_P12 IN_APPLE_CERTIFICATE_PASSWORD IN_APPLE_TEAM_ID \
+            IN_APPLE_API_KEY_P8 IN_APPLE_API_KEY_ID IN_APPLE_API_ISSUER_ID \
+            IN_TAURI_SIGNING_PRIVATE_KEY IN_TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+
+          ./node_modules/.bin/tauri build --target "$TARGET" --bundles app,dmg \
+            --config '{"build":{"beforeBuildCommand":""}}' -- --locked
+
+      # The bundler names its files after the product and version; the
+      # release uses its own names. Exactly one match each: a missing .sig
+      # is a hole in latest.json, and an app that can never update again.
+      - name: Stage the app files
+        id: stage
+        run: |
+          set -euo pipefail
+          bundle="app/src-tauri/target/$TARGET/release/bundle"
+          base="notedown-app-v${NAME_VER}-macos"
+          take() {
+            local pattern="$1" dest="$2" found
+            found="$(find "$bundle" -type f -name "$pattern")"
+            if [ -z "$found" ] || [ "$(printf '%s\n' "$found" | wc -l)" -ne 1 ]; then
+              echo "::error::want exactly one file '$pattern' under $bundle, found: ${found:-none}"
+              exit 1
+            fi
+            cp "$found" "out/$dest"
+          }
+          take '*.dmg' "$base.dmg"
+          take '*.app.tar.gz' "$base.app.tar.gz"
+          take '*.app.tar.gz.sig' "$base.app.tar.gz.sig"
+          ls -la out
+          echo "dmg=out/$base.dmg" >>"$GITHUB_OUTPUT"
+
+      # Tauri notarizes the .app, not the DMG around it. Without a stapled
+      # ticket Gatekeeper asks Apple on first open, or refuses offline.
+      # Staple only fetches the ticket, which sometimes loses its connection
+      # (stapler exit 68): 5 tries, 30 s apart. Worst case 43.3 min
+      # (scripts/ci/notarize.sh) + 5 x (stapler + 30 s), cap 55.
+      - name: Notarize and staple the DMG
+        if: ${{ steps.signing.outputs.sign == 'true' }}
+        timeout-minutes: 55
+        env:
+          DMG: ${{ steps.stage.outputs.dmg }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          bash scripts/ci/notarize.sh "$DMG"
+          for attempt in 1 2 3 4 5; do
+            if xcrun stapler staple "$DMG" && xcrun stapler validate "$DMG"; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::stapling or validating $DMG failed 5 times"
+              exit 1
+            fi
+            echo "stapling or validating failed (try $attempt of 5), next try in 30 s"
+            sleep 30
+          done
+          spctl -a -t open --context context:primary-signature -vv "$DMG"
+
+      # The checks run on the .app from the .app.tar.gz, the file the
+      # updater installs; the DMG holds the same .app. The notices must be
+      # notices-app, never the placeholder of a local build: the llama.cpp
+      # line and the npm part prove it.
+      - name: Check the app
+        env:
+          SIGN: ${{ steps.signing.outputs.sign }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          base="notedown-app-v${NAME_VER}-macos"
+          bad=0
+          err() { echo "::error::$1"; bad=1; }
+          [ -s "out/$base.app.tar.gz.sig" ] || err "out/$base.app.tar.gz.sig is empty"
+          unpacked="$RUNNER_TEMP/unpacked"
+          rm -rf "$unpacked"
+          mkdir -p "$unpacked"
+          tar -xzf "out/$base.app.tar.gz" -C "$unpacked"
+          ls -la "$unpacked"
+          app="$unpacked/Notedown.app"
+          if [ ! -d "$app" ]; then
+            echo "::error::out/$base.app.tar.gz holds no Notedown.app"
+            exit 1
+          fi
+          plist="$app/Contents/Info.plist"
+          id="$(plutil -extract CFBundleIdentifier raw "$plist")"
+          [ "$id" = io.github.jordiboehme.notedown ] || err "the app's bundle identifier is '$id'"
+          short="$(plutil -extract CFBundleShortVersionString raw "$plist")"
+          want="$(awk '
+            /^\[/ { inside = ($0 ~ /^\[package\][[:space:]]*$/); next }
+            inside && /^version[[:space:]]*=/ {
+              sub(/^version[[:space:]]*=[[:space:]]*"/, ""); sub(/".*$/, ""); print; exit
+            }' app/src-tauri/Cargo.toml)"
+          [ "$short" = "$want" ] || err "the app says version '$short', the app crate '$want'"
+          notices="$app/Contents/Resources/THIRD-PARTY-NOTICES.txt"
+          grep -qF -- 'Copyright (c) 2023-2026 The ggml authors' "$notices" \
+            || err "$notices lacks the llama.cpp notice (a placeholder?)"
+          grep -qxF 'Part 3: JavaScript and CSS packages' "$notices" \
+            || err "$notices has no npm part (not notices-app?)"
+          cmp -s "$notices" app/src-tauri/resources/THIRD-PARTY-NOTICES.txt \
+            || err "$notices differs from notices-app"
+          sidecar="$app/Contents/MacOS/notedown"
+          version="$(bash scripts/ci/workspace-version.sh)"
+          got="$("$sidecar" --version)" || got="(failed)"
+          [ "$got" = "notedown $version" ] || err "$sidecar --version printed '$got', want 'notedown $version'"
+          if [ "$SIGN" != true ]; then
+            echo "::notice::unsigned build: the signature, notarization and staple checks are skipped"
+            exit "$bad"
+          fi
+          codesign --verify --deep --strict --verbose=2 "$app" || err "codesign --verify --deep --strict failed on the app"
+          # Tauri signs the sidecar again, with its own identifier; the
+          # identifier is printed, not checked.
+          info="$(codesign --display --verbose=4 "$sidecar" 2>&1)"
+          echo "$info"
+          for w in "Authority=Developer ID Application" "TeamIdentifier=$APPLE_TEAM_ID" "(runtime)" "Timestamp="; do
+            grep -qF -- "$w" <<<"$info" || err "the sidecar's signature lacks '$w'"
+          done
+          xcrun stapler validate "$app" || err "the app in the .app.tar.gz carries no valid stapled ticket"
+          spctl -a -t exec -vv "$app" || err "Gatekeeper does not accept the app"
+          exit "$bad"
+
+      - name: Upload macos
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos
+          path: out/
+          if-no-files-found: error
+
+      # The CLI step deletes its keychain itself; this catches a step that
+      # died. Tauri's own keychain is ~/Library/Keychains/<16 letters and
+      # digits>.keychain-db and stays when the step is killed. The key files
+      # sit in mktemp folders the steps remove; these lines catch the rest.
+      - name: Delete keychains and keys
+        if: ${{ always() }}
+        run: |
+          set -uo pipefail
+          for kc in "$RUNNER_TEMP/notedown-cli.keychain-db" "$HOME"/Library/Keychains/*.keychain-db; do
+            [ -f "$kc" ] || continue
+            name="$(basename "$kc" .keychain-db)"
+            if [ "$name" = notedown-cli ] || [[ "$name" =~ ^[A-Za-z0-9]{16}$ ]]; then
+              echo "deleting $kc"
+              security delete-keychain "$kc" || rm -f "$kc"
+            fi
+          done
+          rm -rf "$RUNNER_TEMP"/notarize.* "$RUNNER_TEMP"/tauri.* \
+            "$RUNNER_TEMP/notedown-cli.p12" "$RUNNER_TEMP/notedown-cli.zip"
+          find "$RUNNER_TEMP" -maxdepth 2 \( -name '*.p8' -o -name '*.p12' -o -name '*.key' \) -print -delete || true
 
   # collect (every asset by name, SHA256SUMS, latest.json, the Homebrew
-  # files) goes here. It downloads linux-amd64, linux-arm64, sboms and the
-  # macOS artifacts.
+  # files) goes here. It downloads linux-amd64, linux-arm64, macos and
+  # sboms.
 
   # publish, images and homebrew go here, each gated on
   # needs.notes.outputs.publish == 'true'.

@@ -70,11 +70,10 @@
   // The library window: the status line, the sidebar with the notes and the device trees, and
   // the selected folder or notes, or the review of a note. It wires the store to Rust; the view
   // models decide. Rust may open it at a note or at New (`__NOTEDOWN_AT__`, `library-at`).
-  let selection = $state<Selection>(
-    openAt((window as unknown as { __NOTEDOWN_AT__?: unknown }).__NOTEDOWN_AT__) ?? { kind: "new" },
-  );
-  /** Where Back in the review goes. */
-  let back = $state<Selection>({ kind: "new" });
+  // What it shows and where Back in the review goes are in the store: a new binding leaves the
+  // review there.
+  library.selection = openAt((window as unknown as { __NOTEDOWN_AT__?: unknown }).__NOTEDOWN_AT__) ?? { kind: "new" };
+  library.back = { kind: "new" };
   /**
    * Counts the openings of a note: the review is keyed by it, so a note opened again (from the
    * panel, while the hidden window still shows it) is read again and marked seen.
@@ -95,12 +94,12 @@
   let tick = $state(Date.now());
 
   const ready = $derived(library.view?.state === "ready");
-  const selectedPath = $derived(selection.kind === "folder" ? selection.path : null);
+  const selectedPath = $derived(library.selection.kind === "folder" ? library.selection.path : null);
   const tree = $derived(treeView(library.listings, open, selectedPath));
   const columns = $derived(columnsView(selectedPath, library.listings, picked));
   const inTree = $derived(library.viewMode === "tree");
   const items = $derived(
-    sidebarItems(library.view, { newNotes: newNotes?.length ?? null, allNotes: allNotes?.length ?? null }, selection),
+    sidebarItems(library.view, { newNotes: newNotes?.length ?? null, allNotes: allNotes?.length ?? null }, library.selection),
   );
 
   // The file actions work on the picked row; in the columns, without one, on the shown folder.
@@ -117,8 +116,8 @@
   // binding (the generation moves).
   $effect(() => {
     void library.generation;
-    const shown = shownFor(library.viewMode, selection, open);
-    const binShown = selection.kind === "bin";
+    const shown = shownFor(library.viewMode, library.selection, open);
+    const binShown = library.selection.kind === "bin";
     untrack(() => showListings(shown, binShown));
   });
 
@@ -127,7 +126,7 @@
   $effect(() => {
     void library.recycle;
     void library.generation;
-    if (!ready || selection.kind !== "bin") return;
+    if (!ready || library.selection.kind !== "bin") return;
     untrack(() => void listBin());
   });
 
@@ -143,8 +142,8 @@
 
   // The selected folder: its first page at once (again after a new binding).
   $effect(() => {
-    if (!ready || !inTree || selection.kind !== "folder") return;
-    const path = selection.path;
+    if (!ready || !inTree || library.selection.kind !== "folder") return;
+    const path = library.selection.path;
     if (library.listings[listingKey(path, false)] === undefined) untrack(() => void listFolder(path, false));
   });
 
@@ -197,7 +196,7 @@
 
   /** Shows `next`: the picked row, a rename and a new folder's name end. */
   function show(next: Selection) {
-    selection = next;
+    library.selection = next;
     picked = null;
     renaming = null;
     naming = false;
@@ -205,14 +204,14 @@
 
   /** Shows the review of the note at `path`; Back goes to what was shown before. */
   function openNote(path: string) {
-    if (selection.kind !== "note") back = selection;
+    if (library.selection.kind !== "note") library.back = library.selection;
     show({ kind: "note", path });
     openings += 1;
   }
 
   /** Shows a folder and opens the folders above it in the tree. */
   function select(path: string) {
-    selection = { kind: "folder", path };
+    library.selection = { kind: "folder", path };
     picked = null;
     renaming = null;
     naming = false;
@@ -268,7 +267,7 @@
   }
 
   function pick(id: SidebarItem["id"]) {
-    selection = { kind: id };
+    library.selection = { kind: id };
   }
 
   function settings(page: string | null) {
@@ -301,17 +300,17 @@
       onSettings={settings}
     />
     <main class="main">
-      {#if selection.kind === "new"}
+      {#if library.selection.kind === "new"}
         <NotesList title="New notes" notes={newNotes} empty="No new notes." onOpen={(note) => openNote(note.path)} />
-      {:else if selection.kind === "all"}
+      {:else if library.selection.kind === "all"}
         <NotesList title="All notes" notes={allNotes} empty="No notes with text yet." onOpen={(note) => openNote(note.path)} />
-      {:else if selection.kind === "note"}
-        {#key `${openings}:${selection.path}`}
-          <Review path={selection.path} onBack={() => (selection = back)} />
+      {:else if library.selection.kind === "note"}
+        {#key `${library.generation}:${openings}:${library.selection.path}`}
+          <Review path={library.selection.path} onBack={() => (library.selection = library.back)} />
         {/key}
       {:else if !ready}
         <StateNotice view={library.view} onSettings={settings} />
-      {:else if selection.kind === "bin"}
+      {:else if library.selection.kind === "bin"}
         <RecycleBin
           bin={library.bin}
           rows={binRows}
@@ -329,7 +328,7 @@
           onEmpty={() => void confirmEmpty()}
         />
       {:else}
-        {@const path = selection.path}
+        {@const path = library.selection.path}
         <FileActions
           {actions}
           {naming}

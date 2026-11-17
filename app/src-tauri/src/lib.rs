@@ -415,6 +415,12 @@ fn library_for(
         for event in rx {
             if event == LibraryEvent::Relist {
                 notes.wake();
+                // A new binding (a login, a log out, another server) leaves the review: the
+                // window shows another place, and no render of the old one runs on. Looked up
+                // per event, so the review is not held here (it holds the library).
+                if let Some(review) = app.try_state::<review::Review>() {
+                    review.close_all();
+                }
             }
             let _ = app.emit_to(windows::WindowKind::Library.label(), LIBRARY_EVENT, event);
         }

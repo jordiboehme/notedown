@@ -12,7 +12,7 @@ import {
   type Point,
   type UploadArgs,
 } from "../library/actions";
-import { listingKey, type LibraryView } from "../library/view";
+import { listingKey, type LibraryView, type Selection } from "../library/view";
 import { binView, mergeBin, restoreTarget, type Bin } from "../library/recycle";
 import {
   LIBRARY_EVENT,
@@ -67,6 +67,10 @@ type Store = {
   emptyAsked: boolean;
   /** An Empty runs. */
   emptying: boolean;
+  /** What the main area shows. */
+  selection: Selection;
+  /** Where Back in the review goes. */
+  back: Selection;
 };
 
 /**
@@ -109,6 +113,8 @@ export const library = $state<Store>({
   restores: {},
   emptyAsked: false,
   emptying: false,
+  selection: { kind: "new" },
+  back: { kind: "new" },
 });
 
 /**
@@ -155,6 +161,8 @@ export function resetLibrary() {
   library.restores = {};
   library.emptyAsked = false;
   library.emptying = false;
+  library.selection = { kind: "new" };
+  library.back = { kind: "new" };
   binEpoch += 1;
   counted.clear();
   dropTarget = null;
@@ -198,6 +206,7 @@ export function applyEvent(event: LibraryEvent) {
       binEpoch += 1;
       lastShown = null;
       shownKeys = null;
+      leaveReview();
       break;
     case "recycle":
       library.recycle += 1;
@@ -207,6 +216,16 @@ export function applyEvent(event: LibraryEvent) {
       void startDrop(event.dropId, dropTarget ? dropTarget(event.position) : null, dropTarget !== null);
       break;
   }
+}
+
+/**
+ * A new binding (a login, a log out, another server) leaves the review: the note may belong to
+ * another account. It goes back to the folder it came from, else to New. Rust closes the
+ * review itself.
+ */
+function leaveReview() {
+  if (library.selection.kind !== "note") return;
+  library.selection = library.back.kind === "folder" ? library.back : { kind: "new" };
 }
 
 /** Keeps a job as Rust sent or answered it, and notes when it ended. */

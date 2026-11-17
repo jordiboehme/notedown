@@ -129,6 +129,34 @@ describe("the library store", () => {
     expect(calls).toContainEqual({ command: "library_cancel_drop", args: { dropId: 9 } });
   });
 
+  it("leaves the review on a new binding", () => {
+    // Back is a folder: the review goes back to it.
+    library.back = { kind: "folder", path: "INBOX" };
+    library.selection = { kind: "note", path: "NOTE/Note/a.note" };
+    applyEvent({ type: "relist" });
+    expect(library.selection).toEqual({ kind: "folder", path: "INBOX" });
+
+    // Back is not a folder: the review goes to New.
+    library.back = { kind: "all" };
+    library.selection = { kind: "note", path: "NOTE/Note/a.note" };
+    applyEvent({ type: "relist" });
+    expect(library.selection).toEqual({ kind: "new" });
+
+    // No review: what is shown stays.
+    library.selection = { kind: "bin" };
+    applyEvent({ type: "relist" });
+    expect(library.selection).toEqual({ kind: "bin" });
+
+    // A state event alone is no new binding: the review stays.
+    library.selection = { kind: "note", path: "NOTE/Note/a.note" };
+    applyEvent({ type: "state", state: "loggedOut", text: null, page: null });
+    expect(library.selection).toEqual({ kind: "note", path: "NOTE/Note/a.note" });
+
+    resetLibrary();
+    expect(library.selection).toEqual({ kind: "new" });
+    expect(library.back).toEqual({ kind: "new" });
+  });
+
   it("forgets the cursor of a folder that an event shows complete", async () => {
     answerNow("library_list", { folder: folder("INBOX", ["a"], false), next: "t1:a" } satisfies Listing);
     await listFolder("INBOX", false);

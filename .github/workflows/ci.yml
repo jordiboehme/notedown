@@ -799,8 +799,8 @@ jobs:
           advanced-security: false
           annotations: true
 
-      # The fixture tests of the CI and release scripts (jq and git are on
-      # the runner image).
+      # The fixture tests of the CI and release scripts (jq, git and python3
+      # with PyYAML are on the runner image).
       - name: Script tests
         run: |
           set -euo pipefail
@@ -808,6 +808,15 @@ jobs:
           bash scripts/ci/test-version-pins.sh
           bash scripts/ci/test-jobs-passed.sh
           bash scripts/ci/test-notices.sh
+          bash scripts/ci/test-permissions-fit.sh
+          bash scripts/ci/test-app-sbom.sh
+
+      # A called workflow that asks for a scope its caller does not grant
+      # fails the whole calling run at startup, on every push. release.yml's
+      # job permissions must fit inside what release-rehearsal.yml (and the
+      # release job of this file) grant.
+      - name: Permissions fit
+        run: bash scripts/ci/permissions-fit.sh
 
       # Every place that names the version names the same one, so a version
       # bump that left a pin behind fails its pull request.

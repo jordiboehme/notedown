@@ -1,0 +1,74 @@
+name: Release rehearsal
+
+# Runs release.yml the way CI on main calls it (workflow_call), with the
+# current tag v<version> and dry_run: true. It proves what a dispatch of
+# release.yml cannot: the call path, the `tag` input, the environment secrets
+# in the called jobs and the race check of the notes job. dry_run makes
+# publish false, so nothing is tagged, signed with cosign or published. A
+# missing release notes file is only a notice in a rehearsal.
+#
+# Dispatch only. Started on main it enters the `release` environment (the
+# deploy rule allows main), so build-macos signs and notarizes as in a real
+# release.
+on:
+  workflow_dispatch: {}
+
+# Read only by default; the calling job grants what release.yml may ask for.
+permissions:
+  contents: read
+
+# No concurrency group: a waiting rehearsal in the group release-main could
+# cancel a waiting release of ci.yml.
+
+jobs:
+  # The tag a merge of this commit would release, from the same script as
+  # ci.yml's release-check. Its release=true|false answer does not matter
+  # here: a rehearsal runs either way.
+  release-check:
+    name: release-check
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # With a notes file in place the script asks the remote for the tag,
+      # hence the retries. A retry writes the same tag line again.
+      - name: Release check
+        id: check
+        run: bash scripts/ci/retry.sh 3 bash scripts/release-check.sh
+
+  rehearsal:
+    name: release
+    needs: release-check
+    # The same grant as ci.yml's release job. scripts/ci/permissions-fit.sh
+    # checks in workflow-lint that release.yml asks for no more.
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    # A local reusable workflow resolves at the commit this run started on.
+    # actionlint 1.7.12 does not parse the self-repository syntax `$/` yet,
+    # so zizmor's self-repository finding is ignored here.
+    uses: ./.github/workflows/release.yml # zizmor: ignore[self-repository]
+    with:
+      tag: ${{ needs.release-check.outputs.tag }}
+      dry_run: true
+    # By name, never `inherit`. The secrets live only in the `release`
+    # environment and this job has none, so these resolve to nothing here by
+    # design: the called jobs that declare `environment: release` read the
+    # environment's values. Do not move the secrets to the repository.
+    secrets:
+      APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+      TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}

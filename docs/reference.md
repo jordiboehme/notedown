@@ -6,8 +6,8 @@ Private Cloud in short. For the setup step by step, see the [getting started gui
 
 ## Install
 
-There is no release yet. Build it from source with the Rust toolchain that `rust-toolchain.toml`
-names (rustup picks it up by itself):
+Ready-made packages for macOS and Linux are in [Install](install.md). To build it from source, use the
+Rust toolchain that `rust-toolchain.toml` names (rustup picks it up by itself):
 
 ```sh
 git clone https://github.com/jordiboehme/notedown.git

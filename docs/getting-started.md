@@ -10,7 +10,8 @@ The examples use a Nomad. Other Supernote devices should work the same way, but 
 
 ### 1. Install Notedown
 
-There is no release yet, so build it from source. rustup installs the toolchain that
+Install the `notedown` command line tool with `brew install jordiboehme/tap/notedown` or from the
+releases page, see [Install](install.md). Or build it from source. rustup installs the toolchain that
 `rust-toolchain.toml` names:
 
 ```sh
@@ -223,13 +224,13 @@ The server keeps a PDF of every note in `share/` in the data folder, for example
 
 The sync server is small. It can run on any machine that stays on all day, so your computer doesn't have to. This can be a small machine, for example a Raspberry Pi or a NAS, or an Intel box or a Mac.
 
-Do step 1 of part 1 first (clone the repository and install rustup). Then build it on that machine without the OCR part. Any Linux machine works (64-bit Arm or x86_64). On a Raspberry Pi, use 64-bit Raspberry Pi OS (arm64):
+The easy way is a release package: the `.deb` with a systemd service, the plain archive or the container image. [Install](install.md) describes them. To build it from source, do step 1 of part 1 first (clone the repository and install rustup). Then build it on that machine without the OCR part. Any Linux machine works (64-bit Arm or x86_64). On a Raspberry Pi, use 64-bit Raspberry Pi OS (arm64):
 
 ```sh
 cargo install --path crates/notedown --no-default-features
 ```
 
-This build has `serve`, `cloud` and `render`. It has no OCR, so there is no `pipeline`, `convert`, `model` or `mcp`, and `serve` has no `--pipeline`. The build needs a C compiler (on Debian and Raspberry Pi OS: `sudo apt install build-essential`). It does not need the C++ toolchain for llama.cpp that the OCR build needs. There are no release binaries yet. Ready-made packages (a `.deb`, a plain archive and a container image) come with the first release, and docs/install.md will describe them.
+This build has `serve`, `cloud` and `render`. It has no OCR, so there is no `pipeline`, `convert`, `model` or `mcp`, and `serve` has no `--pipeline`. The build needs a C compiler (on Debian and Raspberry Pi OS: `sudo apt install build-essential`). It does not need the C++ toolchain for llama.cpp that the OCR build needs.
 
 Set up the account, the import and the server as in part 2, with the installed `notedown`. Two things to know:
 

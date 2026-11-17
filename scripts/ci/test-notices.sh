@@ -22,7 +22,7 @@ root="$tmp/root"
 mkdir -p "$root/scripts" "$root/licenses" "$root/crates/notedown" "$root/app/src-tauri" "$tmp/bin"
 cp "$repo/scripts/third-party-notices.sh" "$root/scripts/"
 cp "$repo/about.toml" "$repo/about.hbs" "$root/"
-cp "$repo/licenses/bundled-code.txt" "$root/licenses/"
+cp "$repo/licenses/bundled-code.txt" "$repo/licenses/aws-lc.txt" "$root/licenses/"
 cp "$repo/app/src-tauri/about.toml" "$root/app/src-tauri/"
 touch "$root/crates/notedown/Cargo.toml" "$root/app/src-tauri/Cargo.toml"
 
@@ -83,6 +83,8 @@ cat > "$app/package-lock.json" <<'EOF'
     "": { "name": "fixture" },
     "node_modules/@scope/api": { "version": "2.0.0", "license": "Apache-2.0 OR MIT" },
     "node_modules/@scope/plugin": { "version": "1.0.0", "license": "MIT OR Apache-2.0" },
+    "node_modules/@scope/plugin/node_modules/helper": { "version": "2.0.0", "license": "MIT" },
+    "node_modules/helper": { "version": "1.0.0", "dev": true, "license": "MIT" },
     "node_modules/svelte": { "version": "5.0.0", "dev": true, "license": "MIT" },
     "node_modules/tailwindcss": { "version": "4.0.0", "dev": true, "license": "MIT" },
     "node_modules/vite": { "version": "8.0.0", "dev": true, "license": "MIT" }
@@ -96,6 +98,11 @@ mkpkg() { # <name> <version> <license> [license-file-text]
 }
 mkpkg @scope/api 2.0.0 "Apache-2.0 OR MIT" "api license text"
 mkpkg @scope/plugin 1.0.0 "MIT OR Apache-2.0"
+# A nested copy at another version than the top-level dev copy: the notices
+# must read the nested one.
+mkpkg @scope/plugin/node_modules/helper 2.0.0 MIT "nested helper license text"
+printf '{ "name": "helper", "version": "2.0.0", "license": "MIT" }\n' > "$app/node_modules/@scope/plugin/node_modules/helper/package.json"
+mkpkg helper 1.0.0 MIT "top helper license text"
 printf 'PackageCopyrightText: 2019-2022, Fixture Authors\n' > "$app/node_modules/@scope/plugin/LICENSE.spdx"
 mkpkg svelte 5.0.0 MIT "svelte license text"
 mkpkg tailwindcss 4.0.0 MIT "tailwind license text"
@@ -119,6 +126,9 @@ if [ "$status" -eq 0 ]; then pass "macos runs"; else fail "macos runs"; cat "$tm
 if grep -qxF '  - serde 1.0.229' "$tmp/macos.txt"; then pass "macos lists the registry crates"; else fail "macos lists the registry crates"; fi
 if grep -qF 'AGPL text here' "$tmp/macos.txt"; then fail "macos drops the block without a registry crate"; else pass "macos drops the block without a registry crate"; fi
 if grep -qF 'Copyright (c) 2023-2026 The ggml authors' "$tmp/macos.txt"; then pass "macos appends the bundled code"; else fail "macos appends the bundled code"; fi
+for want in 'Eric Young' 'The OpenSSL Project'; do
+  if grep -qF -- "$want" "$tmp/macos.txt"; then pass "macos has aws-lc '$want'"; else fail "macos has aws-lc '$want'"; fi
+done
 if grep -q '^#' "$tmp/macos.txt"; then fail "macos drops the comment header of bundled-code.txt"; else pass "macos drops the comment header of bundled-code.txt"; fi
 if grep -q '^@@' "$tmp/macos.txt"; then fail "macos leaves no marker"; else pass "macos leaves no marker"; fi
 if grep -qF -- '--target aarch64-apple-darwin' "$STUB_LOG" && ! grep -qF -- '--no-default-features' "$STUB_LOG" \
@@ -128,6 +138,9 @@ if grep -qF -- '--target aarch64-apple-darwin' "$STUB_LOG" && ! grep -qF -- '--n
 run linux "$tmp/linux.txt"
 if [ "$status" -eq 0 ]; then pass "linux runs"; else fail "linux runs"; cat "$tmp/run.log" >&2; fi
 if grep -qxF '  - anyhow 1.0.104' "$tmp/linux.txt"; then pass "linux lists the registry crates"; else fail "linux lists the registry crates"; fi
+for want in 'Eric Young' 'The OpenSSL Project'; do
+  if grep -qF -- "$want" "$tmp/linux.txt"; then pass "linux has aws-lc '$want'"; else fail "linux has aws-lc '$want'"; fi
+done
 if grep -qF 'ggml authors' "$tmp/linux.txt"; then fail "linux has no bundled code"; else pass "linux has no bundled code"; fi
 if grep -qF -- '--no-default-features --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl' "$STUB_LOG"; then pass "linux cargo-about arguments"; else fail "linux cargo-about arguments"; fi
 
@@ -139,6 +152,12 @@ for want in 'svelte 5.0.0 (MIT)' 'tailwindcss 4.0.0 (MIT)' '@scope/api 2.0.0 (Ap
   'Part 2: the notedown program inside the app'; do
   if grep -qF -- "$want" "$tmp/app.txt"; then pass "app has '$want'"; else fail "app has '$want'"; fi
 done
+if grep -qxF 'helper 2.0.0 (MIT)' "$tmp/app.txt" && grep -qF 'nested helper license text' "$tmp/app.txt" \
+  && ! grep -qF 'top helper license text' "$tmp/app.txt"; then
+  pass "app reads a nested package at its lock path"
+else
+  fail "app reads a nested package at its lock path"
+fi
 if grep -qF 'vite 8.0.0' "$tmp/app.txt"; then fail "app leaves out unbundled dev packages"; else pass "app leaves out unbundled dev packages"; fi
 if grep -qF -- "--manifest-path $root/app/src-tauri/Cargo.toml --config $root/app/src-tauri/about.toml" "$STUB_LOG" \
   && grep -qF -- "--manifest-path $root/crates/notedown/Cargo.toml --config $root/about.toml" "$STUB_LOG"; then pass "app runs cargo-about on the app and on notedown"; else fail "app runs cargo-about on the app and on notedown"; fi

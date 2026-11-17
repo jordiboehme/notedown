@@ -3,10 +3,11 @@
 #
 #   macos  the notedown archive for macOS: the crates of crates/notedown with
 #          default features (OCR) for aarch64-apple-darwin (about.toml), then
-#          the C and C++ code built into it (licenses/bundled-code.txt).
+#          the AWS-LC license file (licenses/aws-lc.txt) and the C and C++
+#          code of llama.cpp built into it (licenses/bundled-code.txt).
 #   linux  the notedown archives and .deb packages for Linux: the crates of
-#          crates/notedown with --no-default-features for both musl targets.
-#          No llama.cpp, so no bundled code.
+#          crates/notedown with --no-default-features for both musl targets,
+#          then licenses/aws-lc.txt. No llama.cpp, so no bundled-code.txt.
 #   app    the Notedown app: the crates of app/src-tauri for
 #          aarch64-apple-darwin (app/src-tauri/about.toml), then the whole
 #          macos text (the notedown program inside the app), then the npm
@@ -16,8 +17,7 @@
 #
 # Needs cargo-about on PATH and the crates fetched (cargo fetch --locked). The
 # app variant also needs jq, app/node_modules (npm ci) and app/dist (npm run
-# build). NOTEDOWN_APP_DIST and NOTEDOWN_APP_NODE_MODULES override those two
-# paths.
+# build).
 #
 # The npm set is the production packages of app/package-lock.json plus
 # app/bundled-packages.txt (devDependencies that Vite compiles into dist).
@@ -97,8 +97,8 @@ cargo_notices() {
   echo "$manifest: $crates crate entries" >&2
 }
 
-# bundled_code <file>: the bundled code notices without the leading "#" lines
-# (how the linked parts were found).
+# bundled_code <file>: a notices file of licenses/ without its leading "#"
+# lines (where the text comes from and how it was checked).
 bundled_code() {
   local file="$1"
   [ -s "$file" ] || die "$file is missing or empty"
@@ -106,8 +106,10 @@ bundled_code() {
 }
 
 # npm_set <package-lock.json> <bundled-packages.txt>
-# Prints the package names, sorted: every non-dev package of the lock file
-# plus the names of the list (comments and blank lines ignored).
+# Prints the package paths below node_modules, sorted: every non-dev package
+# of the lock file with its full lock path (a nested package stays
+# "a/node_modules/b") plus the names of the list (comments and blank lines
+# ignored).
 npm_set() {
   local lock="$1" list="$2"
   [ -s "$lock" ] || die "$lock is missing or empty"
@@ -118,7 +120,7 @@ npm_set() {
       | to_entries[]
       | select(.key | startswith("node_modules/"))
       | select(.value.dev != true)
-      | .key | sub("^.*node_modules/"; "")
+      | .key | sub("^node_modules/"; "")
     ' "$lock"
     sed -e 's/#.*//' -e 's/[[:space:]]//g' "$list" | grep -v '^$' || true
   } | LC_ALL=C sort -u
@@ -126,9 +128,11 @@ npm_set() {
 
 # check_dist <set-file> <dist-dir>
 # Fails when dist shows a package banner or runtime marker whose package is
-# not in the set.
+# not in the set. A set path counts by its package name (the part after the
+# last node_modules/).
 check_dist() {
-  local set="$1" dist="$2" found="$work/found.txt" name marker missing=0
+  local set="$1" dist="$2" found="$work/found.txt" names="$work/names.txt" name marker missing=0
+  sed -E "s|^.*node_modules/||" "$set" | LC_ALL=C sort -u > "$names"
   [ -d "$dist" ] || die "$dist does not exist (run npm ci and npm run build in app first)"
   : > "$found"
   grep -rhoE '/\*! (@[A-Za-z0-9._-]+/)?[A-Za-z0-9._-]+ v[0-9]' "$dist" \
@@ -140,7 +144,7 @@ check_dist() {
   done <<< "$RUNTIME_MARKERS"
   [ -s "$found" ] || die "$dist shows no package banner or runtime marker, the check would prove nothing"
   while read -r name; do
-    if ! grep -qxF -- "$name" "$set"; then
+    if ! grep -qxF -- "$name" "$names"; then
       echo "error: $dist contains $name, which is neither a production dependency nor in app/bundled-packages.txt" >&2
       missing=1
     fi
@@ -155,12 +159,14 @@ check_dist() {
 # says it is used under MIT, names the copyright from LICENSE.spdx and sets
 # fallback=1, and main checks that part 1 has an MIT text.
 npm_notices() {
-  local set="$1" modules="$2" name dir version license files copyright
+  local set="$1" modules="$2" path name dir version license files copyright
   fallback=0
   [ -d "$modules" ] || die "$modules does not exist (run npm ci in app first)"
-  while read -r name; do
-    dir="$modules/$name"
-    [ -s "$dir/package.json" ] || die "$name is in the npm set but not in $modules"
+  while read -r path; do
+    dir="$modules/$path"
+    [ -s "$dir/package.json" ] || die "$path is in the npm set but not in $modules"
+    name="$(jq -r '.name // empty' "$dir/package.json")"
+    [ -n "$name" ] || name="${path##*node_modules/}"
     version="$(jq -r '.version // empty' "$dir/package.json")"
     license="$(jq -r '(.license | if type == "object" then .type else . end) // empty' "$dir/package.json")"
     [ -n "$version" ] || die "$dir/package.json has no version"
@@ -217,6 +223,8 @@ macos_body() {
     echo
     cat "$blocks"
     echo
+    bundled_code "$root/licenses/aws-lc.txt"
+    echo
     bundled_code "$root/licenses/bundled-code.txt"
   } > "$out"
 }
@@ -249,15 +257,18 @@ main() {
         header
         echo "The notedown program is built from the Rust crates listed below. For each"
         echo "license, this file names the crates that use it and gives the license"
-        echo "text."
+        echo "text. The license file of AWS-LC (C code in the aws-lc-sys crate)"
+        echo "follows at the end."
         echo
         cat "$work/linux.txt"
+        echo
+        bundled_code "$root/licenses/aws-lc.txt"
       } > "$body"
       ;;
     app)
       local app="$root/app"
-      local dist="${NOTEDOWN_APP_DIST:-$app/dist}"
-      local modules="${NOTEDOWN_APP_NODE_MODULES:-$app/node_modules}"
+      local dist="$app/dist"
+      local modules="$app/node_modules"
       local set="$work/npm-set.txt"
       npm_set "$app/package-lock.json" "$app/bundled-packages.txt" > "$set"
       [ -s "$set" ] || die "the npm set is empty"

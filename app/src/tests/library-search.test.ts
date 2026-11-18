@@ -14,7 +14,7 @@ vi.mock("@tauri-apps/api/core", () => ({
   }),
 }));
 
-const { DEBOUNCE_MS, SCOPE_LABELS, effectiveScope, entryRow, filterNotes, isFindKey, resultRows, searchPlace, wantsContent } =
+const { DEBOUNCE_MS, SCOPE_LABELS, effectiveScope, entryRow, fieldTakesEscape, filterNotes, isFindKey, resultRows, searchPlace, wantsContent } =
   await import("../library/search");
 const { withoutAt } = await import("../library/view");
 const SearchResults = (await import("../library/SearchResults.svelte")).default;
@@ -329,6 +329,39 @@ describe("LibrarySearch", () => {
     await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
     expect(commands()).toEqual(["notes_search"]);
     expect(s.busy).toBe(false);
+  });
+
+  it("a list that fails to load ends the wait and shows the error", async () => {
+    place = { kind: "new", notes: null };
+    const s = search();
+    s.setScope("here");
+    s.type("plan");
+    expect(s.busy).toBe(true);
+    // The list fails: the search stops waiting and says why.
+    place = { kind: "new", notes: null, error: "store gone" };
+    s.rerun();
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS * 2);
+    expect(calls).toEqual([]);
+    expect(s.busy).toBe(false);
+    expect(s.error).toBe("store gone");
+    expect(s.rows).toEqual([]);
+    // The list comes later: the search runs for it.
+    place = { kind: "new", notes: [note("A", "NOTE/Note/Plan.note")] };
+    s.rerun();
+    expect(s.error).toBeNull();
+    expect(s.rows.map((r) => r.path)).toEqual(["NOTE/Note/Plan.note"]);
+  });
+
+  it("the place of New or All notes carries the error of a list that failed", () => {
+    expect(searchPlace({ kind: "new" }, null, null, { newNotes: "gone" })).toEqual({ kind: "new", notes: null, error: "gone" });
+    expect(searchPlace({ kind: "all" }, null, null, { allNotes: "gone" })).toEqual({ kind: "all", notes: null, error: "gone" });
+    expect(searchPlace({ kind: "all" }, null, null, { newNotes: "gone" })).toEqual({ kind: "all", notes: null });
+  });
+
+  it("the field takes Escape only while it holds text", () => {
+    expect(fieldTakesEscape("plan")).toBe(true);
+    expect(fieldTakesEscape(" ")).toBe(true);
+    expect(fieldTakesEscape("")).toBe(false);
   });
 
   it("a list that changes while This folder searches it is filtered again; the same place runs nothing", async () => {

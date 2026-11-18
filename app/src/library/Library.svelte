@@ -88,6 +88,8 @@
   let sort = $state<Sort>({ by: "name", ascending: true });
   let newNotes = $state<NoteSummary[] | null>(null);
   let allNotes = $state<NoteSummary[] | null>(null);
+  /** Why the last load of New or All notes failed, while that list is still missing. */
+  let listErrors = $state<{ newNotes: string | null; allNotes: string | null }>({ newNotes: null, allNotes: null });
   /** The row picked for the file actions: a row of the list, or a file picked in a column. */
   let picked = $state<string | null>(null);
   /** The row whose name is being typed. */
@@ -96,7 +98,7 @@
   let naming = $state(false);
   let now = $state(Date.now());
   /** The search of the toolbar; while it has text, the main area shows its results. */
-  const search = new LibrarySearch(() => searchPlace(library.selection, newNotes, allNotes));
+  const search = new LibrarySearch(() => searchPlace(library.selection, newNotes, allNotes, listErrors));
   const searching = $derived(search.text.trim() !== "");
   let toolbar: Toolbar | undefined = $state();
   /** The clock of the job rows: done rows go after a while. */
@@ -168,18 +170,32 @@
   // "This folder" follows the shown place and its list of notes: a search that is on runs
   // again when that changes what it searches.
   $effect(() => {
-    void searchPlace(library.selection, newNotes, allNotes);
+    void searchPlace(library.selection, newNotes, allNotes, listErrors);
     void search.scope;
     untrack(() => search.rerun());
   });
 
   function loadNotes() {
-    invoke<NoteSummary[]>("notes_new")
-      .then((notes) => (newNotes = notes))
-      .catch(report("notes_new"));
-    invoke<NoteSummary[]>("notes_all")
-      .then((notes) => (allNotes = notes))
-      .catch(report("notes_all"));
+    invoke<NoteSummary[]>("notes_new").then(
+      (notes) => {
+        newNotes = notes;
+        listErrors.newNotes = null;
+      },
+      (error) => {
+        report("notes_new")(error);
+        listErrors.newNotes = String(error);
+      },
+    );
+    invoke<NoteSummary[]>("notes_all").then(
+      (notes) => {
+        allNotes = notes;
+        listErrors.allNotes = null;
+      },
+      (error) => {
+        report("notes_all")(error);
+        listErrors.allNotes = String(error);
+      },
+    );
   }
 
   onMount(() => {
@@ -375,7 +391,7 @@
               <Review
                 path={library.selection.path}
                 at={library.selection.at ?? null}
-            covered={searching}
+                covered={searching}
                 onAtTaken={() => (library.selection = withoutAt(library.selection))}
                 onBack={() => (library.selection = library.back)}
               />

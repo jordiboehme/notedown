@@ -88,7 +88,8 @@ export function resultRows(names: NameRow[], content: ContentHit[]): ResultRow[]
 
 /** What the window shows, as far as the search cares: "This folder" means it. */
 export type SearchPlace =
-  | { kind: "new" | "all"; notes: NoteSummary[] | null }
+  /** `error` is set when the list failed to load, so a search does not wait for it. */
+  | { kind: "new" | "all"; notes: NoteSummary[] | null; error?: string }
   | { kind: "folder"; path: string }
   | { kind: "other" };
 
@@ -97,17 +98,27 @@ export function searchPlace(
   selection: Selection,
   newNotes: NoteSummary[] | null,
   allNotes: NoteSummary[] | null,
+  errors: { newNotes?: string | null; allNotes?: string | null } = {},
 ): SearchPlace {
   switch (selection.kind) {
     case "new":
-      return { kind: "new", notes: newNotes };
+      return listPlace("new", newNotes, errors.newNotes);
     case "all":
-      return { kind: "all", notes: allNotes };
+      return listPlace("all", allNotes, errors.allNotes);
     case "folder":
       return { kind: "folder", path: selection.path };
     default:
       return { kind: "other" };
   }
+}
+
+function listPlace(kind: "new" | "all", notes: NoteSummary[] | null, error: string | null | undefined): SearchPlace {
+  return notes === null && error ? { kind, notes, error } : { kind, notes };
+}
+
+/** Escape empties the search field only while it holds text; else the window gets it. */
+export function fieldTakesEscape(text: string): boolean {
+  return text !== "";
 }
 
 /**

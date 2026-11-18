@@ -1,8 +1,10 @@
 <script lang="ts">
+  import { fieldTakesEscape } from "./search";
   import type { LibrarySearch } from "./search.svelte";
 
   // The search field of the toolbar. Escape empties it, which gives back the view that was
-  // shown. The window focuses it on Cmd+F through `focus`.
+  // shown; an empty field passes Escape on to the window. The window focuses it on Cmd+F
+  // through `focus`.
   let { search }: { search: LibrarySearch } = $props();
 
   let input: HTMLInputElement | undefined = $state();
@@ -13,7 +15,7 @@
   }
 
   function keydown(event: KeyboardEvent) {
-    if (event.key !== "Escape") return;
+    if (event.key !== "Escape" || !fieldTakesEscape(search.text)) return;
     event.preventDefault();
     // The Escape is the field's: the window and the review under the results do not get it.
     event.stopPropagation();

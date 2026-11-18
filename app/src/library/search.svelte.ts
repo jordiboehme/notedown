@@ -101,10 +101,10 @@ export class LibrarySearch {
    * The shown list of notes when the scope is "This folder" in New or All notes: `notes` is
    * null while the list still loads. Null for any other search.
    */
-  #listed(): { notes: NoteSummary[] | null } | null {
+  #listed(): { notes: NoteSummary[] | null; error?: string } | null {
     const place = this.#place();
     if (this.scope !== "here" || (place.kind !== "new" && place.kind !== "all")) return null;
-    return { notes: place.notes };
+    return { notes: place.notes, error: place.error };
   }
 
   /** The list a run filters by; null for a search that has none. */
@@ -117,7 +117,10 @@ export class LibrarySearch {
     const place = this.#place();
     if (this.shownScope === "everywhere") return "everywhere";
     const listed = this.#listed();
-    if (listed) return `${place.kind}:${listed.notes === null ? "loading" : listed.notes.map((n) => n.key).join(",")}`;
+    if (listed) {
+      const keys = listed.notes?.map((n) => n.key).join(",") ?? (listed.error ? "failed" : "loading");
+      return `${place.kind}:${keys}`;
+    }
     return place.kind === "folder" ? `folder:${place.path}` : place.kind;
   }
 
@@ -131,8 +134,13 @@ export class LibrarySearch {
     }
     const listed = this.#listed();
     if (listed && listed.notes === null) {
-      // The list still loads: no rows yet and no false empty text; it runs once it comes.
       this.#reset();
+      if (listed.error) {
+        // The list failed to load: say so instead of waiting; it runs if the list comes later.
+        this.error = listed.error;
+        return;
+      }
+      // The list still loads: no rows yet and no false empty text; it runs once it comes.
       this.busy = true;
       return;
     }
@@ -140,6 +148,7 @@ export class LibrarySearch {
     if (list) {
       this.names = filterNotes(list, text).map((note) => noteRow(note.path));
       this.more = false;
+      this.error = null;
     }
     this.busy = true;
     const seq = this.#seq;

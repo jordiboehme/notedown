@@ -43,6 +43,7 @@ const PATH = "NOTE/Note/Work/Plan.note";
 function view(states: NoteView["pages"][number]["state"][], catchingUp = false): NoteView {
   return {
     key: "k1",
+    md5: "m1",
     path: PATH,
     title: "Plan",
     catchingUp,
@@ -376,6 +377,20 @@ describe("the review session", () => {
     expect(asked("note_page_image")).toEqual([0, 1, 2, 2]);
     // The ratio of a page that stayed is kept.
     expect(reviewPages(session.view!, session.ratios)[1].ratio).toBeCloseTo(1872 / 1404);
+  });
+
+  it("reload drops every image when the file is another version", async () => {
+    const session = await opened(["done", "done", "done"]);
+    session.seen(0, true);
+    session.measured(0, 1872, 1404);
+    await showAll();
+    // The same pages, but more strokes on them: the images are of the old file.
+    answerNow("note_open", { ...view(["done", "done", "done"]), md5: "m2" });
+    await session.reload();
+    expect(session.images).toEqual({ 0: { state: "loading" }, 1: { state: "loading" }, 2: { state: "loading" } });
+    expect(asked("note_page_image")).toEqual([0, 1, 2, 0, 1, 2]);
+    // The ratio of a page that stayed is kept.
+    expect(session.ratios[0]).toBeCloseTo(1872 / 1404);
   });
 
   it("reload drops images past a shorter note", async () => {

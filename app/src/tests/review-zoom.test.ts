@@ -39,6 +39,7 @@ beforeEach(() => {
 function note(count: number): NoteView {
   return {
     key: "k1",
+    md5: "m1",
     path: "NOTE/Note/Plan.note",
     title: "Plan",
     catchingUp: false,

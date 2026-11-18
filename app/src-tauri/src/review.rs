@@ -178,6 +178,9 @@ impl PartialEq<String> for DataUrl {
 pub struct NoteView {
     /// The key of the note in the pipeline's store; none when the store does not know it.
     pub key: Option<String>,
+    /// The md5 of the file version the pages are of: the server's when the pages come from
+    /// the file, else the one the store read. A window drops its page images when it changes.
+    pub md5: Option<String>,
     pub path: String,
     pub title: String,
     /// A page waits for OCR, or the server has another version than the text was read from.
@@ -247,6 +250,7 @@ impl StoredNote {
         };
         NoteView {
             key: Some(self.key),
+            md5: Some(self.md5).filter(|m| !m.is_empty()),
             path: self.path,
             title,
             catching_up: pending || newer,
@@ -303,7 +307,7 @@ fn page_view(
 
 /// The view of the note at `path` with the pages of its file: the store's text (when it knows
 /// the note) goes to the page with the same id. Always catching up.
-fn file_view(path: &str, stored: Option<StoredNote>, file: &[FilePage]) -> NoteView {
+fn file_view(path: &str, md5: &str, stored: Option<StoredNote>, file: &[FilePage]) -> NoteView {
     let by_id: HashMap<&str, &StoredPage> = stored
         .iter()
         .flat_map(|n| n.pages.iter())
@@ -328,6 +332,7 @@ fn file_view(path: &str, stored: Option<StoredNote>, file: &[FilePage]) -> NoteV
     };
     NoteView {
         key,
+        md5: Some(md5.to_owned()),
         path: path.to_owned(),
         title,
         catching_up: true,
@@ -702,7 +707,12 @@ impl Review {
             // The file decides. When it cannot be read now, the open fails: the store's text
             // must not stand next to images of a file its pages were not matched to.
             stored => match inner.file_pages(path, &entry, mark) {
-                Ok(pages) => file_view(path, stored, &pages),
+                Ok(pages) => file_view(
+                    path,
+                    entry.md5.as_deref().unwrap_or_default(),
+                    stored,
+                    &pages,
+                ),
                 Err(e) => {
                     lock(&inner.opened).remove(path);
                     return Err(e);

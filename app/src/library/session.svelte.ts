@@ -108,13 +108,19 @@ export class ReviewSession {
     this.#update();
   }
 
-  /** Drops the images (and ratios) of the indexes whose page is another one now, or gone. */
+  /**
+   * Drops the images (and ratios) of the indexes whose page is another one now, or gone. When
+   * the file is another version (its md5 changed), every image goes: the strokes may differ.
+   * The ratio of a page that stayed is kept.
+   */
   #keepImages(old: NoteView, view: NoteView) {
+    const newFile = old.md5 !== view.md5;
     const indexes = new Set([...Object.keys(this.images), ...Object.keys(this.ratios)].map(Number));
     for (const index of indexes) {
-      if (old.pages[index]?.pageId === view.pages[index]?.pageId) continue;
+      const samePage = old.pages[index]?.pageId === view.pages[index]?.pageId;
+      if (samePage && !newFile) continue;
       if (this.images[index] !== undefined) this.#drop(index);
-      delete this.ratios[index];
+      if (!samePage) delete this.ratios[index];
     }
   }
 

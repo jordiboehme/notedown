@@ -351,6 +351,11 @@ fn note_open_gives_the_markdown_per_page() {
     ));
     let view = s.review.open(NOTE).unwrap();
     assert_eq!(view.key.as_deref(), Some("F20241104"));
+    assert_eq!(
+        view.md5,
+        Some(md5_hex(BYTES)),
+        "the version the pages are of"
+    );
     assert_eq!(view.path, NOTE);
     assert_eq!(view.title, "Plan");
     assert!(!view.catching_up, "the store has the md5 of the entry");
@@ -973,6 +978,7 @@ fn a_note_the_store_does_not_know_opens_with_all_its_pages() {
     s.info(&[("X", false), ("Y", true), ("Z", false)]);
     let view = s.review.open(NEW).unwrap();
     assert_eq!(view.key, None);
+    assert_eq!(view.md5, Some(md5_hex(BYTES)));
     assert_eq!(view.path, NEW);
     assert_eq!(view.title, "New");
     assert!(view.catching_up);
@@ -1066,6 +1072,11 @@ fn store_text_follows_the_page_id_when_the_file_is_newer() {
     s.info(&[("X", false), ("A", false), ("B", true)]);
     let view = s.review.open(NOTE).unwrap();
     assert_eq!(view.key.as_deref(), Some("F20241104"));
+    assert_eq!(
+        view.md5,
+        Some(md5_hex(BYTES)),
+        "the file's version, not the store's"
+    );
     assert!(view.catching_up);
     assert_eq!(
         rows(&view),

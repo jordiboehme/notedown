@@ -169,6 +169,8 @@ export type NotesChanged = { paths: string[] };
  */
 export type NoteView = {
   key: string | null;
+  /** The md5 of the file version the pages are of; a change means new page images. */
+  md5: string | null;
   path: string;
   title: string;
   catchingUp: boolean;

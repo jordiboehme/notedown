@@ -318,12 +318,13 @@ seconds. The fields:
 
 ## Pipeline search
 
-`notedown pipeline search --query TEXT --data DIR [--account A] [--limit N]` prints the text blocks that
+`notedown pipeline search --query TEXT [--data DIR] [--account A] [--limit N]` prints the text blocks that
 hold every word of `TEXT` as one JSON array, in note and page order, at most `N` blocks (default 20).
 `--account` can be left out when the data folder has only one account. It creates and changes nothing:
 a data folder without text gives `[]`. Words are the runs of letters and digits, compared
 case-insensitive, so `meet` does not find `Meeting` and punctuation does not count. A query without a
-word exits with code 1. Deleted notes are left out. Each hit has:
+word exits with code 1. A text that starts with `-` must be given as `--query=TEXT`, else it is read
+as an option and the call fails. Deleted notes are left out. Each hit has:
 
 - `anchor`: `notedown://<account>/<key>/<pageId>#<blockId>`, the block.
 - `note`: the title of the note.

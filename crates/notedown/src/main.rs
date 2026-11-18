@@ -137,8 +137,8 @@ enum PipelineAction {
         /// The account slug (can be left out when the data folder has only one account)
         #[arg(long)]
         account: Option<String>,
-        /// The words to find (a text that starts with `-` is still the query)
-        #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+        /// The words to find. Give a text that starts with `-` as --query=TEXT
+        #[arg(long, value_name = "TEXT")]
         query: String,
         /// The most blocks to print
         #[arg(long, value_name = "N", default_value_t = notedown_pipeline::search::DEFAULT_LIMIT)]

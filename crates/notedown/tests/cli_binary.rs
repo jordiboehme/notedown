@@ -3696,19 +3696,59 @@ fn pipeline_search_creates_nothing() {
     assert!(!dir.path().join("pipeline").exists());
 }
 
+/// `pipeline search` with `args` after the data folder and the account.
+#[cfg(feature = "ocr")]
+fn pipeline_search_with(data: &std::path::Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["pipeline", "search", "--data"])
+        .arg(data)
+        .args(["--account", "tester"])
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// The app passes the query as one argument, `--query=<text>`: a text that starts with `-` or
+/// holds a space stays the query.
 #[cfg(feature = "ocr")]
 #[test]
-fn pipeline_search_takes_a_query_that_starts_with_a_hyphen() {
+fn pipeline_search_takes_the_query_in_one_argument() {
     let dir = data_with_an_account();
-    save_note(dir.path(), "F1", "Ideas", &["The plan"]);
-    for query in ["-plan", "--plan"] {
-        let out = pipeline_search(dir.path(), query);
+    save_note(dir.path(), "F1", "Ideas", &["The plan", "two words here"]);
+    for (arg, block) in [
+        ("--query=-plan", "b1"),
+        ("--query=--plan", "b1"),
+        ("--query=two words", "b2"),
+    ] {
+        let out = pipeline_search_with(dir.path(), &[arg]);
         assert!(
             out.status.success(),
-            "{query}: {}",
+            "{arg}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(hits.as_array().unwrap().len(), 1, "{query}");
+        let anchors: Vec<&str> = hits
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["anchor"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            anchors,
+            [format!("notedown://tester/F1/P1#2#{block}")],
+            "{arg}"
+        );
+    }
+}
+
+/// An option after `--query` is never taken as the query: the call fails and says so.
+#[cfg(feature = "ocr")]
+#[test]
+fn pipeline_search_never_takes_an_option_as_the_query() {
+    let dir = data_with_an_account();
+    for args in [&["--query", "--limit", "5"][..], &["--query", "-plan"][..]] {
+        let out = pipeline_search_with(dir.path(), args);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
     }
 }

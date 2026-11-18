@@ -579,24 +579,47 @@ fn notes_event_when_the_index_changes() {
     f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 20);
     f.notes.refresh();
     assert_eq!(f.events(), base + 3);
-    // A note without text changes nothing the windows show.
+    // A note without text changes no list, but a store file was read: an open review hears
+    // about it.
     f.write(&note(B, "NOTE/Note/b.note", &[("P1", None, false)]), 20);
     f.notes.refresh();
-    assert_eq!(f.events(), base + 3);
+    assert_eq!(f.events(), base + 4);
+    f.notes.refresh();
+    assert_eq!(f.events(), base + 4, "nothing was read again");
     // Another data folder: the index starts over.
     let other = tempfile::tempdir().unwrap();
     *lock(&f.data_dir) = other.path().to_path_buf();
     f.notes.refresh();
-    assert_eq!(f.events(), base + 4);
+    assert_eq!(f.events(), base + 5);
     assert!(f.notes.all().is_empty());
     // Back, then log out: the index starts over again each time.
     *lock(&f.data_dir) = f.data.path().to_path_buf();
     f.notes.refresh();
-    assert_eq!(f.events(), base + 5);
+    assert_eq!(f.events(), base + 6);
     assert_eq!(f.all_keys(), [A]);
     *lock(&f.account) = None;
     f.notes.refresh();
-    assert_eq!(f.events(), base + 6);
+    assert_eq!(f.events(), base + 7);
+}
+
+#[test]
+fn a_changed_store_file_tells_the_windows_even_when_the_lists_stay() {
+    let f = after_baseline();
+    f.write(&note(B, "NOTE/Note/b.note", &[("P1", None, false)]), 10);
+    f.notes.refresh();
+    let before = f.events();
+    let lists = (f.notes.all(), f.notes.new_notes());
+    assert_eq!(f.events(), before, "a scan that read nothing tells nothing");
+    // The OCR read the page and found no text: the lists stay as they are.
+    f.write(&note(B, "NOTE/Note/b.note", &[("P1", Some(5), false)]), 11);
+    f.notes.refresh();
+    assert_eq!(f.events(), before + 1);
+    assert_eq!((f.notes.all(), f.notes.new_notes()), lists);
+    assert_eq!(f.events(), before + 1);
+    // A store file that goes is a change of the store too.
+    f.remove(B);
+    f.notes.refresh();
+    assert_eq!(f.events(), before + 2);
 }
 
 #[test]

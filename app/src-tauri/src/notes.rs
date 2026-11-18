@@ -19,7 +19,9 @@
 //!
 //! The index follows the store by polling: a scan every [`NOTES_EVERY`] while the panel or the
 //! library window is visible, one at each show, and one before every answer of `notes_new` and
-//! `notes_all`. A scan is a `stat` per file; only changed files are read. The app has no file
+//! `notes_all`. A scan is a `stat` per file; only changed files are read. The windows hear
+//! [`NOTES_EVENT`] when All notes or New notes changed and when a scan read a store file again
+//! (or found one gone), so an open review hears about every page the OCR wrote. The app has no file
 //! watcher, and a watcher would add a dependency for a folder that matters only while a window
 //! shows the notes.
 
@@ -214,6 +216,9 @@ struct State {
     dirty: bool,
     /// What All notes and New notes were when the windows were last told.
     told: Option<(Vec<NoteSummary>, Vec<NoteSummary>)>,
+    /// A scan read a store file again (or found one gone) since the windows were last told: an
+    /// open review hears about it, also when the lists stay as they are.
+    reread: bool,
 }
 
 /// The notes index. Cheap to clone; every clone is the same index.
@@ -253,6 +258,7 @@ impl Notes {
                     seen: None,
                     dirty: false,
                     told: None,
+                    reread: false,
                 }),
                 visible: Mutex::new(false),
                 waker: Mutex::new(None),
@@ -492,10 +498,12 @@ impl Notes {
                 Some(known) if known.stamp == stamp => known,
                 known => match read_note(&path, stamp) {
                     Ok(note) => {
+                        state.reread = true;
                         before.extend(known.and_then(|k| k.note));
                         Indexed { stamp, note }
                     }
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        state.reread |= known.is_some();
                         before.extend(known.and_then(|k| k.note));
                         continue;
                     }
@@ -513,6 +521,7 @@ impl Notes {
             files.insert(name.to_owned(), indexed);
         }
         if complete {
+            state.reread |= !old.is_empty();
             before.extend(old.into_values().filter_map(|f| f.note));
         } else {
             // A file that could not be listed is not gone: the old entries stay this scan.
@@ -579,8 +588,10 @@ impl Notes {
         }
     }
 
-    /// Tells the windows when All notes or New notes is not what they were told last.
+    /// Tells the windows when All notes or New notes is not what they were told last, or when a
+    /// scan read a store file again since.
     fn tell(&self, state: &mut State) {
+        let reread = std::mem::take(&mut state.reread);
         let all = listed_notes(state);
         let new = new_notes_of(state);
         let same = |told: &[NoteSummary], now: &[&Note]| {
@@ -590,7 +601,7 @@ impl Notes {
             .told
             .as_ref()
             .is_some_and(|(a, n)| same(a, &all) && same(n, &new));
-        if !unchanged {
+        if !unchanged || reread {
             let summaries =
                 |notes: Vec<&Note>| notes.into_iter().map(|n| n.summary.clone()).collect();
             state.told = Some((summaries(all), summaries(new)));

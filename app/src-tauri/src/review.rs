@@ -2,10 +2,20 @@
 //! images.
 //!
 //! **The text.** `note_open` reads the whole store file of the note (`notes/<key>.json` of the
-//! account, found through the notes index) and answers the Markdown of each page: the text of
-//! its blocks, joined by blank lines. The note is catching up while a page waits for OCR or
-//! while the server has another version of the file than the store read (`GET /entries?path=`;
-//! without an answer only the pages decide).
+//! account, found through the notes index) and asks the server for the entry
+//! (`GET /entries?path=`). When the store read the version the server has (or the server does
+//! not answer), the pages are the store's: per page its blocks, and their text joined by blank
+//! lines as its Markdown. The note is catching up while a page waits for OCR.
+//!
+//! Otherwise (the store does not know the note, or read another version) the pages come from
+//! the file: its bytes are cached as for a page image (step 1 below) and
+//! `notedown render <note> --info --allow-unknown-version` counts its pages (by md5, once a
+//! run). Each page takes the state and the blocks of the store's page with the same page id;
+//! any other page waits for OCR. Such a note is always catching up. The download and the count
+//! stop when the review closes and at Quit, as a render does. A note the server does not have
+//! (or a folder) is gone. `note_page_image` checks a page against the pages of the last
+//! `note_open` of the path; for a path never opened against the notes index, and for one the
+//! index does not know against the file's pages.
 //!
 //! **The images.** `note_page_image(path, index)` asks the server for the entry, checks that it
 //! is a file with an md5 of 32 lower-case hex characters (server data never becomes a path
@@ -79,9 +89,8 @@ pub const NO_CACHE: &str = "Notedown could not use its cache folder.";
 pub const NO_IMAGE: &str = "The page could not be shown.";
 /// The render did not end in time.
 pub const TOO_LONG: &str = "The page took too long to show.";
-
-/// A note the server has that the pipeline has not read yet.
-pub const NOT_READY: &str = "The text of this note is not ready yet.";
+/// How long `render --info` may take to count the pages of a note.
+pub const INFO_TIMEOUT: Duration = Duration::from_secs(60);
 /// A page index past the note's pages.
 pub const NO_SUCH_PAGE: &str = "This page is not in the note.";
 /// What a call hears when its page was dropped from the view while it waited.
@@ -106,10 +115,22 @@ const CHUNK: usize = 64 * 1024;
 pub struct PageView {
     /// 0-based, as `note_page_image` takes it.
     pub index: usize,
+    /// The page id of the pipeline's store (`PAGEID`, `position:<n>`, `<id>#2`).
+    pub page_id: String,
     pub state: PageState,
     /// The text of the page's blocks, joined by blank lines.
     pub markdown: String,
+    /// The blocks of the page in their order; their texts make up `markdown`.
+    pub blocks: Vec<BlockView>,
     pub landscape: bool,
+}
+
+/// One block of a page: its id in the store and its text (without trailing white space).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockView {
+    pub id: String,
+    pub text: String,
 }
 
 /// The OCR state of a page, as the store has it.
@@ -150,7 +171,8 @@ impl PartialEq<String> for DataUrl {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteView {
-    pub key: String,
+    /// The key of the note in the pipeline's store; none when the store does not know it.
+    pub key: Option<String>,
     pub path: String,
     pub title: String,
     /// A page waits for OCR, or the server has another version than the text was read from.
@@ -179,6 +201,8 @@ struct StoredNote {
 #[serde(rename_all = "camelCase")]
 struct StoredPage {
     #[serde(default)]
+    page_id: String,
+    #[serde(default)]
     state: PageState,
     #[serde(default)]
     landscape: Option<bool>,
@@ -189,7 +213,121 @@ struct StoredPage {
 #[derive(Deserialize)]
 struct StoredBlock {
     #[serde(default)]
+    id: String,
+    #[serde(default)]
     text: String,
+}
+
+impl StoredNote {
+    /// The view of the note as the store has it.
+    fn view(self, newer: bool) -> NoteView {
+        let pages: Vec<PageView> = self
+            .pages
+            .iter()
+            .enumerate()
+            .map(|(index, page)| {
+                page_view(
+                    index,
+                    &page.page_id,
+                    Some(page),
+                    page.landscape.unwrap_or(self.landscape),
+                )
+            })
+            .collect();
+        let pending = pages.iter().any(|p| p.state == PageState::Pending);
+        let title = if self.title.is_empty() {
+            title_of(&self.path)
+        } else {
+            self.title
+        };
+        NoteView {
+            key: Some(self.key),
+            path: self.path,
+            title,
+            catching_up: pending || newer,
+            pages,
+        }
+    }
+}
+
+/// The pages of a note file as `render --info` prints them.
+#[derive(Deserialize)]
+struct FileInfo {
+    pages: Vec<FilePage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FilePage {
+    id: String,
+    #[serde(default)]
+    landscape: bool,
+}
+
+/// A page of the review: with the store's page its state and blocks, else it waits for OCR.
+fn page_view(
+    index: usize,
+    page_id: &str,
+    stored: Option<&StoredPage>,
+    landscape: bool,
+) -> PageView {
+    let blocks: Vec<BlockView> = stored
+        .map(|page| {
+            page.blocks
+                .iter()
+                .map(|b| BlockView {
+                    id: b.id.clone(),
+                    // As the pipeline's Markdown writer joins them.
+                    text: b.text.trim_end().to_owned(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    PageView {
+        index,
+        page_id: page_id.to_owned(),
+        state: stored.map_or(PageState::Pending, |p| p.state),
+        markdown: blocks
+            .iter()
+            .map(|b| b.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        blocks,
+        landscape,
+    }
+}
+
+/// The view of the note at `path` with the pages of its file: the store's text (when it knows
+/// the note) goes to the page with the same id. Always catching up.
+fn file_view(path: &str, stored: Option<StoredNote>, file: &[FilePage]) -> NoteView {
+    let by_id: HashMap<&str, &StoredPage> = stored
+        .iter()
+        .flat_map(|n| n.pages.iter())
+        .map(|p| (p.page_id.as_str(), p))
+        .collect();
+    let pages = file
+        .iter()
+        .enumerate()
+        .map(|(index, page)| {
+            page_view(
+                index,
+                &page.id,
+                by_id.get(page.id.as_str()).copied(),
+                page.landscape,
+            )
+        })
+        .collect();
+    let (key, title) = match &stored {
+        Some(n) if !n.title.is_empty() => (Some(n.key.clone()), n.title.clone()),
+        Some(n) => (Some(n.key.clone()), title_of(path)),
+        None => (None, title_of(path)),
+    };
+    NoteView {
+        key,
+        path: path.to_owned(),
+        title,
+        catching_up: true,
+        pages,
+    }
 }
 
 /// The review: note views and page images. Cheap to clone; every clone is the same review. It
@@ -210,6 +348,10 @@ struct Inner {
     /// The running renders and who waits for them. Held only for short changes and signals,
     /// never across a call, a file read or a wait: `close_all` runs on the main thread.
     table: Mutex<Table>,
+    /// The pages of note files by md5, as `render --info` counted them.
+    infos: Mutex<HashMap<String, Arc<Vec<FilePage>>>>,
+    /// The page count of the last `open` of each path.
+    opened: Mutex<HashMap<String, usize>>,
     /// One download of a note's bytes per md5 at a time.
     fetching: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// The leftovers of earlier runs were removed. Held while they are removed.
@@ -238,6 +380,9 @@ struct Table {
     all_closes: u64,
     /// The running renders by (md5, page index).
     jobs: HashMap<(String, usize), Arc<Slot>>,
+    /// The downloads and counts of note files for `open` (and for a page of a note the index
+    /// does not know), by note path, with their md5. Not renders: they never get a result.
+    opens: HashMap<String, Vec<(String, Arc<Slot>)>>,
     /// The cached notes whose bytes were checked in this run.
     verified: HashSet<String>,
     handles: Vec<JoinHandle<()>>,
@@ -272,6 +417,47 @@ struct SlotState {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Table {
+    /// How often the review of `path` and all reviews were closed: a call that saw other
+    /// marks at its start belongs to a review that closed.
+    fn marks(&self, path: &str) -> (u64, u64) {
+        (self.closes.get(path).copied().unwrap_or(0), self.all_closes)
+    }
+
+    /// A render or a download for `open` uses the note with `md5`: its cache files stay.
+    fn uses(&self, md5: &str) -> bool {
+        self.jobs.keys().any(|(m, _)| m == md5)
+            || self.opens.values().flatten().any(|(m, _)| m == md5)
+    }
+}
+
+/// Takes the slot of a download for `open` out of the table when the call ends.
+struct OpenSlot<'a> {
+    inner: &'a Inner,
+    path: &'a str,
+    slot: Arc<Slot>,
+}
+
+impl Drop for OpenSlot<'_> {
+    fn drop(&mut self) {
+        let mut table = lock(&self.inner.table);
+        if let Some(slots) = table.opens.get_mut(self.path) {
+            slots.retain(|(_, s)| !Arc::ptr_eq(s, &self.slot));
+            if slots.is_empty() {
+                table.opens.remove(self.path);
+            }
+        }
+    }
+}
+
+/// What a failed lookup of an entry says: a gone note, or what went wrong.
+fn gone_or(error: LibraryError) -> String {
+    match error {
+        LibraryError::Rest(RestError::NotFound) => NOTE_GONE.to_owned(),
+        e => e.to_string(),
+    }
 }
 
 /// Removes a file or a folder when it goes out of scope, unless it was kept.
@@ -455,6 +641,8 @@ impl Review {
                 clock,
                 limit,
                 table: Mutex::new(Table::default()),
+                infos: Mutex::new(HashMap::new()),
+                opened: Mutex::new(HashMap::new()),
                 fetching: Mutex::new(HashMap::new()),
                 swept: Mutex::new(false),
                 next_job: AtomicU64::new(0),
@@ -465,53 +653,57 @@ impl Review {
         }
     }
 
-    /// The note at the wire path `path`, from the pipeline's store. Blocking: it scans the
-    /// store and asks the server for the entry.
+    /// The note at the wire path `path`: its pages with the text of the pipeline's store.
+    /// Blocking: it scans the store, asks the server for the entry and may download the note
+    /// and count its pages.
     pub fn open(&self, path: &str) -> Result<NoteView, String> {
-        let Some(file) = self.inner.notes.store_file(path) else {
-            return Err(self.inner.missing(path));
+        let inner = &self.inner;
+        let mark = {
+            let table = lock(&inner.table);
+            if table.quitting {
+                return Err(QUITTING.to_owned());
+            }
+            table.marks(path)
         };
-        let stored: StoredNote = match File::open(&file) {
-            Ok(f) => serde_json::from_reader(BufReader::new(f)).map_err(|_| NOT_READ.to_owned())?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(self.inner.missing(path)),
-            Err(_) => return Err(NOT_READ.to_owned()),
+        let stored: Option<StoredNote> = match inner.notes.store_file(path) {
+            None => None,
+            Some(file) => match File::open(&file) {
+                Ok(f) => Some(
+                    serde_json::from_reader(BufReader::new(f)).map_err(|_| NOT_READ.to_owned())?,
+                ),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(_) => return Err(NOT_READ.to_owned()),
+            },
         };
-        let pages: Vec<PageView> = stored
-            .pages
-            .iter()
-            .enumerate()
-            .map(|(index, page)| PageView {
-                index,
-                state: page.state,
-                markdown: page
-                    .blocks
-                    .iter()
-                    // As the pipeline's Markdown writer joins them.
-                    .map(|b| b.text.trim_end())
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-                landscape: page.landscape.unwrap_or(stored.landscape),
-            })
-            .collect();
-        let pending = pages.iter().any(|p| p.state == PageState::Pending);
-        // Without an answer of the server only the pages decide.
-        let newer = self
-            .inner
+        let entry = match inner
             .library
             .call(|rest| rest.get_json::<Entry>("/entries", &[("path", path)]))
-            .is_ok_and(|entry| entry.md5.as_deref() != Some(stored.md5.as_str()));
-        let title = if stored.title.is_empty() {
-            title_of(&stored.path)
-        } else {
-            stored.title
+        {
+            Ok(entry) if entry.kind == EntryKind::File => entry,
+            Ok(_) | Err(LibraryError::Rest(RestError::NotFound)) => {
+                return Err(NOTE_GONE.to_owned());
+            }
+            // Without an answer of the server the store's pages are all there is.
+            Err(e) => {
+                return match stored {
+                    Some(stored) => Ok(inner.opened(path, stored.view(false))),
+                    None => Err(e.to_string()),
+                };
+            }
         };
-        Ok(NoteView {
-            key: stored.key,
-            path: stored.path,
-            title,
-            catching_up: pending || newer,
-            pages,
-        })
+        let view = match stored {
+            Some(stored) if entry.md5.as_deref() == Some(stored.md5.as_str()) => stored.view(false),
+            stored => match inner.file_pages(path, &entry, mark) {
+                Ok(pages) => file_view(path, stored, &pages),
+                Err(e) if e == REVIEW_CLOSED || e == QUITTING => return Err(e),
+                // The file cannot be read now: the store's text, as a version behind.
+                Err(e) => match stored {
+                    Some(stored) => stored.view(true),
+                    None => return Err(e),
+                },
+            },
+        };
+        Ok(inner.opened(path, view))
     }
 
     /// Page `index` (0-based) of the note at `path` as a `data:image/png;base64,...` URL.
@@ -521,30 +713,33 @@ impl Review {
         if lock(&inner.table).quitting {
             return Err(QUITTING.to_owned());
         }
-        // Only a page of the note as the store has it: no request, download or run for one
-        // past its end. The index as it is: `note_open` scanned before, and the scanner keeps
-        // it fresh, so a page does not scan the store again.
-        match inner.notes.at_path(path) {
-            None => return Err(inner.missing(path)),
-            Some(note) if index >= note.pages => return Err(NO_SUCH_PAGE.to_owned()),
-            Some(_) => {}
+        // Only a page of the note as the last `note_open` of the path showed it: no request,
+        // download or run for one past its end. A path never opened takes the index as it is
+        // (the scanner keeps it fresh, so a page does not scan the store again).
+        let count = lock(&inner.opened)
+            .get(path)
+            .copied()
+            .or_else(|| inner.notes.at_path(path).map(|note| note.pages));
+        if count.is_some_and(|count| index >= count) {
+            return Err(NO_SUCH_PAGE.to_owned());
         }
         let mark = {
             let table = lock(&inner.table);
             if table.quitting {
                 return Err(QUITTING.to_owned());
             }
-            (
-                table.closes.get(path).copied().unwrap_or(0),
-                table.all_closes,
-            )
+            table.marks(path)
         };
         let entry = inner
             .library
             .call(|rest| rest.get_json::<Entry>("/entries", &[("path", path)]))
-            .map_err(|e| e.to_string())?;
+            .map_err(gone_or)?;
         if entry.kind != EntryKind::File {
-            return Err(NOT_A_FILE.to_owned());
+            return Err(if count.is_some() {
+                NOT_A_FILE.to_owned()
+            } else {
+                NOTE_GONE.to_owned()
+            });
         }
         // Checked before it is part of any path.
         let md5 = entry
@@ -552,6 +747,10 @@ impl Review {
             .clone()
             .filter(|m| is_md5(m))
             .ok_or_else(|| NO_MD5.to_owned())?;
+        // A note neither opened nor in the index: the pages of its file decide.
+        if count.is_none() && index >= inner.file_pages(path, &entry, mark)?.len() {
+            return Err(NO_SUCH_PAGE.to_owned());
+        }
         let png = inner.page_file(&md5, index);
         if let Some(url) = cached(&png) {
             return Ok(url);
@@ -561,11 +760,7 @@ impl Review {
             if table.quitting {
                 return Err(QUITTING.to_owned());
             }
-            let now = (
-                table.closes.get(path).copied().unwrap_or(0),
-                table.all_closes,
-            );
-            if now != mark {
+            if table.marks(path) != mark {
                 return Err(REVIEW_CLOSED.to_owned());
             }
             let key = (md5.clone(), index);
@@ -636,6 +831,9 @@ impl Review {
             for slot in table.jobs.values() {
                 leave(slot, path, REVIEW_CLOSED);
             }
+            for (_, slot) in table.opens.get(path).into_iter().flatten() {
+                stop(&mut lock(&slot.state), REVIEW_CLOSED);
+            }
         }
         self.inner.wake_runs();
     }
@@ -667,6 +865,9 @@ impl Review {
                 stop(&mut state, REVIEW_CLOSED);
                 slot.done.notify_all();
             }
+            for (_, slot) in table.opens.values().flatten() {
+                stop(&mut lock(&slot.state), REVIEW_CLOSED);
+            }
         }
         self.inner.wake_runs();
     }
@@ -680,6 +881,9 @@ impl Review {
                 let mut state = lock(&slot.state);
                 stop(&mut state, QUITTING);
                 slot.done.notify_all();
+            }
+            for (_, slot) in table.opens.values().flatten() {
+                stop(&mut lock(&slot.state), QUITTING);
             }
         }
         self.inner.wake_runs();
@@ -873,17 +1077,83 @@ impl Inner {
         }
     }
 
-    /// Why the store has no note at `path`: the server has the file and the pipeline has not
-    /// read it yet, or it is gone (not there, or a folder). Other answers say what went wrong.
-    fn missing(&self, path: &str) -> String {
-        match self
-            .library
-            .call(|rest| rest.get_json::<Entry>("/entries", &[("path", path)]))
-        {
-            Ok(entry) if entry.kind == EntryKind::File => NOT_READY.to_owned(),
-            Ok(_) | Err(LibraryError::Rest(RestError::NotFound)) => NOTE_GONE.to_owned(),
-            Err(e) => e.to_string(),
+    /// Keeps the page count of `view` as the last open of `path`.
+    fn opened(&self, path: &str, view: NoteView) -> NoteView {
+        lock(&self.opened).insert(path.to_owned(), view.pages.len());
+        view
+    }
+
+    /// The pages of the note file of `entry`, counted by `render --info` and kept by md5. The
+    /// download and the count belong to the review of `path`, whose close marks were `mark` at
+    /// the start of the call: a close or Quit stops them.
+    fn file_pages(
+        &self,
+        path: &str,
+        entry: &Entry,
+        mark: (u64, u64),
+    ) -> Result<Arc<Vec<FilePage>>, String> {
+        // Checked before it is part of any path.
+        let md5 = entry
+            .md5
+            .clone()
+            .filter(|m| is_md5(m))
+            .ok_or_else(|| NO_MD5.to_owned())?;
+        if let Some(pages) = lock(&self.infos).get(&md5) {
+            return Ok(pages.clone());
         }
+        if !self.cache.is_absolute() {
+            return Err(NO_CACHE.to_owned());
+        }
+        let slot = Arc::new(Slot::default());
+        {
+            let mut table = lock(&self.table);
+            if table.quitting {
+                return Err(QUITTING.to_owned());
+            }
+            if table.marks(path) != mark {
+                return Err(REVIEW_CLOSED.to_owned());
+            }
+            table
+                .opens
+                .entry(path.to_owned())
+                .or_default()
+                .push((md5.clone(), slot.clone()));
+        }
+        let _open = OpenSlot {
+            inner: self,
+            path,
+            slot: slot.clone(),
+        };
+        self.sweep_once();
+        let note = self.note_file(entry, &md5, &slot)?;
+        if let Some(why) = lock(&slot.state).stopped {
+            return Err(why.to_owned());
+        }
+        let args = vec![
+            "render".to_owned(),
+            note.display().to_string(),
+            "--info".to_owned(),
+            "--allow-unknown-version".to_owned(),
+        ];
+        let output = process::run_bounded(&self.spawn, &args, INFO_TIMEOUT)?;
+        if let Some(why) = lock(&slot.state).stopped {
+            return Err(why.to_owned());
+        }
+        if !output.status.success() {
+            return Err(format!(
+                "{NOT_READ} {}",
+                process::error_text(&output.stderr, output.status)
+            ));
+        }
+        let info: FileInfo = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .and_then(|l| serde_json::from_str(l).ok())
+            .ok_or_else(|| NOT_READ.to_owned())?;
+        let pages = Arc::new(info.pages);
+        lock(&self.infos).insert(md5, pages.clone());
+        Ok(pages)
     }
 
     /// One render of page `index`, into a temp folder; the PNG moves into the cache only when
@@ -1183,11 +1453,15 @@ impl Inner {
     /// cache's own files count: `notes/<md5>.note` and `pages/<md5>/<n>.png`. Files of a note
     /// that is being rendered stay.
     fn trim(&self) {
-        let busy: HashSet<String> = lock(&self.table)
-            .jobs
-            .keys()
-            .map(|(md5, _)| md5.clone())
-            .collect();
+        let busy: HashSet<String> = {
+            let table = lock(&self.table);
+            table
+                .jobs
+                .keys()
+                .map(|(md5, _)| md5.clone())
+                .chain(table.opens.values().flatten().map(|(md5, _)| md5.clone()))
+                .collect()
+        };
         let mut files: Vec<(SystemTime, PathBuf, u64, String)> = Vec::new();
         let mut folders = Vec::new();
         let regular = |path: &Path| {
@@ -1253,7 +1527,7 @@ impl Inner {
                 // Checked again right before the remove: a job that started since keeps its
                 // note's files.
                 let table = lock(&self.table);
-                if table.jobs.keys().any(|(m, _)| *m == md5) {
+                if table.uses(&md5) {
                     continue;
                 }
                 if fs::remove_file(&path).is_ok() {
@@ -1265,7 +1539,7 @@ impl Inner {
         // about to use.
         for (dir, md5) in folders {
             let table = lock(&self.table);
-            if !table.jobs.keys().any(|(m, _)| *m == md5) {
+            if !table.uses(&md5) {
                 let _ = fs::remove_dir(dir);
             }
         }

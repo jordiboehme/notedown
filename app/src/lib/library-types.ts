@@ -140,12 +140,17 @@ export type NoteSummary = {
 export const NOTES_EVENT = "notes";
 
 /**
- * A note for the review (src-tauri/src/review.rs), as `note_open(path)` answers it: the Markdown
- * of each page from the pipeline's store. Show it as text (`white-space: pre-wrap`), never as
- * HTML. `catchingUp`: a page waits for OCR, or the server has a newer version of the note.
- * `landscape` is always false for now (the store has no orientation): take the aspect ratio of a
- * page from its loaded image (Task 13). A note the pipeline has not read yet answers "The text of
- * this note is not ready yet.", a gone one "This note is not there anymore.".
+ * A note for the review (src-tauri/src/review.rs), as `note_open(path)` answers it: every page
+ * of the note, with the text of the pipeline's store where it has some. Each page has its
+ * `pageId` (the store's page id), its `blocks` (id and text, in order) and its `markdown` (the
+ * block texts joined by blank lines). Show the text as text (`white-space: pre-wrap`), never as
+ * HTML. A page the OCR has not read yet is `pending` with no blocks. `key` is the note's key in
+ * the store, null when the store does not know the note yet (no `note_seen` then).
+ * `catchingUp`: a page waits for OCR, or the server has a newer version of the note than the
+ * store read. `landscape` comes from the file when the store is behind it, else it is false (the
+ * store has no orientation): take the aspect ratio of a page from its loaded image. A gone note
+ * answers "This note is not there anymore.". `NOTES_EVENT` also comes when the store wrote a
+ * page: call `note_open` again to show its text.
  *
  * `note_page_image(path, index)` answers page `index` as a `data:image/png;base64,...` URL
  * ("This page is not in the note." past its pages). At most two pages render at once, the
@@ -156,14 +161,16 @@ export const NOTES_EVENT = "notes";
  * review.
  */
 export type NoteView = {
-  key: string;
+  key: string | null;
   path: string;
   title: string;
   catchingUp: boolean;
   pages: {
     index: number;
+    pageId: string;
     state: "done" | "pending" | "failed" | "truncated";
     markdown: string;
+    blocks: { id: string; text: string }[];
     landscape: boolean;
   }[];
 };

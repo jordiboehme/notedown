@@ -46,7 +46,17 @@ function view(states: NoteView["pages"][number]["state"][], catchingUp = false):
     path: PATH,
     title: "Plan",
     catchingUp,
-    pages: states.map((state, index) => ({ index, state, markdown: state === "done" ? `# Page ${index + 1}` : "", landscape: false })),
+    pages: states.map((state, index) => {
+      const markdown = state === "done" ? `# Page ${index + 1}` : "";
+      return {
+        index,
+        pageId: `P${index}`,
+        state,
+        markdown,
+        blocks: markdown === "" ? [] : [{ id: `b${index}`, text: markdown }],
+        landscape: false,
+      };
+    }),
   };
 }
 

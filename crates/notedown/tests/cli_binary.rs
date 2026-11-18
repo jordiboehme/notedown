@@ -3572,3 +3572,126 @@ fn cloud_account_list_prefers_data_over_the_environment() {
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("b@example.org"));
 }
+
+/// A data folder with the account `tester`, as `cloud account add` makes it.
+#[cfg(feature = "ocr")]
+fn data_with_an_account() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let out = cloud(
+        dir.path(),
+        &[
+            "add",
+            "tester",
+            "--email",
+            "tester@example.org",
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    dir
+}
+
+/// Saves a note with one page and one block per text into the store of `tester`.
+#[cfg(feature = "ocr")]
+fn save_note(data: &std::path::Path, key: &str, title: &str, texts: &[&str]) {
+    use notedown_pipeline::model::NoteState;
+    use notedown_pipeline::store::{TextStore, WriterLock};
+    let blocks: Vec<serde_json::Value> = texts
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            serde_json::json!({"id": format!("b{}", i + 1), "label": "text",
+                "bbox": [0, 0, 10, 10], "text": text})
+        })
+        .collect();
+    let note: NoteState = serde_json::from_value(serde_json::json!({
+        "key": key,
+        "path": format!("NOTE/Note/{title}.note"),
+        "title": title,
+        "pages": [
+            {"pageId": "P0", "position": 0, "seq": 1, "blocks": []},
+            {"pageId": "P1#2", "position": 1, "seq": 2, "blocks": blocks},
+        ],
+    }))
+    .unwrap();
+    let lock = WriterLock::take(data).unwrap();
+    let store = TextStore::open_writer(data, "tester", &lock).unwrap();
+    store.save_note(&lock, &note).unwrap();
+}
+
+#[cfg(feature = "ocr")]
+fn pipeline_search(data: &std::path::Path, query: &str) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["pipeline", "search", "--data"])
+        .arg(data)
+        .args(["--account", "tester", "--query", query])
+        .output()
+        .unwrap()
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn pipeline_search_prints_hits_as_json() {
+    let dir = data_with_an_account();
+    save_note(
+        dir.path(),
+        "F1",
+        "Ideas",
+        &["Buy milk", "The plan\nfor Monday"],
+    );
+    save_note(dir.path(), "F2", "Shop", &["Planet and plans"]);
+    let out = pipeline_search(dir.path(), "PLAN");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        hits,
+        serde_json::json!([{
+            "anchor": "notedown://tester/F1/P1#2#b2",
+            "note": "Ideas",
+            "page": 2,
+            "context": "The plan",
+        }])
+    );
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn pipeline_search_refuses_an_empty_query() {
+    let dir = data_with_an_account();
+    let out = pipeline_search(dir.path(), " -- ");
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("give at least one word"), "{err}");
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn pipeline_search_creates_nothing() {
+    let dir = data_with_an_account();
+    let before: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    let out = pipeline_search(dir.path(), "plan");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[]");
+    let after: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(before, after);
+    assert!(!dir.path().join("pipeline").exists());
+}

@@ -127,6 +127,23 @@ enum PipelineAction {
         #[arg(long)]
         account: Option<String>,
     },
+    /// Print the text blocks that hold every word of --query as one JSON array: per block its
+    /// anchor, note title, page and one line of context. Words are runs of letters and digits,
+    /// compared case-insensitive. Creates and changes nothing
+    Search {
+        /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
+        #[arg(long, value_name = "DIR")]
+        data: Option<PathBuf>,
+        /// The account slug (can be left out when the data folder has only one account)
+        #[arg(long)]
+        account: Option<String>,
+        /// The words to find
+        #[arg(long, value_name = "TEXT")]
+        query: String,
+        /// The most blocks to print
+        #[arg(long, value_name = "N", default_value_t = notedown_pipeline::search::DEFAULT_LIMIT)]
+        limit: usize,
+    },
     /// Move the bookmark of a consumer to --up-to, never backwards, and print it as JSON
     Ack {
         /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
@@ -2598,6 +2615,19 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
                 .map_or(0, |d| d.as_millis() as u64);
             let facts = notedown_pipeline::status::status_facts(&data, &slug, now)?;
             println!("{}", to_json(&facts));
+        }
+        PipelineAction::Search {
+            data,
+            account,
+            query,
+            limit,
+        } => {
+            let data = data_dir(data)?;
+            let slug = resolve_account(&data, account.as_deref())?;
+            // `at` reads the store where it is and creates nothing: no store gives no hits.
+            let store = TextStore::at(&data, &slug)?;
+            let hits = notedown_pipeline::search::search(&store, &slug, &query, limit)?;
+            println!("{}", to_json(&hits));
         }
         PipelineAction::Ack {
             data,

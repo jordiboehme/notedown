@@ -316,6 +316,20 @@ seconds. The fields:
 - `consumers`: one entry per consumer of the changes, `{"name", "seq", "ackedAt", "readAt",
   "notesBehind", "more"}`.
 
+## Pipeline search
+
+`notedown pipeline search --query TEXT --data DIR [--account A] [--limit N]` prints the text blocks that
+hold every word of `TEXT` as one JSON array, in note and page order, at most `N` blocks (default 20).
+`--account` can be left out when the data folder has only one account. It creates and changes nothing:
+a data folder without text gives `[]`. Words are the runs of letters and digits, compared
+case-insensitive, so `meet` does not find `Meeting` and punctuation does not count. A query without a
+word exits with code 1. Deleted notes are left out. Each hit has:
+
+- `anchor`: `notedown://<account>/<key>/<pageId>#<blockId>`, the block.
+- `note`: the title of the note.
+- `page`: the page number, from 1.
+- `context`: the first line of the block that holds a word of the query, cut at 200 characters.
+
 ## Markdown files
 
 The pipeline can keep the text of each note as a Markdown file in a folder you pick. The folder

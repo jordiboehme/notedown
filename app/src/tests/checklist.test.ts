@@ -11,6 +11,8 @@ import {
   createAccountProblem,
   foundLine,
   inUse,
+  ocrConnect,
+  RECONNECT_NOTE,
   remoteFolder,
   shortPath,
   startFolder,
@@ -234,6 +236,12 @@ describe("checklist", () => {
     status.existing = { server: false, pipeline: true };
     steps = byId(checklist(input({ status, config, existing: status.existing })));
     expect(steps.connection.state).toBe("done");
+    // The server refused the OCR's token (a password change): step 3 is to do again.
+    status.ocr.tokenRefused = true;
+    steps = byId(checklist(input({ status, config, existing: status.existing })));
+    expect(steps.connection.state).toBe("todo");
+    expect(steps.connection.line).toBe("The server no longer accepts the OCR's login.");
+    status.ocr.tokenRefused = false;
     // This Mac's server does not answer.
     const local = sampleStatus(NOW);
     local.connection = "unreachable";
@@ -611,6 +619,67 @@ describe("connectionRows", () => {
     });
     status.existing = { server: false, pipeline: true };
     expect(connectionRows(status, config, true).at(-1)?.value).toBe("Yes");
+    status.ocr.tokenRefused = true;
+    expect(connectionRows(status, config, true).at(-1)).toEqual({
+      title: "The OCR on this Mac reads from the server",
+      value: "No. Connect again.",
+      tone: "bad",
+    });
+  });
+});
+
+describe("ocrConnect", () => {
+  const remote = (): AppConfig => ({ ...sampleConfig(), mode: "remote", serverUrl: "http://pi.local:19072" });
+
+  it("offers to connect the OCR on another machine without a connection", () => {
+    const status = sampleStatus(NOW);
+    status.existing = { server: false, pipeline: false };
+    expect(ocrConnect(status, remote())).toEqual({
+      again: false,
+      note: "The OCR on this Mac logs in to the server with your password.",
+      button: "Connect",
+    });
+  });
+
+  it("offers to connect again when the server refused the OCR's token", () => {
+    const status = sampleStatus(NOW);
+    status.existing = { server: false, pipeline: true };
+    expect(ocrConnect(status, remote())).toBeNull();
+    status.ocr.tokenRefused = true;
+    expect(ocrConnect(status, remote())).toEqual({ again: true, note: RECONNECT_NOTE, button: "Connect again" });
+    expect(RECONNECT_NOTE).toBe(
+      "The server no longer accepts the OCR's login. This happens after a password change. Enter the password to connect again.",
+    );
+  });
+
+  it("offers nothing on this Mac's server or without a status", () => {
+    const status = sampleStatus(NOW);
+    status.ocr.tokenRefused = true;
+    status.existing = { server: true, pipeline: false };
+    expect(ocrConnect(status, sampleConfig())).toBeNull();
+    expect(ocrConnect(null, remote())).toBeNull();
+    expect(ocrConnect(status, null)).toBeNull();
+  });
+});
+
+describe("the OCR page", () => {
+  it("shows Connect again with the password field when the server refused the OCR's token", async () => {
+    const { render } = await import("svelte/server");
+    const { status } = await import("../lib/status.svelte");
+    const { config } = await import("../settings/config.svelte");
+    const { default: OcrPage } = await import("../settings/pages/OcrPage.svelte");
+    const current = sampleStatus(NOW);
+    current.existing = { server: false, pipeline: true };
+    config.current = { ...sampleConfig(), mode: "remote", serverUrl: "http://pi.local:19072" };
+    status.current = current;
+    expect(render(OcrPage, { props: { now: NOW } }).body).not.toContain("Connect again");
+    status.current = { ...current, ocr: { ...current.ocr, tokenRefused: true } };
+    const body = render(OcrPage, { props: { now: NOW } }).body;
+    expect(body).toContain("Connect again");
+    expect(body).toContain("This happens after a password change. Enter the password to connect again.");
+    expect(body).toContain('type="password"');
+    status.current = null;
+    config.current = null;
   });
 });
 

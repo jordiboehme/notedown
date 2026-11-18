@@ -1,15 +1,17 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { failure, hasLogin, logIn, logOut } from "../api";
-  import { accountActions } from "../account";
+  import { status } from "../../lib/status.svelte";
+  import { failure, hasLogin, logOut } from "../api";
+  import { accountActions, logInFlow } from "../account";
   import { config } from "../config.svelte";
   import Form from "../kit/Form.svelte";
   import Row from "../kit/Row.svelte";
   import Section from "../kit/Section.svelte";
 
   // Settings > Account: who is logged in where. Log in keeps a write token in the Keychain;
-  // Log out deletes the login of this Mac, forgets the account and revokes the token on the
-  // server.
+  // for a server on another machine it also connects the OCR again when the server refused
+  // its token (logInFlow). Log out deletes the login of this Mac, forgets the account and
+  // revokes the token on the server.
   type Note = { text: string; tone: "secondary" | "good" | "bad" };
   let loginNote = $state<Note | null>(null);
   let logoutNote = $state<Note | null>(null);
@@ -42,17 +44,24 @@
 
   async function enter(event: SubmitEvent) {
     event.preventDefault();
-    if (!actions.logIn.enabled) return;
+    const cfg = config.current;
+    if (!actions.logIn.enabled || cfg === null) return;
     busy = "logIn";
     loginNote = null;
+    // Without a status nothing is known about the OCR: it is left as it is.
+    const existing = status.current?.existing ?? { server: false, pipeline: true };
+    const tokenRefused = status.current?.ocr.tokenRefused ?? false;
     try {
-      const answer = await logIn(email, password);
+      const { answer, connectError } = await logInFlow(email, password, cfg, existing, tokenRefused);
       config.current = answer.config;
       loggedIn = true;
       logoutNote = null;
+      const done = `Logged in as ${answer.config.account}.`;
       loginNote = answer.keychain
-        ? { text: `Logged in as ${answer.config.account}. ${answer.keychain}`, tone: "bad" }
-        : { text: `Logged in as ${answer.config.account}.`, tone: "good" };
+        ? { text: `${done} ${answer.keychain}`, tone: "bad" }
+        : connectError
+          ? { text: `${done} The OCR did not connect: ${connectError}`, tone: "bad" }
+          : { text: done, tone: "good" };
     } catch (error) {
       loginNote = { text: failure(error), tone: "bad" };
     } finally {

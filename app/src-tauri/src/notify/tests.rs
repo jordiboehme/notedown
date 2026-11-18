@@ -51,6 +51,7 @@ pub(super) fn base_status() -> Status {
             waiting: 0,
             last_run_ms: Some(NOW - 10 * MIN),
             facts: true,
+            token_refused: false,
         },
         agents: Vec::new(),
         attention: Vec::new(),
@@ -389,6 +390,7 @@ fn ocr_is_not_done_while_pages_wait_or_fail() {
             o.last_error = Some(LastError {
                 text: "boom".to_owned(),
                 at_ms: NOW,
+                code: None,
             });
         }),
     ];
@@ -549,6 +551,7 @@ fn a_standing_ocr_error_is_not_shown_again() {
     rig.input.status.ocr.last_error = Some(LastError {
         text: "token abc123 refused".to_owned(),
         at_ms: NOW,
+        code: None,
     });
     rig.input.status.attention = vec![Attention::OcrError];
     assert!(rig.run().is_empty());

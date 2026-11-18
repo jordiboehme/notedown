@@ -191,6 +191,27 @@ fn ocr_lines() {
         Some(1_763_299_000_000)
     );
     assert_eq!(failed.attention, vec![Attention::OcrError]);
+    assert!(!failed.ocr.token_refused);
+
+    // A refused token: only its code says so. An older pipeline sends the text alone.
+    let text = "the server refused the token of jordi; run notedown connect \
+                https://notes.example.org --data /tmp/n again";
+    let refused = with(serde_json::json!({"lastError": {"text": text, "atMs": 1,
+                                                        "code": "token_refused"}}));
+    assert!(refused.ocr.token_refused);
+    assert_eq!(
+        refused
+            .ocr
+            .last_error
+            .as_ref()
+            .and_then(|e| e.code.as_deref()),
+        Some(TOKEN_REFUSED)
+    );
+    let old = with(serde_json::json!({"lastError": {"text": text, "atMs": 1}}));
+    assert!(!old.ocr.token_refused);
+    let other = with(serde_json::json!({"lastError": {"text": "x", "atMs": 1,
+                                                      "code": "something_else"}}));
+    assert!(!other.ocr.token_refused);
 
     // Pages of notes that still change.
     let settle = with(serde_json::json!({"queued": 0, "pending": 0, "waiting": 4,

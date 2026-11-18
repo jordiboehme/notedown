@@ -3,6 +3,7 @@
   import { relativeTime } from "../../lib/format";
   import { status } from "../../lib/status.svelte";
   import { failure, markdownDir, setMarkdownDir, setModelIdle, showMarkdownDir } from "../api";
+  import { ocrConnect } from "../checklist";
   import { config } from "../config.svelte";
   import { markdownRead, markdownRow } from "../markdown";
   import { MODEL_IDLE, modelIdleMinutes, modelIdleOptions, modelIdleValue } from "../modelIdle";
@@ -10,14 +11,21 @@
   import Row from "../kit/Row.svelte";
   import Section from "../kit/Section.svelte";
   import Segmented from "../kit/Segmented.svelte";
+  import ConnectOcr from "../parts/ConnectOcr.svelte";
   import ModelDownload from "../parts/ModelDownload.svelte";
 
-  // Settings > OCR: the queue, the page in work, the last error, the Markdown folder with
+  // Settings > OCR: the queue, the page in work, the last error (with Connect again when the
+  // server refused the OCR's token), the Markdown folder with
   // Choose... and Show in Finder, and the model with Download, Pause and Remove, and how long
   // the model stays loaded without new pages.
   let { now }: { now: number } = $props();
 
   const ocr = $derived(status.current?.ocr ?? null);
+  // Only Connect again: a first connection belongs to the setup.
+  const reconnect = $derived.by(() => {
+    const row = ocrConnect(status.current, config.current);
+    return row?.again ? row : null;
+  });
 
   let markdownPath = $state<string | null | undefined>(undefined);
   let markdownError = $state<string | null>(null);
@@ -113,6 +121,7 @@
           <span class="value">{relativeTime(ocr.lastError.atMs, now)}</span>
         </Row>
       {/if}
+      <ConnectOcr row={reconnect} />
     {/if}
   </Section>
 

@@ -24,6 +24,7 @@ export function sampleStatus(now: number): Status {
       waiting: 0,
       lastRunMs: now - 5 * 60_000,
       facts: true,
+      tokenRefused: false,
     },
     agents: [
       {
@@ -60,6 +61,7 @@ export function notSetUp(): Status {
       waiting: 0,
       lastRunMs: null,
       facts: false,
+      tokenRefused: false,
     },
     agents: [],
     attention: [],

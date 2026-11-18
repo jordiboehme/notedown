@@ -61,16 +61,20 @@ export interface LogInOutcome {
   connectError: string | null;
 }
 
-/** Logs in; for a server on another machine without a pipeline connection on this Mac, then
+/** Logs in; for a server on another machine without a pipeline connection on this Mac, or
+ * whose server refused the pipeline's token (`tokenRefused`, after a password change), then
  * also connects the pipeline with the same password. A failed login throws as logIn does. */
 export async function logInFlow(
   email: string,
   password: string,
   cfg: AppConfig,
   existing: Status["existing"],
+  tokenRefused: boolean,
 ): Promise<LogInOutcome> {
   const answer = await logIn(email, password);
-  if (cfg.mode !== "remote" || existing.pipeline) return { loggedIn: true, answer, connectError: null };
+  if (cfg.mode !== "remote" || (existing.pipeline && !tokenRefused)) {
+    return { loggedIn: true, answer, connectError: null };
+  }
   try {
     return { loggedIn: true, answer: await connectPipeline(password), connectError: null };
   } catch (error) {

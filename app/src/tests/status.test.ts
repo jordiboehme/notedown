@@ -31,7 +31,7 @@ function sample(ocr: string): Status {
     server: { line: "Runs on this Mac", state: { state: "running", pid: 7, sinceMs: 1 }, deviceUrls: [] },
     pipeline: { line: "Runs", state: { state: "running", pid: 8, sinceMs: 1 } },
     device: { line: null, name: "Nomad", lastSyncMs: 5, syncing: false, online: true, filesChanged: null },
-    ocr: { line: ocr, inWork: null, lastError: null, queued: 0, pending: 0, waiting: 0, lastRunMs: null, facts: true },
+    ocr: { line: ocr, inWork: null, lastError: null, queued: 0, pending: 0, waiting: 0, lastRunMs: null, facts: true, tokenRefused: false },
     agents: [],
     attention: [],
     existing: { server: true, pipeline: false },

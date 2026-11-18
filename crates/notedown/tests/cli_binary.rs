@@ -19,6 +19,12 @@ fn render_command_writes_pngs() {
 
 /// A small note of `pages` blank pages (the container layout of docs/note-format.md 1, 2).
 fn blank_note(pages: usize, signature: &str) -> Vec<u8> {
+    let metas: Vec<String> = (1..=pages).map(|n| format!("<PAGEID:id-{n}>")).collect();
+    note_of_pages(&metas, signature)
+}
+
+/// A small note with one blank page per entry of `metas`, each the raw keys of its page block.
+fn note_of_pages(metas: &[String], signature: &str) -> Vec<u8> {
     fn block(data: &mut Vec<u8>, payload: &[u8]) -> usize {
         let address = data.len();
         data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -29,9 +35,9 @@ fn blank_note(pages: usize, signature: &str) -> Vec<u8> {
     data.extend_from_slice(signature.as_bytes());
     let header = block(&mut data, b"<FILE_TYPE:NOTE>");
     let mut footer = format!("<FILE_FEATURE:{header}>");
-    for n in 1..=pages {
-        let page = block(&mut data, format!("<PAGEID:id-{n}>").as_bytes());
-        footer.push_str(&format!("<PAGE{n}:{page}>"));
+    for (i, meta) in metas.iter().enumerate() {
+        let page = block(&mut data, meta.as_bytes());
+        footer.push_str(&format!("<PAGE{}:{page}>", i + 1));
     }
     let address = block(&mut data, footer.as_bytes());
     data.extend_from_slice(b"tail");
@@ -185,6 +191,92 @@ fn render_reads_the_format_from_the_bytes_not_the_name() {
     let out = render_run(&note, &out_dir, &[]);
     assert!(out.status.success(), "{out:?}");
     assert_eq!(png_names(&out_dir), vec!["blob-page-001.png"]);
+}
+
+fn render_info(file: &std::path::Path, extra: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .arg("render")
+        .arg(file)
+        .arg("--info")
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn render_info_prints_pages_and_orientation() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("four.note");
+    let metas = [
+        "<PAGEID:P1><ORIENTATION:1000>",
+        "<PAGEID:P2><ORIENTATION:1090>",
+        "<PAGEID:P2><ORIENTATION:1270>",
+        "<ORIENTATION:1000>",
+    ]
+    .map(str::to_string);
+    std::fs::write(&note, note_of_pages(&metas, "SN_FILE_VER_20230015")).unwrap();
+    let out = render_info(&note, &[]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        concat!(
+            r#"{"pages":[{"id":"P1","landscape":false},{"id":"P2","landscape":true},"#,
+            r#"{"id":"P2#2","landscape":true},{"id":"position:3","landscape":false}]}"#,
+            "\n"
+        )
+    );
+    assert_eq!(
+        png_names(dir.path()),
+        vec!["four.note"],
+        "no file is written"
+    );
+}
+
+#[test]
+fn render_info_reads_a_real_note_and_honours_the_version_flag() {
+    let out = render_info(std::path::Path::new(NOTE), &[]);
+    assert!(out.status.success(), "{out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let pages = v["pages"].as_array().unwrap();
+    assert!(!pages.is_empty());
+    for p in pages {
+        assert!(p["id"].is_string() && p["landscape"].is_boolean(), "{p}");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("newer.note");
+    std::fs::write(&note, blank_note(1, "SN_FILE_VER_29990001")).unwrap();
+    assert!(
+        !render_info(&note, &[]).status.success(),
+        "strict by default"
+    );
+    let out = render_info(&note, &["--allow-unknown-version"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "{\"pages\":[{\"id\":\"id-1\",\"landscape\":false}]}\n"
+    );
+}
+
+#[test]
+fn render_info_refuses_the_options_that_write_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("two.note");
+    std::fs::write(&note, blank_note(2, "SN_FILE_VER_20230015")).unwrap();
+    let out_dir = dir.path().join("o");
+    for extra in [
+        vec!["--pdf"],
+        vec!["--page", "1"],
+        vec!["--keep-template"],
+        vec!["--out", out_dir.to_str().unwrap()],
+    ] {
+        let out = render_info(&note, &extra);
+        assert!(!out.status.success(), "{extra:?}: {out:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("--info"), "{extra:?}: {err}");
+    }
+    assert!(!out_dir.exists(), "nothing is written");
+    assert_eq!(png_names(dir.path()), vec!["two.note"]);
 }
 
 #[cfg(feature = "ocr")]

@@ -140,15 +140,34 @@ pub struct NoteFingerprint {
     pub pages: Vec<PageFingerprint>,
 }
 
+/// The page ids of a note, in page order: `PAGEID`, or `position:<n>` (0-based) for a page
+/// without one. The second page with the same id gets `<id>#2`, the third `<id>#3`, and so on.
+/// [`fingerprint_note`] uses the same ids, so they match `pageId` in the store.
+pub fn page_ids(nb: &Notebook) -> Vec<String> {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    nb.pages
+        .iter()
+        .map(|page| {
+            let base = page
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("position:{}", page.index));
+            let n = seen.entry(base.clone()).or_insert(0);
+            *n += 1;
+            if *n == 1 { base } else { format!("{base}#{n}") }
+        })
+        .collect()
+}
+
 /// Parse `bytes` as a `.note` and fingerprint every page. The bytes are moved into the parser,
 /// not copied. The error is a reason for people: the parse error, or the page and block that
 /// could not be read.
 pub fn fingerprint_note(bytes: Vec<u8>) -> Result<NoteFingerprint, String> {
     // A newer firmware's signature must not stop the index: the known rules still apply.
     let nb = Notebook::from_bytes(bytes, VersionPolicy::AllowUnknown).map_err(|e| e.to_string())?;
-    let mut seen: HashMap<String, usize> = HashMap::new();
+    let ids = page_ids(&nb);
     let mut pages = Vec::with_capacity(nb.pages.len());
-    for page in &nb.pages {
+    for (page, page_id) in nb.pages.iter().zip(ids) {
         let number = page.index + 1;
         let block = |what: &str, r: Option<BlockRef>| -> Result<&[u8], String> {
             match r {
@@ -199,13 +218,6 @@ pub fn fingerprint_note(bytes: Vec<u8>) -> Result<NoteFingerprint, String> {
             .field("RECOGNFILE", block("RECOGNFILE", page.recogn_file)?)
             .finish();
 
-        let base = page
-            .id
-            .clone()
-            .unwrap_or_else(|| format!("position:{}", page.index));
-        let n = seen.entry(base.clone()).or_insert(0);
-        *n += 1;
-        let page_id = if *n == 1 { base } else { format!("{base}#{n}") };
         pages.push(PageFingerprint::new(
             &page_id,
             page.index,
@@ -244,4 +256,41 @@ fn text_box_records(totalpath: &[u8], page_size: (u32, u32)) -> Result<Vec<&[u8]
         at = end;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test1() -> Vec<u8> {
+        std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/notes/test1.note"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn page_ids_follow_the_fingerprint_rule() {
+        let bytes = test1();
+        let nb = Notebook::from_bytes(bytes.clone(), VersionPolicy::AllowUnknown).unwrap();
+        let fp = fingerprint_note(bytes).unwrap();
+        let ids: Vec<String> = fp.pages.iter().map(|p| p.page_id.clone()).collect();
+        assert_eq!(page_ids(&nb), ids);
+
+        // The same fixture with its pages rewritten to the ids A, A and none.
+        let mut nb = nb;
+        let first = nb.pages[0].clone();
+        nb.pages = [Some("A"), Some("A"), None]
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let mut page = first.clone();
+                page.index = index;
+                page.id = id.map(str::to_string);
+                page
+            })
+            .collect();
+        assert_eq!(page_ids(&nb), vec!["A", "A#2", "position:2"]);
+    }
 }

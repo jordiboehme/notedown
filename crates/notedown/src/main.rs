@@ -557,6 +557,9 @@ struct RenderArgs {
     /// reported on stderr and the others still run
     #[arg(long, value_name = "N", conflicts_with = "pdf")]
     page: Vec<usize>,
+    /// Print the pages as one JSON line ({"pages":[{"id":..,"landscape":..}]}) and write no file
+    #[arg(long, conflicts_with_all = ["pdf", "page", "out", "keep_template"])]
+    info: bool,
     /// Accept .note files with an unknown format version
     #[arg(long)]
     allow_unknown_version: bool,
@@ -747,6 +750,17 @@ fn render(args: RenderArgs) -> Result<ExitCode> {
     };
     let nb = Notebook::open(&args.file, policy)
         .with_context(|| format!("cannot read {}", args.file.display()))?;
+    if args.info {
+        let pages: Vec<serde_json::Value> = notedown_cloud::pages::fingerprint::page_ids(&nb)
+            .into_iter()
+            .zip(&nb.pages)
+            .map(|(id, page)| serde_json::json!({"id": id, "landscape": page.landscape}))
+            .collect();
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "{}", serde_json::json!({ "pages": pages }))?;
+        out.flush()?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let dir = match &args.out {
         Some(d) => d.clone(),
         None => args

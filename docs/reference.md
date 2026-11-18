@@ -70,6 +70,12 @@ grid) is left out because it confuses OCR; add `--keep-template` to keep it, in 
 - With or without `--page`, each path is printed on its own line as soon as the PNG is written. A page
   that fails (for example a number past the end) prints `error: page N: <reason>` on stderr and the
   run goes on with the next page. The exit code is 1 at the end if any page failed.
+- `--info` renders nothing and writes no file. It prints one JSON line with the pages of the note,
+  for example `{"pages":[{"id":"P1","landscape":false}]}`. `id` is the page id that the pipeline's
+  store uses: the `PAGEID` of the page, `position:<n>` (0-based) for a page without one, and
+  `<id>#2`, `<id>#3` for a second and third page with the same id. `landscape` is true for a page in
+  landscape orientation. `--info` cannot be combined with `--pdf`, `--page`, `--out` or
+  `--keep-template`.
 - `--allow-unknown-version` opens a note of a newer format version, as `convert` does.
 - The file name does not need the `.note` extension, because the format is read from the file itself.
 

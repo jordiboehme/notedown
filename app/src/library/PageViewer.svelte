@@ -128,6 +128,7 @@
   }
 
   .paper {
+    box-sizing: border-box;
     flex: none;
     /* Centered while it fits; an auto margin is 0 once it is larger, so all of it scrolls. */
     margin: auto;

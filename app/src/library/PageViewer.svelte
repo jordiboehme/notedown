@@ -66,7 +66,7 @@
         <img src={image.url} alt={row.label} />
       {:else if image?.state === "failed"}
         <p class="why">{image.text}</p>
-      {:else}
+      {:else if image?.state === "loading"}
         <p class="why">Drawing the page...</p>
       {/if}
     </div>

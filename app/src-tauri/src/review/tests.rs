@@ -410,7 +410,8 @@ fn a_note_with_pending_pages_says_so() {
     let s = setup(vec![
         // 1: the store has the version of the server, but a page waits for OCR.
         (look(NOTE), entry()),
-        // 2: every page is done, but the server has a newer version.
+        // 2: every page is done, but the server has a newer version that cannot be downloaded
+        // now (no answer for its bytes): the store's pages, a version behind.
         (look(NOTE), entry_of(json!(other), "file")),
         // 3: every page is done and the md5 is the same.
         (look(NOTE), entry()),
@@ -436,7 +437,11 @@ fn a_note_with_pending_pages_says_so() {
         &md5,
         vec![page("P1", 0, "done", vec![block("b1", "x")])],
     ));
-    assert!(s.review.open(NOTE).unwrap().catching_up, "a newer version");
+    let behind = s.review.open(NOTE).unwrap();
+    assert!(behind.catching_up, "a newer version");
+    assert_eq!(behind.pages.len(), 1);
+    assert_eq!(behind.pages[0].markdown, "x");
+    assert!(s.calls().is_empty(), "nothing to count without the file");
     assert!(!s.review.open(NOTE).unwrap().catching_up, "all caught up");
     assert!(
         !s.review.open(NOTE).unwrap().catching_up,

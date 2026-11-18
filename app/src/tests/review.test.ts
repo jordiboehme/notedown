@@ -19,8 +19,21 @@ vi.mock("@tauri-apps/api/core", () => ({
   }),
 }));
 
-const { reviewPages, pageAt, syncTop, reviewNotice, nearPages, noteTitle, syncGuard, concernsNote, findBlock, keepsHit, PORTRAIT } =
-  await import("../library/review");
+const {
+  reviewPages,
+  pageAt,
+  syncTop,
+  reviewNotice,
+  nearPages,
+  noteTitle,
+  syncGuard,
+  concernsNote,
+  findBlock,
+  keepsHit,
+  canSaveMarkdown,
+  noteMenu,
+  PORTRAIT,
+} = await import("../library/review");
 const { ReviewSession } = await import("../library/session.svelte");
 const { openAt } = await import("../library/view");
 const ReviewPages = (await import("../library/ReviewPages.svelte")).default;
@@ -640,6 +653,70 @@ describe("the review session", () => {
     await opening;
     expect(asked("note_seen")).toEqual([]);
     expect(session.view).toBeNull();
+  });
+});
+
+describe("Save Markdown", () => {
+  it("canSaveMarkdown needs a page with text", () => {
+    expect(canSaveMarkdown(null)).toBe(false);
+    expect(canSaveMarkdown(view([]))).toBe(false);
+    expect(canSaveMarkdown(view(["pending", "pending", "failed"]))).toBe(false);
+    expect(canSaveMarkdown(view(["pending", "done"]))).toBe(true);
+    // A page whose text is only blanks has no text.
+    const blank = view(["done"]);
+    blank.pages[0].markdown = "  \n ";
+    expect(canSaveMarkdown(blank)).toBe(false);
+  });
+
+  const shown = () => calls.filter((c) => c.command === "review_shown").map((c) => c.args);
+
+  it("the review tells Rust what it shows", async () => {
+    answerNow("note_open", view(["pending", "pending"]));
+    const session = new ReviewSession(PATH);
+    await session.open();
+    expect(shown()).toEqual([{ path: PATH, canSave: false }]);
+    // A reload without new text says nothing new.
+    answerNow("note_open", view(["pending", "pending"]));
+    await session.reload();
+    expect(shown()).toHaveLength(1);
+    // The first text came: the note can be saved now.
+    answerNow("note_open", view(["done", "pending"]));
+    await session.reload();
+    expect(shown()).toEqual([
+      { path: PATH, canSave: false },
+      { path: PATH, canSave: true },
+    ]);
+    session.close();
+    expect(shown()).toEqual([
+      { path: PATH, canSave: false },
+      { path: PATH, canSave: true },
+      { path: null, canSave: false },
+    ]);
+  });
+
+  it("a note's context menu is Rust's: the window names the note", () => {
+    const event = { preventDefault: vi.fn() };
+    noteMenu(event, PATH);
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(calls).toEqual([{ command: "library_menu", args: { target: { kind: "note", path: PATH } } }]);
+  });
+
+  it("a failed open tells Rust nothing", async () => {
+    answerError("note_open", "The note is gone.");
+    const session = new ReviewSession(PATH);
+    await session.open();
+    expect(shown()).toEqual([]);
+  });
+
+  it("an open that answers after the close does not show the note again", async () => {
+    let release: (value: unknown) => void = () => {};
+    answers.set("note_open", [() => new Promise((resolve) => (release = resolve))]);
+    const session = new ReviewSession(PATH);
+    const opening = session.open();
+    session.close();
+    release(view(["done"]));
+    await opening;
+    expect(shown()).toEqual([{ path: null, canSave: false }]);
   });
 });
 

@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { NoteView } from "../lib/library-types";
-import { findBlock, nearPages, reviewPages, type BlockAt } from "./review";
+import { canSaveMarkdown, findBlock, nearPages, reviewPages, type BlockAt } from "./review";
 
 /** The image of a page: asked for, shown (a data URL), or why there is none. */
 export type PageImage = { state: "loading" } | { state: "shown"; url: string } | { state: "failed"; text: string };
@@ -130,6 +130,9 @@ export class ReviewSession {
         console.error("notedown: note_seen failed", error),
       );
     }
+    // Rust's File menu saves the note the review shows, once it has text.
+    const canSave = canSaveMarkdown(view);
+    if (old === null || canSaveMarkdown(old) !== canSave) this.#tellShown(this.path, canSave);
     this.#update();
   }
 
@@ -198,8 +201,16 @@ export class ReviewSession {
     this.#closed = true;
     this.#asks.clear();
     this.images = {};
+    this.#tellShown(null, false);
     invoke("note_close", { path: this.path }).catch((error: unknown) =>
       console.error("notedown: note_close failed", error),
+    );
+  }
+
+  /** Tells Rust which note the review shows and whether it can be saved (the File menu). */
+  #tellShown(path: string | null, canSave: boolean) {
+    invoke("review_shown", { path, canSave }).catch((error: unknown) =>
+      console.error("notedown: review_shown failed", error),
     );
   }
 

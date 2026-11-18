@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import type { NoteView } from "../lib/library-types";
 
 // The view models of the review: a note's handwritten pages on one side and its Markdown on
@@ -168,4 +169,20 @@ export function syncGuard() {
  */
 export function keepsHit(markedTop: number, scrollTop: number): boolean {
   return Math.abs(scrollTop - markedTop) <= 1;
+}
+
+/** Save Markdown can save the note: some page has text. */
+export function canSaveMarkdown(view: NoteView | null): boolean {
+  return view !== null && view.pages.some((page) => page.markdown.trim() !== "");
+}
+
+/**
+ * The context menu of the note at `path` (a row of a notes list, a .note file): Rust builds
+ * it ("Save Markdown...", enabled when the note has text) and does its work.
+ */
+export function noteMenu(event: { preventDefault(): void }, path: string) {
+  event.preventDefault();
+  invoke("library_menu", { target: { kind: "note", path } }).catch((error: unknown) =>
+    console.error("notedown: library_menu failed", error),
+  );
 }

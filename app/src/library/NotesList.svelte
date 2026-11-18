@@ -1,9 +1,11 @@
 <script lang="ts">
   import type { NoteSummary } from "../lib/library-types";
   import VirtualRows from "./VirtualRows.svelte";
+  import { noteMenu } from "./review";
   import { dateText, folderLabel } from "./view";
 
-  // New notes or all notes as rows; a click opens the review of the note. Titles are text.
+  // New notes or all notes as rows; a click opens the review of the note and a right click
+  // its context menu (Rust's). Titles are text.
   let {
     title,
     notes,
@@ -38,7 +40,7 @@
 {:else}
   <VirtualRows items={notes} rowHeight={24} key={(note: NoteSummary) => note.key} label={title}>
     {#snippet row(note: NoteSummary)}
-      <button type="button" class="row" onclick={() => onOpen(note)}>
+      <button type="button" class="row" onclick={() => onOpen(note)} oncontextmenu={(event) => noteMenu(event, note.path)}>
         <span class="text">{note.title}</span>
         <span class="text muted">{folderLabel(note.path)}</span>
         <span class="pages muted">{note.pages}</span>

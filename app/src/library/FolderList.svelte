@@ -5,6 +5,7 @@
   import PathBar from "./PathBar.svelte";
   import VirtualRows from "./VirtualRows.svelte";
   import { opensReview } from "./actions";
+  import { noteMenu } from "./review";
   import { drag, pressOn } from "./drag.svelte";
   import { dateText, listRows, needsNextPage, sizeText, type Range, type Sort } from "./view";
 
@@ -126,6 +127,7 @@
               event.preventDefault();
               onOpenNote(entry.path);
             }}
+            oncontextmenu={(event) => opensReview(entry) && noteMenu(event, entry.path)}
             onpointerdown={(event) => pressOn(entry, event)}
           >
             <span class="name">

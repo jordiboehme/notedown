@@ -1,9 +1,10 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { NOTES_EVENT } from "../lib/library-types";
   import { ReviewSession } from "./session.svelte";
-  import { concernsNote, noteTitle, reviewNotice, reviewPages, type BlockAt } from "./review";
+  import { canSaveMarkdown, concernsNote, noteTitle, reviewNotice, reviewPages, type BlockAt } from "./review";
   import ReviewPages from "./ReviewPages.svelte";
   import PageViewer from "./PageViewer.svelte";
   import { ACTUAL, ZOOMS, reviewZoomKey, zoomIn, zoomOut } from "./zoom";
@@ -34,6 +35,17 @@
   const notice = $derived(session.view ? reviewNotice(session.view) : null);
   /** The zoom of the pages side: 1 is fit width. */
   let zoom = $state(ACTUAL);
+
+  /** A save dialog is open: the button waits for it. */
+  let saving = $state(false);
+
+  /** Save Markdown: Rust shows the save dialog and any failure. */
+  function saveMarkdown() {
+    saving = true;
+    invoke("note_save_markdown", { path })
+      .catch((error: unknown) => console.error("notedown: note_save_markdown failed", error))
+      .finally(() => (saving = false));
+  }
 
   function zoomBy(step: "in" | "out" | "actual") {
     zoom = step === "in" ? zoomIn(zoom) : step === "out" ? zoomOut(zoom) : ACTUAL;
@@ -87,13 +99,24 @@
 <header class="head">
   <button type="button" class="back" onclick={onBack}>Back</button>
   <h1 class="title">{session.view?.title ?? noteTitle(path)}</h1>
-  {#if session.view && rows.length > 0}
-    <div class="zoom" role="group" aria-label="Zoom">
-      <button type="button" class="back" disabled={zoom === ZOOMS[0]} onclick={() => zoomBy("out")}>Zoom Out</button>
-      <button type="button" class="back" disabled={zoom === ACTUAL} onclick={() => zoomBy("actual")}>Actual Size</button>
-      <button type="button" class="back" disabled={zoom === ZOOMS[ZOOMS.length - 1]} onclick={() => zoomBy("in")}>Zoom In</button>
-    </div>
-  {/if}
+  <div class="tools">
+    {#if session.view && rows.length > 0}
+      <div class="zoom" role="group" aria-label="Zoom">
+        <button type="button" class="back" disabled={zoom === ZOOMS[0]} onclick={() => zoomBy("out")}>Zoom Out</button>
+        <button type="button" class="back" disabled={zoom === ACTUAL} onclick={() => zoomBy("actual")}>Actual Size</button>
+        <button type="button" class="back" disabled={zoom === ZOOMS[ZOOMS.length - 1]} onclick={() => zoomBy("in")}>Zoom In</button>
+      </div>
+    {/if}
+    {#if session.view}
+      <button
+        type="button"
+        class="back"
+        disabled={saving || !canSaveMarkdown(session.view)}
+        title={canSaveMarkdown(session.view) ? undefined : "This note has no text yet."}
+        onclick={saveMarkdown}>Save Markdown...</button
+      >
+    {/if}
+  </div>
 </header>
 {#if session.stale}<p class="notice">{session.stale}</p>{/if}
 {#if notice}<p class="notice">{notice}</p>{/if}
@@ -152,11 +175,16 @@
     opacity: 0.5;
   }
 
-  .zoom {
+  .tools {
     flex: none;
     display: flex;
-    gap: 6px;
+    gap: 12px;
     margin-left: auto;
+  }
+
+  .zoom {
+    display: flex;
+    gap: 6px;
   }
 
   .title {

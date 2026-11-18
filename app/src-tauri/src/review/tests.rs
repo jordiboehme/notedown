@@ -411,7 +411,8 @@ fn a_note_with_pending_pages_says_so() {
         // 1: the store has the version of the server, but a page waits for OCR.
         (look(NOTE), entry()),
         // 2: every page is done, but the server has a newer version that cannot be downloaded
-        // now (no answer for its bytes): the store's pages, a version behind.
+        // now (no answer for its bytes): an error, never the store's text next to the pages
+        // of another version.
         (look(NOTE), entry_of(json!(other), "file")),
         // 3: every page is done and the md5 is the same.
         (look(NOTE), entry()),
@@ -437,10 +438,9 @@ fn a_note_with_pending_pages_says_so() {
         &md5,
         vec![page("P1", 0, "done", vec![block("b1", "x")])],
     ));
-    let behind = s.review.open(NOTE).unwrap();
-    assert!(behind.catching_up, "a newer version");
-    assert_eq!(behind.pages.len(), 1);
-    assert_eq!(behind.pages[0].markdown, "x");
+    let error = s.review.open(NOTE).unwrap_err();
+    assert!(!error.is_empty());
+    assert_ne!(error, crate::notes::NOTE_GONE);
     assert!(s.calls().is_empty(), "nothing to count without the file");
     assert!(!s.review.open(NOTE).unwrap().catching_up, "all caught up");
     assert!(
@@ -1083,6 +1083,44 @@ fn store_text_follows_the_page_id_when_the_file_is_newer() {
         data_url(&png_of(3, BYTES))
     );
     assert_eq!(s.downloads(), 1);
+}
+
+/// The store read an older version and the newer file cannot be read now: the open fails (the
+/// user sees why and tries again). Store text never stands next to images of a file whose
+/// pages were not matched to it.
+#[test]
+fn a_newer_file_that_cannot_be_read_is_an_error_and_can_be_tried_again() {
+    let s = setup(vec![
+        (look(NOTE), entry()),
+        (
+            FILE.to_owned(),
+            Act::Answer(answer("500 Internal Server Error", "{}")),
+        ),
+        (look(NOTE), entry()),
+        (FILE.to_owned(), bytes_of(BYTES)),
+    ]);
+    s.store(&stored(
+        &md5_hex(b"the old bytes"),
+        vec![
+            page("A", 0, "done", vec![block("a1", "a")]),
+            page("B", 1, "done", vec![block("b1", "b")]),
+        ],
+    ));
+    s.info(&[("X", false), ("A", false), ("B", false)]);
+    let error = s.review.open(NOTE).unwrap_err();
+    assert!(!error.is_empty());
+    assert_ne!(error, crate::notes::NOTE_GONE);
+    assert!(s.info_calls().is_empty());
+    // Tried again, the file decides and the text follows the page ids.
+    let view = s.review.open(NOTE).unwrap();
+    assert_eq!(
+        rows(&view),
+        vec![
+            ("X", PageState::Pending, "", false),
+            ("A", PageState::Done, "a", false),
+            ("B", PageState::Done, "b", false),
+        ]
+    );
 }
 
 #[test]

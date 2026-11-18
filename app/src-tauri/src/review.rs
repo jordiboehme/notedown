@@ -11,8 +11,10 @@
 //! the file: its bytes are cached as for a page image (step 1 below) and
 //! `notedown render <note> --info --allow-unknown-version` counts its pages (by md5, once a
 //! run). Each page takes the state and the blocks of the store's page with the same page id;
-//! any other page waits for OCR. Such a note is always catching up. The download and the count
-//! stop when the review closes and at Quit, as a render does. A note the server does not have
+//! any other page waits for OCR. Such a note is always catching up. When the file cannot be
+//! read, the open fails with the reason (never the store's text of another version). The
+//! download and the count stop when the review closes and at Quit, as a render does. A note
+//! the server does not have
 //! (or a folder) is gone. `note_page_image` checks a page against the pages of the last
 //! `note_open` of the path; for a path never opened against the notes index, and for one the
 //! index does not know against the file's pages.
@@ -693,14 +695,14 @@ impl Review {
         };
         let view = match stored {
             Some(stored) if entry.md5.as_deref() == Some(stored.md5.as_str()) => stored.view(false),
+            // The file decides. When it cannot be read now, the open fails: the store's text
+            // must not stand next to images of a file its pages were not matched to.
             stored => match inner.file_pages(path, &entry, mark) {
                 Ok(pages) => file_view(path, stored, &pages),
-                Err(e) if e == REVIEW_CLOSED || e == QUITTING => return Err(e),
-                // The file cannot be read now: the store's text, as a version behind.
-                Err(e) => match stored {
-                    Some(stored) => stored.view(true),
-                    None => return Err(e),
-                },
+                Err(e) => {
+                    lock(&inner.opened).remove(path);
+                    return Err(e);
+                }
             },
         };
         Ok(inner.opened(path, view))

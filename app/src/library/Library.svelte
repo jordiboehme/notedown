@@ -217,10 +217,13 @@
     naming = false;
   }
 
-  /** Shows the review of the note at `path`; Back goes to what was shown before. */
-  function openNote(path: string) {
+  /**
+   * Shows the review of the note at `path`, at the block `at` (a search hit) when given; Back
+   * goes to what was shown before.
+   */
+  function openNote(path: string, at?: { pageId: string; blockId: string }) {
     if (library.selection.kind !== "note") library.back = library.selection;
-    show({ kind: "note", path });
+    show(at ? { kind: "note", path, at } : { kind: "note", path });
     openings += 1;
   }
 
@@ -298,7 +301,9 @@
   /** A row of the search results: it opens or selects what it names, and the search ends. */
   function openRow(row: ResultRow) {
     search.clear();
-    if (row.kind === "folder") select(row.path);
+    if (row.section === "text" && row.pageId !== undefined && row.blockId !== undefined) {
+      openNote(row.path, { pageId: row.pageId, blockId: row.blockId });
+    } else if (row.kind === "folder") select(row.path);
     else if (row.kind === "note") openNote(row.path);
     else pickFile(row.path);
   }
@@ -356,7 +361,11 @@
         <NotesList title="All notes" notes={allNotes} empty="No notes with text yet." onOpen={(note) => openNote(note.path)} />
       {:else if library.selection.kind === "note"}
         {#key `${library.generation}:${openings}:${library.selection.path}`}
-          <Review path={library.selection.path} onBack={() => (library.selection = library.back)} />
+          <Review
+            path={library.selection.path}
+            at={library.selection.at ?? null}
+            onBack={() => (library.selection = library.back)}
+          />
         {/key}
       {:else if !ready}
         <StateNotice view={library.view} onSettings={settings} />

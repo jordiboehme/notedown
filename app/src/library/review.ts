@@ -14,8 +14,13 @@ export const PAGES_KEPT = 4;
 
 export type PageState = NoteView["pages"][number]["state"];
 
+/** Where a search hit is: the page by its id and the block in it. */
+export type BlockAt = { pageId: string; blockId: string };
+
 export type ReviewPage = {
   index: number;
+  /** The page's id in the note: a search hit names its page by it. */
+  pageId: string;
   label: string;
   state: PageState;
   /** The page's text as the pipeline wrote it; shown as text, never as HTML. */
@@ -24,6 +29,8 @@ export type ReviewPage = {
   stateText: string | null;
   /** Width by height, for the placeholder of its image. */
   ratio: number;
+  /** The page's text block by block, in their order; together they are `markdown`. */
+  blocks: { id: string; text: string }[];
 };
 
 const STATE_TEXTS: Record<Exclude<PageState, "done">, string> = {
@@ -39,6 +46,7 @@ const STATE_TEXTS: Record<Exclude<PageState, "done">, string> = {
 export function reviewPages(view: NoteView, ratios: Record<number, number> = {}): ReviewPage[] {
   return view.pages.map((page) => ({
     index: page.index,
+    pageId: page.pageId,
     label: `Page ${page.index + 1}`,
     state: page.state,
     markdown: page.markdown,
@@ -49,7 +57,18 @@ export function reviewPages(view: NoteView, ratios: Record<number, number> = {})
           : null
         : STATE_TEXTS[page.state],
     ratio: ratios[page.index] ?? (page.landscape ? 1 / PORTRAIT : PORTRAIT),
+    blocks: page.blocks.map((block) => ({ id: block.id, text: block.text })),
   }));
+}
+
+/**
+ * The row of the page `at` names and its block: the page alone (`blockId` null) when the block
+ * is gone, nothing when the page is gone.
+ */
+export function findBlock(rows: ReviewPage[], at: BlockAt): { index: number; blockId: string | null } | null {
+  const row = rows.find((r) => r.pageId === at.pageId);
+  if (!row) return null;
+  return { index: row.index, blockId: row.blocks.some((b) => b.id === at.blockId) ? at.blockId : null };
 }
 
 /** The line above the review while the note is not read to the end. */

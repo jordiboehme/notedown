@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { NoteView } from "../lib/library-types";
-import { nearPages } from "./review";
+import { findBlock, nearPages, reviewPages, type BlockAt } from "./review";
 
 /** The image of a page: asked for, shown (a data URL), or why there is none. */
 export type PageImage = { state: "loading" } | { state: "shown"; url: string } | { state: "failed"; text: string };
@@ -43,6 +43,11 @@ export class ReviewSession {
   ratios = $state<Record<number, number>>({});
   /** The page shown alone in the large view; null while there is none. */
   focused = $state<number | null>(null);
+  /**
+   * Where the text side scrolls to once: the block of a search hit (`blockId` null when only
+   * its page is left), set by the first read that works. The window sets it back to null.
+   */
+  target = $state<{ index: number; blockId: string | null } | null>(null);
 
   #visible = new Set<number>();
   /** The `note_open` that runs, and whether another one was asked for meanwhile. */
@@ -52,8 +57,12 @@ export class ReviewSession {
   #asks = new Map<number, number>();
   #closed = false;
 
-  constructor(path: string) {
+  /** The block the review opens at; used by the first read that works, then gone. */
+  #at: BlockAt | null;
+
+  constructor(path: string, at: BlockAt | null = null) {
     this.path = path;
+    this.#at = at;
   }
 
   /** Reads the note; opening it marks its text seen (when the store knows the note). */
@@ -108,6 +117,10 @@ export class ReviewSession {
     this.error = null;
     this.stale = null;
     if (old) this.#keepImages(old, view);
+    if (this.#at) {
+      this.target = findBlock(reviewPages(view), this.#at);
+      this.#at = null;
+    }
     // A page shown alone that is not in the note anymore: its last page, or no view.
     if (this.focused !== null && this.focused >= view.pages.length) {
       this.focused = view.pages.length > 0 ? view.pages.length - 1 : null;

@@ -10,7 +10,9 @@
   // loaded image (`onMeasured`); it asks for nothing itself. The pages column is `zoom` times
   // the width of its side (scrolled sideways past 1). The divider between the sides can be
   // dragged; the split is kept per viewer. A double-click on a page opens it alone
-  // (`onOpen`); `showPage` scrolls both sides to a page.
+  // (`onOpen`); `showPage` scrolls both sides to a page. The text side shows each block of a
+  // page in its own `pre`; `showBlock` scrolls it to a block (a search hit), marks the block
+  // until the user scrolls, and the pages side follows.
   let {
     rows,
     images,
@@ -148,6 +150,34 @@
     follow("pages");
   }
 
+  /** The block of a search hit, marked until the user scrolls: `index:blockId`. */
+  let hit = $state<string | null>(null);
+
+  /**
+   * Scrolls the text side to the block `blockId` of page `index`, or to the page when the
+   * block is null or not there; the pages side follows.
+   */
+  export function showBlock(index: number, blockId: string | null) {
+    const side = textSide;
+    if (!side) return;
+    const page = side.querySelector<HTMLElement>(`[data-page="${index}"]`);
+    if (!page) return;
+    const block =
+      blockId === null
+        ? null
+        : ([...page.querySelectorAll<HTMLElement>("[data-block]")].find((b) => b.dataset.block === blockId) ?? null);
+    const target = block ?? page;
+    // The side is the offset parent of its pages and blocks; keep its padding above.
+    side.scrollTop = Math.max(0, target.offsetTop - 12);
+    hit = block ? `${index}:${blockId}` : null;
+    follow("text");
+  }
+
+  /** The user scrolls or clicks a side: the mark of the search hit goes. */
+  function userMoved() {
+    hit = null;
+  }
+
   function follow(from: Side) {
     const to: Side = from === "pages" ? "text" : "pages";
     const fromSide = from === "pages" ? pagesSide : textSide;
@@ -163,7 +193,16 @@
 </script>
 
 <div class="sides" bind:this={sides} style:grid-template-columns={`minmax(0, ${split}fr) 6px minmax(0, ${1 - split}fr)`}>
-  <div class="side pages" bind:this={pagesSide} onscroll={() => follow("pages")} aria-label="Pages">
+  <!-- The wheel and a click end the mark of a search hit; the side is no widget. -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div
+    class="side pages"
+    bind:this={pagesSide}
+    onscroll={() => follow("pages")}
+    onwheel={userMoved}
+    onpointerdown={userMoved}
+    aria-label="Pages"
+  >
     <div class="column" style:width={`${zoom * 100}%`}>
     {#each rows as row (row.index)}
       {@const image = images[row.index]}
@@ -223,12 +262,26 @@
     onpointercancel={release}
     onkeydown={nudge}
   ></div>
-  <div class="side text" bind:this={textSide} onscroll={() => follow("text")} aria-label="Text">
+  <!-- The wheel, a click and a key end the mark of a search hit; the side is no widget. -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div
+    class="side text"
+    bind:this={textSide}
+    onscroll={() => follow("text")}
+    onwheel={userMoved}
+    onpointerdown={userMoved}
+    onkeydown={userMoved}
+    aria-label="Text"
+  >
     {#each rows as row (row.index)}
       <section class="page" data-page={row.index} aria-label={row.label}>
         <p class="label">{row.label}</p>
         {#if row.stateText}<p class="why">{row.stateText}</p>{/if}
-        {#if row.markdown.trim() !== ""}<pre class="markdown">{row.markdown}</pre>{/if}
+        {#each row.blocks as block (block.id)}
+          {#if block.text.trim() !== ""}
+            <pre class="markdown" class:hit={hit === `${row.index}:${block.id}`} data-block={block.id}>{block.text}</pre>
+          {/if}
+        {/each}
       </section>
     {/each}
   </div>
@@ -310,7 +363,7 @@
   }
 
   .markdown {
-    margin: 0;
+    margin: 0 0 0.8em;
     font: inherit;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
@@ -318,4 +371,10 @@
     cursor: text;
   }
 
+  /* The block of a search hit, until the user scrolls. */
+  .markdown.hit {
+    border-radius: 3px;
+    background: color-mix(in srgb, var(--accent), transparent 80%);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent), transparent 80%);
+  }
 </style>

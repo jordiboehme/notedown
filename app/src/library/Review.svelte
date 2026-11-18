@@ -1,20 +1,21 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { NOTES_EVENT } from "../lib/library-types";
   import { ReviewSession } from "./session.svelte";
-  import { concernsNote, noteTitle, reviewNotice, reviewPages } from "./review";
+  import { concernsNote, noteTitle, reviewNotice, reviewPages, type BlockAt } from "./review";
   import ReviewPages from "./ReviewPages.svelte";
   import PageViewer from "./PageViewer.svelte";
   import { ACTUAL, ZOOMS, zoomIn, zoomKey, zoomOut } from "./zoom";
 
   // The review of one note: opened when it mounts (that marks it seen), read again when the
   // store changed (new page text shows while it is open), closed in Rust when it goes. The
-  // window keys it by the path, so another note is another review.
-  let { path, onBack }: { path: string; onBack: () => void } = $props();
+  // window keys it by the path, so another note is another review. Opened at a block (a
+  // search hit), the text side scrolls to it once, after the first read.
+  let { path, at = null, onBack }: { path: string; at?: BlockAt | null; onBack: () => void } = $props();
 
   // svelte-ignore state_referenced_locally
-  const session = new ReviewSession(path);
+  const session = new ReviewSession(path, at);
   const rows = $derived(session.view ? reviewPages(session.view, session.ratios) : []);
   const notice = $derived(session.view ? reviewNotice(session.view) : null);
   /** The zoom of the pages side: 1 is fit width. */
@@ -34,6 +35,17 @@
     await tick();
     pages?.showPage(last);
   }
+
+  // The block of a search hit, once the pages are shown: the text side scrolls to it.
+  $effect(() => {
+    const target = session.target;
+    const shown = pages;
+    if (!target || !shown) return;
+    untrack(() => {
+      session.target = null;
+      void tick().then(() => shown.showBlock(target.index, target.blockId));
+    });
+  });
 
   function key(event: KeyboardEvent) {
     // The large view of one page has its own zoom.

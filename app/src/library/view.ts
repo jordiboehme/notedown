@@ -20,7 +20,7 @@ export type Selection =
   | { kind: "all" }
   | { kind: "bin" }
   | { kind: "folder"; path: string }
-  | { kind: "note"; path: string };
+  | { kind: "note"; path: string; at?: { pageId: string; blockId: string } };
 
 /**
  * Where Rust opens the window (`window.__NOTEDOWN_AT__` or the `library-at` event), as a

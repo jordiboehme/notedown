@@ -19,7 +19,8 @@ vi.mock("@tauri-apps/api/core", () => ({
   }),
 }));
 
-const { reviewPages, pageAt, syncTop, reviewNotice, nearPages, noteTitle, syncGuard, concernsNote, PORTRAIT } = await import("../library/review");
+const { reviewPages, pageAt, syncTop, reviewNotice, nearPages, noteTitle, syncGuard, concernsNote, findBlock, PORTRAIT } =
+  await import("../library/review");
 const { ReviewSession } = await import("../library/session.svelte");
 const { openAt } = await import("../library/view");
 const ReviewPages = (await import("../library/ReviewPages.svelte")).default;
@@ -106,6 +107,53 @@ describe("reviewPages", () => {
   it("says when Notedown still reads the note", () => {
     expect(reviewNotice(view(["done"], true))).toBe("Notedown is still reading this note.");
     expect(reviewNotice(view(["done"]))).toBeNull();
+  });
+});
+
+describe("the blocks of the review", () => {
+  it("reviewPages carries the page id and the blocks", () => {
+    const note = view(["done", "pending"]);
+    note.pages[0].blocks = [
+      { id: "b1", text: "One" },
+      { id: "b2", text: "Two" },
+    ];
+    const rows = reviewPages(note);
+    expect(rows.map((r) => r.pageId)).toEqual(["P0", "P1"]);
+    expect(rows[0].blocks).toEqual([
+      { id: "b1", text: "One" },
+      { id: "b2", text: "Two" },
+    ]);
+    expect(rows[1].blocks).toEqual([]);
+  });
+
+  it("findBlock finds the page and the block", () => {
+    const note = view(["done", "done", "done"]);
+    note.pages[1].pageId = "P1#2";
+    note.pages[1].blocks = [
+      { id: "b4", text: "x" },
+      { id: "b5", text: "y" },
+    ];
+    const rows = reviewPages(note);
+    expect(findBlock(rows, { pageId: "P1#2", blockId: "b5" })).toEqual({ index: 1, blockId: "b5" });
+    // A block that is gone gives its page.
+    expect(findBlock(rows, { pageId: "P1#2", blockId: "b9" })).toEqual({ index: 1, blockId: null });
+    // A page that is gone gives nothing.
+    expect(findBlock(rows, { pageId: "P7", blockId: "b5" })).toBeNull();
+  });
+
+  it("the text side has one block per pre inside its page", () => {
+    const note = view(["done", "pending"]);
+    note.pages[0].blocks = [
+      { id: "b1", text: "One" },
+      { id: "b2", text: "Two" },
+    ];
+    const body = render(ReviewPages, {
+      props: { rows: reviewPages(note), images: {}, onSeen: () => {}, onMeasured: () => {} },
+    }).body;
+    const text = body.slice(body.indexOf('aria-label="Text"'));
+    expect(text.match(/data-page="0"/g)).toHaveLength(1);
+    expect(text.match(/data-page="1"/g)).toHaveLength(1);
+    expect(text).toMatch(/data-page="0"[\s\S]*<pre[^>]*data-block="b1"[^>]*>One<\/pre>[\s\S]*<pre[^>]*data-block="b2"[^>]*>Two<\/pre>[\s\S]*data-page="1"/);
   });
 });
 
@@ -212,6 +260,34 @@ describe("the review session", () => {
     ]);
     expect(session.view?.title).toBe("Plan");
     expect(session.error).toBeNull();
+  });
+
+  it("opened at a block, it names the block once: a reload does not scroll again", async () => {
+    answerNow("note_open", view(["done", "done"]));
+    const session = new ReviewSession(PATH, { pageId: "P1", blockId: "b1" });
+    await session.open();
+    expect(session.target).toEqual({ index: 1, blockId: "b1" });
+    session.target = null;
+    answerNow("note_open", view(["done", "done"]));
+    await session.reload();
+    expect(session.target).toBeNull();
+  });
+
+  it("opened at a block of a gone page, it names nothing", async () => {
+    answerNow("note_open", view(["done"]));
+    const session = new ReviewSession(PATH, { pageId: "P5", blockId: "b1" });
+    await session.open();
+    expect(session.target).toBeNull();
+  });
+
+  it("opened at a block after a failed open, the first good read names it", async () => {
+    answerError("note_open", "Notedown could not read the note.");
+    const session = new ReviewSession(PATH, { pageId: "P0", blockId: "b9" });
+    await session.open();
+    expect(session.target).toBeNull();
+    answerNow("note_open", view(["done"]));
+    await session.reload();
+    expect(session.target).toEqual({ index: 0, blockId: null });
   });
 
   it("shows why a note cannot be opened, and marks nothing", async () => {
@@ -563,7 +639,9 @@ describe("note text", () => {
   it("stays text: no HTML from a note is inserted", () => {
     const note = view(["done", "done"]);
     note.pages[0].markdown = '<img src=x onerror="alert(1)"> and <script>alert(2)</script>';
+    note.pages[0].blocks = [{ id: "b0", text: note.pages[0].markdown }];
     note.pages[1].markdown = "**bold** [link](javascript:alert(3))";
+    note.pages[1].blocks = [{ id: "b1", text: note.pages[1].markdown }];
     const body = render(ReviewPages, {
       props: {
         rows: reviewPages(note),

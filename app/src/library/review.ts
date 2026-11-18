@@ -105,6 +105,17 @@ export function nearPages(
   };
 }
 
+/**
+ * Whether a `NOTES_EVENT` concerns the review of the note at `path`: its payload names the
+ * notes whose store file changed. An event without a readable payload counts, so a review
+ * never misses its text.
+ */
+export function concernsNote(payload: unknown, path: string): boolean {
+  const paths = (payload as { paths?: unknown } | null | undefined)?.paths;
+  if (!Array.isArray(paths)) return true;
+  return paths.includes(path);
+}
+
 /** The name of a note by its path, as the review shows it before or without its text. */
 export function noteTitle(path: string): string {
   const name = path.slice(path.lastIndexOf("/") + 1);

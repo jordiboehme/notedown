@@ -37,8 +37,18 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
 /// The event that tells the panel and the library window that the notes changed. It carries
-/// nothing: the windows ask `notes_new` or `notes_all` again.
+/// [`NotesChanged`]: the windows ask `notes_new` or `notes_all` again, and an open review reads
+/// its note again when its path is named.
 pub const NOTES_EVENT: &str = "notes";
+
+/// What [`NOTES_EVENT`] carries: the wire paths of the notes whose store file a scan read again
+/// or found gone since the last event (a moved note with its old and its new path), sorted.
+/// Empty when only All notes or New notes changed (a note marked seen).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotesChanged {
+    pub paths: Vec<String>,
+}
 
 /// How often the store is scanned while a window that shows notes is visible.
 pub const NOTES_EVERY: Duration = Duration::from_secs(2);
@@ -78,7 +88,7 @@ pub type NotesPlace = Arc<dyn Fn() -> (PathBuf, Option<String>) + Send + Sync>;
 
 /// Tells the windows that the notes changed. It must not block: the app only puts it into a
 /// channel.
-pub type NotesEmit = Arc<dyn Fn() + Send + Sync>;
+pub type NotesEmit = Arc<dyn Fn(NotesChanged) + Send + Sync>;
 
 /// The part of a store file the index reads. `strokeList`, `meta` (with the device's
 /// recognition text), the blocks' text and everything else is skipped while parsing.
@@ -216,9 +226,10 @@ struct State {
     dirty: bool,
     /// What All notes and New notes were when the windows were last told.
     told: Option<(Vec<NoteSummary>, Vec<NoteSummary>)>,
-    /// A scan read a store file again (or found one gone) since the windows were last told: an
-    /// open review hears about it, also when the lists stay as they are.
-    reread: bool,
+    /// The paths of the notes whose store file a scan read again (or found gone) since the
+    /// windows were last told: an open review hears about them, also when the lists stay as
+    /// they are.
+    reread: BTreeSet<String>,
 }
 
 /// The notes index. Cheap to clone; every clone is the same index.
@@ -258,7 +269,7 @@ impl Notes {
                     seen: None,
                     dirty: false,
                     told: None,
-                    reread: false,
+                    reread: BTreeSet::new(),
                 }),
                 visible: Mutex::new(false),
                 waker: Mutex::new(None),
@@ -498,13 +509,19 @@ impl Notes {
                 Some(known) if known.stamp == stamp => known,
                 known => match read_note(&path, stamp) {
                     Ok(note) => {
-                        state.reread = true;
-                        before.extend(known.and_then(|k| k.note));
+                        let known = known.and_then(|k| k.note);
+                        for n in note.iter().chain(&known) {
+                            state.reread.insert(n.summary.path.clone());
+                        }
+                        before.extend(known);
                         Indexed { stamp, note }
                     }
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        state.reread |= known.is_some();
-                        before.extend(known.and_then(|k| k.note));
+                        let known = known.and_then(|k| k.note);
+                        for n in &known {
+                            state.reread.insert(n.summary.path.clone());
+                        }
+                        before.extend(known);
                         continue;
                     }
                     // Not readable for now: the old entry stays (with its old stamp, so the
@@ -521,8 +538,11 @@ impl Notes {
             files.insert(name.to_owned(), indexed);
         }
         if complete {
-            state.reread |= !old.is_empty();
-            before.extend(old.into_values().filter_map(|f| f.note));
+            let gone: Vec<Note> = old.into_values().filter_map(|f| f.note).collect();
+            for n in &gone {
+                state.reread.insert(n.summary.path.clone());
+            }
+            before.extend(gone);
         } else {
             // A file that could not be listed is not gone: the old entries stay this scan.
             for (name, known) in old {
@@ -601,11 +621,13 @@ impl Notes {
             .told
             .as_ref()
             .is_some_and(|(a, n)| same(a, &all) && same(n, &new));
-        if !unchanged || reread {
+        if !unchanged || !reread.is_empty() {
             let summaries =
                 |notes: Vec<&Note>| notes.into_iter().map(|n| n.summary.clone()).collect();
             state.told = Some((summaries(all), summaries(new)));
-            (self.inner.emit)();
+            (self.inner.emit)(NotesChanged {
+                paths: reread.into_iter().collect(),
+            });
         }
     }
 }

@@ -19,7 +19,7 @@ vi.mock("@tauri-apps/api/core", () => ({
   }),
 }));
 
-const { reviewPages, pageAt, syncTop, reviewNotice, nearPages, noteTitle, syncGuard, PORTRAIT } = await import("../library/review");
+const { reviewPages, pageAt, syncTop, reviewNotice, nearPages, noteTitle, syncGuard, concernsNote, PORTRAIT } = await import("../library/review");
 const { ReviewSession } = await import("../library/session.svelte");
 const { openAt } = await import("../library/view");
 const ReviewPages = (await import("../library/ReviewPages.svelte")).default;
@@ -156,6 +156,20 @@ describe("syncGuard", () => {
     // A user scroll elsewhere than the set value is followed and ends the guard.
     expect(guard.follows("text", 80)).toBe(true);
     expect(guard.follows("text", 50)).toBe(true);
+  });
+});
+
+describe("concernsNote", () => {
+  it("reloads a review only for an event that names its note", () => {
+    expect(concernsNote({ paths: [PATH] }, PATH)).toBe(true);
+    expect(concernsNote({ paths: ["NOTE/Note/Other.note", PATH] }, PATH)).toBe(true);
+    expect(concernsNote({ paths: ["NOTE/Note/Other.note"] }, PATH)).toBe(false);
+    // A change of the lists alone (a note marked seen) names no note.
+    expect(concernsNote({ paths: [] }, PATH)).toBe(false);
+  });
+
+  it("reloads for an event it cannot read", () => {
+    for (const odd of [null, undefined, {}, { paths: "x" }, "notes"]) expect(concernsNote(odd, PATH)).toBe(true);
   });
 });
 

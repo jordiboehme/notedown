@@ -3,7 +3,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { NOTES_EVENT } from "../lib/library-types";
   import { ReviewSession } from "./session.svelte";
-  import { noteTitle, reviewNotice, reviewPages } from "./review";
+  import { concernsNote, noteTitle, reviewNotice, reviewPages } from "./review";
   import ReviewPages from "./ReviewPages.svelte";
   import PageViewer from "./PageViewer.svelte";
   import { ACTUAL, ZOOMS, zoomIn, zoomKey, zoomOut } from "./zoom";
@@ -46,7 +46,10 @@
 
   onMount(() => {
     void session.open();
-    const stop = listen(NOTES_EVENT, () => void session.reload());
+    // Only a store change of this note (the OCR wrote one of its pages) reads it again.
+    const stop = listen(NOTES_EVENT, (event) => {
+      if (concernsNote(event.payload, path)) void session.reload();
+    });
     return () => {
       void stop.then((unlisten) => unlisten());
       session.close();

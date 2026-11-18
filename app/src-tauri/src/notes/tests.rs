@@ -14,6 +14,8 @@ struct Fixture {
     account: Arc<Mutex<Option<String>>>,
     data_dir: Arc<Mutex<PathBuf>>,
     events: Arc<AtomicUsize>,
+    /// What each event carried, in order.
+    told: Arc<Mutex<Vec<NotesChanged>>>,
     notes: Notes,
 }
 
@@ -33,6 +35,7 @@ impl Fixture {
         let account = Arc::new(Mutex::new(Some(ACCOUNT.to_owned())));
         let data_dir = Arc::new(Mutex::new(data.path().to_path_buf()));
         let events = Arc::new(AtomicUsize::new(0));
+        let told = Arc::new(Mutex::new(Vec::new()));
         let notes = Notes::new(
             {
                 let account = account.clone();
@@ -42,8 +45,10 @@ impl Fixture {
             config.path().to_path_buf(),
             {
                 let events = events.clone();
-                Arc::new(move || {
+                let told = told.clone();
+                Arc::new(move |changed: NotesChanged| {
                     events.fetch_add(1, Ordering::SeqCst);
+                    lock(&told).push(changed);
                 })
             },
         );
@@ -53,6 +58,7 @@ impl Fixture {
             account,
             data_dir,
             events,
+            told,
             notes,
         }
     }
@@ -359,7 +365,7 @@ fn a_note_is_new_until_opened() {
     let again = Notes::new(
         f.notes.inner.place.clone(),
         f.config.path().to_path_buf(),
-        Arc::new(|| {}),
+        Arc::new(|_| {}),
     );
     assert!(again.new_notes().is_empty());
     f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(13), true)]), 30);
@@ -523,7 +529,7 @@ fn a_path_keyed_note_keeps_its_marker_on_a_move() {
     let later = Notes::new(
         f.notes.inner.place.clone(),
         f.config.path().to_path_buf(),
-        Arc::new(|| {}),
+        Arc::new(|_| {}),
     );
     f.write(&note(OLD, "NOTE/Note/a.note", pages), 40);
     f.remove(NEXT);
@@ -620,6 +626,35 @@ fn a_changed_store_file_tells_the_windows_even_when_the_lists_stay() {
     f.remove(B);
     f.notes.refresh();
     assert_eq!(f.events(), before + 2);
+}
+
+#[test]
+fn the_event_names_the_notes_whose_store_file_was_read() {
+    let f = after_baseline();
+    let last = || lock(&f.told).last().cloned().unwrap();
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 10);
+    f.write(&note(B, "NOTE/Note/b.note", &[("P1", None, false)]), 10);
+    f.notes.refresh();
+    assert_eq!(last().paths, ["NOTE/Note/a.note", "NOTE/Note/b.note"]);
+    // Only the note the OCR wrote.
+    f.write(&note(B, "NOTE/Note/b.note", &[("P1", Some(5), false)]), 11);
+    f.notes.refresh();
+    assert_eq!(last().paths, ["NOTE/Note/b.note"]);
+    // A change of New notes alone names no note.
+    f.notes.seen(A).unwrap();
+    assert_eq!(last().paths, Vec::<String>::new());
+    // A move names the old path and the new one; a file that went names its note.
+    f.write(&note(B, "NOTE/Other/b.note", &[("P1", Some(5), false)]), 12);
+    f.notes.refresh();
+    assert_eq!(last().paths, ["NOTE/Note/b.note", "NOTE/Other/b.note"]);
+    f.remove(A);
+    f.notes.refresh();
+    assert_eq!(last().paths, ["NOTE/Note/a.note"]);
+    // On the wire the event is camelCase.
+    assert_eq!(
+        serde_json::to_value(last()).unwrap(),
+        json!({"paths": ["NOTE/Note/a.note"]})
+    );
 }
 
 #[test]

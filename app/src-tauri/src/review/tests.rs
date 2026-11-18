@@ -187,7 +187,7 @@ fn setup_with_limit(routes: Vec<(String, Act)>, limit: u64) -> Setup {
     let notes = Notes::new(
         Arc::new(move || (data_dir.clone(), Some(ACCOUNT.to_owned()))),
         config_dir.path().to_path_buf(),
-        Arc::new(|| {}),
+        Arc::new(|_| {}),
     );
     fs::create_dir_all(store_dir(data.path())).unwrap();
     let review = Review::new(

@@ -134,10 +134,17 @@ export type NoteSummary = {
 };
 
 /**
- * The name of the Tauri event that tells the panel and the library that the notes changed. It
- * carries nothing: ask `notes_new` or `notes_all` again.
+ * The name of the Tauri event that tells the panel and the library that the notes changed: ask
+ * `notes_new` or `notes_all` again. It carries `NotesChanged`.
  */
 export const NOTES_EVENT = "notes";
+
+/**
+ * What `NOTES_EVENT` carries: the wire paths of the notes whose store file changed or went (a
+ * moved note with its old and its new path). Empty when only the lists changed (a note marked
+ * seen). An open review reads its note again only when its path is named.
+ */
+export type NotesChanged = { paths: string[] };
 
 /**
  * A note for the review (src-tauri/src/review.rs), as `note_open(path)` answers it: every page
@@ -149,8 +156,8 @@ export const NOTES_EVENT = "notes";
  * `catchingUp`: a page waits for OCR, or the server has a newer version of the note than the
  * store read. `landscape` comes from the file when the store is behind it, else it is false (the
  * store has no orientation): take the aspect ratio of a page from its loaded image. A gone note
- * answers "This note is not there anymore.". `NOTES_EVENT` also comes when the store wrote a
- * page: call `note_open` again to show its text.
+ * answers "This note is not there anymore.". `NOTES_EVENT` names the note when the store wrote
+ * one of its pages: call `note_open` again to show its text.
  *
  * `note_page_image(path, index)` answers page `index` as a `data:image/png;base64,...` URL
  * ("This page is not in the note." past its pages). At most two pages render at once, the

@@ -36,7 +36,7 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent};
 use import_job::{AppHost as ImportHost, ImportJobs, JobEvent};
 use library::{LIBRARY_EVENT, Library, LibraryEvent};
 use model::{ModelControl, ModelEvent};
-use notes::{NOTES_EVENT, NOTES_EVERY, Notes};
+use notes::{NOTES_EVENT, NOTES_EVERY, Notes, NotesChanged};
 #[cfg(target_os = "macos")]
 use notify::deliver::Deliver;
 use notify::notifier::StopNotifier;
@@ -785,11 +785,11 @@ fn library_for(
 /// The notes index of the account in the config. It reads the config through a handle of its
 /// own; its events go into a channel, and a thread of its own tells the panel and the library.
 fn notes_for(app: AppHandle, config: commands::ConfigReader, config_dir: PathBuf) -> Notes {
-    let (tx, rx) = mpsc::channel::<()>();
+    let (tx, rx) = mpsc::channel::<NotesChanged>();
     std::thread::spawn(move || {
-        for () in rx {
+        for changed in rx {
             for kind in [windows::WindowKind::Panel, windows::WindowKind::Library] {
-                let _ = app.emit_to(kind.label(), NOTES_EVENT, ());
+                let _ = app.emit_to(kind.label(), NOTES_EVENT, changed.clone());
             }
         }
     });
@@ -799,8 +799,8 @@ fn notes_for(app: AppHandle, config: commands::ConfigReader, config_dir: PathBuf
             (config.data_dir, config.account)
         }),
         config_dir,
-        Arc::new(move || {
-            let _ = tx.send(());
+        Arc::new(move |changed| {
+            let _ = tx.send(changed);
         }),
     )
 }

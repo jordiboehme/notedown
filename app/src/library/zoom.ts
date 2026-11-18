@@ -62,3 +62,27 @@ export function saveSplit(storage: Storage | null, x: number): void {
     // Not kept: the next window starts at half and half.
   }
 }
+
+/** The keys of the page viewer: the page before, the page after, or close. */
+export function viewerKey(key: string): "prev" | "next" | "close" | null {
+  switch (key) {
+    case "ArrowLeft":
+    case "ArrowUp":
+    case "PageUp":
+      return "prev";
+    case "ArrowRight":
+    case "ArrowDown":
+    case "PageDown":
+      return "next";
+    case "Escape":
+      return "close";
+    default:
+      return null;
+  }
+}
+
+/** The page before or after `index` in a note of `count` pages; it stays at both ends. */
+export function stepPage(index: number, count: number, step: "prev" | "next"): number {
+  const next = index + (step === "prev" ? -1 : 1);
+  return Math.min(Math.max(count - 1, 0), Math.max(0, next));
+}

@@ -9,19 +9,22 @@
   // into view or left it (`onSeen`, all of one observer callback at once) and the size of each
   // loaded image (`onMeasured`); it asks for nothing itself. The pages column is `zoom` times
   // the width of its side (scrolled sideways past 1). The divider between the sides can be
-  // dragged; the split is kept per viewer.
+  // dragged; the split is kept per viewer. A double-click on a page opens it alone
+  // (`onOpen`); `showPage` scrolls both sides to a page.
   let {
     rows,
     images,
     zoom = 1,
     onSeen,
     onMeasured,
+    onOpen = () => {},
   }: {
     rows: ReviewPage[];
     images: Record<number, PageImage>;
     zoom?: number;
     onSeen: (changes: [index: number, visible: boolean][]) => void;
     onMeasured: (index: number, width: number, height: number) => void;
+    onOpen?: (index: number) => void;
   } = $props();
 
   /** The viewer's storage; null where it cannot be used. */
@@ -134,6 +137,17 @@
     return known;
   }
 
+  /** Scrolls the pages side to the top of page `index`; the text side follows. */
+  export function showPage(index: number) {
+    const side = pagesSide;
+    if (!side) return;
+    const known = offsets("pages", side);
+    const top = known.tops[Math.min(index, known.tops.length - 1)];
+    if (top === undefined) return;
+    side.scrollTop = top;
+    follow("pages");
+  }
+
   function follow(from: Side) {
     const to: Side = from === "pages" ? "text" : "pages";
     const fromSide = from === "pages" ? pagesSide : textSide;
@@ -154,7 +168,8 @@
     {#each rows as row (row.index)}
       {@const image = images[row.index]}
       <section class="page" data-page={row.index} aria-label={row.label}>
-        <div class="paper" style:aspect-ratio={row.ratio}>
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="paper" style:aspect-ratio={row.ratio} ondblclick={() => onOpen(row.index)} title="Double-click to show the page alone">
           {#if image?.state === "shown"}
             <img
               src={image.url}

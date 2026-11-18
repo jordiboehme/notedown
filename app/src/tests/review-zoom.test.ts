@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { NoteView } from "../lib/library-types";
 import {
   ACTUAL,
   SPLIT_KEY,
@@ -7,11 +8,61 @@ import {
   keepPlace,
   readSplit,
   saveSplit,
+  stepPage,
+  viewerKey,
   zoomIn,
   zoomKey,
   zoomOut,
 } from "../library/zoom";
 import { pageAt } from "../library/review";
+
+const calls: { command: string; args: Record<string, unknown> | undefined }[] = [];
+const views: NoteView[] = [];
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn((command: string, args?: Record<string, unknown>) => {
+    calls.push({ command, args });
+    if (command === "note_open") return Promise.resolve(views.shift());
+    // Page images wait: the tests only look at what was asked.
+    if (command === "note_page_image") return new Promise(() => {});
+    return Promise.resolve(null);
+  }),
+}));
+
+const { ReviewSession } = await import("../library/session.svelte");
+
+beforeEach(() => {
+  calls.length = 0;
+  views.length = 0;
+});
+
+function note(count: number): NoteView {
+  return {
+    key: "k1",
+    path: "NOTE/Note/Plan.note",
+    title: "Plan",
+    catchingUp: false,
+    pages: Array.from({ length: count }, (_, index) => ({
+      index,
+      pageId: `P${index}`,
+      state: "done" as const,
+      markdown: "",
+      blocks: [],
+      landscape: false,
+    })),
+  };
+}
+
+function asked(command: string): number[] {
+  return calls.filter((c) => c.command === command).map((c) => c.args?.index as number);
+}
+
+async function opened(count: number) {
+  views.push(note(count));
+  const session = new ReviewSession("NOTE/Note/Plan.note");
+  await session.open();
+  return session;
+}
 
 /** A storage of its own, with the calls it got. */
 function memory(initial: Record<string, string> = {}): Storage & { data: Record<string, string> } {
@@ -127,5 +178,70 @@ describe("the split", () => {
     expect(readSplit(storage)).toBe(0.8);
     expect(() => saveSplit(broken(), 0.4)).not.toThrow();
     expect(() => saveSplit(null, 0.4)).not.toThrow();
+  });
+});
+
+describe("the page viewer", () => {
+  it("reads the keys that go to another page or close it", () => {
+    const table: [string, "prev" | "next" | "close" | null][] = [
+      ["ArrowLeft", "prev"],
+      ["ArrowUp", "prev"],
+      ["PageUp", "prev"],
+      ["ArrowRight", "next"],
+      ["ArrowDown", "next"],
+      ["PageDown", "next"],
+      ["Escape", "close"],
+      ["Enter", null],
+      [" ", null],
+      ["Home", null],
+      ["a", null],
+    ];
+    for (const [key, step] of table) expect(viewerKey(key), key).toBe(step);
+  });
+
+  it("steps to the page before or after, and stays at both ends", () => {
+    expect(stepPage(3, 10, "prev")).toBe(2);
+    expect(stepPage(3, 10, "next")).toBe(4);
+    expect(stepPage(0, 10, "prev")).toBe(0);
+    expect(stepPage(9, 10, "next")).toBe(9);
+    expect(stepPage(0, 1, "next")).toBe(0);
+    // An index past a note that got shorter comes back to its last page.
+    expect(stepPage(12, 10, "prev")).toBe(9);
+  });
+
+  it("asks for the image of the page it shows and its neighbours", async () => {
+    const session = await opened(12);
+    session.seen(0, true);
+    expect(asked("note_page_image")).toEqual([0, 1, 2]);
+    session.focus(8);
+    expect(session.focused).toBe(8);
+    expect(asked("note_page_image")).toEqual([0, 1, 2, 7, 8, 9, 10]);
+    // The pages far from it went: their calls end in Rust.
+    expect(asked("note_page_drop")).toEqual([0, 1, 2]);
+    session.focus(9);
+    expect(asked("note_page_image")).toEqual([0, 1, 2, 7, 8, 9, 10, 11]);
+    // Closed: the pages in view of the pages side count again.
+    session.focus(null);
+    expect(session.focused).toBeNull();
+    expect(asked("note_page_image").slice(8)).toEqual([0, 1, 2]);
+  });
+
+  it("follows a reload that made the note shorter", async () => {
+    const session = await opened(12);
+    session.focus(11);
+    views.push(note(5));
+    await session.reload();
+    expect(session.focused).toBe(4);
+    views.push(note(0));
+    await session.reload();
+    expect(session.focused).toBeNull();
+  });
+
+  it("keeps a page within the note", async () => {
+    const session = await opened(3);
+    session.focus(7);
+    expect(session.focused).toBe(2);
+    session.focus(-1);
+    expect(session.focused).toBe(0);
   });
 });

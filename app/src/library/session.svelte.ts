@@ -33,6 +33,8 @@ export class ReviewSession {
   images = $state<Record<number, PageImage>>({});
   /** Width by height of the images loaded so far, by page index; kept after a drop. */
   ratios = $state<Record<number, number>>({});
+  /** The page shown alone in the large view; null while there is none. */
+  focused = $state<number | null>(null);
 
   #visible = new Set<number>();
   /** The `note_open` that runs, and whether another one was asked for meanwhile. */
@@ -94,6 +96,10 @@ export class ReviewSession {
     this.view = view;
     this.error = null;
     if (old) this.#keepImages(old, view);
+    // A page shown alone that is not in the note anymore: its last page, or no view.
+    if (this.focused !== null && this.focused >= view.pages.length) {
+      this.focused = view.pages.length > 0 ? view.pages.length - 1 : null;
+    }
     if (view.key !== null && (old === null || old.key === null || textOf(old) !== textOf(view))) {
       invoke("note_seen", { key: view.key }).catch((error: unknown) =>
         console.error("notedown: note_seen failed", error),
@@ -129,6 +135,18 @@ export class ReviewSession {
     this.#update();
   }
 
+  /**
+   * Page `index` is shown alone in the large view (kept within the note); null ends the view.
+   * While it is shown, it counts as the page in view: its image and its neighbours are asked
+   * for, and the pages far from it are dropped.
+   */
+  focus(index: number | null) {
+    if (this.#closed) return;
+    const count = this.view?.pages.length ?? 0;
+    this.focused = index === null || count === 0 ? null : Math.min(count - 1, Math.max(0, index));
+    this.#update();
+  }
+
   /** The image of page `index` loaded with this size: its placeholder keeps the ratio. */
   measured(index: number, width: number, height: number) {
     if (width > 0 && height > 0) this.ratios[index] = width / height;
@@ -150,9 +168,14 @@ export class ReviewSession {
     );
   }
 
+  /** The pages in view: the page shown alone, else those of the pages side. */
+  #shown(): Iterable<number> {
+    return this.focused !== null ? [this.focused] : this.#visible;
+  }
+
   #update() {
     if (this.#closed || !this.view) return;
-    const pages = nearPages(this.#visible, this.view.pages.length);
+    const pages = nearPages(this.#shown(), this.view.pages.length);
     if (!pages) return;
     const [keepFrom, keepTo] = pages.keep;
     for (const key of Object.keys(this.images)) {
@@ -166,7 +189,7 @@ export class ReviewSession {
   }
 
   #near(index: number): boolean {
-    const pages = this.view ? nearPages(this.#visible, this.view.pages.length) : null;
+    const pages = this.view ? nearPages(this.#shown(), this.view.pages.length) : null;
     return pages !== null && index >= pages.near[0] && index <= pages.near[1];
   }
 

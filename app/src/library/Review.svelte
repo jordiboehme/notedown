@@ -1,10 +1,11 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { NOTES_EVENT } from "../lib/library-types";
   import { ReviewSession } from "./session.svelte";
   import { noteTitle, reviewNotice, reviewPages } from "./review";
   import ReviewPages from "./ReviewPages.svelte";
+  import PageViewer from "./PageViewer.svelte";
   import { ACTUAL, ZOOMS, zoomIn, zoomKey, zoomOut } from "./zoom";
 
   // The review of one note: opened when it mounts (that marks it seen), read again when the
@@ -23,7 +24,20 @@
     zoom = step === "in" ? zoomIn(zoom) : step === "out" ? zoomOut(zoom) : ACTUAL;
   }
 
+  let pages = $state<ReturnType<typeof ReviewPages>>();
+
+  /** Ends the large view of one page: the pages side shows the page that was shown last. */
+  async function closeViewer() {
+    const last = session.focused;
+    session.focus(null);
+    if (last === null) return;
+    await tick();
+    pages?.showPage(last);
+  }
+
   function key(event: KeyboardEvent) {
+    // The large view of one page has its own zoom.
+    if (session.focused !== null) return;
     const step = zoomKey(event);
     if (!step || !session.view) return;
     event.preventDefault();
@@ -63,12 +77,23 @@
   <p class="note">This note has no pages.</p>
 {:else}
   <ReviewPages
+    bind:this={pages}
     {rows}
     {zoom}
     images={session.images}
     onSeen={(changes) => session.seenMany(changes)}
     onMeasured={(index, width, height) => session.measured(index, width, height)}
+    onOpen={(index) => session.focus(index)}
   />
+  {#if session.focused !== null && rows[session.focused]}
+    <PageViewer
+      row={rows[session.focused]}
+      image={session.images[session.focused]}
+      count={rows.length}
+      onStep={(index) => session.focus(index)}
+      onClose={() => void closeViewer()}
+    />
+  {/if}
 {/if}
 
 <style>

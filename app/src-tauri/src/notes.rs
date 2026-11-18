@@ -518,7 +518,7 @@ impl Notes {
                     }
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {
                         let known = known.and_then(|k| k.note);
-                        for n in &known {
+                        if let Some(n) = &known {
                             state.reread.insert(n.summary.path.clone());
                         }
                         before.extend(known);

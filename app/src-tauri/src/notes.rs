@@ -426,6 +426,19 @@ impl Notes {
             .map(|n| n.summary.clone())
     }
 
+    /// Every note the index lists, by key, as [`listed_by_key`](Self::listed_by_key) finds
+    /// them. Scans first, so a note that got text since the last scan is in it.
+    pub fn listed_by_keys(&self) -> HashMap<String, NoteSummary> {
+        let mut state = lock(&self.inner.state);
+        self.scan(&mut state);
+        self.save_seen(&mut state);
+        self.tell(&mut state);
+        listed_notes(&state)
+            .into_iter()
+            .map(|n| (n.summary.key.clone(), n.summary.clone()))
+            .collect()
+    }
+
     /// The store file of the note at the wire path `path`, by the rule of
     /// [`at_path`](Self::at_path), for a reader of the whole note (the review). Scans first.
     pub fn store_file(&self, path: &str) -> Option<PathBuf> {

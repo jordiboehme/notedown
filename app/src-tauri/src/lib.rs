@@ -153,6 +153,7 @@ pub fn run() {
             }));
             app.manage(model_control(app.handle().clone(), sidecar_spawn.clone()));
             app.manage(setup::Sidecar(sidecar_spawn.clone()));
+            app.manage(Arc::new(search::Searches::default()));
             let poller = status_poller(sidecar_spawn.clone(), reader, processes.clone(), notify);
             let marking = app.state::<commands::ConfigState>().inner().clone();
             let told = app.handle().clone();

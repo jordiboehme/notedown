@@ -1468,14 +1468,18 @@ pub async fn notes_search(
     notes: State<'_, Notes>,
     config: State<'_, ConfigState>,
     sidecar: State<'_, Sidecar>,
+    searches: State<'_, Arc<search::Searches>>,
     query: String,
     under: Option<String>,
 ) -> Result<Vec<ContentHit>, String> {
     let notes = notes.inner().clone();
     let config = config.current();
     let spawn = sidecar.0.clone();
+    let searches = searches.inner().clone();
+    let mine = searches.begin();
     tauri::async_runtime::spawn_blocking(move || {
-        search::notes_search(&spawn, &config, &notes, &query, under.as_deref())
+        let wanted = || searches.is_current(mine);
+        search::notes_search(&spawn, &config, &notes, &query, under.as_deref(), &wanted)
     })
     .await
     .map_err(|e| e.to_string())?

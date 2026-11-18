@@ -5,13 +5,14 @@
 //! hold every word of the query. The app keeps the first hit of each note that its notes index
 //! lists, so a deleted, unscoped or gone note is never a result.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
-use crate::notes::{NoteSummary, Notes};
+use crate::notes::Notes;
 use crate::process::{self, SpawnFn};
 
 /// The most blocks the sidecar gives. The app keeps one per note, so this is more than the
@@ -90,7 +91,9 @@ fn is_under(path: &str, under: &str) -> bool {
 /// The first hit of each note in the sidecar's order, for the notes the index lists and, with
 /// `under`, only those at or below that folder.
 pub fn content_hits(hits: Vec<RawHit>, notes: &Notes, under: Option<&str>) -> Vec<ContentHit> {
-    let mut listed: HashMap<String, Option<NoteSummary>> = HashMap::new();
+    // One scan and one lookup table for the whole answer: a note that got its first text
+    // since the last scan is listed too.
+    let listed = notes.listed_by_keys();
     let mut done: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
     for hit in hits {
@@ -100,10 +103,7 @@ pub fn content_hits(hits: Vec<RawHit>, notes: &Notes, under: Option<&str>) -> Ve
         if done.contains(&key) {
             continue;
         }
-        let summary = listed
-            .entry(key.clone())
-            .or_insert_with(|| notes.listed_by_key(&key));
-        let Some(summary) = summary else {
+        let Some(summary) = listed.get(&key) else {
             continue;
         };
         if under.is_some_and(|u| !is_under(&summary.path, u)) {
@@ -149,16 +149,35 @@ pub fn search_args(config: &AppConfig, query: &str) -> Vec<String> {
     args
 }
 
+/// Numbers the searches of the window: a search that waited while a newer one began is
+/// stale, and runs no sidecar. The window keeps only the newest answer anyway.
+#[derive(Default)]
+pub struct Searches(AtomicU64);
+
+impl Searches {
+    /// A new search begins; its number.
+    pub fn begin(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// No search began after the one numbered `n`.
+    pub fn is_current(&self, n: u64) -> bool {
+        self.0.load(Ordering::SeqCst) == n
+    }
+}
+
 /// The notes whose text holds `query`, by [`content_hits`]. A query that does not search the
-/// text ([`wants_text`]) gives nothing and runs no sidecar. Blocking.
+/// text ([`wants_text`]), or a search that is not `wanted` anymore when its turn comes, gives
+/// nothing and runs no sidecar. Blocking.
 pub fn notes_search(
     spawn: &SpawnFn,
     config: &AppConfig,
     notes: &Notes,
     query: &str,
     under: Option<&str>,
+    wanted: &dyn Fn() -> bool,
 ) -> Result<Vec<ContentHit>, String> {
-    if !wants_text(query) {
+    if !wants_text(query) || !wanted() {
         return Ok(Vec::new());
     }
     let output = process::run_bounded(spawn, &search_args(config, query), SEARCH_TIMEOUT)
@@ -385,6 +404,42 @@ mod tests {
     }
 
     #[test]
+    fn a_note_with_text_since_the_last_scan_is_found() {
+        let store = Store::new().scanned();
+        store.note("F1", "NOTE/Note/a.note", json!({}));
+        let keys: Vec<String> = content_hits(
+            vec![raw("notedown://someone/F1/P1#b1", 1, "new")],
+            &store.notes,
+            None,
+        )
+        .into_iter()
+        .map(|h| h.key)
+        .collect();
+        assert_eq!(keys, ["F1"]);
+    }
+
+    #[test]
+    fn a_newer_search_makes_an_older_one_stale() {
+        let searches = Searches::default();
+        let first = searches.begin();
+        assert!(searches.is_current(first));
+        let second = searches.begin();
+        assert!(!searches.is_current(first));
+        assert!(searches.is_current(second));
+    }
+
+    #[test]
+    fn a_stale_search_runs_no_sidecar() {
+        let store = Store::new().scanned();
+        let (spawn, calls) = recording();
+        assert_eq!(
+            notes_search(&spawn, &config(), &store.notes, "plan", None, &|| false),
+            Ok(Vec::new())
+        );
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn under_keeps_the_notes_at_or_below_the_folder() {
         let store = Store::new();
         store.note("F1", "NOTE/Note/a.note", json!({}));
@@ -417,14 +472,14 @@ mod tests {
         let (spawn, calls) = recording();
         for query in ["", "a", " b ", "--", "?!", " .. "] {
             assert_eq!(
-                notes_search(&spawn, &config(), &store.notes, query, None),
+                notes_search(&spawn, &config(), &store.notes, query, None, &|| true),
                 Ok(Vec::new()),
                 "{query:?}"
             );
         }
         assert!(calls.lock().unwrap().is_empty());
         // A query with a word does call it.
-        let _ = notes_search(&spawn, &config(), &store.notes, "ab", None);
+        let _ = notes_search(&spawn, &config(), &store.notes, "ab", None, &|| true);
         assert_eq!(calls.lock().unwrap().len(), 1);
     }
 
@@ -439,7 +494,7 @@ mod tests {
             {"anchor": "notedown://someone/F1/P1#b2", "note": "a", "page": 1, "context": "plan B"},
         ]);
         let spawn = sidecar(dir.path(), &answer.to_string());
-        let hits = notes_search(&spawn, &config(), &store.notes, "plan", None).unwrap();
+        let hits = notes_search(&spawn, &config(), &store.notes, "plan", None, &|| true).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].context, "The plan");
         assert_eq!(hits[0].block_id, "b1");
@@ -472,11 +527,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let spawn = sidecar(dir.path(), "not json");
         assert_eq!(
-            notes_search(&spawn, &config(), &store.notes, "plan", None),
+            notes_search(&spawn, &config(), &store.notes, "plan", None, &|| true),
             Err(NOT_SEARCHED.to_owned())
         );
         let (spawn, _) = recording();
-        let why = notes_search(&spawn, &config(), &store.notes, "plan", None).unwrap_err();
+        let why =
+            notes_search(&spawn, &config(), &store.notes, "plan", None, &|| true).unwrap_err();
         assert!(why.starts_with(NOT_SEARCHED), "{why}");
     }
 }

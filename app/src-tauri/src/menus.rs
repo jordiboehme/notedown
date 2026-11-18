@@ -5,9 +5,10 @@ use std::sync::{Mutex, PoisonError};
 
 use serde::Deserialize;
 use tauri::menu::{Menu, MenuItem};
-use tauri::{AppHandle, Manager, Runtime, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, Runtime, WebviewWindow};
 
 use crate::notes::Notes;
+use crate::windows::WindowKind;
 
 /// Menu item ids of the context menus start with this, so the app's menu handler can tell them
 /// from the menu bar's.
@@ -67,18 +68,29 @@ pub fn popup<R: Runtime>(window: &WebviewWindow<R>, target: MenuTarget) -> Resul
     window.popup_menu(&menu).map_err(|e| e.to_string())
 }
 
+/// What a failed context menu item sends to the library window (the error text), which shows it
+/// as its notice.
+pub const MENU_ERROR_EVENT: &str = "library-menu-error";
+
+/// Does the work of the context item `id`. Blocking: run it off the main thread.
+pub fn run_context(notes: &Notes, id: &str) -> Result<(), String> {
+    match id {
+        MARK_ALL_SEEN_ID => notes.seen_all().map(|_| ()),
+        other => Err(format!("Unknown menu item {other}.")),
+    }
+}
+
 /// The user picked the context item `id`. The work runs off the main thread, which is the one
-/// that delivers menu events.
+/// that delivers menu events. A failure goes to the library window as its notice.
 pub fn on_context(app: &AppHandle, id: &str) {
     let id = id.to_owned();
     let notes = app.state::<Notes>().inner().clone();
-    tauri::async_runtime::spawn_blocking(move || match id.as_str() {
-        MARK_ALL_SEEN_ID => {
-            if let Err(e) = notes.seen_all() {
-                eprintln!("notedown: Mark All as Seen failed: {e}");
-            }
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(e) = run_context(&notes, &id) {
+            eprintln!("notedown: the menu item {id} failed: {e}");
+            let _ = app.emit_to(WindowKind::Library.label(), MENU_ERROR_EVENT, e);
         }
-        other => eprintln!("notedown: unknown context menu item {other}"),
     });
 }
 
@@ -121,6 +133,41 @@ mod tests {
             MenuTarget::Note {
                 path: "NOTE/a.note".to_owned()
             }
+        );
+    }
+
+    fn notes_with_one_new_note(unreadable: bool) -> (Notes, tempfile::TempDir, tempfile::TempDir) {
+        let data = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let notes_dir = data.path().join("pipeline").join("jordi").join("notes");
+        std::fs::create_dir_all(&notes_dir).unwrap();
+        if unreadable {
+            // A seen.json that is a folder cannot be read.
+            std::fs::create_dir(config.path().join("seen.json")).unwrap();
+        }
+        let root = data.path().to_path_buf();
+        let notes = Notes::new(
+            std::sync::Arc::new(move || (root.clone(), Some("jordi".to_owned()))),
+            config.path().to_path_buf(),
+            std::sync::Arc::new(|_| {}),
+        );
+        (notes, data, config)
+    }
+
+    #[test]
+    fn the_mark_all_seen_item_runs_seen_all_and_an_unknown_item_fails() {
+        let (notes, _data, _config) = notes_with_one_new_note(false);
+        assert_eq!(run_context(&notes, "ctx-mark-all-seen"), Ok(()));
+        let unknown = run_context(&notes, "ctx-nothing").unwrap_err();
+        assert!(unknown.contains("ctx-nothing"), "{unknown}");
+    }
+
+    #[test]
+    fn a_failing_item_hands_its_error_back() {
+        let (notes, _data, _config) = notes_with_one_new_note(true);
+        assert_eq!(
+            run_context(&notes, "ctx-mark-all-seen"),
+            Err(crate::notes::SEEN_NOT_READ.to_owned())
         );
     }
 }

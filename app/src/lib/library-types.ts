@@ -139,6 +139,9 @@ export type NoteSummary = {
  */
 export const NOTES_EVENT = "notes";
 
+/** A context menu item failed; the payload is the error text, which the window shows as its notice. */
+export const MENU_ERROR_EVENT = "library-menu-error";
+
 /**
  * What `NOTES_EVENT` carries: the wire paths of the notes whose store file changed or went (a
  * moved note with its old and its new path). Empty when only the lists changed (a note marked

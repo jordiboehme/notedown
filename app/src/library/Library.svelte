@@ -34,7 +34,7 @@
     showListings,
     startLibrary,
   } from "../lib/library.svelte";
-  import { LIBRARY_AT_EVENT, NOTES_EVENT, type Entry, type NoteSummary } from "../lib/library-types";
+  import { LIBRARY_AT_EVENT, MENU_ERROR_EVENT, NOTES_EVENT, type Entry, type NoteSummary } from "../lib/library-types";
   import { startStatus, status } from "../lib/status.svelte";
   import ColumnsView from "./ColumnsView.svelte";
   import FileActions from "./FileActions.svelte";
@@ -173,6 +173,7 @@
       startLibrary(),
       startStatus(),
       listen(NOTES_EVENT, loadNotes),
+      listen<string>(MENU_ERROR_EVENT, (event) => (library.notice = String(event.payload))),
       listen(LIBRARY_AT_EVENT, (event) => {
         const at = openAt(event.payload);
         if (at?.kind === "note") openNote(at.path);
@@ -277,7 +278,7 @@
   }
 
   function markAllSeen() {
-    invoke<number>("notes_seen_all").then(loadNotes).catch(report("notes_seen_all"));
+    invoke<number>("notes_seen_all").then(loadNotes).catch((error) => (library.notice = String(error)));
   }
 
   function settings(page: string | null) {

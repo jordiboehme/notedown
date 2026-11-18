@@ -3695,3 +3695,20 @@ fn pipeline_search_creates_nothing() {
     assert_eq!(before, after);
     assert!(!dir.path().join("pipeline").exists());
 }
+
+#[cfg(feature = "ocr")]
+#[test]
+fn pipeline_search_takes_a_query_that_starts_with_a_hyphen() {
+    let dir = data_with_an_account();
+    save_note(dir.path(), "F1", "Ideas", &["The plan"]);
+    for query in ["-plan", "--plan"] {
+        let out = pipeline_search(dir.path(), query);
+        assert!(
+            out.status.success(),
+            "{query}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(hits.as_array().unwrap().len(), 1, "{query}");
+    }
+}

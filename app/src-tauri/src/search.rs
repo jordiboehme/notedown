@@ -140,9 +140,9 @@ pub fn search_args(config: &AppConfig, query: &str) -> Vec<String> {
     if let Some(account) = config.account.as_deref().filter(|a| !a.is_empty()) {
         args.extend(["--account".to_owned(), account.to_owned()]);
     }
+    // One argument, so a query that starts with `-` is never read as an option.
     args.extend([
-        "--query".to_owned(),
-        query.to_owned(),
+        format!("--query={query}"),
         "--limit".to_owned(),
         SIDECAR_LIMIT.to_string(),
     ]);
@@ -453,12 +453,17 @@ mod tests {
                 "/nowhere/data",
                 "--account",
                 "someone",
-                "--query",
-                "plan",
+                "--query=plan",
                 "--limit",
                 "1000"
             ]
         );
+    }
+
+    #[test]
+    fn a_query_that_starts_with_a_hyphen_stays_the_query() {
+        let args = search_args(&config(), "-plan");
+        assert!(args.contains(&"--query=-plan".to_owned()), "{args:?}");
     }
 
     #[test]

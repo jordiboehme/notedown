@@ -91,8 +91,11 @@ pub const NO_CACHE: &str = "Notedown could not use its cache folder.";
 pub const NO_IMAGE: &str = "The page could not be shown.";
 /// The render did not end in time.
 pub const TOO_LONG: &str = "The page took too long to show.";
-/// How long `render --info` may take to count the pages of a note.
+/// How long `render --info` may take to count the pages of a note. The run is not stopped by a
+/// close: it ends within this bound, and its answer is dropped for a closed review.
 pub const INFO_TIMEOUT: Duration = Duration::from_secs(60);
+/// How many page lists of note files are kept in memory (by md5).
+pub const INFOS_KEPT: usize = 64;
 /// A page index past the note's pages.
 pub const NO_SUCH_PAGE: &str = "This page is not in the note.";
 /// What a call hears when its page was dropped from the view while it waited.
@@ -352,7 +355,8 @@ struct Inner {
     table: Mutex<Table>,
     /// The pages of note files by md5, as `render --info` counted them.
     infos: Mutex<HashMap<String, Arc<Vec<FilePage>>>>,
-    /// The page count of the last `open` of each path.
+    /// The page count of the last `open` of each path, until `close(path)`. Hiding the window
+    /// (`close_all`) keeps them: the reviews stay and ask for their pages again when it shows.
     opened: Mutex<HashMap<String, usize>>,
     /// One download of a note's bytes per md5 at a time.
     fetching: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -830,6 +834,7 @@ impl Review {
         {
             let mut table = lock(&self.inner.table);
             *table.closes.entry(path.to_owned()).or_default() += 1;
+            lock(&self.inner.opened).remove(path);
             for slot in table.jobs.values() {
                 leave(slot, path, REVIEW_CLOSED);
             }
@@ -1154,8 +1159,20 @@ impl Inner {
             .and_then(|l| serde_json::from_str(l).ok())
             .ok_or_else(|| NOT_READ.to_owned())?;
         let pages = Arc::new(info.pages);
-        lock(&self.infos).insert(md5, pages.clone());
+        self.keep_info(md5, pages.clone());
         Ok(pages)
+    }
+
+    /// Keeps the page list of the file with `md5`; past [`INFOS_KEPT`] another one goes.
+    fn keep_info(&self, md5: String, pages: Arc<Vec<FilePage>>) {
+        let mut infos = lock(&self.infos);
+        if !infos.contains_key(&md5) && infos.len() >= INFOS_KEPT {
+            let other = infos.keys().next().cloned();
+            if let Some(other) = other {
+                infos.remove(&other);
+            }
+        }
+        infos.insert(md5, pages);
     }
 
     /// One render of page `index`, into a temp folder; the PNG moves into the cache only when

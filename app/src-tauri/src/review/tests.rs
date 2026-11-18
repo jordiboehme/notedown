@@ -1124,6 +1124,44 @@ fn a_newer_file_that_cannot_be_read_is_an_error_and_can_be_tried_again() {
 }
 
 #[test]
+fn a_closed_review_forgets_its_page_count() {
+    let s = setup(vec![
+        (look(NOTE), entry()),
+        (FILE.to_owned(), bytes_of(BYTES)),
+    ]);
+    s.store(&stored(
+        &md5_hex(b"the old bytes"),
+        vec![page("A", 0, "done", vec![]), page("B", 1, "done", vec![])],
+    ));
+    s.info(&[("X", false), ("A", false), ("B", false)]);
+    assert_eq!(s.review.open(NOTE).unwrap().pages.len(), 3);
+    assert_eq!(lock(&s.review.inner.opened).len(), 1);
+    s.review.close(NOTE);
+    // Without an open the index decides again: the store has two pages.
+    assert_eq!(s.review.page_image(NOTE, 2).unwrap_err(), NO_SUCH_PAGE);
+    assert!(lock(&s.review.inner.opened).is_empty());
+    // Hiding the window keeps the counts: its reviews ask for their pages again on a show.
+    lock(&s.review.inner.opened).insert(OTHER.to_owned(), 1);
+    s.review.close_all();
+    assert_eq!(lock(&s.review.inner.opened).len(), 1);
+}
+
+#[test]
+fn the_page_lists_of_files_are_kept_up_to_a_limit() {
+    let s = setup(vec![]);
+    let pages = Arc::new(Vec::new());
+    for n in 0..INFOS_KEPT + 10 {
+        s.review.inner.keep_info(format!("{n:032x}"), pages.clone());
+    }
+    let infos = lock(&s.review.inner.infos);
+    assert_eq!(infos.len(), INFOS_KEPT);
+    assert!(
+        infos.contains_key(&format!("{:032x}", INFOS_KEPT + 9)),
+        "the newest stays"
+    );
+}
+
+#[test]
 fn a_note_in_the_store_at_the_same_md5_needs_no_download() {
     let s = setup(vec![(look(NOTE), entry())]);
     s.info(&[("X", false)]);

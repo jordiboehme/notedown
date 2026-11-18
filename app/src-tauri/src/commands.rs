@@ -17,6 +17,7 @@ use crate::notify::deliver::{Authorization, Deliver};
 use crate::poller::{Poller, rest_base};
 use crate::processes::{ProcessStates, Processes};
 use crate::review::{DataUrl, NoteView, Review};
+use crate::search::{self, ContentHit};
 use crate::serve_info::ServeInfo;
 use crate::setup::{self, ExistingFolder, Sidecar};
 use crate::status::Status;
@@ -1433,6 +1434,28 @@ pub async fn notes_seen_all(notes: State<'_, Notes>) -> Result<usize, String> {
     tauri::async_runtime::spawn_blocking(move || notes.seen_all())
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// The notes whose text holds `query`, one per note at its first block, by the bundled
+/// sidecar. With `under`, only the notes at or below that folder. A query of fewer than two
+/// characters or without a letter or digit gives nothing and runs no sidecar. Off the main
+/// thread.
+#[tauri::command]
+pub async fn notes_search(
+    notes: State<'_, Notes>,
+    config: State<'_, ConfigState>,
+    sidecar: State<'_, Sidecar>,
+    query: String,
+    under: Option<String>,
+) -> Result<Vec<ContentHit>, String> {
+    let notes = notes.inner().clone();
+    let config = config.current();
+    let spawn = sidecar.0.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        search::notes_search(&spawn, &config, &notes, &query, under.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// The library opens the native context menu of `target` at the pointer. The items and their

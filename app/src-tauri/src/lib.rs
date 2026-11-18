@@ -17,6 +17,7 @@ pub mod processes;
 pub mod quit;
 pub mod rest;
 pub mod review;
+pub mod search;
 pub mod serve_info;
 pub mod setup;
 pub mod status;
@@ -294,6 +295,7 @@ pub fn run() {
             commands::notes_all,
             commands::note_seen,
             commands::notes_seen_all,
+            commands::notes_search,
             commands::library_menu,
             commands::note_open,
             commands::note_page_image,
@@ -1008,6 +1010,7 @@ mod tests {
                 "notes_all",
                 "note_seen",
                 "notes_seen_all",
+                "notes_search",
                 "library_menu",
                 "note_open",
                 "note_page_image",
@@ -1087,7 +1090,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 76);
+        assert_eq!(handler_commands().len(), 77);
     }
 
     #[test]
@@ -1140,6 +1143,7 @@ mod tests {
             "notes_all",
             "note_seen",
             "notes_seen_all",
+            "notes_search",
             "library_menu",
             "note_open",
             "note_page_image",
@@ -1211,7 +1215,13 @@ mod tests {
             assert!(granted(window).contains("notes_new"), "{window}");
         }
         assert!(!granted("settings").contains("notes_new"));
-        for command in ["notes_all", "note_seen", "notes_seen_all", "library_menu"] {
+        for command in [
+            "notes_all",
+            "note_seen",
+            "notes_seen_all",
+            "notes_search",
+            "library_menu",
+        ] {
             assert!(granted("library").contains(command), "{command}");
             for window in ["panel", "settings"] {
                 assert!(!granted(window).contains(command), "{window} has {command}");

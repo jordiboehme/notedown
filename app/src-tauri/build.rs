@@ -52,6 +52,7 @@ const COMMANDS: &[&str] = &[
     "notes_all",
     "note_seen",
     "notes_seen_all",
+    "notes_search",
     "library_menu",
     "note_open",
     "note_page_image",

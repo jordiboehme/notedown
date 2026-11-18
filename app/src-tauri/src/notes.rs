@@ -416,6 +416,16 @@ impl Notes {
         by_path(&state).remove(path).map(|n| n.summary.clone())
     }
 
+    /// The note with the key `key` when the index lists it (it has text and is not deleted,
+    /// unscoped or hidden by another note at its path). Uses the index as it is.
+    pub fn listed_by_key(&self, key: &str) -> Option<NoteSummary> {
+        let state = lock(&self.inner.state);
+        listed_notes(&state)
+            .into_iter()
+            .find(|n| n.summary.key == key)
+            .map(|n| n.summary.clone())
+    }
+
     /// The store file of the note at the wire path `path`, by the rule of
     /// [`at_path`](Self::at_path), for a reader of the whole note (the review). Scans first.
     pub fn store_file(&self, path: &str) -> Option<PathBuf> {

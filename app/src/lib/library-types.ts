@@ -134,6 +134,20 @@ export type NoteSummary = {
 };
 
 /**
+ * One note whose text holds the query, at its first block that does (`notes_search`). `page`
+ * counts from 1; `pageId` and `blockId` name the block in the note's text.
+ */
+export type ContentHit = {
+  key: string;
+  path: string;
+  title: string;
+  page: number;
+  pageId: string;
+  blockId: string;
+  context: string;
+};
+
+/**
  * The name of the Tauri event that tells the panel and the library that the notes changed: ask
  * `notes_new` or `notes_all` again. It carries `NotesChanged`.
  */

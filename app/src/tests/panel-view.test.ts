@@ -60,7 +60,7 @@ describe("the panel", () => {
   it("marks an attention line", () => {
     const status = sampleStatus(now);
     status.attention = ["ocrError"];
-    status.ocr.lastError = { text: "no model", atMs: now - 60_000 };
+    status.ocr.lastError = { text: "no model", atMs: now - 60_000, code: null };
     status.ocr.line = "The last OCR pass failed: no model";
     expect(html({ status })).toContain('data-attention="true"');
   });

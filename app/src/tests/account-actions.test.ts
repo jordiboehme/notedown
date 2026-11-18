@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { accountActions, logInFlow, useFolder, type AccountState } from "../settings/account";
+import { accountActions, loginNote, logInFlow, pageLogIn, useFolder, type AccountState } from "../settings/account";
+import { sampleStatus } from "./sample";
 import type { AppConfig, ConfigAnswer, ExistingFolder } from "../settings/api";
 
 const invoke = vi.fn();
@@ -184,7 +185,7 @@ describe("logInFlow", () => {
 
   it("connects the pipeline with the same password on another machine without one", async () => {
     invoke.mockImplementation(async (command: string) => answer(command === "log_in" ? "me" : "me-connected"));
-    const outcome = await logInFlow("me@example.org", "pw", config, { server: false, pipeline: false });
+    const outcome = await logInFlow("me@example.org", "pw", config, { server: false, pipeline: false }, false);
     expect(invoke.mock.calls).toEqual([
       ["log_in", { email: "me@example.org", password: "pw" }],
       ["connect_pipeline", { password: "pw" }],
@@ -194,9 +195,31 @@ describe("logInFlow", () => {
 
   it("logs in only on this Mac or with a pipeline already there", async () => {
     invoke.mockImplementation(async () => answer("me"));
-    await logInFlow("me@example.org", "pw", { ...config, mode: "local" }, { server: true, pipeline: false });
-    await logInFlow("me@example.org", "pw", config, { server: false, pipeline: true });
+    await logInFlow("me@example.org", "pw", { ...config, mode: "local" }, { server: true, pipeline: false }, false);
+    await logInFlow("me@example.org", "pw", config, { server: false, pipeline: true }, false);
     expect(invoke.mock.calls.map((c) => c[0])).toEqual(["log_in", "log_in"]);
+  });
+
+  it("connects the pipeline again when the server refused its token", async () => {
+    invoke.mockImplementation(async (command: string) => answer(command === "log_in" ? "me" : "me-connected"));
+    const outcome = await logInFlow("me@example.org", "pw", config, { server: false, pipeline: true }, true);
+    expect(invoke.mock.calls).toEqual([
+      ["log_in", { email: "me@example.org", password: "pw" }],
+      ["connect_pipeline", { password: "pw" }],
+    ]);
+    expect(outcome).toEqual({ loggedIn: true, answer: answer("me-connected"), connectError: null });
+    // On this Mac's server there is no pipeline login to renew.
+    invoke.mockClear();
+    await logInFlow("me@example.org", "pw", { ...config, mode: "local" }, { server: true, pipeline: true }, true);
+    expect(invoke.mock.calls.map((c) => c[0])).toEqual(["log_in"]);
+  });
+
+  it("keeps the Keychain note of the login when the pipeline connects too", async () => {
+    invoke.mockImplementation(async (command: string) =>
+      command === "log_in" ? { ...answer("me"), keychain: "The Keychain did not keep the login." } : answer("me-connected"),
+    );
+    const outcome = await logInFlow("me@example.org", "pw", config, { server: false, pipeline: true }, true);
+    expect(outcome.answer).toEqual({ ...answer("me-connected"), keychain: "The Keychain did not keep the login." });
   });
 
   it("keeps the login when the connection fails", async () => {
@@ -204,7 +227,7 @@ describe("logInFlow", () => {
       if (command === "connect_pipeline") throw "the server refused the email or the password";
       return answer("me");
     });
-    const outcome = await logInFlow("me@example.org", "pw", config, { server: false, pipeline: false });
+    const outcome = await logInFlow("me@example.org", "pw", config, { server: false, pipeline: false }, false);
     expect(outcome).toEqual({
       loggedIn: true,
       answer: answer("me"),
@@ -216,9 +239,46 @@ describe("logInFlow", () => {
     invoke.mockImplementation(async () => {
       throw "The server refused the e-mail or the password.";
     });
-    await expect(logInFlow("me@example.org", "pw", config, { server: false, pipeline: false })).rejects.toBe(
+    await expect(logInFlow("me@example.org", "pw", config, { server: false, pipeline: false }, false)).rejects.toBe(
       "The server refused the e-mail or the password.",
     );
     expect(invoke).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("the Account page login", () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    invoke.mockImplementation(async () => answer("me"));
+  });
+
+  it("connects the OCR again when the status says its token is refused", async () => {
+    const status = sampleStatus(1);
+    status.existing = { server: false, pipeline: true };
+    status.ocr.tokenRefused = true;
+    await pageLogIn("me@example.org", "pw", config, status);
+    expect(invoke.mock.calls.map((c) => c[0])).toEqual(["log_in", "connect_pipeline"]);
+    invoke.mockClear();
+    status.ocr.tokenRefused = false;
+    await pageLogIn("me@example.org", "pw", config, status);
+    expect(invoke.mock.calls.map((c) => c[0])).toEqual(["log_in"]);
+  });
+
+  it("leaves the OCR alone without a status", async () => {
+    await pageLogIn("me@example.org", "pw", config, null);
+    expect(invoke.mock.calls.map((c) => c[0])).toEqual(["log_in"]);
+  });
+
+  it("says the login, the Keychain problem and the OCR's connect error", () => {
+    const ok = { loggedIn: true as const, answer: answer("me"), connectError: null };
+    expect(loginNote(ok)).toEqual({ text: "Logged in as me.", tone: "good" });
+    expect(loginNote({ ...ok, answer: { ...answer("me"), keychain: "No Keychain." } })).toEqual({
+      text: "Logged in as me. No Keychain.",
+      tone: "bad",
+    });
+    expect(loginNote({ ...ok, connectError: "the server refused the email or the password" })).toEqual({
+      text: "Logged in as me. The OCR did not connect: the server refused the email or the password",
+      tone: "bad",
+    });
   });
 });

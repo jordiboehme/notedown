@@ -50,6 +50,10 @@ pub enum Error {
     Ocr(#[from] notedown_ocr::OcrError),
     #[error("{0}")]
     Read(String),
+    /// The server refused the token of an account (401); a new login fixes it. The text says
+    /// how.
+    #[error("{0}")]
+    TokenRefused(String),
     /// A data folder that is the server's own and has no `accounts/` yet.
     #[error("no accounts in {} yet; create one with `notedown cloud account add`", .0.display())]
     NoAccounts(std::path::PathBuf),
@@ -76,6 +80,16 @@ pub enum Error {
         path: std::path::PathBuf,
         message: String,
     },
+}
+
+impl Error {
+    /// What the error is, for a program to act on (the code of a [`store::LastError`]).
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            Error::TokenRefused(_) => Some(store::TOKEN_REFUSED),
+            _ => None,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

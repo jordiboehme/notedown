@@ -13,11 +13,14 @@
   let {
     email = $bindable(),
     existing,
+    tokenRefused,
     onLoggedIn,
     onOpen,
   }: {
     email: string;
     existing: Status["existing"];
+    /** The server refused the OCR's token: a login connects it again. */
+    tokenRefused: boolean;
     onLoggedIn: (outcome: LogInOutcome) => void;
     onOpen: (url: string) => void;
   } = $props();
@@ -99,7 +102,7 @@
       return;
     }
     void run(async () => {
-      const outcome = await logInFlow(email.trim(), password, cfg, existing);
+      const outcome = await logInFlow(email.trim(), password, cfg, existing, tokenRefused);
       done(outcome.answer, outcome);
     });
   }

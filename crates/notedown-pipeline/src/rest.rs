@@ -256,7 +256,10 @@ impl RestSource {
             state = self.load(slug)?.1;
         }
         if let Some(message) = self.refusal(slug, &state) {
-            return Err(Error::Read(message));
+            return Err(match state {
+                State::Refused(_) => Error::TokenRefused(message),
+                _ => Error::Read(message),
+            });
         }
         match state {
             State::Removed if !journal => Err(Error::Read(format!(
@@ -352,7 +355,7 @@ impl RestSource {
                 let state = State::Refused(self.clock.now_ms());
                 let message = self.refusal(slug, &state).unwrap_or_default();
                 self.set_state(slug, token, state);
-                (Error::Read(message), true)
+                (Error::TokenRefused(message), true)
             }
             (410, Some("account_removed")) => {
                 self.set_state(slug, token, State::Removed);
@@ -566,6 +569,14 @@ impl ServerData for RestSource {
         self.entries()
             .iter()
             .filter_map(|(slug, e)| Some((slug.clone(), self.refusal(slug, &e.state)?)))
+            .collect()
+    }
+
+    fn refused(&self) -> Vec<String> {
+        self.entries()
+            .iter()
+            .filter(|(_, e)| matches!(e.state, State::Refused(_)))
+            .map(|(slug, _)| slug.clone())
             .collect()
     }
 

@@ -598,6 +598,30 @@ fn a_past_next_due_time_is_not_shown() {
 }
 
 #[test]
+fn of_two_same_errors_the_one_with_a_code_is_shown() {
+    let d = setup();
+    d.put("test1", "NOTE/Note");
+    worker(&d, no_settle(), engine_reading("hello"))
+        .run_once(true)
+        .unwrap();
+    let text = "the server refused the token of jordi";
+    // The account's error of an older pipeline is newer than the source error with the code.
+    let stats = d.data.join("pipeline").join(SLUG).join("stats.json");
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&stats).unwrap()).unwrap();
+    json["lastError"] = json!({"text": text, "atMs": 2});
+    std::fs::write(&stats, serde_json::to_vec(&json).unwrap()).unwrap();
+    std::fs::write(
+        d.data.join("pipeline/last_error.json"),
+        json!({"text": text, "atMs": 1, "code": "token_refused"}).to_string(),
+    )
+    .unwrap();
+    let e = facts(&d.data).last_error.expect("an error");
+    assert_eq!(e.code.as_deref(), Some("token_refused"));
+    assert_eq!(e.at_ms, 1);
+}
+
+#[test]
 fn a_broken_error_or_stats_file_does_not_fail_the_status() {
     let d = setup();
     d.put("test1", "NOTE/Note");

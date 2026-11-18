@@ -240,7 +240,14 @@ pub struct LastError {
     pub text: String,
     /// Ms since the epoch.
     pub at_ms: u64,
+    /// What the failure is, for a program to act on: [`TOKEN_REFUSED`] or none. An older
+    /// pipeline writes none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
+
+/// The [`LastError::code`] of a token the server refused (401): a new login fixes it.
+pub const TOKEN_REFUSED: &str = "token_refused";
 
 /// `stats.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,12 +276,26 @@ pub fn source_error(data: &Path) -> Result<Option<LastError>> {
     read_json(&data.join(PIPELINE_DIR).join(LAST_ERROR_FILE))
 }
 
-/// Keeps `error` as the last error of the source. The same text again keeps the first time
-/// and writes nothing.
-pub fn set_source_error(data: &Path, _w: &WriterLock, error: LastError) -> Result<()> {
-    if source_error(data)?.is_some_and(|e| e.text == error.text) {
-        return Ok(());
+/// `error` as it replaces `old`: `None` when it is the same (text and code), so nothing is
+/// written. The same text with another code (one an older pipeline did not write) keeps the
+/// first time.
+fn next_error(old: Option<&LastError>, mut error: LastError) -> Option<LastError> {
+    match old {
+        Some(old) if old.text == error.text && old.code == error.code => None,
+        Some(old) if old.text == error.text => {
+            error.at_ms = old.at_ms;
+            Some(error)
+        }
+        _ => Some(error),
     }
+}
+
+/// Keeps `error` as the last error of the source. The same error again keeps the first time
+/// and writes nothing; a code an older pipeline did not write is added with the first time.
+pub fn set_source_error(data: &Path, _w: &WriterLock, error: LastError) -> Result<()> {
+    let Some(error) = next_error(source_error(data)?.as_ref(), error) else {
+        return Ok(());
+    };
     let path = data.join(PIPELINE_DIR).join(LAST_ERROR_FILE);
     notedown_cloud::fsutil::write_atomic(&path, &json_bytes(&error)?, false)?;
     Ok(())
@@ -920,19 +941,16 @@ impl TextStore {
         })
     }
 
-    /// Sets `last_error`. The same text again keeps the first time and writes nothing, so a
-    /// failure that repeats every second shows since when it lasts. Unlike the other stats it
-    /// is written also while the store waits for a repair (the error may be why), but never
-    /// into a store folder that is gone.
+    /// Sets `last_error`. The same error again keeps the first time and writes nothing, so a
+    /// failure that repeats every second shows since when it lasts; a code an older pipeline
+    /// did not write is added with the first time. Unlike the other stats it is written also
+    /// while the store waits for a repair (the error may be why), but never into a store
+    /// folder that is gone.
     pub fn set_last_error(&self, _w: &WriterLock, error: LastError) -> Result<Stats> {
         let mut stats = self.stats()?;
-        if stats
-            .last_error
-            .as_ref()
-            .is_some_and(|e| e.text == error.text)
-        {
+        let Some(error) = next_error(stats.last_error.as_ref(), error) else {
             return Ok(stats);
-        }
+        };
         stats.last_error = Some(error);
         notedown_cloud::fsutil::write_atomic_in(
             &self.dir.join(STATS_FILE),

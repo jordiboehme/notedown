@@ -37,6 +37,11 @@ pub trait ServerData: Send + Sync {
     fn refusals(&self) -> Vec<(String, String)> {
         Vec::new()
     }
+    /// The accounts of [`ServerData::refusals`] whose token the server refused (401), as of
+    /// the last calls: a new login fixes them.
+    fn refused(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// Whether the source knows for sure that account `slug`, left out of the last
     /// [`ServerData::accounts`], is gone. Only then may a removal delete its note text; a
     /// slug that is only missing from the list (a refused token, a failed request) waits.

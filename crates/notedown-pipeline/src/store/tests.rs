@@ -411,6 +411,44 @@ fn region_missed_adds_up_and_survives_reopen() {
 }
 
 #[test]
+fn a_new_code_for_the_same_error_is_written_with_its_first_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let w = WriterLock::take(tmp.path()).unwrap();
+    let store = TextStore::open_writer(tmp.path(), "jordi", &w).unwrap();
+    let error = |at_ms: u64, code: Option<&str>| LastError {
+        text: "the server refused the token of jordi".into(),
+        at_ms,
+        code: code.map(str::to_owned),
+    };
+    // An older pipeline kept the error without a code.
+    store.set_last_error(&w, error(1, None)).unwrap();
+    store
+        .set_last_error(&w, error(5, Some(TOKEN_REFUSED)))
+        .unwrap();
+    let kept = TextStore::open_writer(tmp.path(), "jordi", &w)
+        .unwrap()
+        .stats()
+        .unwrap()
+        .last_error;
+    assert_eq!(kept, Some(error(1, Some(TOKEN_REFUSED))));
+    // The same error again writes nothing new.
+    store
+        .set_last_error(&w, error(9, Some(TOKEN_REFUSED)))
+        .unwrap();
+    assert_eq!(
+        store.stats().unwrap().last_error,
+        Some(error(1, Some(TOKEN_REFUSED)))
+    );
+    // The source error does the same.
+    set_source_error(tmp.path(), &w, error(1, None)).unwrap();
+    set_source_error(tmp.path(), &w, error(5, Some(TOKEN_REFUSED))).unwrap();
+    assert_eq!(
+        source_error(tmp.path()).unwrap(),
+        Some(error(1, Some(TOKEN_REFUSED)))
+    );
+}
+
+#[test]
 fn a_bad_slug_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     for bad in ["", "..", "a/b", "."] {

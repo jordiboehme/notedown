@@ -61,21 +61,43 @@ export interface LogInOutcome {
   connectError: string | null;
 }
 
-/** Logs in; for a server on another machine without a pipeline connection on this Mac, then
+/** Logs in; for a server on another machine without a pipeline connection on this Mac, or
+ * whose server refused the pipeline's token (`tokenRefused`, after a password change), then
  * also connects the pipeline with the same password. A failed login throws as logIn does. */
 export async function logInFlow(
   email: string,
   password: string,
   cfg: AppConfig,
   existing: Status["existing"],
+  tokenRefused: boolean,
 ): Promise<LogInOutcome> {
   const answer = await logIn(email, password);
-  if (cfg.mode !== "remote" || existing.pipeline) return { loggedIn: true, answer, connectError: null };
+  if (cfg.mode !== "remote" || (existing.pipeline && !tokenRefused)) {
+    return { loggedIn: true, answer, connectError: null };
+  }
   try {
-    return { loggedIn: true, answer: await connectPipeline(password), connectError: null };
+    const connected = await connectPipeline(password);
+    // The connection's answer has no Keychain note: the login's stays.
+    return { loggedIn: true, answer: { ...connected, keychain: answer.keychain }, connectError: null };
   } catch (error) {
     return { loggedIn: true, answer, connectError: failure(error) };
   }
+}
+
+/** Log in of the Account page: logInFlow with what the status knows about the OCR. Without a
+ * status nothing is known, so the OCR is left as it is. */
+export function pageLogIn(email: string, password: string, cfg: AppConfig, status: Status | null): Promise<LogInOutcome> {
+  const existing = status?.existing ?? { server: false, pipeline: true };
+  return logInFlow(email, password, cfg, existing, status?.ocr.tokenRefused ?? false);
+}
+
+/** The note of the Account page after a login. */
+export function loginNote(outcome: LogInOutcome): { text: string; tone: "good" | "bad" } {
+  const { answer, connectError } = outcome;
+  const done = `Logged in as ${answer.config.account}.`;
+  if (answer.keychain) return { text: `${done} ${answer.keychain}`, tone: "bad" };
+  if (connectError) return { text: `${done} The OCR did not connect: ${connectError}`, tone: "bad" };
+  return { text: done, tone: "good" };
 }
 
 /** The place "Use it" sets for a folder found on this Mac. */

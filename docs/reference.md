@@ -303,7 +303,8 @@ seconds. The fields:
 - `failed`, `truncated`, `errors`: pages whose tries are used up, pages whose text was cut and failed
   pages that are tried again.
 - `lastError`: `{"text", "atMs"}` of the last failure of the pipeline as a whole, or `null`. A good
-  pass clears it.
+  pass clears it. When the server refused the token of an account, it also has `"code":
+  "token_refused"`: a new `notedown connect` fixes it.
 - `lastRunMs`: when the last pass ended, or `null`.
 - `inWork`: `{"note", "path", "page", "pages", "startedMs"}` of the page it reads now, or `null`.
 - `consumers`: one entry per consumer of the changes, `{"name", "seq", "ackedAt", "readAt",

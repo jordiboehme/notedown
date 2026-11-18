@@ -62,6 +62,8 @@ interface Own {
   done: boolean;
   line: string;
   working?: string;
+  /** false: a step to do that the later steps of the chain do not wait for. */
+  holds?: boolean;
 }
 
 export function checklist(input: ChecklistInput): Step[] {
@@ -89,7 +91,8 @@ export function checklist(input: ChecklistInput): Step[] {
     const chained = CHAIN.indexOf(id);
     // By the state shown: a step that works again (an import that runs) is not done.
     const shown = (earlier: StepId) => steps.find((s) => s.id === earlier)?.state;
-    const before = chained === -1 ? undefined : CHAIN.slice(0, chained).find((earlier) => shown(earlier) !== "done");
+    const passed = (earlier: StepId) => shown(earlier) === "done" || own[earlier].holds === false;
+    const before = chained === -1 ? undefined : CHAIN.slice(0, chained).find((earlier) => !passed(earlier));
     if (before !== undefined) {
       const line = `Do step ${ORDER.indexOf(before) + 1} first.`;
       steps.push({ id, title, state: "blocked", line, blockedBy: before });
@@ -159,6 +162,10 @@ function connection({ status, config, existing, job }: ChecklistInput): Own {
   if (status.account === null) return { done: false, line: "Checking the connection." };
   if (config.mode === "remote" && !existing.pipeline) {
     return { done: false, line: "The OCR is not connected to the server yet." };
+  }
+  // The import and the Supernote do not use the OCR's login: they do not wait for it.
+  if (config.mode === "remote" && status.ocr.tokenRefused) {
+    return { done: false, holds: false, line: REFUSED_ERROR };
   }
   return { done: true, line: "The server answers, and the login works." };
 }
@@ -441,8 +448,39 @@ export function connectionRows(status: Status, config: AppConfig, hasLogin: bool
   if (config.mode === "remote") {
     rows.push({
       title: "The OCR on this Mac reads from the server",
-      ...(status.existing.pipeline ? YES : { value: "Not connected yet", tone: "bad" as const }),
+      ...(!status.existing.pipeline
+        ? { value: "Not connected yet", tone: "bad" as const }
+        : status.ocr.tokenRefused
+          ? { value: "No. Connect again.", tone: "bad" as const }
+          : YES),
     });
   }
   return rows;
+}
+
+/** The Last error of the OCR page while the server refuses the OCR's token. */
+export const REFUSED_ERROR = "The server no longer accepts the OCR's login.";
+
+/** The note of Connect again: the server refused the OCR's token. */
+export const RECONNECT_NOTE =
+  "The server no longer accepts the OCR's login. This happens after a password change. Enter the password to connect again.";
+
+/** The Connect the OCR row of step 3 and the OCR page. */
+export interface OcrConnect {
+  /** The OCR was connected and the server refused its token. */
+  again: boolean;
+  note: string;
+  button: string;
+}
+
+/** The Connect the OCR row for a server on another machine: to connect the OCR when this Mac
+ * has no connection, or to connect it again when the server refused its token. null when
+ * nothing is to do. */
+export function ocrConnect(status: Status | null, config: AppConfig | null): OcrConnect | null {
+  if (status === null || config?.mode !== "remote") return null;
+  if (!status.existing.pipeline) {
+    return { again: false, note: "The OCR on this Mac logs in to the server with your password.", button: "Connect" };
+  }
+  if (status.ocr.tokenRefused) return { again: true, note: RECONNECT_NOTE, button: "Connect again" };
+  return null;
 }

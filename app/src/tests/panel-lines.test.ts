@@ -62,7 +62,7 @@ describe("panelLines", () => {
     status.ocr = {
       ...status.ocr,
       line: "The last OCR pass failed: no model",
-      lastError: { text: "no model", atMs: now - 3 * 60_000 },
+      lastError: { text: "no model", atMs: now - 3 * 60_000, code: null },
     };
     status.device.lastSyncMs = now - 3 * 86_400_000;
     status.attention = ["ocrError"];

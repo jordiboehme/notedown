@@ -47,7 +47,9 @@ use crate::retention;
 use crate::scope::in_scope;
 use crate::setup::Setup;
 use crate::source::{Removal, ServerAccount, ServerData};
-use crate::store::{LastError, TextStore, WriterLock, clear_source_error, set_source_error};
+use crate::store::{
+    LastError, TOKEN_REFUSED, TextStore, WriterLock, clear_source_error, set_source_error,
+};
 use crate::{Error, Result};
 use note::{Mode, NoteJob};
 
@@ -392,13 +394,14 @@ impl Worker {
 
     /// Keeps `text` as the last error of account `slug` for the status, in a store that
     /// exists. Best effort: the error was said already.
-    fn keep_error(&self, lock: &WriterLock, slug: &str, text: String) {
+    fn keep_error(&self, lock: &WriterLock, slug: &str, text: String, code: Option<&str>) {
         if let Ok(store) = TextStore::at(&self.setup.local, slug) {
             let _ = store.set_last_error(
                 lock,
                 LastError {
                     text,
                     at_ms: self.clock.now_ms(),
+                    code: code.map(str::to_owned),
                 },
             );
         }
@@ -408,6 +411,9 @@ impl Worker {
     /// last_error.json`): `failed`, the error of the account list, else the refused tokens.
     /// With neither, the error is cleared. Best effort, as [`keep_error`](Self::keep_error).
     fn source_seen(&self, lock: &WriterLock, failed: Option<String>) {
+        // A refused token is the code only while no failure of the list hides it.
+        let code = (failed.is_none() && !self.setup.source.refused().is_empty())
+            .then(|| TOKEN_REFUSED.to_owned());
         let text = failed.or_else(|| {
             let refused: Vec<String> = self
                 .setup
@@ -426,6 +432,7 @@ impl Worker {
                 LastError {
                     text,
                     at_ms: self.clock.now_ms(),
+                    code,
                 },
             ),
             None => clear_source_error(local, lock),
@@ -1222,7 +1229,7 @@ impl Worker {
                 }
                 Err(e) => {
                     self.say_once(&topic, format!("notedown pipeline: account {slug}: {e}"));
-                    self.keep_error(lock, &slug, e.to_string());
+                    self.keep_error(lock, &slug, e.to_string(), e.code());
                     // A failed write blocks the store until a repair: open it again next time.
                     // The notes written before the failure keep their Markdown files current.
                     if let Some(text) = stores.remove(&slug) {
@@ -1330,7 +1337,7 @@ impl Worker {
                 Err(Error::ModelMissing) => {
                     self.clear_work(lock);
                     for slug in stores.keys() {
-                        self.keep_error(lock, slug, Error::ModelMissing.to_string());
+                        self.keep_error(lock, slug, Error::ModelMissing.to_string(), None);
                     }
                     // Moves, deletes and scope changes are done, and notes with text need no
                     // model: their files are kept also while the model is missing.
@@ -1344,7 +1351,7 @@ impl Worker {
                         &format!("note:{slug}"),
                         format!("notedown pipeline: {}: {e}", d.path),
                     );
-                    self.keep_error(lock, slug, format!("{}: {e}", d.path));
+                    self.keep_error(lock, slug, format!("{}: {e}", d.path), None);
                     broken.push(slug.clone());
                 }
             }

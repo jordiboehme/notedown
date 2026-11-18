@@ -142,6 +142,7 @@
         <AccountStep
           bind:email
           existing={status.current?.existing ?? { server: false, pipeline: false }}
+          tokenRefused={status.current?.ocr.tokenRefused ?? false}
           onLoggedIn={loggedInNow}
           {onOpen}
         />

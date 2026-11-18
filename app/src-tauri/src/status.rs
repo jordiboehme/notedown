@@ -45,7 +45,17 @@ pub struct PipelineFacts {
 pub struct LastError {
     pub text: String,
     pub at_ms: u64,
+    /// What the failure is: [`TOKEN_REFUSED`] or none. An older pipeline sends none.
+    pub code: Option<String>,
 }
+
+/// The code of a last error when the server refused the pipeline's token: a new
+/// `connect` fixes it.
+pub const TOKEN_REFUSED: &str = "token_refused";
+
+/// The OCR line while the server refuses the pipeline's token.
+pub const TOKEN_REFUSED_LINE: &str =
+    "The server no longer accepts the OCR's login. Connect again in Notedown Settings > OCR.";
 
 /// The page the pipeline reads now.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,6 +289,9 @@ pub struct OcrStatus {
     /// This status has an answer of `pipeline status`; without it the fields above say
     /// nothing about the pipeline.
     pub facts: bool,
+    /// The server refused the pipeline's token: the OCR must connect again. Only from the
+    /// code of the last error, never from its text.
+    pub token_refused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -536,6 +549,7 @@ fn ocr_line(line: &str) -> OcrStatus {
         waiting: 0,
         last_run_ms: None,
         facts: false,
+        token_refused: false,
     }
 }
 
@@ -561,9 +575,18 @@ fn ocr_status(
         Some(PipelineCall::Facts(facts)) => facts,
     };
     let in_queue = facts.queued + facts.pending;
+    let token_refused = facts
+        .last_error
+        .as_ref()
+        .is_some_and(|e| e.code.as_deref() == Some(TOKEN_REFUSED));
     let line = if let Some(e) = &facts.last_error {
         attention.push(Attention::OcrError);
-        format!("The last OCR pass failed: {}", e.text)
+        // The pipeline's text names a terminal command; the app has Connect again.
+        if token_refused {
+            TOKEN_REFUSED_LINE.to_owned()
+        } else {
+            format!("The last OCR pass failed: {}", e.text)
+        }
     } else if in_queue > 0 {
         format!("{} waiting", count(in_queue, "page", "pages"))
     } else if facts.waiting > 0 {
@@ -584,6 +607,7 @@ fn ocr_status(
         waiting: facts.waiting,
         last_run_ms: facts.last_run_ms,
         facts: true,
+        token_refused,
     };
     let agents = facts.consumers.iter().map(agent).collect();
     (ocr, agents)

@@ -42,6 +42,8 @@ export interface SyncCount {
 export interface LastError {
   text: string;
   atMs: number;
+  /** What the failure is ("token_refused"); null from an older pipeline. */
+  code: string | null;
 }
 
 export interface AgentStatus {
@@ -82,6 +84,8 @@ export interface Status {
     lastRunMs: number | null;
     /** The status has an answer of `pipeline status`. */
     facts: boolean;
+    /** The server refused the OCR's token (after a password change): it must connect again. */
+    tokenRefused: boolean;
   };
   agents: AgentStatus[];
   attention: Attention[];

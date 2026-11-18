@@ -154,6 +154,8 @@ pub fn save_with(
 /// main thread.
 pub fn save(app: &AppHandle, path: &str) -> Result<Option<PathBuf>, String> {
     let notes = app.state::<Notes>().inner().clone();
+    // A page the review shows with text may be newer than the index's last scan.
+    notes.refresh();
     let config_state = app.state::<ConfigState>().inner().clone();
     let config = config_state.current();
     let spawn = app.state::<crate::setup::Sidecar>().0.clone();

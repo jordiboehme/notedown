@@ -62,6 +62,8 @@ interface Own {
   done: boolean;
   line: string;
   working?: string;
+  /** false: a step to do that the later steps of the chain do not wait for. */
+  holds?: boolean;
 }
 
 export function checklist(input: ChecklistInput): Step[] {
@@ -89,7 +91,8 @@ export function checklist(input: ChecklistInput): Step[] {
     const chained = CHAIN.indexOf(id);
     // By the state shown: a step that works again (an import that runs) is not done.
     const shown = (earlier: StepId) => steps.find((s) => s.id === earlier)?.state;
-    const before = chained === -1 ? undefined : CHAIN.slice(0, chained).find((earlier) => shown(earlier) !== "done");
+    const passed = (earlier: StepId) => shown(earlier) === "done" || own[earlier].holds === false;
+    const before = chained === -1 ? undefined : CHAIN.slice(0, chained).find((earlier) => !passed(earlier));
     if (before !== undefined) {
       const line = `Do step ${ORDER.indexOf(before) + 1} first.`;
       steps.push({ id, title, state: "blocked", line, blockedBy: before });
@@ -160,8 +163,9 @@ function connection({ status, config, existing, job }: ChecklistInput): Own {
   if (config.mode === "remote" && !existing.pipeline) {
     return { done: false, line: "The OCR is not connected to the server yet." };
   }
+  // The import and the Supernote do not use the OCR's login: they do not wait for it.
   if (config.mode === "remote" && status.ocr.tokenRefused) {
-    return { done: false, line: "The server no longer accepts the OCR's login." };
+    return { done: false, holds: false, line: REFUSED_ERROR };
   }
   return { done: true, line: "The server answers, and the login works." };
 }
@@ -453,6 +457,9 @@ export function connectionRows(status: Status, config: AppConfig, hasLogin: bool
   }
   return rows;
 }
+
+/** The Last error of the OCR page while the server refuses the OCR's token. */
+export const REFUSED_ERROR = "The server no longer accepts the OCR's login.";
 
 /** The note of Connect again: the server refused the OCR's token. */
 export const RECONNECT_NOTE =

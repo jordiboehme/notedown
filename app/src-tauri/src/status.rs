@@ -53,6 +53,10 @@ pub struct LastError {
 /// `connect` fixes it.
 pub const TOKEN_REFUSED: &str = "token_refused";
 
+/// The OCR line while the server refuses the pipeline's token.
+pub const TOKEN_REFUSED_LINE: &str =
+    "The server no longer accepts the OCR's login. Connect again in Settings > OCR.";
+
 /// The page the pipeline reads now.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -571,9 +575,18 @@ fn ocr_status(
         Some(PipelineCall::Facts(facts)) => facts,
     };
     let in_queue = facts.queued + facts.pending;
+    let token_refused = facts
+        .last_error
+        .as_ref()
+        .is_some_and(|e| e.code.as_deref() == Some(TOKEN_REFUSED));
     let line = if let Some(e) = &facts.last_error {
         attention.push(Attention::OcrError);
-        format!("The last OCR pass failed: {}", e.text)
+        // The pipeline's text names a terminal command; the app has Connect again.
+        if token_refused {
+            TOKEN_REFUSED_LINE.to_owned()
+        } else {
+            format!("The last OCR pass failed: {}", e.text)
+        }
     } else if in_queue > 0 {
         format!("{} waiting", count(in_queue, "page", "pages"))
     } else if facts.waiting > 0 {
@@ -594,10 +607,7 @@ fn ocr_status(
         waiting: facts.waiting,
         last_run_ms: facts.last_run_ms,
         facts: true,
-        token_refused: facts
-            .last_error
-            .as_ref()
-            .is_some_and(|e| e.code.as_deref() == Some(TOKEN_REFUSED)),
+        token_refused,
     };
     let agents = facts.consumers.iter().map(agent).collect();
     (ocr, agents)

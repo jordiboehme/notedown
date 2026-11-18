@@ -241,6 +241,9 @@ describe("checklist", () => {
     steps = byId(checklist(input({ status, config, existing: status.existing })));
     expect(steps.connection.state).toBe("todo");
     expect(steps.connection.line).toBe("The server no longer accepts the OCR's login.");
+    // The import and the Supernote do not use the OCR's login: they do not wait for it.
+    expect(steps.import.state).not.toBe("blocked");
+    expect(steps.supernote.state).not.toBe("blocked");
     status.ocr.tokenRefused = false;
     // This Mac's server does not answer.
     const local = sampleStatus(NOW);
@@ -673,8 +676,15 @@ describe("the OCR page", () => {
     config.current = { ...sampleConfig(), mode: "remote", serverUrl: "http://pi.local:19072" };
     status.current = current;
     expect(render(OcrPage, { props: { now: NOW } }).body).not.toContain("Connect again");
-    status.current = { ...current, ocr: { ...current.ocr, tokenRefused: true } };
+    const lastError = {
+      text: "the server refused the token of jordi; run notedown connect http://pi.local:19072 --data /x again",
+      atMs: NOW,
+      code: "token_refused",
+    };
+    status.current = { ...current, ocr: { ...current.ocr, tokenRefused: true, lastError } };
     const body = render(OcrPage, { props: { now: NOW } }).body;
+    // No terminal command: the app has Connect again.
+    expect(body).not.toContain("notedown connect");
     expect(body).toContain("Connect again");
     expect(body).toContain("This happens after a password change. Enter the password to connect again.");
     expect(body).toContain('type="password"');

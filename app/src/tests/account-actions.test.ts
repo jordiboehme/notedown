@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { accountActions, logInFlow, useFolder, type AccountState } from "../settings/account";
+import { accountActions, loginNote, logInFlow, pageLogIn, useFolder, type AccountState } from "../settings/account";
+import { sampleStatus } from "./sample";
 import type { AppConfig, ConfigAnswer, ExistingFolder } from "../settings/api";
 
 const invoke = vi.fn();
@@ -213,6 +214,14 @@ describe("logInFlow", () => {
     expect(invoke.mock.calls.map((c) => c[0])).toEqual(["log_in"]);
   });
 
+  it("keeps the Keychain note of the login when the pipeline connects too", async () => {
+    invoke.mockImplementation(async (command: string) =>
+      command === "log_in" ? { ...answer("me"), keychain: "The Keychain did not keep the login." } : answer("me-connected"),
+    );
+    const outcome = await logInFlow("me@example.org", "pw", config, { server: false, pipeline: true }, true);
+    expect(outcome.answer).toEqual({ ...answer("me-connected"), keychain: "The Keychain did not keep the login." });
+  });
+
   it("keeps the login when the connection fails", async () => {
     invoke.mockImplementation(async (command: string) => {
       if (command === "connect_pipeline") throw "the server refused the email or the password";
@@ -234,5 +243,42 @@ describe("logInFlow", () => {
       "The server refused the e-mail or the password.",
     );
     expect(invoke).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("the Account page login", () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    invoke.mockImplementation(async () => answer("me"));
+  });
+
+  it("connects the OCR again when the status says its token is refused", async () => {
+    const status = sampleStatus(1);
+    status.existing = { server: false, pipeline: true };
+    status.ocr.tokenRefused = true;
+    await pageLogIn("me@example.org", "pw", config, status);
+    expect(invoke.mock.calls.map((c) => c[0])).toEqual(["log_in", "connect_pipeline"]);
+    invoke.mockClear();
+    status.ocr.tokenRefused = false;
+    await pageLogIn("me@example.org", "pw", config, status);
+    expect(invoke.mock.calls.map((c) => c[0])).toEqual(["log_in"]);
+  });
+
+  it("leaves the OCR alone without a status", async () => {
+    await pageLogIn("me@example.org", "pw", config, null);
+    expect(invoke.mock.calls.map((c) => c[0])).toEqual(["log_in"]);
+  });
+
+  it("says the login, the Keychain problem and the OCR's connect error", () => {
+    const ok = { loggedIn: true as const, answer: answer("me"), connectError: null };
+    expect(loginNote(ok)).toEqual({ text: "Logged in as me.", tone: "good" });
+    expect(loginNote({ ...ok, answer: { ...answer("me"), keychain: "No Keychain." } })).toEqual({
+      text: "Logged in as me. No Keychain.",
+      tone: "bad",
+    });
+    expect(loginNote({ ...ok, connectError: "the server refused the email or the password" })).toEqual({
+      text: "Logged in as me. The OCR did not connect: the server refused the email or the password",
+      tone: "bad",
+    });
   });
 });

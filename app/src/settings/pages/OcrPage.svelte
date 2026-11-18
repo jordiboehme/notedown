@@ -3,7 +3,7 @@
   import { relativeTime } from "../../lib/format";
   import { status } from "../../lib/status.svelte";
   import { failure, markdownDir, setMarkdownDir, setModelIdle, showMarkdownDir } from "../api";
-  import { ocrConnect } from "../checklist";
+  import { ocrConnect, REFUSED_ERROR } from "../checklist";
   import { config } from "../config.svelte";
   import { markdownRead, markdownRow } from "../markdown";
   import { MODEL_IDLE, modelIdleMinutes, modelIdleOptions, modelIdleValue } from "../modelIdle";
@@ -117,7 +117,8 @@
         </Row>
       {/if}
       {#if ocr.lastError}
-        <Row title="Last error" note={ocr.lastError.text} tone="bad">
+        <!-- A refused token's text names a terminal command; Connect again below does it. -->
+        <Row title="Last error" note={ocr.tokenRefused ? REFUSED_ERROR : ocr.lastError.text} tone="bad">
           <span class="value">{relativeTime(ocr.lastError.atMs, now)}</span>
         </Row>
       {/if}

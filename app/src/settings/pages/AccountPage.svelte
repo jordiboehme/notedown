@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { status } from "../../lib/status.svelte";
   import { failure, hasLogin, logOut } from "../api";
-  import { accountActions, logInFlow } from "../account";
+  import { accountActions, loginNote as noteOf, pageLogIn } from "../account";
   import { config } from "../config.svelte";
   import Form from "../kit/Form.svelte";
   import Row from "../kit/Row.svelte";
@@ -48,20 +48,12 @@
     if (!actions.logIn.enabled || cfg === null) return;
     busy = "logIn";
     loginNote = null;
-    // Without a status nothing is known about the OCR: it is left as it is.
-    const existing = status.current?.existing ?? { server: false, pipeline: true };
-    const tokenRefused = status.current?.ocr.tokenRefused ?? false;
     try {
-      const { answer, connectError } = await logInFlow(email, password, cfg, existing, tokenRefused);
-      config.current = answer.config;
+      const outcome = await pageLogIn(email, password, cfg, status.current);
+      config.current = outcome.answer.config;
       loggedIn = true;
       logoutNote = null;
-      const done = `Logged in as ${answer.config.account}.`;
-      loginNote = answer.keychain
-        ? { text: `${done} ${answer.keychain}`, tone: "bad" }
-        : connectError
-          ? { text: `${done} The OCR did not connect: ${connectError}`, tone: "bad" }
-          : { text: done, tone: "good" };
+      loginNote = noteOf(outcome);
     } catch (error) {
       loginNote = { text: failure(error), tone: "bad" };
     } finally {

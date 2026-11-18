@@ -199,6 +199,14 @@ fn ocr_lines() {
     let refused = with(serde_json::json!({"lastError": {"text": text, "atMs": 1,
                                                         "code": "token_refused"}}));
     assert!(refused.ocr.token_refused);
+    // The app's own words, no terminal command; the pipeline's text stays in the error.
+    assert_eq!(refused.ocr.line, TOKEN_REFUSED_LINE);
+    assert!(!refused.ocr.line.contains("notedown connect"));
+    assert_eq!(refused.attention, vec![Attention::OcrError]);
+    assert_eq!(
+        refused.ocr.last_error.as_ref().map(|e| e.text.as_str()),
+        Some(text)
+    );
     assert_eq!(
         refused
             .ocr
@@ -209,6 +217,7 @@ fn ocr_lines() {
     );
     let old = with(serde_json::json!({"lastError": {"text": text, "atMs": 1}}));
     assert!(!old.ocr.token_refused);
+    assert_eq!(old.ocr.line, format!("The last OCR pass failed: {text}"));
     let other = with(serde_json::json!({"lastError": {"text": "x", "atMs": 1,
                                                       "code": "something_else"}}));
     assert!(!other.ocr.token_refused);

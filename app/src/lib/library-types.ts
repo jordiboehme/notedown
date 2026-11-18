@@ -134,6 +134,15 @@ export type NoteSummary = {
 };
 
 /**
+ * What `library_find` answers: the files whose name holds the text, at most 200, in tree
+ * order, and whether there were more.
+ */
+export type Found = {
+  entries: Entry[];
+  more: boolean;
+};
+
+/**
  * One note whose text holds the query, at its first block that does (`notes_search`). `page`
  * counts from 1; `pageId` and `blockId` name the block in the note's text.
  */

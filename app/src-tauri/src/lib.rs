@@ -291,6 +291,7 @@ pub fn run() {
             commands::library_cancel_drop,
             commands::library_download,
             commands::library_reveal,
+            commands::library_find,
             commands::notes_new,
             commands::notes_all,
             commands::note_seen,
@@ -1006,6 +1007,7 @@ mod tests {
                 "library_cancel_drop",
                 "library_download",
                 "library_reveal",
+                "library_find",
                 "notes_new",
                 "notes_all",
                 "note_seen",
@@ -1090,7 +1092,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 77);
+        assert_eq!(handler_commands().len(), 78);
     }
 
     #[test]
@@ -1139,6 +1141,7 @@ mod tests {
             "library_cancel_drop",
             "library_download",
             "library_reveal",
+            "library_find",
             "notes_new",
             "notes_all",
             "note_seen",
@@ -1203,6 +1206,7 @@ mod tests {
                 "library_cancel_drop",
                 "library_download",
                 "library_reveal",
+                "library_find",
             ] {
                 assert!(!granted(window).contains(command), "{window} has {command}");
             }

@@ -9,7 +9,9 @@ use tauri::{AppHandle, State};
 
 use crate::config::{self, AppConfig, Mode, NotificationChoices, StartView};
 use crate::import_job::{self, BackupFolder, ImportJobs, JobKind};
-use crate::library::{Choice, Entry, Job, Key, Library, Listed, RecyclePage, StateView, UploadAsk};
+use crate::library::{
+    Choice, Entry, Found, Job, Key, Library, Listed, RecyclePage, StateView, UploadAsk,
+};
 use crate::login::{self, LoginError, LoginGate, Password};
 use crate::model::{ModelControl, ModelState};
 use crate::notes::{NoteSummary, Notes};
@@ -1434,6 +1436,27 @@ pub async fn notes_seen_all(notes: State<'_, Notes>) -> Result<usize, String> {
     tauri::async_runtime::spawn_blocking(move || notes.seen_all())
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// The most files a name search answers.
+pub const FIND_LIMIT: usize = 200;
+
+/// The files below the folder `under` (the whole library without it) whose name holds `text`,
+/// at most [`FIND_LIMIT`], and whether there were more. Off the main thread.
+#[tauri::command]
+pub async fn library_find(
+    library: State<'_, Library>,
+    text: String,
+    under: Option<String>,
+) -> Result<Found, String> {
+    let library = library.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .find(&text, under.as_deref().unwrap_or(""), FIND_LIMIT)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// The notes whose text holds `query`, one per note at its first block, by the bundled

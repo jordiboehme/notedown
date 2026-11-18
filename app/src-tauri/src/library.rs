@@ -325,6 +325,8 @@ struct Inner {
     waker: Mutex<Option<Sender<()>>>,
     /// The id of the last job.
     next_job: AtomicU64,
+    /// The number of the last name search (`Library::find`): a newer one stops an older walk.
+    finds: AtomicU64,
     /// Restores that ask for another name, by the key of their bin item.
     asking: Mutex<HashMap<String, Job>>,
     /// The drops and the upload queue. Held only for short changes and the events they send,
@@ -396,6 +398,7 @@ impl Library {
                 stepping: Mutex::new(()),
                 waker: Mutex::new(None),
                 next_job: AtomicU64::new(0),
+                finds: AtomicU64::new(0),
                 asking: Mutex::new(HashMap::new()),
                 uploads: Mutex::new(uploads::Uploads::default()),
                 downloads: downloads::Shared::default(),
@@ -559,10 +562,12 @@ impl Library {
 mod cache;
 mod changes;
 mod downloads;
+mod find;
 mod listing;
 mod uploads;
 
 pub use cache::{Key, Listed};
+pub use find::{Found, name_matches};
 pub use listing::{FOLLOW_EVERY, RecycleItem, RecyclePage};
 pub(crate) use uploads::is_md5;
 pub use uploads::{Ask, Choice, UploadAsk};
@@ -582,6 +587,9 @@ mod tests;
 
 #[cfg(test)]
 mod listing_tests;
+
+#[cfg(test)]
+mod find_tests;
 
 #[cfg(test)]
 mod changes_tests;

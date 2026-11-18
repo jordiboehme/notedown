@@ -48,6 +48,7 @@ const COMMANDS: &[&str] = &[
     "library_cancel_drop",
     "library_download",
     "library_reveal",
+    "library_find",
     "notes_new",
     "notes_all",
     "note_seen",

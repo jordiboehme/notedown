@@ -5,6 +5,7 @@
   import { ReviewSession } from "./session.svelte";
   import { noteTitle, reviewNotice, reviewPages } from "./review";
   import ReviewPages from "./ReviewPages.svelte";
+  import { ACTUAL, ZOOMS, zoomIn, zoomKey, zoomOut } from "./zoom";
 
   // The review of one note: opened when it mounts (that marks it seen), read again when the
   // store changed (new page text shows while it is open), closed in Rust when it goes. The
@@ -15,6 +16,19 @@
   const session = new ReviewSession(path);
   const rows = $derived(session.view ? reviewPages(session.view, session.ratios) : []);
   const notice = $derived(session.view ? reviewNotice(session.view) : null);
+  /** The zoom of the pages side: 1 is fit width. */
+  let zoom = $state(ACTUAL);
+
+  function zoomBy(step: "in" | "out" | "actual") {
+    zoom = step === "in" ? zoomIn(zoom) : step === "out" ? zoomOut(zoom) : ACTUAL;
+  }
+
+  function key(event: KeyboardEvent) {
+    const step = zoomKey(event);
+    if (!step || !session.view) return;
+    event.preventDefault();
+    zoomBy(step);
+  }
 
   onMount(() => {
     void session.open();
@@ -26,11 +40,18 @@
   });
 </script>
 
-<svelte:window onfocus={() => session.refresh()} />
+<svelte:window onfocus={() => session.refresh()} onkeydown={key} />
 
 <header class="head">
   <button type="button" class="back" onclick={onBack}>Back</button>
   <h1 class="title">{session.view?.title ?? noteTitle(path)}</h1>
+  {#if session.view && rows.length > 0}
+    <div class="zoom" role="group" aria-label="Zoom">
+      <button type="button" class="back" disabled={zoom === ZOOMS[0]} onclick={() => zoomBy("out")}>Zoom Out</button>
+      <button type="button" class="back" disabled={zoom === ACTUAL} onclick={() => zoomBy("actual")}>Actual Size</button>
+      <button type="button" class="back" disabled={zoom === ZOOMS[ZOOMS.length - 1]} onclick={() => zoomBy("in")}>Zoom In</button>
+    </div>
+  {/if}
 </header>
 {#if notice}<p class="notice">{notice}</p>{/if}
 
@@ -43,6 +64,7 @@
 {:else}
   <ReviewPages
     {rows}
+    {zoom}
     images={session.images}
     onSeen={(changes) => session.seenMany(changes)}
     onMeasured={(index, width, height) => session.measured(index, width, height)}
@@ -68,7 +90,19 @@
     color: inherit;
   }
 
+  .back:disabled {
+    opacity: 0.5;
+  }
+
+  .zoom {
+    flex: none;
+    display: flex;
+    gap: 6px;
+    margin-left: auto;
+  }
+
   .title {
+    min-width: 0;
     margin: 0;
     font-size: 13px;
     font-weight: 600;

@@ -421,11 +421,69 @@ describe("the review session", () => {
     await session.reload();
     expect(session.view).toBe(before);
     expect(session.error).toBeNull();
-    expect(session.stale).toBe("This note is not there anymore.");
+    expect(session.stale).toBe("This view is not up to date. This note is not there anymore.");
     // A reload that works again ends the line.
     answerNow("note_open", view(["done", "pending"]));
     await session.reload();
     expect(session.stale).toBeNull();
+  });
+
+  it("asks for no new page image while the view is not up to date", async () => {
+    const session = await opened();
+    session.seen(0, true);
+    expect(asked("note_page_image")).toEqual([0, 1, 2]);
+    answerError("note_open", "The connection to the server was cut.");
+    await session.reload();
+    // Far down: the pages there would come from a file the text may not match.
+    session.seen(0, false);
+    session.seen(9, true);
+    expect(asked("note_page_image")).toEqual([0, 1, 2]);
+    // Far pages still go.
+    expect(asked("note_page_drop")).toEqual([0, 1, 2]);
+    answerNow("note_open", view(Array.from({ length: 12 }, () => "done" as const)));
+    await session.reload();
+    expect(asked("note_page_image")).toEqual([0, 1, 2, 8, 9, 10, 11]);
+  });
+
+  it("tries a failed open again when the window gets the focus", async () => {
+    answerError("note_open", "The file did not arrive whole. Try again.");
+    const session = new ReviewSession(PATH);
+    await session.open();
+    expect(session.error).toBe("The file did not arrive whole. Try again.");
+    answerNow("note_open", view(["done"]));
+    session.refresh();
+    await flush();
+    expect(session.error).toBeNull();
+    expect(session.view?.pages).toHaveLength(1);
+    expect(calls.filter((c) => c.command === "note_open")).toHaveLength(2);
+    // With a view that is up to date, the focus reads nothing again.
+    session.refresh();
+    await flush();
+    expect(calls.filter((c) => c.command === "note_open")).toHaveLength(2);
+  });
+
+  it("a failed open has a Try Again button that opens the note again", async () => {
+    const source = (await import("../library/Review.svelte?raw")).default as string;
+    expect(source).toContain('onclick={() => void session.reload()}>Try Again</button>');
+    answerError("note_open", "The file did not arrive whole. Try again.");
+    const session = new ReviewSession(PATH);
+    await session.open();
+    answerNow("note_open", view(["done"]));
+    await session.reload();
+    expect(session.error).toBeNull();
+    expect(asked("note_seen")).toHaveLength(1);
+  });
+
+  it("tries a failed reload again when the window gets the focus", async () => {
+    const session = await opened(["done"]);
+    answerError("note_open", "The connection to the server was cut.");
+    await session.reload();
+    expect(session.stale).not.toBeNull();
+    answerNow("note_open", view(["done"]));
+    session.refresh();
+    await flush();
+    expect(session.stale).toBeNull();
+    expect(calls.filter((c) => c.command === "note_open")).toHaveLength(3);
   });
 
   it("a reload the window ended itself is no reason to show", async () => {

@@ -74,7 +74,10 @@
 {#if notice}<p class="notice">{notice}</p>{/if}
 
 {#if session.error}
-  <p class="note">{session.error}</p>
+  <div class="failed">
+    <p class="note">{session.error}</p>
+    <button type="button" class="back" onclick={() => void session.reload()}>Try Again</button>
+  </div>
 {:else if !session.view}
   <p class="note">Opening the note...</p>
 {:else if rows.length === 0}
@@ -146,6 +149,13 @@
     padding: 6px 14px;
     color: var(--secondary);
     border-bottom: 1px solid var(--separator);
+  }
+
+  .failed {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding-right: 14px;
   }
 
   .note {

@@ -14,6 +14,9 @@ function text(error: unknown): string {
   return typeof error === "string" ? error : error instanceof Error ? error.message : String(error);
 }
 
+/** The start of the line above a view whose reload failed. */
+const STALE = "This view is not up to date.";
+
 /** The text of a note, page by page: a reload that changes it brought new text. */
 function textOf(view: NoteView): string {
   return JSON.stringify(view.pages.map((page) => [page.pageId, page.markdown]));
@@ -96,7 +99,7 @@ export class ReviewSession {
       const why = text(error);
       // A reload that fails keeps what is shown and says why above it.
       if (!this.view) this.error = why;
-      else if (!ENDED.has(why)) this.stale = why;
+      else if (!ENDED.has(why)) this.stale = `${STALE} ${why}`;
       return;
     }
     if (this.#closed) return;
@@ -167,8 +170,12 @@ export class ReviewSession {
     if (width > 0 && height > 0) this.ratios[index] = width / height;
   }
 
-  /** The window shows again: hiding it closed the review in Rust, so near pages are asked again. */
+  /**
+   * The window shows again or gets the focus: hiding it closed the review in Rust, so near
+   * pages are asked again. A failed open or reload is tried again.
+   */
   refresh() {
+    if (this.error !== null || this.stale !== null) void this.reload();
     this.#update();
   }
 
@@ -198,6 +205,9 @@ export class ReviewSession {
       if (index >= keepFrom && index <= keepTo) continue;
       this.#drop(index);
     }
+    // While the view is not up to date, a new image could be of a file its text does not
+    // match: the pages wait for the next reload that works.
+    if (this.stale !== null) return;
     for (let index = pages.near[0]; index <= pages.near[1]; index++) {
       if (this.images[index] === undefined) this.#ask(index);
     }

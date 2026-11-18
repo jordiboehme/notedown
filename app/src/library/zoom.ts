@@ -27,6 +27,17 @@ export function zoomKey(e: { key: string; metaKey: boolean }): "in" | "out" | "a
   return null;
 }
 
+/**
+ * The zoom key of the review: none while a search lies over it (`covered`) or while a page is
+ * shown alone (`alone`, it has its own zoom).
+ */
+export function reviewZoomKey(
+  e: { key: string; metaKey: boolean },
+  { covered, alone }: { covered: boolean; alone: boolean },
+): "in" | "out" | "actual" | null {
+  return covered || alone ? null : zoomKey(e);
+}
+
 /** Where the pages side scrolls to after a zoom: the same page at the same share of it. */
 export function keepPlace(scrollTop: number, before: Offsets, after: Offsets): number {
   return syncTop(scrollTop, before, after);
@@ -90,4 +101,20 @@ export function stepPage(index: number, count: number, step: "prev" | "next"): n
 /** The keys that open a focused page in the large view: Return and Space. */
 export function openKey(key: string): boolean {
   return key === "Enter" || key === " ";
+}
+
+/**
+ * What a key does to the page shown alone: a zoom step, a move to another page or the close,
+ * or nothing. While a search lies over it (`covered`), no key reaches it.
+ */
+export function viewerInput(
+  e: { key: string; metaKey: boolean; ctrlKey: boolean; altKey: boolean },
+  covered: boolean,
+): { zoom: "in" | "out" | "actual" } | { move: "prev" | "next" | "close" } | null {
+  if (covered) return null;
+  const zoom = zoomKey(e);
+  if (zoom) return { zoom };
+  if (e.metaKey || e.ctrlKey || e.altKey) return null;
+  const move = viewerKey(e.key);
+  return move ? { move } : null;
 }

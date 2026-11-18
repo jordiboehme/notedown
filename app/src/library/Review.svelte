@@ -6,7 +6,7 @@
   import { concernsNote, noteTitle, reviewNotice, reviewPages, type BlockAt } from "./review";
   import ReviewPages from "./ReviewPages.svelte";
   import PageViewer from "./PageViewer.svelte";
-  import { ACTUAL, ZOOMS, zoomIn, zoomKey, zoomOut } from "./zoom";
+  import { ACTUAL, ZOOMS, reviewZoomKey, zoomIn, zoomOut } from "./zoom";
 
   // The review of one note: opened when it mounts (that marks it seen), read again when the
   // store changed (new page text shows while it is open), closed in Rust when it goes. The
@@ -15,11 +15,14 @@
   let {
     path,
     at = null,
+    covered = false,
     onAtTaken = () => {},
     onBack,
   }: {
     path: string;
     at?: BlockAt | null;
+    /** A search lies over the review: its window keys do nothing. */
+    covered?: boolean;
     /** The session took `at`: the window drops it, so the review is not opened at it again. */
     onAtTaken?: () => void;
     onBack: () => void;
@@ -59,9 +62,7 @@
   });
 
   function key(event: KeyboardEvent) {
-    // The large view of one page has its own zoom.
-    if (session.focused !== null) return;
-    const step = zoomKey(event);
+    const step = reviewZoomKey(event, { covered, alone: session.focused !== null });
     if (!step || !session.view) return;
     event.preventDefault();
     zoomBy(step);
@@ -121,6 +122,7 @@
       row={rows[session.focused]}
       image={session.images[session.focused]}
       count={rows.length}
+      {covered}
       onStep={(index) => session.focus(index)}
       onClose={() => void closeViewer()}
     />

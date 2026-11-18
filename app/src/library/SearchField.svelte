@@ -15,6 +15,8 @@
   function keydown(event: KeyboardEvent) {
     if (event.key !== "Escape") return;
     event.preventDefault();
+    // The Escape is the field's: the window and the review under the results do not get it.
+    event.stopPropagation();
     search.clear();
   }
 </script>

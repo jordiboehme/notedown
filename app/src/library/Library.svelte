@@ -313,7 +313,11 @@
   function keydown(event: KeyboardEvent) {
     if (event.key === "Escape" && drag.current) stopDrag();
     // Escape ends a search wherever the focus is, and gives back the view under it.
-    else if (event.key === "Escape" && searching) search.clear();
+    else if (event.key === "Escape" && searching) {
+      // The Escape is the search's: the review under it (a page shown alone) must not get it.
+      event.stopImmediatePropagation();
+      search.clear();
+    }
     if (isFindKey(event)) {
       event.preventDefault();
       toolbar?.focusSearch();
@@ -371,6 +375,7 @@
               <Review
                 path={library.selection.path}
                 at={library.selection.at ?? null}
+            covered={searching}
                 onAtTaken={() => (library.selection = withoutAt(library.selection))}
                 onBack={() => (library.selection = library.back)}
               />

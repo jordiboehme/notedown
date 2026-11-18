@@ -13,6 +13,8 @@ import {
   viewerKey,
   zoomIn,
   zoomKey,
+  reviewZoomKey,
+  viewerInput,
   zoomOut,
 } from "../library/zoom";
 import { pageAt, reviewPages } from "../library/review";
@@ -121,6 +123,36 @@ describe("zoom steps", () => {
     expect(zoomOut(1.1)).toBe(1);
     expect(zoomIn(5)).toBe(3);
     expect(zoomOut(0.5)).toBe(1);
+  });
+});
+
+describe("reviewZoomKey", () => {
+  it("zooms the review only while it is shown and no page is shown alone", () => {
+    const plus = { key: "=", metaKey: true };
+    expect(reviewZoomKey(plus, { covered: false, alone: false })).toBe("in");
+    // A search lies over the review: its keys do not reach the hidden pages.
+    for (const key of ["=", "+", "-", "0"]) {
+      expect(reviewZoomKey({ key, metaKey: true }, { covered: true, alone: false })).toBeNull();
+    }
+    // The large view of one page has its own zoom.
+    expect(reviewZoomKey(plus, { covered: false, alone: true })).toBeNull();
+  });
+});
+
+describe("viewerInput", () => {
+  const key = (k: string, metaKey = false) => ({ key: k, metaKey, ctrlKey: false, altKey: false });
+
+  it("zooms, steps and closes the page shown alone", () => {
+    expect(viewerInput(key("=", true), false)).toEqual({ zoom: "in" });
+    expect(viewerInput(key("ArrowRight"), false)).toEqual({ move: "next" });
+    expect(viewerInput(key("Escape"), false)).toEqual({ move: "close" });
+    expect(viewerInput(key("a"), false)).toBeNull();
+  });
+
+  it("takes no key while a search lies over it", () => {
+    for (const k of [key("=", true), key("-", true), key("0", true), key("ArrowRight"), key("ArrowLeft"), key("Escape")]) {
+      expect(viewerInput(k, true), k.key).toBeNull();
+    }
   });
 });
 

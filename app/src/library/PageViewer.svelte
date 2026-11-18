@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { PageImage } from "./session.svelte";
   import type { ReviewPage } from "./review";
-  import { ACTUAL, ZOOMS, stepPage, viewerKey, zoomIn, zoomKey, zoomOut } from "./zoom";
+  import { ACTUAL, ZOOMS, stepPage, viewerInput, zoomIn, zoomOut } from "./zoom";
 
   // One page alone in a large view over the whole window, fit to the window. The same zoom
   // keys as the pages side; the arrow keys and Page Up and Page Down go to the page before or
@@ -11,12 +11,15 @@
     row,
     image,
     count,
+    covered = false,
     onStep,
     onClose,
   }: {
     row: ReviewPage;
     image: PageImage | undefined;
     count: number;
+    /** A search lies over the review: no key reaches the page. */
+    covered?: boolean;
     onStep: (index: number) => void;
     onClose: () => void;
   } = $props();
@@ -30,18 +33,14 @@
   });
 
   function key(event: KeyboardEvent) {
-    const step = zoomKey(event);
-    if (step) {
-      event.preventDefault();
-      zoom = step === "in" ? zoomIn(zoom) : step === "out" ? zoomOut(zoom) : ACTUAL;
-      return;
-    }
-    if (event.metaKey || event.ctrlKey || event.altKey) return;
-    const move = viewerKey(event.key);
-    if (!move) return;
+    const input = viewerInput(event, covered);
+    if (!input) return;
     event.preventDefault();
-    if (move === "close") onClose();
-    else onStep(stepPage(row.index, count, move));
+    if ("zoom" in input) {
+      const step = input.zoom;
+      zoom = step === "in" ? zoomIn(zoom) : step === "out" ? zoomOut(zoom) : ACTUAL;
+    } else if (input.move === "close") onClose();
+    else onStep(stepPage(row.index, count, input.move));
   }
 </script>
 

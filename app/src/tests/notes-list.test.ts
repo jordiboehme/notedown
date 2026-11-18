@@ -10,8 +10,9 @@ const note: NoteSummary = {
   path: "NOTE/Note/a.note",
   title: "a",
   pages: 1,
+  pagesWithText: 1,
   changedMs: 0,
-} as NoteSummary;
+};
 
 function html(notes: NoteSummary[] | null, onMarkAllSeen?: () => void) {
   return render(NotesList, {

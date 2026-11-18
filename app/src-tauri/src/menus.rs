@@ -139,7 +139,7 @@ mod tests {
     fn notes_with_one_new_note(unreadable: bool) -> (Notes, tempfile::TempDir, tempfile::TempDir) {
         let data = tempfile::tempdir().unwrap();
         let config = tempfile::tempdir().unwrap();
-        let notes_dir = data.path().join("pipeline").join("jordi").join("notes");
+        let notes_dir = data.path().join("pipeline").join("someone").join("notes");
         std::fs::create_dir_all(&notes_dir).unwrap();
         if unreadable {
             // A seen.json that is a folder cannot be read.
@@ -147,10 +147,21 @@ mod tests {
         }
         let root = data.path().to_path_buf();
         let notes = Notes::new(
-            std::sync::Arc::new(move || (root.clone(), Some("jordi".to_owned()))),
+            std::sync::Arc::new(move || (root.clone(), Some("someone".to_owned()))),
             config.path().to_path_buf(),
             std::sync::Arc::new(|_| {}),
         );
+        // The first scan sees an empty store, so the note written after it is new.
+        assert!(notes.new_notes().is_empty());
+        let note = serde_json::json!({
+            "key": "A",
+            "path": "NOTE/Note/a.note",
+            "pages": [{"pageId": "P1", "seq": 4, "blocks": [{"id": "b1", "text": "Hello"}]}],
+        });
+        std::fs::write(notes_dir.join("A.json"), note.to_string()).unwrap();
+        if !unreadable {
+            assert_eq!(notes.new_notes().len(), 1, "the fixture has one new note");
+        }
         (notes, data, config)
     }
 
@@ -158,6 +169,7 @@ mod tests {
     fn the_mark_all_seen_item_runs_seen_all_and_an_unknown_item_fails() {
         let (notes, _data, _config) = notes_with_one_new_note(false);
         assert_eq!(run_context(&notes, "ctx-mark-all-seen"), Ok(()));
+        assert!(notes.new_notes().is_empty(), "the item marked the note");
         let unknown = run_context(&notes, "ctx-nothing").unwrap_err();
         assert!(unknown.contains("ctx-nothing"), "{unknown}");
     }

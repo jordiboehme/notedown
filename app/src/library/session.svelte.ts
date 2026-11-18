@@ -14,10 +14,16 @@ function text(error: unknown): string {
   return typeof error === "string" ? error : error instanceof Error ? error.message : String(error);
 }
 
+/** The text of a note, page by page: a reload that changes it brought new text. */
+function textOf(view: NoteView): string {
+  return JSON.stringify(view.pages.map((page) => [page.pageId, page.markdown]));
+}
+
 /**
  * One review of the note at `path`: its text from `note_open`, and the images of the pages
  * near the view. The window tells it which pages are in view (`seen`); it asks Rust for the
- * near ones and drops the far ones. `close` ends it in Rust (`note_close`).
+ * near ones and drops the far ones. `reload` reads the note again when the store changed.
+ * `close` ends it in Rust (`note_close`).
  */
 export class ReviewSession {
   readonly path: string;
@@ -29,6 +35,9 @@ export class ReviewSession {
   ratios = $state<Record<number, number>>({});
 
   #visible = new Set<number>();
+  /** The `note_open` that runs, and whether another one was asked for meanwhile. */
+  #loading: Promise<void> | null = null;
+  #again = false;
   /** Counts the asks of each page: an answer of an older ask (dropped since) is not shown. */
   #asks = new Map<number, number>();
   #closed = false;
@@ -37,19 +46,69 @@ export class ReviewSession {
     this.path = path;
   }
 
-  /** Reads the note; opening it marks its text seen. */
-  async open(): Promise<void> {
+  /** Reads the note; opening it marks its text seen (when the store knows the note). */
+  open(): Promise<void> {
+    return this.#load();
+  }
+
+  /**
+   * Reads the note again (the store changed): the new view replaces the old one. Images stay
+   * for the pages whose page id at their index is the same; the others go. New text is marked
+   * seen. On an error the old view stays. A reload asked for while one runs gives one more
+   * after it, never two at once, so an older answer never replaces a newer one.
+   */
+  reload(): Promise<void> {
+    return this.#load();
+  }
+
+  #load(): Promise<void> {
+    if (this.#closed) return Promise.resolve();
+    if (this.#loading) {
+      this.#again = true;
+      return this.#loading;
+    }
+    this.#loading = (async () => {
+      try {
+        do {
+          this.#again = false;
+          await this.#read();
+        } while (this.#again && !this.#closed);
+      } finally {
+        this.#loading = null;
+      }
+    })();
+    return this.#loading;
+  }
+
+  async #read(): Promise<void> {
+    let view: NoteView;
     try {
-      const view = await invoke<NoteView>("note_open", { path: this.path });
-      if (this.#closed) return;
-      this.view = view;
-      this.error = null;
+      view = await invoke<NoteView>("note_open", { path: this.path });
+    } catch (error) {
+      // A reload that fails keeps what is shown.
+      if (!this.#closed && !this.view) this.error = text(error);
+      return;
+    }
+    if (this.#closed) return;
+    const old = this.view;
+    this.view = view;
+    this.error = null;
+    if (old) this.#keepImages(old, view);
+    if (view.key !== null && (old === null || old.key === null || textOf(old) !== textOf(view))) {
       invoke("note_seen", { key: view.key }).catch((error: unknown) =>
         console.error("notedown: note_seen failed", error),
       );
-      this.#update();
-    } catch (error) {
-      if (!this.#closed) this.error = text(error);
+    }
+    this.#update();
+  }
+
+  /** Drops the images (and ratios) of the indexes whose page is another one now, or gone. */
+  #keepImages(old: NoteView, view: NoteView) {
+    const indexes = new Set([...Object.keys(this.images), ...Object.keys(this.ratios)].map(Number));
+    for (const index of indexes) {
+      if (old.pages[index]?.pageId === view.pages[index]?.pageId) continue;
+      if (this.images[index] !== undefined) this.#drop(index);
+      delete this.ratios[index];
     }
   }
 

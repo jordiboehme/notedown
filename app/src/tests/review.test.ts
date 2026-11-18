@@ -78,7 +78,7 @@ describe("reviewPages", () => {
     expect(rows[0].markdown).toBe("# Page 1");
     expect(rows.map((r) => r.stateText)).toEqual([
       null,
-      "Not read yet.",
+      "Waiting for the OCR.",
       "Notedown could not read this page.",
       "The text of this page was cut short.",
     ]);
@@ -182,7 +182,7 @@ describe("openAt", () => {
 });
 
 describe("the review session", () => {
-  async function opened(states = Array.from({ length: 12 }, () => "done" as const)) {
+  async function opened(states: NoteView["pages"][number]["state"][] = Array.from({ length: 12 }, () => "done" as const)) {
     answerNow("note_open", view(states));
     const session = new ReviewSession(PATH);
     await session.open();
@@ -334,6 +334,116 @@ describe("the review session", () => {
     expect(session.images[0]).toBeUndefined();
     session.seen(5, true);
     expect(asked("note_page_image")).toEqual([0, 1, 2]);
+  });
+
+  /** Answers every page image asked so far with a URL that names the page. */
+  async function showAll() {
+    for (const [index, call] of pending) call.resolve(`data:image/png;base64,P${index}`);
+    pending.clear();
+    await flush();
+  }
+
+  it("reload keeps the images of the pages that stay", async () => {
+    const session = await opened(["done", "pending", "done", "done"]);
+    session.seen(0, true);
+    session.measured(1, 1872, 1404);
+    await showAll();
+    expect(asked("note_page_image")).toEqual([0, 1, 2]);
+    // The OCR read page 2 and a page was inserted before page 3.
+    const next = view(["done", "done", "done", "done", "done"]);
+    next.pages[2].pageId = "PX";
+    answerNow("note_open", next);
+    await session.reload();
+    expect(session.view).toEqual(next);
+    expect(session.images[0]).toEqual({ state: "shown", url: "data:image/png;base64,P0" });
+    expect(session.images[1]).toEqual({ state: "shown", url: "data:image/png;base64,P1" });
+    // Another page at index 2: its old image goes and it is asked again.
+    expect(session.images[2]).toEqual({ state: "loading" });
+    expect(asked("note_page_image")).toEqual([0, 1, 2, 2]);
+    // The ratio of a page that stayed is kept.
+    expect(reviewPages(session.view!, session.ratios)[1].ratio).toBeCloseTo(1872 / 1404);
+  });
+
+  it("reload drops images past a shorter note", async () => {
+    const session = await opened(["done", "done", "done"]);
+    session.seen(0, true);
+    await showAll();
+    answerNow("note_open", view(["done", "done"]));
+    await session.reload();
+    expect(session.view?.pages.length).toBe(2);
+    expect(Object.keys(session.images)).toEqual(["0", "1"]);
+    expect(asked("note_page_drop")).toEqual([]);
+  });
+
+  it("reload ends the call of a page that went while it loads", async () => {
+    const session = await opened(["done", "done", "done"]);
+    session.seen(0, true);
+    answerNow("note_open", view(["done"]));
+    await session.reload();
+    expect(asked("note_page_drop")).toEqual([1, 2]);
+    expect(Object.keys(session.images)).toEqual(["0"]);
+  });
+
+  it("a failed reload keeps the view", async () => {
+    const session = await opened(["done", "pending"]);
+    const before = session.view;
+    answerError("note_open", "This note is not there anymore.");
+    await session.reload();
+    expect(session.view).toBe(before);
+    expect(session.error).toBeNull();
+  });
+
+  it("marks new text seen after a reload, and nothing without new text", async () => {
+    const session = await opened(["done", "pending"]);
+    expect(asked("note_seen")).toHaveLength(1);
+    answerNow("note_open", view(["done", "pending"]));
+    await session.reload();
+    expect(asked("note_seen")).toHaveLength(1);
+    answerNow("note_open", view(["done", "done"]));
+    await session.reload();
+    expect(asked("note_seen")).toHaveLength(2);
+    expect(calls.at(-1)).toEqual({ command: "note_seen", args: { key: "k1" } });
+  });
+
+  it("no note_seen for a note without a key", async () => {
+    const unread = { ...view(["pending", "pending"]), key: null };
+    answerNow("note_open", unread);
+    const session = new ReviewSession(PATH);
+    await session.open();
+    expect(session.view).toEqual(unread);
+    answerNow("note_open", { ...view(["done", "pending"]), key: null });
+    await session.reload();
+    expect(session.view?.pages[0].markdown).toBe("# Page 1");
+    expect(asked("note_seen")).toEqual([]);
+    // The store came to know the note: its text is seen.
+    answerNow("note_open", view(["done", "done"]));
+    await session.reload();
+    expect(calls.filter((c) => c.command === "note_seen").map((c) => c.args)).toEqual([{ key: "k1" }]);
+  });
+
+  it("reloads asked for while one runs give one more, and an older answer never wins", async () => {
+    const session = await opened(["pending"]);
+    const releases: ((value: unknown) => void)[] = [];
+    const held = () => new Promise((resolve) => releases.push(resolve));
+    answers.set("note_open", [held, held, held]);
+    const first = session.reload();
+    const second = session.reload();
+    const third = session.reload();
+    expect(calls.filter((c) => c.command === "note_open")).toHaveLength(2);
+    releases[0](view(["done"]));
+    await flush();
+    expect(calls.filter((c) => c.command === "note_open")).toHaveLength(3);
+    releases[1](view(["done", "done"]));
+    await Promise.all([first, second, third]);
+    expect(calls.filter((c) => c.command === "note_open")).toHaveLength(3);
+    expect(session.view?.pages.length).toBe(2);
+  });
+
+  it("a reload after the close does nothing", async () => {
+    const session = await opened(["pending"]);
+    session.close();
+    await session.reload();
+    expect(calls.filter((c) => c.command === "note_open")).toHaveLength(1);
   });
 
   it("a note opened while the session closed is not marked seen", async () => {

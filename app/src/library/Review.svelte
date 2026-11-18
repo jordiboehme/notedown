@@ -1,11 +1,14 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
+  import { NOTES_EVENT } from "../lib/library-types";
   import { ReviewSession } from "./session.svelte";
   import { noteTitle, reviewNotice, reviewPages } from "./review";
   import ReviewPages from "./ReviewPages.svelte";
 
-  // The review of one note: opened when it mounts (that marks it seen), closed in Rust when it
-  // goes. The window keys it by the path, so another note is another review.
+  // The review of one note: opened when it mounts (that marks it seen), read again when the
+  // store changed (new page text shows while it is open), closed in Rust when it goes. The
+  // window keys it by the path, so another note is another review.
   let { path, onBack }: { path: string; onBack: () => void } = $props();
 
   // svelte-ignore state_referenced_locally
@@ -15,7 +18,11 @@
 
   onMount(() => {
     void session.open();
-    return () => session.close();
+    const stop = listen(NOTES_EVENT, () => void session.reload());
+    return () => {
+      void stop.then((unlisten) => unlisten());
+      session.close();
+    };
   });
 </script>
 

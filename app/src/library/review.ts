@@ -27,7 +27,7 @@ export type ReviewPage = {
 };
 
 const STATE_TEXTS: Record<Exclude<PageState, "done">, string> = {
-  pending: "Not read yet.",
+  pending: "Waiting for the OCR.",
   failed: "Notedown could not read this page.",
   truncated: "The text of this page was cut short.",
 };

@@ -331,6 +331,14 @@ as an option and the call fails. Deleted notes are left out. Each hit has:
 - `page`: the page number, from 1.
 - `context`: the first line of the block that holds a word of the query, cut at 200 characters.
 
+## Pipeline note
+
+`notedown pipeline note --key KEY [--data DIR] [--account A]` prints the Markdown of one note: the same
+text as its file in the Markdown folder and `get_note` of the MCP server, but for the `generated:` time.
+It has every page of the note. A page that has no text yet keeps its heading and its `page_id` comment.
+`--account` can be left out when the data folder has only one account. It creates and changes nothing.
+An unknown or deleted note exits with code 1 and `error: no note KEY`.
+
 ## Markdown files
 
 The pipeline can keep the text of each note as a Markdown file in a folder you pick. The folder

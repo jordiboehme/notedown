@@ -3752,3 +3752,119 @@ fn pipeline_search_never_takes_an_option_as_the_query() {
         assert!(out.stdout.is_empty(), "{args:?}");
     }
 }
+
+/// Saves note `key` with page 1 read (one block per text) and page 2 still waiting for the
+/// OCR into the store of `tester`.
+#[cfg(feature = "ocr")]
+fn save_half_read_note(data: &std::path::Path, key: &str, title: &str, texts: &[&str]) {
+    use notedown_pipeline::model::NoteState;
+    use notedown_pipeline::store::{TextStore, WriterLock};
+    let blocks: Vec<serde_json::Value> = texts
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            serde_json::json!({"id": format!("b{}", i + 1), "label": "text",
+                "bbox": [0, 0, 10, 10], "text": text})
+        })
+        .collect();
+    let note: NoteState = serde_json::from_value(serde_json::json!({
+        "key": key,
+        "path": format!("NOTE/Note/{title}.note"),
+        "title": title,
+        "pages": [
+            {"pageId": "P1", "position": 0, "seq": 1, "state": "done", "blocks": blocks},
+            {"pageId": "P2", "position": 1, "state": "pending", "blocks": []},
+        ],
+    }))
+    .unwrap();
+    let lock = WriterLock::take(data).unwrap();
+    let store = TextStore::open_writer(data, "tester", &lock).unwrap();
+    store.save_note(&lock, &note).unwrap();
+}
+
+#[cfg(feature = "ocr")]
+fn pipeline_note(data: &std::path::Path, key: &str) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["pipeline", "note", "--data"])
+        .arg(data)
+        .args(["--account", "tester", "--key", key])
+        .output()
+        .unwrap()
+}
+
+/// The lines of a Markdown document without the `generated:` line of its frontmatter.
+#[cfg(feature = "ocr")]
+fn without_generated(text: &str) -> Vec<&str> {
+    let mut fences = 0;
+    text.split('\n')
+        .filter(|line| {
+            if *line == "---" {
+                fences += 1;
+            }
+            !(fences == 1 && line.starts_with("generated:"))
+        })
+        .collect()
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn pipeline_note_prints_the_markdown_file_text() {
+    let dir = data_with_an_account();
+    save_half_read_note(
+        dir.path(),
+        "F1",
+        "Plan",
+        &["The plan\nfor Monday", "Buy milk"],
+    );
+    let out = pipeline_note(dir.path(), "F1");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let printed = String::from_utf8(out.stdout).unwrap();
+
+    // What the Markdown folder writer writes for the same note.
+    let md = tempfile::tempdir().unwrap();
+    let store = notedown_pipeline::store::TextStore::at(dir.path(), "tester").unwrap();
+    let mut writer =
+        notedown_pipeline::markdown::Writer::new(md.path(), &md.path().join("manifest.json"))
+            .unwrap();
+    writer.sync(&store, "tester", &[]).unwrap();
+    let file = std::fs::read_to_string(md.path().join("Plan.md")).unwrap();
+
+    assert_eq!(without_generated(&printed), without_generated(&file));
+    assert!(printed.contains("<!-- notedown://tester/F1/P1#b1 -->\nThe plan\nfor Monday"));
+    // The page that waits for the OCR is there with its id and no text.
+    assert!(
+        printed.ends_with("## Page 2\n<!-- page_id: P2 -->\n"),
+        "{printed}"
+    );
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn pipeline_note_of_an_unknown_key_fails() {
+    let dir = data_with_an_account();
+    save_half_read_note(dir.path(), "F1", "Plan", &["The plan"]);
+    let out = pipeline_note(dir.path(), "F9");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("error: no note F9"), "{err}");
+
+    // A deleted note is no note either.
+    {
+        use notedown_pipeline::store::{TextStore, WriterLock};
+        let lock = WriterLock::take(dir.path()).unwrap();
+        let store = TextStore::open_writer(dir.path(), "tester", &lock).unwrap();
+        let mut note = store.note("F1").unwrap().unwrap();
+        note.deleted = true;
+        store.save_note(&lock, &note).unwrap();
+    }
+    let out = pipeline_note(dir.path(), "F1");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("error: no note F1"), "{err}");
+}

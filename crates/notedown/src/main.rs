@@ -144,6 +144,20 @@ enum PipelineAction {
         #[arg(long, value_name = "N", default_value_t = notedown_pipeline::search::DEFAULT_LIMIT)]
         limit: usize,
     },
+    /// Print the Markdown of one note: the same text as its file in the Markdown folder and
+    /// get_note of the MCP server, with every page (a page without text has its heading only).
+    /// Creates and changes nothing
+    Note {
+        /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
+        #[arg(long, value_name = "DIR")]
+        data: Option<PathBuf>,
+        /// The account slug (can be left out when the data folder has only one account)
+        #[arg(long)]
+        account: Option<String>,
+        /// The note key
+        #[arg(long, value_name = "KEY")]
+        key: String,
+    },
     /// Move the bookmark of a consumer to --up-to, never backwards, and print it as JSON
     Ack {
         /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
@@ -2628,6 +2642,17 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
             let store = TextStore::at(&data, &slug)?;
             let hits = notedown_pipeline::search::search(&store, &slug, &query, limit)?;
             println!("{}", to_json(&hits));
+        }
+        PipelineAction::Note { data, account, key } => {
+            let data = data_dir(data)?;
+            let slug = resolve_account(&data, account.as_deref())?;
+            // `at` reads the store where it is and creates nothing.
+            let store = TextStore::at(&data, &slug)?;
+            let note = store
+                .note(&key)?
+                .filter(|note| !note.deleted)
+                .ok_or_else(|| anyhow!("no note {key}"))?;
+            print!("{}", notedown_pipeline::format::note_document(&note, &slug));
         }
         PipelineAction::Ack {
             data,

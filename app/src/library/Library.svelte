@@ -43,6 +43,7 @@
   import NotesList from "./NotesList.svelte";
   import RecycleBin from "./RecycleBin.svelte";
   import Review from "./Review.svelte";
+  import SearchResults from "./SearchResults.svelte";
   import Sidebar from "./Sidebar.svelte";
   import StateNotice from "./StateNotice.svelte";
   import StatusLine from "./StatusLine.svelte";
@@ -64,6 +65,8 @@
   import { entryActions, folderAt, followChange, jobRows, type Change } from "./actions";
   import { emptyConfirm, recycleRows } from "./recycle";
   import { drag, folderUnder, letGo, moveTo, stopDrag } from "./drag.svelte";
+  import { isFindKey, searchPlace, type ResultRow } from "./search";
+  import { LibrarySearch } from "./search.svelte";
   import "../lib/system.css";
   import "./library.css";
 
@@ -90,6 +93,10 @@
   /** The name of a new folder is being typed. */
   let naming = $state(false);
   let now = $state(Date.now());
+  /** The search of the toolbar; while it has text, the main area shows its results. */
+  const search = new LibrarySearch(() => searchPlace(library.selection, newNotes, allNotes));
+  const searching = $derived(search.text.trim() !== "");
+  let toolbar: Toolbar | undefined = $state();
   /** The clock of the job rows: done rows go after a while. */
   let tick = $state(Date.now());
 
@@ -154,6 +161,13 @@
     untrack(() => {
       for (const item of missing) void listFolder(item.path, item.foldersOnly);
     });
+  });
+
+  // "This folder" follows the shown place: a search that is on runs again for it.
+  $effect(() => {
+    const selection = library.selection;
+    void (selection.kind === "folder" || selection.kind === "note" ? selection.path : selection.kind);
+    untrack(() => search.rerun());
   });
 
   function loadNotes() {
@@ -281,6 +295,22 @@
     invoke<number>("notes_seen_all").then(loadNotes).catch((error) => (library.notice = String(error)));
   }
 
+  /** A row of the search results: it opens or selects what it names, and the search ends. */
+  function openRow(row: ResultRow) {
+    search.clear();
+    if (row.kind === "folder") select(row.path);
+    else if (row.kind === "note") openNote(row.path);
+    else pickFile(row.path);
+  }
+
+  function keydown(event: KeyboardEvent) {
+    if (event.key === "Escape" && drag.current) stopDrag();
+    if (isFindKey(event)) {
+      event.preventDefault();
+      toolbar?.focusSearch();
+    }
+  }
+
   function settings(page: string | null) {
     invoke("open_settings", { page }).catch(report("open_settings"));
   }
@@ -292,12 +322,12 @@
   onpointermove={moveTo}
   onpointerup={released}
   onpointercancel={stopDrag}
-  onkeydown={(event) => event.key === "Escape" && drag.current && stopDrag()}
+  onkeydown={keydown}
 />
 
 <div class="library window">
   <StatusLine status={status.current} {now} onSetUp={() => settings("setup")} />
-  <Toolbar view={library.viewMode} onView={(view) => void chooseView(view)} />
+  <Toolbar bind:this={toolbar} view={library.viewMode} onView={(view) => void chooseView(view)} {search} />
   <div class="body">
     <Sidebar
       notes={items.notes}
@@ -312,7 +342,9 @@
       onNewMenu={newMenu}
     />
     <main class="main">
-      {#if library.selection.kind === "new"}
+      {#if searching}
+        <SearchResults {search} onRow={openRow} />
+      {:else if library.selection.kind === "new"}
         <NotesList
           title="New notes"
           notes={newNotes}

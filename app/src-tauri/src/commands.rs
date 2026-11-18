@@ -108,6 +108,12 @@ impl ConfigState {
         self.reset.load(Ordering::SeqCst)
     }
 
+    /// Keeps `dir` as the folder of the last Save Markdown.
+    pub fn set_last_markdown_save_dir(&self, dir: PathBuf) -> Result<(), String> {
+        self.update(|c| c.last_markdown_save_dir = Some(dir))
+            .map(|_| ())
+    }
+
     /// The config as it is now.
     pub fn current(&self) -> AppConfig {
         self.config
@@ -1493,6 +1499,32 @@ pub fn library_menu(
     target: crate::menus::MenuTarget,
 ) -> Result<(), String> {
     crate::menus::popup(&window, target)
+}
+
+/// Saves the Markdown of the note at `path` into a file the user picks in the save dialog.
+/// Answers the saved file, `None` when the user cancelled or the save failed (Rust shows that
+/// in a dialog). Off the main thread: the dialog waits for the user.
+#[tauri::command]
+pub async fn note_save_markdown(app: tauri::AppHandle, path: String) -> Option<String> {
+    let shown = app.clone();
+    let saved =
+        tauri::async_runtime::spawn_blocking(move || crate::save_markdown::save(&app, &path))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+    match saved {
+        Ok(file) => file.map(|f| f.to_string_lossy().into_owned()),
+        Err(error) => {
+            crate::save_markdown::show_error(&shown, &error);
+            None
+        }
+    }
+}
+
+/// The review shows the note at `path` (`None` when it closed), which can be saved when
+/// `can_save`: the File menu's "Save Markdown..." follows.
+#[tauri::command]
+pub fn review_shown(app: tauri::AppHandle, path: Option<String>, can_save: bool) {
+    crate::save_markdown::review_shown(&app, path, can_save);
 }
 
 /// The note at `path` for the review: the Markdown of each page from the pipeline's store, and

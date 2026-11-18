@@ -60,6 +60,8 @@ pub struct AppConfig {
     pub last_update_shown: Option<String>,
     /// Which desktop notifications to show; off by default.
     pub notifications: NotificationChoices,
+    /// The folder of the last Save Markdown; the next save starts there.
+    pub last_markdown_save_dir: Option<PathBuf>,
 }
 
 /// The switch of the desktop notifications and the choice of each event.
@@ -339,6 +341,7 @@ impl Default for AppConfig {
             last_update_check_ms: None,
             last_update_shown: None,
             notifications: NotificationChoices::default(),
+            last_markdown_save_dir: None,
         }
     }
 }
@@ -504,6 +507,7 @@ mod tests {
             last_update_check_ms: Some(1_763_300_000_000),
             last_update_shown: Some("0.2.0".into()),
             notifications: NotificationChoices::default(),
+            last_markdown_save_dir: Some(PathBuf::from("/Users/someone/Notes")),
         }
     }
 
@@ -534,6 +538,26 @@ mod tests {
         let text = fs::read_to_string(dir.path().join(FILE)).unwrap();
         assert!(text.contains("\"lastUpdateShown\""), "{text}");
         assert_eq!(load(dir.path()).last_update_shown.as_deref(), Some("0.2.0"));
+    }
+
+    #[test]
+    fn the_last_markdown_save_folder_round_trips_and_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        // A config of an earlier version saved no Markdown yet.
+        fs::write(dir.path().join(FILE), r#"{"mode":"local"}"#).unwrap();
+        assert_eq!(load(dir.path()).last_markdown_save_dir, None);
+        assert_eq!(AppConfig::default().last_markdown_save_dir, None);
+        let config = AppConfig {
+            last_markdown_save_dir: Some(PathBuf::from("/Users/someone/Notes")),
+            ..AppConfig::default()
+        };
+        save(dir.path(), &config).unwrap();
+        let text = fs::read_to_string(dir.path().join(FILE)).unwrap();
+        assert!(text.contains("\"lastMarkdownSaveDir\""), "{text}");
+        assert_eq!(
+            load(dir.path()).last_markdown_save_dir,
+            Some(PathBuf::from("/Users/someone/Notes"))
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ use crate::windows::WindowKind;
 /// from the menu bar's.
 pub const CONTEXT_PREFIX: &str = "ctx-";
 const MARK_ALL_SEEN_ID: &str = "ctx-mark-all-seen";
+const SAVE_MARKDOWN_ID: &str = "ctx-save-markdown";
 
 /// What the user opened a context menu on.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -38,25 +39,38 @@ pub struct MenuEntry {
 pub struct MenuTargetState(pub Mutex<Option<MenuTarget>>);
 
 /// The items for `target`; `has_text` says whether a note target has text.
-pub fn context_items(target: &MenuTarget, _has_text: bool) -> Vec<MenuEntry> {
+pub fn context_items(target: &MenuTarget, has_text: bool) -> Vec<MenuEntry> {
     match target {
         MenuTarget::NewNotes => vec![MenuEntry {
             id: MARK_ALL_SEEN_ID,
             text: "Mark All as Seen",
             enabled: true,
         }],
-        MenuTarget::Note { .. } => Vec::new(),
+        MenuTarget::Note { .. } => vec![MenuEntry {
+            id: SAVE_MARKDOWN_ID,
+            text: crate::save_markdown::MENU_TEXT,
+            enabled: has_text,
+        }],
     }
+}
+
+/// Whether the notes index knows the note at `path` with text on some page.
+pub fn has_text(notes: &Notes, path: &str) -> bool {
+    notes.at_path(path).is_some_and(|n| n.pages_with_text > 0)
 }
 
 /// Builds the native menu of `target` and pops it up at the pointer of `window`. The target is
 /// kept until the next menu, for [`on_context`].
 pub fn popup<R: Runtime>(window: &WebviewWindow<R>, target: MenuTarget) -> Result<(), String> {
-    let items = context_items(&target, false);
+    let app = window.app_handle();
+    let text = match &target {
+        MenuTarget::Note { path } => has_text(&app.state::<Notes>(), path),
+        MenuTarget::NewNotes => false,
+    };
+    let items = context_items(&target, text);
     if items.is_empty() {
         return Ok(());
     }
-    let app = window.app_handle();
     let menu = Menu::new(app).map_err(|e| e.to_string())?;
     for entry in &items {
         let item = MenuItem::with_id(app, entry.id, entry.text, entry.enabled, None::<&str>)
@@ -83,6 +97,19 @@ pub fn run_context(notes: &Notes, id: &str) -> Result<(), String> {
 /// The user picked the context item `id`. The work runs off the main thread, which is the one
 /// that delivers menu events. A failure goes to the library window as its notice.
 pub fn on_context(app: &AppHandle, id: &str) {
+    if id == SAVE_MARKDOWN_ID {
+        // The note the menu was opened on; its save shows its own failure.
+        let target = app
+            .state::<MenuTargetState>()
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(MenuTarget::Note { path }) = target {
+            crate::save_markdown::save_in_background(app, path);
+        }
+        return;
+    }
     let id = id.to_owned();
     let notes = app.state::<Notes>().inner().clone();
     let app = app.clone();
@@ -119,7 +146,14 @@ mod tests {
         let note = MenuTarget::Note {
             path: "NOTE/a.note".to_owned(),
         };
-        assert!(context_items(&note, true).is_empty());
+        assert_eq!(
+            context_items(&note, true),
+            [entry("ctx-save-markdown", "Save Markdown...", true)]
+        );
+        assert_eq!(
+            context_items(&note, false),
+            [entry("ctx-save-markdown", "Save Markdown...", false)]
+        );
     }
 
     #[test]
@@ -172,6 +206,13 @@ mod tests {
         assert!(notes.new_notes().is_empty(), "the item marked the note");
         let unknown = run_context(&notes, "ctx-nothing").unwrap_err();
         assert!(unknown.contains("ctx-nothing"), "{unknown}");
+    }
+
+    #[test]
+    fn a_note_has_text_when_the_index_knows_it_with_text() {
+        let (notes, _data, _config) = notes_with_one_new_note(false);
+        assert!(has_text(&notes, "NOTE/Note/a.note"));
+        assert!(!has_text(&notes, "NOTE/Note/other.note"));
     }
 
     #[test]

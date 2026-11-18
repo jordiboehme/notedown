@@ -3,7 +3,7 @@
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Rect, Runtime};
+use tauri::{AppHandle, Manager, Rect, Runtime};
 
 use crate::status::Attention;
 use crate::windows;
@@ -168,6 +168,7 @@ pub fn on_menu_event(app: &AppHandle, id: &str) {
         }
         CHECK_UPDATES_ID => crate::check_update_from_menu(app),
         QUIT_ID => crate::request_quit(app),
+        crate::save_markdown::MENU_ID => crate::save_markdown::on_menu(app),
         _ if id.starts_with(crate::menus::CONTEXT_PREFIX) => crate::menus::on_context(app, id),
         _ => {}
     }
@@ -175,8 +176,9 @@ pub fn on_menu_event(app: &AppHandle, id: &str) {
 
 /// The app menu that macOS shows while a window makes the app Regular, with its native Quit
 /// replaced by ours: the native one ends the process without the event loop, so the children
-/// would not be stopped first.
-pub fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
+/// would not be stopped first. The File submenu gets "Save Markdown...", whose item is kept in
+/// [`crate::save_markdown::SaveMenuItem`].
+pub fn app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     use tauri::menu::MenuItemKind;
     let menu = Menu::default(app)?;
     // The app submenu comes first and its last item is the native Quit (Menu::default in
@@ -195,6 +197,13 @@ pub fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             true,
             Some("CmdOrCtrl+Q"),
         )?)?;
+    }
+    let save = crate::save_markdown::add_to_file_menu(app, &menu)?;
+    if let Some(kept) = app.try_state::<crate::save_markdown::SaveMenuItem>() {
+        *kept
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(save);
     }
     Ok(menu)
 }

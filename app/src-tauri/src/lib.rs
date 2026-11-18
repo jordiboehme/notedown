@@ -17,6 +17,7 @@ pub mod processes;
 pub mod quit;
 pub mod rest;
 pub mod review;
+pub mod save_markdown;
 pub mod search;
 pub mod serve_info;
 pub mod setup;
@@ -103,6 +104,8 @@ pub fn run() {
         .on_window_event(windows::on_window_event)
         .manage(Shown::default())
         .manage(menus::MenuTargetState::default())
+        .manage(save_markdown::SaveTarget::default())
+        .manage(save_markdown::SaveMenuItem::default())
         .manage(Arc::new(QuitFlow::new()))
         .manage(Arc::new(login::LoginGate::default()))
         .setup(|app| {
@@ -299,6 +302,8 @@ pub fn run() {
             commands::notes_seen_all,
             commands::notes_search,
             commands::library_menu,
+            commands::note_save_markdown,
+            commands::review_shown,
             commands::note_open,
             commands::note_page_image,
             commands::note_close,
@@ -1019,6 +1024,8 @@ mod tests {
                 "note_page_image",
                 "note_close",
                 "note_page_drop",
+                "note_save_markdown",
+                "review_shown",
                 "open_settings"
             ])
         );
@@ -1093,7 +1100,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 78);
+        assert_eq!(handler_commands().len(), 80);
     }
 
     #[test]
@@ -1153,6 +1160,8 @@ mod tests {
             "note_page_image",
             "note_close",
             "note_page_drop",
+            "note_save_markdown",
+            "review_shown",
             "markdown_dir",
             "set_markdown_dir",
             "show_markdown_dir",
@@ -1241,6 +1250,8 @@ mod tests {
             "note_page_image",
             "note_close",
             "note_page_drop",
+            "note_save_markdown",
+            "review_shown",
         ] {
             assert!(granted("library").contains(command), "{command}");
             for window in ["panel", "settings"] {

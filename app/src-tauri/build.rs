@@ -59,6 +59,8 @@ const COMMANDS: &[&str] = &[
     "note_page_image",
     "note_close",
     "note_page_drop",
+    "note_save_markdown",
+    "review_shown",
     "markdown_dir",
     "set_markdown_dir",
     "show_markdown_dir",

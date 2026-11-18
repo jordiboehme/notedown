@@ -240,7 +240,14 @@ pub struct LastError {
     pub text: String,
     /// Ms since the epoch.
     pub at_ms: u64,
+    /// What the failure is, for a program to act on: [`TOKEN_REFUSED`] or none. An older
+    /// pipeline writes none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
+
+/// The [`LastError::code`] of a token the server refused (401): a new login fixes it.
+pub const TOKEN_REFUSED: &str = "token_refused";
 
 /// `stats.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,10 +276,10 @@ pub fn source_error(data: &Path) -> Result<Option<LastError>> {
     read_json(&data.join(PIPELINE_DIR).join(LAST_ERROR_FILE))
 }
 
-/// Keeps `error` as the last error of the source. The same text again keeps the first time
-/// and writes nothing.
+/// Keeps `error` as the last error of the source. The same text and code again keeps the
+/// first time and writes nothing; a code an older pipeline did not write is written.
 pub fn set_source_error(data: &Path, _w: &WriterLock, error: LastError) -> Result<()> {
-    if source_error(data)?.is_some_and(|e| e.text == error.text) {
+    if source_error(data)?.is_some_and(|e| e.text == error.text && e.code == error.code) {
         return Ok(());
     }
     let path = data.join(PIPELINE_DIR).join(LAST_ERROR_FILE);
@@ -920,7 +927,7 @@ impl TextStore {
         })
     }
 
-    /// Sets `last_error`. The same text again keeps the first time and writes nothing, so a
+    /// Sets `last_error`. The same text and code again keeps the first time and writes nothing, so a
     /// failure that repeats every second shows since when it lasts. Unlike the other stats it
     /// is written also while the store waits for a repair (the error may be why), but never
     /// into a store folder that is gone.
@@ -929,7 +936,7 @@ impl TextStore {
         if stats
             .last_error
             .as_ref()
-            .is_some_and(|e| e.text == error.text)
+            .is_some_and(|e| e.text == error.text && e.code == error.code)
         {
             return Ok(stats);
         }

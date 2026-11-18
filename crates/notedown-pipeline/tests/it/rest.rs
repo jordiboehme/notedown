@@ -19,6 +19,7 @@ use notedown_pipeline::cursor;
 use notedown_pipeline::rest::RestSource;
 use notedown_pipeline::setup::Setup;
 use notedown_pipeline::source::{NoteBytes, Removal, ServerData};
+use notedown_pipeline::store::TOKEN_REFUSED;
 use notedown_pipeline::worker::{Clock, Worker};
 use tempfile::TempDir;
 
@@ -474,12 +475,15 @@ fn a_refused_token_is_left_out_and_reported() {
             refused_message(&rig.server.url(), rig.local.path(), SLUG)
         )]
     );
-    assert!(src.records(SLUG).is_err());
+    assert_eq!(src.refused(), [SLUG.to_string()]);
+    // The error says what it is, for the app to offer a new login.
+    assert_eq!(src.records(SLUG).unwrap_err().code(), Some(TOKEN_REFUSED));
     assert!(src.journal(SLUG, 1, 10).is_err());
     // A new login (notedown connect) settles it.
     rig.connect(SLUG);
     assert_eq!(src.accounts().unwrap().len(), 2);
     assert!(src.refusals().is_empty());
+    assert!(src.refused().is_empty());
 }
 
 #[test]
@@ -547,8 +551,10 @@ fn a_token_under_the_wrong_name_is_left_out() {
     assert!(src.records("anna").is_err());
     assert!(src.journal("anna", 1, 10).is_err());
     assert!(src.note("anna", "NOTE/Note/test1.note").is_err());
-    assert!(src.digests("anna").is_err());
+    // Another account's token is no refused token: a new login of anna would not fix it.
+    assert_eq!(src.digests("anna").unwrap_err().code(), None);
     assert_eq!(src.accounts().unwrap(), vec![]);
+    assert!(src.refused().is_empty());
     let file = rig.tokens().join("anna.token");
     assert_eq!(
         src.refusals(),
@@ -844,10 +850,62 @@ fn a_refused_token_on_a_fresh_folder_is_the_last_error() {
         e.text,
         refused_message(&rig.server.url(), rig.local.path(), SLUG)
     );
+    assert_eq!(e.code.as_deref(), Some(TOKEN_REFUSED));
+    let json = std::fs::read_to_string(rig.local.path().join("pipeline/last_error.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(json["code"], "token_refused");
     // A new login clears it.
     rig.connect(SLUG);
     w.run(stop_at(&clock, clock.now_ms() + 2_000)).unwrap();
     assert!(status(&clock).last_error.is_none(), "{:?}", said.lines());
+}
+
+#[test]
+fn a_refusal_kept_by_an_older_pipeline_gets_its_code() {
+    let rig = Rig::new();
+    rig.connect(SLUG);
+    let clock = TestClock::at(now_ms());
+    let s = rest_setup(&rig, &clock);
+    revoke_all_tokens(&rig.d.data, SLUG).unwrap();
+    // Notedown 0.1.0 kept the same text without a code.
+    let text = refused_message(&rig.server.url(), rig.local.path(), SLUG);
+    let pipeline = rig.local.path().join("pipeline");
+    std::fs::create_dir_all(&pipeline).unwrap();
+    std::fs::write(
+        pipeline.join("last_error.json"),
+        serde_json::json!({"text": text, "atMs": 1}).to_string(),
+    )
+    .unwrap();
+    let said = Said::default();
+    worker(&s, &clock, &said)
+        .run(stop_at(&clock, clock.now_ms() + 2_000))
+        .unwrap();
+    let e = notedown_pipeline::status::status_facts(rig.local.path(), SLUG, clock.now_ms())
+        .unwrap()
+        .last_error
+        .expect("the refusal is the last error");
+    assert_eq!(e.text, text);
+    assert_eq!(e.code.as_deref(), Some(TOKEN_REFUSED));
+}
+
+#[test]
+fn a_token_of_another_account_is_no_refused_token() {
+    let rig = Rig::new();
+    create_account(&rig.d.data, "anna");
+    let token = login(&rig.server.url(), "anna@example.org", "secret");
+    write_token(&rig.tokens(), SLUG, &token);
+    let clock = TestClock::at(now_ms());
+    let s = rest_setup(&rig, &clock);
+    let said = Said::default();
+    worker(&s, &clock, &said)
+        .run(stop_at(&clock, clock.now_ms() + 2_000))
+        .unwrap();
+    let e = notedown_pipeline::status::status_facts(rig.local.path(), SLUG, clock.now_ms())
+        .unwrap()
+        .last_error
+        .expect("the wrong token is the last error");
+    assert!(e.text.contains("holds a token of anna"), "{}", e.text);
+    assert_eq!(e.code, None);
 }
 
 #[test]

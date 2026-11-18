@@ -413,13 +413,26 @@ describe("the review session", () => {
     expect(Object.keys(session.images)).toEqual(["0"]);
   });
 
-  it("a failed reload keeps the view", async () => {
+  it("a failed reload keeps the view and says why", async () => {
     const session = await opened(["done", "pending"]);
     const before = session.view;
+    expect(session.stale).toBeNull();
     answerError("note_open", "This note is not there anymore.");
     await session.reload();
     expect(session.view).toBe(before);
     expect(session.error).toBeNull();
+    expect(session.stale).toBe("This note is not there anymore.");
+    // A reload that works again ends the line.
+    answerNow("note_open", view(["done", "pending"]));
+    await session.reload();
+    expect(session.stale).toBeNull();
+  });
+
+  it("a reload the window ended itself is no reason to show", async () => {
+    const session = await opened(["done"]);
+    answerError("note_open", "The review was closed.");
+    await session.reload();
+    expect(session.stale).toBeNull();
   });
 
   it("marks new text seen after a reload, and nothing without new text", async () => {

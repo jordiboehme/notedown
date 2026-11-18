@@ -29,6 +29,11 @@ export class ReviewSession {
   readonly path: string;
   view = $state<NoteView | null>(null);
   error = $state<string | null>(null);
+  /**
+   * Why the last reload failed while the old view stays (a gone note says so); null after a
+   * reload that worked.
+   */
+  stale = $state<string | null>(null);
   /** The images by page index; a page without one shows its placeholder. */
   images = $state<Record<number, PageImage>>({});
   /** Width by height of the images loaded so far, by page index; kept after a drop. */
@@ -87,14 +92,18 @@ export class ReviewSession {
     try {
       view = await invoke<NoteView>("note_open", { path: this.path });
     } catch (error) {
-      // A reload that fails keeps what is shown.
-      if (!this.#closed && !this.view) this.error = text(error);
+      if (this.#closed) return;
+      const why = text(error);
+      // A reload that fails keeps what is shown and says why above it.
+      if (!this.view) this.error = why;
+      else if (!ENDED.has(why)) this.stale = why;
       return;
     }
     if (this.#closed) return;
     const old = this.view;
     this.view = view;
     this.error = null;
+    this.stale = null;
     if (old) this.#keepImages(old, view);
     // A page shown alone that is not in the note anymore: its last page, or no view.
     if (this.focused !== null && this.focused >= view.pages.length) {

@@ -70,6 +70,7 @@
     </div>
   {/if}
 </header>
+{#if session.stale}<p class="notice">{session.stale}</p>{/if}
 {#if notice}<p class="notice">{notice}</p>{/if}
 
 {#if session.error}

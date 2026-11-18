@@ -192,7 +192,7 @@ pub(crate) mod tests {
     use super::*;
     use std::process::Command;
 
-    const WAIT: Duration = Duration::from_secs(10);
+    const WAIT: Duration = crate::test_procs::HANG_GUARD;
 
     fn wait_until(mut done: impl FnMut() -> bool) -> bool {
         let until = Instant::now() + WAIT;

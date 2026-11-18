@@ -12,7 +12,7 @@ use crate::config::{AppConfig, Mode};
 use crate::process::{self, ChildKind, Launch, SpawnFn};
 
 const GRACE: Duration = Duration::from_millis(200);
-const WAIT: Duration = Duration::from_secs(10);
+const WAIT: Duration = crate::test_procs::HANG_GUARD;
 const START_MS: u64 = 1_000_000;
 
 struct Rig {
@@ -333,13 +333,14 @@ fn stop_is_quick_when_the_child_ends_on_term() {
         ChildKind::Server,
         rig.spawn(&script),
         rig.clock(),
-        Duration::from_secs(30),
+        // A grace far past the guard: a stop that waited for it fails the test.
+        Duration::from_secs(600),
     );
     sup.start(vec![]);
     running_pid(&sup);
     let began = Instant::now();
     sup.stop();
-    assert!(began.elapsed() < Duration::from_secs(10));
+    assert!(began.elapsed() < WAIT);
     assert_eq!(sup.state(), ChildState::Stopped);
 }
 
@@ -530,8 +531,8 @@ fn a_listener_may_read_the_state_while_the_child_starts() {
         starter.start(vec![]);
         let _ = done_tx.send(());
     });
-    let finished = done_rx.recv_timeout(Duration::from_secs(5)).is_ok()
-        && wait_until(|| read.lock().unwrap().len() >= 2);
+    let finished =
+        done_rx.recv_timeout(WAIT).is_ok() && wait_until(|| read.lock().unwrap().len() >= 2);
     if !finished {
         // Deadlocked: the supervisor cannot be dropped (stop would hang), so end the child by
         // hand and leak the rest.

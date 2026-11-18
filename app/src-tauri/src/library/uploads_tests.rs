@@ -202,7 +202,7 @@ fn by_line<'a>(requests: &'a [Request], key: &str) -> &'a Request {
 
 /// Waits (at most five seconds) until `done` holds for the events so far.
 fn wait_for(events: &Events, done: impl Fn(&[LibraryEvent]) -> bool) {
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = Instant::now() + crate::test_procs::HANG_GUARD;
     while !done(&events.all()) {
         assert!(Instant::now() < until, "waited in vain: {:?}", events.all());
         std::thread::sleep(Duration::from_millis(5));
@@ -814,10 +814,10 @@ fn a_stalled_upload_ends() {
     ]);
     let id = drop_paths(&s, vec![file]);
     assert_eq!(s.library.upload(id, NOTE, false, None), Ok(None));
-    reached.recv_timeout(Duration::from_secs(5)).unwrap();
+    reached.recv_timeout(crate::test_procs::HANG_GUARD).unwrap();
     // The server reads nothing more. The client fills the socket's buffers first, so a minute
     // passes again and again until the counter has stood still for one.
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = Instant::now() + crate::test_procs::HANG_GUARD;
     while !s
         .events
         .all()
@@ -833,7 +833,7 @@ fn a_stalled_upload_ends() {
     assert_eq!(ended.text.as_deref(), Some("The connection stalled."));
     // The request was dropped: the connection ended before the whole body came.
     release.send(()).unwrap();
-    assert!(closed.recv_timeout(Duration::from_secs(5)).unwrap());
+    assert!(closed.recv_timeout(crate::test_procs::HANG_GUARD).unwrap());
 }
 
 #[test]
@@ -1050,8 +1050,8 @@ fn two_uploads_run_at_a_time() {
     ]);
     let id = drop_paths(&s, paths);
     assert_eq!(s.library.upload(id, NOTE, false, None), Ok(None));
-    came.recv_timeout(Duration::from_secs(5)).unwrap();
-    came.recv_timeout(Duration::from_secs(5)).unwrap();
+    came.recv_timeout(crate::test_procs::HANG_GUARD).unwrap();
+    came.recv_timeout(crate::test_procs::HANG_GUARD).unwrap();
     let now = last(&job_events(&s));
     assert_eq!(now["a.txt"].state, JobState::Running);
     assert_eq!(now["b.txt"].state, JobState::Running);
@@ -1113,8 +1113,8 @@ fn cancel_all_stops_a_drop() {
     ]);
     let id = drop_paths(&s, vec![a, b, c]);
     assert_eq!(s.library.upload(id, NOTE, false, None), Ok(None));
-    reached.recv_timeout(Duration::from_secs(5)).unwrap();
-    came.recv_timeout(Duration::from_secs(5)).unwrap();
+    reached.recv_timeout(crate::test_procs::HANG_GUARD).unwrap();
+    came.recv_timeout(crate::test_procs::HANG_GUARD).unwrap();
     take(&s);
     s.library.cancel_drop(id);
     let cancelled = job_events(&s);
@@ -1133,7 +1133,7 @@ fn cancel_all_stops_a_drop() {
     // Nothing more came, and nothing ended otherwise.
     assert!(job_events(&s).is_empty());
     release.send(()).unwrap();
-    assert!(closed.recv_timeout(Duration::from_secs(5)).unwrap());
+    assert!(closed.recv_timeout(crate::test_procs::HANG_GUARD).unwrap());
     let _ = go.send(());
     assert!(
         !lines(&s.server.received()).contains(&look("NOTE/Note/c.txt")),
@@ -1359,7 +1359,7 @@ fn a_cancel_during_keep_both_stops_the_looks() {
     s.library.join_uploads();
     let asked = job_events(&s).pop().unwrap();
     s.library.answer(asked.id, Choice::KeepBoth).unwrap();
-    came.recv_timeout(Duration::from_secs(5)).unwrap();
+    came.recv_timeout(crate::test_procs::HANG_GUARD).unwrap();
     s.library.cancel(asked.id);
     go.send(()).unwrap();
     s.library.join_uploads();

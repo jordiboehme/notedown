@@ -17,14 +17,14 @@ use crate::library::LibraryState;
 use crate::process::spawn_program;
 use crate::rest::test_http::{Act, Routed, answer, file_answer};
 use crate::serve_info::ServeInfo;
-use crate::test_procs::{gone, kill_in, left_in, tagged_sleep};
+use crate::test_procs::{HANG_GUARD, gone, kill_in, left_in, runs_in, tagged_sleep};
 use crate::token::{MemoryStore, Token, TokenStore, token_key};
 
 const ACCOUNT: &str = "jordi";
 const NOTE: &str = "NOTE/Note/Plan.note";
 const BYTES: &[u8] = b"the bytes of the note";
 /// How long a test waits for a condition before it fails.
-const WAIT: Duration = Duration::from_secs(10);
+const WAIT: Duration = HANG_GUARD;
 
 fn md5_hex(bytes: &[u8]) -> String {
     crate::login::hex(&Md5::digest(bytes))
@@ -64,8 +64,8 @@ fn bytes_of(body: &[u8]) -> Act {
 /// file `info` of the test folder (the pages of the note). `render <file> ... --page N --out D`
 /// writes a PNG `D/Plan-page-00N.png` that holds the page and the note's bytes, and prints its
 /// path. With `fail` it reports the page as failed; with `hold` it waits for `release` or
-/// `release-<N>` (10 s at
-/// most) before it writes; with `linger` it writes, prints and then runs this test's own sleep
+/// `release-<N>` (120 s at
+/// most, a guard against a hang) before it writes; with `linger` it writes, prints and then runs this test's own sleep
 /// of the length in `linger`.
 fn sidecar(dir: &Path) -> SpawnFn {
     let d = dir.display();
@@ -96,7 +96,7 @@ if [ -f "{d}/fail" ]; then
 fi
 if [ -f "{d}/hold" ]; then
   i=0
-  while [ ! -f "{d}/release" ] && [ ! -f "{d}/release-$page" ] && [ "$i" -lt 1000 ]; do
+  while [ ! -f "{d}/release" ] && [ ! -f "{d}/release-$page" ] && [ "$i" -lt 12000 ]; do
     sleep 0.01; i=$((i + 1))
   done
 fi
@@ -665,6 +665,11 @@ fn a_killed_render_leaves_no_cache() {
             })
     };
     s.wait_until("the printed page", tmp_png);
+    // The render is past its `exec` into the sleep: a kill now cannot meet a process in the
+    // middle of an exec, whose command line `pgrep` may not read.
+    s.wait_until("the lingering render", || {
+        runs_in(s.bin.path(), "sleep 321")
+    });
     // Killed from outside: its page, printed and written, is no answer.
     kill_in(s.bin.path());
     let error = call.join().unwrap().unwrap_err();
@@ -687,6 +692,9 @@ fn a_killed_render_leaves_no_cache() {
         std::thread::spawn(move || review.page_image(NOTE, 1))
     };
     s.wait_until("the printed page", tmp_png);
+    s.wait_until("the lingering render", || {
+        runs_in(s.bin.path(), "sleep 322")
+    });
     s.review.quit();
     assert_eq!(call.join().unwrap().unwrap_err(), QUITTING);
     assert!(gone(s.bin.path()), "{}", left_in(s.bin.path()));

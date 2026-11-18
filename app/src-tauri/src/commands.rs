@@ -1917,7 +1917,7 @@ mod tests {
             let _ = release
                 .lock()
                 .unwrap()
-                .recv_timeout(std::time::Duration::from_secs(10));
+                .recv_timeout(crate::test_procs::HANG_GUARD);
             config::save(dir, config)
         })
     }
@@ -1932,7 +1932,7 @@ mod tests {
         let saver = state.clone();
         let saving = std::thread::spawn(move || saver.set_start_view(StartView::Columns));
         started_rx
-            .recv_timeout(std::time::Duration::from_secs(10))
+            .recv_timeout(crate::test_procs::HANG_GUARD)
             .expect("the save did not start");
         // While the save runs, the config reads at once, as it was.
         let (read_tx, read_rx) = std::sync::mpsc::channel();
@@ -1940,7 +1940,9 @@ mod tests {
         std::thread::spawn(move || {
             let _ = read_tx.send(reader.current());
         });
-        let read = read_rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Longer than the held save's own guard: a read that waits for the save gets its
+        // new value and fails below.
+        let read = read_rx.recv_timeout(crate::test_procs::HANG_GUARD * 2);
         release_tx.send(()).unwrap();
         assert_eq!(
             read.expect("the read waited for the save").start_view,

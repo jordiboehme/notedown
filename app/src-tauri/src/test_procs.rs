@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+/// How long a test waits for a state or an event before it fails. Only a guard against a
+/// hang: a correct run never comes near it, also on a loaded machine. No test may rely on it.
+pub const HANG_GUARD: Duration = Duration::from_secs(120);
+
 /// Links `<dir>/sleep` to `/bin/sleep` and returns the link. `exec "<dir>/sleep" 316` then
 /// shows the folder in its command line, also after the shell is gone.
 pub fn tagged_sleep(dir: &Path) -> PathBuf {
@@ -39,19 +43,35 @@ pub fn pids_in(dir: &Path) -> Vec<i32> {
         .collect()
 }
 
-/// Whether every process that names `dir` is gone, after a short wait for the system to reap
-/// it.
+/// Whether every process that names `dir` is gone, after a wait for the system to reap it
+/// ([`HANG_GUARD`] at most).
 pub fn gone(dir: &Path) -> bool {
     let start = Instant::now();
     loop {
         if pids_in(dir).is_empty() {
             return true;
         }
-        if start.elapsed() > Duration::from_secs(3) {
+        if start.elapsed() > HANG_GUARD {
             return false;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Whether a process that names `dir` runs with `text` in its command line (`"sleep 321"`: the
+/// test's own sleep of that length runs, so the process is past its `exec`).
+pub fn runs_in(dir: &Path, text: &str) -> bool {
+    let pids: Vec<String> = pids_in(dir).iter().map(i32::to_string).collect();
+    if pids.is_empty() {
+        return false;
+    }
+    let out = Command::new("ps")
+        .args(["-o", "command=", "-p", &pids.join(",")])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|line| line.contains(text))
 }
 
 /// What still runs in `dir`, for a failure message.
@@ -86,7 +106,7 @@ fn only_the_processes_of_the_folder_are_found() {
     let pid = child.id() as i32;
     let start = Instant::now();
     while !pids_in(mine.path()).contains(&pid) {
-        assert!(start.elapsed() < Duration::from_secs(5), "not found");
+        assert!(start.elapsed() < HANG_GUARD, "not found");
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(pids_in(other.path()).is_empty());

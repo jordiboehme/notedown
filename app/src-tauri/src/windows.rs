@@ -520,7 +520,6 @@ mod tests {
     fn the_poller_gets_the_visibility_of_the_moment_in_order() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Mutex, mpsc};
-        use std::time::Duration;
 
         let visible = Arc::new(AtomicBool::new(true));
         let applied = Arc::new(Mutex::new(Vec::new()));
@@ -542,11 +541,11 @@ mod tests {
         );
         // The panel opens, then a blur hides it before the first call is through.
         tx.send(true).unwrap();
-        seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        seen_rx.recv_timeout(crate::test_procs::HANG_GUARD).unwrap();
         visible.store(false, Ordering::SeqCst);
         tx.send(false).unwrap();
         gate_tx.send(()).unwrap();
-        seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        seen_rx.recv_timeout(crate::test_procs::HANG_GUARD).unwrap();
         assert_eq!(*applied.lock().unwrap(), vec![(true, true), (false, false)]);
     }
 

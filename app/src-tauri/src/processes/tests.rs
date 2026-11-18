@@ -15,7 +15,7 @@ use crate::probe::test_server::{TestServer, free_port, notedown_401};
 use crate::supervisor::system_clock;
 
 const GRACE: Duration = Duration::from_millis(200);
-const WAIT: Duration = Duration::from_secs(10);
+const WAIT: Duration = crate::test_procs::HANG_GUARD;
 
 /// The server's fake: the start lines of `serve`, then it waits.
 const SERVE: &str = "echo 'notedown cloud server'

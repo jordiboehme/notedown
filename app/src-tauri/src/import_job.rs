@@ -564,9 +564,36 @@ struct Inner {
     run: Mutex<Run>,
     /// Signals the end of a job's process.
     reaped: Condvar,
-    /// A wait between the end of the process and its reap, so a test can pause in it.
+    /// A gate between the end of the process and its reap, so a test can pause in it.
     #[cfg(test)]
-    after_exit: Mutex<Duration>,
+    after_exit: ExitGate,
+}
+
+/// Holds a job between the end of its process and its reap while a test holds the gate.
+#[cfg(test)]
+#[derive(Default)]
+struct ExitGate {
+    /// (held, a job waits in it)
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+impl ExitGate {
+    /// A job passes: it waits here while the gate is held.
+    fn pass(&self) {
+        let mut state = lock(&self.state);
+        if !state.0 {
+            return;
+        }
+        state.1 = true;
+        self.changed.notify_all();
+        let mut state = self
+            .changed
+            .wait_while(state, |s| s.0)
+            .unwrap_or_else(PoisonError::into_inner);
+        state.1 = false;
+    }
 }
 
 #[derive(Default)]
@@ -634,7 +661,7 @@ impl ImportJobs {
                 run: Mutex::new(Run::default()),
                 reaped: Condvar::new(),
                 #[cfg(test)]
-                after_exit: Mutex::new(Duration::ZERO),
+                after_exit: ExitGate::default(),
             }),
         }
     }
@@ -808,10 +835,31 @@ impl ImportJobs {
         Ok(args)
     }
 
-    /// Makes the end of a job wait `wait` between the end of its process and its reap.
+    /// Makes the end of a job wait between the end of its process and its reap until
+    /// [`release_after_exit`](Self::release_after_exit).
     #[cfg(test)]
-    fn hold_after_exit(&self, wait: Duration) {
-        *lock(&self.inner.after_exit) = wait;
+    fn hold_after_exit(&self) {
+        lock(&self.inner.after_exit.state).0 = true;
+    }
+
+    /// Waits until a job waits in the held gate ([`crate::test_procs::HANG_GUARD`] at most).
+    #[cfg(test)]
+    fn wait_held_after_exit(&self) {
+        let gate = &self.inner.after_exit;
+        let (state, timeout) = gate
+            .changed
+            .wait_timeout_while(lock(&gate.state), crate::test_procs::HANG_GUARD, |s| !s.1)
+            .unwrap_or_else(PoisonError::into_inner);
+        drop(state);
+        assert!(!timeout.timed_out(), "no job ended");
+    }
+
+    /// Lets a held job go on to its reap.
+    #[cfg(test)]
+    fn release_after_exit(&self) {
+        let gate = &self.inner.after_exit;
+        lock(&gate.state).0 = false;
+        gate.changed.notify_all();
     }
 }
 
@@ -993,7 +1041,7 @@ impl Inner {
         // its number still belongs to it.
         wait_ended(child.id());
         #[cfg(test)]
-        std::thread::sleep(*lock(&self.after_exit));
+        self.after_exit.pass();
         {
             let mut run = lock(&self.run);
             run.pgid = None;

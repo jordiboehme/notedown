@@ -855,7 +855,7 @@ fn the_follower_thread_ends_with_the_library() {
         "the follower keeps the library alive"
     );
     // The thread sees its channel close and ends; a bounded look, no sleep decides it.
-    let until = std::time::Instant::now() + Duration::from_secs(5);
+    let until = std::time::Instant::now() + crate::test_procs::HANG_GUARD;
     while !thread.is_finished() && std::time::Instant::now() < until {
         std::thread::yield_now();
     }

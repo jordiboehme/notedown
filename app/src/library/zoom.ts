@@ -86,3 +86,8 @@ export function stepPage(index: number, count: number, step: "prev" | "next"): n
   const next = index + (step === "prev" ? -1 : 1);
   return Math.min(Math.max(count - 1, 0), Math.max(0, next));
 }
+
+/** The keys that open a focused page in the large view: Return and Space. */
+export function openKey(key: string): boolean {
+  return key === "Enter" || key === " ";
+}

@@ -6,6 +6,7 @@ import {
   ZOOMS,
   clampSplit,
   keepPlace,
+  openKey,
   readSplit,
   saveSplit,
   stepPage,
@@ -14,7 +15,8 @@ import {
   zoomKey,
   zoomOut,
 } from "../library/zoom";
-import { pageAt } from "../library/review";
+import { pageAt, reviewPages } from "../library/review";
+import { render } from "svelte/server";
 
 const calls: { command: string; args: Record<string, unknown> | undefined }[] = [];
 const views: NoteView[] = [];
@@ -30,6 +32,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 const { ReviewSession } = await import("../library/session.svelte");
+const ReviewPages = (await import("../library/ReviewPages.svelte")).default;
 
 beforeEach(() => {
   calls.length = 0;
@@ -244,5 +247,22 @@ describe("the page viewer", () => {
     expect(session.focused).toBe(2);
     session.focus(-1);
     expect(session.focused).toBe(0);
+  });
+});
+
+describe("opening the large view from the keyboard", () => {
+  it("opens with Return or Space", () => {
+    expect(openKey("Enter")).toBe(true);
+    expect(openKey(" ")).toBe(true);
+    for (const key of ["Escape", "a", "ArrowDown", "Tab"]) expect(openKey(key), key).toBe(false);
+  });
+
+  it("makes each page a button that can take the focus", () => {
+    const body = render(ReviewPages, {
+      props: { rows: reviewPages(note(2)), images: {}, onSeen: () => {}, onMeasured: () => {} },
+    }).body;
+    expect(body.match(/role="button"/g)).toHaveLength(2);
+    expect(body).toContain('aria-label="Show Page 1 alone"');
+    expect(body).toContain('tabindex="0"');
   });
 });

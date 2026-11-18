@@ -2,7 +2,7 @@
   import { tick } from "svelte";
   import type { PageImage } from "./session.svelte";
   import { syncGuard, syncTop, type Offsets, type ReviewPage, type Side } from "./review";
-  import { clampSplit, keepPlace, readSplit, saveSplit } from "./zoom";
+  import { clampSplit, keepPlace, openKey, readSplit, saveSplit } from "./zoom";
 
   // The review's two sides: the handwritten pages and their Markdown, scrolled together page by
   // page. The Markdown is shown as text (pre-wrap), never as HTML. It tells which pages came
@@ -168,8 +168,20 @@
     {#each rows as row (row.index)}
       {@const image = images[row.index]}
       <section class="page" data-page={row.index} aria-label={row.label}>
-        <!-- svelte-ignore a11y_no_static_element_interactions -->
-        <div class="paper" style:aspect-ratio={row.ratio} ondblclick={() => onOpen(row.index)} title="Double-click to show the page alone">
+        <div
+          class="paper"
+          style:aspect-ratio={row.ratio}
+          role="button"
+          tabindex="0"
+          aria-label={`Show ${row.label} alone`}
+          title="Double-click to show the page alone"
+          ondblclick={() => onOpen(row.index)}
+          onkeydown={(event) => {
+            if (!openKey(event.key)) return;
+            event.preventDefault();
+            onOpen(row.index);
+          }}
+        >
           {#if image?.state === "shown"}
             <img
               src={image.url}
@@ -272,6 +284,11 @@
     border: 1px solid var(--separator);
     border-radius: 3px;
     overflow: hidden;
+  }
+
+  .paper:focus-visible {
+    outline: 2px solid var(--accent, Highlight);
+    outline-offset: 2px;
   }
 
   .paper img {

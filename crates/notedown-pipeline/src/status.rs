@@ -91,7 +91,12 @@ pub fn status_facts(data: &Path, slug: &str, now_ms: u64) -> crate::Result<Statu
         .flatten()
         .filter(|&t| t > now_ms)
         .min();
+    // The newer one; of two with the same text the one with a code (an older pipeline wrote
+    // none).
     let last_error = match (stats.last_error, source_error(data).ok().flatten()) {
+        (Some(a), Some(b)) if a.text == b.text && a.code.is_none() != b.code.is_none() => {
+            Some(if b.code.is_some() { b } else { a })
+        }
         (Some(a), Some(b)) => Some(if b.at_ms > a.at_ms { b } else { a }),
         (a, b) => a.or(b),
     };

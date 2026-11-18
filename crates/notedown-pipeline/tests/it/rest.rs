@@ -886,6 +886,8 @@ fn a_refusal_kept_by_an_older_pipeline_gets_its_code() {
         .expect("the refusal is the last error");
     assert_eq!(e.text, text);
     assert_eq!(e.code.as_deref(), Some(TOKEN_REFUSED));
+    // The error lasts since the older pipeline saw it.
+    assert_eq!(e.at_ms, 1);
 }
 
 #[test]

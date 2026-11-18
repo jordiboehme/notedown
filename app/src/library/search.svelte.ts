@@ -8,6 +8,7 @@ import type { ContentHit, Found, NoteSummary } from "../lib/library-types";
 import {
   DEBOUNCE_MS,
   DEFAULT_SCOPE,
+  effectiveScope,
   entryRow,
   filterNotes,
   hasWord,
@@ -38,9 +39,21 @@ export class LibrarySearch {
   #place: () => SearchPlace;
   #seq = 0;
   #timer: ReturnType<typeof setTimeout> | null = null;
+  /** What the last run was for ([`#signature`]): the same place runs nothing again. */
+  #ranFor = "";
 
   constructor(place: () => SearchPlace) {
     this.#place = place;
+  }
+
+  /** The scope the search uses now: "This folder" where no folder or list is shown is Everywhere. */
+  get shownScope(): Scope {
+    return effectiveScope(this.scope, this.#place());
+  }
+
+  /** "This folder" means something only where a folder or a list of notes is shown. */
+  get hereAvailable(): boolean {
+    return this.#place().kind !== "other";
   }
 
   /** The user typed: the names of a shown list follow at once, the rest after the wait. */
@@ -55,9 +68,12 @@ export class LibrarySearch {
     this.#schedule();
   }
 
-  /** The shown place changed: a search that is on runs again for it. */
+  /**
+   * The shown place or its list of notes changed: a search that is on runs again when that
+   * changes what it searches (not for Everywhere, not for the same list).
+   */
   rerun() {
-    if (this.text.trim() !== "") this.#schedule();
+    if (this.text.trim() !== "" && this.#signature() !== this.#ranFor) this.#schedule();
   }
 
   /** Empties the field and the rows; a waiting run never starts and pending answers are dropped. */
@@ -81,21 +97,46 @@ export class LibrarySearch {
     this.error = null;
   }
 
-  /** The shown list of notes when the scope is "This folder" in New or All notes. */
-  #list(): NoteSummary[] | null {
+  /**
+   * The shown list of notes when the scope is "This folder" in New or All notes: `notes` is
+   * null while the list still loads. Null for any other search.
+   */
+  #listed(): { notes: NoteSummary[] | null } | null {
     const place = this.#place();
     if (this.scope !== "here" || (place.kind !== "new" && place.kind !== "all")) return null;
-    return place.notes ?? [];
+    return { notes: place.notes };
+  }
+
+  /** The list a run filters by; null for a search that has none. */
+  #list(): NoteSummary[] | null {
+    return this.#listed()?.notes ?? null;
+  }
+
+  /** What a run searches: the scope used, the folder, or the keys of the shown list. */
+  #signature(): string {
+    const place = this.#place();
+    if (this.shownScope === "everywhere") return "everywhere";
+    const listed = this.#listed();
+    if (listed) return `${place.kind}:${listed.notes === null ? "loading" : listed.notes.map((n) => n.key).join(",")}`;
+    return place.kind === "folder" ? `folder:${place.path}` : place.kind;
   }
 
   #schedule() {
     this.#stop();
+    this.#ranFor = this.#signature();
     const text = this.text.trim();
     if (text === "") {
       this.#reset();
       return;
     }
-    const list = this.#list();
+    const listed = this.#listed();
+    if (listed && listed.notes === null) {
+      // The list still loads: no rows yet and no false empty text; it runs once it comes.
+      this.#reset();
+      this.busy = true;
+      return;
+    }
+    const list = listed?.notes ?? null;
     if (list) {
       this.names = filterNotes(list, text).map((note) => noteRow(note.path));
       this.more = false;
@@ -112,7 +153,7 @@ export class LibrarySearch {
     const current = () => seq === this.#seq;
     const place = this.#place();
     const list = this.#list();
-    const under = this.scope === "here" && place.kind === "folder" ? place.path : null;
+    const under = this.shownScope === "here" && place.kind === "folder" ? place.path : null;
     this.error = null;
     const fail = (error: unknown) => {
       if (current()) this.error = String(error);

@@ -12,7 +12,18 @@
   // store changed (new page text shows while it is open), closed in Rust when it goes. The
   // window keys it by the path, so another note is another review. Opened at a block (a
   // search hit), the text side scrolls to it once, after the first read.
-  let { path, at = null, onBack }: { path: string; at?: BlockAt | null; onBack: () => void } = $props();
+  let {
+    path,
+    at = null,
+    onAtTaken = () => {},
+    onBack,
+  }: {
+    path: string;
+    at?: BlockAt | null;
+    /** The session took `at`: the window drops it, so the review is not opened at it again. */
+    onAtTaken?: () => void;
+    onBack: () => void;
+  } = $props();
 
   // svelte-ignore state_referenced_locally
   const session = new ReviewSession(path, at);
@@ -57,6 +68,7 @@
   }
 
   onMount(() => {
+    if (at) onAtTaken();
     void session.open();
     // Only a store change of this note (the OCR wrote one of its pages) reads it again.
     const stop = listen(NOTES_EVENT, (event) => {

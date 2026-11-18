@@ -1,7 +1,7 @@
 <script lang="ts">
   import { tick } from "svelte";
   import type { PageImage } from "./session.svelte";
-  import { syncGuard, syncTop, type Offsets, type ReviewPage, type Side } from "./review";
+  import { keepsHit, syncGuard, syncTop, type Offsets, type ReviewPage, type Side } from "./review";
   import { clampSplit, keepPlace, openKey, readSplit, saveSplit } from "./zoom";
 
   // The review's two sides: the handwritten pages and their Markdown, scrolled together page by
@@ -12,7 +12,7 @@
   // dragged; the split is kept per viewer. A double-click on a page opens it alone
   // (`onOpen`); `showPage` scrolls both sides to a page. The text side shows each block of a
   // page in its own `pre`; `showBlock` scrolls it to a block (a search hit), marks the block
-  // until the user scrolls, and the pages side follows.
+  // until the text side scrolls away from it, and the pages side follows.
   let {
     rows,
     images,
@@ -152,6 +152,8 @@
 
   /** The block of a search hit, marked until the user scrolls: `index:blockId`. */
   let hit = $state<string | null>(null);
+  /** Where `showBlock` put the text side; a scroll away from it ends the mark. */
+  let hitTop = 0;
 
   /**
    * Scrolls the text side to the block `blockId` of page `index`, or to the page when the
@@ -169,13 +171,18 @@
     const target = block ?? page;
     // The side is the offset parent of its pages and blocks; keep its padding above.
     side.scrollTop = Math.max(0, target.offsetTop - 12);
+    hitTop = side.scrollTop;
     hit = block ? `${index}:${blockId}` : null;
     follow("text");
   }
 
-  /** The user scrolls or clicks a side: the mark of the search hit goes. */
-  function userMoved() {
-    hit = null;
+  /**
+   * The text side scrolled. Away from where `showBlock` put it, the scroll is the user's
+   * (wheel, keys, scroll bar, or the pages side it follows): the mark of the hit goes.
+   */
+  function textScrolled() {
+    if (hit !== null && textSide && !keepsHit(hitTop, textSide.scrollTop)) hit = null;
+    follow("text");
   }
 
   function follow(from: Side) {
@@ -193,16 +200,7 @@
 </script>
 
 <div class="sides" bind:this={sides} style:grid-template-columns={`minmax(0, ${split}fr) 6px minmax(0, ${1 - split}fr)`}>
-  <!-- The wheel and a click end the mark of a search hit; the side is no widget. -->
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div
-    class="side pages"
-    bind:this={pagesSide}
-    onscroll={() => follow("pages")}
-    onwheel={userMoved}
-    onpointerdown={userMoved}
-    aria-label="Pages"
-  >
+  <div class="side pages" bind:this={pagesSide} onscroll={() => follow("pages")} aria-label="Pages">
     <div class="column" style:width={`${zoom * 100}%`}>
     {#each rows as row (row.index)}
       {@const image = images[row.index]}
@@ -262,17 +260,7 @@
     onpointercancel={release}
     onkeydown={nudge}
   ></div>
-  <!-- The wheel, a click and a key end the mark of a search hit; the side is no widget. -->
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div
-    class="side text"
-    bind:this={textSide}
-    onscroll={() => follow("text")}
-    onwheel={userMoved}
-    onpointerdown={userMoved}
-    onkeydown={userMoved}
-    aria-label="Text"
-  >
+  <div class="side text" bind:this={textSide} onscroll={textScrolled} aria-label="Text">
     {#each rows as row (row.index)}
       <section class="page" data-page={row.index} aria-label={row.label}>
         <p class="label">{row.label}</p>

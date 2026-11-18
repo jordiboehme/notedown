@@ -161,3 +161,11 @@ export function syncGuard() {
     },
   };
 }
+
+/**
+ * Whether the mark of a search hit stays: the text side is still where the window scrolled it
+ * (`markedTop`), within a pixel. Any other scroll is the user's, whatever moved it.
+ */
+export function keepsHit(markedTop: number, scrollTop: number): boolean {
+  return Math.abs(scrollTop - markedTop) <= 1;
+}

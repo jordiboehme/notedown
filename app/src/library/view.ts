@@ -22,6 +22,11 @@ export type Selection =
   | { kind: "folder"; path: string }
   | { kind: "note"; path: string; at?: { pageId: string; blockId: string } };
 
+/** The selection without the block a note was opened at: the review used it already. */
+export function withoutAt(selection: Selection): Selection {
+  return selection.kind === "note" && selection.at ? { kind: "note", path: selection.path } : selection;
+}
+
 /**
  * Where Rust opens the window (`window.__NOTEDOWN_AT__` or the `library-at` event), as a
  * selection: the review of a note, New, All notes (a click on a sync notification) or the

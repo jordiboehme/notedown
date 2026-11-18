@@ -14,9 +14,13 @@ vi.mock("@tauri-apps/api/core", () => ({
   }),
 }));
 
-const { DEBOUNCE_MS, SCOPE_LABELS, filterNotes, isFindKey, resultRows, searchPlace, wantsContent } = await import(
-  "../library/search"
-);
+const { DEBOUNCE_MS, SCOPE_LABELS, effectiveScope, entryRow, filterNotes, isFindKey, resultRows, searchPlace, wantsContent } =
+  await import("../library/search");
+const { withoutAt } = await import("../library/view");
+const SearchResults = (await import("../library/SearchResults.svelte")).default;
+const SearchLayer = (await import("../library/SearchLayer.svelte")).default;
+const { render } = await import("svelte/server");
+const { createRawSnippet } = await import("svelte");
 const { LibrarySearch } = await import("../library/search.svelte");
 type SearchPlace = import("../library/search.svelte").SearchPlace;
 
@@ -121,6 +125,29 @@ describe("the pure parts", () => {
     expect(searchPlace({ kind: "folder", path: "NOTE" }, null, null)).toEqual({ kind: "folder", path: "NOTE" });
     expect(searchPlace({ kind: "bin" }, null, null)).toEqual({ kind: "other" });
     expect(searchPlace({ kind: "note", path: "NOTE/a.note" }, null, null)).toEqual({ kind: "other" });
+  });
+
+  it("This folder is only there where a folder or a list of notes is shown", () => {
+    const folder: SearchPlace = { kind: "folder", path: "NOTE" };
+    const other: SearchPlace = { kind: "other" };
+    expect(effectiveScope("here", folder)).toBe("here");
+    expect(effectiveScope("here", { kind: "new", notes: [] })).toBe("here");
+    expect(effectiveScope("here", other)).toBe("everywhere");
+    expect(effectiveScope("everywhere", folder)).toBe("everywhere");
+  });
+
+  it("a name row is a note or a file", () => {
+    expect(entryRow(entry("NOTE/a.note")).kind).toBe("note");
+    expect(entryRow(entry("Document/a.pdf")).kind).toBe("file");
+  });
+
+  it("a note opened at a block loses the block once it was used", () => {
+    const at = { pageId: "P1", blockId: "b1" };
+    expect(withoutAt({ kind: "note", path: "NOTE/a.note", at })).toEqual({ kind: "note", path: "NOTE/a.note" });
+    const plain = { kind: "note" as const, path: "NOTE/a.note" };
+    expect(withoutAt(plain)).toBe(plain);
+    const folder = { kind: "folder" as const, path: "NOTE" };
+    expect(withoutAt(folder)).toBe(folder);
   });
 
   it("the scope labels and the wait are the plan's", () => {
@@ -275,6 +302,64 @@ describe("LibrarySearch", () => {
     expect(s.error).toBeNull();
   });
 
+  it("This folder in the review searches everywhere and is not the scope it shows", async () => {
+    place = { kind: "other" };
+    const s = search();
+    s.setScope("here");
+    expect(s.shownScope).toBe("everywhere");
+    expect(s.hereAvailable).toBe(false);
+    s.type("plan");
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+    expect(calls.find((c) => c.command === "library_find")?.args).toEqual({ text: "plan", under: "" });
+  });
+
+  it("a list that is still loading shows no false empty text and waits for the list", async () => {
+    place = { kind: "new", notes: null };
+    const s = search();
+    s.setScope("here");
+    s.type("plan");
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS * 2);
+    expect(calls).toEqual([]);
+    expect(s.busy).toBe(true);
+    expect(s.rows).toEqual([]);
+    // The list comes: the search runs for it.
+    place = { kind: "new", notes: [note("A", "NOTE/Note/Plan.note")] };
+    s.rerun();
+    expect(s.rows.map((r) => r.path)).toEqual(["NOTE/Note/Plan.note"]);
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+    expect(commands()).toEqual(["notes_search"]);
+    expect(s.busy).toBe(false);
+  });
+
+  it("a list that changes while This folder searches it is filtered again; the same place runs nothing", async () => {
+    place = { kind: "all", notes: [note("A", "NOTE/Note/Plan.note")] };
+    const s = search();
+    s.setScope("here");
+    s.type("plan");
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+    calls.length = 0;
+    s.rerun();
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+    expect(calls).toEqual([]);
+    place = { kind: "all", notes: [note("A", "NOTE/Note/Plan.note"), note("B", "NOTE/Note/plans.note")] };
+    s.rerun();
+    expect(s.rows.map((r) => r.path)).toEqual(["NOTE/Note/Plan.note", "NOTE/Note/plans.note"]);
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+    expect(commands()).toEqual(["notes_search"]);
+  });
+
+  it("a list that changes while Everywhere searches runs nothing", async () => {
+    place = { kind: "all", notes: [note("A", "NOTE/Note/Plan.note")] };
+    const s = search();
+    s.type("plan");
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+    calls.length = 0;
+    place = { kind: "all", notes: [note("B", "NOTE/Note/b.note")] };
+    s.rerun();
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+    expect(calls).toEqual([]);
+  });
+
   it("a new scope runs again", async () => {
     const s = search();
     s.type("plan");
@@ -283,5 +368,59 @@ describe("LibrarySearch", () => {
     s.setScope("here");
     await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
     expect(calls.find((c) => c.command === "library_find")?.args).toEqual({ text: "plan", under: "NOTE/Note" });
+  });
+});
+
+describe("the search results", () => {
+  function body(s: InstanceType<typeof LibrarySearch>) {
+    return render(SearchResults, { props: { search: s, onRow: () => {} } }).body;
+  }
+
+  it("show the headings, the empty texts and the more line", () => {
+    const s = search();
+    s.text = "plan";
+    let html = body(s);
+    expect(html).toContain("Names");
+    expect(html).toContain("In the Text");
+    expect(html).toContain("No names match.");
+    expect(html).toContain("No text matches.");
+    expect(html).not.toContain("More than 200 names.");
+    s.names = [{ kind: "file", path: "Document/plan.pdf", name: "plan.pdf" }];
+    s.more = true;
+    html = body(s);
+    expect(html).not.toContain("No names match.");
+    expect(html).toContain("More than 200 names. Type more to narrow the list.");
+    s.text = "p";
+    expect(body(s)).toContain("Type 2 characters or more to search the text.");
+  });
+
+  it("show This folder as not available in the review and the bin", () => {
+    place = { kind: "other" };
+    const s = search();
+    s.text = "plan";
+    s.setScope("here");
+    const here = body(s).match(/<button[^>]*>\s*This folder/)?.[0] ?? "";
+    expect(here).toContain("disabled");
+    expect(here).toContain('aria-pressed="false"');
+    place = { kind: "folder", path: "NOTE" };
+    const shown = body(s).match(/<button[^>]*>\s*This folder/)?.[0] ?? "";
+    expect(shown).not.toContain("disabled");
+    expect(shown).toContain('aria-pressed="true"');
+  });
+});
+
+describe("the search layer", () => {
+  const view = createRawSnippet(() => ({ render: () => '<p class="the-view">The review</p>' }));
+  const results = createRawSnippet(() => ({ render: () => '<p class="the-results">Results</p>' }));
+
+  it("keeps the view mounted under the results and makes it inert", () => {
+    const searching = render(SearchLayer, { props: { searching: true, view, results } }).body;
+    expect(searching).toContain("The review");
+    expect(searching).toContain("Results");
+    expect(searching).toMatch(/<div[^>]*class="view[^"]*"[^>]*inert/);
+    const idle = render(SearchLayer, { props: { searching: false, view, results } }).body;
+    expect(idle).toContain("The review");
+    expect(idle).not.toContain("Results");
+    expect(idle).not.toMatch(/inert/);
   });
 });

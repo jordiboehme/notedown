@@ -20,8 +20,8 @@ export const MORE_NAMES = "More than 200 names. Type more to narrow the list.";
 export const NO_NAMES = "No names match.";
 export const NO_TEXT = "No text matches.";
 
-/** A note or a file whose name holds the text. */
-export type NameRow = { kind: "note" | "file" | "folder"; path: string; name: string };
+/** A note or a file whose name holds the text. Folders are no results (spec 3). */
+export type NameRow = { kind: "note" | "file"; path: string; name: string };
 
 /** One row of the results: a name hit, or a text hit with its block. */
 export type ResultRow = NameRow & {
@@ -62,8 +62,9 @@ export function noteRow(path: string): NameRow {
   return { kind: /\.note$/i.test(path) ? "note" : "file", path, name: nameOf(path) };
 }
 
+/** A file `library_find` answered (it answers files only). */
 export function entryRow(entry: Entry): NameRow {
-  return entry.kind === "folder" ? { kind: "folder", path: entry.path, name: entry.name } : noteRow(entry.path);
+  return noteRow(entry.path);
 }
 
 /** The name hits first, then the text hits. A note in both lists is in both. */
@@ -107,6 +108,14 @@ export function searchPlace(
     default:
       return { kind: "other" };
   }
+}
+
+/**
+ * The scope a search uses in `place`: "This folder" means the shown folder or list of notes,
+ * so where none is shown (the review, the recycle bin) it searches everywhere.
+ */
+export function effectiveScope(scope: Scope, place: SearchPlace): Scope {
+  return scope === "here" && place.kind === "other" ? "everywhere" : scope;
 }
 
 /** Cmd+F focuses the search field. */

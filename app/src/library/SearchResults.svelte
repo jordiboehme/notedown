@@ -19,8 +19,10 @@
       {#each scopes as scope (scope)}
         <button
           type="button"
-          class:pressed={search.scope === scope}
-          aria-pressed={search.scope === scope}
+          class:pressed={search.shownScope === scope}
+          aria-pressed={search.shownScope === scope}
+          disabled={scope === "here" && !search.hereAvailable}
+          title={scope === "here" && !search.hereAvailable ? "Pick a folder or a list of notes to search in it." : null}
           onclick={() => search.setScope(scope)}
         >
           {SCOPE_LABELS[scope]}
@@ -106,6 +108,10 @@
 
   .switch button + button {
     border-left: 0.5px solid var(--button-rim);
+  }
+
+  .switch button:disabled {
+    color: var(--tertiary);
   }
 
   .switch button.pressed {

@@ -19,7 +19,7 @@ vi.mock("@tauri-apps/api/core", () => ({
   }),
 }));
 
-const { reviewPages, pageAt, syncTop, reviewNotice, nearPages, noteTitle, syncGuard, concernsNote, findBlock, PORTRAIT } =
+const { reviewPages, pageAt, syncTop, reviewNotice, nearPages, noteTitle, syncGuard, concernsNote, findBlock, keepsHit, PORTRAIT } =
   await import("../library/review");
 const { ReviewSession } = await import("../library/session.svelte");
 const { openAt } = await import("../library/view");
@@ -139,6 +139,14 @@ describe("the blocks of the review", () => {
     expect(findBlock(rows, { pageId: "P1#2", blockId: "b9" })).toEqual({ index: 1, blockId: null });
     // A page that is gone gives nothing.
     expect(findBlock(rows, { pageId: "P7", blockId: "b5" })).toBeNull();
+  });
+
+  it("the mark of a hit stays while the text side is where the window put it", () => {
+    expect(keepsHit(300, 300)).toBe(true);
+    expect(keepsHit(300, 300.6)).toBe(true);
+    // Any other scroll is the user's: by wheel, keys, the scroll bar or the pages side.
+    expect(keepsHit(300, 340)).toBe(false);
+    expect(keepsHit(300, 0)).toBe(false);
   });
 
   it("the text side has one block per pre inside its page", () => {

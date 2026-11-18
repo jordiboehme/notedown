@@ -55,7 +55,7 @@ pub const TOKEN_REFUSED: &str = "token_refused";
 
 /// The OCR line while the server refuses the pipeline's token.
 pub const TOKEN_REFUSED_LINE: &str =
-    "The server no longer accepts the OCR's login. Connect again in Settings > OCR.";
+    "The server no longer accepts the OCR's login. Connect again in Notedown Settings > OCR.";
 
 /// The page the pipeline reads now.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

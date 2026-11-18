@@ -5,6 +5,7 @@ pub mod config;
 pub mod import_job;
 pub mod library;
 pub mod login;
+pub mod menus;
 pub mod model;
 pub mod notes;
 pub mod notify;
@@ -100,6 +101,7 @@ pub fn run() {
         .on_menu_event(|app, event| tray::on_menu_event(app, event.id().as_ref()))
         .on_window_event(windows::on_window_event)
         .manage(Shown::default())
+        .manage(menus::MenuTargetState::default())
         .manage(Arc::new(QuitFlow::new()))
         .manage(Arc::new(login::LoginGate::default()))
         .setup(|app| {
@@ -291,6 +293,8 @@ pub fn run() {
             commands::notes_new,
             commands::notes_all,
             commands::note_seen,
+            commands::notes_seen_all,
+            commands::library_menu,
             commands::note_open,
             commands::note_page_image,
             commands::note_close,
@@ -1003,6 +1007,8 @@ mod tests {
                 "notes_new",
                 "notes_all",
                 "note_seen",
+                "notes_seen_all",
+                "library_menu",
                 "note_open",
                 "note_page_image",
                 "note_close",
@@ -1081,7 +1087,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 74);
+        assert_eq!(handler_commands().len(), 76);
     }
 
     #[test]
@@ -1133,6 +1139,8 @@ mod tests {
             "notes_new",
             "notes_all",
             "note_seen",
+            "notes_seen_all",
+            "library_menu",
             "note_open",
             "note_page_image",
             "note_close",
@@ -1203,7 +1211,7 @@ mod tests {
             assert!(granted(window).contains("notes_new"), "{window}");
         }
         assert!(!granted("settings").contains("notes_new"));
-        for command in ["notes_all", "note_seen"] {
+        for command in ["notes_all", "note_seen", "notes_seen_all", "library_menu"] {
             assert!(granted("library").contains(command), "{command}");
             for window in ["panel", "settings"] {
                 assert!(!granted(window).contains(command), "{window} has {command}");

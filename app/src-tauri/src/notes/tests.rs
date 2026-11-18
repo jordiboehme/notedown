@@ -853,3 +853,84 @@ fn notes_newer_than_counts_listed_notes_with_newer_text() {
     *lock(&f.account) = None;
     assert_eq!(f.notes.notes_newer_than(0), (0, None));
 }
+
+fn saves(f: &Fixture) -> usize {
+    f.notes.inner.saves.load(Ordering::SeqCst)
+}
+
+#[test]
+fn seen_all_marks_every_new_note_in_one_write() {
+    let f = after_baseline();
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 10);
+    f.write(&note(B, "NOTE/Note/b.note", &[("P1", Some(5), true)]), 11);
+    f.write(&note(C, "NOTE/Note/c.note", &[("P1", Some(6), true)]), 12);
+    f.notes.refresh();
+    let writes = saves(&f);
+    let events = f.events();
+    assert_eq!(f.notes.seen_all(), Ok(3));
+    assert_eq!(saves(&f), writes + 1, "one write for all three");
+    assert_eq!(f.events(), events + 1, "told once");
+    assert_eq!(f.marks(), json!({A: 4, B: 5, C: 6}));
+    assert!(f.new_keys().is_empty());
+    // Nothing new: nothing is written and nobody is told.
+    let (writes, events) = (saves(&f), f.events());
+    assert_eq!(f.notes.seen_all(), Ok(0));
+    assert_eq!(saves(&f), writes);
+    assert_eq!(f.events(), events);
+}
+
+#[test]
+fn seen_all_marks_only_the_notes_that_are_new_at_the_call() {
+    let f = after_baseline();
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 10);
+    f.write(&note(B, "NOTE/Note/b.note", &[("P1", Some(5), true)]), 11);
+    f.write(&note(C, "NOTE/Note/c.note", &[("P1", None, false)]), 12);
+    f.notes.seen(B).unwrap();
+    assert_eq!(f.new_keys(), [A]);
+    // A gets newer text after the list was read and before the click: the mark follows the
+    // text at the call. C has no text, so it is not new and gets no marker.
+    f.write(
+        &note(
+            A,
+            "NOTE/Note/a.note",
+            &[("P1", Some(4), true), ("P2", Some(9), true)],
+        ),
+        20,
+    );
+    assert_eq!(f.notes.seen_all(), Ok(1));
+    assert_eq!(f.marks(), json!({A: 9, B: 5}));
+    assert!(f.new_keys().is_empty());
+}
+
+#[test]
+fn a_note_that_gets_text_after_seen_all_is_new_again() {
+    let f = after_baseline();
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 10);
+    assert_eq!(f.notes.seen_all(), Ok(1));
+    assert!(f.new_keys().is_empty());
+    f.write(
+        &note(
+            A,
+            "NOTE/Note/a.note",
+            &[("P1", Some(4), true), ("P2", Some(12), true)],
+        ),
+        20,
+    );
+    assert_eq!(f.new_keys(), [A]);
+    assert_eq!(f.notes.seen_all(), Ok(1));
+    assert_eq!(f.marks(), json!({A: 12}));
+}
+
+#[test]
+fn seen_all_with_unreadable_markers_says_so() {
+    let mine = json!({ACCOUNT: [{"dataDir": "/x", "seen": {"X": 3}}]});
+    let f = Fixture::with_seen(Some(mine.clone()));
+    let path = f.config.path().join("seen.json");
+    if unreadable(&path).is_none() {
+        return;
+    }
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 10);
+    assert_eq!(f.notes.seen_all(), Err(SEEN_NOT_READ.to_owned()));
+    readable(&path);
+    assert_eq!(f.seen_file(), mine);
+}

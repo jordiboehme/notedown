@@ -270,6 +270,16 @@
     library.selection = { kind: id };
   }
 
+  // The sidebar's New row and the New list's button: the menu is Rust's, the button calls the
+  // same command. The lists reload when the notes change.
+  function newMenu() {
+    invoke("library_menu", { target: { kind: "newNotes" } }).catch(report("library_menu"));
+  }
+
+  function markAllSeen() {
+    invoke<number>("notes_seen_all").then(loadNotes).catch(report("notes_seen_all"));
+  }
+
   function settings(page: string | null) {
     invoke("open_settings", { page }).catch(report("open_settings"));
   }
@@ -298,10 +308,17 @@
       onSelect={select}
       onToggle={toggle}
       onSettings={settings}
+      onNewMenu={newMenu}
     />
     <main class="main">
       {#if library.selection.kind === "new"}
-        <NotesList title="New notes" notes={newNotes} empty="No new notes." onOpen={(note) => openNote(note.path)} />
+        <NotesList
+          title="New notes"
+          notes={newNotes}
+          empty="No new notes."
+          onOpen={(note) => openNote(note.path)}
+          onMarkAllSeen={markAllSeen}
+        />
       {:else if library.selection.kind === "all"}
         <NotesList title="All notes" notes={allNotes} empty="No notes with text yet." onOpen={(note) => openNote(note.path)} />
       {:else if library.selection.kind === "note"}

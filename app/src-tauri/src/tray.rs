@@ -168,6 +168,7 @@ pub fn on_menu_event(app: &AppHandle, id: &str) {
         }
         CHECK_UPDATES_ID => crate::check_update_from_menu(app),
         QUIT_ID => crate::request_quit(app),
+        _ if id.starts_with(crate::menus::CONTEXT_PREFIX) => crate::menus::on_context(app, id),
         _ => {}
     }
 }

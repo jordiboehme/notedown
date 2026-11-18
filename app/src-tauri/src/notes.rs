@@ -249,6 +249,9 @@ struct Inner {
     visible: Mutex<bool>,
     /// Wakes the scanner's thread, once it runs.
     waker: Mutex<Option<Sender<()>>>,
+    /// How many times seen.json was written, for the tests.
+    #[cfg(test)]
+    saves: std::sync::atomic::AtomicUsize,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -273,6 +276,8 @@ impl Notes {
                 }),
                 visible: Mutex::new(false),
                 waker: Mutex::new(None),
+                #[cfg(test)]
+                saves: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
     }
@@ -354,6 +359,50 @@ impl Notes {
             _ => {
                 self.save_seen(&mut state);
                 Err(NOTE_GONE.to_owned())
+            }
+        };
+        self.tell(&mut state);
+        result
+    }
+
+    /// The user cleared the New count: the marker of every note that is new now goes to its
+    /// text seq, in one write, and the windows are told once. Scans first, so a note that got
+    /// text since the list was read is marked at the text it has now. Answers how many notes it
+    /// marked.
+    pub fn seen_all(&self) -> Result<usize, String> {
+        let mut state = lock(&self.inner.state);
+        self.scan(&mut state);
+        let fresh: Vec<(String, u64)> = new_notes_of(&state)
+            .into_iter()
+            .map(|n| (n.summary.key.clone(), n.text_seq))
+            .collect();
+        let place = state.place.clone();
+        let result = match place {
+            Some((dir, account)) => {
+                let marks = state
+                    .seen
+                    .as_mut()
+                    .and_then(|seen| marks_mut(seen, &account, &dir));
+                match marks {
+                    None => Err(SEEN_NOT_READ.to_owned()),
+                    Some(marks) => {
+                        for (key, seq) in &fresh {
+                            marks.insert(key.clone(), *seq);
+                        }
+                        if !fresh.is_empty() {
+                            state.dirty = true;
+                        }
+                        if self.save_seen(&mut state) {
+                            Ok(fresh.len())
+                        } else {
+                            Err(SEEN_NOT_SAVED.to_owned())
+                        }
+                    }
+                }
+            }
+            None => {
+                self.save_seen(&mut state);
+                Ok(0)
             }
         };
         self.tell(&mut state);
@@ -598,6 +647,10 @@ impl Notes {
         };
         match write_seen(&self.inner.config_dir, seen) {
             Ok(()) => {
+                #[cfg(test)]
+                self.inner
+                    .saves
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 state.dirty = false;
                 true
             }

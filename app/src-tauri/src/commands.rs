@@ -1425,6 +1425,26 @@ pub async fn note_seen(notes: State<'_, Notes>, key: String) -> Result<(), Strin
         .map_err(|e| e.to_string())?
 }
 
+/// The library cleared the New count: every note that is new now is marked seen, in one write.
+/// Answers how many notes it marked. Off the main thread.
+#[tauri::command]
+pub async fn notes_seen_all(notes: State<'_, Notes>) -> Result<usize, String> {
+    let notes = notes.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || notes.seen_all())
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The library opens the native context menu of `target` at the pointer. The items and their
+/// work are Rust's (menus.rs).
+#[tauri::command]
+pub fn library_menu(
+    window: tauri::WebviewWindow,
+    target: crate::menus::MenuTarget,
+) -> Result<(), String> {
+    crate::menus::popup(&window, target)
+}
+
 /// The note at `path` for the review: the Markdown of each page from the pipeline's store, and
 /// whether it is catching up. Off the main thread (it scans the store and asks the server).
 #[tauri::command]

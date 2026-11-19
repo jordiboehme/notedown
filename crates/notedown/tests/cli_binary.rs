@@ -336,6 +336,42 @@ fn convert_updates_an_old_header_without_loading_the_model() {
     );
 }
 
+/// A .md file that Chandra OCR 2 wrote is converted again: convert asks for the new model
+/// (here it is missing) and does not only update the header.
+#[cfg(feature = "ocr")]
+#[test]
+fn convert_reads_a_chandra_file_again() {
+    use sha2::Digest;
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("Test 2.note");
+    std::fs::copy(NOTE, &note).unwrap();
+    let sha = const_hex::encode(sha2::Sha256::digest(std::fs::read(&note).unwrap()));
+    let body = "\n<a id=\"page-1\"></a>\n## Page 1\n\nText that Chandra read\n";
+    let old = format!(
+        "---\nsource: Test 2.note\nsource_sha256: {sha}\nkind: supernote-note\npages: 1\n\
+         model: chandra-ocr-2 Q4_K_M\nconverted_at: \"2026-10-01T08:00:00Z\"\n\
+         generator: notedown {}\nkeywords: []\n---\n{body}",
+        env!("CARGO_PKG_VERSION")
+    );
+    std::fs::write(dir.path().join("Test 2.md"), &old).unwrap();
+    let models = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .env("NOTEDOWN_MODEL_DIR", models.path())
+        .current_dir(dir.path())
+        .args(["convert", "Test 2.note"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("notedown model pull"), "{stderr}");
+    assert!(!stderr.contains("updated the header"), "{stderr}");
+    // Nothing was read, so the old file stays as it was.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("Test 2.md")).unwrap(),
+        old
+    );
+}
+
 #[cfg(feature = "ocr")]
 fn model_cmd(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
     // A closed local port as the proxy: a download fails at once and nothing leaves this

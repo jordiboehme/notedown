@@ -1162,6 +1162,67 @@ fn old_header_of_another_model_is_converted_again() {
     assert!(!md.contains("Old OCR text"), "{md}");
 }
 
+/// The engine of notedown 0.2: the fake reading under the pagevision model name.
+struct PagevisionEngine(FakeEngine);
+impl OcrEngine for PagevisionEngine {
+    fn ocr_png(&mut self, png: &[u8]) -> Result<PageOcr, OcrError> {
+        self.0.ocr_png(png)
+    }
+    fn label(&self) -> &str {
+        notedown_ocr::model::ENGINE_LABEL
+    }
+}
+
+/// Jordi's ruling for 0.2: `notedown convert` reads a page that Chandra OCR 2 read again with
+/// the new OCR. (The server keeps Chandra's blocks; the pipeline migration tests pin that.)
+#[test]
+fn convert_reads_a_chandra_page_again() {
+    let (_dir, src) = setup();
+    let note = src.join("Test 2.note");
+    let md_path = src.join("Test 2.md");
+    let chandra_body = "
+<a id=\"page-1\"></a>
+## Page 1
+<!-- page_id: P20261005225535142460xFi05hBOdWD6 -->
+
+Text that Chandra read
+";
+    std::fs::write(
+        &md_path,
+        old_header_md(&note, "chandra-ocr-2 Q4_K_M", chandra_body),
+    )
+    .unwrap();
+    let (inputs, _) = inputs::collect(std::slice::from_ref(&note), None);
+    let outputs = inputs::output_paths(&inputs, None);
+    let mut engine = PagevisionEngine(FakeEngine { calls: 0 });
+    let outcome = pipeline::convert_one(
+        &inputs[0],
+        &outputs[0],
+        &mut engine,
+        &opts(None),
+        &FileIndex::default(),
+    )
+    .unwrap();
+    assert_eq!(outcome, pipeline::Outcome::Converted { pages: 1 });
+    assert_eq!(engine.0.calls, 1, "the page is read again");
+    let md = std::fs::read_to_string(&md_path).unwrap();
+    assert!(!md.contains("Text that Chandra read"), "{md}");
+    assert!(md.contains("Hello page"), "{md}");
+    let fm = Frontmatter::parse(&md).unwrap();
+    assert_eq!(fm.generated_model, notedown_ocr::model::ENGINE_LABEL);
+    // The next run finds it current.
+    let again = pipeline::convert_one(
+        &inputs[0],
+        &outputs[0],
+        &mut engine,
+        &opts(None),
+        &FileIndex::default(),
+    )
+    .unwrap();
+    assert_eq!(again, pipeline::Outcome::Skipped);
+    assert_eq!(engine.0.calls, 1);
+}
+
 #[test]
 fn reserved_names_get_the_source_extension() {
     let input = |name: &str, kind| inputs::Input {

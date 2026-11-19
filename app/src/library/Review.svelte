@@ -65,6 +65,12 @@
     pages?.showPage(last);
   }
 
+  // A search over the review hides it from the File menu's Save Markdown...
+  $effect(() => {
+    const over = covered;
+    untrack(() => session.cover(over));
+  });
+
   // The block of a search hit, once the pages are shown: the text side scrolls to it.
   $effect(() => {
     const target = session.target;

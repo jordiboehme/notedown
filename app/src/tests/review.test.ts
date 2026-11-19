@@ -700,6 +700,39 @@ describe("Save Markdown", () => {
     ]);
   });
 
+  it("a search over the review hides it from the File menu until the search goes", async () => {
+    answerNow("note_open", view(["done"]));
+    const session = new ReviewSession(PATH);
+    await session.open();
+    session.cover(true);
+    // Covered twice says nothing new.
+    session.cover(true);
+    expect(shown()).toEqual([
+      { path: PATH, canSave: true },
+      { path: null, canSave: false },
+    ]);
+    // New text while covered: the menu still has nothing to save.
+    answerNow("note_open", view(["done", "done"]));
+    await session.reload();
+    expect(shown()).toHaveLength(2);
+    session.cover(false);
+    expect(shown()).toEqual([
+      { path: PATH, canSave: true },
+      { path: null, canSave: false },
+      { path: PATH, canSave: true },
+    ]);
+  });
+
+  it("a review covered before its note came tells Rust only once it is shown", async () => {
+    answerNow("note_open", view(["done"]));
+    const session = new ReviewSession(PATH);
+    session.cover(true);
+    await session.open();
+    expect(shown()).toEqual([]);
+    session.cover(false);
+    expect(shown()).toEqual([{ path: PATH, canSave: true }]);
+  });
+
   it("a note's context menu is Rust's: the window names the note", () => {
     const event = { preventDefault: vi.fn() };
     noteMenu(event, PATH);

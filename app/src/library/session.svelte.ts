@@ -56,6 +56,10 @@ export class ReviewSession {
   /** Counts the asks of each page: an answer of an older ask (dropped since) is not shown. */
   #asks = new Map<number, number>();
   #closed = false;
+  /** A search lies over the review: the File menu has no note to save then. */
+  #covered = false;
+  /** What Rust was told last (`review_shown`): at the start, no note. */
+  #told: { path: string | null; canSave: boolean } = { path: null, canSave: false };
 
   /** The block the review opens at; used by the first read that works, then gone. */
   #at: BlockAt | null;
@@ -130,9 +134,7 @@ export class ReviewSession {
         console.error("notedown: note_seen failed", error),
       );
     }
-    // Rust's File menu saves the note the review shows, once it has text.
-    const canSave = canSaveMarkdown(view);
-    if (old === null || canSaveMarkdown(old) !== canSave) this.#tellShown(this.path, canSave);
+    this.#tellMenu();
     this.#update();
   }
 
@@ -195,6 +197,15 @@ export class ReviewSession {
     this.#update();
   }
 
+  /**
+   * A search lies over the review (`covered`) or went away. While it covers the review, the
+   * note is not seen, so the File menu's Save Markdown... has nothing to save.
+   */
+  cover(covered: boolean) {
+    this.#covered = covered;
+    this.#tellMenu();
+  }
+
   /** The review ends: its calls in Rust end, later answers are not shown. */
   close() {
     if (this.#closed) return;
@@ -207,8 +218,22 @@ export class ReviewSession {
     );
   }
 
+  /**
+   * Rust's File menu saves the note the review shows, once it has text and while no search
+   * covers it. Tells Rust only a change.
+   */
+  #tellMenu() {
+    if (this.#closed || !this.view) return;
+    const shown = !this.#covered;
+    const path = shown ? this.path : null;
+    const canSave = shown && canSaveMarkdown(this.view);
+    if (this.#told.path === path && this.#told.canSave === canSave) return;
+    this.#tellShown(path, canSave);
+  }
+
   /** Tells Rust which note the review shows and whether it can be saved (the File menu). */
   #tellShown(path: string | null, canSave: boolean) {
+    this.#told = { path, canSave };
     invoke("review_shown", { path, canSave }).catch((error: unknown) =>
       console.error("notedown: review_shown failed", error),
     );

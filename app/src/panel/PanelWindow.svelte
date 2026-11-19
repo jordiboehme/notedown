@@ -8,6 +8,7 @@
   import { startStatus, status } from "../lib/status.svelte";
   import Panel from "./Panel.svelte";
   import { PANEL_WIDTH, panelHeight } from "./fit";
+  import { pauseCalls } from "./commands";
   import { newNotesView } from "./notes";
   import { cancelQuit, confirmQuit, followQuitRequests, pressQuit, quitQuestion } from "./quit.svelte";
 
@@ -22,6 +23,8 @@
   function call(command: string, args?: Record<string, unknown>) {
     invoke(command, args).catch((error: unknown) => console.error(`notedown: ${command} failed`, error));
   }
+
+  const pause = pauseCalls(call);
 
   /** The new notes, asked when the panel opens and on each notes event. */
   function loadNotes() {
@@ -77,7 +80,7 @@
     onQuit={() => pressQuit(status.current)}
     onConfirmQuit={confirmQuit}
     onCancelQuit={cancelQuit}
-    onPauseMenu={(x, y) => call("panel_pause_menu", { x, y })}
-    onResumeOcr={() => call("panel_ocr_resume")}
+    onPauseMenu={pause.pauseMenu}
+    onResumeOcr={pause.resumeOcr}
   />
 </div>

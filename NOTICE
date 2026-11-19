@@ -6,6 +6,11 @@ the terms of the GNU Affero General Public License as published by the Free
 Software Foundation, either version 3 of the License, or (at your option) any
 later version (AGPL-3.0-or-later). See the LICENSE file for the full text.
 
+The notedown-ocr crate (crates/notedown-ocr) is licensed under MPL-2.0 since 0.2.0,
+see https://github.com/jordiboehme/notedown/blob/main/crates/notedown-ocr/LICENSE.
+The rest of notedown is AGPL-3.0-or-later.
+Released versions keep the licence they were released under.
+
 notedown is not affiliated with Ratta or Supernote.
 
 The Supernote .note format was documented from sample files and public

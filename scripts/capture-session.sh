@@ -16,11 +16,11 @@ bin="$root/target/release/notedown"
 cd "$root"
 
 if ! command -v cargo >/dev/null 2>&1; then
-  tc="$HOME/.rustup/toolchains/1.99.0-aarch64-apple-darwin/bin"
+  tc="$HOME/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin"
   export PATH="$tc:$PATH"
 fi
 if ! command -v cargo >/dev/null 2>&1; then
-  echo "cargo not found, install Rust 1.99.0 with rustup" >&2
+  echo "cargo not found, install Rust 1.99.1 with rustup" >&2
   exit 1
 fi
 

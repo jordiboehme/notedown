@@ -209,6 +209,9 @@ and let's talk.
 
 Notedown is licensed under AGPL-3.0-or-later, see `LICENSE`.
 
+The one exception is the `notedown-ocr` crate. Since 0.2.0 it is licensed under MPL-2.0, see
+`crates/notedown-ocr/LICENSE`. Versions released before keep the licence they had.
+
 The OCR model is Chandra OCR 2 by Datalab. Notedown downloads the weights on request and does not ship
 them. They are under a modified OpenRAIL-M license: free for personal use and for organisations under 2
 million USD revenue. See the model card for the exact terms.

@@ -444,7 +444,14 @@ fn serve(
             request.body = std::mem::take(&mut body);
             let _ = tx.send(clone_request(&request));
             let _ = arrived.send(());
-            let _ = go.recv_timeout(WAIT);
+            // Until `go`, its end, or the end of the server.
+            let until = Instant::now() + WAIT;
+            while Instant::now() < until && !stop.load(Ordering::SeqCst) {
+                match go.recv_timeout(Duration::from_millis(20)) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    _ => break,
+                }
+            }
             let _ = stream.write_all(answer.as_bytes());
             let _ = stream.flush();
             return;

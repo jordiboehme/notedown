@@ -60,6 +60,7 @@
     rootRows,
     shownFor,
     sidebarItems,
+    toolbarPath,
     treeSelected,
     treeView,
     withoutAt,
@@ -383,7 +384,17 @@
 
 <div class="library window">
   <StatusLine status={status.current} {now} onSetUp={() => settings("setup")} />
-  <Toolbar bind:this={toolbar} view={library.viewMode} onView={(view) => void chooseView(view)} {search} />
+  <Toolbar
+    bind:this={toolbar}
+    view={library.viewMode}
+    onView={(view) => void chooseView(view)}
+    {search}
+    path={toolbarPath(library.selection)}
+    onOpen={(path) => {
+      search.clear();
+      select(path);
+    }}
+  />
   <div class="body">
     <Sidebar
       notes={items.notes}
@@ -458,7 +469,6 @@
             {#if !inTree}
               {#key library.generation}
                 <ColumnsView
-                  {path}
                   columns={columns.columns}
                   {renaming}
                   onSelect={select}

@@ -413,3 +413,28 @@ export function afterBack(back: Selection, path: string, reveal: Reveal | null):
   if (reveal?.note === path) return { selection: { kind: "folder", path: reveal.folder }, picked: path };
   return { selection: back, picked: null };
 }
+
+/** The name of a note by its path, as the review shows it before or without its text. */
+export function noteTitle(path: string): string {
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  return name.endsWith(".note") ? name.slice(0, -".note".length) : name;
+}
+
+/** A part of the toolbar's path: a folder (a button that shows it) or a name (`path` null). */
+export type PathPart = { label: string; path: string | null };
+
+const PLACE_NAMES = { new: "New", all: "All notes", bin: "Recycle bin" } as const;
+
+/**
+ * The path in the toolbar: the folders of the shown folder, or of the open note followed by
+ * its name; New, All notes and the bin show their own name. `full` is the whole path as text,
+ * for the tooltip.
+ */
+export function toolbarPath(selection: Selection): { crumbs: PathPart[]; full: string } {
+  let crumbs: PathPart[];
+  if (selection.kind === "folder") crumbs = pathBar(selection.path);
+  else if (selection.kind === "note") {
+    crumbs = [...pathBar(parentOf(selection.path)), { label: noteTitle(selection.path), path: null }];
+  } else crumbs = [{ label: PLACE_NAMES[selection.kind], path: null }];
+  return { crumbs, full: crumbs.map((crumb) => crumb.label).join(" / ") };
+}

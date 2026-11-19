@@ -142,10 +142,7 @@ export function concernsNote(payload: unknown, path: string): boolean {
 }
 
 /** The name of a note by its path, as the review shows it before or without its text. */
-export function noteTitle(path: string): string {
-  const name = path.slice(path.lastIndexOf("/") + 1);
-  return name.endsWith(".note") ? name.slice(0, -".note".length) : name;
-}
+export { noteTitle } from "./view";
 
 export type Side = "pages" | "text";
 

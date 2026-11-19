@@ -2,14 +2,13 @@
   import { untrack } from "svelte";
   import type { Entry, FolderState } from "../lib/library-types";
   import NameField from "./NameField.svelte";
-  import PathBar from "./PathBar.svelte";
   import VirtualRows from "./VirtualRows.svelte";
   import { opensReview } from "./actions";
   import { noteMenu } from "./review";
   import { drag, pressOn } from "./drag.svelte";
   import { dateText, listRows, needsNextPage, sizeText, type Range, type Sort } from "./view";
 
-  // The selected folder: the path bar, the column heads and the rows. The first page shows at
+  // The selected folder: the column heads and the rows. The first page shows at
   // once; the next page is asked for when the rows near its end come into view. A click picks
   // a row (for the file actions), a double click opens a folder or the review of a .note file
   // (Enter too, for a .note), a press and a drag moves it.
@@ -65,8 +64,6 @@
     return sort.ascending ? "▴" : "▾";
   }
 </script>
-
-<PathBar {path} {onOpen} />
 
 <div class="heads" role="group" aria-label="Sort">
   {#each [["name", "Name"], ["size", "Size"], ["date", "Changed"]] as const as [by, title] (by)}

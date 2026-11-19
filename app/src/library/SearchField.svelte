@@ -38,6 +38,7 @@
 
 <style>
   .field {
+    flex: none;
     width: 200px;
     font: inherit;
     font-size: 12px;

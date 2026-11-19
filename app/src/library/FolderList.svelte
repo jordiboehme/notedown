@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import type { Entry, FolderState } from "../lib/library-types";
   import NameField from "./NameField.svelte";
   import SortHeads from "./SortHeads.svelte";
@@ -50,9 +50,15 @@
   /** A head was clicked in this folder: it loads all its pages, so the sort covers every row. */
   let clicked = $state(false);
 
+  let list: ReturnType<typeof VirtualRows<Entry>> | undefined = $state();
+
   function sortBy(by: Sort["by"]) {
     clicked = true;
     onSort(nextSort(sort, by));
+    // The picked row stays picked; the sort may move it out of view.
+    void tick().then(() => {
+      if (picked !== null) list?.show(view.rows.findIndex((entry) => entry.path === picked));
+    });
   }
 
   function seen(range: Range) {
@@ -91,7 +97,7 @@
   {:else if folder.entries.length === 0 && folder.complete}
     <p class="note">This folder is empty.</p>
   {:else}
-    <VirtualRows items={view.rows} rowHeight={ROW} key={(entry: Entry) => entry.id} label="Files and folders" onRange={seen}>
+    <VirtualRows bind:this={list} items={view.rows} rowHeight={ROW} key={(entry: Entry) => entry.id} label="Files and folders" onRange={seen}>
       {#snippet row(entry: Entry)}
         {#snippet name()}
           <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">

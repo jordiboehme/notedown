@@ -54,6 +54,9 @@
     listingKey,
     openAt,
     afterBack,
+    columnsPlace,
+    crumbTarget,
+    noteOrigin,
     parentOf,
     pathBar,
     revealOf,
@@ -64,6 +67,7 @@
     treeSelected,
     treeView,
     withoutAt,
+    type BackTo,
     type Reveal,
     type Selection,
     type SidebarItem,
@@ -73,7 +77,7 @@
   import { emptyConfirm, recycleRows } from "./recycle";
   import { drag, folderUnder, letGo, moveTo, stopDrag } from "./drag.svelte";
   import { isFindKey, searchPlace, type ResultRow } from "./search";
-  import { keepsWebMenu, selectionCopy, type MenuSelection } from "./webmenu";
+  import { WebMenuGuard, selectionCopy } from "./webmenu";
   import { LibrarySearch } from "./search.svelte";
   import "../lib/system.css";
   import "./library.css";
@@ -138,7 +142,9 @@
   /** The folder the sidebar selects: the shown one, or the open note's. */
   const sidebarPath = $derived(treeSelected(library.selection, reveal));
   const tree = $derived(treeView(library.listings, open, sidebarPath));
-  const columns = $derived(columnsView(selectedPath, library.listings, picked));
+  /** The columns show the shown folder, or the open note's folder with the note picked. */
+  const columnsAt = $derived(columnsPlace(library.selection, reveal, picked));
+  const columns = $derived(columnsView(columnsAt.path, library.listings, columnsAt.file));
   const inTree = $derived(library.viewMode === "tree");
   const items = $derived(
     sidebarItems(library.view, { newNotes: newNotes?.length ?? null, allNotes: allNotes?.length ?? null }, library.selection),
@@ -158,7 +164,7 @@
   // binding (the generation moves).
   $effect(() => {
     void library.generation;
-    const shown = shownFor(library.viewMode, library.selection, open);
+    const shown = shownFor(library.viewMode, library.selection, open, reveal);
     const binShown = library.selection.kind === "bin";
     untrack(() => showListings(shown, binShown));
   });
@@ -272,12 +278,9 @@
    * Shows the review of the note at `path`, at the block `at` (a search hit) when given; Back
    * goes to what was shown before.
    */
-  function openNote(path: string, at?: { pageId: string; blockId: string }) {
-    if (library.selection.kind !== "note") {
-      library.back = library.selection;
-      backPicked = picked;
-    }
-    backSearch = null;
+  function openNote(path: string, at?: { pageId: string; blockId: string }, fromSearch: string | null = null) {
+    origin = noteOrigin(origin, { selection: library.selection, picked }, fromSearch);
+    library.back = origin.selection;
     reveal = null;
     show(at ? { kind: "note", path, at } : { kind: "note", path });
     openings += 1;
@@ -295,14 +298,12 @@
     for (const folder of found.opens) open.add(folder);
   }
 
-  /** The row picked where the note was opened from, given back by Back. */
-  let backPicked: string | null = null;
-  /** The search the note was opened from, given back by Back; null when none. */
-  let backSearch: string | null = null;
+  /** Where Back from the open note goes: the place, its picked row, the search. */
+  let origin: BackTo = { selection: library.back, picked: null, search: null };
 
   /** Back from a note: to what was shown before it, with its picked row or its search. */
   function back() {
-    const next = afterBack({ selection: library.back, picked: backPicked, search: backSearch });
+    const next = afterBack(origin);
     show(next.selection);
     picked = next.picked;
     if (next.search !== null) search.type(next.search);
@@ -360,6 +361,8 @@
     if (open.has(path)) {
       // Closing a folder closes the folders below it too: they are not shown.
       for (const other of [...open]) if (other === path || other.startsWith(`${path}/`)) open.delete(other);
+      // A folder that waits to scroll into view is not shown anymore.
+      if (scrollTo !== null && scrollTo.startsWith(`${path}/`)) scrollTo = null;
     } else {
       open.add(path);
     }
@@ -381,14 +384,13 @@
 
   /** A row of the search results: it opens or selects what it names, and the search ends. */
   function openRow(row: ResultRow) {
+    // Back from a note gives the results back.
     const typed = search.text;
     search.clear();
     if (row.section === "text" && row.pageId !== undefined && row.blockId !== undefined) {
-      openNote(row.path, { pageId: row.pageId, blockId: row.blockId });
-    } else if (row.kind === "note") openNote(row.path);
-    else return pickFile(row.path);
-    // Back gives the results back.
-    backSearch = typed;
+      openNote(row.path, { pageId: row.pageId, blockId: row.blockId }, typed);
+    } else if (row.kind === "note") openNote(row.path, undefined, typed);
+    else pickFile(row.path);
   }
 
   function keydown(event: KeyboardEvent) {
@@ -405,20 +407,11 @@
     }
   }
 
-  /** The selection when the last pointer went down; undefined before the first one. */
-  let pressSelection: MenuSelection | null | undefined;
-
-  function pressed() {
-    pressSelection = selectionCopy(window.getSelection());
-  }
-
   /** WebKit's own menu stays only in text fields and on selected text. */
-  function contextMenu(event: MouseEvent) {
-    const selection = pressSelection !== undefined ? pressSelection : selectionCopy(window.getSelection());
-    pressSelection = undefined;
-    const target = event.target instanceof Element ? event.target : null;
-    if (!keepsWebMenu(target, selection)) event.preventDefault();
-  }
+  const menuGuard = new WebMenuGuard((x, y) => {
+    const caret = document.caretRangeFromPoint?.(x, y) ?? null;
+    return selectionCopy(window.getSelection(), caret ? { node: caret.startContainer, offset: caret.startOffset } : null);
+  });
 
   function settings(page: string | null) {
     invoke("open_settings", { page }).catch(report("open_settings"));
@@ -432,8 +425,8 @@
   onpointerup={released}
   onpointercancel={stopDrag}
   onkeydown={keydown}
-  onpointerdowncapture={pressed}
-  oncontextmenu={contextMenu}
+  onpointerdowncapture={(event) => menuGuard.pressed(event)}
+  oncontextmenu={(event) => menuGuard.menu(event)}
 />
 
 <div class="library window">
@@ -441,12 +434,18 @@
   <Toolbar
     bind:this={toolbar}
     view={library.viewMode}
-    onView={(view) => void chooseView(view)}
+    onView={(view) => {
+      // A reveal that waits to scroll is for the view it was made in.
+      scrollTo = null;
+      void chooseView(view);
+    }}
     {search}
     path={toolbarPath(library.selection)}
     onOpen={(path) => {
+      const target = crumbTarget(library.selection, path);
       search.clear();
-      select(path);
+      select(target.folder);
+      picked = target.picked;
     }}
   />
   <div class="body">

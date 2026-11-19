@@ -234,3 +234,14 @@ describe("a list that comes in pages", () => {
     for (const head of heads) expect(head).not.toContain("disabled");
   });
 });
+
+describe("the picked row after a sort", () => {
+  it("is scrolled into view when the sort moved it out", async () => {
+    const { scrollToShow } = await import("../library/view");
+    // Rows of 24 pixels in a view 240 high, scrolled to the top.
+    expect(scrollToShow({ index: 3, rowHeight: 24, scrollTop: 0, height: 240 })).toBe(0);
+    expect(scrollToShow({ index: 50, rowHeight: 24, scrollTop: 0, height: 240 })).toBe(50 * 24 + 24 - 240);
+    expect(scrollToShow({ index: 2, rowHeight: 24, scrollTop: 1000, height: 240 })).toBe(48);
+    expect(scrollToShow({ index: -1, rowHeight: 24, scrollTop: 300, height: 240 })).toBe(300);
+  });
+});

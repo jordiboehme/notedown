@@ -1,21 +1,35 @@
 import { describe, expect, it } from "vitest";
-import { afterBack, revealOf, rootRows, treeSelected, treeView, type Reveal, type Selection } from "../library/view";
+import {
+  afterBack,
+  columnsPlace,
+  columnsView,
+  crumbTarget,
+  noteOrigin,
+  revealOf,
+  rootRows,
+  shownFor,
+  treeSelected,
+  treeView,
+  type BackTo,
+  type Reveal,
+  type Selection,
+} from "../library/view";
 
 describe("the reveal of an open note", () => {
-  it("is the note's folder and the folders above it", () => {
+  it("is the note's folder, opened with the folders above it", () => {
     expect(revealOf("NOTE/Note/Work/2026/Plan.note")).toEqual({
       note: "NOTE/Note/Work/2026/Plan.note",
       folder: "NOTE/Note/Work/2026",
-      opens: ["NOTE/Note", "NOTE/Note/Work"],
+      opens: ["NOTE/Note", "NOTE/Note/Work", "NOTE/Note/Work/2026"],
     });
   });
 
   it("is the device tree itself for a note right in it", () => {
-    expect(revealOf("NOTE/Note/Plan.note")).toEqual({ note: "NOTE/Note/Plan.note", folder: "NOTE/Note", opens: [] });
+    expect(revealOf("NOTE/Note/Plan.note")).toEqual({ note: "NOTE/Note/Plan.note", folder: "NOTE/Note", opens: ["NOTE/Note"] });
     expect(revealOf("DOCUMENT/Document/a/b.note")).toEqual({
       note: "DOCUMENT/Document/a/b.note",
       folder: "DOCUMENT/Document/a",
-      opens: ["DOCUMENT/Document"],
+      opens: ["DOCUMENT/Document", "DOCUMENT/Document/a"],
     });
   });
 
@@ -101,5 +115,79 @@ describe("Back from a note", () => {
     });
     // An empty search is no search to give back.
     expect(afterBack({ selection: { kind: "all" }, picked: null, search: "  " }).search).toBeNull();
+  });
+});
+
+describe("the columns while a note is open", () => {
+  const note: Selection = { kind: "note", path: "NOTE/Note/Work/Plan.note" };
+  const reveal = revealOf("NOTE/Note/Work/Plan.note");
+
+  it("show the path to the note's folder with the note picked", () => {
+    expect(columnsPlace(note, reveal, null)).toEqual({ path: "NOTE/Note/Work", file: "NOTE/Note/Work/Plan.note" });
+    const shown = columnsView("NOTE/Note/Work", {}, "NOTE/Note/Work/Plan.note");
+    expect(shown.columns.map((c) => c.path)).toEqual([null, "NOTE/Note", "NOTE/Note/Work"]);
+    // Rust follows those folders while the note is open, so the columns are ready.
+    expect(shownFor("columns", note, new Set(), reveal)).toEqual(shown.shown);
+  });
+
+  it("show the shown folder with its picked file, and nothing before the reveal", () => {
+    expect(columnsPlace({ kind: "folder", path: "INBOX" }, null, "INBOX/a.pdf")).toEqual({ path: "INBOX", file: "INBOX/a.pdf" });
+    expect(columnsPlace(note, null, null)).toEqual({ path: null, file: null });
+    expect(columnsPlace({ kind: "new" }, reveal, null)).toEqual({ path: null, file: null });
+    expect(shownFor("columns", note, new Set(), null)).toEqual([]);
+  });
+
+  it("do not change what the tree follows", () => {
+    expect(shownFor("tree", note, new Set(["NOTE/Note"]), reveal)).toEqual([{ path: "NOTE/Note", foldersOnly: true }]);
+  });
+});
+
+describe("a click on a folder of the path", () => {
+  const note: Selection = { kind: "note", path: "NOTE/Note/Work/Plan.note" };
+
+  it("on the open note's folder shows it with the note picked", () => {
+    expect(crumbTarget(note, "NOTE/Note/Work")).toEqual({ folder: "NOTE/Note/Work", picked: "NOTE/Note/Work/Plan.note" });
+  });
+
+  it("on any other folder shows it with nothing picked", () => {
+    expect(crumbTarget(note, "NOTE/Note")).toEqual({ folder: "NOTE/Note", picked: null });
+    expect(crumbTarget({ kind: "folder", path: "NOTE/Note/Work" }, "NOTE/Note/Work")).toEqual({
+      folder: "NOTE/Note/Work",
+      picked: null,
+    });
+  });
+});
+
+describe("where a note is opened from", () => {
+  const none: BackTo = { selection: { kind: "new" }, picked: null, search: null };
+
+  it("is the shown place with its picked row", () => {
+    expect(noteOrigin(none, { selection: { kind: "folder", path: "INBOX" }, picked: "INBOX/a.note" }, null)).toEqual({
+      selection: { kind: "folder", path: "INBOX" },
+      picked: "INBOX/a.note",
+      search: null,
+    });
+  });
+
+  it("is the search when the note came from its results", () => {
+    expect(noteOrigin(none, { selection: { kind: "all" }, picked: null }, "plan")).toEqual({
+      selection: { kind: "all" },
+      picked: null,
+      search: "plan",
+    });
+  });
+
+  it("stays the place before the first note when a note opens over a note", () => {
+    const first = noteOrigin(none, { selection: { kind: "folder", path: "INBOX" }, picked: "INBOX/a.note" }, null);
+    const over = { selection: { kind: "note", path: "INBOX/a.note" } as Selection, picked: null };
+    // A search hit opened over the review: Back gives the results, then the place.
+    expect(noteOrigin(first, over, "plan")).toEqual({ ...first, search: "plan" });
+    // A note opened over a note from elsewhere (a notification): no search to give back.
+    expect(noteOrigin({ ...first, search: "plan" }, over, null)).toEqual(first);
+  });
+
+  it("is where Back goes, after the reveal too", () => {
+    const from = noteOrigin(none, { selection: { kind: "folder", path: "INBOX" }, picked: "INBOX/a.note" }, "x");
+    expect(afterBack(from)).toEqual(from);
   });
 });

@@ -140,17 +140,14 @@ fn a_sync_then_a_change_gives_only_that_change() {
     assert!(done.notes.is_empty(), "{done:?}");
 }
 
-/// The real model reads one fixture page. Skips when the model files are not in the cache
-/// (`notedown model pull`), so the normal run needs no model. One page only: about a minute.
+/// The real models read one fixture page. Needs the four model files in `NOTEDOWN_MODEL_DIR`
+/// (or the cache of `notedown model pull`); run it in a release build.
 #[test]
+#[ignore = "needs the four pagevision model files (NOTEDOWN_MODEL_DIR)"]
 fn real_model_reads_a_fixture_page() {
-    let paths = match resolve(None, None) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("skipping: the OCR model is missing ({e})");
-            return;
-        }
-    };
+    let paths = resolve(None, None).unwrap_or_else(|e| {
+        panic!("set NOTEDOWN_MODEL_DIR to a folder with the four model files: {e}")
+    });
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/notes/test1.note");
     let nb = Notebook::open(&path, VersionPolicy::AllowUnknown).unwrap();
     let start = std::time::Instant::now();

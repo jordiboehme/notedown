@@ -161,13 +161,13 @@ mod tests {
         let page = page_ocr(result(vec![block(
             [100, 200, 600, 700],
             Content::Picture {
-                description: "A clamp seen from the side.".into(),
+                description: "A cup with a handle.".into(),
             },
-            "> Sketch: A clamp seen from the side.",
+            "> Sketch: A cup with a handle.",
         )]));
         assert_eq!(page.blocks[0].label, "Image");
         assert_eq!(page.mermaid_blocks, 0);
-        assert_eq!(page.markdown, "> Sketch: A clamp seen from the side.\n");
+        assert_eq!(page.markdown, "> Sketch: A cup with a handle.\n");
     }
 
     #[test]

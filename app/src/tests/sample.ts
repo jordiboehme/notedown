@@ -102,5 +102,13 @@ export function sampleConfig(): AppConfig {
 
 /** The model on disk and ready. */
 export function readyModel(): ModelState {
-  return { installed: true, sizeBytes: 3_400_000_000, path: "/m/model", pulling: false, progress: null, problem: null };
+  return {
+    installed: true,
+    sizeBytes: 3_556_512_484,
+    path: "/m/model",
+    pulling: false,
+    progress: null,
+    problem: null,
+    oldFiles: false,
+  };
 }

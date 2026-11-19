@@ -1992,6 +1992,24 @@ pub async fn model_remove(model: State<'_, ModelControl>) -> Result<ModelState, 
         .map_err(|e| e.to_string())?
 }
 
+/// The licences of the model files, shown before the download. Nothing is downloaded for it.
+#[tauri::command]
+pub async fn model_licences(model: State<'_, ModelControl>) -> Result<Vec<String>, String> {
+    let model = model.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || model.licences())
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Deletes the model files of notedown 0.1, then says what is on disk.
+#[tauri::command]
+pub async fn model_clean_old(model: State<'_, ModelControl>) -> Result<ModelState, String> {
+    let model = model.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || model.clean_old())
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// What the import commands refuse without a backup folder in the setup record.
 pub const NO_BACKUP_DIR: &str = "Choose the backup folder first.";
 /// What the app data commands refuse without a `.snbak` file (and without the empty choice).

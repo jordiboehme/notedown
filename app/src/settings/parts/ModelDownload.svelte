@@ -6,6 +6,7 @@
     MODEL_PROGRESS_EVENT,
     MODEL_READY_EVENT,
     failure,
+    modelCleanOld,
     modelPause,
     modelPull,
     modelRemove,
@@ -14,11 +15,15 @@
     type Progress,
   } from "../api";
   import { formatBytes, fraction } from "../format";
+  import { licences, loadLicences } from "../modelLicences.svelte";
+  import { MODEL_TEXT, licenceLine } from "../modelText";
   import Row from "../kit/Row.svelte";
   import StatusDot from "../kit/StatusDot.svelte";
 
-  // The rows of the OCR model: its state with Download, Pause and Remove, the progress of a
-  // download, the size on disk and the file. The OCR page and step 4 of the setup show it;
+  // The rows of the OCR model: its licences (before the download), its state with Download,
+  // Pause and Remove, the progress of a download, the size on disk and the file. When the model
+  // files of Notedown 0.1 are still there, a button offers to remove them; nothing removes them
+  // on its own. The OCR page and step 4 of the setup show it;
   // `onchange` tells the page each new state.
   let { onchange }: { onchange?: (model: ModelState) => void } = $props();
 
@@ -43,8 +48,11 @@
     }
   }
 
+  const licence = $derived(licenceLine(licences.lines ?? []));
+
   onMount(() => {
     void check();
+    void loadLicences();
     const stops = [
       listen<Progress>(MODEL_PROGRESS_EVENT, (event) => {
         progress = event.payload;
@@ -93,11 +101,20 @@
       asking = false;
       model = await modelRemove();
     });
+  const cleanOld = () =>
+    act(async () => {
+      model = await modelCleanOld();
+    });
 </script>
 
-<Row title="Model" note="Chandra OCR 2 runs on your Mac. Your notes never leave it.">
-  <span class="value">About 3.4 GB</span>
+<Row title="Model" note={MODEL_TEXT.note}>
+  <span class="value">{MODEL_TEXT.size}</span>
 </Row>
+{#if licence}
+  <p class="licences">{licence}</p>
+{:else if licences.error}
+  <p class="licences bad">{licences.error}</p>
+{/if}
 <Row title="Status" note={error ?? model?.problem ?? null} tone="bad">
   {#if model === null}
     <span class="value">Checking...</span>
@@ -135,9 +152,35 @@
     <span class="value">{formatBytes(model.sizeBytes)}</span>
   </Row>
   {#if model.path}<Row title="File" note={model.path} path />{/if}
+  {#if model.oldFiles}
+    <div class="old">
+      <button type="button" class="button" disabled={busy} onclick={cleanOld}>{MODEL_TEXT.cleanOld}</button>
+    </div>
+  {/if}
 {/if}
 
 <style>
+  .licences {
+    margin: 0;
+    padding: 0 10px 9px;
+    font-size: 11px;
+    color: var(--secondary);
+    overflow-wrap: anywhere;
+    /* The status row below follows a paragraph, not a row, so this is its separator. */
+    border-bottom: 1px solid var(--separator);
+  }
+
+  .licences.bad {
+    color: var(--bad);
+  }
+
+  .old {
+    display: flex;
+    justify-content: flex-end;
+    padding: 9px 10px;
+    border-top: 1px solid var(--separator);
+  }
+
   .bar {
     width: 120px;
     accent-color: var(--brand);

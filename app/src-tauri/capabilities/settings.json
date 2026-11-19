@@ -29,6 +29,8 @@
     "allow-model-pull",
     "allow-model-pause",
     "allow-model-remove",
+    "allow-model-licences",
+    "allow-model-clean-old",
     "allow-markdown-dir",
     "allow-set-markdown-dir",
     "allow-show-markdown-dir",

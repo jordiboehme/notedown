@@ -183,7 +183,7 @@ fn note(key: &str, path: &str, pages: &[Page<'_>]) -> Value {
         "title": title,
         "size": 1234,
         "md5": "0123456789abcdef0123456789abcdef",
-        "model": "chandra",
+        "model": "pagevision qwen3.5-4b Q4_K_M",
         "meta": {
             "keywords": ["k"],
             "titles": [],

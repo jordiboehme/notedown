@@ -1,5 +1,6 @@
-//! The OCR model: its state (`model path`, `model verify`), the download (`model pull --json`)
-//! with Pause, and Remove.
+//! The OCR model: its state (`model path`, `model verify`), its licences
+//! (`model pull --json --licences-only`), the download (`model pull --json`) with Pause, Remove,
+//! and the removal of the old model files of notedown 0.1 (`model clean-old`).
 //!
 //! Only one pull runs at a time. It runs in a process group of its own, so Pause and Quit stop
 //! it with everything it started. After its `ready` line the model is checked again with
@@ -30,6 +31,13 @@ pub const REMOVE_RUNS: &str = "The model is being removed.";
 
 const QUITTING: &str = "Notedown is quitting.";
 
+/// The model files of notedown 0.1. Only `model clean-old` removes them, and only when the user
+/// asks for it.
+pub const OLD_FILES: [&str; 2] = [
+    "chandra-ocr-2.Q4_K_M.gguf",
+    "chandra-ocr-2.mmproj-q8_0.gguf",
+];
+
 /// One progress line of `model pull --json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct Progress {
@@ -54,6 +62,8 @@ pub struct ModelState {
     pub progress: Option<Progress>,
     /// The state could not be read.
     pub problem: Option<String>,
+    /// The model files of notedown 0.1 (or a part of them) are still in the model folder.
+    pub old_files: bool,
 }
 
 /// What a pull tells the app.
@@ -71,7 +81,7 @@ pub enum ModelEvent {
 /// Gets every event. It must not block: the app only sends it into a channel.
 pub type Sink = Arc<dyn Fn(&ModelEvent) + Send + Sync>;
 
-/// How long `model path` and `model verify` may take. Verify reads 3.4 GB through SHA-256.
+/// How long `model path` and `model verify` may take. Verify reads 3.6 GB through SHA-256.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long a stop waits for the pull to be reaped after SIGKILL.
 const GONE_WAIT: Duration = Duration::from_secs(5);
@@ -123,22 +133,55 @@ struct FileMark {
     modified: Option<SystemTime>,
 }
 
-/// The files `model path` names.
+/// The lines of `model path` that name the four model files, in this order.
+const FILE_KEYS: [&str; 4] = ["model: ", "mmproj: ", "layout: ", "lines: "];
+
+/// The folder and the files `model path` names.
+#[derive(Debug)]
 struct Paths {
-    model: PathBuf,
-    mmproj: PathBuf,
+    /// The model folder; the old model files are looked for here.
+    cache: PathBuf,
+    /// The four model files: the model, its projector, the layout and the text line detector.
+    files: Vec<PathBuf>,
 }
 
 impl Paths {
     /// The model files and the parts of a download.
-    fn all(&self) -> [PathBuf; 4] {
-        [
-            self.model.clone(),
-            self.mmproj.clone(),
-            part(&self.model),
-            part(&self.mmproj),
-        ]
+    fn all(&self) -> Vec<PathBuf> {
+        let parts = self.files.iter().map(|f| part(f.as_path()));
+        self.files.iter().cloned().chain(parts).collect()
     }
+
+    /// Whether an old model file or a part of one is in the model folder.
+    fn old_files(&self) -> bool {
+        OLD_FILES.iter().any(|name| {
+            let path = self.cache.join(name);
+            path.exists() || part(&path).exists()
+        })
+    }
+}
+
+/// The answer of `model path`; every line is needed. An older notedown names only two files.
+fn parse_paths(text: &str) -> Option<Paths> {
+    let line = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .map(|v| PathBuf::from(v.trim()))
+    };
+    let cache = line("cache: ")?;
+    let files = FILE_KEYS
+        .iter()
+        .map(|key| line(key))
+        .collect::<Option<Vec<_>>>()?;
+    Some(Paths { cache, files })
+}
+
+/// The licence lines in the answer of `model pull --json --licences-only`.
+fn parse_licences(text: &str) -> Option<Vec<String>> {
+    text.lines().find_map(|line| {
+        let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+        serde_json::from_value(value.get("licences")?.clone()).ok()
+    })
 }
 
 fn part(path: &Path) -> PathBuf {
@@ -217,6 +260,40 @@ impl ModelControl {
         Ok(())
     }
 
+    /// The licences of the model files, one line per licensor. Nothing is downloaded for it.
+    /// Blocking: it runs `model pull --json --licences-only`.
+    pub fn licences(&self) -> Result<Vec<String>, String> {
+        let output = self
+            .inner
+            .check(&["model", "pull", "--json", "--licences-only"])
+            .map_err(|why| format!("The licences are not known: {why}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "The licences are not known: {}",
+                process::error_text(&output.stderr, output.status)
+            ));
+        }
+        parse_licences(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
+            "The licences are not known: the notedown program did not name them".to_owned()
+        })
+    }
+
+    /// Deletes the model files of notedown 0.1 with `model clean-old`, then says what is on
+    /// disk. The new model files stay.
+    pub fn clean_old(&self) -> Result<ModelState, String> {
+        let output = self
+            .inner
+            .check(&["model", "clean-old"])
+            .map_err(|why| format!("The old model files could not be deleted: {why}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "The old model files could not be deleted: {}",
+                process::error_text(&output.stderr, output.status)
+            ));
+        }
+        Ok(self.inner.state())
+    }
+
     /// Stops a running download; Download continues it later. Returns when it is gone.
     pub fn pause(&self) {
         self.inner.stop();
@@ -286,6 +363,7 @@ impl Inner {
             pulling,
             progress,
             problem: None,
+            old_files: false,
         };
         let paths = match self.paths() {
             Ok(paths) => paths,
@@ -296,7 +374,8 @@ impl Inner {
         };
         let marks: Vec<FileMark> = paths.all().iter().map(|p| mark(p)).collect();
         state.size_bytes = marks.iter().filter_map(|m| m.len).sum();
-        state.path = Some(paths.model.display().to_string());
+        state.path = paths.files.first().map(|p| p.display().to_string());
+        state.old_files = paths.old_files();
         // A running download changes the files all the time; verify only when it is over.
         if pulling {
             return state;
@@ -382,18 +461,9 @@ impl Inner {
                 process::error_text(&output.stderr, output.status)
             ));
         }
-        let text = String::from_utf8_lossy(&output.stdout);
-        let line = |key: &str| {
-            text.lines()
-                .find_map(|l| l.strip_prefix(key))
-                .map(|v| PathBuf::from(v.trim()))
-        };
-        match (line("model: "), line("mmproj: ")) {
-            (Some(model), Some(mmproj)) => Ok(Paths { model, mmproj }),
-            _ => Err(
-                "The model folder is not known: the notedown program did not name it".to_owned(),
-            ),
-        }
+        parse_paths(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
+            "The model folder is not known: the notedown program did not name it".to_owned()
+        })
     }
 
     /// Reads the pull's lines until it ends, then reports how it ended.

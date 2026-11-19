@@ -5,31 +5,37 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use notedown_ocr::convert::chandra_page;
-use notedown_ocr::{OcrEngine, OcrError, PageOcr};
+use notedown_ocr::{OcrBlock, OcrEngine, OcrError, PageOcr};
 use sha2::{Digest, Sha256};
 
 /// The default reading: one text block over the whole page.
-pub const DEFAULT_HTML: &str =
-    r#"<div data-label="Text" data-bbox="0 0 1000 1000"><p>fake page</p></div>"#;
+pub fn default_reading() -> Vec<OcrBlock> {
+    vec![text_block([0, 0, 1000, 1000], "fake page")]
+}
 
-/// Chandra layout HTML for one `Text` block with a box on the 0..1000 grid.
-pub fn text_block(bbox: [u32; 4], text: &str) -> String {
-    format!(
-        r#"<div data-label="Text" data-bbox="{} {} {} {}"><p>{text}</p></div>"#,
-        bbox[0], bbox[1], bbox[2], bbox[3]
-    )
+/// One block with a box on the 0..1000 grid, or none.
+pub fn block(label: &str, bbox: Option<[u32; 4]>, markdown: &str) -> OcrBlock {
+    OcrBlock {
+        label: label.into(),
+        bbox,
+        markdown: markdown.into(),
+    }
+}
+
+/// One `Text` block with a box on the 0..1000 grid.
+pub fn text_block(bbox: [u32; 4], text: &str) -> OcrBlock {
+    block("Text", Some(bbox), text)
 }
 
 pub fn sha256(png: &[u8]) -> [u8; 32] {
     Sha256::digest(png).into()
 }
 
-/// Returns the HTML mapped to the PNG's SHA-256, or the default. Counts calls and can fail
+/// Returns the blocks mapped to the PNG's SHA-256, or the default. Counts calls and can fail
 /// the next N of them. The handles are shared, so a test can keep them after the engine moved.
 pub struct FakeEngine {
-    map: HashMap<[u8; 32], String>,
-    default_html: String,
+    map: HashMap<[u8; 32], Vec<OcrBlock>>,
+    default_blocks: Vec<OcrBlock>,
     calls: Arc<AtomicUsize>,
     fail_next: Arc<AtomicU32>,
     truncated: bool,
@@ -39,10 +45,10 @@ pub struct FakeEngine {
 }
 
 impl FakeEngine {
-    pub fn new(map: HashMap<[u8; 32], String>) -> Self {
+    pub fn new(map: HashMap<[u8; 32], Vec<OcrBlock>>) -> Self {
         FakeEngine {
             map,
-            default_html: DEFAULT_HTML.to_string(),
+            default_blocks: default_reading(),
             calls: Arc::default(),
             fail_next: Arc::default(),
             truncated: false,
@@ -57,8 +63,8 @@ impl FakeEngine {
         self
     }
 
-    pub fn with_default(mut self, html: &str) -> Self {
-        self.default_html = html.to_string();
+    pub fn with_default(mut self, blocks: Vec<OcrBlock>) -> Self {
+        self.default_blocks = blocks;
         self
     }
 
@@ -74,9 +80,9 @@ impl FakeEngine {
         self
     }
 
-    /// Maps one more PNG to `html`.
-    pub fn insert(&mut self, png: &[u8], html: &str) {
-        self.map.insert(sha256(png), html.to_string());
+    /// Maps one more PNG to `blocks`.
+    pub fn insert(&mut self, png: &[u8], blocks: Vec<OcrBlock>) {
+        self.map.insert(sha256(png), blocks);
     }
 
     /// The next `n` calls fail.
@@ -110,14 +116,14 @@ impl OcrEngine for FakeEngine {
         if failing {
             return Err(OcrError::Engine("fake engine failure".into()));
         }
-        let html = self
+        let blocks = self
             .map
             .get(&sha256(png))
-            .unwrap_or(&self.default_html)
+            .unwrap_or(&self.default_blocks)
             .clone();
         Ok(PageOcr {
             truncated: self.truncated,
-            ..chandra_page(&html)
+            ..PageOcr::from_blocks(blocks)
         })
     }
 

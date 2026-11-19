@@ -251,7 +251,7 @@ fn a_note_without_text_gets_no_file() {
     let d = setup();
     let out = tempfile::tempdir().unwrap();
     let key = d.put("test1", "NOTE/Note");
-    let engine = FakeEngine::new(Default::default()).with_default("");
+    let engine = FakeEngine::new(Default::default()).with_default(Vec::new());
     worker(&d, with_dir(out.path()), engine)
         .run_once(true)
         .unwrap();

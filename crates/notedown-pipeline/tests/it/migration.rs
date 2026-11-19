@@ -12,7 +12,7 @@ use notedown_pipeline::region::{Rect, Region};
 use notedown_pipeline::store::{TextStore, WriterLock};
 use time::UtcOffset;
 
-use crate::fake_engine::{FakeEngine, text_block};
+use crate::fake_engine::{FakeEngine, block, text_block};
 use crate::worker::{no_settle, setup, worker};
 
 /// The model name notedown 0.1 stored.
@@ -29,13 +29,15 @@ fn chandra_page_is_not_read_again_after_upgrade() {
     let d = setup();
     let key = d.put("test1", "NOTE/Note");
     // notedown 0.1 read the page with Chandra.
-    let html = format!(
-        "{}{}",
-        text_block([100, 100, 900, 200], "Meeting with Anna"),
-        r#"<div data-label="Diagram" data-bbox="100 300 900 700"><pre>graph TD; A[Start] --&gt; B[End];</pre></div>"#
-    );
     let chandra = FakeEngine::new(HashMap::new())
-        .with_default(&html)
+        .with_default(vec![
+            text_block([100, 100, 900, 200], "Meeting with Anna"),
+            block(
+                "Diagram",
+                Some([100, 300, 900, 700]),
+                "```mermaid\ngraph TD\nA[Start] --> B[End]\n```",
+            ),
+        ])
         .with_label(CHANDRA);
     worker(&d, no_settle(), chandra).run_once(true).unwrap();
     let before = note_state(&d, &key);
@@ -44,7 +46,7 @@ fn chandra_page_is_not_read_again_after_upgrade() {
 
     // After the upgrade: same strokes, the pagevision engine. Nothing is read again.
     let pagevision = FakeEngine::new(HashMap::new())
-        .with_default(&text_block([0, 0, 1000, 1000], "read again"))
+        .with_default(vec![text_block([0, 0, 1000, 1000], "read again")])
         .with_label(ENGINE_LABEL);
     let calls = pagevision.calls_handle();
     worker(&d, no_settle(), pagevision).run_once(true).unwrap();

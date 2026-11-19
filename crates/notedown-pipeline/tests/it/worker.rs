@@ -146,7 +146,7 @@ pub(crate) fn with_parts(
 }
 
 pub(crate) fn engine_reading(text: &str) -> FakeEngine {
-    FakeEngine::new(HashMap::new()).with_default(&text_block([100, 100, 900, 200], text))
+    FakeEngine::new(HashMap::new()).with_default(vec![text_block([100, 100, 900, 200], text)])
 }
 
 /// One machine: the server's folder is the pipeline's own, with `cfg`.

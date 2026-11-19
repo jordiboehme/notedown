@@ -678,8 +678,7 @@ pub fn convert_one(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notedown_ocr::OcrError;
-    use notedown_ocr::convert::chandra_page;
+    use notedown_ocr::{OcrBlock, OcrError};
 
     struct Counting(usize);
     impl OcrEngine for Counting {
@@ -688,7 +687,11 @@ mod tests {
             Ok(PageOcr {
                 prompt_tokens: 1,
                 output_tokens: 1,
-                ..chandra_page("<div data-label=\"Text\"><p>Hi</p></div>")
+                ..PageOcr::from_blocks(vec![OcrBlock {
+                    label: "Text".into(),
+                    bbox: None,
+                    markdown: "Hi".into(),
+                }])
             })
         }
         fn label(&self) -> &str {

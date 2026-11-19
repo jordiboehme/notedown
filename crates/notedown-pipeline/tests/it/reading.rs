@@ -6,7 +6,7 @@ use notedown_note::{DigestRef, Notebook, VersionPolicy};
 use notedown_pipeline::meta::note_meta;
 use notedown_pipeline::ocr::read_page;
 
-use crate::fake_engine::{FakeEngine, text_block};
+use crate::fake_engine::{FakeEngine, block, text_block};
 
 fn fixture() -> Notebook {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/notes/test1.note");
@@ -29,13 +29,14 @@ fn a_blank_page_skips_the_engine() {
 fn blocks_come_with_grid_boxes() {
     let nb = fixture();
     let png = NoteSource::new(&nb, false).png(0).unwrap();
-    let html = format!(
-        "{}{}<div data-label=\"Image\" data-bbox=\"1 2 3 4\"></div><p>loose</p>",
+    let blocks = vec![
         text_block([10, 20, 500, 120], "first"),
         text_block([10, 200, 500, 300], "second"),
-    );
+        block("Image", Some([1, 2, 3, 4]), "> Sketch: a cup"),
+        block("Text", None, "loose"),
+    ];
     let mut engine = FakeEngine::new(HashMap::new());
-    engine.insert(&png, &html);
+    engine.insert(&png, blocks);
     let reading = read_page(&nb, 0, &mut engine).unwrap();
     assert_eq!(engine.calls(), 1);
     assert_eq!(reading.blocks.len(), 4, "{:?}", reading.blocks);

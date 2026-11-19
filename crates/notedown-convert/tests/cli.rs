@@ -17,10 +17,18 @@ impl OcrEngine for FakeEngine {
             output_tokens: 5,
             encode_ms: 1,
             decode_ms: 1,
-            ..notedown_ocr::convert::chandra_page(
-                r#"<div data-label="Text"><p>Hello page</p></div><div data-label="Diagram"><pre>graph LR
-A --> B</pre></div>"#,
-            )
+            ..PageOcr::from_blocks(vec![
+                notedown_ocr::OcrBlock {
+                    label: "Text".into(),
+                    bbox: None,
+                    markdown: "Hello page".into(),
+                },
+                notedown_ocr::OcrBlock {
+                    label: "Diagram".into(),
+                    bbox: None,
+                    markdown: "```mermaid\ngraph LR\nA --> B\n```".into(),
+                },
+            ])
         })
     }
     fn label(&self) -> &str {
@@ -861,7 +869,7 @@ fn sample_fm() -> Frontmatter {
         description: "Handwritten Supernote note, 1 page, read by OCR.".into(),
         resource: "Test 2.note".into(),
         generated_by: "notedown/0.1.0".into(),
-        generated_model: "chandra-ocr-2 Q4_K_M".into(),
+        generated_model: "pagevision qwen3.5-4b Q4_K_M".into(),
         generated_at: "2026-10-05T23:10:00Z".into(),
         source_date: Some("2026-10-05".into()),
         last_modified: Some("2026-10-05T22:55:35Z".into()),
@@ -903,7 +911,7 @@ title: \"Test 2\"
 description: \"Handwritten Supernote note, 1 page, read by OCR.\"
 resource: \"Test 2.note\"
 tags: [supernote]
-generated: { by: notedown/0.1.0, model: \"chandra-ocr-2 Q4_K_M\", at: 2026-10-05T23:10:00Z }
+generated: { by: notedown/0.1.0, model: \"pagevision qwen3.5-4b Q4_K_M\", at: 2026-10-05T23:10:00Z }
 source_date: 2026-10-05
 sources:
   - { id: note, resource: \"Test 2.note\", last_modified: 2026-10-05T22:55:35Z }
@@ -981,7 +989,7 @@ source_sha256: ab
 kind: supernote-note
 file_id: F1
 pages: 2
-model: chandra-ocr-2 Q4_K_M
+model: pagevision qwen3.5-4b Q4_K_M
 converted_at: \"2026-10-05T23:10:00Z\"
 generator: notedown 0.1.0
 keywords:
@@ -996,7 +1004,7 @@ links:
     let fm = Frontmatter::parse(old).unwrap();
     assert_eq!(fm.format, HeaderFormat::Old);
     assert_eq!(fm.generated_by, "notedown/0.1.0");
-    assert_eq!(fm.generated_model, "chandra-ocr-2 Q4_K_M");
+    assert_eq!(fm.generated_model, "pagevision qwen3.5-4b Q4_K_M");
     assert_eq!(fm.generated_at, "2026-10-05T23:10:00Z");
     assert_eq!(fm.source_sha256, "ab");
     assert_eq!(fm.file_id.as_deref(), Some("F1"));
@@ -1248,7 +1256,11 @@ impl OcrEngine for TruncatingEngine {
             prompt_tokens: 1,
             output_tokens: 1,
             truncated: true,
-            ..notedown_ocr::convert::chandra_page("<div data-label=\"Text\"><p>Cut</p></div>")
+            ..PageOcr::from_blocks(vec![notedown_ocr::OcrBlock {
+                label: "Text".into(),
+                bbox: None,
+                markdown: "Cut".into(),
+            }])
         })
     }
     fn label(&self) -> &str {

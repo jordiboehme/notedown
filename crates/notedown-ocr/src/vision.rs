@@ -10,7 +10,6 @@ use pagevision::{BlockKind, PageError, PageResult};
 
 use crate::OcrError;
 use crate::engine::{OcrBlock, OcrEngine, OcrOptions, PageOcr};
-use crate::markdown::assemble;
 use crate::model::ModelPaths;
 
 /// pagevision behind the `OcrEngine` seam.
@@ -47,8 +46,8 @@ impl OcrEngine for VisionEngine {
     }
 }
 
-/// The stored label of a block kind. These are the labels Chandra gave, so blocks of both
-/// engines compare by the same label classes. A sketch is a picture and stored as "Image".
+/// The stored label of a block kind. These are the labels notedown 0.1 stored (Chandra OCR 2),
+/// so old and new blocks compare by the same label classes. A sketch is a picture and stored as "Image".
 pub fn block_label(kind: BlockKind) -> &'static str {
     match kind {
         BlockKind::Paragraph | BlockKind::Text => "Text",
@@ -65,38 +64,29 @@ pub fn block_label(kind: BlockKind) -> &'static str {
 /// A pagevision result as notedown's page result. The boxes are on the 0..=1000 grid of the
 /// page already.
 pub fn page_ocr(result: PageResult) -> PageOcr {
-    let mut mermaid_blocks = 0;
-    let blocks: Vec<OcrBlock> = result
+    let blocks = result
         .blocks
         .into_iter()
-        .map(|b| {
-            let kind = b.kind();
-            if kind == BlockKind::Diagram {
-                mermaid_blocks += 1;
-            }
-            OcrBlock {
-                label: block_label(kind).to_string(),
-                bbox: Some([
-                    u32::from(b.bbox.x0),
-                    u32::from(b.bbox.y0),
-                    u32::from(b.bbox.x1),
-                    u32::from(b.bbox.y1),
-                ]),
-                markdown: b.markdown,
-            }
+        .map(|b| OcrBlock {
+            label: block_label(b.kind()).to_string(),
+            bbox: Some([
+                u32::from(b.bbox.x0),
+                u32::from(b.bbox.y0),
+                u32::from(b.bbox.x1),
+                u32::from(b.bbox.y1),
+            ]),
+            markdown: b.markdown,
         })
         .collect();
-    let parts: Vec<String> = blocks.iter().map(|b| b.markdown.clone()).collect();
+    // Only a Diagram kind gets the label "Diagram", so the count is the count of Diagram blocks.
     PageOcr {
-        markdown: assemble(&parts),
-        blocks,
-        mermaid_blocks,
         raw: result.raw.unwrap_or_default(),
         prompt_tokens: result.stats.prompt_tokens,
         output_tokens: result.stats.output_tokens,
         truncated: result.truncated,
         encode_ms: result.stats.encode_ms,
         decode_ms: result.stats.decode_ms,
+        ..PageOcr::from_blocks(blocks)
     }
 }
 

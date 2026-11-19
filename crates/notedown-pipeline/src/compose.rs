@@ -2,7 +2,7 @@
 //!
 //! Untouched handwriting keeps its text and id exactly; only the place that
 //! changed takes the new reading. Box comparisons happen in page pixels: every
-//! block box (old and new, both on Chandra's 0..1000 grid) goes through
+//! block box (old and new, both on the 0..1000 grid of the page) goes through
 //! `block_rect` first. The output blocks keep their grid boxes.
 //!
 //! Decisions where spec 3.3 leaves room (also in the task 5 report):
@@ -85,7 +85,7 @@ const COVER: f32 = 0.5;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewBlock {
     pub label: String,
-    /// `[left, top, right, bottom]` on Chandra's 0..1000 grid.
+    /// `[left, top, right, bottom]` on the 0..1000 grid of the page.
     pub bbox: [u32; 4],
     pub text: String,
 }
@@ -103,7 +103,8 @@ pub struct Composed {
     pub replaced: Vec<(String, Vec<String>)>,
 }
 
-/// One label for the three labels the converter renders as a diagram.
+/// One class for the drawing labels: "Diagram", "Figure" (stored by notedown 0.1) and "Image"
+/// (a sketch), so a drawing keeps its id when its label changes between them.
 fn label_class(label: &str) -> &str {
     match label {
         "Diagram" | "Figure" | "Image" => "Diagram",

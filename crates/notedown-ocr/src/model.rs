@@ -213,74 +213,6 @@ fn pull_in(
     resolve_in(dir, None, None)
 }
 
-/// The Chandra OCR 2 model of notedown 0.1. It stays until the switch to pagevision is done.
-pub mod chandra {
-    use super::{ModelFile, OcrError, cache_dir, override_label};
-    use std::path::{Path, PathBuf};
-
-    #[derive(Debug, Clone, Copy)]
-    pub struct ModelSpec {
-        pub label: &'static str,
-        pub repo: &'static str,
-        pub model: ModelFile,
-        pub mmproj: ModelFile,
-    }
-
-    pub const DEFAULT_MODEL: ModelSpec = ModelSpec {
-        label: "chandra-ocr-2 Q4_K_M",
-        repo: "prithivMLmods/chandra-ocr-2-GGUF",
-        model: ModelFile {
-            file_name: "chandra-ocr-2.Q4_K_M.gguf",
-            size: 3066384992,
-            sha256: "bde0505fda04eb1a89e122b2112e60b10c8c9697db5ca90a2e03635984f3a07d",
-        },
-        mmproj: ModelFile {
-            file_name: "chandra-ocr-2.mmproj-q8_0.gguf",
-            size: 366894368,
-            sha256: "709be8aeda77c5732e58e957367439eae14ebb73b4f4a78b558013d000948bc3",
-        },
-    };
-
-    #[derive(Debug, Clone)]
-    pub struct ModelPaths {
-        pub model: PathBuf,
-        pub mmproj: PathBuf,
-        pub label: String,
-    }
-
-    pub fn resolve(
-        spec: &ModelSpec,
-        model_override: Option<&Path>,
-        mmproj_override: Option<&Path>,
-    ) -> Result<ModelPaths, OcrError> {
-        resolve_in(&cache_dir()?, spec, model_override, mmproj_override)
-    }
-
-    pub(super) fn resolve_in(
-        cache: &Path,
-        spec: &ModelSpec,
-        model_override: Option<&Path>,
-        mmproj_override: Option<&Path>,
-    ) -> Result<ModelPaths, OcrError> {
-        let model = model_override
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| cache.join(spec.model.file_name));
-        let mmproj = mmproj_override
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| cache.join(spec.mmproj.file_name));
-        for path in [&model, &mmproj] {
-            if !path.is_file() {
-                return Err(OcrError::ModelMissing { path: path.clone() });
-            }
-        }
-        Ok(ModelPaths {
-            model,
-            mmproj,
-            label: override_label(model_override, spec.label),
-        })
-    }
-}
-
 /// Downloads `url` into `dest` through `dest.part`. A part left by an earlier run is
 /// continued with a `Range` request; a partial answer from another offset is asked for again
 /// without `Range`. The part stays on download and IO errors and is
@@ -380,7 +312,6 @@ pub fn download_from(
 
 #[cfg(test)]
 mod tests {
-    use super::chandra::DEFAULT_MODEL;
     use super::*;
 
     #[test]
@@ -435,38 +366,6 @@ mod tests {
                 .unwrap()
                 .ends_with("notedown/models")
         );
-    }
-
-    #[test]
-    fn resolve_reports_missing_with_pull_hint() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = chandra::resolve_in(dir.path(), &DEFAULT_MODEL, None, None).unwrap_err();
-        assert!(matches!(err, OcrError::ModelMissing { .. }));
-        assert!(err.to_string().contains("notedown model pull"), "{err}");
-    }
-
-    #[test]
-    fn resolve_uses_cache_paths_and_default_label() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(DEFAULT_MODEL.model.file_name), b"x").unwrap();
-        std::fs::write(dir.path().join(DEFAULT_MODEL.mmproj.file_name), b"y").unwrap();
-        let r = chandra::resolve_in(dir.path(), &DEFAULT_MODEL, None, None).unwrap();
-        assert_eq!(r.model, dir.path().join(DEFAULT_MODEL.model.file_name));
-        assert_eq!(r.label, "chandra-ocr-2 Q4_K_M");
-    }
-
-    #[test]
-    fn overrides_are_used_as_given() {
-        let dir = tempfile::tempdir().unwrap();
-        let m = dir.path().join("my-q8.gguf");
-        let p = dir.path().join("proj.gguf");
-        std::fs::write(&m, b"x").unwrap();
-        std::fs::write(&p, b"y").unwrap();
-        let empty = tempfile::tempdir().unwrap();
-        let r = chandra::resolve_in(empty.path(), &DEFAULT_MODEL, Some(&m), Some(&p)).unwrap();
-        assert_eq!(r.model, m);
-        assert_eq!(r.mmproj, p);
-        assert_eq!(r.label, "my-q8");
     }
 
     #[test]

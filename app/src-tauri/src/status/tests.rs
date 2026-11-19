@@ -862,6 +862,13 @@ fn a_paused_pipeline_shows_the_pause() {
 
 #[test]
 fn a_pause_whose_time_passed_gives_the_normal_lines() {
+    // Until the pause watch cleared it, the stopped pipeline still shows it, as the menu does.
+    let until = NOW;
+    let s = status_from(&paused(Some(until)), NOW + 500);
+    let line = format!("OCR paused until {}", crate::pause::local_clock(until));
+    assert_eq!(s.ocr.line, line);
+    assert!(s.ocr.paused);
+    // Once the pipeline runs again, the normal lines.
     let mut parts = paused(Some(NOW));
     parts.pipeline = running(NOW - DAY);
     let s = status_from(&parts, NOW);
@@ -870,6 +877,19 @@ fn a_pause_whose_time_passed_gives_the_normal_lines() {
     assert!(!s.ocr.paused);
     assert!(s.ocr.in_work.is_some());
     assert_eq!(s.attention, vec![Attention::OcrError]);
+}
+
+#[test]
+fn another_notedown_wins_over_a_pause() {
+    // The pause cannot stop a pipeline that another Notedown runs: the status says so.
+    let mut parts = paused(None);
+    parts.pipeline = ChildState::Outside {
+        what: "pipeline".into(),
+    };
+    let s = status_from(&parts, NOW);
+    assert_eq!(s.pipeline.line, OUTSIDE_LINE);
+    assert!(!s.ocr.paused);
+    assert_ne!(s.ocr.line, "OCR paused");
 }
 
 #[test]

@@ -293,18 +293,17 @@ impl Processes {
         }
     }
 
-    /// Starts the child unless another Notedown does its job. Only a start probes: a paused
-    /// pipeline never looks for another one.
+    /// Starts the child unless another Notedown does its job. A paused pipeline looks too: the
+    /// pause cannot stop the pipeline of another Notedown, so the status says that it runs
+    /// outside the app instead of "OCR paused". It never starts one.
     fn launch(&self, sup: &ProcessSupervisor, launch: &Launch, config: &AppConfig) {
-        let Launch::Start(args) = launch else {
-            sup.launch(launch);
-            return;
-        };
         let kind = sup.kind();
-        if self.found_outside(kind, config) {
-            sup.outside(kind.name());
-        } else {
-            sup.start(args.clone());
+        match launch {
+            Launch::Start(_) | Launch::Paused if self.found_outside(kind, config) => {
+                sup.outside(kind.name());
+            }
+            Launch::Start(args) => sup.start(args.clone()),
+            _ => sup.launch(launch),
         }
     }
 

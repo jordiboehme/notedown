@@ -335,11 +335,10 @@ pub fn status_from(parts: &Parts, now_ms: u64) -> Status {
         attention.push(Attention::ServerUnreachable);
     }
     let server = server_status(parts, reach, &mut attention);
-    // A pause stops the pipeline; a pipeline that is not connected yet says that instead.
     let pause_line = config
         .ocr_pause
         .as_ref()
-        .filter(|p| parts.pipeline != ChildState::NotConnected && pause::active(Some(p), now_ms))
+        .filter(|p| pause_shows(p, &parts.pipeline, now_ms))
         .map(|p| pause::pause_line(p, pause::local_clock));
     let pipeline = PipelineStatus {
         line: pause_line
@@ -377,6 +376,19 @@ pub fn status_from(parts: &Parts, now_ms: u64) -> Status {
         account,
         connection,
         first_sync_error: None,
+    }
+}
+
+/// Whether the status shows the pause `p` of the config. A pipeline that is not connected yet,
+/// or that another Notedown runs (the pause cannot stop it), says that instead. A timed pause
+/// shows while it holds, and also after its end while the pipeline is still stopped: the pause
+/// watch clears it within about a second and starts the pipeline, and until then the status
+/// says what the tray menu says.
+fn pause_shows(p: &pause::OcrPause, pipeline: &ChildState, now_ms: u64) -> bool {
+    match pipeline {
+        ChildState::NotConnected | ChildState::Outside { .. } => false,
+        ChildState::Stopped => true,
+        _ => pause::active(Some(p), now_ms),
     }
 }
 

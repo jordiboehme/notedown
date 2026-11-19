@@ -654,7 +654,7 @@ fn a_paused_pipeline_does_not_start_on_start_with() {
         running_pid(p.server());
         assert_eq!(p.pipeline().state(), ChildState::Stopped, "{until:?}");
     }
-    // Paused never probes: the reprobe finds nothing to start either.
+    // The reprobe finds nothing to start either.
     p.reprobe_with(|| AppConfig {
         ocr_pause: pause(None),
         ..rig.config()
@@ -795,5 +795,37 @@ fn an_expired_pause_starts_the_pipeline_after_a_restart() {
     p.start_with(|| config.clone());
     running_pid(p.pipeline());
     assert_eq!(rig.pipeline_spawns(), 2);
+    p.stop_all();
+}
+
+#[test]
+fn a_pause_does_not_hide_another_notedowns_pipeline() {
+    let rig = Rig::new();
+    rig.listen_on(free_port());
+    let lock = rig.data().join("pipeline").join(".writer.lock");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    let writer = std::fs::File::create(&lock).unwrap();
+    writer.try_lock().unwrap();
+    let paused = || AppConfig {
+        ocr_pause: pause(None),
+        ..rig.config()
+    };
+
+    let p = rig.paused_processes();
+    p.start_with(|| rig.config());
+    assert_eq!(p.pipeline().state(), outside("pipeline"));
+    // A pause cannot stop it: it stays outside, also at a start and a reprobe.
+    p.relaunch_pipeline_with(paused);
+    assert_eq!(p.pipeline().state(), outside("pipeline"));
+    p.start_with(paused);
+    assert_eq!(p.pipeline().state(), outside("pipeline"));
+    p.reprobe_with(paused);
+    assert_eq!(p.pipeline().state(), outside("pipeline"));
+
+    // Once it is gone, the pause holds and nothing starts.
+    writer.unlock().unwrap();
+    p.reprobe_with(paused);
+    assert_eq!(p.pipeline().state(), ChildState::Stopped);
+    assert_eq!(rig.pipeline_spawns(), 0);
     p.stop_all();
 }

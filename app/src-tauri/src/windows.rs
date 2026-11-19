@@ -309,14 +309,37 @@ pub fn show_window(app: &AppHandle, kind: WindowKind, opening: Opening) -> tauri
     Ok(())
 }
 
+/// Whether `url` is a page of the app: its own origin (`tauri://localhost`), or the dev server
+/// `dev` in a dev build. A link, a drag or a menu item never loads anything else in a window;
+/// the browser opens links (`open_link`).
+pub fn own_page(url: &tauri::Url, dev: Option<&tauri::Url>) -> bool {
+    let app = url.scheme() == "tauri" && url.host_str() == Some("localhost");
+    let dev_page = dev.is_some_and(|dev| {
+        url.scheme() == dev.scheme()
+            && url.host_str() == dev.host_str()
+            && url.port_or_known_default() == dev.port_or_known_default()
+    });
+    app || dev_page
+}
+
 fn build_window(
     app: &AppHandle,
     kind: WindowKind,
     opening: &Opening,
 ) -> tauri::Result<WebviewWindow> {
+    let dev = app
+        .config()
+        .build
+        .dev_url
+        .clone()
+        .filter(|_| tauri::is_dev());
     let builder =
         WebviewWindowBuilder::new(app, kind.label(), WebviewUrl::App("index.html".into()))
-            .visible(false);
+            .visible(false)
+            // Only the app's own pages load; a new window (a middle click, Open Link in New
+            // Window) never opens.
+            .on_navigation(move |url| own_page(url, dev.as_ref()))
+            .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny);
     let builder = match kind {
         WindowKind::Settings => builder
             .title("Notedown Settings")
@@ -504,6 +527,30 @@ fn drop_pixels(x: f64, y: f64, scale: f64) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_loads_only_its_own_pages() {
+        let url = |s: &str| tauri::Url::parse(s).unwrap();
+        let dev = url("http://localhost:1420");
+        assert!(own_page(&url("tauri://localhost/index.html"), None));
+        assert!(own_page(&url("tauri://localhost/"), Some(&dev)));
+        assert!(own_page(
+            &url("http://localhost:1420/index.html"),
+            Some(&dev)
+        ));
+        for other in [
+            "https://huggingface.co/Qwen/Qwen3.5-4B",
+            "https://github.com/jordiboehme/notedown",
+            "tauri://other/index.html",
+            "http://localhost:1421/",
+            "about:blank",
+            "file:///etc/passwd",
+        ] {
+            assert!(!own_page(&url(other), Some(&dev)), "{other}");
+        }
+        // Without a dev server, its address is no page of the app.
+        assert!(!own_page(&url("http://localhost:1420/"), None));
+    }
     use WindowKind::*;
 
     #[test]

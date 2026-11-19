@@ -91,13 +91,11 @@ describe("the model rows", () => {
     // The text of the line, without its tags and Svelte's comments.
     const text = paragraph.replace(/<!--[\s\S]*?-->/g, "").replace(/<[^>]+>/g, "");
     expect(text).toBe(LINE);
-    // Each model name is a link to its page.
-    const links = [...paragraph.matchAll(/<a[^>]*href="([^"]+)"[^>]*>([^<]+)<\/a>/g)].map((m) => [m[2], m[1]]);
-    expect(links).toEqual([
-      ["Qwen3.5-4B", "https://huggingface.co/Qwen/Qwen3.5-4B"],
-      ["PP-DocLayoutV3", "https://huggingface.co/PaddlePaddle/PP-DocLayoutV3"],
-      ["PP-OCRv6", "https://huggingface.co/PaddlePaddle/PP-OCRv6_small_det"],
-    ]);
+    // Each model name is a button that opens its page in the browser; no link the web view
+    // could load itself.
+    const names = [...paragraph.matchAll(/<button[^>]*type="button"[^>]*class="link[^"]*"[^>]*>([^<]+)<\/button>/g)].map((m) => m[1]);
+    expect(names).toEqual(["Qwen3.5-4B", "PP-DocLayoutV3", "PP-OCRv6"]);
+    expect(paragraph).not.toContain("href");
     expect(body).toContain(MODEL_TEXT.note);
     expect(body).toContain(MODEL_TEXT.size);
     // Under the model row, above the status row with the Download button.

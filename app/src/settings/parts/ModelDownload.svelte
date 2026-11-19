@@ -61,8 +61,7 @@
   const groups = $derived(licenceGroups(licences.files ?? []));
 
   /** A model's page opens in the browser (Rust opens only pages on Hugging Face). */
-  function openPage(event: MouseEvent, page: string) {
-    event.preventDefault();
+  function openPage(page: string) {
     openLink(page).catch((error: unknown) => console.error("notedown: the link did not open", error));
   }
 
@@ -132,7 +131,8 @@
     Licences: {#each groups as group, g (g)}{#if g > 0}{"; "}{/if}{#each group.models as model, i (model.name)}{modelJoint(
           i,
           group.models.length,
-        )}{#if model.page}<a href={model.page} onclick={(event) => openPage(event, model.page!)}>{model.name}</a
+        )}{#if model.page}<button type="button" class="link" onclick={() => openPage(model.page!)}
+            >{model.name}</button
           >{:else}{model.name}{/if}{/each} ({group.licensor}): {group.licence}{/each}
   </p>
 {:else if licences.error}
@@ -210,8 +210,24 @@
     border-bottom: 1px solid var(--separator);
   }
 
-  .licences a {
+  /* A model name: looks like a link, opens its page in the browser. */
+  .licences .link {
+    font: inherit;
     color: var(--accent);
+    padding: 0;
+    border: 0;
+    background: none;
+    cursor: pointer;
+  }
+
+  .licences .link:hover {
+    text-decoration: underline;
+  }
+
+  .licences .link:focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--accent), transparent 50%);
+    outline-offset: 1px;
+    border-radius: 2px;
   }
 
   .licences.bad {

@@ -20,7 +20,7 @@ use llama_cpp_2::{LogOptions, send_logs_to_tracing};
 
 use crate::convert::chandra_page;
 use crate::engine::{OcrEngine, OcrOptions, PageOcr};
-use crate::model::ModelPaths;
+use crate::model::chandra::ModelPaths;
 use crate::{OcrError, prompt};
 
 /// Context size for the prompt (image tokens plus layout prompt), before the output budget.

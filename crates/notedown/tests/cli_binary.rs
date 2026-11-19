@@ -337,28 +337,139 @@ fn convert_updates_an_old_header_without_loading_the_model() {
 }
 
 #[cfg(feature = "ocr")]
+fn model_cmd(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    // A closed local port as the proxy: a download fails at once and nothing leaves this
+    // machine.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let proxy = format!("http://127.0.0.1:{port}");
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"));
+    cmd.env("NOTEDOWN_MODEL_DIR", dir).arg("model").args(args);
+    for var in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        cmd.env(var, &proxy);
+    }
+    cmd.env_remove("NO_PROXY").env_remove("no_proxy");
+    cmd.output().unwrap()
+}
+
+#[cfg(feature = "ocr")]
 #[test]
-fn model_path_prints_cache_dir() {
+fn path_prints_four_files() {
     let dir = tempfile::tempdir().unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
-        .env("NOTEDOWN_MODEL_DIR", dir.path())
-        .args(["model", "path"])
-        .output()
-        .unwrap();
+    let out = model_cmd(dir.path(), &["path"]);
     assert!(out.status.success());
-    assert!(String::from_utf8_lossy(&out.stdout).contains("chandra-ocr-2.Q4_K_M.gguf"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let d = dir.path().display();
+    let expected = format!(
+        "cache: {d}\nmodel: {d}/Qwen3.5-4B-Q4_K_M.gguf\nmmproj: {d}/mmproj-F16.gguf\n\
+         layout: {d}/pp-doclayoutv3.safetensors\nlines: {d}/pp-ocrv6-small-det.onnx\n"
+    );
+    assert_eq!(stdout, expected);
 }
 
 #[cfg(feature = "ocr")]
 #[test]
 fn model_verify_fails_for_empty_cache() {
     let dir = tempfile::tempdir().unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
-        .env("NOTEDOWN_MODEL_DIR", dir.path())
-        .args(["model", "verify"])
-        .output()
-        .unwrap();
+    let out = model_cmd(dir.path(), &["verify"]);
     assert_eq!(out.status.code(), Some(1));
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn verify_names_each_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = model_cmd(dir.path(), &["verify"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 4, "{stdout}");
+    for (line, name) in lines.iter().zip([
+        "Qwen3.5-4B-Q4_K_M.gguf",
+        "mmproj-F16.gguf",
+        "pp-doclayoutv3.safetensors",
+        "pp-ocrv6-small-det.onnx",
+    ]) {
+        assert!(line.starts_with(&format!("{name}: ")), "{line}");
+        assert!(line.contains("not found"), "{line}");
+    }
+}
+
+#[cfg(feature = "ocr")]
+const LICENCES_JSON: &str = r#"{"licences":["Qwen3.5-4B (Qwen team, Alibaba Cloud): Apache-2.0","PP-DocLayoutV3 and PP-OCRv6 (PaddlePaddle Authors): Apache-2.0"]}"#;
+
+#[cfg(feature = "ocr")]
+#[test]
+fn pull_json_starts_with_licences() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = model_cmd(dir.path(), &["pull", "--json"]);
+    // The download itself fails at the closed proxy.
+    assert!(!out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.lines().next(), Some(LICENCES_JSON), "{stdout}");
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn pull_shows_licences_and_size_before_it_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = model_cmd(dir.path(), &["pull"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let expected = "The model files have these licences:\n\
+                    Qwen3.5-4B (Qwen team, Alibaba Cloud): Apache-2.0\n\
+                    PP-DocLayoutV3 and PP-OCRv6 (PaddlePaddle Authors): Apache-2.0\n\
+                    The download is about 3.6 GB.\n";
+    assert!(stderr.starts_with(expected), "{stderr}");
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn licences_only_does_not_download() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("models");
+    let out = model_cmd(&cache, &["pull", "--json", "--licences-only"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{LICENCES_JSON}\n")
+    );
+    // No folder made, no file written.
+    assert!(!cache.exists());
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn clean_old_removes_only_chandra_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir.path().join("chandra-ocr-2.Q4_K_M.gguf");
+    let part = dir.path().join("chandra-ocr-2.mmproj-q8_0.gguf.part");
+    let keep = dir.path().join("Qwen3.5-4B-Q4_K_M.gguf");
+    std::fs::write(&old, b"x").unwrap();
+    std::fs::write(&part, b"x").unwrap();
+    std::fs::write(&keep, b"x").unwrap();
+    let out = model_cmd(dir.path(), &["clean-old"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(!old.exists() && !part.exists());
+    assert!(keep.exists());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!("removed {}", old.display())),
+        "{stdout}"
+    );
+    // A second run finds nothing and still succeeds.
+    let out = model_cmd(dir.path(), &["clean-old"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "no old model files\n");
 }
 
 fn cloud(data: &std::path::Path, args: &[&str], stdin: Option<&str>) -> std::process::Output {

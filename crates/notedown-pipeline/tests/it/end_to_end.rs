@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use notedown_note::{Notebook, VersionPolicy};
-use notedown_ocr::model::{DEFAULT_MODEL, resolve};
+use notedown_ocr::model::chandra::{DEFAULT_MODEL, resolve};
 use notedown_ocr::{LlamaEngine, OcrOptions};
 use notedown_pipeline::delta::{Start, delta, manifest};
 use notedown_pipeline::model::Change;

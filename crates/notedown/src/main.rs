@@ -15,7 +15,7 @@ use notedown_convert::links::FileIndex;
 use notedown_convert::pipeline::{Options, Outcome, convert_one};
 use notedown_note::{Notebook, RenderOptions, VersionPolicy, encode_png};
 #[cfg(feature = "ocr")]
-use notedown_ocr::model::{self, DEFAULT_MODEL};
+use notedown_ocr::model::{self, chandra::DEFAULT_MODEL};
 #[cfg(feature = "ocr")]
 use notedown_ocr::{LlamaEngine, OcrEngine, OcrError, OcrOptions, PageOcr};
 
@@ -604,6 +604,9 @@ enum ModelAction {
         /// Print one JSON line per progress update on stdout
         #[arg(long)]
         json: bool,
+        /// Print the licences of the model files and stop, without a download
+        #[arg(long)]
+        licences_only: bool,
         /// Stop when the process PID is no longer the parent (for the Mac app)
         #[arg(long, value_name = "PID", hide = true)]
         exit_with_parent: Option<u32>,
@@ -612,6 +615,8 @@ enum ModelAction {
     Path,
     /// Check size and SHA-256 of the model files
     Verify,
+    /// Delete the files of the old OCR model (Chandra) from the cache
+    CleanOld,
 }
 
 #[cfg(feature = "ocr")]
@@ -634,7 +639,7 @@ impl OcrEngine for LazyEngine {
                 return Err(OcrError::Engine(msg.clone()));
             }
             let start = Instant::now();
-            let loaded = model::resolve(
+            let loaded = model::chandra::resolve(
                 &DEFAULT_MODEL,
                 self.model.as_deref(),
                 self.mmproj.as_deref(),
@@ -879,8 +884,25 @@ fn model_command(action: ModelAction) -> Result<ExitCode> {
     match action {
         ModelAction::Pull {
             json,
+            licences_only,
             exit_with_parent: parent,
         } => {
+            // The licences come first, before anything is downloaded.
+            let licences = model::licence_lines();
+            if json {
+                println!("{}", serde_json::json!({ "licences": licences }));
+            } else {
+                eprintln!("The model files have these licences:");
+                for line in &licences {
+                    eprintln!("{line}");
+                }
+            }
+            if licences_only {
+                return Ok(ExitCode::SUCCESS);
+            }
+            if !json {
+                eprintln!("The download is {}.", model::TOTAL_SIZE);
+            }
             // SIGTERM ends the pull as it is; the part file stays and the next pull continues.
             exit_with_parent(parent);
             let mut last = Instant::now() - Duration::from_secs(10);
@@ -905,36 +927,33 @@ fn model_command(action: ModelAction) -> Result<ExitCode> {
                     }
                 }
             };
-            let paths = model::pull(&DEFAULT_MODEL, &mut progress)?;
+            let paths = model::pull(&mut progress)?;
             if json {
-                println!("{}", ready_json(&paths.model));
+                println!("{}", ready_json(&paths.files.model));
             } else {
-                eprintln!("model ready: {}", paths.model.display());
+                eprintln!("model ready: {}", paths.files.model.display());
             }
             Ok(ExitCode::SUCCESS)
         }
         ModelAction::Path => {
             let dir = model::cache_dir()?;
+            let files = model::ModelFiles::in_dir(&dir);
             println!("cache: {}", dir.display());
-            println!(
-                "model: {}",
-                dir.join(DEFAULT_MODEL.model.file_name).display()
-            );
-            println!(
-                "mmproj: {}",
-                dir.join(DEFAULT_MODEL.mmproj.file_name).display()
-            );
+            println!("model: {}", files.model.display());
+            println!("mmproj: {}", files.mmproj.display());
+            println!("layout: {}", files.layout.display());
+            println!("lines: {}", files.text_det.display());
             Ok(ExitCode::SUCCESS)
         }
         ModelAction::Verify => {
             let dir = model::cache_dir()?;
             let mut bad = false;
-            for file in [&DEFAULT_MODEL.model, &DEFAULT_MODEL.mmproj] {
-                match model::verify_file(&dir.join(file.file_name), file) {
-                    Ok(()) => println!("{}: ok", file.file_name),
+            for file in &model::FILES {
+                match model::verify_file(&dir.join(file.local), file) {
+                    Ok(()) => println!("{}: ok", file.local),
                     Err(e) => {
                         bad = true;
-                        println!("{}: {e}", file.file_name);
+                        println!("{}: {e}", file.local);
                     }
                 }
             }
@@ -943,6 +962,16 @@ fn model_command(action: ModelAction) -> Result<ExitCode> {
             } else {
                 ExitCode::SUCCESS
             })
+        }
+        ModelAction::CleanOld => {
+            let removed = model::clean_old(&model::cache_dir()?)?;
+            if removed.is_empty() {
+                println!("no old model files");
+            }
+            for path in removed {
+                println!("removed {}", path.display());
+            }
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
@@ -2503,7 +2532,7 @@ fn pipeline_command(args: PipelineArgs) -> Result<ExitCode> {
     }
     // The model is loaded when a page is due, as `notedown convert` loads it.
     let loader: EngineLoader = Box::new(|| {
-        let paths = model::resolve(&DEFAULT_MODEL, None, None)?;
+        let paths = model::chandra::resolve(&DEFAULT_MODEL, None, None)?;
         eprintln!("loading model {} ...", paths.label);
         let engine = LlamaEngine::load(&paths, OcrOptions::default())?;
         Ok(Box::new(engine) as Box<dyn OcrEngine>)

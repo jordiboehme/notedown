@@ -7,7 +7,7 @@ use notedown_ocr::{LlamaEngine, OcrEngine, OcrOptions, model};
 #[test]
 #[ignore = "needs the Chandra 2 model files (notedown model pull) and takes about a minute"]
 fn ocr_test2_page_finds_text_and_diagram() {
-    let paths = model::resolve(&model::DEFAULT_MODEL, None, None).unwrap();
+    let paths = model::chandra::resolve(&model::chandra::DEFAULT_MODEL, None, None).unwrap();
     let load_start = std::time::Instant::now();
     let mut engine = LlamaEngine::load(&paths, OcrOptions::default()).unwrap();
     let load_ms = load_start.elapsed().as_millis();

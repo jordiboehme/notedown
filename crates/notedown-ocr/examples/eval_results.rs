@@ -84,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("no <id>=<png> given".into());
     }
 
-    let paths = model::resolve(&model::DEFAULT_MODEL, None, None)?;
+    let paths = model::chandra::resolve(&model::chandra::DEFAULT_MODEL, None, None)?;
     let mut engine = LlamaEngine::load(&paths, OcrOptions::default())?;
     let mut pages = Vec::new();
     for (id, path) in inputs {
@@ -118,8 +118,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             krate: format!("notedown-ocr {}", env!("CARGO_PKG_VERSION")),
             llama_cpp_2: "0.1.161",
             model_sha256: [
-                model::DEFAULT_MODEL.model.sha256,
-                model::DEFAULT_MODEL.mmproj.sha256,
+                model::chandra::DEFAULT_MODEL.model.sha256,
+                model::chandra::DEFAULT_MODEL.mmproj.sha256,
             ],
             prompt_sha256: const_hex::encode(Sha256::digest(OCR_LAYOUT_PROMPT.as_bytes())),
             preprocess: "none",

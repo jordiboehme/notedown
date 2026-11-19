@@ -548,6 +548,14 @@ async fn read_body(body: Body) -> Option<Bytes> {
     Some(Bytes::from(bytes))
 }
 
+/// Whether the request log drops the rest of a streamed body the handler left unread: only a
+/// `drainable` one, and not when the client waits for `100 Continue` (`expects`) and the
+/// handler never asked for the body (`polled`). Such a client sends no body, and a drain that
+/// polls before hyper has written the answer would make hyper send the 100 and ask for it.
+fn drains_rest(drainable: bool, expects: bool, polled: bool) -> bool {
+    drainable && (polled || !expects)
+}
+
 /// The body of a streamed route as the handler reads it. The request log keeps a second handle,
 /// so when the handler answers without reading it all (a refusal), the request log drops the
 /// rest ([`drop_rest`]). `polled` tells whether the handler asked for the body at all (then
@@ -644,10 +652,7 @@ pub async fn log_request(
         let request = Request::from_parts(parts, Body::from_stream(stream));
         let response = next.run(request).await;
         // The handler has dropped the body: drop what it left unread (nothing after a full read).
-        // Not when the client waits for `100 Continue` and the handler never asked for the body:
-        // the client sends none, and reading it would make hyper ask for it.
-        if drain
-            && !(expects && !polled.load(Ordering::Relaxed))
+        if drains_rest(drain, expects, polled.load(Ordering::Relaxed))
             && let Ok(stream) = Arc::try_unwrap(shared)
         {
             let stream = stream.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -798,4 +803,20 @@ fn finish_entry(
     }
     entry.duration_ms = Some(started.elapsed().as_millis() as u64);
     state.log.record(entry);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drains_rest;
+
+    #[test]
+    fn a_client_waiting_for_100_continue_is_not_asked_for_its_body() {
+        // drainable, expects, polled
+        assert!(drains_rest(true, false, false));
+        assert!(drains_rest(true, false, true));
+        assert!(drains_rest(true, true, true));
+        assert!(!drains_rest(true, true, false));
+        assert!(!drains_rest(false, false, true));
+        assert!(!drains_rest(false, true, true));
+    }
 }

@@ -2288,6 +2288,8 @@ fn a_client_that_waits_for_100_continue_is_refused_without_it() {
     assert!(text.contains("too_large"), "{text}");
     assert!(!text.contains("100 Continue"), "{text}");
     // The server does not ask for the body: it does not read it and closes the connection.
+    // (hyper also ends the body once the answer is out; the skip in the request log covers a
+    // drain that would poll before that, see `drains_rest`.)
     assert_unread(&mut stream);
 }
 

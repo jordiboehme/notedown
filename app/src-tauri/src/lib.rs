@@ -333,7 +333,6 @@ pub fn run() {
             commands::update_state,
             commands::check_for_update,
             commands::install_update_and_restart,
-            commands::ocr_pause,
             commands::ocr_resume
         ])
         .build(tauri::generate_context!())
@@ -955,7 +954,7 @@ mod tests {
         names.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    const SETTINGS_ONLY: [&str; 46] = [
+    const SETTINGS_ONLY: [&str; 45] = [
         "get_config",
         "set_mode",
         "set_start_view",
@@ -1000,7 +999,6 @@ mod tests {
         "update_state",
         "check_for_update",
         "install_update_and_restart",
-        "ocr_pause",
         "ocr_resume",
     ];
 
@@ -1129,7 +1127,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 82);
+        assert_eq!(handler_commands().len(), 81);
     }
 
     #[test]
@@ -1215,7 +1213,6 @@ mod tests {
             "update_state",
             "check_for_update",
             "install_update_and_restart",
-            "ocr_pause",
             "ocr_resume",
         ]);
         assert_eq!(manifest_commands(), all);

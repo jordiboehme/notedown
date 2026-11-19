@@ -1063,7 +1063,7 @@ fn relaunch_unless_held(
     }
 }
 
-/// [`pause_ocr_with`] in the app, for the command and the menu bar: then the status polls again.
+/// [`pause_ocr_with`] in the app, for the menu bar: then the status polls again.
 pub fn pause_ocr(app: &AppHandle, choice: PauseChoice) -> Result<(), String> {
     let processes = app.state::<Arc<Processes>>();
     pause_ocr_with(
@@ -1109,14 +1109,6 @@ fn pause_changed(app: &AppHandle) {
     if let Some(poller) = app.try_state::<Poller>() {
         poller.poll_now();
     }
-}
-
-/// Pauses the OCR (Settings > OCR); the menu bar calls [`pause_ocr`] itself.
-#[tauri::command]
-pub async fn ocr_pause(app: AppHandle, choice: PauseChoice) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || pause_ocr(&app, choice))
-        .await
-        .map_err(|e| e.to_string())?
 }
 
 /// Ends the OCR pause (Settings > OCR); the menu bar calls [`resume_ocr`] itself.

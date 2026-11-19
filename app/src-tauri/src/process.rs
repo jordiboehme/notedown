@@ -268,21 +268,24 @@ pub fn signal_group(pgid: u32, signal: i32) -> io::Result<()> {
 /// The longest a group kill waits for its group to be empty.
 pub const KILL_GUARD: Duration = Duration::from_secs(120);
 
-/// Kills the group `pgid` until no process of it is left, at most `limit`. A process that a
-/// member forks while the SIGKILL is on its way can miss it (macOS) and live on in the group:
-/// so each look that still finds a process kills the group again. True when it is empty.
+/// Kills the group `pgid` until no process of it is left, at most `limit`. True when it is
+/// empty. The one implementation for every group the app kills.
+///
+/// A process that a member forks while the SIGKILL is on its way can miss it (macOS) and live
+/// on in the group: so each look that still finds a process kills the group again. It looks
+/// before each signal, so an empty group gets none: a group with a member keeps its number,
+/// which therefore still names this group. A member that ended but is not reaped yet counts
+/// (macOS answers EPERM for it): call it once the leader is reaped, or while its reaper runs.
 pub fn kill_group_until_empty(pgid: u32, limit: Duration) -> bool {
     let until = std::time::Instant::now() + limit;
-    loop {
-        let _ = signal_group(pgid, libc::SIGKILL);
-        if !group_alive(pgid) {
-            return true;
-        }
+    while group_alive(pgid) {
         if std::time::Instant::now() >= until {
             return false;
         }
+        let _ = signal_group(pgid, libc::SIGKILL);
         std::thread::sleep(Duration::from_millis(5));
     }
+    true
 }
 
 /// Whether any process of the group `pgid` is still there.

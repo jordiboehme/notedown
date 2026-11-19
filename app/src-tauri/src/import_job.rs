@@ -1177,8 +1177,12 @@ impl Inner {
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
-        // No signal after the reap: the group's number may belong to someone else by then.
         drop(run);
+        // What it left in its group (a process forked while a signal was on its way) goes too.
+        // Only a group with a member gets a signal, so its number is still this group's.
+        if !process::kill_group_until_empty(pgid, process::KILL_GUARD) {
+            eprintln!("notedown: the process group {pgid} is still there after the kill");
+        }
     }
 }
 

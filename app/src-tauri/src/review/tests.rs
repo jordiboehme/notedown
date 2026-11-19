@@ -63,7 +63,9 @@ fn bytes_of(body: &[u8]) -> Act {
 /// The fake `notedown`: every call goes to `calls`. `render <file> --info ...` prints the
 /// file `info` of the test folder (the pages of the note). `render <file> ... --page N --out D`
 /// writes a PNG `D/Plan-page-00N.png` that holds the page and the note's bytes, and prints its
-/// path. With `fail` it reports the page as failed; with `hold` it waits for `release` or
+/// path. With `fork` it forks this test's own sleep without a break (each round starts one
+/// and ends the one before) and writes `forking` after the first. With `fail` it reports the
+/// page as failed; with `hold` it waits for `release` or
 /// `release-<N>` (120 s at
 /// most, a guard against a hang) before it writes; with `linger` it writes, prints and then runs this test's own sleep
 /// of the length in `linger`.
@@ -93,6 +95,17 @@ done
 if [ -f "{d}/fail" ]; then
   echo "error: page $page: the note has 1 page and pages count from 1" >&2
   exit 1
+fi
+if [ -f "{d}/fork" ]; then
+  "$S" 3231 &
+  old=$!
+  touch "{d}/forking"
+  while :; do
+    "$S" 3231 &
+    new=$!
+    kill $old 2>/dev/null
+    old=$new
+  done
 fi
 if [ -f "{d}/hold" ]; then
   i=0
@@ -708,6 +721,34 @@ fn a_killed_render_leaves_no_cache() {
             format!("notes/{md5}.note"),
             "pages/".to_owned()
         ]
+    );
+}
+
+#[test]
+fn quit_leaves_nothing_of_a_render_that_keeps_forking() {
+    let s = setup(vec![
+        (look(NOTE), entry()),
+        (FILE.to_owned(), bytes_of(BYTES)),
+        (look(NOTE), entry()),
+        (look(NOTE), entry()),
+    ]);
+    s.flag("fork", "");
+    let call = {
+        let review = s.review.clone();
+        std::thread::spawn(move || review.page_image(NOTE, 0))
+    };
+    s.wait_until("the forking render", || {
+        s.bin.path().join("forking").exists()
+    });
+    s.review.quit();
+    assert_eq!(call.join().unwrap().unwrap_err(), QUITTING);
+    // The render's thread ends once its group is empty: nothing of it may be left now.
+    s.review.join();
+    assert_eq!(
+        crate::test_procs::pids_in(s.bin.path()),
+        Vec::<i32>::new(),
+        "{}",
+        left_in(s.bin.path())
     );
 }
 

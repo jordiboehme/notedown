@@ -36,7 +36,8 @@
 //! 3. One render per (md5, page): a second call for the same page waits for the running one.
 //!    A render is killed when every review that waits for it closes (`note_close(path)`, and
 //!    every review when the library window hides) and at Quit; a render that takes longer than
-//!    [`RENDER_TIMEOUT`] is killed too. A group is never signalled after it was reaped.
+//!    [`RENDER_TIMEOUT`] is killed too, until its group is empty (a process forked during the
+//!    kill can miss it). A group is signalled only while it has a member.
 //!
 //! The leftovers of a run that ended without cleaning up (temp folders and temp files) are
 //! removed once a run, before its first render or download. After each render the cache
@@ -971,7 +972,19 @@ fn stop(state: &mut SlotState, why: &'static str) {
     state.stopped.get_or_insert(why);
     if let Some(pgid) = state.pgid {
         let _ = process::signal_group(pgid, libc::SIGKILL);
+        kill_until_empty_in_background(pgid);
     }
+}
+
+/// Kills the group `pgid` until it is empty, on a thread of its own: the stops run on the main
+/// thread and never wait. A process forked while the first SIGKILL was on its way can have
+/// missed it, and it holds the render's pipes, so its reaper would wait for it.
+fn kill_until_empty_in_background(pgid: u32) {
+    std::thread::spawn(move || {
+        if !process::kill_group_until_empty(pgid, process::KILL_GUARD) {
+            eprintln!("notedown: the process group {pgid} is still there after the kill");
+        }
+    });
 }
 
 /// The cached page at `png` as a data URL, touched; none when it is not there.
@@ -1260,9 +1273,15 @@ impl Inner {
                     }
                 }
             }
+            let pgid = child.id();
             let status = child.wait();
-            // Reaped: no signal to this group from now on.
+            // Reaped: no signal to this group from now on, but from here: what the render
+            // left in its group (a process forked while a kill was on its way) goes too, before
+            // the render ends.
             lock(&reaper.state).pgid = None;
+            if !process::kill_group_until_empty(pgid, process::KILL_GUARD) {
+                eprintln!("notedown: the process group {pgid} is still there after the kill");
+            }
             let errors = errors.join().unwrap_or_default();
             let _ = tx.send((status, lines, errors));
         });
@@ -1274,6 +1293,7 @@ impl Inner {
                         let state = lock(&slot.state);
                         if let Some(pgid) = state.pgid {
                             let _ = process::signal_group(pgid, libc::SIGKILL);
+                            kill_until_empty_in_background(pgid);
                         }
                     }
                     (rx.recv_timeout(GONE_WAIT).ok(), true)

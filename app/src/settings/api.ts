@@ -144,12 +144,17 @@ export interface Progress {
 export interface ModelState {
   installed: boolean;
   sizeBytes: number;
-  path: string | null;
+  /** The model folder. */
+  folder: string | null;
+  /** The names of the four model files in the folder. */
+  files: string[];
   pulling: boolean;
   progress: Progress | null;
   problem: string | null;
   /** The model files of Notedown 0.1 are still on disk. */
   oldFiles: boolean;
+  /** The bytes of the old model files. */
+  oldBytes: number;
 }
 
 export const MODEL_PROGRESS_EVENT = "model-progress";

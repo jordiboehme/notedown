@@ -251,10 +251,7 @@ fn ready_checks_the_model_again() {
     assert!(state.installed);
     assert!(!state.pulling);
     assert_eq!(state.size_bytes, 8);
-    assert_eq!(
-        state.path.as_deref(),
-        Some(dir.path().join("m.gguf").to_str().unwrap())
-    );
+    assert_eq!(state.folder.as_deref(), dir.path().to_str());
     let calls = fs::read_to_string(dir.path().join("calls")).unwrap();
     let pull_at = calls.find("model pull --json").expect("no pull");
     let verify_at = calls.rfind("model verify").expect("no verify");
@@ -497,11 +494,41 @@ fn old_model_files_are_offered_and_clean_old_removes_them() {
     let dir = tempfile::tempdir().unwrap();
     let (control, _) = control(sidecar(dir.path(), "  exit 0"));
     assert!(!control.state().old_files);
+    assert_eq!(control.state().old_bytes, 0);
     fs::write(dir.path().join(OLD_FILES[1]), "x").unwrap();
     assert!(control.state().old_files);
     let state = control.clean_old().unwrap();
     assert!(!state.old_files);
+    assert_eq!(state.old_bytes, 0);
     assert!(!dir.path().join(OLD_FILES[1]).exists());
     let calls = fs::read_to_string(dir.path().join("calls")).unwrap();
     assert!(calls.lines().any(|l| l == "model clean-old"), "{calls}");
+}
+
+#[test]
+fn the_old_size_counts_the_old_files_and_their_parts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (control, _) = control(sidecar(dir.path(), "  exit 0"));
+    fs::write(dir.path().join(OLD_FILES[0]), "12345").unwrap();
+    fs::write(dir.path().join(format!("{}.part", OLD_FILES[1])), "12").unwrap();
+    // The new model files do not count.
+    fs::write(dir.path().join("m.gguf"), "123").unwrap();
+    let state = control.state();
+    assert!(state.old_files);
+    assert_eq!(state.old_bytes, 7);
+    // A part file that has no bytes yet is still offered for removal.
+    fs::remove_file(dir.path().join(OLD_FILES[0])).unwrap();
+    fs::write(dir.path().join(format!("{}.part", OLD_FILES[1])), "").unwrap();
+    let state = control.state();
+    assert!(state.old_files);
+    assert_eq!(state.old_bytes, 0);
+}
+
+#[test]
+fn the_state_names_the_folder_and_all_four_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let (control, _) = control(sidecar(dir.path(), "  exit 0"));
+    let state = control.state();
+    assert_eq!(state.folder.as_deref(), dir.path().to_str());
+    assert_eq!(state.files, ["m.gguf", "p.gguf", "l.safetensors", "d.onnx"]);
 }

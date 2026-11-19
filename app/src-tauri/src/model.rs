@@ -54,8 +54,10 @@ pub struct ModelState {
     pub installed: bool,
     /// The bytes of the model files on disk, a part of a download included.
     pub size_bytes: u64,
-    /// The model file.
-    pub path: Option<String>,
+    /// The model folder.
+    pub folder: Option<String>,
+    /// The names of the four model files in the folder.
+    pub files: Vec<String>,
     /// A download runs (or its result is being checked).
     pub pulling: bool,
     /// The last progress of the running download.
@@ -64,6 +66,8 @@ pub struct ModelState {
     pub problem: Option<String>,
     /// The model files of notedown 0.1 (or a part of them) are still in the model folder.
     pub old_files: bool,
+    /// The bytes of those old files and their parts.
+    pub old_bytes: u64,
 }
 
 /// What a pull tells the app.
@@ -152,12 +156,17 @@ impl Paths {
         self.files.iter().cloned().chain(parts).collect()
     }
 
-    /// Whether an old model file or a part of one is in the model folder.
-    fn old_files(&self) -> bool {
-        OLD_FILES.iter().any(|name| {
-            let path = self.cache.join(name);
-            path.exists() || part(&path).exists()
-        })
+    /// The old model files and their parts that are in the model folder.
+    fn old_marks(&self) -> Vec<FileMark> {
+        OLD_FILES
+            .iter()
+            .flat_map(|name| {
+                let path = self.cache.join(name);
+                [part(&path), path]
+            })
+            .map(|p| mark(&p))
+            .filter(|m| m.len.is_some())
+            .collect()
     }
 }
 
@@ -359,11 +368,13 @@ impl Inner {
         let mut state = ModelState {
             installed: false,
             size_bytes: 0,
-            path: None,
+            folder: None,
+            files: Vec::new(),
             pulling,
             progress,
             problem: None,
             old_files: false,
+            old_bytes: 0,
         };
         let paths = match self.paths() {
             Ok(paths) => paths,
@@ -374,8 +385,20 @@ impl Inner {
         };
         let marks: Vec<FileMark> = paths.all().iter().map(|p| mark(p)).collect();
         state.size_bytes = marks.iter().filter_map(|m| m.len).sum();
-        state.path = paths.files.first().map(|p| p.display().to_string());
-        state.old_files = paths.old_files();
+        state.folder = Some(paths.cache.display().to_string());
+        state.files = paths
+            .files
+            .iter()
+            .map(|p| {
+                p.file_name().map_or_else(
+                    || p.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        let old = paths.old_marks();
+        state.old_files = !old.is_empty();
+        state.old_bytes = old.iter().filter_map(|m| m.len).sum();
         // A running download changes the files all the time; verify only when it is over.
         if pulling {
             return state;

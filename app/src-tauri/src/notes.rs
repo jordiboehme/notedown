@@ -416,6 +416,17 @@ impl Notes {
         by_path(&state).remove(path).map(|n| n.summary.clone())
     }
 
+    /// [`at_path`](Self::at_path) without waiting: `None` while a scan holds the index (for
+    /// the main thread, which must not wait for one).
+    pub fn try_at_path(&self, path: &str) -> Option<Option<NoteSummary>> {
+        let state = match self.inner.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(by_path(&state).remove(path).map(|n| n.summary.clone()))
+    }
+
     /// The note with the key `key` when the index lists it (it has text and is not deleted,
     /// unscoped or hidden by another note at its path). Uses the index as it is.
     pub fn listed_by_key(&self, key: &str) -> Option<NoteSummary> {

@@ -54,9 +54,13 @@ pub fn context_items(target: &MenuTarget, has_text: bool) -> Vec<MenuEntry> {
     }
 }
 
-/// Whether the notes index knows the note at `path` with text on some page.
+/// Whether the notes index knows the note at `path` with text on some page. It does not wait
+/// for a scan (the menu opens on the main thread): while one runs the answer is yes, and the
+/// save checks again.
 pub fn has_text(notes: &Notes, path: &str) -> bool {
-    notes.at_path(path).is_some_and(|n| n.pages_with_text > 0)
+    notes
+        .try_at_path(path)
+        .is_none_or(|note| note.is_some_and(|n| n.pages_with_text > 0))
 }
 
 /// Builds the native menu of `target` and pops it up at the pointer of `window`. The target is

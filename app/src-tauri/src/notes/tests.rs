@@ -934,3 +934,23 @@ fn seen_all_with_unreadable_markers_says_so() {
     readable(&path);
     assert_eq!(f.seen_file(), mine);
 }
+
+#[test]
+fn try_at_path_does_not_wait_for_a_scan() {
+    let f = Fixture::new();
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 20);
+    f.notes.refresh();
+    assert_eq!(
+        f.notes
+            .try_at_path("NOTE/Note/a.note")
+            .unwrap()
+            .unwrap()
+            .key,
+        A
+    );
+    assert_eq!(f.notes.try_at_path("NOTE/Note/b.note"), Some(None));
+    // A scan holds the index: the answer is "not known now", at once.
+    let held = f.notes.inner.state.lock().unwrap();
+    assert_eq!(f.notes.try_at_path("NOTE/Note/a.note"), None);
+    drop(held);
+}

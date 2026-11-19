@@ -4,7 +4,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
@@ -16,6 +16,7 @@ use crate::commands::ConfigState;
 use crate::config::AppConfig;
 use crate::notes::{NoteSummary, Notes};
 use crate::process::{self, SpawnFn};
+use crate::windows::WindowKind;
 
 /// How long the sidecar may take for one note.
 pub const NOTE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -32,18 +33,58 @@ pub const MENU_TEXT: &str = "Save Markdown...";
 /// The title of the dialog that shows a failed save.
 const ERROR_TITLE: &str = "Save Markdown";
 
-/// The note the review shows, by its wire path: what the File menu item saves.
+/// What the File menu item saves: the note the review shows (its wire path), whether it has
+/// text, and whether the library window is in front. Only all three enable the item, so
+/// Cmd+Shift+S in Settings never saves the note of a hidden library.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SaveState {
+    pub path: Option<String>,
+    pub can_save: bool,
+    pub library_front: bool,
+}
+
+impl SaveState {
+    /// The note the File menu item saves now, if any.
+    pub fn target(&self) -> Option<&str> {
+        self.path
+            .as_deref()
+            .filter(|_| self.can_save && self.library_front)
+    }
+}
+
+/// The [`SaveState`] of the app, and whether a save panel is open.
 #[derive(Default)]
-pub struct SaveTarget(pub Mutex<Option<String>>);
+pub struct SaveTarget {
+    state: Mutex<SaveState>,
+    saving: AtomicBool,
+}
+
+/// The one save that runs; dropped, the next may start.
+pub struct SaveTurn<'a>(&'a AtomicBool);
+
+impl<'a> SaveTurn<'a> {
+    /// The turn, `None` while another save runs (its panel is open).
+    pub fn take(saving: &'a AtomicBool) -> Option<Self> {
+        (!saving.swap(true, Ordering::SeqCst)).then_some(SaveTurn(saving))
+    }
+}
+
+impl Drop for SaveTurn<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
 
 /// The File menu item, kept from when the menu was built, so it can be enabled and disabled.
 #[derive(Default)]
 pub struct SaveMenuItem(pub Mutex<Option<MenuItem<Wry>>>);
 
 /// The file name a save proposes for a note titled `title`: `<title>.md`, with "/" and ":"
-/// (which a Mac file name cannot hold) as "-". A note without a title is "Note.md".
+/// (which a Mac file name cannot hold) as "-" and no leading dot. A note without a title is
+/// "Note.md".
 pub fn file_name(title: &str) -> String {
-    let title = title.trim();
+    // A leading dot would make a hidden file.
+    let title = title.trim().trim_start_matches('.').trim();
     if title.is_empty() {
         return "Note.md".to_owned();
     }
@@ -95,7 +136,8 @@ pub fn markdown_of(spawn: &SpawnFn, config: &AppConfig, key: &str) -> Result<Str
 }
 
 /// Writes `text` to `path`: into a temp file in the same folder, then renamed over `path`, so
-/// the file is never half written. The temp file is removed when that fails.
+/// the file is never half written. The temp file is removed when that fails. The folder is
+/// synced after the rename, so the new name survives a crash too.
 pub fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let not_saved = |e: std::io::Error| format!("The file {} was not saved: {e}", path.display());
@@ -122,7 +164,12 @@ pub fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
     written.map_err(|e| {
         let _ = std::fs::remove_file(&temp);
         not_saved(e)
-    })
+    })?;
+    // The file is saved; a folder that cannot be synced does not undo that.
+    if let Ok(folder) = std::fs::File::open(dir) {
+        let _ = folder.sync_all();
+    }
+    Ok(())
 }
 
 /// A save of the note at `path` with its steps given: `ask` is the save dialog (`None` for
@@ -150,9 +197,17 @@ pub fn save_with(
 }
 
 /// Saves the Markdown of the note at `path` into a file the user picks in the save dialog.
-/// `Ok(None)` when the user cancels. Blocking (the dialog waits for the user): never on the
-/// main thread.
+/// `Ok(None)` when the user cancels, or while another save's panel is open. Blocking (the
+/// dialog waits for the user): never on the main thread.
 pub fn save(app: &AppHandle, path: &str) -> Result<Option<PathBuf>, String> {
+    let target = app.state::<SaveTarget>();
+    let Some(_turn) = SaveTurn::take(&target.saving) else {
+        return Ok(None);
+    };
+    // The panel is a sheet on the library window when that shows.
+    let library = app
+        .get_webview_window(WindowKind::Library.label())
+        .filter(|w| w.is_visible().unwrap_or(false));
     let notes = app.state::<Notes>().inner().clone();
     // A page the review shows with text may be newer than the index's last scan.
     notes.refresh();
@@ -168,8 +223,12 @@ pub fn save(app: &AppHandle, path: &str) -> Result<Option<PathBuf>, String> {
         &notes,
         path,
         |note| {
-            app.dialog()
-                .file()
+            let dialog = app.dialog().file();
+            let dialog = match &library {
+                Some(window) => dialog.set_parent(window),
+                None => dialog,
+            };
+            dialog
                 .set_file_name(file_name(&note.title))
                 .set_directory(start_folder(
                     config.last_markdown_save_dir.as_deref(),
@@ -209,27 +268,30 @@ pub fn save_in_background(app: &AppHandle, path: String) {
     });
 }
 
-/// The File menu item was picked: saves the note the review shows.
+/// The File menu item was picked: saves the note the review shows, only while the library is
+/// in front.
 pub fn on_menu(app: &AppHandle) {
-    let path = app
-        .state::<SaveTarget>()
-        .0
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone();
+    let path = lock_state(app).target().map(str::to_owned);
     if let Some(path) = path {
         save_in_background(app, path);
     }
 }
 
-/// The review shows the note at `path` (`None`: no note), which can be saved when `can_save`:
-/// the File menu item follows.
-pub fn review_shown(app: &AppHandle, path: Option<String>, can_save: bool) {
-    let enabled = path.is_some() && can_save;
-    *app.state::<SaveTarget>()
-        .0
+fn lock_state(app: &AppHandle) -> std::sync::MutexGuard<'_, SaveState> {
+    app.state::<SaveTarget>()
+        .inner()
+        .state
         .lock()
-        .unwrap_or_else(PoisonError::into_inner) = path;
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Changes the [`SaveState`] and lets the File menu item follow.
+fn change_state(app: &AppHandle, change: impl FnOnce(&mut SaveState)) {
+    let enabled = {
+        let mut state = lock_state(app);
+        change(&mut state);
+        state.target().is_some()
+    };
     if let Some(item) = app
         .state::<SaveMenuItem>()
         .0
@@ -240,6 +302,19 @@ pub fn review_shown(app: &AppHandle, path: Option<String>, can_save: bool) {
     {
         eprintln!("notedown: the Save Markdown menu item did not change: {why}");
     }
+}
+
+/// The review shows the note at `path` (`None`: no note), which can be saved when `can_save`.
+pub fn review_shown(app: &AppHandle, path: Option<String>, can_save: bool) {
+    change_state(app, |state| {
+        state.path = path;
+        state.can_save = can_save;
+    });
+}
+
+/// The library window came to the front or left it (hidden, or another window in front).
+pub fn library_focused(app: &AppHandle, front: bool) {
+    change_state(app, |state| state.library_front = front);
 }
 
 /// Puts "Save Markdown..." (Cmd+Shift+S, disabled) at the top of the File submenu of `menu`,
@@ -280,9 +355,38 @@ mod tests {
             ("a/b:c", "a-b-c.md"),
             ("", "Note.md"),
             ("Meeting 2026", "Meeting 2026.md"),
+            // No hidden file: leading dots go.
+            (".plan", "plan.md"),
+            ("...", "Note.md"),
         ] {
             assert_eq!(file_name(title), name, "{title:?}");
         }
+    }
+
+    #[test]
+    fn the_file_item_saves_only_a_note_with_text_in_the_library_in_front() {
+        let state = |path: Option<&str>, can_save, library_front| SaveState {
+            path: path.map(str::to_owned),
+            can_save,
+            library_front,
+        };
+        assert_eq!(
+            state(Some("N/a.note"), true, true).target(),
+            Some("N/a.note")
+        );
+        // Settings in front of a hidden or unfocused library: nothing to save.
+        assert_eq!(state(Some("N/a.note"), true, false).target(), None);
+        assert_eq!(state(Some("N/a.note"), false, true).target(), None);
+        assert_eq!(state(None, true, true).target(), None);
+    }
+
+    #[test]
+    fn one_save_at_a_time() {
+        let saving = AtomicBool::new(false);
+        let first = SaveTurn::take(&saving).expect("the first save");
+        assert!(SaveTurn::take(&saving).is_none(), "a second panel");
+        drop(first);
+        assert!(SaveTurn::take(&saving).is_some(), "free again");
     }
 
     #[test]

@@ -340,6 +340,10 @@ pub fn hide_window(app: &AppHandle, kind: WindowKind) {
         let _ = window.hide();
     }
     let visible = app.state::<Shown>().set(kind, false);
+    if kind == WindowKind::Library {
+        // A hidden library is not in front, whatever focus event comes or not.
+        crate::save_markdown::library_focused(app, false);
+    }
     apply_policy(app, &visible);
     tell_poller(app, false);
     tell_library(app, kind, false);
@@ -476,6 +480,10 @@ pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
                 let (x, y) = drop_pixels(position.x, position.y, scale);
                 library.dropped(paths.clone(), x, y);
             }
+        }
+        // Save Markdown in the File menu follows whether the library is in front.
+        WindowEvent::Focused(front) if kind == WindowKind::Library => {
+            crate::save_markdown::library_focused(app, *front);
         }
         WindowEvent::Focused(false) if kind == WindowKind::Panel => {
             let shown = app.state::<Shown>();

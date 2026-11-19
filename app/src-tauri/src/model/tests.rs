@@ -48,7 +48,7 @@ case "$1 $2" in
   ;;
 "model pull")
   if [ "$3 $4" = "--json --licences-only" ]; then
-    echo '{{"licences":["Qwen3.5-4B (Qwen team, Alibaba Cloud): Apache-2.0","PP-DocLayoutV3 and PP-OCRv6 (PaddlePaddle Authors): Apache-2.0"]}}'
+    echo '{{"files":[{{"file":"q.gguf","licence":"Apache-2.0","licensor":"Qwen team","model":"Qwen3.5-4B","page":"https://huggingface.co/Qwen/Qwen3.5-4B"}},{{"file":"m.gguf","licence":"Apache-2.0","licensor":"Qwen team","model":"Qwen3.5-4B","page":"https://huggingface.co/Qwen/Qwen3.5-4B"}},{{"file":"l.safetensors","licence":"Apache-2.0","licensor":"PaddlePaddle Authors","model":"PP-DocLayoutV3","page":"https://huggingface.co/PaddlePaddle/PP-DocLayoutV3"}}],"licences":["Qwen3.5-4B (Qwen team): Apache-2.0","PP-DocLayoutV3 (PaddlePaddle Authors): Apache-2.0"]}}'
     exit 0
   fi
 {pull}
@@ -468,17 +468,40 @@ fn the_size_counts_all_four_files() {
 fn licences_come_from_the_pull_before_any_download() {
     let dir = tempfile::tempdir().unwrap();
     let (control, events) = control(sidecar(dir.path(), "  exit 1"));
+    let file = |model: &str, page: &str, licensor: &str| LicenceFile {
+        model: model.to_owned(),
+        page: page.to_owned(),
+        licence: "Apache-2.0".to_owned(),
+        licensor: licensor.to_owned(),
+    };
+    let qwen = file(
+        "Qwen3.5-4B",
+        "https://huggingface.co/Qwen/Qwen3.5-4B",
+        "Qwen team",
+    );
     assert_eq!(
         control.licences().unwrap(),
         [
-            "Qwen3.5-4B (Qwen team, Alibaba Cloud): Apache-2.0",
-            "PP-DocLayoutV3 and PP-OCRv6 (PaddlePaddle Authors): Apache-2.0",
+            qwen.clone(),
+            qwen,
+            file(
+                "PP-DocLayoutV3",
+                "https://huggingface.co/PaddlePaddle/PP-DocLayoutV3",
+                "PaddlePaddle Authors"
+            ),
         ]
     );
     let calls = fs::read_to_string(dir.path().join("calls")).unwrap();
     assert_eq!(calls.trim(), "model pull --json --licences-only");
     assert!(events.lock().unwrap().is_empty());
     assert!(!control.state().pulling);
+}
+
+#[test]
+fn licences_without_files_are_an_error() {
+    // A notedown program of 0.2.0 names lines only.
+    assert_eq!(parse_licences(r#"{"licences":["A (B): C"]}"#), None);
+    assert_eq!(parse_licences("nothing"), None);
 }
 
 #[test]

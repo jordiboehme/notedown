@@ -636,7 +636,28 @@ fn resolved(path: &Path) -> PathBuf {
 }
 
 pub fn allowed_link(url: &str) -> bool {
-    ABOUT_LINKS.contains(&url) || SETUP_LINKS.contains(&url) || url == NOTIFICATIONS_PANE
+    ABOUT_LINKS.contains(&url)
+        || SETUP_LINKS.contains(&url)
+        || url == NOTIFICATIONS_PANE
+        || model_page(url)
+}
+
+/// A model's page on Hugging Face, as the OCR page links the licences: a path of plain names
+/// under https://huggingface.co/, nothing else.
+fn model_page(url: &str) -> bool {
+    let Some(path) = url.strip_prefix("https://huggingface.co/") else {
+        return false;
+    };
+    let parts: Vec<&str> = path.split('/').collect();
+    !path.is_empty()
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && *part != "."
+                && *part != ".."
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
 }
 
 pub fn last_lines(mut lines: Vec<String>, n: usize) -> Vec<String> {
@@ -1917,7 +1938,8 @@ pub fn mcp_info(config: State<'_, ConfigState>) -> Result<McpInfo, String> {
     })
 }
 
-/// Opens one of the About links or the setup's links in the browser. No other address opens.
+/// Opens one of the About links, the setup's links or a model's page on Hugging Face (the
+/// licences of the OCR page) in the browser. No other address opens.
 #[tauri::command]
 pub async fn open_link(url: String) -> Result<(), String> {
     if !allowed_link(&url) {
@@ -2000,7 +2022,9 @@ pub async fn model_remove(model: State<'_, ModelControl>) -> Result<ModelState, 
 
 /// The licences of the model files, shown before the download. Nothing is downloaded for it.
 #[tauri::command]
-pub async fn model_licences(model: State<'_, ModelControl>) -> Result<Vec<String>, String> {
+pub async fn model_licences(
+    model: State<'_, ModelControl>,
+) -> Result<Vec<crate::model::LicenceFile>, String> {
     let model = model.inner().clone();
     tauri::async_runtime::spawn_blocking(move || model.licences())
         .await
@@ -2837,6 +2861,29 @@ mod tests {
         assert!(!allowed_link(
             "x-apple.systempreferences:com.apple.preference.security"
         ));
+    }
+
+    #[test]
+    fn the_model_pages_on_hugging_face_open() {
+        for page in [
+            "https://huggingface.co/Qwen/Qwen3.5-4B",
+            "https://huggingface.co/PaddlePaddle/PP-DocLayoutV3",
+            "https://huggingface.co/PaddlePaddle/PP-OCRv6_small_det",
+        ] {
+            assert!(allowed_link(page), "{page}");
+        }
+        for other in [
+            "https://huggingface.co/",
+            "http://huggingface.co/Qwen/Qwen3.5-4B",
+            "https://huggingface.co.example.org/Qwen",
+            "https://huggingface.co@example.org/Qwen",
+            "https://huggingface.co/Qwen/../../etc",
+            "https://huggingface.co/Qwen/x?y=1",
+            "https://huggingface.co/Qwen/x y",
+            "-a https://huggingface.co/Qwen",
+        ] {
+            assert!(!allowed_link(other), "{other}");
+        }
     }
 
     fn choices(enabled: bool) -> NotificationChoices {

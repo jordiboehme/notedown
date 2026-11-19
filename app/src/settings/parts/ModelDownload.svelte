@@ -11,12 +11,21 @@
     modelPull,
     modelRemove,
     modelState,
+    openLink,
     type ModelState,
     type Progress,
   } from "../api";
   import { formatBytes, fraction } from "../format";
   import { licences, loadLicences } from "../modelLicences.svelte";
-  import { MODEL_TEXT, canDownload, cleanOldButton, cleanOldQuestion, filesNote, licenceLine } from "../modelText";
+  import {
+    MODEL_TEXT,
+    canDownload,
+    cleanOldButton,
+    cleanOldQuestion,
+    filesNote,
+    licenceGroups,
+    modelJoint,
+  } from "../modelText";
   import Row from "../kit/Row.svelte";
   import StatusDot from "../kit/StatusDot.svelte";
 
@@ -49,7 +58,13 @@
     }
   }
 
-  const licence = $derived(licenceLine(licences.lines ?? []));
+  const groups = $derived(licenceGroups(licences.files ?? []));
+
+  /** A model's page opens in the browser (Rust opens only pages on Hugging Face). */
+  function openPage(event: MouseEvent, page: string) {
+    event.preventDefault();
+    openLink(page).catch((error: unknown) => console.error("notedown: the link did not open", error));
+  }
 
   onMount(() => {
     void check();
@@ -112,8 +127,14 @@
 <Row title="Model" note={MODEL_TEXT.note}>
   <span class="value">{MODEL_TEXT.size}</span>
 </Row>
-{#if licence}
-  <p class="licences">{licence}</p>
+{#if groups.length > 0}
+  <p class="licences">
+    Licences: {#each groups as group, g (g)}{#if g > 0}{"; "}{/if}{#each group.models as model, i (model.name)}{modelJoint(
+          i,
+          group.models.length,
+        )}{#if model.page}<a href={model.page} onclick={(event) => openPage(event, model.page!)}>{model.name}</a
+          >{:else}{model.name}{/if}{/each} ({group.licensor}): {group.licence}{/each}
+  </p>
 {:else if licences.error}
   <div class="licences bad">
     <span>{licences.error}</span>
@@ -187,6 +208,10 @@
     overflow-wrap: anywhere;
     /* The status row below follows a paragraph, not a row, so this is its separator. */
     border-bottom: 1px solid var(--separator);
+  }
+
+  .licences a {
+    color: var(--accent);
   }
 
   .licences.bad {

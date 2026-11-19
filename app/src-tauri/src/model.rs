@@ -15,7 +15,7 @@ use std::process::{Child, ChildStderr, ChildStdout, Output, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::process::{self, SpawnFn};
 
@@ -185,11 +185,22 @@ fn parse_paths(text: &str) -> Option<Paths> {
     Some(Paths { cache, files })
 }
 
-/// The licence lines in the answer of `model pull --json --licences-only`.
-fn parse_licences(text: &str) -> Option<Vec<String>> {
+/// One model file's licence, the model it belongs to and the page of that model (a Hugging Face
+/// address), as `model pull --json --licences-only` names them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LicenceFile {
+    pub model: String,
+    pub page: String,
+    pub licence: String,
+    pub licensor: String,
+}
+
+/// The files with their licences in the answer of `model pull --json --licences-only`.
+fn parse_licences(text: &str) -> Option<Vec<LicenceFile>> {
     text.lines().find_map(|line| {
         let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
-        serde_json::from_value(value.get("licences")?.clone()).ok()
+        serde_json::from_value(value.get("files")?.clone()).ok()
     })
 }
 
@@ -269,9 +280,9 @@ impl ModelControl {
         Ok(())
     }
 
-    /// The licences of the model files, one line per licensor. Nothing is downloaded for it.
-    /// Blocking: it runs `model pull --json --licences-only`.
-    pub fn licences(&self) -> Result<Vec<String>, String> {
+    /// The licences of the model files, one per file with its model and the model's page.
+    /// Nothing is downloaded for it. Blocking: it runs `model pull --json --licences-only`.
+    pub fn licences(&self) -> Result<Vec<LicenceFile>, String> {
         let output = self
             .inner
             .check(&["model", "pull", "--json", "--licences-only"])

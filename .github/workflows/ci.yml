@@ -657,7 +657,7 @@ jobs:
           # The rust-toolchain.toml pin, so the action's container does not
           # resolve a different toolchain. Dependabot does not update this
           # value: move it together with rust-toolchain.toml.
-          rust-version: '1.99.0'
+          rust-version: '1.99.1'
           # `check` without a list runs all four: advisories, bans,
           # licenses and sources.
           command: check
@@ -669,7 +669,7 @@ jobs:
       - name: cargo-deny for the Mac app
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
-          rust-version: '1.99.0'
+          rust-version: '1.99.1'
           manifest-path: app/src-tauri/Cargo.toml
           command: check
           arguments: --all-features --locked
@@ -792,6 +792,7 @@ jobs:
           bash scripts/ci/test-version-pins.sh
           bash scripts/ci/test-jobs-passed.sh
           bash scripts/ci/test-notices.sh
+          bash scripts/ci/test-licence-headers.sh
           bash scripts/ci/test-permissions-fit.sh
           bash scripts/ci/test-app-sbom.sh
           bash scripts/ci/test-check-linux-binary.sh

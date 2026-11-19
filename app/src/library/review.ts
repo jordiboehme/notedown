@@ -72,9 +72,14 @@ export function findBlock(rows: ReviewPage[], at: BlockAt): { index: number; blo
   return { index: row.index, blockId: row.blocks.some((b) => b.id === at.blockId) ? at.blockId : null };
 }
 
-/** The line above the review while the note is not read to the end. */
-export function reviewNotice(view: NoteView): string | null {
-  return view.catchingUp ? "Notedown is still reading this note." : null;
+/**
+ * The line above the review while the note is not read to the end. `pause` is the status
+ * line's pause text ("OCR paused until 14:32") while an OCR pause holds: then nothing reads the
+ * note, and the review says so in the same words.
+ */
+export function reviewNotice(view: NoteView, pause: string | null = null): string | null {
+  if (!view.catchingUp) return null;
+  return pause ?? "Notedown is still reading this note.";
 }
 
 /** The page at `scrollTop`, given the tops of the pages (ascending): the last one at or above it. */

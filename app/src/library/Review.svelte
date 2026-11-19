@@ -4,6 +4,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { NOTES_EVENT } from "../lib/library-types";
   import { ReviewSession } from "./session.svelte";
+  import { status } from "../lib/status.svelte";
   import { canSaveMarkdown, concernsNote, noteTitle, reviewNotice, reviewPages, type BlockAt } from "./review";
   import ReviewPages from "./ReviewPages.svelte";
   import PageViewer from "./PageViewer.svelte";
@@ -32,7 +33,9 @@
   // svelte-ignore state_referenced_locally
   const session = new ReviewSession(path, at);
   const rows = $derived(session.view ? reviewPages(session.view, session.ratios) : []);
-  const notice = $derived(session.view ? reviewNotice(session.view) : null);
+  // During an OCR pause the notice says so, in the status line's words.
+  const pauseLine = $derived(status.current?.ocr.paused ? status.current.ocr.line : null);
+  const notice = $derived(session.view ? reviewNotice(session.view, pauseLine) : null);
   /** The zoom of the pages side: 1 is fit width. */
   let zoom = $state(ACTUAL);
 

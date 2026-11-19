@@ -121,6 +121,12 @@ describe("reviewPages", () => {
     expect(reviewNotice(view(["done"], true))).toBe("Notedown is still reading this note.");
     expect(reviewNotice(view(["done"]))).toBeNull();
   });
+
+  it("says the OCR is paused, in the words of the status line, while a pause holds", () => {
+    expect(reviewNotice(view(["done", "pending"], true), "OCR paused until 14:32")).toBe("OCR paused until 14:32");
+    expect(reviewNotice(view(["done"]), "OCR paused until 14:32")).toBeNull();
+    expect(reviewNotice(view(["done", "pending"], true), null)).toBe("Notedown is still reading this note.");
+  });
 });
 
 describe("the blocks of the review", () => {

@@ -210,9 +210,11 @@ Every page starts with an `<a id="page-N"></a>` anchor, so links to a page insid
 as `#page-N`. The image line and the `<name>.assets/` folder appear only with `--images`. A page that
 hit the token limit gets `<!-- notedown: truncated -->`. Drawn diagrams that the model reads as Mermaid
 become `mermaid` code blocks. When the model also describes the diagram, the description follows as a
-`>` blockquote. A diagram without a valid Mermaid block (the model gave none, or it does not parse)
-becomes a `> Diagram: ...` blockquote with the model's description instead. A drawing that is not a
-diagram becomes a `> Sketch: ...` blockquote.
+`>` blockquote. When the Mermaid block of a diagram does not parse, the diagram becomes a
+`> Diagram: ...` blockquote with the model's description. When the page reading gives no block for a
+diagram at all, the blockquote is the fixed text
+`> Diagram: A diagram that the page reading did not return.` A drawing that is not a diagram becomes
+a `> Sketch: ...` blockquote.
 
 Links to other notes are listed in a `Links:` line at the end of the page. `links:` in the front
 matter keeps each link to another note: `target_file_id` is the `FILE_ID` of the target note,

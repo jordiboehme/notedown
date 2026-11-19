@@ -396,10 +396,11 @@ mod tests {
         .map(|h| h.key)
         .collect();
         assert_eq!(keys, ["F1"]);
-        assert_eq!(store.notes.listed_by_key("F2"), None);
+        let listed = store.notes.listed_by_keys();
+        assert_eq!(listed.get("F2"), None);
         assert_eq!(
-            store.notes.listed_by_key("F1").map(|n| n.path),
-            Some("NOTE/Note/a.note".to_owned())
+            listed.get("F1").map(|n| n.path.as_str()),
+            Some("NOTE/Note/a.note")
         );
     }
 

@@ -438,18 +438,8 @@ impl Notes {
         Some(by_path(&state).remove(path).map(|n| n.summary.clone()))
     }
 
-    /// The note with the key `key` when the index lists it (it has text and is not deleted,
-    /// unscoped or hidden by another note at its path). Uses the index as it is.
-    pub fn listed_by_key(&self, key: &str) -> Option<NoteSummary> {
-        let state = lock(&self.inner.state);
-        listed_notes(&state)
-            .into_iter()
-            .find(|n| n.summary.key == key)
-            .map(|n| n.summary.clone())
-    }
-
-    /// Every note the index lists, by key, as [`listed_by_key`](Self::listed_by_key) finds
-    /// them. Scans first, so a note that got text since the last scan is in it.
+    /// Every note the index lists (with text, not deleted, unscoped or hidden by another note
+    /// at its path), by key. Scans first, so a note that got text since the last scan is in it.
     pub fn listed_by_keys(&self) -> HashMap<String, NoteSummary> {
         let mut state = lock(&self.inner.state);
         self.scan(&mut state);

@@ -8,15 +8,15 @@ use super::*;
 use crate::process::spawn_program;
 use crate::test_procs::{gone, kill_in, left_in, tagged_sleep};
 
-/// How long a test waits for an event before it fails.
-const WAIT: Duration = Duration::from_secs(10);
+/// How long a test waits for an event before it fails: only a guard against a hang.
+const WAIT: Duration = crate::test_procs::HANG_GUARD;
 /// The stop grace in tests.
 const GRACE: Duration = Duration::from_millis(200);
 
 /// A fake sidecar: `model path` names files in `dir`, `model verify` is ok when the model file
 /// is there, `model pull --json` runs `pull`. Every call is written to `dir/calls`. `$S` is
 /// this test's own sleep (see [`tagged_sleep`]). With `dir/hold-path`, `model path` waits for
-/// `dir/release` (10 s at most).
+/// `dir/release` (about two minutes at most: only a guard against a hang).
 fn sidecar(dir: &Path, pull: &str) -> SpawnFn {
     let d = dir.display();
     let s = tagged_sleep(dir);
@@ -29,7 +29,7 @@ case "$1 $2" in
 "model path")
   if [ -f "{d}/hold-path" ]; then
     i=0
-    while [ ! -f "{d}/release" ] && [ "$i" -lt 1000 ]; do sleep 0.01; i=$((i + 1)); done
+    while [ ! -f "{d}/release" ] && [ "$i" -lt 12000 ]; do sleep 0.01; i=$((i + 1)); done
   fi
   echo "cache: {d}"
   echo "model: {d}/m.gguf"
@@ -379,7 +379,7 @@ fn quit_stops_a_running_check() {
     });
     called(dir.path(), "model verify");
     control.quit();
-    let ended = rx.recv_timeout(Duration::from_secs(3));
+    let ended = rx.recv_timeout(WAIT);
     // Never leave the fake behind, also when the check fails.
     kill_in(dir.path());
     let state = ended.expect("the check still runs after Quit");

@@ -159,7 +159,8 @@ pub(crate) mod test_server {
     }
 
     /// Waits up to `deadline` for a connection on a nonblocking `listener`. The stream it gives
-    /// blocks again and has a read timeout of 5 s, so a test that reads from it cannot hang.
+    /// blocks again and has a read timeout of [`crate::test_procs::HANG_GUARD`], so a test that
+    /// reads from it cannot hang.
     pub fn accept_within(listener: &TcpListener, deadline: Duration) -> Option<TcpStream> {
         let until = std::time::Instant::now() + deadline;
         while std::time::Instant::now() < until {
@@ -167,7 +168,9 @@ pub(crate) mod test_server {
                 Ok((stream, _)) => {
                     // An accepted socket keeps the listener's nonblocking flag on macOS.
                     stream.set_nonblocking(false).ok()?;
-                    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+                    stream
+                        .set_read_timeout(Some(crate::test_procs::HANG_GUARD))
+                        .ok()?;
                     return Some(stream);
                 }
                 Err(_) => std::thread::sleep(Duration::from_millis(5)),
@@ -240,6 +243,42 @@ pub(crate) mod test_server {
         }
     }
 
+    /// A port on `127.0.0.1` that a test holds without listening on it: a connection to it is
+    /// refused, and no other process can take the port while the holder lives.
+    pub struct HeldPort {
+        pub port: u16,
+        _socket: std::os::fd::OwnedFd,
+    }
+
+    /// Binds a socket to `127.0.0.1:0` and never listens on it.
+    pub fn held_port() -> HeldPort {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        // SAFETY: plain socket calls on a socket this function owns; the address structs are
+        // zeroed, filled in and sized as the calls expect.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0, "no socket: {}", std::io::Error::last_os_error());
+            let socket = OwnedFd::from_raw_fd(fd);
+            let mut addr: libc::sockaddr_in = std::mem::zeroed();
+            addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+            addr.sin_family = libc::AF_INET as libc::sa_family_t;
+            addr.sin_port = 0;
+            addr.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
+            let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            let bound = libc::bind(fd, (&raw const addr).cast::<libc::sockaddr>(), len);
+            assert_eq!(bound, 0, "no bind: {}", std::io::Error::last_os_error());
+            let mut got: libc::sockaddr_in = std::mem::zeroed();
+            let mut got_len = len;
+            let named =
+                libc::getsockname(fd, (&raw mut got).cast::<libc::sockaddr>(), &mut got_len);
+            assert_eq!(named, 0, "no name: {}", std::io::Error::last_os_error());
+            HeldPort {
+                port: u16::from_be(got.sin_port),
+                _socket: socket,
+            }
+        }
+    }
+
     /// A port nothing listens on (taken from the system, then let go).
     pub fn free_port() -> u16 {
         TcpListener::bind("127.0.0.1:0")
@@ -265,7 +304,9 @@ mod tests {
 
     #[test]
     fn a_free_port_is_none() {
-        assert_eq!(server(free_port()), ServerProbe::None);
+        // Held, not let go: no other process can start to listen there during the probe.
+        let held = held_port();
+        assert_eq!(server(held.port), ServerProbe::None);
     }
 
     #[test]

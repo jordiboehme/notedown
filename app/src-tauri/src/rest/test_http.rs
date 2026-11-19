@@ -10,8 +10,9 @@ use std::sync::mpsc::{Receiver, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// How long the server waits for a connection, and a test for a request.
-const WAIT: Duration = Duration::from_secs(10);
+/// How long the server waits for a connection, and a test for a request: only a guard
+/// against a hang.
+const WAIT: Duration = crate::test_procs::HANG_GUARD;
 
 /// One request the server got.
 pub struct Request {

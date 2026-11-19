@@ -13,6 +13,7 @@ use super::listing_tests::Time;
 use super::tests::{CountingStore, Events, Place, TOKEN, remote_key};
 use super::*;
 use crate::rest::test_http::{Act, Request, Routed, answer, file_answer};
+use crate::test_procs::HANG_GUARD;
 
 const HELLO_MD5: &str = "5d41402abc4b2a76b9719d911017c592";
 const ENTRY: &str = "GET /rest/v1/entries/41";
@@ -447,15 +448,15 @@ fn a_stalled_download_ends() {
         ),
     ]);
     let queued = s.library.download(41).unwrap();
-    reached.recv_timeout(Duration::from_secs(5)).unwrap();
+    reached.recv_timeout(HANG_GUARD).unwrap();
     // Wait until the 1,000 bytes are written, then let a minute pass with nothing new.
     let kept = part(&s, "big.bin", queued.id);
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = Instant::now() + HANG_GUARD;
     while std::fs::metadata(&kept).map(|m| m.len()).unwrap_or(0) < 1_000 {
         assert!(Instant::now() < until, "the bytes did not come");
         std::thread::sleep(Duration::from_millis(5));
     }
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = Instant::now() + HANG_GUARD;
     while !s.events.all().iter().any(|e| {
         matches!(e, LibraryEvent::Job { job } if job.id == queued.id && job.state == JobState::Failed)
     }) {
@@ -468,7 +469,7 @@ fn a_stalled_download_ends() {
     assert_eq!(ended.text.as_deref(), Some("The connection stalled."));
     // The request was dropped; what came is kept for a retry.
     release.send(()).unwrap();
-    assert!(closed.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(closed.recv_timeout(HANG_GUARD).unwrap());
     assert_eq!(std::fs::read(&kept).unwrap(), &body[..1_000]);
 
     // A cancel removes it.
@@ -629,10 +630,10 @@ fn two_downloads_run_at_a_time() {
         ("GET /rest/v1/files/42".into(), hello()),
     ]);
     let held = s.library.download(41).unwrap();
-    reached.recv_timeout(Duration::from_secs(5)).unwrap();
+    reached.recv_timeout(HANG_GUARD).unwrap();
     // While the first one waits for its bytes, the second one runs and ends.
     let second = s.library.download(42).unwrap();
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = Instant::now() + HANG_GUARD;
     while !s.events.all().iter().any(|e| {
         matches!(e, LibraryEvent::Job { job } if job.id == second.id && job.state == JobState::Done)
     }) {

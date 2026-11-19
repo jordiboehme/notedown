@@ -15,7 +15,7 @@ use notedown_convert::links::FileIndex;
 use notedown_convert::pipeline::{Options, Outcome, convert_one};
 use notedown_note::{Notebook, RenderOptions, VersionPolicy, encode_png};
 #[cfg(feature = "ocr")]
-use notedown_ocr::model::{self, ENGINE_LABEL};
+use notedown_ocr::model;
 #[cfg(feature = "ocr")]
 use notedown_ocr::{OcrEngine, OcrError, OcrOptions, PageOcr, VisionEngine};
 
@@ -686,13 +686,8 @@ fn convert(args: ConvertArgs) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
     let outputs = inputs::output_paths(&found, args.out.as_deref());
-    let label = match &args.model {
-        Some(p) => p
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| ENGINE_LABEL.to_string()),
-        None => ENGINE_LABEL.to_string(),
-    };
+    // The same name `model::resolve` gives the loaded engine.
+    let label = model::label_for(args.model.as_deref());
     let mut engine = LazyEngine {
         label,
         model: args.model.clone(),

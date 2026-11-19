@@ -92,16 +92,16 @@ fn resolve_in(
     }
     Ok(ModelPaths {
         files,
-        label: override_label(model_override, ENGINE_LABEL),
+        label: label_for(model_override),
     })
 }
 
-/// The file stem of a `--model` override, else `default`.
-fn override_label(model_override: Option<&Path>, default: &str) -> String {
+/// The model name to store: the file stem of a `--model` override, else [`ENGINE_LABEL`].
+pub fn label_for(model_override: Option<&Path>) -> String {
     model_override
         .and_then(Path::file_stem)
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| default.to_string())
+        .unwrap_or_else(|| ENGINE_LABEL.to_string())
 }
 
 /// The licences of the four files, one line per licensor. Shown before a download starts.
@@ -651,6 +651,12 @@ mod four_file_tests {
         assert_eq!(r.files.layout, dir.path().join(FILES[2].local));
         assert_eq!(r.files.text_det, dir.path().join(FILES[3].local));
         assert_eq!(r.label, "my-q8");
+    }
+
+    #[test]
+    fn label_follows_the_model_override() {
+        assert_eq!(label_for(None), ENGINE_LABEL);
+        assert_eq!(label_for(Some(Path::new("/m/my-q8.gguf"))), "my-q8");
     }
 
     #[test]

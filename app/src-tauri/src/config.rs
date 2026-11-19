@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::pause::OcrPause;
+
 const FILE: &str = "config.json";
 const BROKEN: &str = "config.json.broken";
 const TEMP: &str = "config.json.tmp";
@@ -62,6 +64,8 @@ pub struct AppConfig {
     pub notifications: NotificationChoices,
     /// The folder of the last Save Markdown; the next save starts there.
     pub last_markdown_save_dir: Option<PathBuf>,
+    /// The OCR pause, kept over a restart; `None`: the OCR runs ([`crate::pause`]).
+    pub ocr_pause: Option<OcrPause>,
 }
 
 /// The switch of the desktop notifications and the choice of each event.
@@ -342,6 +346,7 @@ impl Default for AppConfig {
             last_update_shown: None,
             notifications: NotificationChoices::default(),
             last_markdown_save_dir: None,
+            ocr_pause: None,
         }
     }
 }
@@ -508,6 +513,9 @@ mod tests {
             last_update_shown: Some("0.2.0".into()),
             notifications: NotificationChoices::default(),
             last_markdown_save_dir: Some(PathBuf::from("/Users/someone/Notes")),
+            ocr_pause: Some(OcrPause {
+                until_ms: Some(1_763_300_060_000),
+            }),
         }
     }
 
@@ -558,6 +566,30 @@ mod tests {
             load(dir.path()).last_markdown_save_dir,
             Some(PathBuf::from("/Users/someone/Notes"))
         );
+    }
+
+    #[test]
+    fn the_ocr_pause_round_trips_and_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        // A config of an earlier version knows no pause.
+        fs::write(dir.path().join(FILE), r#"{"mode":"local"}"#).unwrap();
+        assert_eq!(load(dir.path()).ocr_pause, None);
+        assert_eq!(AppConfig::default().ocr_pause, None);
+        for pause in [
+            OcrPause {
+                until_ms: Some(1_763_300_060_000),
+            },
+            OcrPause { until_ms: None },
+        ] {
+            let config = AppConfig {
+                ocr_pause: Some(pause),
+                ..AppConfig::default()
+            };
+            save(dir.path(), &config).unwrap();
+            let text = fs::read_to_string(dir.path().join(FILE)).unwrap();
+            assert!(text.contains("\"ocrPause\""), "{text}");
+            assert_eq!(load(dir.path()).ocr_pause, Some(pause));
+        }
     }
 
     #[test]

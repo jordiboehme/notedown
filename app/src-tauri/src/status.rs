@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{AppConfig, ExistingSetup, Mode};
 use crate::notify::store::SyncCount;
+use crate::pause;
 use crate::supervisor::ChildState;
 
 /// The line of a child that another Notedown process replaces.
@@ -292,6 +293,8 @@ pub struct OcrStatus {
     /// The server refused the pipeline's token: the OCR must connect again. Only from the
     /// code of the last error, never from its text.
     pub token_refused: bool,
+    /// An OCR pause holds: `line` says until when, and the pipeline is stopped.
+    pub paused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -332,15 +335,34 @@ pub fn status_from(parts: &Parts, now_ms: u64) -> Status {
         attention.push(Attention::ServerUnreachable);
     }
     let server = server_status(parts, reach, &mut attention);
+    // A pause stops the pipeline; a pipeline that is not connected yet says that instead.
+    let pause_line = config
+        .ocr_pause
+        .as_ref()
+        .filter(|p| parts.pipeline != ChildState::NotConnected && pause::active(Some(p), now_ms))
+        .map(|p| pause::pause_line(p, pause::local_clock));
     let pipeline = PipelineStatus {
-        line: child_line(&parts.pipeline, "Runs"),
+        line: pause_line
+            .clone()
+            .unwrap_or_else(|| child_line(&parts.pipeline, "Runs")),
         state: parts.pipeline.clone(),
     };
-    if matches!(parts.pipeline, ChildState::Backoff { .. }) {
+    if pause_line.is_none() && matches!(parts.pipeline, ChildState::Backoff { .. }) {
         attention.push(Attention::PipelineBackoff);
     }
     let device = device_status(parts, now_ms, &mut attention);
-    let (ocr, agents) = ocr_status(parts, no_account, &mut attention);
+    let mut ocr_attention = Vec::new();
+    let (mut ocr, agents) = ocr_status(parts, no_account, &mut ocr_attention);
+    match pause_line {
+        // The counts stay. A killed run leaves its page in work behind, and the pipeline's
+        // problems wait with it.
+        Some(line) => {
+            ocr.line = line;
+            ocr.in_work = None;
+            ocr.paused = true;
+        }
+        None => attention.extend(ocr_attention),
+    }
     let (connection, account) = account_state(parts.account.as_ref());
 
     Status {
@@ -550,6 +572,7 @@ fn ocr_line(line: &str) -> OcrStatus {
         last_run_ms: None,
         facts: false,
         token_refused: false,
+        paused: false,
     }
 }
 
@@ -608,6 +631,7 @@ fn ocr_status(
         last_run_ms: facts.last_run_ms,
         facts: true,
         token_refused,
+        paused: false,
     };
     let agents = facts.consumers.iter().map(agent).collect();
     (ocr, agents)

@@ -9,6 +9,7 @@ pub mod menus;
 pub mod model;
 pub mod notes;
 pub mod notify;
+pub mod pause;
 pub mod pidfile;
 pub mod poller;
 pub mod probe;

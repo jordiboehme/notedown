@@ -593,6 +593,7 @@ fn the_status_serializes_for_the_webview() {
     assert_eq!(v["server"]["deviceUrls"][0], "http://192.168.1.20:19072");
     assert_eq!(v["device"]["lastSyncMs"], 1_763_290_900_000u64);
     assert_eq!(v["ocr"]["inWork"]["startedMs"], 1_763_299_990_000u64);
+    assert_eq!(v["ocr"]["paused"], false);
     assert_eq!(v["agents"][1]["notesBehind"], 50);
     assert_eq!(v["attention"], serde_json::json!([]));
     assert_eq!(v["existing"]["server"], true);
@@ -802,4 +803,83 @@ fn the_agents_carry_their_seq() {
     assert_eq!(seqs, [40, 2, 99]);
     let v = serde_json::to_value(&s).unwrap();
     assert_eq!(v["agents"][0]["seq"], serde_json::json!(40));
+}
+
+/// A Local setup whose pipeline a pause stopped, with a page in work and an error left in
+/// the store.
+fn paused(until_ms: Option<u64>) -> Parts {
+    let mut parts = local();
+    parts.config.ocr_pause = Some(crate::pause::OcrPause { until_ms });
+    parts.pipeline = ChildState::Stopped;
+    let mut f = facts(FACTS);
+    f.last_error = Some(LastError {
+        text: "the model is missing".into(),
+        at_ms: NOW - MIN,
+        code: None,
+    });
+    parts.pipeline_status = Some(PipelineCall::Facts(f));
+    parts
+}
+
+#[test]
+fn a_paused_pipeline_shows_the_pause() {
+    let until = NOW + 5 * MIN;
+    let line = format!("OCR paused until {}", crate::pause::local_clock(until));
+    let s = status_from(&paused(Some(until)), NOW);
+    assert_eq!(s.pipeline.line, line);
+    assert_eq!(s.ocr.line, line);
+    assert!(s.ocr.paused);
+    // A killed run leaves its page in work behind; it is read again after the pause.
+    assert_eq!(s.ocr.in_work, None);
+    // The pause is no problem, and the error of the store waits with it.
+    assert!(s.attention.is_empty(), "{:?}", s.attention);
+    // The counts stay.
+    assert_eq!((s.ocr.queued, s.ocr.pending), (3, 2));
+    assert!(s.ocr.facts);
+    assert_eq!(s.agents.len(), 3);
+
+    // Until resumed.
+    let s = status_from(&paused(None), NOW);
+    assert_eq!(s.pipeline.line, "OCR paused");
+    assert_eq!(s.ocr.line, "OCR paused");
+    assert!(s.ocr.paused);
+
+    // A backoff before the pause took hold is no problem either.
+    let mut parts = paused(None);
+    parts.pipeline = ChildState::Backoff {
+        until_ms: NOW + 4_000,
+        last_error: "the model is missing".into(),
+    };
+    let s = status_from(&parts, NOW);
+    assert_eq!(s.pipeline.line, "OCR paused");
+    assert!(s.attention.is_empty(), "{:?}", s.attention);
+
+    // Before the first status call.
+    let mut parts = paused(None);
+    parts.pipeline_status = None;
+    assert_eq!(status_from(&parts, NOW).ocr.line, "OCR paused");
+}
+
+#[test]
+fn a_pause_whose_time_passed_gives_the_normal_lines() {
+    let mut parts = paused(Some(NOW));
+    parts.pipeline = running(NOW - DAY);
+    let s = status_from(&parts, NOW);
+    assert_eq!(s.pipeline.line, "Runs");
+    assert_eq!(s.ocr.line, "The last OCR pass failed: the model is missing");
+    assert!(!s.ocr.paused);
+    assert!(s.ocr.in_work.is_some());
+    assert_eq!(s.attention, vec![Attention::OcrError]);
+}
+
+#[test]
+fn not_connected_wins_over_a_pause() {
+    let mut parts = paused(None);
+    parts.config.mode = Mode::Remote;
+    parts.config.server_url = Some("https://notes.example.org".into());
+    parts.pipeline = ChildState::NotConnected;
+    let s = status_from(&parts, NOW);
+    assert_eq!(s.pipeline.line, "Not connected yet");
+    assert_eq!(s.ocr.line, "Not connected yet");
+    assert!(!s.ocr.paused);
 }

@@ -1,10 +1,11 @@
 <script lang="ts">
-  import { MORE_NAMES, NO_NAMES, NO_TEXT, SCOPE_LABELS, wantsContent, type ResultRow, type Scope } from "./search";
+  import { MORE_NAMES, NO_NAMES, NO_TEXT, SCOPE_LABELS, resultMenu, wantsContent, type ResultRow, type Scope } from "./search";
   import type { LibrarySearch } from "./search.svelte";
   import { folderLabel } from "./view";
 
   // The results of the search in the main area: the scope switch, the name hits and the text
-  // hits. A click on a row hands it to the window, which opens or selects what it names.
+  // hits. A click on a row hands it to the window, which opens or selects what it names; a
+  // note's row has the context menu of a note.
   let { search, onRow }: { search: LibrarySearch; onRow: (row: ResultRow) => void } = $props();
 
   const scopes: Scope[] = ["here", "everywhere"];
@@ -40,7 +41,7 @@
   <div class="list">
     <h2 class="section">Names</h2>
     {#each names as row (`${row.kind}:${row.path}`)}
-      <button type="button" class="row" onclick={() => onRow(row)}>
+      <button type="button" class="row" onclick={() => onRow(row)} oncontextmenu={(event) => resultMenu(event, row)}>
         <span class="text">{row.name}</span>
         <span class="text muted">{folderLabel(row.path)}</span>
       </button>
@@ -55,7 +56,7 @@
 
     <h2 class="section">In the Text</h2>
     {#each texts as row (row.path)}
-      <button type="button" class="row hit" onclick={() => onRow(row)}>
+      <button type="button" class="row hit" onclick={() => onRow(row)} oncontextmenu={(event) => resultMenu(event, row)}>
         <span class="line">
           <span class="text">{row.name}</span>
           <span class="text muted">{folderLabel(row.path)}</span>

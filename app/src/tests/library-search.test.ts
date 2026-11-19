@@ -14,7 +14,7 @@ vi.mock("@tauri-apps/api/core", () => ({
   }),
 }));
 
-const { DEBOUNCE_MS, SCOPE_LABELS, effectiveScope, entryRow, fieldTakesEscape, filterNotes, isFindKey, resultRows, searchPlace, wantsContent } =
+const { DEBOUNCE_MS, SCOPE_LABELS, effectiveScope, entryRow, fieldTakesEscape, filterNotes, isFindKey, resultMenu, resultRows, searchPlace, wantsContent } =
   await import("../library/search");
 const { withoutAt } = await import("../library/view");
 const SearchResults = (await import("../library/SearchResults.svelte")).default;
@@ -439,6 +439,24 @@ describe("the search results", () => {
     const shown = body(s).match(/<button[^>]*>\s*This folder/)?.[0] ?? "";
     expect(shown).not.toContain("disabled");
     expect(shown).toContain('aria-pressed="true"');
+  });
+});
+
+describe("the context menu of a result", () => {
+  it("is the note's menu on a note, in both sections, and nothing on a file", () => {
+    calls.length = 0;
+    const event = () => ({ preventDefault: vi.fn() });
+    const onNote = event();
+    resultMenu(onNote, { kind: "note", path: "NOTE/Note/plan.note", name: "plan.note", section: "names" });
+    expect(onNote.preventDefault).toHaveBeenCalled();
+    resultMenu(event(), { kind: "note", path: "NOTE/Note/plan.note", name: "plan", section: "text", page: 1 });
+    const onFile = event();
+    resultMenu(onFile, { kind: "file", path: "Document/plan.pdf", name: "plan.pdf", section: "names" });
+    expect(onFile.preventDefault).not.toHaveBeenCalled();
+    expect(calls).toEqual([
+      { command: "library_menu", args: { target: { kind: "note", path: "NOTE/Note/plan.note" } } },
+      { command: "library_menu", args: { target: { kind: "note", path: "NOTE/Note/plan.note" } } },
+    ]);
   });
 });
 

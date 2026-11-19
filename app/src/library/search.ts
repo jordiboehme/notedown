@@ -3,6 +3,7 @@
 
 import type { ContentHit, Entry, NoteSummary } from "../lib/library-types";
 import type { Selection } from "./view";
+import { noteMenu } from "./review";
 
 /** "This folder" (the shown folder and below it, or the shown list of notes) or "Everywhere". */
 export type Scope = "here" | "everywhere";
@@ -127,6 +128,14 @@ export function fieldTakesEscape(text: string): boolean {
  */
 export function effectiveScope(scope: Scope, place: SearchPlace): Scope {
   return scope === "here" && place.kind === "other" ? "everywhere" : scope;
+}
+
+/**
+ * The context menu of a result row: a note's row (a name or a text hit) has the menu of a note
+ * in the library lists ("Save Markdown..."); another file has none.
+ */
+export function resultMenu(event: { preventDefault(): void }, row: ResultRow) {
+  if (row.kind === "note") noteMenu(event, row.path);
 }
 
 /** Cmd+F focuses the search field. */

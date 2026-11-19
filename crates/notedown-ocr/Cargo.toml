@@ -8,24 +8,19 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-scraper.workspace = true
+pagevision = { workspace = true, features = ["engine", "serde"] }
 serde.workspace = true
 sha2.workspace = true
 const-hex.workspace = true
 thiserror.workspace = true
 dirs.workspace = true
 reqwest.workspace = true
+# Only so that the vulkan and cuda features can reach it; cargo unifies it with the copy
+# inside pagevision, which turns on its backend features.
+llama-cpp-2 = { version = "=0.1.161", default-features = false }
 
 [dev-dependencies]
-insta.workspace = true
 tempfile.workspace = true
-serde_json.workspace = true
-
-[target.'cfg(target_os = "macos")'.dependencies]
-llama-cpp-2 = { version = "=0.1.161", default-features = false, features = ["mtmd", "metal"] }
-
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-llama-cpp-2 = { version = "=0.1.161", default-features = false, features = ["mtmd", "openmp"] }
 
 [features]
 vulkan = ["llama-cpp-2/vulkan"]

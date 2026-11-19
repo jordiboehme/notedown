@@ -13,7 +13,7 @@ use crate::page::StrokeEntry;
 pub struct Block {
     pub id: String,
     pub label: String,
-    /// `[left, top, right, bottom]` on Chandra's 0..1000 grid; `region::block_rect`
+    /// `[left, top, right, bottom]` on the 0..1000 grid of the page; `region::block_rect`
     /// gives page pixels.
     pub bbox: [u32; 4],
     pub text: String,

@@ -7,7 +7,7 @@ use notedown_ocr::OcrEngine;
 use crate::compose::NewBlock;
 use crate::{Error, Result};
 
-/// The whole page on Chandra's grid, for a block without a box.
+/// The whole page on the 0..=1000 grid, for a block without a box.
 const WHOLE_PAGE: [u32; 4] = [0, 0, 1000, 1000];
 
 /// What the engine read on one page.

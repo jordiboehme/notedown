@@ -28,4 +28,12 @@ ignore = [
     # chrono is unmaintained: no flaw, no fix. rmcp needs it (not optional) and turns on the
     # chrono04 feature of schemars. Remove this when rmcp no longer depends on chrono.
     { id = "RUSTSEC-2026-0543", reason = "unmaintained only; rmcp needs chrono" },
+    # paste is unmaintained: no flaw, no fix. It comes only through gemm (candle-core) for the
+    # detectors of pagevision. Approved by Jordi on 2026-11-19 as a single ignore. Remove this
+    # when gemm no longer depends on paste.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained only; gemm in candle-core needs paste" },
 ]
+
+[sources]
+# pagevision comes from rezzer by git, pinned to a commit in Cargo.toml.
+allow-git = ["https://github.com/jordiboehme/rezzer"]

@@ -88,6 +88,12 @@ A file is skipped when its `.md` already exists and the front matter has the sam
 same model and the same Notedown major version. The model is not even loaded when every file is
 skipped.
 
+A new OCR model counts as a change. Notedown 0.2 reads with pagevision instead of Chandra OCR 2, so
+`notedown convert` reads a `.md` file that Chandra wrote again on its next run, with the new OCR. This
+takes a while on a big folder (about 30 s per page on an Apple silicon Mac). The server works
+differently: it keeps the text of pages that Chandra read and reads a page again only when the page
+changes.
+
 A `.md` file from an older Notedown has a front matter without `type`. When its source checksum, model
 and major version still match, Notedown only replaces the front matter with the new one and keeps the
 text below it byte for byte. No OCR runs for this and the model isn't loaded. The run prints "updated

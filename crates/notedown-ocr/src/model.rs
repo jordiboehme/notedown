@@ -7,6 +7,26 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+pub use pagevision::model::{HubFile, ModelFiles, hub_url};
+
+/// The four model files of pagevision, each pinned to a Hugging Face revision: the Qwen model,
+/// its mmproj, the layout detector and the text line detector.
+pub const FILES: [HubFile; 4] = pagevision::model::ALL_FILES;
+
+/// The model name stored with every page and file this engine reads.
+pub const ENGINE_LABEL: &str = "pagevision qwen3.5-4b Q4_K_M";
+
+/// The size of all four files together (3,556,512,484 bytes).
+pub const TOTAL_SIZE: &str = "about 3.6 GB";
+
+/// The files of the Chandra model that notedown 0.1 downloaded. `clean_old` removes them and
+/// their part files; nothing removes them on its own.
+pub const OLD_FILES: [&str; 2] = [
+    "chandra-ocr-2.Q4_K_M.gguf",
+    "chandra-ocr-2.mmproj-q8_0.gguf",
+];
+
+/// One file to download, with its expected size and SHA-256.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelFile {
     pub file_name: &'static str,
@@ -14,33 +34,20 @@ pub struct ModelFile {
     pub sha256: &'static str,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ModelSpec {
-    pub label: &'static str,
-    pub repo: &'static str,
-    pub model: ModelFile,
-    pub mmproj: ModelFile,
+impl From<&HubFile> for ModelFile {
+    fn from(f: &HubFile) -> Self {
+        ModelFile {
+            file_name: f.local,
+            size: f.size,
+            sha256: f.sha256,
+        }
+    }
 }
 
-pub const DEFAULT_MODEL: ModelSpec = ModelSpec {
-    label: "chandra-ocr-2 Q4_K_M",
-    repo: "prithivMLmods/chandra-ocr-2-GGUF",
-    model: ModelFile {
-        file_name: "chandra-ocr-2.Q4_K_M.gguf",
-        size: 3066384992,
-        sha256: "bde0505fda04eb1a89e122b2112e60b10c8c9697db5ca90a2e03635984f3a07d",
-    },
-    mmproj: ModelFile {
-        file_name: "chandra-ocr-2.mmproj-q8_0.gguf",
-        size: 366894368,
-        sha256: "709be8aeda77c5732e58e957367439eae14ebb73b4f4a78b558013d000948bc3",
-    },
-};
-
+/// The four model files to load, and the model name to store.
 #[derive(Debug, Clone)]
 pub struct ModelPaths {
-    pub model: PathBuf,
-    pub mmproj: PathBuf,
+    pub files: ModelFiles,
     pub label: String,
 }
 
@@ -57,47 +64,80 @@ fn cache_dir_from(env: Option<std::ffi::OsString>) -> Result<PathBuf, OcrError> 
         .ok_or_else(|| OcrError::Engine("cannot determine the cache directory".into()))
 }
 
+/// The four files in the cache folder. `--model` and `--mmproj` replace only the Qwen files.
+/// Every file must exist.
 pub fn resolve(
-    spec: &ModelSpec,
     model_override: Option<&Path>,
     mmproj_override: Option<&Path>,
 ) -> Result<ModelPaths, OcrError> {
-    resolve_in(&cache_dir()?, spec, model_override, mmproj_override)
+    resolve_in(&cache_dir()?, model_override, mmproj_override)
 }
 
 fn resolve_in(
     cache: &Path,
-    spec: &ModelSpec,
     model_override: Option<&Path>,
     mmproj_override: Option<&Path>,
 ) -> Result<ModelPaths, OcrError> {
-    let model = model_override
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| cache.join(spec.model.file_name));
-    let mmproj = mmproj_override
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| cache.join(spec.mmproj.file_name));
-    for path in [&model, &mmproj] {
+    let mut files = ModelFiles::in_dir(cache);
+    if let Some(p) = model_override {
+        files.model = p.to_path_buf();
+    }
+    if let Some(p) = mmproj_override {
+        files.mmproj = p.to_path_buf();
+    }
+    for path in [&files.model, &files.mmproj, &files.layout, &files.text_det] {
         if !path.is_file() {
             return Err(OcrError::ModelMissing { path: path.clone() });
         }
     }
-    let label = match model_override {
-        Some(p) => p
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| spec.label.to_string()),
-        None => spec.label.to_string(),
-    };
     Ok(ModelPaths {
-        model,
-        mmproj,
-        label,
+        files,
+        label: label_for(model_override),
     })
 }
 
+/// The model name to store: the file stem of a `--model` override, else [`ENGINE_LABEL`].
+pub fn label_for(model_override: Option<&Path>) -> String {
+    model_override
+        .and_then(Path::file_stem)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ENGINE_LABEL.to_string())
+}
+
+/// The licences of the four files, one line per licensor. Shown before a download starts.
+pub fn licence_lines() -> Vec<String> {
+    let [model, _, layout, _] = FILES;
+    vec![
+        format!("Qwen3.5-4B ({}): {}", model.licensor, model.licence),
+        format!(
+            "PP-DocLayoutV3 and PP-OCRv6 ({}): {}",
+            layout.licensor, layout.licence
+        ),
+    ]
+}
+
+/// Removes the Chandra files of notedown 0.1 (`OLD_FILES`) and their part files from `dir`, and
+/// nothing else. Returns the removed paths. A missing file or folder is no error.
+pub fn clean_old(dir: &Path) -> Result<Vec<PathBuf>, OcrError> {
+    let mut removed = Vec::new();
+    for name in OLD_FILES {
+        for path in [dir.join(name), dir.join(format!("{name}.part"))] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed.push(path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    Ok(removed)
+}
+
 /// Checks size first, then streams the file through SHA-256.
-pub fn verify_file(path: &Path, expected: &ModelFile) -> Result<(), OcrError> {
+pub fn verify_file(path: &Path, expected: &HubFile) -> Result<(), OcrError> {
+    verify_model_file(path, &expected.into())
+}
+
+fn verify_model_file(path: &Path, expected: &ModelFile) -> Result<(), OcrError> {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -143,35 +183,34 @@ fn check_hash(path: &Path, expected: &ModelFile, actual: String) -> Result<(), O
     }
 }
 
-/// Downloads every file that is missing or fails verification.
+/// Downloads every one of the four files that is missing or fails verification, each from its
+/// pinned revision (`hub_url`) into `<cache>/<local name>`.
 /// `progress` receives (file name, bytes so far, total bytes).
-pub fn pull(
-    spec: &ModelSpec,
-    progress: &mut dyn FnMut(&str, u64, u64),
-) -> Result<ModelPaths, OcrError> {
-    let dir = cache_dir()?;
-    std::fs::create_dir_all(&dir)?;
-    for file in [&spec.model, &spec.mmproj] {
-        let dest = dir.join(file.file_name);
-        if verify_file(&dest, file).is_ok() {
-            continue;
-        }
-        download(spec.repo, file, &dest, progress)?;
-    }
-    resolve_in(&dir, spec, None, None)
+pub fn pull(progress: &mut dyn FnMut(&str, u64, u64)) -> Result<ModelPaths, OcrError> {
+    pull_in(&cache_dir()?, &mut download_from, progress)
 }
 
-fn download(
-    repo: &str,
-    file: &ModelFile,
-    dest: &Path,
+/// The download of one file: URL, expected file, destination and progress.
+type Fetch<'a> =
+    dyn FnMut(&str, &ModelFile, &Path, &mut dyn FnMut(&str, u64, u64)) -> Result<(), OcrError> + 'a;
+
+/// [`pull`] into `dir`, with the download as a seam. A file that is there already reports
+/// itself as complete.
+fn pull_in(
+    dir: &Path,
+    fetch: &mut Fetch,
     progress: &mut dyn FnMut(&str, u64, u64),
-) -> Result<(), OcrError> {
-    let url = format!(
-        "https://huggingface.co/{repo}/resolve/main/{}",
-        file.file_name
-    );
-    download_from(&url, file, dest, progress)
+) -> Result<ModelPaths, OcrError> {
+    std::fs::create_dir_all(dir)?;
+    for f in &FILES {
+        let dest = dir.join(f.local);
+        if verify_file(&dest, f).is_ok() {
+            progress(f.local, f.size, f.size);
+            continue;
+        }
+        fetch(&hub_url(f), &f.into(), &dest, progress)?;
+    }
+    resolve_in(dir, None, None)
 }
 
 /// Downloads `url` into `dest` through `dest.part`. A part left by an earlier run is
@@ -263,7 +302,7 @@ pub fn download_from(
         progress(file.file_name, total, total);
     }
 
-    if let Err(e) = verify_file(&part, file) {
+    if let Err(e) = verify_model_file(&part, file) {
         let _ = std::fs::remove_file(&part);
         return Err(e);
     }
@@ -285,18 +324,18 @@ mod tests {
             size: 5,
             sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
         };
-        verify_file(&p, &good).unwrap();
+        verify_model_file(&p, &good).unwrap();
         let bad = ModelFile {
             sha256: "00",
             ..good
         };
         assert!(matches!(
-            verify_file(&p, &bad),
+            verify_model_file(&p, &bad),
             Err(OcrError::Checksum { .. })
         ));
         let wrong_size = ModelFile { size: 6, ..good };
         assert!(matches!(
-            verify_file(&p, &wrong_size),
+            verify_model_file(&p, &wrong_size),
             Err(OcrError::Checksum { .. })
         ));
     }
@@ -310,7 +349,7 @@ mod tests {
             sha256: "00",
         };
         assert!(matches!(
-            verify_file(&dir.path().join("nope"), &f),
+            verify_model_file(&dir.path().join("nope"), &f),
             Err(OcrError::ModelMissing { .. })
         ));
     }
@@ -330,51 +369,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_reports_missing_with_pull_hint() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = resolve_in(dir.path(), &DEFAULT_MODEL, None, None).unwrap_err();
-        assert!(matches!(err, OcrError::ModelMissing { .. }));
-        assert!(err.to_string().contains("notedown model pull"), "{err}");
-    }
-
-    #[test]
-    fn resolve_uses_cache_paths_and_default_label() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(DEFAULT_MODEL.model.file_name), b"x").unwrap();
-        std::fs::write(dir.path().join(DEFAULT_MODEL.mmproj.file_name), b"y").unwrap();
-        let r = resolve_in(dir.path(), &DEFAULT_MODEL, None, None).unwrap();
-        assert_eq!(r.model, dir.path().join(DEFAULT_MODEL.model.file_name));
-        assert_eq!(r.label, "chandra-ocr-2 Q4_K_M");
-    }
-
-    #[test]
-    fn overrides_are_used_as_given() {
-        let dir = tempfile::tempdir().unwrap();
-        let m = dir.path().join("my-q8.gguf");
-        let p = dir.path().join("proj.gguf");
-        std::fs::write(&m, b"x").unwrap();
-        std::fs::write(&p, b"y").unwrap();
-        let empty = tempfile::tempdir().unwrap();
-        let r = resolve_in(empty.path(), &DEFAULT_MODEL, Some(&m), Some(&p)).unwrap();
-        assert_eq!(r.model, m);
-        assert_eq!(r.mmproj, p);
-        assert_eq!(r.label, "my-q8");
-    }
-
-    #[test]
-    #[ignore]
+    #[ignore = "needs the four model files in the cache (notedown model pull)"]
     fn real_cache_files_verify() {
         let dir = cache_dir().unwrap();
-        verify_file(
-            &dir.join(DEFAULT_MODEL.model.file_name),
-            &DEFAULT_MODEL.model,
-        )
-        .unwrap();
-        verify_file(
-            &dir.join(DEFAULT_MODEL.mmproj.file_name),
-            &DEFAULT_MODEL.mmproj,
-        )
-        .unwrap();
+        for f in &FILES {
+            verify_file(&dir.join(f.local), f).unwrap();
+        }
     }
 
     use std::io::{BufRead, BufReader};
@@ -582,5 +582,146 @@ mod tests {
             seen.lock().unwrap().as_slice(),
             [Some("1500-".to_string()), None]
         );
+    }
+}
+
+#[cfg(test)]
+mod four_file_tests {
+    use super::*;
+
+    #[test]
+    fn pull_url_uses_the_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut urls = Vec::new();
+        let mut fetch = |url: &str,
+                         file: &ModelFile,
+                         dest: &Path,
+                         _: &mut dyn FnMut(&str, u64, u64)|
+         -> Result<(), OcrError> {
+            urls.push((url.to_string(), file.file_name.to_string()));
+            std::fs::write(dest, b"x")?;
+            Ok(())
+        };
+        let paths = pull_in(dir.path(), &mut fetch, &mut |_, _, _| {}).unwrap();
+        let expected: Vec<(String, String)> = FILES
+            .iter()
+            .map(|f| (hub_url(f), f.local.to_string()))
+            .collect();
+        assert_eq!(urls, expected);
+        for (url, _) in &urls {
+            assert!(!url.contains("/resolve/main/"), "{url}");
+        }
+        assert_eq!(paths.files, ModelFiles::in_dir(dir.path()));
+        assert_eq!(paths.label, ENGINE_LABEL);
+    }
+
+    #[test]
+    fn resolve_needs_all_four_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for (i, f) in FILES.iter().enumerate() {
+            let err = resolve_in(dir.path(), None, None).unwrap_err();
+            match err {
+                OcrError::ModelMissing { path } => assert_eq!(path, dir.path().join(f.local)),
+                e => panic!("{e}"),
+            }
+            std::fs::write(dir.path().join(f.local), b"x").unwrap();
+            if i + 1 < FILES.len() {
+                assert!(resolve_in(dir.path(), None, None).is_err());
+            }
+        }
+        let r = resolve_in(dir.path(), None, None).unwrap();
+        assert_eq!(r.files, ModelFiles::in_dir(dir.path()));
+        assert_eq!(r.label, ENGINE_LABEL);
+    }
+
+    #[test]
+    fn overrides_replace_only_the_qwen_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in &FILES[2..] {
+            std::fs::write(dir.path().join(f.local), b"x").unwrap();
+        }
+        let other = tempfile::tempdir().unwrap();
+        let m = other.path().join("my-q8.gguf");
+        let p = other.path().join("proj.gguf");
+        std::fs::write(&m, b"x").unwrap();
+        std::fs::write(&p, b"y").unwrap();
+        let r = resolve_in(dir.path(), Some(&m), Some(&p)).unwrap();
+        assert_eq!(r.files.model, m);
+        assert_eq!(r.files.mmproj, p);
+        assert_eq!(r.files.layout, dir.path().join(FILES[2].local));
+        assert_eq!(r.files.text_det, dir.path().join(FILES[3].local));
+        assert_eq!(r.label, "my-q8");
+    }
+
+    #[test]
+    fn label_follows_the_model_override() {
+        assert_eq!(label_for(None), ENGINE_LABEL);
+        assert_eq!(label_for(Some(Path::new("/m/my-q8.gguf"))), "my-q8");
+    }
+
+    #[test]
+    fn missing_file_names_the_pull_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_in(dir.path(), None, None).unwrap_err();
+        assert!(err.to_string().contains("notedown model pull"), "{err}");
+    }
+
+    #[test]
+    fn licences_name_the_licensors() {
+        assert_eq!(
+            licence_lines(),
+            [
+                "Qwen3.5-4B (Qwen team, Alibaba Cloud): Apache-2.0",
+                "PP-DocLayoutV3 and PP-OCRv6 (PaddlePaddle Authors): Apache-2.0",
+            ]
+        );
+        // Both detectors have the same licensor and licence, so one line covers them.
+        assert_eq!(FILES[2].licensor, FILES[3].licensor);
+        assert_eq!(FILES[2].licence, FILES[3].licence);
+        assert_eq!(FILES[0].licensor, FILES[1].licensor);
+    }
+
+    #[test]
+    fn total_size_text_matches_the_files() {
+        let total: u64 = FILES.iter().map(|f| f.size).sum();
+        assert_eq!(total, 3_556_512_484);
+        assert_eq!(TOTAL_SIZE, "about 3.6 GB");
+    }
+
+    #[test]
+    fn verify_names_each_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in &FILES {
+            let err = verify_file(&dir.path().join(f.local), f).unwrap_err();
+            assert!(err.to_string().contains(f.local), "{err}");
+        }
+        let f = HubFile {
+            size: 5,
+            sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            ..FILES[3]
+        };
+        let p = dir.path().join(f.local);
+        std::fs::write(&p, b"hello").unwrap();
+        verify_file(&p, &f).unwrap();
+    }
+
+    #[test]
+    fn clean_old_removes_only_chandra_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("chandra-ocr-2.Q4_K_M.gguf");
+        let part = dir.path().join("chandra-ocr-2.mmproj-q8_0.gguf.part");
+        let keep = dir.path().join("mmproj-F16.gguf");
+        let other = dir.path().join("chandra-ocr-2.notes.txt");
+        for p in [&old, &part, &keep, &other] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        let mut removed = clean_old(dir.path()).unwrap();
+        removed.sort();
+        assert_eq!(removed, [old.clone(), part.clone()]);
+        assert!(!old.exists() && !part.exists());
+        assert!(keep.exists() && other.exists());
+        // Nothing left to remove is no error.
+        assert!(clean_old(dir.path()).unwrap().is_empty());
+        assert!(clean_old(&dir.path().join("missing")).unwrap().is_empty());
     }
 }

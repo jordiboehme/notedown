@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 use notedown_note::{Link, LinkKind, Notebook, VersionPolicy};
 use notedown_ocr::OcrBlock;
-use notedown_ocr::convert::assemble;
+use notedown_ocr::markdown::assemble;
 
 use crate::document::{Frontmatter, FrontmatterLink};
 use crate::inputs::{Input, InputKind};

@@ -126,6 +126,10 @@ if [ "$status" -eq 0 ]; then pass "macos runs"; else fail "macos runs"; cat "$tm
 if grep -qxF '  - serde 1.0.229' "$tmp/macos.txt"; then pass "macos lists the registry crates"; else fail "macos lists the registry crates"; fi
 if grep -qF 'AGPL text here' "$tmp/macos.txt"; then fail "macos drops the block without a registry crate"; else pass "macos drops the block without a registry crate"; fi
 if grep -qF 'Copyright (c) 2023-2026 The ggml authors' "$tmp/macos.txt"; then pass "macos appends the bundled code"; else fail "macos appends the bundled code"; fi
+pagevision='Code adapted from oar-ocr-vl, OpenCV, PaddleOCR and PaddleX inside'
+for want in "$pagevision" 'Copyright the oar-ocr authors' 'Copyright the PaddlePaddle Authors' 'OpenCV Foundation'; do
+  if grep -qF -- "$want" "$tmp/macos.txt"; then pass "macos has the pagevision part '$want'"; else fail "macos has the pagevision part '$want'"; fi
+done
 for want in 'Eric Young' 'The OpenSSL Project'; do
   if grep -qF -- "$want" "$tmp/macos.txt"; then pass "macos has aws-lc '$want'"; else fail "macos has aws-lc '$want'"; fi
 done
@@ -141,7 +145,7 @@ if grep -qxF '  - anyhow 1.0.104' "$tmp/linux.txt"; then pass "linux lists the r
 for want in 'Eric Young' 'The OpenSSL Project'; do
   if grep -qF -- "$want" "$tmp/linux.txt"; then pass "linux has aws-lc '$want'"; else fail "linux has aws-lc '$want'"; fi
 done
-if grep -qF 'ggml authors' "$tmp/linux.txt"; then fail "linux has no bundled code"; else pass "linux has no bundled code"; fi
+if grep -qF 'ggml authors' "$tmp/linux.txt" || grep -qF -- "$pagevision" "$tmp/linux.txt"; then fail "linux has no bundled code"; else pass "linux has no bundled code"; fi
 if grep -qF -- '--no-default-features --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl' "$STUB_LOG"; then pass "linux cargo-about arguments"; else fail "linux cargo-about arguments"; fi
 
 # --- app
@@ -149,7 +153,7 @@ run app "$tmp/app.txt"
 if [ "$status" -eq 0 ]; then pass "app runs"; else fail "app runs"; cat "$tmp/run.log" >&2; fi
 for want in 'svelte 5.0.0 (MIT)' 'tailwindcss 4.0.0 (MIT)' '@scope/api 2.0.0 (Apache-2.0 OR MIT)' \
   'svelte license text' 'Copyright 2019-2022, Fixture Authors' 'Copyright (c) 2023-2026 The ggml authors' \
-  'Part 2: the notedown program inside the app'; do
+  "$pagevision" 'Part 2: the notedown program inside the app'; do
   if grep -qF -- "$want" "$tmp/app.txt"; then pass "app has '$want'"; else fail "app has '$want'"; fi
 done
 if grep -qxF 'helper 2.0.0 (MIT)' "$tmp/app.txt" && grep -qF 'nested helper license text' "$tmp/app.txt" \

@@ -95,7 +95,7 @@ pub fn change_region(old: &[StrokeEntry], new: &[StrokeEntry], extra: &[Rect]) -
     }
 }
 
-/// Maps a Chandra block box (`[x0, y0, x1, y1]` on a 0..1000 grid over the
+/// Maps an OCR block box (`[x0, y0, x1, y1]` on a 0..1000 grid over the
 /// rendered page image) to page pixels. `width` and `height` are the rendered
 /// image size, which is the page bitmap size already swapped for landscape pages
 /// (docs/note-format.md 4.6). The renderer draws in the stored orientation, so

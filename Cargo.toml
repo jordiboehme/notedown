@@ -24,11 +24,9 @@ image = { version = "=0.25.10", default-features = false, features = ["png"] }
 sha2 = "=0.11.1"
 const-hex = "=1.19.3"
 similar = "=3.2.1"
-insta = "=1.49.0"
 zip = { version = "=9.6.0", default-features = false, features = ["deflate"] }
 pdf-writer = "=0.15.0"
 miniz_oxide = "=0.9.1"
-scraper = "=0.29.0"
 dirs = "=7.0.0"
 reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "rustls"] }
 tempfile = "=3.27.0"
@@ -54,6 +52,8 @@ unicase = "=2.10.0"
 notify = { version = "=8.2.2", default-features = false, features = ["macos_fsevent"] }
 rmcp = { version = "=3.10.0", default-features = false, features = ["server", "transport-io", "macros"] }
 schemars = "=1.2.3"
+# Page OCR from rezzer, pinned to a commit on its main branch.
+pagevision = { git = "https://github.com/jordiboehme/rezzer", rev = "a0685acfa2e576310e3bb7a30bb79a7f45593154", default-features = false }
 
 # Lean debug builds: our own code keeps line tables (readable backtraces), dependencies carry no
 # debug info. This keeps target/ small and links faster.

@@ -18,10 +18,22 @@ export interface PanelLine {
   attention: boolean;
   /** The line has a button: "setup" opens Settings at Setup. */
   action: "setup" | null;
+  /** The OCR pause control; only on the OCR line. */
+  pause: PauseControl | null;
+}
+
+/**
+ * The OCR pause control of the panel. Its button opens the Pause OCR menu ("menu") or ends the
+ * pause ("resume"); `change` adds Change Pause, which opens the same menu.
+ */
+export interface PauseControl {
+  button: "Pause OCR" | "Resume OCR Now";
+  action: "menu" | "resume";
+  change: boolean;
 }
 
 function line(key: string, label: string, text: string, rest: Partial<PanelLine> = {}): PanelLine {
-  return { key, label, text, when: null, more: null, tone: "off", attention: false, action: null, ...rest };
+  return { key, label, text, when: null, more: null, tone: "off", attention: false, action: null, pause: null, ...rest };
 }
 
 function has(status: Status, ...kinds: Attention[]): boolean {
@@ -85,17 +97,33 @@ function agentLines(status: Status, now: number): PanelLine[] {
   );
 }
 
+/**
+ * The pause control of `status`, as the tray menu offers it: Pause OCR, or Resume OCR Now and
+ * Change Pause while a pause holds. Rust's `ocr.paused` decides, so the panel, the tray menu and
+ * Settings agree. A pipeline that is not connected or that another Notedown runs gets none:
+ * its line wins over a pause there (status_from), and a pause cannot act on it.
+ */
+export function pauseControl(status: Status | null): PauseControl | null {
+  if (!status || status.setup.mode === "notSet") return null;
+  if (status.ocr.paused) return { button: "Resume OCR Now", action: "resume", change: true };
+  const pipeline = status.pipeline.state.state;
+  if (pipeline === "notConnected" || pipeline === "outside") return null;
+  return { button: "Pause OCR", action: "menu", change: false };
+}
+
 /** The OCR queue, the pause, or the state of the pipeline while it does not run. */
 function ocrLine(status: Status, now: number): PanelLine {
   const ocr = status.ocr;
+  const pause = pauseControl(status);
   // A pause is no problem: its line says until when, whatever the pipeline did before it.
-  if (ocr.paused) return line("ocr", "OCR", ocr.line);
+  if (ocr.paused) return line("ocr", "OCR", ocr.line, { pause });
   const attention = has(status, "ocrError", "pipelineBackoff");
   const pipeline = status.pipeline.state;
   if (pipeline.state !== "running" && pipeline.state !== "notConnected") {
     return line("ocr", "OCR", status.pipeline.line, {
       tone: attention ? "problem" : childTone(pipeline),
       attention,
+      pause,
     });
   }
   const work = ocr.inWork;
@@ -108,6 +136,7 @@ function ocrLine(status: Status, now: number): PanelLine {
     more: work ? `${work.note}, page ${work.page} of ${work.pages}` : null,
     tone: attention ? "problem" : tone,
     attention,
+    pause,
   });
 }
 

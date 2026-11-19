@@ -229,7 +229,7 @@ export const modelState = () => invoke<ModelState>("model_state");
 export const modelPull = () => invoke("model_pull");
 export const modelPause = () => invoke<ModelState>("model_pause");
 export const modelRemove = () => invoke<ModelState>("model_remove");
-/** Ends the OCR pause; the pause itself starts in the menu bar. */
+/** Ends the OCR pause; the pause itself starts in the menu bar or the panel. */
 export const ocrResume = () => invoke<void>("ocr_resume");
 /** Backs the Supernote at url up into dir; progress and the end come as events. */
 export const backupStart = (url: string, dir: string, resume: boolean) =>

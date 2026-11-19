@@ -19,6 +19,8 @@
     onQuit,
     onConfirmQuit,
     onCancelQuit,
+    onPauseMenu,
+    onResumeOcr,
   }: {
     status: Status | null;
     now: number;
@@ -32,7 +34,16 @@
     onQuit: () => void;
     onConfirmQuit: () => void;
     onCancelQuit: () => void;
+    /** Opens the native Pause OCR menu at `x`, `y` (CSS pixels of the window). */
+    onPauseMenu: (x: number, y: number) => void;
+    onResumeOcr: () => void;
   } = $props();
+
+  /** The Pause OCR menu opens under the button, as a pull-down menu does. */
+  function openPauseMenu(event: MouseEvent) {
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    onPauseMenu(rect.left, rect.bottom + 2);
+  }
 
   const lines = $derived(status ? panelLines(status, now) : []);
 </script>
@@ -64,6 +75,22 @@
             {#if line.more}<p class="more">{line.more}</p>{/if}
             {#if line.action === "setup"}
               <button type="button" class="button strong setup" onclick={onSetUp}>Set up</button>
+            {/if}
+            {#if line.pause}
+              <div class="pause">
+                {#if line.pause.action === "resume"}
+                  <button type="button" class="button small" onclick={onResumeOcr}>{line.pause.button}</button>
+                {:else}
+                  <button type="button" class="button small pulldown" aria-haspopup="menu" onclick={openPauseMenu}
+                    >{line.pause.button}</button
+                  >
+                {/if}
+                {#if line.pause.change}
+                  <button type="button" class="plain small pulldown" aria-haspopup="menu" onclick={openPauseMenu}
+                    >Change Pause</button
+                  >
+                {/if}
+              </div>
             {/if}
           </div>
         </li>
@@ -238,6 +265,30 @@
 
   .setup {
     margin-top: 6px;
+  }
+
+  .pause {
+    display: flex;
+    gap: 4px;
+    margin-top: 5px;
+  }
+
+  .small {
+    padding: 1px 8px;
+    font-size: 12px;
+  }
+
+  /* A pull-down button: a small chevron after the text, as in a Mac menu button. */
+  .pulldown::after {
+    content: "";
+    display: inline-block;
+    width: 4px;
+    height: 4px;
+    margin: 0 1px 2px 6px;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    transform: rotate(45deg);
+    vertical-align: middle;
   }
 
   .new-notes.none {

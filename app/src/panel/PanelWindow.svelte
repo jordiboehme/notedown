@@ -77,5 +77,7 @@
     onQuit={() => pressQuit(status.current)}
     onConfirmQuit={confirmQuit}
     onCancelQuit={cancelQuit}
+    onPauseMenu={(x, y) => call("panel_pause_menu", { x, y })}
+    onResumeOcr={() => call("panel_ocr_resume")}
   />
 </div>

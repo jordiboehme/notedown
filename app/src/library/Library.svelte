@@ -133,6 +133,8 @@
   const selectedPath = $derived(library.selection.kind === "folder" ? library.selection.path : null);
   /** Where the open note is in the tree, once its review opened it. */
   let reveal = $state<Reveal | null>(null);
+  /** The folder the tree scrolls into view once its row is there; null when none waits. */
+  let scrollTo = $state<string | null>(null);
   /** The folder the sidebar selects: the shown one, or the open note's. */
   const sidebarPath = $derived(treeSelected(library.selection, reveal));
   const tree = $derived(treeView(library.listings, open, sidebarPath));
@@ -260,6 +262,7 @@
   /** Shows `next`: the picked row, a rename and a new folder's name end. */
   function show(next: Selection) {
     library.selection = next;
+    scrollTo = null;
     picked = null;
     renaming = null;
     naming = false;
@@ -284,6 +287,7 @@
     const found = revealOf(path);
     if (!found || library.selection.kind !== "note" || library.selection.path !== path) return;
     reveal = found;
+    scrollTo = found.folder;
     for (const folder of found.opens) open.add(folder);
   }
 
@@ -444,6 +448,8 @@
       onToggle={toggle}
       onSettings={settings}
       onNewMenu={newMenu}
+      scrollTo={inTree ? scrollTo : null}
+      onScrolled={() => (scrollTo = null)}
     />
     <main class="main">
       <SearchLayer {searching}>

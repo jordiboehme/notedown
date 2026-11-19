@@ -8,7 +8,7 @@
   import { canSaveMarkdown, concernsNote, noteTitle, reviewNotice, reviewPages, type BlockAt } from "./review";
   import ReviewPages from "./ReviewPages.svelte";
   import PageViewer from "./PageViewer.svelte";
-  import { ACTUAL, ZOOMS, reviewZoomKey, zoomIn, zoomOut } from "./zoom";
+  import { ACTUAL, ZOOMS, findEndsAlone, reviewZoomKey, zoomIn, zoomOut } from "./zoom";
 
   // The review of one note: opened when it mounts (that marks it seen), read again when the
   // store changed (new page text shows while it is open), closed in Rust when it goes. The
@@ -77,6 +77,11 @@
   });
 
   function key(event: KeyboardEvent) {
+    // The library focuses its search field on Cmd+F: the large view must not hide it.
+    if (findEndsAlone(event, session.focused !== null)) {
+      void closeViewer();
+      return;
+    }
     const step = reviewZoomKey(event, { covered, alone: session.focused !== null });
     if (!step || !session.view) return;
     event.preventDefault();

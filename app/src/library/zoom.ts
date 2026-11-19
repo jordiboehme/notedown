@@ -1,4 +1,5 @@
 import { syncTop, type Offsets } from "./review";
+import { isFindKey } from "./search";
 
 // The zoom of the review's pages and the split between its two sides. Pure functions; the
 // components hold the state.
@@ -36,6 +37,14 @@ export function reviewZoomKey(
   { covered, alone }: { covered: boolean; alone: boolean },
 ): "in" | "out" | "actual" | null {
   return covered || alone ? null : zoomKey(e);
+}
+
+/**
+ * Cmd+F while a page is shown alone (`alone`) ends the large view: it covers the search field
+ * that Cmd+F focuses, and the arrow keys typed in that field must not step the page behind it.
+ */
+export function findEndsAlone(e: { key: string; metaKey: boolean }, alone: boolean): boolean {
+  return alone && isFindKey(e);
 }
 
 /** Where the pages side scrolls to after a zoom: the same page at the same share of it. */

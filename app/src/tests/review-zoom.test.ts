@@ -14,6 +14,7 @@ import {
   zoomIn,
   zoomKey,
   reviewZoomKey,
+  findEndsAlone,
   viewerInput,
   zoomOut,
 } from "../library/zoom";
@@ -136,6 +137,18 @@ describe("reviewZoomKey", () => {
     }
     // The large view of one page has its own zoom.
     expect(reviewZoomKey(plus, { covered: false, alone: true })).toBeNull();
+  });
+});
+
+describe("findEndsAlone", () => {
+  it("ends the large view on Cmd+F, so the search field it focuses is seen and takes the arrow keys", () => {
+    expect(findEndsAlone({ key: "f", metaKey: true }, true)).toBe(true);
+    expect(findEndsAlone({ key: "F", metaKey: true }, true)).toBe(true);
+    // No page shown alone: nothing to end.
+    expect(findEndsAlone({ key: "f", metaKey: true }, false)).toBe(false);
+    // Only Cmd+F.
+    expect(findEndsAlone({ key: "f", metaKey: false }, true)).toBe(false);
+    expect(findEndsAlone({ key: "ArrowRight", metaKey: false }, true)).toBe(false);
   });
 });
 

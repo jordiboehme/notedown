@@ -2206,4 +2206,43 @@ fn a_large_json_body_is_answered_in_json() {
     let (status, answer) = post(9);
     assert_eq!(status, 413, "{answer}");
     assert_eq!(answer, json!({"error": "too_large"}));
+    // Far over 8 MiB, while the client is still sending: the server reads the rest of the body
+    // before it answers, so the client gets the 413 and not a reset.
+    let (status, answer) = post(32);
+    assert_eq!(status, 413, "{answer}");
+    assert_eq!(answer, json!({"error": "too_large"}));
+}
+
+#[test]
+fn a_body_over_the_drain_cap_is_cut_off_and_the_server_goes_on() {
+    let s = start_imported();
+    let t = writer(&s);
+    let mib = notedown_cloud::api::MAX_DRAINED_BODY / (1024 * 1024) + 16;
+    let body = format!(
+        "{{\"path\":\"NOTE/Note/{}\"}}",
+        "a".repeat(mib * 1024 * 1024)
+    );
+    // The server does not read this much: the client gets the 413 or a closed connection.
+    let sent = s
+        .client
+        .post(s.url("/folders"))
+        .bearer_auth(&t)
+        .header("content-type", "application/json")
+        .body(body)
+        .send();
+    if let Ok(r) = sent {
+        let (status, answer) = json_of(r);
+        assert_eq!((status, answer), (413, json!({"error": "too_large"})));
+    }
+    // The next request is answered as usual.
+    let (status, answer) = json_of(
+        s.client
+            .post(s.url("/folders"))
+            .bearer_auth(&t)
+            .header("content-type", "application/json")
+            .body(r#"{"path":"NOTE/Note/after"}"#)
+            .send()
+            .unwrap(),
+    );
+    assert!(status < 300, "{status}: {answer}");
 }

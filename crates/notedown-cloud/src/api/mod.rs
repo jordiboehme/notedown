@@ -33,7 +33,7 @@ pub mod tasks;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -51,6 +51,15 @@ use crate::auth::Device;
 use crate::diag::{LogEntry, LogKind};
 use crate::server::{AppState, MAX_REQUEST_BODY};
 use envelope::{LogDevice, LogFlags, Reply, Streamed};
+
+/// The most bytes of a request body that the request log reads in all when the body is over
+/// [`MAX_REQUEST_BODY`]: it reads and drops the rest, so the client, still sending, receives the
+/// refusal and not a reset. A larger body is cut off.
+pub const MAX_DRAINED_BODY: usize = 64 * 1024 * 1024;
+
+/// The longest time the request log reads and drops the rest of a body over
+/// [`MAX_REQUEST_BODY`]; a slower sender is cut off.
+const DRAIN_TIME: Duration = Duration::from_secs(10);
 
 pub const FLAG_UNKNOWN: &str = "unknown_endpoint";
 pub const FLAG_RETRY: &str = "retry_suspected";
@@ -474,10 +483,49 @@ fn raw_json(bytes: &[u8]) -> Option<String> {
     Some(text.to_string())
 }
 
+/// The whole request body when it is at most [`MAX_REQUEST_BODY`] bytes, else `None` (also for
+/// a broken body). Over the limit the rest is read and dropped, up to [`MAX_DRAINED_BODY`] bytes
+/// in all and for at most [`DRAIN_TIME`]: hyper itself drops only what it has buffered and then
+/// closes the connection with the client still sending, which resets it before the client reads
+/// the answer.
+async fn read_body(body: Body) -> Option<Bytes> {
+    use axum::body::HttpBody as _;
+    use futures_util::StreamExt;
+    // A Content-Length over the cap: not worth reading.
+    let drain = body
+        .size_hint()
+        .exact()
+        .is_none_or(|n| n <= MAX_DRAINED_BODY as u64);
+    let mut stream = body.into_data_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        if bytes.len() + chunk.len() > MAX_REQUEST_BODY {
+            if drain {
+                let mut seen = bytes.len() + chunk.len();
+                drop(bytes);
+                let rest = async {
+                    while seen < MAX_DRAINED_BODY {
+                        match stream.next().await {
+                            Some(Ok(c)) => seen += c.len(),
+                            _ => break,
+                        }
+                    }
+                };
+                let _ = tokio::time::timeout(DRAIN_TIME, rest).await;
+            }
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Some(Bytes::from(bytes))
+}
+
 /// Writes one [`LogEntry`] per request: method, path, query, headers, masked bodies, status,
 /// envelope result, duration, device, firmware and flags. The request body is read up to
 /// [`MAX_REQUEST_BODY`]; a larger one is not passed on (the answer is still an envelope, or the
-/// JSON 413 `too_large` of the REST API). The byte uploads of accept mode and the app's upload
+/// JSON 413 `too_large` of the REST API), and its rest is read and dropped first, within bounds
+/// ([`read_body`]). The byte uploads of accept mode and the app's upload
 /// ([`crate::rest::is_streamed_write`]) are passed on unread and logged as
 /// `<N bytes, not logged>`.
 /// A REST read that succeeded and a repeated REST token refusal are passed on without a line
@@ -539,8 +587,8 @@ pub async fn log_request(
         )));
         response
     } else {
-        match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
-            Ok(bytes) => {
+        match read_body(body).await {
+            Some(bytes) => {
                 entry.request_body = body_for_log(&bytes, &content_type);
                 entry.request_body_raw = raw_json(&bytes);
                 if let Some(Value::Object(m)) = &entry.request_body {
@@ -554,7 +602,7 @@ pub async fn log_request(
                 let request = Request::from_parts(parts, Body::from(bytes));
                 next.run(request).await
             }
-            Err(_) => {
+            None => {
                 entry.request_body = Some(Value::String(format!(
                     "<body not read: larger than {MAX_REQUEST_BODY} bytes or broken; content-type {}>",
                     if content_type.is_empty() {

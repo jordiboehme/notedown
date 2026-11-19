@@ -142,12 +142,10 @@ pub fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let not_saved = |e: std::io::Error| format!("The file {} was not saved: {e}", path.display());
     let dir = path.parent().unwrap_or(Path::new("."));
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    // A fixed temp name: the user's name may be near the 255 bytes a name can have, and the
+    // temp file must fit as well.
     let temp = dir.join(format!(
-        ".{name}.{}.{}.tmp",
+        ".notedown-save.{}.{}.tmp",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
@@ -174,7 +172,8 @@ pub fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
 
 /// A save of the note at `path` with its steps given: `ask` is the save dialog (`None` for
 /// Cancel), `markdown` reads the text and `remember` keeps the folder of the saved file. A
-/// note the index does not know, or one without text, is refused with [`NO_TEXT`].
+/// note the index does not know at `path` (moved or renamed while its review was open) is
+/// refused with [`NOTE_GONE`](crate::notes::NOTE_GONE), one without text with [`NO_TEXT`].
 pub fn save_with(
     notes: &Notes,
     path: &str,
@@ -182,9 +181,12 @@ pub fn save_with(
     markdown: impl FnOnce(&NoteSummary) -> Result<String, String>,
     remember: impl FnOnce(&Path),
 ) -> Result<Option<PathBuf>, String> {
-    let Some(note) = notes.at_path(path).filter(|n| n.pages_with_text > 0) else {
-        return Err(NO_TEXT.to_owned());
+    let Some(note) = notes.at_path(path) else {
+        return Err(crate::notes::NOTE_GONE.to_owned());
     };
+    if note.pages_with_text == 0 {
+        return Err(NO_TEXT.to_owned());
+    }
     let Some(target) = ask(&note) else {
         return Ok(None);
     };
@@ -541,16 +543,40 @@ mod tests {
     #[test]
     fn a_note_without_text_is_not_saved() {
         let (notes, _data, _config) = notes_with(false);
-        for path in ["NOTE/Note/Plan.note", "NOTE/Note/Other.note"] {
-            let result = save_with(
-                &notes,
-                path,
-                |_| panic!("no dialog"),
-                |_| panic!("no sidecar"),
-                |_| panic!("nothing to remember"),
-            );
-            assert_eq!(result, Err(NO_TEXT.to_owned()), "{path}");
-        }
+        let result = save_with(
+            &notes,
+            "NOTE/Note/Plan.note",
+            |_| panic!("no dialog"),
+            |_| panic!("no sidecar"),
+            |_| panic!("nothing to remember"),
+        );
+        assert_eq!(result, Err(NO_TEXT.to_owned()));
+    }
+
+    #[test]
+    fn a_note_moved_away_while_open_is_not_there_anymore() {
+        // The review keeps the old path after a move or rename: the index knows no note there.
+        let (notes, _data, _config) = notes_with(true);
+        let result = save_with(
+            &notes,
+            "NOTE/Note/Other.note",
+            |_| panic!("no dialog"),
+            |_| panic!("no sidecar"),
+            |_| panic!("nothing to remember"),
+        );
+        assert_eq!(result, Err(crate::notes::NOTE_GONE.to_owned()));
+    }
+
+    #[test]
+    fn a_long_file_name_saves() {
+        // A name near the 255 bytes a file name may have: the temp file must fit too.
+        let dir = tempfile::tempdir().unwrap();
+        let name = format!("{}.md", "n".repeat(250));
+        assert_eq!(name.len(), 253);
+        let path = dir.path().join(&name);
+        write_atomically(&path, "# Long\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# Long\n");
+        assert_eq!(entries(dir.path()), [name]);
     }
 
     #[test]

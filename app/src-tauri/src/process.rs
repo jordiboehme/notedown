@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::config::{self, AppConfig, Mode};
 use crate::login;
+use crate::pause;
 
 /// Which child a supervisor runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +88,9 @@ pub enum Launch {
     NotConnected,
     /// Start the child with these arguments.
     Start(Vec<String>),
+    /// An OCR pause holds: the pipeline does not run, and a running one is killed at once
+    /// ([`crate::pause`]).
+    Paused,
 }
 
 /// The launch of both children.
@@ -99,8 +103,18 @@ pub struct Plan {
 /// Local mode runs both children; Remote mode runs the pipeline only, and only when
 /// `<data>/pipeline.toml` exists; no mode runs nothing. `parent` is the app's pid. In both
 /// modes the pipeline is a child of its own (never `serve --pipeline`), so it alone gets the
-/// Markdown folder.
-pub fn plan(config: &AppConfig, parent: u32) -> Plan {
+/// Markdown folder. While an OCR pause holds at `now_ms`, a pipeline that would start is
+/// [`Launch::Paused`]; the server runs on.
+pub fn plan(config: &AppConfig, parent: u32, now_ms: u64) -> Plan {
+    let mut plan = plan_unpaused(config, parent);
+    if matches!(plan.pipeline, Launch::Start(_)) && pause::active(config.ocr_pause.as_ref(), now_ms)
+    {
+        plan.pipeline = Launch::Paused;
+    }
+    plan
+}
+
+fn plan_unpaused(config: &AppConfig, parent: u32) -> Plan {
     let data = &config.data_dir;
     match config.mode {
         Mode::NotSet => Plan {
@@ -251,6 +265,34 @@ pub fn signal_group(pgid: u32, signal: i32) -> io::Result<()> {
     }
 }
 
+/// The longest a group kill waits for its group to be empty. A process stuck in the kernel (a hung
+/// network or iCloud folder) can hold quit or a pause this long, so the app waits 10 s; the tests
+/// wait 120 s, so a loaded machine never fails them.
+#[cfg(not(test))]
+pub const KILL_GUARD: Duration = Duration::from_secs(10);
+#[cfg(test)]
+pub const KILL_GUARD: Duration = Duration::from_secs(120);
+
+/// Kills the group `pgid` until no process of it is left, at most `limit`. True when it is
+/// empty. The one implementation for every group the app kills.
+///
+/// A process that a member forks while the SIGKILL is on its way can miss it (macOS) and live
+/// on in the group: so each look that still finds a process kills the group again. It looks
+/// before each signal, so an empty group gets none: a group with a member keeps its number,
+/// which therefore still names this group. A member that ended but is not reaped yet counts
+/// (macOS answers EPERM for it): call it once the leader is reaped, or while its reaper runs.
+pub fn kill_group_until_empty(pgid: u32, limit: Duration) -> bool {
+    let until = std::time::Instant::now() + limit;
+    while group_alive(pgid) {
+        if std::time::Instant::now() >= until {
+            return false;
+        }
+        let _ = signal_group(pgid, libc::SIGKILL);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    true
+}
+
 /// Whether any process of the group `pgid` is still there.
 pub fn group_alive(pgid: u32) -> bool {
     let Ok(pgid) = i32::try_from(pgid) else {
@@ -300,7 +342,7 @@ mod tests {
                 model_idle_minutes: minutes,
                 ..config(Mode::Local, dir.path())
             };
-            let plan = plan(&config, 3);
+            let plan = plan(&config, 3, 0);
             let Launch::Start(pipeline) = plan.pipeline else {
                 panic!("no pipeline");
             };
@@ -316,7 +358,7 @@ mod tests {
     #[test]
     fn local_mode_plans_serve_and_the_pipeline() {
         let dir = tempfile::tempdir().unwrap();
-        let plan = plan(&config(Mode::Local, dir.path()), 4242);
+        let plan = plan(&config(Mode::Local, dir.path()), 4242, 0);
         assert_eq!(plan.server, Launch::Start(args("serve", dir.path(), 4242)));
         assert_eq!(
             plan.pipeline,
@@ -327,12 +369,12 @@ mod tests {
     #[test]
     fn remote_mode_runs_the_pipeline_only_with_pipeline_toml() {
         let dir = tempfile::tempdir().unwrap();
-        let without = plan(&config(Mode::Remote, dir.path()), 7);
+        let without = plan(&config(Mode::Remote, dir.path()), 7, 0);
         assert_eq!(without.server, Launch::Off);
         assert_eq!(without.pipeline, Launch::NotConnected);
 
         std::fs::write(dir.path().join("pipeline.toml"), "").unwrap();
-        let with = plan(&config(Mode::Remote, dir.path()), 7);
+        let with = plan(&config(Mode::Remote, dir.path()), 7, 0);
         assert_eq!(with.server, Launch::Off);
         assert_eq!(
             with.pipeline,
@@ -354,7 +396,7 @@ mod tests {
                     .collect(),
                 ..config(mode, dir.path())
             };
-            let plan = plan(&config, 9);
+            let plan = plan(&config, 9, 0);
             let mut pipeline = args("pipeline", dir.path(), 9);
             pipeline.extend(flag(want));
             assert_eq!(plan.pipeline, Launch::Start(pipeline), "{mode:?}");
@@ -371,7 +413,7 @@ mod tests {
             with_flag(mode, &[("jordi", "/notes/md")], "/notes/md");
         }
         // Without an account the pipeline gets no folder.
-        let plan = plan(&config(Mode::Local, dir.path()), 9);
+        let plan = plan(&config(Mode::Local, dir.path()), 9, 0);
         assert_eq!(
             plan.pipeline,
             Launch::Start(args("pipeline", dir.path(), 9))
@@ -379,9 +421,42 @@ mod tests {
     }
 
     #[test]
+    fn plan_pauses_the_pipeline_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_763_300_000_000;
+        let paused = |mode, until_ms| AppConfig {
+            ocr_pause: Some(crate::pause::OcrPause { until_ms }),
+            ..config(mode, dir.path())
+        };
+        // Local: the server runs on.
+        let local = plan(&paused(Mode::Local, None), 4242, now);
+        assert_eq!(local.server, Launch::Start(args("serve", dir.path(), 4242)));
+        assert_eq!(local.pipeline, Launch::Paused);
+        // A pause whose time came is over.
+        let over = plan(&paused(Mode::Local, Some(now)), 4242, now);
+        assert_eq!(
+            over.pipeline,
+            Launch::Start(args("pipeline", dir.path(), 4242))
+        );
+        let ahead = plan(&paused(Mode::Local, Some(now + 1)), 4242, now);
+        assert_eq!(ahead.pipeline, Launch::Paused);
+        // Remote: a pipeline that is not connected stays so; a connected one pauses.
+        let remote = plan(&paused(Mode::Remote, None), 7, now);
+        assert_eq!(remote.server, Launch::Off);
+        assert_eq!(remote.pipeline, Launch::NotConnected);
+        std::fs::write(dir.path().join("pipeline.toml"), "").unwrap();
+        let remote = plan(&paused(Mode::Remote, None), 7, now);
+        assert_eq!(remote.server, Launch::Off);
+        assert_eq!(remote.pipeline, Launch::Paused);
+        // No mode runs nothing, paused or not.
+        let none = plan(&paused(Mode::NotSet, None), 7, now);
+        assert_eq!(none.pipeline, Launch::Off);
+    }
+
+    #[test]
     fn no_mode_runs_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let plan = plan(&config(Mode::NotSet, dir.path()), 7);
+        let plan = plan(&config(Mode::NotSet, dir.path()), 7, 0);
         assert_eq!(plan.server, Launch::Off);
         assert_eq!(plan.pipeline, Launch::Off);
     }

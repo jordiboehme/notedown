@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import type { NoteView } from "../lib/library-types";
 
 // The view models of the review: a note's handwritten pages on one side and its Markdown on
@@ -14,8 +15,13 @@ export const PAGES_KEPT = 4;
 
 export type PageState = NoteView["pages"][number]["state"];
 
+/** Where a search hit is: the page by its id and the block in it. */
+export type BlockAt = { pageId: string; blockId: string };
+
 export type ReviewPage = {
   index: number;
+  /** The page's id in the note: a search hit names its page by it. */
+  pageId: string;
   label: string;
   state: PageState;
   /** The page's text as the pipeline wrote it; shown as text, never as HTML. */
@@ -24,10 +30,12 @@ export type ReviewPage = {
   stateText: string | null;
   /** Width by height, for the placeholder of its image. */
   ratio: number;
+  /** The page's text block by block, in their order; together they are `markdown`. */
+  blocks: { id: string; text: string }[];
 };
 
 const STATE_TEXTS: Record<Exclude<PageState, "done">, string> = {
-  pending: "Not read yet.",
+  pending: "Waiting for the OCR.",
   failed: "Notedown could not read this page.",
   truncated: "The text of this page was cut short.",
 };
@@ -39,6 +47,7 @@ const STATE_TEXTS: Record<Exclude<PageState, "done">, string> = {
 export function reviewPages(view: NoteView, ratios: Record<number, number> = {}): ReviewPage[] {
   return view.pages.map((page) => ({
     index: page.index,
+    pageId: page.pageId,
     label: `Page ${page.index + 1}`,
     state: page.state,
     markdown: page.markdown,
@@ -49,12 +58,28 @@ export function reviewPages(view: NoteView, ratios: Record<number, number> = {})
           : null
         : STATE_TEXTS[page.state],
     ratio: ratios[page.index] ?? (page.landscape ? 1 / PORTRAIT : PORTRAIT),
+    blocks: page.blocks.map((block) => ({ id: block.id, text: block.text })),
   }));
 }
 
-/** The line above the review while the note is not read to the end. */
-export function reviewNotice(view: NoteView): string | null {
-  return view.catchingUp ? "Notedown is still reading this note." : null;
+/**
+ * The row of the page `at` names and its block: the page alone (`blockId` null) when the block
+ * is gone, nothing when the page is gone.
+ */
+export function findBlock(rows: ReviewPage[], at: BlockAt): { index: number; blockId: string | null } | null {
+  const row = rows.find((r) => r.pageId === at.pageId);
+  if (!row) return null;
+  return { index: row.index, blockId: row.blocks.some((b) => b.id === at.blockId) ? at.blockId : null };
+}
+
+/**
+ * The line above the review while the note is not read to the end. `pause` is the status
+ * line's pause text ("OCR paused until 14:32") while an OCR pause holds: then nothing reads the
+ * note, and the review says so in the same words.
+ */
+export function reviewNotice(view: NoteView, pause: string | null = null): string | null {
+  if (!view.catchingUp) return null;
+  return pause ?? "Notedown is still reading this note.";
 }
 
 /** The page at `scrollTop`, given the tops of the pages (ascending): the last one at or above it. */
@@ -105,6 +130,17 @@ export function nearPages(
   };
 }
 
+/**
+ * Whether a `NOTES_EVENT` concerns the review of the note at `path`: its payload names the
+ * notes whose store file changed. An event without a readable payload counts, so a review
+ * never misses its text.
+ */
+export function concernsNote(payload: unknown, path: string): boolean {
+  const paths = (payload as { paths?: unknown } | null | undefined)?.paths;
+  if (!Array.isArray(paths)) return true;
+  return paths.includes(path);
+}
+
 /** The name of a note by its path, as the review shows it before or without its text. */
 export function noteTitle(path: string): string {
   const name = path.slice(path.lastIndexOf("/") + 1);
@@ -130,4 +166,28 @@ export function syncGuard() {
       return expected === undefined || Math.abs(top - expected) > 1;
     },
   };
+}
+
+/**
+ * Whether the mark of a search hit stays: the text side is still where the window scrolled it
+ * (`markedTop`), within a pixel. Any other scroll is the user's, whatever moved it.
+ */
+export function keepsHit(markedTop: number, scrollTop: number): boolean {
+  return Math.abs(scrollTop - markedTop) <= 1;
+}
+
+/** Save Markdown can save the note: some page has text. */
+export function canSaveMarkdown(view: NoteView | null): boolean {
+  return view !== null && view.pages.some((page) => page.markdown.trim() !== "");
+}
+
+/**
+ * The context menu of the note at `path` (a row of a notes list, a .note file): Rust builds
+ * it ("Save Markdown...", enabled when the note has text) and does its work.
+ */
+export function noteMenu(event: { preventDefault(): void }, path: string) {
+  event.preventDefault();
+  invoke("library_menu", { target: { kind: "note", path } }).catch((error: unknown) =>
+    console.error("notedown: library_menu failed", error),
+  );
 }

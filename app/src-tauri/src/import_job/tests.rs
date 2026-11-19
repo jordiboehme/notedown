@@ -11,7 +11,7 @@ use crate::process::spawn_program;
 use crate::test_procs::{gone, kill_in, left_in, tagged_sleep};
 
 /// How long a test waits for an event before it fails.
-const WAIT: Duration = Duration::from_secs(10);
+const WAIT: Duration = crate::test_procs::HANG_GUARD;
 /// The stop grace in tests.
 const GRACE: Duration = Duration::from_millis(200);
 
@@ -238,17 +238,13 @@ fn a_pause_after_the_end_keeps_the_result() {
     let body = r#"echo '{"report":{"complete":true,"files":3}}'"#;
     let (jobs, events) = jobs(sidecar(dir.path(), body), FakeHost::new(dir.path()));
     // The process has ended, but the job has not noticed yet.
-    jobs.hold_after_exit(Duration::from_millis(800));
+    jobs.hold_after_exit();
     jobs.backup("http://sn:8089", &backup_dir(dir.path()), false)
         .unwrap();
-    let start = Instant::now();
-    while calls(dir.path()).is_empty() {
-        assert!(start.elapsed() < WAIT);
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    std::thread::sleep(Duration::from_millis(300));
+    jobs.wait_held_after_exit();
     assert_eq!(jobs.state(), Some(JobKind::Backup));
     jobs.pause();
+    jobs.release_after_exit();
     let end = wait_for(&events, |e| {
         is_end(e) || matches!(e, JobEvent::Paused { .. })
     });

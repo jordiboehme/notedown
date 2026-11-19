@@ -5,9 +5,11 @@ pub mod config;
 pub mod import_job;
 pub mod library;
 pub mod login;
+pub mod menus;
 pub mod model;
 pub mod notes;
 pub mod notify;
+pub mod pause;
 pub mod pidfile;
 pub mod poller;
 pub mod probe;
@@ -16,6 +18,8 @@ pub mod processes;
 pub mod quit;
 pub mod rest;
 pub mod review;
+pub mod save_markdown;
+pub mod search;
 pub mod serve_info;
 pub mod setup;
 pub mod status;
@@ -36,7 +40,7 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent};
 use import_job::{AppHost as ImportHost, ImportJobs, JobEvent};
 use library::{LIBRARY_EVENT, Library, LibraryEvent};
 use model::{ModelControl, ModelEvent};
-use notes::{NOTES_EVENT, NOTES_EVERY, Notes};
+use notes::{NOTES_EVENT, NOTES_EVERY, Notes, NotesChanged};
 #[cfg(target_os = "macos")]
 use notify::deliver::Deliver;
 use notify::notifier::StopNotifier;
@@ -100,6 +104,9 @@ pub fn run() {
         .on_menu_event(|app, event| tray::on_menu_event(app, event.id().as_ref()))
         .on_window_event(windows::on_window_event)
         .manage(Shown::default())
+        .manage(menus::MenuTargetState::default())
+        .manage(save_markdown::SaveTarget::default())
+        .manage(save_markdown::SaveMenuItem::default())
         .manage(Arc::new(QuitFlow::new()))
         .manage(Arc::new(login::LoginGate::default()))
         .setup(|app| {
@@ -150,6 +157,7 @@ pub fn run() {
             }));
             app.manage(model_control(app.handle().clone(), sidecar_spawn.clone()));
             app.manage(setup::Sidecar(sidecar_spawn.clone()));
+            app.manage(Arc::new(search::Searches::default()));
             let poller = status_poller(sidecar_spawn.clone(), reader, processes.clone(), notify);
             let marking = app.state::<commands::ConfigState>().inner().clone();
             let told = app.handle().clone();
@@ -288,9 +296,15 @@ pub fn run() {
             commands::library_cancel_drop,
             commands::library_download,
             commands::library_reveal,
+            commands::library_find,
             commands::notes_new,
             commands::notes_all,
             commands::note_seen,
+            commands::notes_seen_all,
+            commands::notes_search,
+            commands::library_menu,
+            commands::note_save_markdown,
+            commands::review_shown,
             commands::note_open,
             commands::note_page_image,
             commands::note_close,
@@ -318,7 +332,8 @@ pub fn run() {
             commands::open_recycle_bin,
             commands::update_state,
             commands::check_for_update,
-            commands::install_update_and_restart
+            commands::install_update_and_restart,
+            commands::ocr_resume
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
@@ -630,15 +645,42 @@ fn import_jobs(app: AppHandle, spawn: process::SpawnFn, host: ImportHost) -> Imp
     )
 }
 
-/// Starts the children as the config asks, then probes what is `Outside` every 30 s.
+/// Starts the children as the config asks, then probes what is `Outside` every 30 s. A pause
+/// whose end came while the app was closed is cleared first.
 fn supervise(app: AppHandle) {
     std::thread::spawn(move || {
         let processes = app.state::<Arc<Processes>>().inner().clone();
-        let config = app.state::<commands::ConfigState>().reader();
+        let state = app.state::<commands::ConfigState>().inner().clone();
+        // The watch starts after this clear: a failure is told here once, not again by it.
+        let watch = match state.clear_expired_pause(processes.now_ms()) {
+            Ok(_) => commands::PauseWatch::default(),
+            Err(e) => {
+                eprintln!("notedown: the ended OCR pause was not cleared: {e}");
+                commands::PauseWatch::after_failed_clear(state.current().ocr_pause)
+            }
+        };
+        watch_the_pause(app.clone(), watch);
+        // The icon was built before the config was there: now the menu shows a kept pause.
+        tray::set_menu(&app);
+        let config = state.reader();
         processes.start_with(|| config.current());
         loop {
             std::thread::sleep(REPROBE_EVERY);
             processes.reprobe_with(|| config.current());
+        }
+    });
+}
+
+/// How often the app looks whether a timed OCR pause has ended.
+const PAUSE_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Ends a timed OCR pause at its time: clears it and starts the pipeline, as Resume does. A
+/// clear that cannot be saved still starts the pipeline, and is told once.
+fn watch_the_pause(app: AppHandle, mut watch: commands::PauseWatch) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(PAUSE_TICK);
+            commands::end_expired_pause(&app, &mut watch);
         }
     });
 }
@@ -785,11 +827,11 @@ fn library_for(
 /// The notes index of the account in the config. It reads the config through a handle of its
 /// own; its events go into a channel, and a thread of its own tells the panel and the library.
 fn notes_for(app: AppHandle, config: commands::ConfigReader, config_dir: PathBuf) -> Notes {
-    let (tx, rx) = mpsc::channel::<()>();
+    let (tx, rx) = mpsc::channel::<NotesChanged>();
     std::thread::spawn(move || {
-        for () in rx {
+        for changed in rx {
             for kind in [windows::WindowKind::Panel, windows::WindowKind::Library] {
-                let _ = app.emit_to(kind.label(), NOTES_EVENT, ());
+                let _ = app.emit_to(kind.label(), NOTES_EVENT, changed.clone());
             }
         }
     });
@@ -799,8 +841,8 @@ fn notes_for(app: AppHandle, config: commands::ConfigReader, config_dir: PathBuf
             (config.data_dir, config.account)
         }),
         config_dir,
-        Arc::new(move || {
-            let _ = tx.send(());
+        Arc::new(move |changed| {
+            let _ = tx.send(changed);
         }),
     )
 }
@@ -915,7 +957,7 @@ mod tests {
         names.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    const SETTINGS_ONLY: [&str; 44] = [
+    const SETTINGS_ONLY: [&str; 45] = [
         "get_config",
         "set_mode",
         "set_start_view",
@@ -960,6 +1002,7 @@ mod tests {
         "update_state",
         "check_for_update",
         "install_update_and_restart",
+        "ocr_resume",
     ];
 
     #[test]
@@ -1000,13 +1043,19 @@ mod tests {
                 "library_cancel_drop",
                 "library_download",
                 "library_reveal",
+                "library_find",
                 "notes_new",
                 "notes_all",
                 "note_seen",
+                "notes_seen_all",
+                "notes_search",
+                "library_menu",
                 "note_open",
                 "note_page_image",
                 "note_close",
                 "note_page_drop",
+                "note_save_markdown",
+                "review_shown",
                 "open_settings"
             ])
         );
@@ -1081,7 +1130,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 74);
+        assert_eq!(handler_commands().len(), 81);
     }
 
     #[test]
@@ -1130,13 +1179,19 @@ mod tests {
             "library_cancel_drop",
             "library_download",
             "library_reveal",
+            "library_find",
             "notes_new",
             "notes_all",
             "note_seen",
+            "notes_seen_all",
+            "notes_search",
+            "library_menu",
             "note_open",
             "note_page_image",
             "note_close",
             "note_page_drop",
+            "note_save_markdown",
+            "review_shown",
             "markdown_dir",
             "set_markdown_dir",
             "show_markdown_dir",
@@ -1161,6 +1216,7 @@ mod tests {
             "update_state",
             "check_for_update",
             "install_update_and_restart",
+            "ocr_resume",
         ]);
         assert_eq!(manifest_commands(), all);
         // Every granted command is a real one.
@@ -1191,6 +1247,7 @@ mod tests {
                 "library_cancel_drop",
                 "library_download",
                 "library_reveal",
+                "library_find",
             ] {
                 assert!(!granted(window).contains(command), "{window} has {command}");
             }
@@ -1203,7 +1260,13 @@ mod tests {
             assert!(granted(window).contains("notes_new"), "{window}");
         }
         assert!(!granted("settings").contains("notes_new"));
-        for command in ["notes_all", "note_seen"] {
+        for command in [
+            "notes_all",
+            "note_seen",
+            "notes_seen_all",
+            "notes_search",
+            "library_menu",
+        ] {
             assert!(granted("library").contains(command), "{command}");
             for window in ["panel", "settings"] {
                 assert!(!granted(window).contains(command), "{window} has {command}");
@@ -1218,6 +1281,8 @@ mod tests {
             "note_page_image",
             "note_close",
             "note_page_drop",
+            "note_save_markdown",
+            "review_shown",
         ] {
             assert!(granted("library").contains(command), "{command}");
             for window in ["panel", "settings"] {

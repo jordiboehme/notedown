@@ -1,0 +1,129 @@
+import { syncTop, type Offsets } from "./review";
+import { isFindKey } from "./search";
+
+// The zoom of the review's pages and the split between its two sides. Pure functions; the
+// components hold the state.
+
+/** The zoom steps of the pages side: 1 is the width of the pages column (fit width). */
+export const ZOOMS = [1, 1.25, 1.5, 2, 3];
+/** Actual Size: back to fit width. */
+export const ACTUAL = 1;
+
+/** The next larger step; the largest stays. */
+export function zoomIn(z: number): number {
+  return ZOOMS.find((step) => step > z) ?? ZOOMS[ZOOMS.length - 1];
+}
+
+/** The next smaller step; the smallest stays. */
+export function zoomOut(z: number): number {
+  return [...ZOOMS].reverse().find((step) => step < z) ?? ZOOMS[0];
+}
+
+/** Cmd+Plus (with or without Shift), Cmd+Minus and Cmd+0; null for any other key. */
+export function zoomKey(e: { key: string; metaKey: boolean }): "in" | "out" | "actual" | null {
+  if (!e.metaKey) return null;
+  if (e.key === "=" || e.key === "+") return "in";
+  if (e.key === "-") return "out";
+  if (e.key === "0") return "actual";
+  return null;
+}
+
+/**
+ * The zoom key of the review: none while a search lies over it (`covered`) or while a page is
+ * shown alone (`alone`, it has its own zoom).
+ */
+export function reviewZoomKey(
+  e: { key: string; metaKey: boolean },
+  { covered, alone }: { covered: boolean; alone: boolean },
+): "in" | "out" | "actual" | null {
+  return covered || alone ? null : zoomKey(e);
+}
+
+/**
+ * Cmd+F while a page is shown alone (`alone`) ends the large view: it covers the search field
+ * that Cmd+F focuses, and the arrow keys typed in that field must not step the page behind it.
+ */
+export function findEndsAlone(e: { key: string; metaKey: boolean }, alone: boolean): boolean {
+  return alone && isFindKey(e);
+}
+
+/** Where the pages side scrolls to after a zoom: the same page at the same share of it. */
+export function keepPlace(scrollTop: number, before: Offsets, after: Offsets): number {
+  return syncTop(scrollTop, before, after);
+}
+
+/** Where the split between the pages and the text is kept, per viewer. */
+export const SPLIT_KEY = "notedown.review.split";
+const SPLIT_DEFAULT = 0.5;
+
+/** The share of the pages side, between a fifth and four fifths of the window. */
+export function clampSplit(x: number): number {
+  if (!Number.isFinite(x)) return SPLIT_DEFAULT;
+  return Math.min(0.8, Math.max(0.2, x));
+}
+
+/** The split saved last; half and half without one, or when the storage cannot be read. */
+export function readSplit(storage: Storage | null): number {
+  try {
+    const saved = storage?.getItem(SPLIT_KEY);
+    if (saved === null || saved === undefined || saved.trim() === "") return SPLIT_DEFAULT;
+    const x = Number(saved);
+    return Number.isFinite(x) ? clampSplit(x) : SPLIT_DEFAULT;
+  } catch {
+    return SPLIT_DEFAULT;
+  }
+}
+
+/** Saves the split; a storage that fails is no error (the split only stays for this window). */
+export function saveSplit(storage: Storage | null, x: number): void {
+  try {
+    storage?.setItem(SPLIT_KEY, String(clampSplit(x)));
+  } catch {
+    // Not kept: the next window starts at half and half.
+  }
+}
+
+/** The keys of the page viewer: the page before, the page after, or close. */
+export function viewerKey(key: string): "prev" | "next" | "close" | null {
+  switch (key) {
+    case "ArrowLeft":
+    case "ArrowUp":
+    case "PageUp":
+      return "prev";
+    case "ArrowRight":
+    case "ArrowDown":
+    case "PageDown":
+      return "next";
+    case "Escape":
+      return "close";
+    default:
+      return null;
+  }
+}
+
+/** The page before or after `index` in a note of `count` pages; it stays at both ends. */
+export function stepPage(index: number, count: number, step: "prev" | "next"): number {
+  const next = index + (step === "prev" ? -1 : 1);
+  return Math.min(Math.max(count - 1, 0), Math.max(0, next));
+}
+
+/** The keys that open a focused page in the large view: Return and Space. */
+export function openKey(key: string): boolean {
+  return key === "Enter" || key === " ";
+}
+
+/**
+ * What a key does to the page shown alone: a zoom step, a move to another page or the close,
+ * or nothing. While a search lies over it (`covered`), no key reaches it.
+ */
+export function viewerInput(
+  e: { key: string; metaKey: boolean; ctrlKey: boolean; altKey: boolean },
+  covered: boolean,
+): { zoom: "in" | "out" | "actual" } | { move: "prev" | "next" | "close" } | null {
+  if (covered) return null;
+  const zoom = zoomKey(e);
+  if (zoom) return { zoom };
+  if (e.metaKey || e.ctrlKey || e.altKey) return null;
+  const move = viewerKey(e.key);
+  return move ? { move } : null;
+}

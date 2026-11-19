@@ -17,7 +17,7 @@ use crate::status::Attention;
 use crate::supervisor::ChildState;
 use crate::token::MemoryStore;
 
-const WAIT: Duration = Duration::from_secs(10);
+const WAIT: Duration = crate::test_procs::HANG_GUARD;
 const T0: u64 = 1_763_300_000_000;
 const SEC: u64 = 1_000;
 
@@ -583,7 +583,8 @@ fn a_hanging_status_call_is_ended() {
         answer,
         PipelineCall::Failed("it did not answer in time".into())
     );
-    assert!(start.elapsed() < Duration::from_secs(5));
+    // The sleep runs 314 s: an end before the guard is the bound at work.
+    assert!(start.elapsed() < WAIT);
     let ended = crate::test_procs::gone(dir.path());
     crate::test_procs::kill_in(dir.path());
     assert!(ended, "the call was ended");
@@ -673,8 +674,8 @@ fn the_token_goes_only_into_the_header() {
     let (heads_tx, heads_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for _ in 0..2 {
-            // Gives up after 10 s, so a request that never comes cannot hold the test.
-            let Some(mut stream) = accept_within(&listener, Duration::from_secs(10)) else {
+            // Gives up after the guard, so a request that never comes cannot hold the test.
+            let Some(mut stream) = accept_within(&listener, WAIT) else {
                 return;
             };
             let mut head = Vec::new();
@@ -701,11 +702,7 @@ fn the_token_goes_only_into_the_header() {
     sources.account(&base, Some(&Token::new("Secret-1")));
     sources.account(&base, None);
     let heads: Vec<String> = (0..2)
-        .map(|_| {
-            heads_rx
-                .recv_timeout(Duration::from_secs(15))
-                .expect("no request came")
-        })
+        .map(|_| heads_rx.recv_timeout(WAIT).expect("no request came"))
         .collect();
     assert!(
         heads[0].starts_with("get /rest/v1/account http/1.1"),

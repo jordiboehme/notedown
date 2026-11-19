@@ -19,7 +19,9 @@
 //!
 //! The index follows the store by polling: a scan every [`NOTES_EVERY`] while the panel or the
 //! library window is visible, one at each show, and one before every answer of `notes_new` and
-//! `notes_all`. A scan is a `stat` per file; only changed files are read. The app has no file
+//! `notes_all`. A scan is a `stat` per file; only changed files are read. The windows hear
+//! [`NOTES_EVENT`] when All notes or New notes changed and when a scan read a store file again
+//! (or found one gone), so an open review hears about every page the OCR wrote. The app has no file
 //! watcher, and a watcher would add a dependency for a folder that matters only while a window
 //! shows the notes.
 
@@ -35,8 +37,18 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
 /// The event that tells the panel and the library window that the notes changed. It carries
-/// nothing: the windows ask `notes_new` or `notes_all` again.
+/// [`NotesChanged`]: the windows ask `notes_new` or `notes_all` again, and an open review reads
+/// its note again when its path is named.
 pub const NOTES_EVENT: &str = "notes";
+
+/// What [`NOTES_EVENT`] carries: the wire paths of the notes whose store file a scan read again
+/// or found gone since the last event (a moved note with its old and its new path), sorted.
+/// Empty when only All notes or New notes changed (a note marked seen).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotesChanged {
+    pub paths: Vec<String>,
+}
 
 /// How often the store is scanned while a window that shows notes is visible.
 pub const NOTES_EVERY: Duration = Duration::from_secs(2);
@@ -76,7 +88,7 @@ pub type NotesPlace = Arc<dyn Fn() -> (PathBuf, Option<String>) + Send + Sync>;
 
 /// Tells the windows that the notes changed. It must not block: the app only puts it into a
 /// channel.
-pub type NotesEmit = Arc<dyn Fn() + Send + Sync>;
+pub type NotesEmit = Arc<dyn Fn(NotesChanged) + Send + Sync>;
 
 /// The part of a store file the index reads. `strokeList`, `meta` (with the device's
 /// recognition text), the blocks' text and everything else is skipped while parsing.
@@ -214,6 +226,10 @@ struct State {
     dirty: bool,
     /// What All notes and New notes were when the windows were last told.
     told: Option<(Vec<NoteSummary>, Vec<NoteSummary>)>,
+    /// The paths of the notes whose store file a scan read again (or found gone) since the
+    /// windows were last told: an open review hears about them, also when the lists stay as
+    /// they are.
+    reread: BTreeSet<String>,
 }
 
 /// The notes index. Cheap to clone; every clone is the same index.
@@ -233,6 +249,9 @@ struct Inner {
     visible: Mutex<bool>,
     /// Wakes the scanner's thread, once it runs.
     waker: Mutex<Option<Sender<()>>>,
+    /// How many times seen.json was written, for the tests.
+    #[cfg(test)]
+    saves: std::sync::atomic::AtomicUsize,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -253,9 +272,12 @@ impl Notes {
                     seen: None,
                     dirty: false,
                     told: None,
+                    reread: BTreeSet::new(),
                 }),
                 visible: Mutex::new(false),
                 waker: Mutex::new(None),
+                #[cfg(test)]
+                saves: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
     }
@@ -343,11 +365,90 @@ impl Notes {
         result
     }
 
+    /// The user cleared the New count: the marker of every note that is new now goes to its
+    /// text seq, in one write, and the windows are told once. Scans first, so a note that got
+    /// text since the list was read is marked at the text it has now. Answers how many notes it
+    /// marked.
+    pub fn seen_all(&self) -> Result<usize, String> {
+        let mut state = lock(&self.inner.state);
+        self.scan(&mut state);
+        let fresh: Vec<(String, u64)> = new_notes_of(&state)
+            .into_iter()
+            .map(|n| (n.summary.key.clone(), n.text_seq))
+            .collect();
+        let place = state.place.clone();
+        let result = match place {
+            Some((dir, account)) => {
+                let marks = state
+                    .seen
+                    .as_mut()
+                    .and_then(|seen| marks_mut(seen, &account, &dir));
+                match marks {
+                    None => Err(SEEN_NOT_READ.to_owned()),
+                    Some(marks) => {
+                        for (key, seq) in &fresh {
+                            marks.insert(key.clone(), *seq);
+                        }
+                        if !fresh.is_empty() {
+                            state.dirty = true;
+                        }
+                        if self.save_seen(&mut state) {
+                            Ok(fresh.len())
+                        } else {
+                            Err(SEEN_NOT_SAVED.to_owned())
+                        }
+                    }
+                }
+            }
+            None => {
+                self.save_seen(&mut state);
+                Ok(0)
+            }
+        };
+        self.tell(&mut state);
+        result
+    }
+
     /// The note at the wire path `path`: the state that is not deleted or unscoped wins over
     /// one that is. Uses the index as it is.
     pub fn at_path(&self, path: &str) -> Option<NoteSummary> {
         let state = lock(&self.inner.state);
         by_path(&state).remove(path).map(|n| n.summary.clone())
+    }
+
+    /// How many notes are new in the index as it is, without waiting: `None` while a scan
+    /// holds the index (for the main thread, which must not wait for one).
+    pub fn try_new_count(&self) -> Option<usize> {
+        let state = match self.inner.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(new_notes_of(&state).len())
+    }
+
+    /// [`at_path`](Self::at_path) without waiting: `None` while a scan holds the index (for
+    /// the main thread, which must not wait for one).
+    pub fn try_at_path(&self, path: &str) -> Option<Option<NoteSummary>> {
+        let state = match self.inner.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(by_path(&state).remove(path).map(|n| n.summary.clone()))
+    }
+
+    /// Every note the index lists (with text, not deleted, unscoped or hidden by another note
+    /// at its path), by key. Scans first, so a note that got text since the last scan is in it.
+    pub fn listed_by_keys(&self) -> HashMap<String, NoteSummary> {
+        let mut state = lock(&self.inner.state);
+        self.scan(&mut state);
+        self.save_seen(&mut state);
+        self.tell(&mut state);
+        listed_notes(&state)
+            .into_iter()
+            .map(|n| (n.summary.key.clone(), n.summary.clone()))
+            .collect()
     }
 
     /// The store file of the note at the wire path `path`, by the rule of
@@ -492,11 +593,19 @@ impl Notes {
                 Some(known) if known.stamp == stamp => known,
                 known => match read_note(&path, stamp) {
                     Ok(note) => {
-                        before.extend(known.and_then(|k| k.note));
+                        let known = known.and_then(|k| k.note);
+                        for n in note.iter().chain(&known) {
+                            state.reread.insert(n.summary.path.clone());
+                        }
+                        before.extend(known);
                         Indexed { stamp, note }
                     }
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        before.extend(known.and_then(|k| k.note));
+                        let known = known.and_then(|k| k.note);
+                        if let Some(n) = &known {
+                            state.reread.insert(n.summary.path.clone());
+                        }
+                        before.extend(known);
                         continue;
                     }
                     // Not readable for now: the old entry stays (with its old stamp, so the
@@ -513,7 +622,11 @@ impl Notes {
             files.insert(name.to_owned(), indexed);
         }
         if complete {
-            before.extend(old.into_values().filter_map(|f| f.note));
+            let gone: Vec<Note> = old.into_values().filter_map(|f| f.note).collect();
+            for n in &gone {
+                state.reread.insert(n.summary.path.clone());
+            }
+            before.extend(gone);
         } else {
             // A file that could not be listed is not gone: the old entries stay this scan.
             for (name, known) in old {
@@ -569,6 +682,10 @@ impl Notes {
         };
         match write_seen(&self.inner.config_dir, seen) {
             Ok(()) => {
+                #[cfg(test)]
+                self.inner
+                    .saves
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 state.dirty = false;
                 true
             }
@@ -579,8 +696,10 @@ impl Notes {
         }
     }
 
-    /// Tells the windows when All notes or New notes is not what they were told last.
+    /// Tells the windows when All notes or New notes is not what they were told last, or when a
+    /// scan read a store file again since.
     fn tell(&self, state: &mut State) {
+        let reread = std::mem::take(&mut state.reread);
         let all = listed_notes(state);
         let new = new_notes_of(state);
         let same = |told: &[NoteSummary], now: &[&Note]| {
@@ -590,11 +709,13 @@ impl Notes {
             .told
             .as_ref()
             .is_some_and(|(a, n)| same(a, &all) && same(n, &new));
-        if !unchanged {
+        if !unchanged || !reread.is_empty() {
             let summaries =
                 |notes: Vec<&Note>| notes.into_iter().map(|n| n.summary.clone()).collect();
             state.told = Some((summaries(all), summaries(new)));
-            (self.inner.emit)();
+            (self.inner.emit)(NotesChanged {
+                paths: reread.into_iter().collect(),
+            });
         }
     }
 }

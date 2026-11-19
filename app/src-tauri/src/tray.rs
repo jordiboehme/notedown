@@ -1,10 +1,11 @@
 //! The menu bar icon and the panel under it.
 
 use tauri::image::Image;
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Rect, Runtime};
+use tauri::{AppHandle, Manager, Rect, Runtime, Wry};
 
+use crate::pause::{self, OcrPause, PauseChoice};
 use crate::status::Attention;
 use crate::windows;
 
@@ -16,6 +17,82 @@ pub const OPEN_LIBRARY_ID: &str = "open-library";
 pub const SETTINGS_ID: &str = "settings";
 pub const CHECK_UPDATES_ID: &str = "check-updates";
 pub const QUIT_ID: &str = "quit";
+/// The Pause OCR submenu, and the lines while a pause holds.
+pub const PAUSE_1M_ID: &str = "pause-1m";
+pub const PAUSE_5M_ID: &str = "pause-5m";
+pub const PAUSE_1H_ID: &str = "pause-1h";
+pub const PAUSE_UNTIL_RESUMED_ID: &str = "pause-until-resumed";
+pub const RESUME_OCR_ID: &str = "resume-ocr";
+/// The disabled line that says until when the OCR is paused.
+pub const PAUSE_STATUS_ID: &str = "pause-status";
+
+/// One entry of the tray menu, before it is made into a native one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrayEntry {
+    Item {
+        id: String,
+        text: String,
+        enabled: bool,
+    },
+    Submenu {
+        text: String,
+        items: Vec<TrayEntry>,
+    },
+    Separator,
+}
+
+fn entry(id: &str, text: &str, enabled: bool) -> TrayEntry {
+    TrayEntry::Item {
+        id: id.to_owned(),
+        text: text.to_owned(),
+        enabled,
+    }
+}
+
+/// The tray menu with the OCR pause `pause` at `now_ms`. While it holds, a disabled line says
+/// until when (`clock` gives the clock time of its end) and Resume OCR Now ends it. The Pause
+/// OCR submenu is always there, also to change a pause.
+pub fn tray_entries(
+    pause: Option<&OcrPause>,
+    now_ms: u64,
+    clock: impl Fn(u64) -> String,
+) -> Vec<TrayEntry> {
+    let mut entries = vec![
+        entry(OPEN_LIBRARY_ID, "Open Library", true),
+        entry(SETTINGS_ID, "Settings...", true),
+        entry(CHECK_UPDATES_ID, "Check for Updates...", true),
+        TrayEntry::Separator,
+    ];
+    if let Some(p) = pause.filter(|p| pause::active(Some(p), now_ms)) {
+        entries.push(entry(PAUSE_STATUS_ID, &pause::pause_line(p, clock), false));
+        entries.push(entry(RESUME_OCR_ID, "Resume OCR Now", true));
+    }
+    entries.extend([
+        TrayEntry::Submenu {
+            text: "Pause OCR".to_owned(),
+            items: vec![
+                entry(PAUSE_1M_ID, "For 1 Minute", true),
+                entry(PAUSE_5M_ID, "For 5 Minutes", true),
+                entry(PAUSE_1H_ID, "For 1 Hour", true),
+                entry(PAUSE_UNTIL_RESUMED_ID, "Until I Resume", true),
+            ],
+        },
+        TrayEntry::Separator,
+        entry(QUIT_ID, "Quit Notedown", true),
+    ]);
+    entries
+}
+
+/// The pause a menu item id picks.
+pub fn pause_choice(id: &str) -> Option<PauseChoice> {
+    match id {
+        PAUSE_1M_ID => Some(PauseChoice::OneMinute),
+        PAUSE_5M_ID => Some(PauseChoice::FiveMinutes),
+        PAUSE_1H_ID => Some(PauseChoice::OneHour),
+        PAUSE_UNTIL_RESUMED_ID => Some(PauseChoice::UntilResumed),
+        _ => None,
+    }
+}
 
 // The 2x images: tray-icon draws any image 18 pt high, so these stay sharp on a Retina
 // screen. `app/scripts/tray-icons.sh` renders them from docs/assets/icon-menubar.svg.
@@ -90,24 +167,56 @@ impl TrayIconKind {
     }
 }
 
+/// The native items of `entries`.
+fn render(app: &AppHandle, entries: &[TrayEntry]) -> tauri::Result<Vec<Box<dyn IsMenuItem<Wry>>>> {
+    entries
+        .iter()
+        .map(|e| -> tauri::Result<Box<dyn IsMenuItem<Wry>>> {
+            Ok(match e {
+                TrayEntry::Item { id, text, enabled } => Box::new(MenuItem::with_id(
+                    app,
+                    id.as_str(),
+                    text,
+                    *enabled,
+                    None::<&str>,
+                )?),
+                TrayEntry::Submenu { text, items } => {
+                    let items = render(app, items)?;
+                    let refs: Vec<&dyn IsMenuItem<Wry>> = items.iter().map(|i| &**i).collect();
+                    Box::new(Submenu::with_items(app, text, true, &refs)?)
+                }
+                TrayEntry::Separator => Box::new(PredefinedMenuItem::separator(app)?),
+            })
+        })
+        .collect()
+}
+
+/// The tray menu as the config's pause is now.
+fn menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
+    // The setup builds the icon before the config is managed; the menu is set again after.
+    let pause = app
+        .try_state::<crate::commands::ConfigState>()
+        .and_then(|c| c.current().ocr_pause);
+    let now = app
+        .try_state::<std::sync::Arc<crate::processes::Processes>>()
+        .map_or_else(|| (crate::supervisor::system_clock())(), |p| p.now_ms());
+    let items = render(app, &tray_entries(pause.as_ref(), now, pause::local_clock))?;
+    let refs: Vec<&dyn IsMenuItem<Wry>> = items.iter().map(|i| &**i).collect();
+    Menu::with_items(app, &refs)
+}
+
+/// Builds the tray menu again: after every change of the OCR pause, its end included.
+pub fn set_menu(app: &AppHandle) {
+    if let Some(tray) = app.tray_by_id(TRAY_ID)
+        && let Ok(menu) = menu(app)
+    {
+        let _ = tray.set_menu(Some(menu));
+    }
+}
+
 /// Builds the menu bar icon: a left click toggles the panel, a right click opens the menu.
 pub fn build(app: &AppHandle) -> tauri::Result<TrayIcon> {
-    let menu = Menu::with_items(
-        app,
-        &[
-            &MenuItem::with_id(app, OPEN_LIBRARY_ID, "Open Library", true, None::<&str>)?,
-            &MenuItem::with_id(app, SETTINGS_ID, "Settings...", true, None::<&str>)?,
-            &MenuItem::with_id(
-                app,
-                CHECK_UPDATES_ID,
-                "Check for Updates...",
-                true,
-                None::<&str>,
-            )?,
-            &PredefinedMenuItem::separator(app)?,
-            &MenuItem::with_id(app, QUIT_ID, "Quit Notedown", true, None::<&str>)?,
-        ],
-    )?;
+    let menu = menu(app)?;
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(TrayIconKind::Normal.image()?)
         .icon_as_template(true)
@@ -167,15 +276,38 @@ pub fn on_menu_event(app: &AppHandle, id: &str) {
                 windows::show_window(app, windows::WindowKind::Settings, windows::Opening::Plain);
         }
         CHECK_UPDATES_ID => crate::check_update_from_menu(app),
+        // Off the main thread: the config is saved with an fsync. The menu is built again
+        // when the pause changed.
+        RESUME_OCR_ID => {
+            let app = app.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = crate::commands::resume_ocr(&app) {
+                    eprintln!("notedown: the OCR pause did not end: {e}");
+                }
+            });
+        }
+        _ if pause_choice(id).is_some() => {
+            let (app, choice) = (app.clone(), pause_choice(id));
+            std::thread::spawn(move || {
+                if let Some(choice) = choice
+                    && let Err(e) = crate::commands::pause_ocr(&app, choice)
+                {
+                    eprintln!("notedown: the OCR was not paused: {e}");
+                }
+            });
+        }
         QUIT_ID => crate::request_quit(app),
+        crate::save_markdown::MENU_ID => crate::save_markdown::on_menu(app),
+        _ if id.starts_with(crate::menus::CONTEXT_PREFIX) => crate::menus::on_context(app, id),
         _ => {}
     }
 }
 
 /// The app menu that macOS shows while a window makes the app Regular, with its native Quit
 /// replaced by ours: the native one ends the process without the event loop, so the children
-/// would not be stopped first.
-pub fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
+/// would not be stopped first. The File submenu gets "Save Markdown...", whose item is kept in
+/// [`crate::save_markdown::SaveMenuItem`].
+pub fn app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     use tauri::menu::MenuItemKind;
     let menu = Menu::default(app)?;
     // The app submenu comes first and its last item is the native Quit (Menu::default in
@@ -194,6 +326,13 @@ pub fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             true,
             Some("CmdOrCtrl+Q"),
         )?)?;
+    }
+    let save = crate::save_markdown::add_to_file_menu(app, &menu)?;
+    if let Some(kept) = app.try_state::<crate::save_markdown::SaveMenuItem>() {
+        *kept
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(save);
     }
     Ok(menu)
 }
@@ -417,6 +556,111 @@ mod tests {
         assert_eq!(
             panel_place(notch, None, 340.0, &screens),
             Some((842.0, 37.0))
+        );
+    }
+
+    const NOW: u64 = 1_763_300_000_000;
+
+    fn item(id: &str, text: &str, enabled: bool) -> TrayEntry {
+        TrayEntry::Item {
+            id: id.to_owned(),
+            text: text.to_owned(),
+            enabled,
+        }
+    }
+
+    /// The menu with `status` (the pause lines) between the first separator and the submenu.
+    fn menu_with(status: Vec<TrayEntry>) -> Vec<TrayEntry> {
+        let mut entries = vec![
+            item(OPEN_LIBRARY_ID, "Open Library", true),
+            item(SETTINGS_ID, "Settings...", true),
+            item(CHECK_UPDATES_ID, "Check for Updates...", true),
+            TrayEntry::Separator,
+        ];
+        entries.extend(status);
+        entries.extend([
+            TrayEntry::Submenu {
+                text: "Pause OCR".to_owned(),
+                items: vec![
+                    item(PAUSE_1M_ID, "For 1 Minute", true),
+                    item(PAUSE_5M_ID, "For 5 Minutes", true),
+                    item(PAUSE_1H_ID, "For 1 Hour", true),
+                    item(PAUSE_UNTIL_RESUMED_ID, "Until I Resume", true),
+                ],
+            },
+            TrayEntry::Separator,
+            item(QUIT_ID, "Quit Notedown", true),
+        ]);
+        entries
+    }
+
+    fn clock(ms: u64) -> String {
+        assert_eq!(ms, NOW + 60_000);
+        "14:32".to_owned()
+    }
+
+    #[test]
+    fn the_menu_without_a_pause_offers_one() {
+        assert_eq!(tray_entries(None, NOW, clock), menu_with(Vec::new()));
+        // A pause whose time came is over.
+        let over = OcrPause {
+            until_ms: Some(NOW),
+        };
+        assert_eq!(tray_entries(Some(&over), NOW, clock), menu_with(Vec::new()));
+    }
+
+    #[test]
+    fn the_menu_of_a_timed_pause_says_until_when() {
+        let timed = OcrPause {
+            until_ms: Some(NOW + 60_000),
+        };
+        assert_eq!(
+            tray_entries(Some(&timed), NOW, clock),
+            menu_with(vec![
+                item(PAUSE_STATUS_ID, "OCR paused until 14:32", false),
+                item(RESUME_OCR_ID, "Resume OCR Now", true),
+            ])
+        );
+    }
+
+    #[test]
+    fn the_menu_of_a_pause_until_resumed() {
+        let open = OcrPause { until_ms: None };
+        assert_eq!(
+            tray_entries(Some(&open), NOW, |_| unreachable!()),
+            menu_with(vec![
+                item(PAUSE_STATUS_ID, "OCR paused", false),
+                item(RESUME_OCR_ID, "Resume OCR Now", true),
+            ])
+        );
+    }
+
+    #[test]
+    fn the_pause_ids_are_the_choices() {
+        assert_eq!(pause_choice(PAUSE_1M_ID), Some(PauseChoice::OneMinute));
+        assert_eq!(pause_choice(PAUSE_5M_ID), Some(PauseChoice::FiveMinutes));
+        assert_eq!(pause_choice(PAUSE_1H_ID), Some(PauseChoice::OneHour));
+        assert_eq!(
+            pause_choice(PAUSE_UNTIL_RESUMED_ID),
+            Some(PauseChoice::UntilResumed)
+        );
+        assert_eq!(pause_choice(RESUME_OCR_ID), None);
+        assert_eq!(pause_choice(QUIT_ID), None);
+        assert_eq!(
+            [
+                PAUSE_1M_ID,
+                PAUSE_5M_ID,
+                PAUSE_1H_ID,
+                PAUSE_UNTIL_RESUMED_ID,
+                RESUME_OCR_ID
+            ],
+            [
+                "pause-1m",
+                "pause-5m",
+                "pause-1h",
+                "pause-until-resumed",
+                "resume-ocr"
+            ]
         );
     }
 

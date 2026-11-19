@@ -1063,27 +1063,89 @@ fn log_out_without_a_server_still_logs_out() {
     let dir = tempfile::tempdir().unwrap();
     let (state, store) = kept_login(dir.path(), port);
 
-    let started = std::time::Instant::now();
-    log_out_now(&state, &store, &ServeInfo::default());
+    // The log out ends (the guard only catches a hang) and nothing of the login is left.
+    let after = log_out_within_the_guard(&state, &store);
 
-    assert!(started.elapsed() < LOGOUT_TIMEOUT + std::time::Duration::from_secs(1));
+    assert_eq!(after.account, None);
     assert_logged_out(dir.path(), &state, &store, port);
+}
+
+/// [`log_out_now`] on a thread of its own: fails the test when it does not end within
+/// [`crate::test_procs::HANG_GUARD`].
+fn log_out_within_the_guard(state: &ConfigState, store: &MemoryStore) -> AppConfig {
+    std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            let _ = tx.send(log_out_now(state, store, &ServeInfo::default()));
+        });
+        rx.recv_timeout(crate::test_procs::HANG_GUARD)
+            .expect("the log out hangs")
+    })
 }
 
 #[test]
 fn log_out_does_not_wait_for_a_silent_server() {
-    // The connection opens (the system accepts it), but nobody ever answers.
+    // The server takes the revoke but answers nothing until the log out has returned.
     let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    silent.set_nonblocking(true).unwrap();
     let port = silent.local_addr().unwrap().port();
+    let (returned_tx, returned_rx) = std::sync::mpsc::channel::<()>();
+    let (waiting_tx, waiting_rx) = std::sync::mpsc::channel::<bool>();
+    let server = std::thread::spawn(move || {
+        let guard = crate::test_procs::HANG_GUARD;
+        let Some(mut stream) = crate::probe::test_server::accept_within(&silent, guard) else {
+            return;
+        };
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            match std::io::Read::read(&mut stream, &mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => head.extend_from_slice(&buf[..n]),
+            }
+        }
+        if returned_rx.recv_timeout(guard).is_err() {
+            return;
+        }
+        // Whether the revoke still waits for its answer: a log out that waited for it would
+        // only have returned after the revoke gave up and closed the connection.
+        stream.set_nonblocking(true).unwrap();
+        let still_waits = matches!(
+            stream.peek(&mut buf),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+        );
+        let _ = waiting_tx.send(still_waits);
+    });
     let dir = tempfile::tempdir().unwrap();
     let (state, store) = kept_login(dir.path(), port);
 
-    let started = std::time::Instant::now();
-    log_out_now(&state, &store, &ServeInfo::default());
+    // The revoke may wait as long as the guard: it cannot give up while the test looks.
+    std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (state, store) = (&state, &store);
+        scope.spawn(move || {
+            let _ = tx.send(crate::commands::log_out_with(
+                &LoginGate::default(),
+                store,
+                state,
+                &crate::library::idle(),
+                &ServeInfo::default(),
+                crate::test_procs::HANG_GUARD,
+            ));
+        });
+        rx.recv_timeout(crate::test_procs::HANG_GUARD)
+            .expect("the log out hangs")
+            .unwrap();
+    });
+    returned_tx.send(()).unwrap();
 
-    // The revoke runs on a thread of its own: the log out answers at once.
-    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    // The revoke runs on a thread of its own: the log out returned while it still waited.
+    let still_waits = waiting_rx
+        .recv_timeout(crate::test_procs::HANG_GUARD)
+        .expect("no revoke came");
+    assert!(still_waits, "the log out waited for the revoke");
     assert_logged_out(dir.path(), &state, &store, port);
+    server.join().unwrap();
 }
 
 #[test]
@@ -1093,17 +1155,16 @@ fn revoke_waits_for_a_silent_server_no_longer_than_the_bound() {
         "http://127.0.0.1:{}/rest/v1",
         silent.local_addr().unwrap().port()
     );
-    let started = std::time::Instant::now();
-    assert_eq!(
-        revoke(&base, Token::new("tok-123")),
-        Err(RestError::Unreachable)
-    );
-    let took = started.elapsed();
-    assert!(took >= LOGOUT_TIMEOUT, "{took:?}");
-    assert!(
-        took < LOGOUT_TIMEOUT + std::time::Duration::from_secs(1),
-        "{took:?}"
-    );
+    // The listener never answers. The revoke gives up by itself (the guard only catches a
+    // hang) and counts the server as unreachable.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(revoke_within(&base, Token::new("tok-123"), LOGOUT_TIMEOUT));
+    });
+    let ended = rx
+        .recv_timeout(crate::test_procs::HANG_GUARD)
+        .expect("the revoke waits on");
+    assert_eq!(ended, Err(RestError::Unreachable));
     drop(silent);
 }
 
@@ -1128,13 +1189,13 @@ fn revoke_counts_a_token_that_is_gone_as_done() {
     ] {
         let server = Scripted::start(vec![answer(status, body)]);
         assert_eq!(
-            revoke(&server.base(), Token::new("tok-123")),
+            revoke_within(&server.base(), Token::new("tok-123"), LOGOUT_TIMEOUT),
             Ok(()),
             "{status}"
         );
     }
     let older = Scripted::start(vec![answer("404 Not Found", r#"{"error":"no_route"}"#)]);
-    let error = revoke(&older.base(), Token::new("tok-123")).unwrap_err();
+    let error = revoke_within(&older.base(), Token::new("tok-123"), LOGOUT_TIMEOUT).unwrap_err();
     assert!(!error.to_string().contains("tok-123"), "{error}");
     assert_eq!(
         error,

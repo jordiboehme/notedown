@@ -86,6 +86,8 @@ export interface Status {
     facts: boolean;
     /** The server refused the OCR's token (after a password change): it must connect again. */
     tokenRefused: boolean;
+    /** An OCR pause holds: `line` says until when ("OCR paused until 14:32"), the pipeline is stopped. */
+    paused: boolean;
   };
   agents: AgentStatus[];
   attention: Attention[];

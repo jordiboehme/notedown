@@ -17,14 +17,14 @@ use crate::library::LibraryState;
 use crate::process::spawn_program;
 use crate::rest::test_http::{Act, Routed, answer, file_answer};
 use crate::serve_info::ServeInfo;
-use crate::test_procs::{gone, kill_in, left_in, tagged_sleep};
+use crate::test_procs::{HANG_GUARD, gone, kill_in, left_in, runs_in, tagged_sleep};
 use crate::token::{MemoryStore, Token, TokenStore, token_key};
 
 const ACCOUNT: &str = "jordi";
 const NOTE: &str = "NOTE/Note/Plan.note";
 const BYTES: &[u8] = b"the bytes of the note";
 /// How long a test waits for a condition before it fails.
-const WAIT: Duration = Duration::from_secs(10);
+const WAIT: Duration = HANG_GUARD;
 
 fn md5_hex(bytes: &[u8]) -> String {
     crate::login::hex(&Md5::digest(bytes))
@@ -60,11 +60,14 @@ fn bytes_of(body: &[u8]) -> Act {
     ))
 }
 
-/// The fake `notedown`: every call goes to `calls`. `render <file> ... --page N --out D`
+/// The fake `notedown`: every call goes to `calls`. `render <file> --info ...` prints the
+/// file `info` of the test folder (the pages of the note). `render <file> ... --page N --out D`
 /// writes a PNG `D/Plan-page-00N.png` that holds the page and the note's bytes, and prints its
-/// path. With `fail` it reports the page as failed; with `hold` it waits for `release` or
-/// `release-<N>` (10 s at
-/// most) before it writes; with `linger` it writes, prints and then runs this test's own sleep
+/// path. With `fork` it forks this test's own sleep without a break (each round starts one
+/// and ends the one before) and writes `forking` after the first. With `fail` it reports the
+/// page as failed; with `hold` it waits for `release` or
+/// `release-<N>` (120 s at
+/// most, a guard against a hang) before it writes; with `linger` it writes, prints and then runs this test's own sleep
 /// of the length in `linger`.
 fn sidecar(dir: &Path) -> SpawnFn {
     let d = dir.display();
@@ -75,6 +78,9 @@ fn sidecar(dir: &Path) -> SpawnFn {
 S="{s}"
 echo "$*" >> "{d}/calls"
 [ "$1" = render ] || exit 2
+for a in "$@"; do
+  if [ "$a" = --info ]; then cat "{d}/info"; exit 0; fi
+done
 file="$2"
 page=""
 out=""
@@ -90,9 +96,20 @@ if [ -f "{d}/fail" ]; then
   echo "error: page $page: the note has 1 page and pages count from 1" >&2
   exit 1
 fi
+if [ -f "{d}/fork" ]; then
+  "$S" 3231 &
+  old=$!
+  touch "{d}/forking"
+  while :; do
+    "$S" 3231 &
+    new=$!
+    kill $old 2>/dev/null
+    old=$new
+  done
+fi
 if [ -f "{d}/hold" ]; then
   i=0
-  while [ ! -f "{d}/release" ] && [ ! -f "{d}/release-$page" ] && [ "$i" -lt 1000 ]; do
+  while [ ! -f "{d}/release" ] && [ ! -f "{d}/release-$page" ] && [ "$i" -lt 12000 ]; do
     sleep 0.01; i=$((i + 1))
   done
 fi
@@ -183,7 +200,7 @@ fn setup_with_limit(routes: Vec<(String, Act)>, limit: u64) -> Setup {
     let notes = Notes::new(
         Arc::new(move || (data_dir.clone(), Some(ACCOUNT.to_owned()))),
         config_dir.path().to_path_buf(),
-        Arc::new(|| {}),
+        Arc::new(|_| {}),
     );
     fs::create_dir_all(store_dir(data.path())).unwrap();
     let review = Review::new(
@@ -346,7 +363,12 @@ fn note_open_gives_the_markdown_per_page() {
         ],
     ));
     let view = s.review.open(NOTE).unwrap();
-    assert_eq!(view.key, "F20241104");
+    assert_eq!(view.key.as_deref(), Some("F20241104"));
+    assert_eq!(
+        view.md5,
+        Some(md5_hex(BYTES)),
+        "the version the pages are of"
+    );
     assert_eq!(view.path, NOTE);
     assert_eq!(view.title, "Plan");
     assert!(!view.catching_up, "the store has the md5 of the entry");
@@ -364,8 +386,27 @@ fn note_open_gives_the_markdown_per_page() {
             (3, PageState::Truncated, "cut <script>x</script>", false),
         ]
     );
+    // Each page has its id and its blocks with their ids.
+    assert_eq!(view.pages[0].page_id, "P1");
+    assert_eq!(
+        view.pages[0].blocks,
+        vec![
+            BlockView {
+                id: "b1".to_owned(),
+                text: "# Plan".to_owned()
+            },
+            BlockView {
+                id: "b2".to_owned(),
+                text: "first line\nsecond".to_owned()
+            },
+        ]
+    );
+    assert!(view.pages[2].blocks.is_empty());
     // The answer is camelCase, as the window reads it.
     let wire = serde_json::to_value(&view).unwrap();
+    assert_eq!(wire["key"], json!("F20241104"));
+    assert_eq!(wire["pages"][1]["pageId"], json!("P2"));
+    assert_eq!(wire["pages"][1]["blocks"][0]["id"], json!("b3"));
     assert_eq!(wire["catchingUp"], json!(false));
     assert_eq!(wire["pages"][1]["landscape"], json!(true));
     assert_eq!(wire["pages"][2]["state"], json!("failed"));
@@ -387,7 +428,9 @@ fn a_note_with_pending_pages_says_so() {
     let s = setup(vec![
         // 1: the store has the version of the server, but a page waits for OCR.
         (look(NOTE), entry()),
-        // 2: every page is done, but the server has a newer version.
+        // 2: every page is done, but the server has a newer version that cannot be downloaded
+        // now (no answer for its bytes): an error, never the store's text next to the pages
+        // of another version.
         (look(NOTE), entry_of(json!(other), "file")),
         // 3: every page is done and the md5 is the same.
         (look(NOTE), entry()),
@@ -413,7 +456,10 @@ fn a_note_with_pending_pages_says_so() {
         &md5,
         vec![page("P1", 0, "done", vec![block("b1", "x")])],
     ));
-    assert!(s.review.open(NOTE).unwrap().catching_up, "a newer version");
+    let error = s.review.open(NOTE).unwrap_err();
+    assert!(!error.is_empty());
+    assert_ne!(error, crate::notes::NOTE_GONE);
+    assert!(s.calls().is_empty(), "nothing to count without the file");
     assert!(!s.review.open(NOTE).unwrap().catching_up, "all caught up");
     assert!(
         !s.review.open(NOTE).unwrap().catching_up,
@@ -632,6 +678,11 @@ fn a_killed_render_leaves_no_cache() {
             })
     };
     s.wait_until("the printed page", tmp_png);
+    // The render is past its `exec` into the sleep: a kill now cannot meet a process in the
+    // middle of an exec, whose command line `pgrep` may not read.
+    s.wait_until("the lingering render", || {
+        runs_in(s.bin.path(), "sleep 321")
+    });
     // Killed from outside: its page, printed and written, is no answer.
     kill_in(s.bin.path());
     let error = call.join().unwrap().unwrap_err();
@@ -654,6 +705,9 @@ fn a_killed_render_leaves_no_cache() {
         std::thread::spawn(move || review.page_image(NOTE, 1))
     };
     s.wait_until("the printed page", tmp_png);
+    s.wait_until("the lingering render", || {
+        runs_in(s.bin.path(), "sleep 322")
+    });
     s.review.quit();
     assert_eq!(call.join().unwrap().unwrap_err(), QUITTING);
     assert!(gone(s.bin.path()), "{}", left_in(s.bin.path()));
@@ -667,6 +721,34 @@ fn a_killed_render_leaves_no_cache() {
             format!("notes/{md5}.note"),
             "pages/".to_owned()
         ]
+    );
+}
+
+#[test]
+fn quit_leaves_nothing_of_a_render_that_keeps_forking() {
+    let s = setup(vec![
+        (look(NOTE), entry()),
+        (FILE.to_owned(), bytes_of(BYTES)),
+        (look(NOTE), entry()),
+        (look(NOTE), entry()),
+    ]);
+    s.flag("fork", "");
+    let call = {
+        let review = s.review.clone();
+        std::thread::spawn(move || review.page_image(NOTE, 0))
+    };
+    s.wait_until("the forking render", || {
+        s.bin.path().join("forking").exists()
+    });
+    s.review.quit();
+    assert_eq!(call.join().unwrap().unwrap_err(), QUITTING);
+    // The render's thread ends once its group is empty: nothing of it may be left now.
+    s.review.join();
+    assert_eq!(
+        crate::test_procs::pids_in(s.bin.path()),
+        Vec::<i32>::new(),
+        "{}",
+        left_in(s.bin.path())
     );
 }
 
@@ -885,37 +967,371 @@ fn the_render_always_has_out() {
     assert_eq!(s.calls().len(), 2);
 }
 
+const NEW: &str = "NOTE/Note/New.note";
+
+fn not_found() -> Act {
+    Act::Answer(answer(
+        "404 Not Found",
+        &json!({"error": "not_found"}).to_string(),
+    ))
+}
+
+impl Setup {
+    /// The pages the fake sidecar's `render --info` prints: `(id, landscape)` each.
+    fn info(&self, pages: &[(&str, bool)]) {
+        let pages: Vec<Value> = pages
+            .iter()
+            .map(|(id, landscape)| json!({"id": id, "landscape": landscape}))
+            .collect();
+        self.flag("info", &format!("{}\n", json!({ "pages": pages })));
+    }
+
+    /// The `render --info` calls of the fake sidecar.
+    fn info_calls(&self) -> Vec<String> {
+        self.calls()
+            .into_iter()
+            .filter(|c| c.contains("--info"))
+            .collect()
+    }
+
+    /// The downloads since the last look at the server's requests.
+    fn downloads(&self) -> usize {
+        self.server
+            .received()
+            .iter()
+            .filter(|r| r.target.contains("/files/"))
+            .count()
+    }
+}
+
+fn rows(view: &NoteView) -> Vec<(&str, PageState, &str, bool)> {
+    view.pages
+        .iter()
+        .map(|p| {
+            (
+                p.page_id.as_str(),
+                p.state,
+                p.markdown.as_str(),
+                p.landscape,
+            )
+        })
+        .collect()
+}
+
 #[test]
-fn a_note_not_in_the_store_is_not_ready_or_gone() {
-    let (new, gone, folder) = (
-        "NOTE/Note/New.note",
-        "NOTE/Note/Gone.note",
-        "NOTE/Note/Folder",
-    );
-    let not_found = || {
-        Act::Answer(answer(
-            "404 Not Found",
-            &json!({"error": "not_found"}).to_string(),
-        ))
-    };
+fn a_note_the_store_does_not_know_opens_with_all_its_pages() {
     let s = setup(vec![
-        (look(new), entry()),
-        (look(gone), not_found()),
-        (look(folder), entry_of(json!(null), "folder")),
-        (look(new), entry()),
-        (look(gone), not_found()),
+        (look(NEW), entry()),
+        (FILE.to_owned(), bytes_of(BYTES)),
     ]);
-    // A file the pipeline has not read yet.
-    assert_eq!(s.review.open(new).unwrap_err(), NOT_READY);
-    assert_eq!(s.review.open(gone).unwrap_err(), crate::notes::NOTE_GONE);
-    assert_eq!(s.review.open(folder).unwrap_err(), crate::notes::NOTE_GONE);
-    // Its pages are not asked for either: the store knows no page count.
-    assert_eq!(s.review.page_image(new, 0).unwrap_err(), NOT_READY);
+    s.info(&[("X", false), ("Y", true), ("Z", false)]);
+    let view = s.review.open(NEW).unwrap();
+    assert_eq!(view.key, None);
+    assert_eq!(view.md5, Some(md5_hex(BYTES)));
+    assert_eq!(view.path, NEW);
+    assert_eq!(view.title, "New");
+    assert!(view.catching_up);
     assert_eq!(
-        s.review.page_image(gone, 0).unwrap_err(),
+        rows(&view),
+        vec![
+            ("X", PageState::Pending, "", false),
+            ("Y", PageState::Pending, "", true),
+            ("Z", PageState::Pending, "", false),
+        ]
+    );
+    assert!(view.pages.iter().all(|p| p.blocks.is_empty()));
+    assert_eq!(
+        view.pages.iter().map(|p| p.index).collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    assert_eq!(serde_json::to_value(&view).unwrap()["key"], Value::Null);
+    // One count of the cached note by its absolute path, read-only.
+    let note = s
+        .cache()
+        .join("notes")
+        .join(format!("{}.note", md5_hex(BYTES)));
+    let calls = s.calls();
+    assert_eq!(
+        calls,
+        vec![format!(
+            "render {} --info --allow-unknown-version",
+            note.display()
+        )]
+    );
+    assert_eq!(fs::read(&note).unwrap(), BYTES);
+}
+
+#[test]
+fn a_page_image_of_an_unread_note_is_rendered() {
+    let s = setup(vec![
+        (look(NEW), entry()),
+        (FILE.to_owned(), bytes_of(BYTES)),
+        (look(NEW), entry()),
+    ]);
+    s.info(&[("X", false), ("Y", false), ("Z", false)]);
+    s.review.open(NEW).unwrap();
+    assert_eq!(
+        s.review.page_image(NEW, 2).unwrap(),
+        data_url(&png_of(3, BYTES))
+    );
+    assert_eq!(s.downloads(), 1, "the note is downloaded once");
+    // Past the pages of the last open: no request, no render.
+    assert_eq!(s.review.page_image(NEW, 3).unwrap_err(), NO_SUCH_PAGE);
+    assert!(s.server.received().is_empty());
+    assert_eq!(s.info_calls().len(), 1);
+    assert_eq!(s.calls().len(), 2, "{:?}", s.calls());
+}
+
+/// A page asked for of a note that was never opened and the store does not know: its pages
+/// are counted as `note_open` counts them, once per md5.
+#[test]
+fn a_page_image_of_a_never_opened_note_counts_its_pages() {
+    let s = setup(vec![
+        (look(NEW), entry()),
+        (FILE.to_owned(), bytes_of(BYTES)),
+        (look(NEW), entry()),
+    ]);
+    s.info(&[("X", false), ("Y", false), ("Z", false)]);
+    assert_eq!(s.review.page_image(NEW, 3).unwrap_err(), NO_SUCH_PAGE);
+    assert_eq!(s.info_calls().len(), 1);
+    assert_eq!(s.calls().len(), 1, "no render past the end");
+    assert_eq!(
+        s.review.page_image(NEW, 2).unwrap(),
+        data_url(&png_of(3, BYTES))
+    );
+    assert_eq!(s.info_calls().len(), 1, "the count is kept by md5");
+    assert_eq!(s.downloads(), 1);
+}
+
+#[test]
+fn store_text_follows_the_page_id_when_the_file_is_newer() {
+    let s = setup(vec![
+        (look(NOTE), entry()),
+        (FILE.to_owned(), bytes_of(BYTES)),
+        (look(NOTE), entry()),
+    ]);
+    // The store read an older version; a page was inserted at the front since.
+    s.store(&stored(
+        &md5_hex(b"the old bytes"),
+        vec![
+            page("A", 0, "done", vec![block("a1", "a")]),
+            page("B", 1, "done", vec![block("b1", "b")]),
+        ],
+    ));
+    s.info(&[("X", false), ("A", false), ("B", true)]);
+    let view = s.review.open(NOTE).unwrap();
+    assert_eq!(view.key.as_deref(), Some("F20241104"));
+    assert_eq!(
+        view.md5,
+        Some(md5_hex(BYTES)),
+        "the file's version, not the store's"
+    );
+    assert!(view.catching_up);
+    assert_eq!(
+        rows(&view),
+        vec![
+            ("X", PageState::Pending, "", false),
+            ("A", PageState::Done, "a", false),
+            ("B", PageState::Done, "b", true),
+        ]
+    );
+    assert_eq!(view.pages[1].blocks[0].id, "a1");
+    assert_eq!(s.info_calls().len(), 1);
+    // The page guard follows the open, not the store's two pages.
+    assert_eq!(
+        s.review.page_image(NOTE, 2).unwrap(),
+        data_url(&png_of(3, BYTES))
+    );
+    assert_eq!(s.downloads(), 1);
+}
+
+/// The store read an older version and the newer file cannot be read now: the open fails (the
+/// user sees why and tries again). Store text never stands next to images of a file whose
+/// pages were not matched to it.
+#[test]
+fn a_newer_file_that_cannot_be_read_is_an_error_and_can_be_tried_again() {
+    let s = setup(vec![
+        (look(NOTE), entry()),
+        (
+            FILE.to_owned(),
+            Act::Answer(answer("500 Internal Server Error", "{}")),
+        ),
+        (look(NOTE), entry()),
+        (FILE.to_owned(), bytes_of(BYTES)),
+    ]);
+    s.store(&stored(
+        &md5_hex(b"the old bytes"),
+        vec![
+            page("A", 0, "done", vec![block("a1", "a")]),
+            page("B", 1, "done", vec![block("b1", "b")]),
+        ],
+    ));
+    s.info(&[("X", false), ("A", false), ("B", false)]);
+    let error = s.review.open(NOTE).unwrap_err();
+    assert!(!error.is_empty());
+    assert_ne!(error, crate::notes::NOTE_GONE);
+    assert!(s.info_calls().is_empty());
+    // Tried again, the file decides and the text follows the page ids.
+    let view = s.review.open(NOTE).unwrap();
+    assert_eq!(
+        rows(&view),
+        vec![
+            ("X", PageState::Pending, "", false),
+            ("A", PageState::Done, "a", false),
+            ("B", PageState::Done, "b", false),
+        ]
+    );
+}
+
+#[test]
+fn a_closed_review_forgets_its_page_count() {
+    let s = setup(vec![
+        (look(NOTE), entry()),
+        (FILE.to_owned(), bytes_of(BYTES)),
+    ]);
+    s.store(&stored(
+        &md5_hex(b"the old bytes"),
+        vec![page("A", 0, "done", vec![]), page("B", 1, "done", vec![])],
+    ));
+    s.info(&[("X", false), ("A", false), ("B", false)]);
+    assert_eq!(s.review.open(NOTE).unwrap().pages.len(), 3);
+    assert_eq!(lock(&s.review.inner.opened).len(), 1);
+    s.review.close(NOTE);
+    // Without an open the index decides again: the store has two pages.
+    assert_eq!(s.review.page_image(NOTE, 2).unwrap_err(), NO_SUCH_PAGE);
+    assert!(lock(&s.review.inner.opened).is_empty());
+    // Hiding the window keeps the counts: its reviews ask for their pages again on a show.
+    lock(&s.review.inner.opened).insert(OTHER.to_owned(), 1);
+    s.review.close_all();
+    assert_eq!(lock(&s.review.inner.opened).len(), 1);
+}
+
+#[test]
+fn the_page_lists_of_files_are_kept_up_to_a_limit() {
+    let s = setup(vec![]);
+    let pages = Arc::new(Vec::new());
+    for n in 0..INFOS_KEPT + 10 {
+        s.review.inner.keep_info(format!("{n:032x}"), pages.clone());
+    }
+    let infos = lock(&s.review.inner.infos);
+    assert_eq!(infos.len(), INFOS_KEPT);
+    assert!(
+        infos.contains_key(&format!("{:032x}", INFOS_KEPT + 9)),
+        "the newest stays"
+    );
+}
+
+#[test]
+fn a_note_in_the_store_at_the_same_md5_needs_no_download() {
+    let s = setup(vec![(look(NOTE), entry())]);
+    s.info(&[("X", false)]);
+    let view = s.review.open(NOTE).unwrap();
+    assert_eq!(view.pages.len(), 12);
+    assert_eq!(view.pages[3].page_id, "P3");
+    assert!(s.info_calls().is_empty(), "{:?}", s.calls());
+    assert_eq!(s.downloads(), 0);
+}
+
+#[test]
+fn a_gone_note_says_so() {
+    let folder = "NOTE/Note/Folder";
+    let s = setup(vec![
+        (look(NEW), not_found()),
+        (look(folder), entry_of(json!(null), "folder")),
+        (look(NEW), not_found()),
+        (look(NOTE), not_found()),
+        (
+            look(NEW),
+            Act::Answer(answer("500 Internal Server Error", "{}")),
+        ),
+    ]);
+    assert_eq!(s.review.open(NEW).unwrap_err(), crate::notes::NOTE_GONE);
+    assert_eq!(s.review.open(folder).unwrap_err(), crate::notes::NOTE_GONE);
+    assert_eq!(
+        s.review.page_image(NEW, 0).unwrap_err(),
         crate::notes::NOTE_GONE
     );
+    // The store still has its text, but the server has no file there anymore.
+    assert_eq!(s.review.open(NOTE).unwrap_err(), crate::notes::NOTE_GONE);
+    // Another answer of the server says what went wrong.
+    let error = s.review.open(NEW).unwrap_err();
+    assert_ne!(error, crate::notes::NOTE_GONE);
+    assert!(!error.is_empty());
     assert!(s.calls().is_empty());
+    assert_eq!(s.downloads(), 0);
+}
+
+#[test]
+fn a_close_during_the_download_of_an_open_ends_it() {
+    let (arrived, downloading) = std::sync::mpsc::channel();
+    let (go, held) = std::sync::mpsc::channel();
+    let file = String::from_utf8(file_answer(
+        "200 OK",
+        &[("etag", &format!("\"{}\"", md5_hex(BYTES)))],
+        BYTES,
+    ))
+    .unwrap();
+    let s = setup(vec![
+        (look(NEW), entry()),
+        (
+            FILE.to_owned(),
+            Act::Hold {
+                answer: file,
+                arrived,
+                go: held,
+            },
+        ),
+    ]);
+    s.info(&[("X", false)]);
+    let open = {
+        let review = s.review.clone();
+        std::thread::spawn(move || review.open(NEW))
+    };
+    downloading.recv_timeout(WAIT).unwrap();
+    // Another review closing is no reason to stop it.
+    s.review.close(OTHER);
+    s.review.close(NEW);
+    assert_eq!(open.join().unwrap().unwrap_err(), REVIEW_CLOSED);
+    go.send(()).unwrap();
+    assert!(s.calls().is_empty(), "nothing is counted");
+    assert!(
+        s.cached().iter().all(|f| !f.ends_with(".part")),
+        "{:?}",
+        s.cached()
+    );
+}
+
+#[test]
+fn closing_every_review_ends_the_download_of_an_open() {
+    let (arrived, downloading) = std::sync::mpsc::channel();
+    let (go, held) = std::sync::mpsc::channel();
+    let file = String::from_utf8(file_answer(
+        "200 OK",
+        &[("etag", &format!("\"{}\"", md5_hex(BYTES)))],
+        BYTES,
+    ))
+    .unwrap();
+    let s = setup(vec![
+        (look(NEW), entry()),
+        (
+            FILE.to_owned(),
+            Act::Hold {
+                answer: file,
+                arrived,
+                go: held,
+            },
+        ),
+    ]);
+    let open = {
+        let review = s.review.clone();
+        std::thread::spawn(move || review.open(NEW))
+    };
+    downloading.recv_timeout(WAIT).unwrap();
+    s.review.close_all();
+    assert_eq!(open.join().unwrap().unwrap_err(), REVIEW_CLOSED);
+    go.send(()).unwrap();
+    s.review.quit();
+    assert_eq!(s.review.open(NEW).unwrap_err(), QUITTING);
 }
 
 #[test]

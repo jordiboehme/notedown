@@ -340,6 +340,10 @@ pub fn hide_window(app: &AppHandle, kind: WindowKind) {
         let _ = window.hide();
     }
     let visible = app.state::<Shown>().set(kind, false);
+    if kind == WindowKind::Library {
+        // A hidden library is not in front, whatever focus event comes or not.
+        crate::save_markdown::library_focused(app, false);
+    }
     apply_policy(app, &visible);
     tell_poller(app, false);
     tell_library(app, kind, false);
@@ -477,6 +481,10 @@ pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
                 library.dropped(paths.clone(), x, y);
             }
         }
+        // Save Markdown in the File menu follows whether the library is in front.
+        WindowEvent::Focused(front) if kind == WindowKind::Library => {
+            crate::save_markdown::library_focused(app, *front);
+        }
         WindowEvent::Focused(false) if kind == WindowKind::Panel => {
             let shown = app.state::<Shown>();
             if shown.is_visible(WindowKind::Panel) {
@@ -520,7 +528,6 @@ mod tests {
     fn the_poller_gets_the_visibility_of_the_moment_in_order() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Mutex, mpsc};
-        use std::time::Duration;
 
         let visible = Arc::new(AtomicBool::new(true));
         let applied = Arc::new(Mutex::new(Vec::new()));
@@ -542,11 +549,11 @@ mod tests {
         );
         // The panel opens, then a blur hides it before the first call is through.
         tx.send(true).unwrap();
-        seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        seen_rx.recv_timeout(crate::test_procs::HANG_GUARD).unwrap();
         visible.store(false, Ordering::SeqCst);
         tx.send(false).unwrap();
         gate_tx.send(()).unwrap();
-        seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        seen_rx.recv_timeout(crate::test_procs::HANG_GUARD).unwrap();
         assert_eq!(*applied.lock().unwrap(), vec![(true, true), (false, false)]);
     }
 

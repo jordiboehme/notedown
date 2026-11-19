@@ -127,6 +127,37 @@ enum PipelineAction {
         #[arg(long)]
         account: Option<String>,
     },
+    /// Print the text blocks that hold every word of --query as one JSON array: per block its
+    /// anchor, note title, page and one line of context. Words are runs of letters and digits,
+    /// compared case-insensitive. Creates and changes nothing
+    Search {
+        /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
+        #[arg(long, value_name = "DIR")]
+        data: Option<PathBuf>,
+        /// The account slug (can be left out when the data folder has only one account)
+        #[arg(long)]
+        account: Option<String>,
+        /// The words to find. Give a text that starts with `-` as --query=TEXT
+        #[arg(long, value_name = "TEXT")]
+        query: String,
+        /// The most blocks to print
+        #[arg(long, value_name = "N", default_value_t = notedown_pipeline::search::DEFAULT_LIMIT)]
+        limit: usize,
+    },
+    /// Print the Markdown of one note: the same text as its file in the Markdown folder and
+    /// get_note of the MCP server, with every page (a page without text has its heading only).
+    /// Creates and changes nothing
+    Note {
+        /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
+        #[arg(long, value_name = "DIR")]
+        data: Option<PathBuf>,
+        /// The account slug (can be left out when the data folder has only one account)
+        #[arg(long)]
+        account: Option<String>,
+        /// The note key
+        #[arg(long, value_name = "KEY")]
+        key: String,
+    },
     /// Move the bookmark of a consumer to --up-to, never backwards, and print it as JSON
     Ack {
         /// The data folder (default: $NOTEDOWN_DATA, else ~/notedown-data)
@@ -557,6 +588,9 @@ struct RenderArgs {
     /// reported on stderr and the others still run
     #[arg(long, value_name = "N", conflicts_with = "pdf")]
     page: Vec<usize>,
+    /// Print the pages as one JSON line ({"pages":[{"id":..,"landscape":..}]}) and write no file
+    #[arg(long, conflicts_with_all = ["pdf", "page", "out", "keep_template"])]
+    info: bool,
     /// Accept .note files with an unknown format version
     #[arg(long)]
     allow_unknown_version: bool,
@@ -747,6 +781,17 @@ fn render(args: RenderArgs) -> Result<ExitCode> {
     };
     let nb = Notebook::open(&args.file, policy)
         .with_context(|| format!("cannot read {}", args.file.display()))?;
+    if args.info {
+        let pages: Vec<serde_json::Value> = notedown_cloud::pages::fingerprint::page_ids(&nb)
+            .into_iter()
+            .zip(&nb.pages)
+            .map(|(id, page)| serde_json::json!({"id": id, "landscape": page.landscape}))
+            .collect();
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "{}", serde_json::json!({ "pages": pages }))?;
+        out.flush()?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let dir = match &args.out {
         Some(d) => d.clone(),
         None => args
@@ -2584,6 +2629,30 @@ fn pipeline_action(action: PipelineAction) -> Result<ExitCode> {
                 .map_or(0, |d| d.as_millis() as u64);
             let facts = notedown_pipeline::status::status_facts(&data, &slug, now)?;
             println!("{}", to_json(&facts));
+        }
+        PipelineAction::Search {
+            data,
+            account,
+            query,
+            limit,
+        } => {
+            let data = data_dir(data)?;
+            let slug = resolve_account(&data, account.as_deref())?;
+            // `at` reads the store where it is and creates nothing: no store gives no hits.
+            let store = TextStore::at(&data, &slug)?;
+            let hits = notedown_pipeline::search::search(&store, &slug, &query, limit)?;
+            println!("{}", to_json(&hits));
+        }
+        PipelineAction::Note { data, account, key } => {
+            let data = data_dir(data)?;
+            let slug = resolve_account(&data, account.as_deref())?;
+            // `at` reads the store where it is and creates nothing.
+            let store = TextStore::at(&data, &slug)?;
+            let note = store
+                .note(&key)?
+                .filter(|note| !note.deleted)
+                .ok_or_else(|| anyhow!("no note {key}"))?;
+            print!("{}", notedown_pipeline::format::note_document(&note, &slug));
         }
         PipelineAction::Ack {
             data,

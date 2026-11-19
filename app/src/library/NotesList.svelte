@@ -1,18 +1,33 @@
 <script lang="ts">
   import type { NoteSummary } from "../lib/library-types";
   import VirtualRows from "./VirtualRows.svelte";
+  import { noteMenu } from "./review";
   import { dateText, folderLabel } from "./view";
 
-  // New notes or all notes as rows; a click opens the review of the note. Titles are text.
+  // New notes or all notes as rows; a click opens the review of the note and a right click
+  // its context menu (Rust's). Titles are text.
   let {
     title,
     notes,
     empty,
     onOpen,
-  }: { title: string; notes: NoteSummary[] | null; empty: string; onOpen: (note: NoteSummary) => void } = $props();
+    onMarkAllSeen,
+  }: {
+    title: string;
+    notes: NoteSummary[] | null;
+    empty: string;
+    onOpen: (note: NoteSummary) => void;
+    /** Given only for the New list: it shows the Mark All as Seen button. */
+    onMarkAllSeen?: () => void;
+  } = $props();
 </script>
 
-<h1 class="title">{title}</h1>
+<div class="head">
+  <h1 class="title">{title}</h1>
+  {#if onMarkAllSeen}
+    <button type="button" class="mark" disabled={!notes?.length} onclick={onMarkAllSeen}>Mark All as Seen</button>
+  {/if}
+</div>
 
 <div class="heads" role="presentation">
   <span>Name</span><span>Folder</span><span class="pages">Pages</span><span>Changed</span>
@@ -25,7 +40,7 @@
 {:else}
   <VirtualRows items={notes} rowHeight={24} key={(note: NoteSummary) => note.key} label={title}>
     {#snippet row(note: NoteSummary)}
-      <button type="button" class="row" onclick={() => onOpen(note)}>
+      <button type="button" class="row" onclick={() => onOpen(note)} oncontextmenu={(event) => noteMenu(event, note.path)}>
         <span class="text">{note.title}</span>
         <span class="text muted">{folderLabel(note.path)}</span>
         <span class="pages muted">{note.pages}</span>
@@ -36,13 +51,27 @@
 {/if}
 
 <style>
-  .title {
+  .head {
     flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 0 14px 0 0;
+    border-bottom: 1px solid var(--separator);
+  }
+
+  .title {
     margin: 0;
     padding: 8px 14px;
     font-size: 13px;
     font-weight: 600;
-    border-bottom: 1px solid var(--separator);
+  }
+
+  .mark {
+    font: inherit;
+    font-size: 12px;
+    padding: 2px 10px;
   }
 
   .heads,

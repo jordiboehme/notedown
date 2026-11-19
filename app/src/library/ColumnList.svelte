@@ -4,6 +4,7 @@
   import NameField from "./NameField.svelte";
   import VirtualRows from "./VirtualRows.svelte";
   import { opensReview } from "./actions";
+  import { noteMenu } from "./review";
   import { drag, pressOn } from "./drag.svelte";
   import { needsNextPage, type Column, type ColumnRow, type Range } from "./view";
 
@@ -83,6 +84,7 @@
             aria-current={entry.selected ? "true" : undefined}
             onclick={() => onSelect(entry.path, entry.kind)}
             ondblclick={() => opensReview(entry) && onOpenNote(entry.path)}
+            oncontextmenu={(event) => opensReview(entry) && noteMenu(event, entry.path)}
             onpointerdown={(event) => entry.entry && pressOn(entry.entry, event)}
           >
             {@render icon()}

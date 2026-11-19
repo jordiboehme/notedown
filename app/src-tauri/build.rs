@@ -48,13 +48,19 @@ const COMMANDS: &[&str] = &[
     "library_cancel_drop",
     "library_download",
     "library_reveal",
+    "library_find",
     "notes_new",
     "notes_all",
     "note_seen",
+    "notes_seen_all",
+    "notes_search",
+    "library_menu",
     "note_open",
     "note_page_image",
     "note_close",
     "note_page_drop",
+    "note_save_markdown",
+    "review_shown",
     "markdown_dir",
     "set_markdown_dir",
     "show_markdown_dir",
@@ -79,6 +85,7 @@ const COMMANDS: &[&str] = &[
     "update_state",
     "check_for_update",
     "install_update_and_restart",
+    "ocr_resume",
 ];
 
 fn main() {

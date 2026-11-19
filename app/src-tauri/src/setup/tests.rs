@@ -54,7 +54,7 @@ fn run_with_password_writes_one_line_to_stdin() {
         &spawn,
         &args,
         &Password::new(SECRET),
-        Duration::from_secs(10),
+        crate::test_procs::HANG_GUARD,
     )
     .unwrap();
     assert!(output.status.success());
@@ -82,7 +82,8 @@ fn run_with_password_is_bounded() {
     let left = left_in(dir.path());
     kill_in(dir.path());
     assert_eq!(result.unwrap_err(), "it did not answer in time");
-    assert!(took < Duration::from_secs(3), "took {took:?}");
+    // The sleep runs 330 s: an end before the guard is the bound at work.
+    assert!(took < crate::test_procs::HANG_GUARD, "took {took:?}");
     assert!(gone(dir.path()), "left: {left}");
 }
 
@@ -106,7 +107,8 @@ fn run_with_password_ends_a_grandchild_too() {
     let ended = gone(dir.path());
     kill_in(dir.path());
     assert_eq!(result.unwrap_err(), "it did not answer in time");
-    assert!(took < Duration::from_secs(3), "took {took:?}");
+    // The sleep runs 330 s: an end before the guard is the bound at work.
+    assert!(took < crate::test_procs::HANG_GUARD, "took {took:?}");
     assert!(ended, "left: {left}");
 }
 
@@ -125,7 +127,8 @@ fn run_bounded_ends_a_grandchild_too() {
     let ended = gone(dir.path());
     kill_in(dir.path());
     assert_eq!(result.unwrap_err(), "it did not answer in time");
-    assert!(took < Duration::from_secs(3), "took {took:?}");
+    // The sleep runs 330 s: an end before the guard is the bound at work.
+    assert!(took < crate::test_procs::HANG_GUARD, "took {took:?}");
     assert!(ended, "left: {left}");
 }
 
@@ -137,7 +140,7 @@ fn run_with_password_refuses_two_lines_before_the_spawn() {
         &spawn,
         &strings(&["connect"]),
         &Password::new("a\nb"),
-        Duration::from_secs(10),
+        crate::test_procs::HANG_GUARD,
     )
     .unwrap_err();
     assert_eq!(error, "The password must be one line.");

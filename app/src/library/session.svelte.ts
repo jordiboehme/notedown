@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { NoteView } from "../lib/library-types";
-import { nearPages } from "./review";
+import { canSaveMarkdown, findBlock, nearPages, reviewPages, type BlockAt } from "./review";
 
 /** The image of a page: asked for, shown (a data URL), or why there is none. */
 export type PageImage = { state: "loading" } | { state: "shown"; url: string } | { state: "failed"; text: string };
@@ -14,42 +14,143 @@ function text(error: unknown): string {
   return typeof error === "string" ? error : error instanceof Error ? error.message : String(error);
 }
 
+/** The start of the line above a view whose reload failed. */
+const STALE = "This view is not up to date.";
+
+/** The text of a note, page by page: a reload that changes it brought new text. */
+function textOf(view: NoteView): string {
+  return JSON.stringify(view.pages.map((page) => [page.pageId, page.markdown]));
+}
+
 /**
  * One review of the note at `path`: its text from `note_open`, and the images of the pages
  * near the view. The window tells it which pages are in view (`seen`); it asks Rust for the
- * near ones and drops the far ones. `close` ends it in Rust (`note_close`).
+ * near ones and drops the far ones. `reload` reads the note again when the store changed.
+ * `close` ends it in Rust (`note_close`).
  */
 export class ReviewSession {
   readonly path: string;
   view = $state<NoteView | null>(null);
   error = $state<string | null>(null);
+  /**
+   * Why the last reload failed while the old view stays (a gone note says so); null after a
+   * reload that worked.
+   */
+  stale = $state<string | null>(null);
   /** The images by page index; a page without one shows its placeholder. */
   images = $state<Record<number, PageImage>>({});
   /** Width by height of the images loaded so far, by page index; kept after a drop. */
   ratios = $state<Record<number, number>>({});
+  /** The page shown alone in the large view; null while there is none. */
+  focused = $state<number | null>(null);
+  /**
+   * Where the text side scrolls to once: the block of a search hit (`blockId` null when only
+   * its page is left), set by the first read that works. The window sets it back to null.
+   */
+  target = $state<{ index: number; blockId: string | null } | null>(null);
 
   #visible = new Set<number>();
+  /** The `note_open` that runs, and whether another one was asked for meanwhile. */
+  #loading: Promise<void> | null = null;
+  #again = false;
   /** Counts the asks of each page: an answer of an older ask (dropped since) is not shown. */
   #asks = new Map<number, number>();
   #closed = false;
+  /** A search lies over the review: the File menu has no note to save then. */
+  #covered = false;
+  /** What Rust was told last (`review_shown`): at the start, no note. */
+  #told: { path: string | null; canSave: boolean } = { path: null, canSave: false };
 
-  constructor(path: string) {
+  /** The block the review opens at; used by the first read that works, then gone. */
+  #at: BlockAt | null;
+
+  constructor(path: string, at: BlockAt | null = null) {
     this.path = path;
+    this.#at = at;
   }
 
-  /** Reads the note; opening it marks its text seen. */
-  async open(): Promise<void> {
+  /** Reads the note; opening it marks its text seen (when the store knows the note). */
+  open(): Promise<void> {
+    return this.#load();
+  }
+
+  /**
+   * Reads the note again (the store changed): the new view replaces the old one. Images stay
+   * for the pages whose page id at their index is the same; the others go. New text is marked
+   * seen. On an error the old view stays. A reload asked for while one runs gives one more
+   * after it, never two at once, so an older answer never replaces a newer one.
+   */
+  reload(): Promise<void> {
+    return this.#load();
+  }
+
+  #load(): Promise<void> {
+    if (this.#closed) return Promise.resolve();
+    if (this.#loading) {
+      this.#again = true;
+      return this.#loading;
+    }
+    this.#loading = (async () => {
+      try {
+        do {
+          this.#again = false;
+          await this.#read();
+        } while (this.#again && !this.#closed);
+      } finally {
+        this.#loading = null;
+      }
+    })();
+    return this.#loading;
+  }
+
+  async #read(): Promise<void> {
+    let view: NoteView;
     try {
-      const view = await invoke<NoteView>("note_open", { path: this.path });
+      view = await invoke<NoteView>("note_open", { path: this.path });
+    } catch (error) {
       if (this.#closed) return;
-      this.view = view;
-      this.error = null;
+      const why = text(error);
+      // A reload that fails keeps what is shown and says why above it.
+      if (!this.view) this.error = why;
+      else if (!ENDED.has(why)) this.stale = `${STALE} ${why}`;
+      return;
+    }
+    if (this.#closed) return;
+    const old = this.view;
+    this.view = view;
+    this.error = null;
+    this.stale = null;
+    if (old) this.#keepImages(old, view);
+    if (this.#at) {
+      this.target = findBlock(reviewPages(view), this.#at);
+      this.#at = null;
+    }
+    // A page shown alone that is not in the note anymore: its last page, or no view.
+    if (this.focused !== null && this.focused >= view.pages.length) {
+      this.focused = view.pages.length > 0 ? view.pages.length - 1 : null;
+    }
+    if (view.key !== null && (old === null || old.key === null || textOf(old) !== textOf(view))) {
       invoke("note_seen", { key: view.key }).catch((error: unknown) =>
         console.error("notedown: note_seen failed", error),
       );
-      this.#update();
-    } catch (error) {
-      if (!this.#closed) this.error = text(error);
+    }
+    this.#tellMenu();
+    this.#update();
+  }
+
+  /**
+   * Drops the images (and ratios) of the indexes whose page is another one now, or gone. When
+   * the file is another version (its md5 changed), every image goes: the strokes may differ.
+   * The ratio of a page that stayed is kept.
+   */
+  #keepImages(old: NoteView, view: NoteView) {
+    const newFile = old.md5 !== view.md5;
+    const indexes = new Set([...Object.keys(this.images), ...Object.keys(this.ratios)].map(Number));
+    for (const index of indexes) {
+      const samePage = old.pages[index]?.pageId === view.pages[index]?.pageId;
+      if (samePage && !newFile) continue;
+      if (this.images[index] !== undefined) this.#drop(index);
+      if (!samePage) delete this.ratios[index];
     }
   }
 
@@ -70,14 +171,39 @@ export class ReviewSession {
     this.#update();
   }
 
+  /**
+   * Page `index` is shown alone in the large view (kept within the note); null ends the view.
+   * While it is shown, it counts as the page in view: its image and its neighbours are asked
+   * for, and the pages far from it are dropped.
+   */
+  focus(index: number | null) {
+    if (this.#closed) return;
+    const count = this.view?.pages.length ?? 0;
+    this.focused = index === null || count === 0 ? null : Math.min(count - 1, Math.max(0, index));
+    this.#update();
+  }
+
   /** The image of page `index` loaded with this size: its placeholder keeps the ratio. */
   measured(index: number, width: number, height: number) {
     if (width > 0 && height > 0) this.ratios[index] = width / height;
   }
 
-  /** The window shows again: hiding it closed the review in Rust, so near pages are asked again. */
+  /**
+   * The window shows again or gets the focus: hiding it closed the review in Rust, so near
+   * pages are asked again. A failed open or reload is tried again.
+   */
   refresh() {
+    if (this.error !== null || this.stale !== null) void this.reload();
     this.#update();
+  }
+
+  /**
+   * A search lies over the review (`covered`) or went away. While it covers the review, the
+   * note is not seen, so the File menu's Save Markdown... has nothing to save.
+   */
+  cover(covered: boolean) {
+    this.#covered = covered;
+    this.#tellMenu();
   }
 
   /** The review ends: its calls in Rust end, later answers are not shown. */
@@ -86,14 +212,41 @@ export class ReviewSession {
     this.#closed = true;
     this.#asks.clear();
     this.images = {};
+    this.#tellShown(null, false);
     invoke("note_close", { path: this.path }).catch((error: unknown) =>
       console.error("notedown: note_close failed", error),
     );
   }
 
+  /**
+   * Rust's File menu saves the note the review shows, once it has text and while no search
+   * covers it. Tells Rust only a change.
+   */
+  #tellMenu() {
+    if (this.#closed || !this.view) return;
+    const shown = !this.#covered;
+    const path = shown ? this.path : null;
+    const canSave = shown && canSaveMarkdown(this.view);
+    if (this.#told.path === path && this.#told.canSave === canSave) return;
+    this.#tellShown(path, canSave);
+  }
+
+  /** Tells Rust which note the review shows and whether it can be saved (the File menu). */
+  #tellShown(path: string | null, canSave: boolean) {
+    this.#told = { path, canSave };
+    invoke("review_shown", { path, canSave }).catch((error: unknown) =>
+      console.error("notedown: review_shown failed", error),
+    );
+  }
+
+  /** The pages in view: the page shown alone, else those of the pages side. */
+  #shown(): Iterable<number> {
+    return this.focused !== null ? [this.focused] : this.#visible;
+  }
+
   #update() {
     if (this.#closed || !this.view) return;
-    const pages = nearPages(this.#visible, this.view.pages.length);
+    const pages = nearPages(this.#shown(), this.view.pages.length);
     if (!pages) return;
     const [keepFrom, keepTo] = pages.keep;
     for (const key of Object.keys(this.images)) {
@@ -101,13 +254,16 @@ export class ReviewSession {
       if (index >= keepFrom && index <= keepTo) continue;
       this.#drop(index);
     }
+    // While the view is not up to date, a new image could be of a file its text does not
+    // match: the pages wait for the next reload that works.
+    if (this.stale !== null) return;
     for (let index = pages.near[0]; index <= pages.near[1]; index++) {
       if (this.images[index] === undefined) this.#ask(index);
     }
   }
 
   #near(index: number): boolean {
-    const pages = this.view ? nearPages(this.#visible, this.view.pages.length) : null;
+    const pages = this.view ? nearPages(this.#shown(), this.view.pages.length) : null;
     return pages !== null && index >= pages.near[0] && index <= pages.near[1];
   }
 

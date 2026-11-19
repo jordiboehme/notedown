@@ -1,11 +1,23 @@
 <script lang="ts">
+  import SearchField from "./SearchField.svelte";
+  import type { LibrarySearch } from "./search.svelte";
   import { viewButtons, type LibraryView } from "./view";
 
   // The toolbar of the library window: the view button switches the folders between a tree in
-  // the sidebar and columns.
-  let { view, onView }: { view: LibraryView; onView: (view: LibraryView) => void } = $props();
+  // the sidebar and columns, and the search field searches the library.
+  let {
+    view,
+    onView,
+    search,
+  }: { view: LibraryView; onView: (view: LibraryView) => void; search: LibrarySearch } = $props();
 
   const buttons = $derived(viewButtons(view));
+  let field: SearchField | undefined = $state();
+
+  /** Cmd+F. */
+  export function focusSearch() {
+    field?.focus();
+  }
 </script>
 
 <div class="toolbar">
@@ -16,6 +28,7 @@
       </button>
     {/each}
   </div>
+  <SearchField bind:this={field} {search} />
 </div>
 
 <style>
@@ -23,6 +36,8 @@
     flex: none;
     display: flex;
     justify-content: flex-end;
+    align-items: center;
+    gap: 10px;
     padding: 4px 10px;
     border-bottom: 1px solid var(--separator);
   }

@@ -5,18 +5,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::Serialize;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::config::{self, AppConfig, Mode, NotificationChoices, StartView};
 use crate::import_job::{self, BackupFolder, ImportJobs, JobKind};
-use crate::library::{Choice, Entry, Job, Key, Library, Listed, RecyclePage, StateView, UploadAsk};
+use crate::library::{
+    Choice, Entry, Found, Job, Key, Library, Listed, RecyclePage, StateView, UploadAsk,
+};
 use crate::login::{self, LoginError, LoginGate, Password};
 use crate::model::{ModelControl, ModelState};
 use crate::notes::{NoteSummary, Notes};
 use crate::notify::deliver::{Authorization, Deliver};
+use crate::pause::{self, OcrPause, PauseChoice};
 use crate::poller::{Poller, rest_base};
 use crate::processes::{ProcessStates, Processes};
 use crate::review::{DataUrl, NoteView, Review};
+use crate::search::{self, ContentHit};
 use crate::serve_info::ServeInfo;
 use crate::setup::{self, ExistingFolder, Sidecar};
 use crate::status::Status;
@@ -103,6 +107,33 @@ impl ConfigState {
     /// The config was reset at start and has not been saved since.
     pub fn was_reset(&self) -> bool {
         self.reset.load(Ordering::SeqCst)
+    }
+
+    /// Keeps `dir` as the folder of the last Save Markdown.
+    pub fn set_last_markdown_save_dir(&self, dir: PathBuf) -> Result<(), String> {
+        self.update(|c| c.last_markdown_save_dir = Some(dir))
+            .map(|_| ())
+    }
+
+    /// Sets the OCR pause (`None`: the OCR runs).
+    pub fn set_ocr_pause(&self, p: Option<OcrPause>) -> Result<AppConfig, String> {
+        self.update(|c| c.ocr_pause = p)
+    }
+
+    /// Clears a timed pause whose end came by `now_ms`. True when it cleared one; a pause set
+    /// again meanwhile stays.
+    pub fn clear_expired_pause(&self, now_ms: u64) -> Result<bool, String> {
+        match self.try_update(|c| {
+            if !pause::expired(c.ocr_pause.as_ref(), now_ms) {
+                return Err(());
+            }
+            c.ocr_pause = None;
+            Ok(())
+        }) {
+            Ok(_) => Ok(true),
+            Err(TryUpdateError::Refused(())) => Ok(false),
+            Err(TryUpdateError::NotSaved(why)) => Err(why),
+        }
     }
 
     /// The config as it is now.
@@ -490,6 +521,26 @@ pub fn log_out_of(
     library: &Library,
     serve_info: &ServeInfo,
 ) -> Result<AppConfig, String> {
+    log_out_with(
+        gate,
+        store,
+        state,
+        library,
+        serve_info,
+        login::LOGOUT_TIMEOUT,
+    )
+}
+
+/// [`log_out_of`] with the revoke bounded by `revoke_bound`: a test makes it longer than it
+/// looks, so the revoke cannot give up while the test checks that the log out did not wait.
+pub(crate) fn log_out_with(
+    gate: &LoginGate,
+    store: &dyn TokenStore,
+    state: &ConfigState,
+    library: &Library,
+    serve_info: &ServeInfo,
+    revoke_bound: std::time::Duration,
+) -> Result<AppConfig, String> {
     let (forgotten, revoking) = {
         let _no_login = gate.hold();
         let before = state.current();
@@ -508,15 +559,16 @@ pub fn log_out_of(
     // On a thread of its own: this Mac is logged out already, and a silent server must not
     // hold the answer up. The call itself ends within the bound.
     if revoking.is_some() {
-        std::thread::spawn(move || revoke_quietly(revoking));
+        std::thread::spawn(move || revoke_quietly(revoking, revoke_bound));
     }
     forgotten
 }
 
-/// Revokes a token that this Mac let go of; the outcome is not shown and never logged.
-fn revoke_quietly(revoking: Option<(Token, String)>) {
+/// Revokes a token that this Mac let go of, within `bound`; the outcome is not shown and
+/// never logged.
+fn revoke_quietly(revoking: Option<(Token, String)>, bound: std::time::Duration) {
     if let Some((token, base)) = revoking {
-        let _ = login::revoke(&base, token);
+        let _ = login::revoke_within(&base, token, bound);
     }
 }
 
@@ -684,7 +736,7 @@ pub fn change_place(
     };
     // After the login lock, as after a login: the binding reads the Keychain.
     library.refresh();
-    revoke_quietly(revoking);
+    revoke_quietly(revoking, login::LOGOUT_TIMEOUT);
     Ok((replaced, ConfigAnswer { config, keychain }))
 }
 
@@ -956,6 +1008,174 @@ pub(crate) fn relaunch_pipeline(
         processes.relaunch_pipeline_with(|| reader.current());
         drop(server);
     });
+}
+
+/// Pauses the OCR (`choice` at `now_ms`): saves the pause, then kills the pipeline at once on a
+/// thread of its own. While an import holds the server, only the pause is saved: the import's
+/// own start of the children reads it. A new choice during a pause only moves its end.
+pub fn pause_ocr_with(
+    config: &ConfigState,
+    processes: &Arc<Processes>,
+    server: &import_job::ServerUse,
+    choice: PauseChoice,
+    now_ms: u64,
+) -> Result<(), String> {
+    config.set_ocr_pause(Some(pause::pause_for(choice, now_ms)))?;
+    relaunch_unless_held(config, processes, server);
+    Ok(())
+}
+
+/// Ends the OCR pause: clears it, then starts the pipeline on a thread of its own, as
+/// [`pause_ocr_with`] does.
+pub fn resume_ocr_with(
+    config: &ConfigState,
+    processes: &Arc<Processes>,
+    server: &import_job::ServerUse,
+) -> Result<(), String> {
+    config.set_ocr_pause(None)?;
+    relaunch_unless_held(config, processes, server);
+    Ok(())
+}
+
+/// Ends a timed pause whose end came by `now_ms`, as [`resume_ocr_with`] does. True when it
+/// ended one.
+pub fn end_expired_pause_with(
+    config: &ConfigState,
+    processes: &Arc<Processes>,
+    server: &import_job::ServerUse,
+    now_ms: u64,
+) -> Result<bool, String> {
+    let ended = config.clear_expired_pause(now_ms)?;
+    if ended {
+        relaunch_unless_held(config, processes, server);
+    }
+    Ok(ended)
+}
+
+/// What one tick of the pause watch did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PauseTick {
+    /// No pause ended: none is set, it still holds, or its end was handled before.
+    Holds,
+    /// The pause ended: it was cleared and the pipeline starts.
+    Ended,
+    /// The pause ended, but its clear could not be saved (why): the pipeline starts anyway,
+    /// as the plan treats an ended pause as over.
+    EndedNotSaved(String),
+}
+
+/// The pause watch: [`end_expired_pause_with`] on each tick. An ended pause whose clear cannot
+/// be saved (a full disk, a folder that cannot be written) is handled once: the pipeline starts
+/// and the failure is told once, not on every tick. Later ticks try the clear again.
+#[derive(Default)]
+pub struct PauseWatch {
+    /// The ended pause whose clear failed and was already handled.
+    not_saved: Option<OcrPause>,
+}
+
+impl PauseWatch {
+    /// A watch that starts after the start's own clear of `pause` failed and was told: its
+    /// ticks do not tell that failure again.
+    pub fn after_failed_clear(pause: Option<OcrPause>) -> Self {
+        Self { not_saved: pause }
+    }
+
+    pub fn tick(
+        &mut self,
+        config: &ConfigState,
+        processes: &Arc<Processes>,
+        server: &import_job::ServerUse,
+        now_ms: u64,
+    ) -> PauseTick {
+        match end_expired_pause_with(config, processes, server, now_ms) {
+            Ok(true) => {
+                self.not_saved = None;
+                PauseTick::Ended
+            }
+            Ok(false) => PauseTick::Holds,
+            Err(why) => {
+                let ended = config.current().ocr_pause;
+                if ended.is_some() && ended == self.not_saved {
+                    return PauseTick::Holds;
+                }
+                self.not_saved = ended;
+                relaunch_unless_held(config, processes, server);
+                PauseTick::EndedNotSaved(why)
+            }
+        }
+    }
+}
+
+/// [`relaunch_pipeline`] while no import holds the server.
+fn relaunch_unless_held(
+    config: &ConfigState,
+    processes: &Arc<Processes>,
+    server: &import_job::ServerUse,
+) {
+    if let Ok(server) = server.try_use() {
+        relaunch_pipeline(config, processes, server);
+    }
+}
+
+/// [`pause_ocr_with`] in the app, for the menu bar: then the status polls again.
+pub fn pause_ocr(app: &AppHandle, choice: PauseChoice) -> Result<(), String> {
+    let processes = app.state::<Arc<Processes>>();
+    pause_ocr_with(
+        app.state::<ConfigState>().inner(),
+        processes.inner(),
+        &app.state::<ImportJobs>().server_use(),
+        choice,
+        processes.now_ms(),
+    )?;
+    pause_changed(app);
+    Ok(())
+}
+
+/// [`resume_ocr_with`] in the app, for the command and the menu bar.
+pub fn resume_ocr(app: &AppHandle) -> Result<(), String> {
+    resume_ocr_with(
+        app.state::<ConfigState>().inner(),
+        app.state::<Arc<Processes>>().inner(),
+        &app.state::<ImportJobs>().server_use(),
+    )?;
+    pause_changed(app);
+    Ok(())
+}
+
+/// [`PauseWatch::tick`] in the app, on each tick of the pause watch: an ended pause shows in
+/// the tray menu and the status at once.
+pub fn end_expired_pause(app: &AppHandle, watch: &mut PauseWatch) {
+    let processes = app.state::<Arc<Processes>>();
+    let tick = watch.tick(
+        app.state::<ConfigState>().inner(),
+        processes.inner(),
+        &app.state::<ImportJobs>().server_use(),
+        processes.now_ms(),
+    );
+    match tick {
+        PauseTick::Holds => {}
+        PauseTick::Ended => pause_changed(app),
+        PauseTick::EndedNotSaved(why) => {
+            eprintln!("notedown: the ended OCR pause was not cleared: {why}");
+            pause_changed(app);
+        }
+    }
+}
+
+/// After a pause, its end or a resume: the tray menu and the status show it at once.
+fn pause_changed(app: &AppHandle) {
+    crate::tray::set_menu(app);
+    if let Some(poller) = app.try_state::<Poller>() {
+        poller.poll_now();
+    }
+}
+
+/// Ends the OCR pause (Settings > OCR); the menu bar calls [`resume_ocr`] itself.
+#[tauri::command]
+pub async fn ocr_resume(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || resume_ocr(&app))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Whether the Keychain keeps a login for the account in the config, off the main thread.
@@ -1425,6 +1645,100 @@ pub async fn note_seen(notes: State<'_, Notes>, key: String) -> Result<(), Strin
         .map_err(|e| e.to_string())?
 }
 
+/// The library cleared the New count: every note that is new now is marked seen, in one write.
+/// Answers how many notes it marked. Off the main thread.
+#[tauri::command]
+pub async fn notes_seen_all(notes: State<'_, Notes>) -> Result<usize, String> {
+    let notes = notes.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || notes.seen_all())
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The most files a name search answers.
+pub const FIND_LIMIT: usize = 200;
+
+/// The files below the folder `under` (the whole library without it) whose name holds `text`,
+/// at most [`FIND_LIMIT`], and whether there were more. Off the main thread.
+#[tauri::command]
+pub async fn library_find(
+    library: State<'_, Library>,
+    text: String,
+    under: Option<String>,
+) -> Result<Found, String> {
+    let library = library.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        library
+            .find(&text, under.as_deref().unwrap_or(""), FIND_LIMIT)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The notes whose text holds `query`, one per note at its first block, by the bundled
+/// sidecar. With `under`, only the notes at or below that folder. A query of fewer than two
+/// characters or without a letter or digit gives nothing and runs no sidecar. Off the main
+/// thread.
+#[tauri::command]
+pub async fn notes_search(
+    notes: State<'_, Notes>,
+    config: State<'_, ConfigState>,
+    sidecar: State<'_, Sidecar>,
+    searches: State<'_, Arc<search::Searches>>,
+    query: String,
+    under: Option<String>,
+) -> Result<Vec<ContentHit>, String> {
+    let notes = notes.inner().clone();
+    let config = config.current();
+    let spawn = sidecar.0.clone();
+    let searches = searches.inner().clone();
+    let mine = searches.begin();
+    tauri::async_runtime::spawn_blocking(move || {
+        let wanted = || searches.is_current(mine);
+        search::notes_search(&spawn, &config, &notes, &query, under.as_deref(), &wanted)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The library opens the native context menu of `target` at the pointer. The items and their
+/// work are Rust's (menus.rs).
+#[tauri::command]
+pub fn library_menu(
+    window: tauri::WebviewWindow,
+    target: crate::menus::MenuTarget,
+) -> Result<(), String> {
+    crate::menus::popup(&window, target)
+}
+
+/// Saves the Markdown of the note at `path` into a file the user picks in the save dialog.
+/// Answers the saved file, `None` when the user cancelled or the save failed (Rust shows that
+/// in a dialog). Off the main thread: the dialog waits for the user.
+#[tauri::command]
+pub async fn note_save_markdown(app: tauri::AppHandle, path: String) -> Option<String> {
+    let shown = app.clone();
+    let saved = tauri::async_runtime::spawn_blocking(move || {
+        crate::save_markdown::save(&app, &path, crate::save_markdown::SaveFrom::Review)
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    match saved {
+        Ok(file) => file.map(|f| f.to_string_lossy().into_owned()),
+        Err(error) => {
+            crate::save_markdown::show_error(&shown, &error);
+            None
+        }
+    }
+}
+
+/// The review shows the note at `path` (`None` when it closed), which can be saved when
+/// `can_save`: the File menu's "Save Markdown..." follows.
+#[tauri::command]
+pub fn review_shown(app: tauri::AppHandle, path: Option<String>, can_save: bool) {
+    crate::save_markdown::review_shown(&app, path, can_save);
+}
+
 /// The note at `path` for the review: the Markdown of each page from the pipeline's store, and
 /// whether it is catching up. Off the main thread (it scans the store and asks the server).
 #[tauri::command]
@@ -1815,7 +2129,7 @@ mod tests {
             let _ = release
                 .lock()
                 .unwrap()
-                .recv_timeout(std::time::Duration::from_secs(10));
+                .recv_timeout(crate::test_procs::HANG_GUARD);
             config::save(dir, config)
         })
     }
@@ -1830,7 +2144,7 @@ mod tests {
         let saver = state.clone();
         let saving = std::thread::spawn(move || saver.set_start_view(StartView::Columns));
         started_rx
-            .recv_timeout(std::time::Duration::from_secs(10))
+            .recv_timeout(crate::test_procs::HANG_GUARD)
             .expect("the save did not start");
         // While the save runs, the config reads at once, as it was.
         let (read_tx, read_rx) = std::sync::mpsc::channel();
@@ -1838,7 +2152,9 @@ mod tests {
         std::thread::spawn(move || {
             let _ = read_tx.send(reader.current());
         });
-        let read = read_rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Longer than the held save's own guard: a read that waits for the save gets its
+        // new value and fails below.
+        let read = read_rx.recv_timeout(crate::test_procs::HANG_GUARD * 2);
         release_tx.send(()).unwrap();
         assert_eq!(
             read.expect("the read waited for the save").start_view,
@@ -2728,5 +3044,210 @@ mod tests {
             .unwrap();
         assert_eq!(file_time_ms(&file), Ok(1_763_300_000_123));
         assert!(file_time_ms(&dir.path().join("missing.snbak")).is_err());
+    }
+
+    mod pause {
+        use super::*;
+        use crate::pause::{OcrPause, PauseChoice};
+        use crate::processes::tests::{NOW, Rig, pause, running_pid, wait_until};
+        use crate::supervisor::ChildState;
+
+        const MIN: u64 = 60_000;
+
+        /// A Local setup that runs, its config saved in the rig's folder.
+        fn running(rig: &Rig) -> (ConfigState, Arc<Processes>) {
+            rig.listen_on(crate::probe::test_server::free_port());
+            let config_dir = rig.dir.path().join("config");
+            config::save(&config_dir, &rig.config()).unwrap();
+            let state = ConfigState::load(config_dir);
+            let p = Arc::new(rig.paused_processes());
+            p.start_with(|| state.current());
+            running_pid(p.server());
+            running_pid(p.pipeline());
+            (state, p)
+        }
+
+        /// Waits until no command uses the server: the relaunch on its thread is over.
+        fn relaunched(server: &import_job::ServerUse) {
+            assert!(
+                wait_until(|| server.hold_for_test().is_some()),
+                "the relaunch does not end"
+            );
+        }
+
+        #[test]
+        fn a_pause_is_saved_and_kills_the_pipeline_and_a_resume_starts_it() {
+            let rig = Rig::new();
+            rig.trap_term();
+            let (state, p) = running(&rig);
+            rig.wait_ready();
+            let server = import_job::ServerUse::default();
+
+            pause_ocr_with(&state, &p, &server, PauseChoice::FiveMinutes, NOW).unwrap();
+            let saved = Some(OcrPause {
+                until_ms: Some(NOW + 5 * MIN),
+            });
+            assert_eq!(state.current().ocr_pause, saved);
+            assert_eq!(config::load(&state.dir).ocr_pause, saved);
+            relaunched(&server);
+            assert_eq!(p.pipeline().state(), ChildState::Stopped);
+            assert!(!rig.got_term(), "the pipeline got a SIGTERM");
+            assert_eq!(rig.pipeline_spawns(), 1);
+
+            // Another choice during the pause only moves its end.
+            pause_ocr_with(&state, &p, &server, PauseChoice::UntilResumed, NOW).unwrap();
+            assert_eq!(state.current().ocr_pause, pause(None));
+            relaunched(&server);
+            assert_eq!(p.pipeline().state(), ChildState::Stopped);
+
+            resume_ocr_with(&state, &p, &server).unwrap();
+            assert_eq!(state.current().ocr_pause, None);
+            assert_eq!(config::load(&state.dir).ocr_pause, None);
+            relaunched(&server);
+            running_pid(p.pipeline());
+            assert_eq!(rig.pipeline_spawns(), 2);
+            p.stop_all();
+        }
+
+        #[test]
+        fn a_pause_during_an_import_only_saves() {
+            let rig = Rig::new();
+            let (state, p) = running(&rig);
+            let pid = running_pid(p.pipeline());
+            let server = import_job::ServerUse::default();
+            let import = server.hold_for_test().unwrap();
+
+            pause_ocr_with(&state, &p, &server, PauseChoice::OneHour, NOW).unwrap();
+            assert_eq!(
+                config::load(&state.dir).ocr_pause,
+                pause(Some(NOW + 60 * MIN))
+            );
+            // Nothing was relaunched: the import stops the children itself.
+            assert_eq!(running_pid(p.pipeline()), pid);
+            assert_eq!(rig.pipeline_spawns(), 1);
+
+            // The import's own start reads the saved pause.
+            drop(import);
+            p.start_with(|| state.current());
+            running_pid(p.server());
+            assert_eq!(p.pipeline().state(), ChildState::Stopped);
+            assert_eq!(rig.pipeline_spawns(), 1);
+            p.stop_all();
+        }
+
+        #[test]
+        fn a_pause_ends_at_its_time() {
+            let rig = Rig::new();
+            let (state, p) = running(&rig);
+            let server = import_job::ServerUse::default();
+            pause_ocr_with(&state, &p, &server, PauseChoice::OneMinute, NOW).unwrap();
+            relaunched(&server);
+            assert_eq!(p.pipeline().state(), ChildState::Stopped);
+
+            // Before its time: nothing changes.
+            assert_eq!(
+                end_expired_pause_with(&state, &p, &server, NOW + MIN - 1),
+                Ok(false)
+            );
+            assert!(state.current().ocr_pause.is_some());
+            // At its time it is cleared and the pipeline starts.
+            rig.set_now(NOW + MIN);
+            assert_eq!(
+                end_expired_pause_with(&state, &p, &server, NOW + MIN),
+                Ok(true)
+            );
+            assert_eq!(config::load(&state.dir).ocr_pause, None);
+            relaunched(&server);
+            running_pid(p.pipeline());
+            assert_eq!(rig.pipeline_spawns(), 2);
+            // Once.
+            assert_eq!(
+                end_expired_pause_with(&state, &p, &server, NOW + MIN),
+                Ok(false)
+            );
+            p.stop_all();
+        }
+
+        #[test]
+        fn a_timed_pause_whose_clear_is_not_saved_still_ends_once() {
+            let rig = Rig::new();
+            rig.listen_on(crate::probe::test_server::free_port());
+            let config_dir = rig.dir.path().join("config");
+            config::save(&config_dir, &rig.config()).unwrap();
+            // A config folder that cannot be written once `broken` is set (a full disk).
+            let broken = Arc::new(AtomicBool::new(false));
+            let fails = broken.clone();
+            let state = ConfigState::load_with(
+                config_dir,
+                Arc::new(move |dir: &Path, c: &AppConfig| {
+                    if fails.load(Ordering::SeqCst) {
+                        return Err(std::io::Error::other("the disk is full"));
+                    }
+                    config::save(dir, c)
+                }),
+            );
+            let p = Arc::new(rig.paused_processes());
+            p.start_with(|| state.current());
+            running_pid(p.server());
+            running_pid(p.pipeline());
+            let server = import_job::ServerUse::default();
+            pause_ocr_with(&state, &p, &server, PauseChoice::OneMinute, NOW).unwrap();
+            relaunched(&server);
+            assert_eq!(p.pipeline().state(), ChildState::Stopped);
+
+            broken.store(true, Ordering::SeqCst);
+            let mut watch = PauseWatch::default();
+            // Before its end: nothing.
+            assert_eq!(
+                watch.tick(&state, &p, &server, NOW + MIN - 1),
+                PauseTick::Holds
+            );
+            // At its end the clear fails, but the pipeline starts: the pause is over.
+            rig.set_now(NOW + MIN);
+            let first = watch.tick(&state, &p, &server, NOW + MIN);
+            assert!(
+                matches!(&first, PauseTick::EndedNotSaved(why) if why.contains("the disk is full")),
+                "{first:?}"
+            );
+            relaunched(&server);
+            running_pid(p.pipeline());
+            assert_eq!(rig.pipeline_spawns(), 2);
+            // The next ticks say nothing more: the failure is told once per pause.
+            assert_eq!(
+                watch.tick(&state, &p, &server, NOW + MIN + 1_000),
+                PauseTick::Holds
+            );
+            assert!(
+                state.current().ocr_pause.is_some(),
+                "the clear was not saved"
+            );
+
+            // Once the folder can be written, the next tick clears it; the pipeline runs on.
+            broken.store(false, Ordering::SeqCst);
+            assert_eq!(
+                watch.tick(&state, &p, &server, NOW + MIN + 2_000),
+                PauseTick::Ended
+            );
+            relaunched(&server);
+            assert_eq!(config::load(&state.dir).ocr_pause, None);
+            running_pid(p.pipeline());
+            assert_eq!(rig.pipeline_spawns(), 2);
+            p.stop_all();
+        }
+
+        #[test]
+        fn an_expired_pause_is_cleared_at_the_start() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = ConfigState::load(dir.path().to_owned());
+            state.set_ocr_pause(pause(Some(NOW))).unwrap();
+            assert_eq!(state.clear_expired_pause(NOW - 1), Ok(false));
+            assert!(state.current().ocr_pause.is_some());
+            assert_eq!(state.clear_expired_pause(NOW), Ok(true));
+            assert_eq!(config::load(dir.path()).ocr_pause, None);
+            // A pause until resumed never expires.
+            state.set_ocr_pause(pause(None)).unwrap();
+            assert_eq!(state.clear_expired_pause(u64::MAX), Ok(false));
+            assert_eq!(config::load(dir.path()).ocr_pause, pause(None));
+        }
     }
 }

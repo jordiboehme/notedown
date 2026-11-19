@@ -20,7 +20,12 @@ export type Selection =
   | { kind: "all" }
   | { kind: "bin" }
   | { kind: "folder"; path: string }
-  | { kind: "note"; path: string };
+  | { kind: "note"; path: string; at?: { pageId: string; blockId: string } };
+
+/** The selection without the block a note was opened at: the review used it already. */
+export function withoutAt(selection: Selection): Selection {
+  return selection.kind === "note" && selection.at ? { kind: "note", path: selection.path } : selection;
+}
 
 /**
  * Where Rust opens the window (`window.__NOTEDOWN_AT__` or the `library-at` event), as a

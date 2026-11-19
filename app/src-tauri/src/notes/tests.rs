@@ -14,6 +14,8 @@ struct Fixture {
     account: Arc<Mutex<Option<String>>>,
     data_dir: Arc<Mutex<PathBuf>>,
     events: Arc<AtomicUsize>,
+    /// What each event carried, in order.
+    told: Arc<Mutex<Vec<NotesChanged>>>,
     notes: Notes,
 }
 
@@ -33,6 +35,7 @@ impl Fixture {
         let account = Arc::new(Mutex::new(Some(ACCOUNT.to_owned())));
         let data_dir = Arc::new(Mutex::new(data.path().to_path_buf()));
         let events = Arc::new(AtomicUsize::new(0));
+        let told = Arc::new(Mutex::new(Vec::new()));
         let notes = Notes::new(
             {
                 let account = account.clone();
@@ -42,8 +45,10 @@ impl Fixture {
             config.path().to_path_buf(),
             {
                 let events = events.clone();
-                Arc::new(move || {
+                let told = told.clone();
+                Arc::new(move |changed: NotesChanged| {
                     events.fetch_add(1, Ordering::SeqCst);
+                    lock(&told).push(changed);
                 })
             },
         );
@@ -53,6 +58,7 @@ impl Fixture {
             account,
             data_dir,
             events,
+            told,
             notes,
         }
     }
@@ -359,7 +365,7 @@ fn a_note_is_new_until_opened() {
     let again = Notes::new(
         f.notes.inner.place.clone(),
         f.config.path().to_path_buf(),
-        Arc::new(|| {}),
+        Arc::new(|_| {}),
     );
     assert!(again.new_notes().is_empty());
     f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(13), true)]), 30);
@@ -523,7 +529,7 @@ fn a_path_keyed_note_keeps_its_marker_on_a_move() {
     let later = Notes::new(
         f.notes.inner.place.clone(),
         f.config.path().to_path_buf(),
-        Arc::new(|| {}),
+        Arc::new(|_| {}),
     );
     f.write(&note(OLD, "NOTE/Note/a.note", pages), 40);
     f.remove(NEXT);
@@ -579,24 +585,76 @@ fn notes_event_when_the_index_changes() {
     f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 20);
     f.notes.refresh();
     assert_eq!(f.events(), base + 3);
-    // A note without text changes nothing the windows show.
+    // A note without text changes no list, but a store file was read: an open review hears
+    // about it.
     f.write(&note(B, "NOTE/Note/b.note", &[("P1", None, false)]), 20);
     f.notes.refresh();
-    assert_eq!(f.events(), base + 3);
+    assert_eq!(f.events(), base + 4);
+    f.notes.refresh();
+    assert_eq!(f.events(), base + 4, "nothing was read again");
     // Another data folder: the index starts over.
     let other = tempfile::tempdir().unwrap();
     *lock(&f.data_dir) = other.path().to_path_buf();
     f.notes.refresh();
-    assert_eq!(f.events(), base + 4);
+    assert_eq!(f.events(), base + 5);
     assert!(f.notes.all().is_empty());
     // Back, then log out: the index starts over again each time.
     *lock(&f.data_dir) = f.data.path().to_path_buf();
     f.notes.refresh();
-    assert_eq!(f.events(), base + 5);
+    assert_eq!(f.events(), base + 6);
     assert_eq!(f.all_keys(), [A]);
     *lock(&f.account) = None;
     f.notes.refresh();
-    assert_eq!(f.events(), base + 6);
+    assert_eq!(f.events(), base + 7);
+}
+
+#[test]
+fn a_changed_store_file_tells_the_windows_even_when_the_lists_stay() {
+    let f = after_baseline();
+    f.write(&note(B, "NOTE/Note/b.note", &[("P1", None, false)]), 10);
+    f.notes.refresh();
+    let before = f.events();
+    let lists = (f.notes.all(), f.notes.new_notes());
+    assert_eq!(f.events(), before, "a scan that read nothing tells nothing");
+    // The OCR read the page and found no text: the lists stay as they are.
+    f.write(&note(B, "NOTE/Note/b.note", &[("P1", Some(5), false)]), 11);
+    f.notes.refresh();
+    assert_eq!(f.events(), before + 1);
+    assert_eq!((f.notes.all(), f.notes.new_notes()), lists);
+    assert_eq!(f.events(), before + 1);
+    // A store file that goes is a change of the store too.
+    f.remove(B);
+    f.notes.refresh();
+    assert_eq!(f.events(), before + 2);
+}
+
+#[test]
+fn the_event_names_the_notes_whose_store_file_was_read() {
+    let f = after_baseline();
+    let last = || lock(&f.told).last().cloned().unwrap();
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 10);
+    f.write(&note(B, "NOTE/Note/b.note", &[("P1", None, false)]), 10);
+    f.notes.refresh();
+    assert_eq!(last().paths, ["NOTE/Note/a.note", "NOTE/Note/b.note"]);
+    // Only the note the OCR wrote.
+    f.write(&note(B, "NOTE/Note/b.note", &[("P1", Some(5), false)]), 11);
+    f.notes.refresh();
+    assert_eq!(last().paths, ["NOTE/Note/b.note"]);
+    // A change of New notes alone names no note.
+    f.notes.seen(A).unwrap();
+    assert_eq!(last().paths, Vec::<String>::new());
+    // A move names the old path and the new one; a file that went names its note.
+    f.write(&note(B, "NOTE/Other/b.note", &[("P1", Some(5), false)]), 12);
+    f.notes.refresh();
+    assert_eq!(last().paths, ["NOTE/Note/b.note", "NOTE/Other/b.note"]);
+    f.remove(A);
+    f.notes.refresh();
+    assert_eq!(last().paths, ["NOTE/Note/a.note"]);
+    // On the wire the event is camelCase.
+    assert_eq!(
+        serde_json::to_value(last()).unwrap(),
+        json!({"paths": ["NOTE/Note/a.note"]})
+    );
 }
 
 #[test]
@@ -794,4 +852,105 @@ fn notes_newer_than_counts_listed_notes_with_newer_text() {
     // Without an account there are no notes.
     *lock(&f.account) = None;
     assert_eq!(f.notes.notes_newer_than(0), (0, None));
+}
+
+fn saves(f: &Fixture) -> usize {
+    f.notes.inner.saves.load(Ordering::SeqCst)
+}
+
+#[test]
+fn seen_all_marks_every_new_note_in_one_write() {
+    let f = after_baseline();
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 10);
+    f.write(&note(B, "NOTE/Note/b.note", &[("P1", Some(5), true)]), 11);
+    f.write(&note(C, "NOTE/Note/c.note", &[("P1", Some(6), true)]), 12);
+    f.notes.refresh();
+    let writes = saves(&f);
+    let events = f.events();
+    assert_eq!(f.notes.seen_all(), Ok(3));
+    assert_eq!(saves(&f), writes + 1, "one write for all three");
+    assert_eq!(f.events(), events + 1, "told once");
+    assert_eq!(f.marks(), json!({A: 4, B: 5, C: 6}));
+    assert!(f.new_keys().is_empty());
+    // Nothing new: nothing is written and nobody is told.
+    let (writes, events) = (saves(&f), f.events());
+    assert_eq!(f.notes.seen_all(), Ok(0));
+    assert_eq!(saves(&f), writes);
+    assert_eq!(f.events(), events);
+}
+
+#[test]
+fn seen_all_marks_only_the_notes_that_are_new_at_the_call() {
+    let f = after_baseline();
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 10);
+    f.write(&note(B, "NOTE/Note/b.note", &[("P1", Some(5), true)]), 11);
+    f.write(&note(C, "NOTE/Note/c.note", &[("P1", None, false)]), 12);
+    f.notes.seen(B).unwrap();
+    assert_eq!(f.new_keys(), [A]);
+    // A gets newer text after the list was read and before the click: the mark follows the
+    // text at the call. C has no text, so it is not new and gets no marker.
+    f.write(
+        &note(
+            A,
+            "NOTE/Note/a.note",
+            &[("P1", Some(4), true), ("P2", Some(9), true)],
+        ),
+        20,
+    );
+    assert_eq!(f.notes.seen_all(), Ok(1));
+    assert_eq!(f.marks(), json!({A: 9, B: 5}));
+    assert!(f.new_keys().is_empty());
+}
+
+#[test]
+fn a_note_that_gets_text_after_seen_all_is_new_again() {
+    let f = after_baseline();
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 10);
+    assert_eq!(f.notes.seen_all(), Ok(1));
+    assert!(f.new_keys().is_empty());
+    f.write(
+        &note(
+            A,
+            "NOTE/Note/a.note",
+            &[("P1", Some(4), true), ("P2", Some(12), true)],
+        ),
+        20,
+    );
+    assert_eq!(f.new_keys(), [A]);
+    assert_eq!(f.notes.seen_all(), Ok(1));
+    assert_eq!(f.marks(), json!({A: 12}));
+}
+
+#[test]
+fn seen_all_with_unreadable_markers_says_so() {
+    let mine = json!({ACCOUNT: [{"dataDir": "/x", "seen": {"X": 3}}]});
+    let f = Fixture::with_seen(Some(mine.clone()));
+    let path = f.config.path().join("seen.json");
+    if unreadable(&path).is_none() {
+        return;
+    }
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 10);
+    assert_eq!(f.notes.seen_all(), Err(SEEN_NOT_READ.to_owned()));
+    readable(&path);
+    assert_eq!(f.seen_file(), mine);
+}
+
+#[test]
+fn try_at_path_does_not_wait_for_a_scan() {
+    let f = Fixture::new();
+    f.write(&note(A, "NOTE/Note/a.note", &[("P1", Some(4), true)]), 20);
+    f.notes.refresh();
+    assert_eq!(
+        f.notes
+            .try_at_path("NOTE/Note/a.note")
+            .unwrap()
+            .unwrap()
+            .key,
+        A
+    );
+    assert_eq!(f.notes.try_at_path("NOTE/Note/b.note"), Some(None));
+    // A scan holds the index: the answer is "not known now", at once.
+    let held = f.notes.inner.state.lock().unwrap();
+    assert_eq!(f.notes.try_at_path("NOTE/Note/a.note"), None);
+    drop(held);
 }

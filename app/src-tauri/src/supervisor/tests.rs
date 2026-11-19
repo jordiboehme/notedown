@@ -12,7 +12,7 @@ use crate::config::{AppConfig, Mode};
 use crate::process::{self, ChildKind, Launch, SpawnFn};
 
 const GRACE: Duration = Duration::from_millis(200);
-const WAIT: Duration = Duration::from_secs(10);
+const WAIT: Duration = crate::test_procs::HANG_GUARD;
 const START_MS: u64 = 1_000_000;
 
 struct Rig {
@@ -148,7 +148,7 @@ fn local_mode_runs_serve_and_the_pipeline_as_two_children() {
         ..AppConfig::default()
     };
     let me = std::process::id();
-    let plan = process::plan(&config, me);
+    let plan = process::plan(&config, me, START_MS);
     let server = rig.supervisor(ChildKind::Server, &script);
     let pipeline = rig.supervisor(ChildKind::Pipeline, &script);
     server.launch(&plan.server);
@@ -333,13 +333,14 @@ fn stop_is_quick_when_the_child_ends_on_term() {
         ChildKind::Server,
         rig.spawn(&script),
         rig.clock(),
-        Duration::from_secs(30),
+        // A grace far past the guard: a stop that waited for it fails the test.
+        Duration::from_secs(600),
     );
     sup.start(vec![]);
     running_pid(&sup);
     let began = Instant::now();
     sup.stop();
-    assert!(began.elapsed() < Duration::from_secs(10));
+    assert!(began.elapsed() < WAIT);
     assert_eq!(sup.state(), ChildState::Stopped);
 }
 
@@ -441,7 +442,7 @@ fn remote_mode_without_pipeline_toml_is_not_connected() {
     };
     let server = rig.supervisor(ChildKind::Server, &script);
     let pipeline = rig.supervisor(ChildKind::Pipeline, &script);
-    let plan = process::plan(&config, std::process::id());
+    let plan = process::plan(&config, std::process::id(), START_MS);
     server.launch(&plan.server);
     pipeline.launch(&plan.pipeline);
     assert_eq!(server.state(), ChildState::Stopped);
@@ -449,7 +450,7 @@ fn remote_mode_without_pipeline_toml_is_not_connected() {
     assert_eq!(rig.spawns(), 0);
 
     std::fs::write(data.join("pipeline.toml"), "").unwrap();
-    let plan = process::plan(&config, std::process::id());
+    let plan = process::plan(&config, std::process::id(), START_MS);
     assert!(matches!(plan.pipeline, Launch::Start(_)));
     pipeline.launch(&plan.pipeline);
     running_pid(&pipeline);
@@ -530,8 +531,8 @@ fn a_listener_may_read_the_state_while_the_child_starts() {
         starter.start(vec![]);
         let _ = done_tx.send(());
     });
-    let finished = done_rx.recv_timeout(Duration::from_secs(5)).is_ok()
-        && wait_until(|| read.lock().unwrap().len() >= 2);
+    let finished =
+        done_rx.recv_timeout(WAIT).is_ok() && wait_until(|| read.lock().unwrap().len() >= 2);
     if !finished {
         // Deadlocked: the supervisor cannot be dropped (stop would hang), so end the child by
         // hand and leak the rest.
@@ -562,4 +563,145 @@ fn a_listener_may_read_the_state_while_the_child_starts() {
     // The starter's clone is gone before the test ends, so the last drop (which stops the
     // child) runs here and not on a thread the end of the test binary could cut short.
     starting.join().unwrap();
+}
+
+/// A child that writes `<dir>/ready` once its TERM trap is set and its own child runs, and
+/// `<dir>/term` when a SIGTERM reaches it. Ready comes after the fork of `sleep`: a signal to
+/// the group while the shell is still in that fork can miss the new process on macOS, which
+/// then keeps the group alive.
+const TRAPS_TERM: &str = "trap 'echo term > \"$DIR/term\"; exit 0' TERM\n\
+     sleep 307 &\n\
+     echo ready > \"$DIR/ready\"\n\
+     wait";
+
+#[test]
+fn kill_now_sends_no_sigterm() {
+    let rig = Rig::new();
+    let script = rig.script("child", TRAPS_TERM);
+    let pid_file = rig.path().join("run").join("pipeline.pid");
+    // A grace past the guard: a kill that waited for it fails the test.
+    let sup = ProcessSupervisor::new(
+        ChildKind::Pipeline,
+        rig.spawn(&script),
+        rig.clock(),
+        Duration::from_secs(600),
+    );
+    sup.keep_pid_file(pid_file.clone(), PathBuf::from("/bin/sh"));
+    sup.start(vec![]);
+    let pid = running_pid(&sup);
+    assert!(wait_until(|| rig.path().join("ready").exists()));
+    assert!(pid_file.exists());
+
+    sup.kill_now();
+    assert_eq!(sup.state(), ChildState::Stopped);
+    assert!(!process::group_alive(pid));
+    assert!(!pid_file.exists());
+    assert!(!rig.path().join("term").exists(), "the child got a SIGTERM");
+    // Nothing starts again.
+    rig.set_now(rig.now() + 3_600_000);
+    assert_eq!(sup.state(), ChildState::Stopped);
+    assert_eq!(rig.spawns(), 1);
+}
+
+#[test]
+fn stop_sends_the_sigterm_that_kill_now_leaves_out() {
+    // The positive control of kill_now_sends_no_sigterm: the same child under stop().
+    let rig = Rig::new();
+    let script = rig.script("child", TRAPS_TERM);
+    let sup = ProcessSupervisor::new(
+        ChildKind::Pipeline,
+        rig.spawn(&script),
+        rig.clock(),
+        Duration::from_secs(600),
+    );
+    sup.start(vec![]);
+    running_pid(&sup);
+    assert!(wait_until(|| rig.path().join("ready").exists()));
+    sup.stop();
+    assert_eq!(sup.state(), ChildState::Stopped);
+    assert!(rig.path().join("term").exists(), "no SIGTERM came");
+}
+
+#[test]
+fn a_paused_launch_kills_the_child_at_once() {
+    let rig = Rig::new();
+    let script = rig.script("child", TRAPS_TERM);
+    let sup = ProcessSupervisor::new(
+        ChildKind::Pipeline,
+        rig.spawn(&script),
+        rig.clock(),
+        Duration::from_secs(600),
+    );
+    sup.launch(&Launch::Start(vec![]));
+    let pid = running_pid(&sup);
+    assert!(wait_until(|| rig.path().join("ready").exists()));
+    sup.launch(&Launch::Paused);
+    assert_eq!(sup.state(), ChildState::Stopped);
+    assert!(!process::group_alive(pid));
+    assert!(!rig.path().join("term").exists(), "the child got a SIGTERM");
+    // A paused launch of a stopped child starts nothing.
+    sup.launch(&Launch::Paused);
+    assert_eq!(sup.state(), ChildState::Stopped);
+    assert_eq!(rig.spawns(), 1);
+}
+
+/// A child that forks without a break while the kill comes: each round starts a long `sleep`
+/// and ends the one before, so a fork is nearly always under way. `<dir>/ready` comes after its
+/// first fork.
+const FORKS_ON: &str = "sleep 3071 &\n\
+     old=$!\n\
+     echo ready > \"$DIR/ready\"\n\
+     while :; do\n\
+       sleep 3071 &\n\
+       new=$!\n\
+       kill $old 2>/dev/null\n\
+       old=$new\n\
+     done";
+
+/// The processes of group `pgid`, as `ps` lists them (zombies too).
+fn members(pgid: u32) -> Vec<String> {
+    let out = Command::new("/bin/ps")
+        .args(["-axo", "pgid=,pid=,stat=,command="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.split_whitespace().next() == Some(pgid.to_string().as_str()))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Asserts that nothing of group `pgid` is left.
+fn group_is_empty(pgid: u32) {
+    assert!(!process::group_alive(pgid), "left: {:?}", members(pgid));
+    assert_eq!(members(pgid), Vec::<String>::new());
+}
+
+#[test]
+fn kill_now_leaves_nothing_of_a_child_that_keeps_forking() {
+    let rig = Rig::new();
+    let script = rig.script("child", FORKS_ON);
+    let sup = rig.supervisor(ChildKind::Pipeline, &script);
+    sup.start(vec![]);
+    let pid = running_pid(&sup);
+    assert!(wait_until(|| rig.path().join("ready").exists()));
+
+    sup.kill_now();
+    assert_eq!(sup.state(), ChildState::Stopped);
+    group_is_empty(pid);
+}
+
+#[test]
+fn stop_leaves_nothing_of_a_child_that_keeps_forking() {
+    let rig = Rig::new();
+    // The shell ignores SIGTERM, so it still forks when the SIGKILL comes after the grace.
+    let script = rig.script("child", &format!("trap '' TERM\n{FORKS_ON}"));
+    let sup = rig.supervisor(ChildKind::Pipeline, &script);
+    sup.start(vec![]);
+    let pid = running_pid(&sup);
+    assert!(wait_until(|| rig.path().join("ready").exists()));
+
+    sup.stop();
+    assert_eq!(sup.state(), ChildState::Stopped);
+    group_is_empty(pid);
 }

@@ -34,7 +34,7 @@
     showListings,
     startLibrary,
   } from "../lib/library.svelte";
-  import { LIBRARY_AT_EVENT, NOTES_EVENT, type Entry, type NoteSummary } from "../lib/library-types";
+  import { LIBRARY_AT_EVENT, MENU_ERROR_EVENT, NOTES_EVENT, type Entry, type NoteSummary } from "../lib/library-types";
   import { startStatus, status } from "../lib/status.svelte";
   import ColumnsView from "./ColumnsView.svelte";
   import FileActions from "./FileActions.svelte";
@@ -43,6 +43,8 @@
   import NotesList from "./NotesList.svelte";
   import RecycleBin from "./RecycleBin.svelte";
   import Review from "./Review.svelte";
+  import SearchLayer from "./SearchLayer.svelte";
+  import SearchResults from "./SearchResults.svelte";
   import Sidebar from "./Sidebar.svelte";
   import StateNotice from "./StateNotice.svelte";
   import StatusLine from "./StatusLine.svelte";
@@ -57,6 +59,7 @@
     shownFor,
     sidebarItems,
     treeView,
+    withoutAt,
     type Selection,
     type SidebarItem,
     type Sort,
@@ -64,6 +67,8 @@
   import { entryActions, folderAt, followChange, jobRows, type Change } from "./actions";
   import { emptyConfirm, recycleRows } from "./recycle";
   import { drag, folderUnder, letGo, moveTo, stopDrag } from "./drag.svelte";
+  import { isFindKey, searchPlace, type ResultRow } from "./search";
+  import { LibrarySearch } from "./search.svelte";
   import "../lib/system.css";
   import "./library.css";
 
@@ -83,6 +88,8 @@
   let sort = $state<Sort>({ by: "name", ascending: true });
   let newNotes = $state<NoteSummary[] | null>(null);
   let allNotes = $state<NoteSummary[] | null>(null);
+  /** Why the last load of New or All notes failed, while that list is still missing. */
+  let listErrors = $state<{ newNotes: string | null; allNotes: string | null }>({ newNotes: null, allNotes: null });
   /** The row picked for the file actions: a row of the list, or a file picked in a column. */
   let picked = $state<string | null>(null);
   /** The row whose name is being typed. */
@@ -90,6 +97,10 @@
   /** The name of a new folder is being typed. */
   let naming = $state(false);
   let now = $state(Date.now());
+  /** The search of the toolbar; while it has text, the main area shows its results. */
+  const search = new LibrarySearch(() => searchPlace(library.selection, newNotes, allNotes, listErrors));
+  const searching = $derived(search.text.trim() !== "");
+  let toolbar: Toolbar | undefined = $state();
   /** The clock of the job rows: done rows go after a while. */
   let tick = $state(Date.now());
 
@@ -156,13 +167,35 @@
     });
   });
 
+  // "This folder" follows the shown place and its list of notes: a search that is on runs
+  // again when that changes what it searches.
+  $effect(() => {
+    void searchPlace(library.selection, newNotes, allNotes, listErrors);
+    void search.scope;
+    untrack(() => search.rerun());
+  });
+
   function loadNotes() {
-    invoke<NoteSummary[]>("notes_new")
-      .then((notes) => (newNotes = notes))
-      .catch(report("notes_new"));
-    invoke<NoteSummary[]>("notes_all")
-      .then((notes) => (allNotes = notes))
-      .catch(report("notes_all"));
+    invoke<NoteSummary[]>("notes_new").then(
+      (notes) => {
+        newNotes = notes;
+        listErrors.newNotes = null;
+      },
+      (error) => {
+        report("notes_new")(error);
+        listErrors.newNotes = String(error);
+      },
+    );
+    invoke<NoteSummary[]>("notes_all").then(
+      (notes) => {
+        allNotes = notes;
+        listErrors.allNotes = null;
+      },
+      (error) => {
+        report("notes_all")(error);
+        listErrors.allNotes = String(error);
+      },
+    );
   }
 
   onMount(() => {
@@ -173,6 +206,7 @@
       startLibrary(),
       startStatus(),
       listen(NOTES_EVENT, loadNotes),
+      listen<string>(MENU_ERROR_EVENT, (event) => (library.notice = String(event.payload))),
       listen(LIBRARY_AT_EVENT, (event) => {
         const at = openAt(event.payload);
         if (at?.kind === "note") openNote(at.path);
@@ -202,10 +236,13 @@
     naming = false;
   }
 
-  /** Shows the review of the note at `path`; Back goes to what was shown before. */
-  function openNote(path: string) {
+  /**
+   * Shows the review of the note at `path`, at the block `at` (a search hit) when given; Back
+   * goes to what was shown before.
+   */
+  function openNote(path: string, at?: { pageId: string; blockId: string }) {
     if (library.selection.kind !== "note") library.back = library.selection;
-    show({ kind: "note", path });
+    show(at ? { kind: "note", path, at } : { kind: "note", path });
     openings += 1;
   }
 
@@ -270,6 +307,39 @@
     library.selection = { kind: id };
   }
 
+  // The sidebar's New row and the New list's button: the menu is Rust's, the button calls the
+  // same command. The lists reload when the notes change.
+  function newMenu() {
+    invoke("library_menu", { target: { kind: "newNotes" } }).catch(report("library_menu"));
+  }
+
+  function markAllSeen() {
+    invoke<number>("notes_seen_all").then(loadNotes).catch((error) => (library.notice = String(error)));
+  }
+
+  /** A row of the search results: it opens or selects what it names, and the search ends. */
+  function openRow(row: ResultRow) {
+    search.clear();
+    if (row.section === "text" && row.pageId !== undefined && row.blockId !== undefined) {
+      openNote(row.path, { pageId: row.pageId, blockId: row.blockId });
+    } else if (row.kind === "note") openNote(row.path);
+    else pickFile(row.path);
+  }
+
+  function keydown(event: KeyboardEvent) {
+    if (event.key === "Escape" && drag.current) stopDrag();
+    // Escape ends a search wherever the focus is, and gives back the view under it.
+    else if (event.key === "Escape" && searching) {
+      // The Escape is the search's: the review under it (a page shown alone) must not get it.
+      event.stopImmediatePropagation();
+      search.clear();
+    }
+    if (isFindKey(event)) {
+      event.preventDefault();
+      toolbar?.focusSearch();
+    }
+  }
+
   function settings(page: string | null) {
     invoke("open_settings", { page }).catch(report("open_settings"));
   }
@@ -281,12 +351,12 @@
   onpointermove={moveTo}
   onpointerup={released}
   onpointercancel={stopDrag}
-  onkeydown={(event) => event.key === "Escape" && drag.current && stopDrag()}
+  onkeydown={keydown}
 />
 
 <div class="library window">
   <StatusLine status={status.current} {now} onSetUp={() => settings("setup")} />
-  <Toolbar view={library.viewMode} onView={(view) => void chooseView(view)} />
+  <Toolbar bind:this={toolbar} view={library.viewMode} onView={(view) => void chooseView(view)} {search} />
   <div class="body">
     <Sidebar
       notes={items.notes}
@@ -298,79 +368,99 @@
       onSelect={select}
       onToggle={toggle}
       onSettings={settings}
+      onNewMenu={newMenu}
     />
     <main class="main">
-      {#if library.selection.kind === "new"}
-        <NotesList title="New notes" notes={newNotes} empty="No new notes." onOpen={(note) => openNote(note.path)} />
-      {:else if library.selection.kind === "all"}
-        <NotesList title="All notes" notes={allNotes} empty="No notes with text yet." onOpen={(note) => openNote(note.path)} />
-      {:else if library.selection.kind === "note"}
-        {#key `${library.generation}:${openings}:${library.selection.path}`}
-          <Review path={library.selection.path} onBack={() => (library.selection = library.back)} />
-        {/key}
-      {:else if !ready}
-        <StateNotice view={library.view} onSettings={settings} />
-      {:else if library.selection.kind === "bin"}
-        <RecycleBin
-          bin={library.bin}
-          rows={binRows}
-          restores={library.restores}
-          question={emptyConfirm(library.bin, library.emptyAsked)}
-          emptying={library.emptying}
-          onMore={() => void listBinNext()}
-          onRestore={(item) => void restoreItem(item)}
-          onAnswer={(key, typed) => void answerRestore(key, typed)}
-          onCancel={(key) => void cancelRestore(key)}
-          onDraft={restoreDraft}
-          onFocused={restoreFocused}
-          onAskEmpty={askEmpty}
-          onDropEmpty={dropEmpty}
-          onEmpty={() => void confirmEmpty()}
-        />
-      {:else}
-        {@const path = library.selection.path}
-        <FileActions
-          {actions}
-          {naming}
-          onNewFolder={() => (naming = true)}
-          onNamed={named}
-          onRename={() => (renaming = actedOn)}
-          onDelete={() => void remove()}
-          onDownload={download}
-          onOpen={() => actedOn && openNote(actedOn)}
-        />
-        {#if !inTree}
-          {#key library.generation}
-            <ColumnsView
-              {path}
-              columns={columns.columns}
-              {renaming}
-              onSelect={select}
-              onFile={pickFile}
-              onOpenNote={openNote}
-              onRename={rename}
+      <SearchLayer {searching}>
+        {#snippet results()}
+          <SearchResults {search} onRow={openRow} />
+        {/snippet}
+        {#snippet view()}
+          {#if library.selection.kind === "new"}
+            <NotesList
+              title="New notes"
+              notes={newNotes}
+              empty="No new notes."
+              onOpen={(note) => openNote(note.path)}
+              onMarkAllSeen={markAllSeen}
             />
-          {/key}
-        {:else}
-          {#key `${path}:${library.generation}`}
-            <FolderList
-              {path}
-              folder={library.listings[listingKey(path, false)]}
-              next={library.next[listingKey(path, false)] ?? null}
-              busy={isBusy(path, false)}
-              {sort}
-              {picked}
-              {renaming}
-              onSort={(next) => (sort = next)}
-              onOpen={select}
-              onOpenNote={openNote}
-              onMore={() => void listNext(path, false)}
-              onPick={(row) => (picked = row)}
-              onRename={rename}
+          {:else if library.selection.kind === "all"}
+            <NotesList title="All notes" notes={allNotes} empty="No notes with text yet." onOpen={(note) => openNote(note.path)} />
+          {:else if library.selection.kind === "note"}
+            {#key `${library.generation}:${openings}:${library.selection.path}`}
+              <Review
+                path={library.selection.path}
+                at={library.selection.at ?? null}
+                covered={searching}
+                onAtTaken={() => (library.selection = withoutAt(library.selection))}
+                onBack={() => (library.selection = library.back)}
+              />
+            {/key}
+          {:else if !ready}
+            <StateNotice view={library.view} onSettings={settings} />
+          {:else if library.selection.kind === "bin"}
+            <RecycleBin
+              bin={library.bin}
+              rows={binRows}
+              restores={library.restores}
+              question={emptyConfirm(library.bin, library.emptyAsked)}
+              emptying={library.emptying}
+              onMore={() => void listBinNext()}
+              onRestore={(item) => void restoreItem(item)}
+              onAnswer={(key, typed) => void answerRestore(key, typed)}
+              onCancel={(key) => void cancelRestore(key)}
+              onDraft={restoreDraft}
+              onFocused={restoreFocused}
+              onAskEmpty={askEmpty}
+              onDropEmpty={dropEmpty}
+              onEmpty={() => void confirmEmpty()}
             />
-          {/key}
-        {/if}
-      {/if}
+          {:else}
+            {@const path = library.selection.path}
+            <FileActions
+              {actions}
+              {naming}
+              onNewFolder={() => (naming = true)}
+              onNamed={named}
+              onRename={() => (renaming = actedOn)}
+              onDelete={() => void remove()}
+              onDownload={download}
+              onOpen={() => actedOn && openNote(actedOn)}
+            />
+            {#if !inTree}
+              {#key library.generation}
+                <ColumnsView
+                  {path}
+                  columns={columns.columns}
+                  {renaming}
+                  onSelect={select}
+                  onFile={pickFile}
+                  onOpenNote={openNote}
+                  onRename={rename}
+                />
+              {/key}
+            {:else}
+              {#key `${path}:${library.generation}`}
+                <FolderList
+                  {path}
+                  folder={library.listings[listingKey(path, false)]}
+                  next={library.next[listingKey(path, false)] ?? null}
+                  busy={isBusy(path, false)}
+                  {sort}
+                  {picked}
+                  {renaming}
+                  onSort={(next) => (sort = next)}
+                  onOpen={select}
+                  onOpenNote={openNote}
+                  onMore={() => void listNext(path, false)}
+                  onPick={(row) => (picked = row)}
+                  onRename={rename}
+                />
+              {/key}
+            {/if}
+          {/if}
+        {/snippet}
+      </SearchLayer>
     </main>
   </div>
   <Jobs

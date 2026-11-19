@@ -52,6 +52,7 @@ pub(super) fn base_status() -> Status {
             last_run_ms: Some(NOW - 10 * MIN),
             facts: true,
             token_refused: false,
+            paused: false,
         },
         agents: Vec::new(),
         attention: Vec::new(),
@@ -938,5 +939,45 @@ fn the_old_event_test_of_a_sync_uses_this_macs_clock() {
     let mut rig = Rig::seen();
     rig.later(4 * 60 * MIN);
     rig.synced(rig.now - 3 * 60 * MIN, Some(4));
+    assert!(rig.run().is_empty());
+}
+
+#[test]
+fn a_pause_and_its_end_give_no_notice() {
+    let mut rig = Rig::seen();
+    // Running with a page in work and pages in the queue.
+    rig.input.status.ocr.line = "3 pages waiting".to_owned();
+    rig.input.status.ocr.queued = 3;
+    rig.input.status.ocr.in_work = Some(InWork {
+        note: "k1".to_owned(),
+        path: "NOTE/Note/a.note".to_owned(),
+        page: 2,
+        pages: 5,
+        started_ms: NOW - MIN,
+    });
+    assert!(rig.run().is_empty());
+    let running = rig.input.status.clone();
+
+    // Paused, as `status_from` gives it: the pipeline stopped, no page in work, the counts
+    // and an error of the store stay, no attention.
+    rig.later(MIN);
+    let status = &mut rig.input.status;
+    status.pipeline.state = ChildState::Stopped;
+    status.pipeline.line = "OCR paused".to_owned();
+    status.ocr.line = "OCR paused".to_owned();
+    status.ocr.paused = true;
+    status.ocr.in_work = None;
+    status.ocr.last_error = Some(LastError {
+        text: "the model is missing".to_owned(),
+        at_ms: NOW - 2 * MIN,
+        code: None,
+    });
+    assert!(rig.run().is_empty());
+    rig.later(40 * MIN);
+    assert!(rig.run().is_empty());
+
+    // Running again.
+    rig.later(MIN);
+    rig.input.status = running;
     assert!(rig.run().is_empty());
 }

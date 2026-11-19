@@ -70,6 +70,12 @@ grid) is left out because it confuses OCR; add `--keep-template` to keep it, in 
 - With or without `--page`, each path is printed on its own line as soon as the PNG is written. A page
   that fails (for example a number past the end) prints `error: page N: <reason>` on stderr and the
   run goes on with the next page. The exit code is 1 at the end if any page failed.
+- `--info` renders nothing and writes no file. It prints one JSON line with the pages of the note,
+  for example `{"pages":[{"id":"P1","landscape":false}]}`. `id` is the page id that the pipeline's
+  store uses: the `PAGEID` of the page, `position:<n>` (0-based) for a page without one, and
+  `<id>#2`, `<id>#3` for a second and third page with the same id. `landscape` is true for a page in
+  landscape orientation. `--info` cannot be combined with `--pdf`, `--page`, `--out` or
+  `--keep-template`.
 - `--allow-unknown-version` opens a note of a newer format version, as `convert` does.
 - The file name does not need the `.note` extension, because the format is read from the file itself.
 
@@ -309,6 +315,29 @@ seconds. The fields:
 - `inWork`: `{"note", "path", "page", "pages", "startedMs"}` of the page it reads now, or `null`.
 - `consumers`: one entry per consumer of the changes, `{"name", "seq", "ackedAt", "readAt",
   "notesBehind", "more"}`.
+
+## Pipeline search
+
+`notedown pipeline search --query TEXT [--data DIR] [--account A] [--limit N]` prints the text blocks that
+hold every word of `TEXT` as one JSON array, in note and page order, at most `N` blocks (default 20).
+`--account` can be left out when the data folder has only one account. It creates and changes nothing:
+a data folder without text gives `[]`. Words are the runs of letters and digits, compared
+case-insensitive, so `meet` does not find `Meeting` and punctuation does not count. A query without a
+word exits with code 1. A text that starts with `-` must be given as `--query=TEXT`, else it is read
+as an option and the call fails. Deleted notes are left out. Each hit has:
+
+- `anchor`: `notedown://<account>/<key>/<pageId>#<blockId>`, the block.
+- `note`: the title of the note.
+- `page`: the page number, from 1.
+- `context`: the first line of the block that holds a word of the query, cut at 200 characters.
+
+## Pipeline note
+
+`notedown pipeline note --key KEY [--data DIR] [--account A]` prints the Markdown of one note: the same
+text as its file in the Markdown folder and `get_note` of the MCP server, but for the `generated:` time.
+It has every page of the note. A page that has no text yet keeps its heading and its `page_id` comment.
+`--account` can be left out when the data folder has only one account. It creates and changes nothing.
+An unknown or deleted note exits with code 1 and `error: no note KEY`.
 
 ## Markdown files
 

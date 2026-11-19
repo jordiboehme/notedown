@@ -125,7 +125,6 @@ impl<F: FnOnce()> Drop for Finish<F> {
 mod tests {
     use super::*;
     use std::sync::{Mutex, mpsc};
-    use std::time::Duration;
 
     fn flow() -> Arc<QuitFlow> {
         Arc::new(QuitFlow::new())
@@ -155,7 +154,7 @@ mod tests {
             },
         );
         assert!(started);
-        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        done_rx.recv_timeout(crate::test_procs::HANG_GUARD).unwrap();
         assert_eq!(*log.lock().unwrap(), vec!["stop", "exit"]);
         // The exit that `exit` asks for now goes through.
         assert_eq!(flow.on_exit_request(Some(0)), ExitDecision::Allow);
@@ -175,12 +174,14 @@ mod tests {
             },
             move || done_tx.send(()).unwrap(),
         ));
-        in_stop_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        in_stop_rx
+            .recv_timeout(crate::test_procs::HANG_GUARD)
+            .unwrap();
         // Cmd+Q again, or the Dock: still stopping, so held back without a second flow.
         assert_eq!(flow.on_exit_request(Some(0)), ExitDecision::Prevent);
         assert!(!flow.quit_with(|| panic!("a second stop"), || panic!("a second exit")));
         release_tx.send(()).unwrap();
-        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        done_rx.recv_timeout(crate::test_procs::HANG_GUARD).unwrap();
         assert_eq!(flow.on_exit_request(Some(0)), ExitDecision::Allow);
     }
 
@@ -192,7 +193,7 @@ mod tests {
             || panic!("the stop failed (expected in this test)"),
             move || done_tx.send(()).unwrap(),
         ));
-        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        done_rx.recv_timeout(crate::test_procs::HANG_GUARD).unwrap();
         assert_eq!(flow.on_exit_request(Some(0)), ExitDecision::Allow);
     }
 
@@ -239,7 +240,7 @@ mod tests {
             },
         );
         assert!(started);
-        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        done_rx.recv_timeout(crate::test_procs::HANG_GUARD).unwrap();
         assert_eq!(*log.lock().unwrap(), vec!["stop", "restart"]);
         // The restart's own exit request goes through once the children are stopped.
         assert_eq!(
@@ -272,13 +273,15 @@ mod tests {
             },
             move || done_tx.send(()).unwrap(),
         ));
-        in_stop_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        in_stop_rx
+            .recv_timeout(crate::test_procs::HANG_GUARD)
+            .unwrap();
         // Cmd+Q while the restart stops the children: held back, no Quit flow.
         assert_eq!(flow.on_exit_request(Some(0)), ExitDecision::Prevent);
         assert!(!flow.quit_with(|| panic!("a second stop"), || panic!("an exit")));
         assert!(!flow.restart_with(|| panic!("a second stop"), || panic!("a second restart")));
         release_tx.send(()).unwrap();
-        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        done_rx.recv_timeout(crate::test_procs::HANG_GUARD).unwrap();
         assert_eq!(
             flow.on_exit_request(Some(RESTART_EXIT_CODE)),
             ExitDecision::Allow
@@ -296,7 +299,7 @@ mod tests {
         ));
         assert!(!flow.restart_with(|| panic!("a stop"), || panic!("a restart")));
         release_tx.send(()).unwrap();
-        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        done_rx.recv_timeout(crate::test_procs::HANG_GUARD).unwrap();
     }
 
     #[test]
@@ -307,7 +310,7 @@ mod tests {
             || panic!("the stop failed (expected in this test)"),
             move || done_tx.send(()).unwrap(),
         ));
-        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        done_rx.recv_timeout(crate::test_procs::HANG_GUARD).unwrap();
     }
 
     #[test]

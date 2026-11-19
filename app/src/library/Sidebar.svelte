@@ -16,6 +16,7 @@
     onSelect,
     onToggle,
     onSettings,
+    onNewMenu,
   }: {
     notes: SidebarItem[];
     tree: boolean;
@@ -26,6 +27,7 @@
     onSelect: (path: string) => void;
     onToggle: (path: string) => void;
     onSettings: (page: string | null) => void;
+    onNewMenu: () => void;
   } = $props();
 </script>
 
@@ -36,6 +38,12 @@
     class:selected={entry.selected}
     aria-current={entry.selected ? "page" : undefined}
     onclick={() => onPick(entry.id)}
+    oncontextmenu={entry.id === "new"
+      ? (event) => {
+          event.preventDefault();
+          onNewMenu();
+        }
+      : undefined}
   >
     <span class="text">{entry.label}</span>
     {#if entry.count}<span class="count" class:fresh={entry.id === "new"}>{entry.count}</span>{/if}

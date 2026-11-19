@@ -19,6 +19,12 @@ fn render_command_writes_pngs() {
 
 /// A small note of `pages` blank pages (the container layout of docs/note-format.md 1, 2).
 fn blank_note(pages: usize, signature: &str) -> Vec<u8> {
+    let metas: Vec<String> = (1..=pages).map(|n| format!("<PAGEID:id-{n}>")).collect();
+    note_of_pages(&metas, signature)
+}
+
+/// A small note with one blank page per entry of `metas`, each the raw keys of its page block.
+fn note_of_pages(metas: &[String], signature: &str) -> Vec<u8> {
     fn block(data: &mut Vec<u8>, payload: &[u8]) -> usize {
         let address = data.len();
         data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -29,9 +35,9 @@ fn blank_note(pages: usize, signature: &str) -> Vec<u8> {
     data.extend_from_slice(signature.as_bytes());
     let header = block(&mut data, b"<FILE_TYPE:NOTE>");
     let mut footer = format!("<FILE_FEATURE:{header}>");
-    for n in 1..=pages {
-        let page = block(&mut data, format!("<PAGEID:id-{n}>").as_bytes());
-        footer.push_str(&format!("<PAGE{n}:{page}>"));
+    for (i, meta) in metas.iter().enumerate() {
+        let page = block(&mut data, meta.as_bytes());
+        footer.push_str(&format!("<PAGE{}:{page}>", i + 1));
     }
     let address = block(&mut data, footer.as_bytes());
     data.extend_from_slice(b"tail");
@@ -185,6 +191,92 @@ fn render_reads_the_format_from_the_bytes_not_the_name() {
     let out = render_run(&note, &out_dir, &[]);
     assert!(out.status.success(), "{out:?}");
     assert_eq!(png_names(&out_dir), vec!["blob-page-001.png"]);
+}
+
+fn render_info(file: &std::path::Path, extra: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .arg("render")
+        .arg(file)
+        .arg("--info")
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn render_info_prints_pages_and_orientation() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("four.note");
+    let metas = [
+        "<PAGEID:P1><ORIENTATION:1000>",
+        "<PAGEID:P2><ORIENTATION:1090>",
+        "<PAGEID:P2><ORIENTATION:1270>",
+        "<ORIENTATION:1000>",
+    ]
+    .map(str::to_string);
+    std::fs::write(&note, note_of_pages(&metas, "SN_FILE_VER_20230015")).unwrap();
+    let out = render_info(&note, &[]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        concat!(
+            r#"{"pages":[{"id":"P1","landscape":false},{"id":"P2","landscape":true},"#,
+            r#"{"id":"P2#2","landscape":true},{"id":"position:3","landscape":false}]}"#,
+            "\n"
+        )
+    );
+    assert_eq!(
+        png_names(dir.path()),
+        vec!["four.note"],
+        "no file is written"
+    );
+}
+
+#[test]
+fn render_info_reads_a_real_note_and_honours_the_version_flag() {
+    let out = render_info(std::path::Path::new(NOTE), &[]);
+    assert!(out.status.success(), "{out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let pages = v["pages"].as_array().unwrap();
+    assert!(!pages.is_empty());
+    for p in pages {
+        assert!(p["id"].is_string() && p["landscape"].is_boolean(), "{p}");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("newer.note");
+    std::fs::write(&note, blank_note(1, "SN_FILE_VER_29990001")).unwrap();
+    assert!(
+        !render_info(&note, &[]).status.success(),
+        "strict by default"
+    );
+    let out = render_info(&note, &["--allow-unknown-version"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "{\"pages\":[{\"id\":\"id-1\",\"landscape\":false}]}\n"
+    );
+}
+
+#[test]
+fn render_info_refuses_the_options_that_write_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("two.note");
+    std::fs::write(&note, blank_note(2, "SN_FILE_VER_20230015")).unwrap();
+    let out_dir = dir.path().join("o");
+    for extra in [
+        vec!["--pdf"],
+        vec!["--page", "1"],
+        vec!["--keep-template"],
+        vec!["--out", out_dir.to_str().unwrap()],
+    ] {
+        let out = render_info(&note, &extra);
+        assert!(!out.status.success(), "{extra:?}: {out:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("--info"), "{extra:?}: {err}");
+    }
+    assert!(!out_dir.exists(), "nothing is written");
+    assert_eq!(png_names(dir.path()), vec!["two.note"]);
 }
 
 #[cfg(feature = "ocr")]
@@ -3479,4 +3571,300 @@ fn cloud_account_list_prefers_data_over_the_environment() {
         .unwrap();
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("b@example.org"));
+}
+
+/// A data folder with the account `tester`, as `cloud account add` makes it.
+#[cfg(feature = "ocr")]
+fn data_with_an_account() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let out = cloud(
+        dir.path(),
+        &[
+            "add",
+            "tester",
+            "--email",
+            "tester@example.org",
+            "--password-stdin",
+        ],
+        Some("secret\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    dir
+}
+
+/// Saves a note with one page and one block per text into the store of `tester`.
+#[cfg(feature = "ocr")]
+fn save_note(data: &std::path::Path, key: &str, title: &str, texts: &[&str]) {
+    use notedown_pipeline::model::NoteState;
+    use notedown_pipeline::store::{TextStore, WriterLock};
+    let blocks: Vec<serde_json::Value> = texts
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            serde_json::json!({"id": format!("b{}", i + 1), "label": "text",
+                "bbox": [0, 0, 10, 10], "text": text})
+        })
+        .collect();
+    let note: NoteState = serde_json::from_value(serde_json::json!({
+        "key": key,
+        "path": format!("NOTE/Note/{title}.note"),
+        "title": title,
+        "pages": [
+            {"pageId": "P0", "position": 0, "seq": 1, "blocks": []},
+            {"pageId": "P1#2", "position": 1, "seq": 2, "blocks": blocks},
+        ],
+    }))
+    .unwrap();
+    let lock = WriterLock::take(data).unwrap();
+    let store = TextStore::open_writer(data, "tester", &lock).unwrap();
+    store.save_note(&lock, &note).unwrap();
+}
+
+#[cfg(feature = "ocr")]
+fn pipeline_search(data: &std::path::Path, query: &str) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["pipeline", "search", "--data"])
+        .arg(data)
+        .args(["--account", "tester", "--query", query])
+        .output()
+        .unwrap()
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn pipeline_search_prints_hits_as_json() {
+    let dir = data_with_an_account();
+    save_note(
+        dir.path(),
+        "F1",
+        "Ideas",
+        &["Buy milk", "The plan\nfor Monday"],
+    );
+    save_note(dir.path(), "F2", "Shop", &["Planet and plans"]);
+    let out = pipeline_search(dir.path(), "PLAN");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        hits,
+        serde_json::json!([{
+            "anchor": "notedown://tester/F1/P1#2#b2",
+            "note": "Ideas",
+            "page": 2,
+            "context": "The plan",
+        }])
+    );
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn pipeline_search_refuses_an_empty_query() {
+    let dir = data_with_an_account();
+    let out = pipeline_search(dir.path(), " -- ");
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("give at least one word"), "{err}");
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn pipeline_search_creates_nothing() {
+    let dir = data_with_an_account();
+    let before: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    let out = pipeline_search(dir.path(), "plan");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[]");
+    let after: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(before, after);
+    assert!(!dir.path().join("pipeline").exists());
+}
+
+/// `pipeline search` with `args` after the data folder and the account.
+#[cfg(feature = "ocr")]
+fn pipeline_search_with(data: &std::path::Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["pipeline", "search", "--data"])
+        .arg(data)
+        .args(["--account", "tester"])
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// The app passes the query as one argument, `--query=<text>`: a text that starts with `-` or
+/// holds a space stays the query.
+#[cfg(feature = "ocr")]
+#[test]
+fn pipeline_search_takes_the_query_in_one_argument() {
+    let dir = data_with_an_account();
+    save_note(dir.path(), "F1", "Ideas", &["The plan", "two words here"]);
+    for (arg, block) in [
+        ("--query=-plan", "b1"),
+        ("--query=--plan", "b1"),
+        ("--query=two words", "b2"),
+    ] {
+        let out = pipeline_search_with(dir.path(), &[arg]);
+        assert!(
+            out.status.success(),
+            "{arg}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let anchors: Vec<&str> = hits
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["anchor"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            anchors,
+            [format!("notedown://tester/F1/P1#2#{block}")],
+            "{arg}"
+        );
+    }
+}
+
+/// An option after `--query` is never taken as the query: the call fails and says so.
+#[cfg(feature = "ocr")]
+#[test]
+fn pipeline_search_never_takes_an_option_as_the_query() {
+    let dir = data_with_an_account();
+    for args in [&["--query", "--limit", "5"][..], &["--query", "-plan"][..]] {
+        let out = pipeline_search_with(dir.path(), args);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+    }
+}
+
+/// Saves note `key` with page 1 read (one block per text) and page 2 still waiting for the
+/// OCR into the store of `tester`.
+#[cfg(feature = "ocr")]
+fn save_half_read_note(data: &std::path::Path, key: &str, title: &str, texts: &[&str]) {
+    use notedown_pipeline::model::NoteState;
+    use notedown_pipeline::store::{TextStore, WriterLock};
+    let blocks: Vec<serde_json::Value> = texts
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            serde_json::json!({"id": format!("b{}", i + 1), "label": "text",
+                "bbox": [0, 0, 10, 10], "text": text})
+        })
+        .collect();
+    let note: NoteState = serde_json::from_value(serde_json::json!({
+        "key": key,
+        "path": format!("NOTE/Note/{title}.note"),
+        "title": title,
+        "pages": [
+            {"pageId": "P1", "position": 0, "seq": 1, "state": "done", "blocks": blocks},
+            {"pageId": "P2", "position": 1, "state": "pending", "blocks": []},
+        ],
+    }))
+    .unwrap();
+    let lock = WriterLock::take(data).unwrap();
+    let store = TextStore::open_writer(data, "tester", &lock).unwrap();
+    store.save_note(&lock, &note).unwrap();
+}
+
+#[cfg(feature = "ocr")]
+fn pipeline_note(data: &std::path::Path, key: &str) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_notedown"))
+        .args(["pipeline", "note", "--data"])
+        .arg(data)
+        .args(["--account", "tester", "--key", key])
+        .output()
+        .unwrap()
+}
+
+/// The lines of a Markdown document without the `generated:` line of its frontmatter.
+#[cfg(feature = "ocr")]
+fn without_generated(text: &str) -> Vec<&str> {
+    let mut fences = 0;
+    text.split('\n')
+        .filter(|line| {
+            if *line == "---" {
+                fences += 1;
+            }
+            !(fences == 1 && line.starts_with("generated:"))
+        })
+        .collect()
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn pipeline_note_prints_the_markdown_file_text() {
+    let dir = data_with_an_account();
+    save_half_read_note(
+        dir.path(),
+        "F1",
+        "Plan",
+        &["The plan\nfor Monday", "Buy milk"],
+    );
+    let out = pipeline_note(dir.path(), "F1");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let printed = String::from_utf8(out.stdout).unwrap();
+
+    // What the Markdown folder writer writes for the same note.
+    let md = tempfile::tempdir().unwrap();
+    let store = notedown_pipeline::store::TextStore::at(dir.path(), "tester").unwrap();
+    let mut writer =
+        notedown_pipeline::markdown::Writer::new(md.path(), &md.path().join("manifest.json"))
+            .unwrap();
+    writer.sync(&store, "tester", &[]).unwrap();
+    let file = std::fs::read_to_string(md.path().join("Plan.md")).unwrap();
+
+    assert_eq!(without_generated(&printed), without_generated(&file));
+    assert!(printed.contains("<!-- notedown://tester/F1/P1#b1 -->\nThe plan\nfor Monday"));
+    // The page that waits for the OCR is there with its id and no text.
+    assert!(
+        printed.ends_with("## Page 2\n<!-- page_id: P2 -->\n"),
+        "{printed}"
+    );
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn pipeline_note_of_an_unknown_key_fails() {
+    let dir = data_with_an_account();
+    save_half_read_note(dir.path(), "F1", "Plan", &["The plan"]);
+    let out = pipeline_note(dir.path(), "F9");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("error: no note F9"), "{err}");
+
+    // A deleted note is no note either.
+    {
+        use notedown_pipeline::store::{TextStore, WriterLock};
+        let lock = WriterLock::take(dir.path()).unwrap();
+        let store = TextStore::open_writer(dir.path(), "tester", &lock).unwrap();
+        let mut note = store.note("F1").unwrap().unwrap();
+        note.deleted = true;
+        store.save_note(&lock, &note).unwrap();
+    }
+    let out = pipeline_note(dir.path(), "F1");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("error: no note F1"), "{err}");
 }

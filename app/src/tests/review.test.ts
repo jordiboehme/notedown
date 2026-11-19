@@ -19,7 +19,21 @@ vi.mock("@tauri-apps/api/core", () => ({
   }),
 }));
 
-const { reviewPages, pageAt, syncTop, reviewNotice, nearPages, noteTitle, syncGuard, PORTRAIT } = await import("../library/review");
+const {
+  reviewPages,
+  pageAt,
+  syncTop,
+  reviewNotice,
+  nearPages,
+  noteTitle,
+  syncGuard,
+  concernsNote,
+  findBlock,
+  keepsHit,
+  canSaveMarkdown,
+  noteMenu,
+  PORTRAIT,
+} = await import("../library/review");
 const { ReviewSession } = await import("../library/session.svelte");
 const { openAt } = await import("../library/view");
 const ReviewPages = (await import("../library/ReviewPages.svelte")).default;
@@ -43,10 +57,21 @@ const PATH = "NOTE/Note/Work/Plan.note";
 function view(states: NoteView["pages"][number]["state"][], catchingUp = false): NoteView {
   return {
     key: "k1",
+    md5: "m1",
     path: PATH,
     title: "Plan",
     catchingUp,
-    pages: states.map((state, index) => ({ index, state, markdown: state === "done" ? `# Page ${index + 1}` : "", landscape: false })),
+    pages: states.map((state, index) => {
+      const markdown = state === "done" ? `# Page ${index + 1}` : "";
+      return {
+        index,
+        pageId: `P${index}`,
+        state,
+        markdown,
+        blocks: markdown === "" ? [] : [{ id: `b${index}`, text: markdown }],
+        landscape: false,
+      };
+    }),
   };
 }
 
@@ -68,7 +93,7 @@ describe("reviewPages", () => {
     expect(rows[0].markdown).toBe("# Page 1");
     expect(rows.map((r) => r.stateText)).toEqual([
       null,
-      "Not read yet.",
+      "Waiting for the OCR.",
       "Notedown could not read this page.",
       "The text of this page was cut short.",
     ]);
@@ -95,6 +120,67 @@ describe("reviewPages", () => {
   it("says when Notedown still reads the note", () => {
     expect(reviewNotice(view(["done"], true))).toBe("Notedown is still reading this note.");
     expect(reviewNotice(view(["done"]))).toBeNull();
+  });
+
+  it("says the OCR is paused, in the words of the status line, while a pause holds", () => {
+    expect(reviewNotice(view(["done", "pending"], true), "OCR paused until 14:32")).toBe("OCR paused until 14:32");
+    expect(reviewNotice(view(["done"]), "OCR paused until 14:32")).toBeNull();
+    expect(reviewNotice(view(["done", "pending"], true), null)).toBe("Notedown is still reading this note.");
+  });
+});
+
+describe("the blocks of the review", () => {
+  it("reviewPages carries the page id and the blocks", () => {
+    const note = view(["done", "pending"]);
+    note.pages[0].blocks = [
+      { id: "b1", text: "One" },
+      { id: "b2", text: "Two" },
+    ];
+    const rows = reviewPages(note);
+    expect(rows.map((r) => r.pageId)).toEqual(["P0", "P1"]);
+    expect(rows[0].blocks).toEqual([
+      { id: "b1", text: "One" },
+      { id: "b2", text: "Two" },
+    ]);
+    expect(rows[1].blocks).toEqual([]);
+  });
+
+  it("findBlock finds the page and the block", () => {
+    const note = view(["done", "done", "done"]);
+    note.pages[1].pageId = "P1#2";
+    note.pages[1].blocks = [
+      { id: "b4", text: "x" },
+      { id: "b5", text: "y" },
+    ];
+    const rows = reviewPages(note);
+    expect(findBlock(rows, { pageId: "P1#2", blockId: "b5" })).toEqual({ index: 1, blockId: "b5" });
+    // A block that is gone gives its page.
+    expect(findBlock(rows, { pageId: "P1#2", blockId: "b9" })).toEqual({ index: 1, blockId: null });
+    // A page that is gone gives nothing.
+    expect(findBlock(rows, { pageId: "P7", blockId: "b5" })).toBeNull();
+  });
+
+  it("the mark of a hit stays while the text side is where the window put it", () => {
+    expect(keepsHit(300, 300)).toBe(true);
+    expect(keepsHit(300, 300.6)).toBe(true);
+    // Any other scroll is the user's: by wheel, keys, the scroll bar or the pages side.
+    expect(keepsHit(300, 340)).toBe(false);
+    expect(keepsHit(300, 0)).toBe(false);
+  });
+
+  it("the text side has one block per pre inside its page", () => {
+    const note = view(["done", "pending"]);
+    note.pages[0].blocks = [
+      { id: "b1", text: "One" },
+      { id: "b2", text: "Two" },
+    ];
+    const body = render(ReviewPages, {
+      props: { rows: reviewPages(note), images: {}, onSeen: () => {}, onMeasured: () => {} },
+    }).body;
+    const text = body.slice(body.indexOf('aria-label="Text"'));
+    expect(text.match(/data-page="0"/g)).toHaveLength(1);
+    expect(text.match(/data-page="1"/g)).toHaveLength(1);
+    expect(text).toMatch(/data-page="0"[\s\S]*<pre[^>]*data-block="b1"[^>]*>One<\/pre>[\s\S]*<pre[^>]*data-block="b2"[^>]*>Two<\/pre>[\s\S]*data-page="1"/);
   });
 });
 
@@ -149,6 +235,20 @@ describe("syncGuard", () => {
   });
 });
 
+describe("concernsNote", () => {
+  it("reloads a review only for an event that names its note", () => {
+    expect(concernsNote({ paths: [PATH] }, PATH)).toBe(true);
+    expect(concernsNote({ paths: ["NOTE/Note/Other.note", PATH] }, PATH)).toBe(true);
+    expect(concernsNote({ paths: ["NOTE/Note/Other.note"] }, PATH)).toBe(false);
+    // A change of the lists alone (a note marked seen) names no note.
+    expect(concernsNote({ paths: [] }, PATH)).toBe(false);
+  });
+
+  it("reloads for an event it cannot read", () => {
+    for (const odd of [null, undefined, {}, { paths: "x" }, "notes"]) expect(concernsNote(odd, PATH)).toBe(true);
+  });
+});
+
 describe("nearPages", () => {
   it("is one page above the view and two below, and keeps four on each side", () => {
     expect(nearPages([4, 5], 20)).toEqual({ near: [3, 7], keep: [0, 9] });
@@ -172,7 +272,7 @@ describe("openAt", () => {
 });
 
 describe("the review session", () => {
-  async function opened(states = Array.from({ length: 12 }, () => "done" as const)) {
+  async function opened(states: NoteView["pages"][number]["state"][] = Array.from({ length: 12 }, () => "done" as const)) {
     answerNow("note_open", view(states));
     const session = new ReviewSession(PATH);
     await session.open();
@@ -187,6 +287,34 @@ describe("the review session", () => {
     ]);
     expect(session.view?.title).toBe("Plan");
     expect(session.error).toBeNull();
+  });
+
+  it("opened at a block, it names the block once: a reload does not scroll again", async () => {
+    answerNow("note_open", view(["done", "done"]));
+    const session = new ReviewSession(PATH, { pageId: "P1", blockId: "b1" });
+    await session.open();
+    expect(session.target).toEqual({ index: 1, blockId: "b1" });
+    session.target = null;
+    answerNow("note_open", view(["done", "done"]));
+    await session.reload();
+    expect(session.target).toBeNull();
+  });
+
+  it("opened at a block of a gone page, it names nothing", async () => {
+    answerNow("note_open", view(["done"]));
+    const session = new ReviewSession(PATH, { pageId: "P5", blockId: "b1" });
+    await session.open();
+    expect(session.target).toBeNull();
+  });
+
+  it("opened at a block after a failed open, the first good read names it", async () => {
+    answerError("note_open", "Notedown could not read the note.");
+    const session = new ReviewSession(PATH, { pageId: "P0", blockId: "b9" });
+    await session.open();
+    expect(session.target).toBeNull();
+    answerNow("note_open", view(["done"]));
+    await session.reload();
+    expect(session.target).toEqual({ index: 0, blockId: null });
   });
 
   it("shows why a note cannot be opened, and marks nothing", async () => {
@@ -326,6 +454,201 @@ describe("the review session", () => {
     expect(asked("note_page_image")).toEqual([0, 1, 2]);
   });
 
+  /** Answers every page image asked so far with a URL that names the page. */
+  async function showAll() {
+    for (const [index, call] of pending) call.resolve(`data:image/png;base64,P${index}`);
+    pending.clear();
+    await flush();
+  }
+
+  it("reload keeps the images of the pages that stay", async () => {
+    const session = await opened(["done", "pending", "done", "done"]);
+    session.seen(0, true);
+    session.measured(1, 1872, 1404);
+    await showAll();
+    expect(asked("note_page_image")).toEqual([0, 1, 2]);
+    // The OCR read page 2 and a page was inserted before page 3.
+    const next = view(["done", "done", "done", "done", "done"]);
+    next.pages[2].pageId = "PX";
+    answerNow("note_open", next);
+    await session.reload();
+    expect(session.view).toEqual(next);
+    expect(session.images[0]).toEqual({ state: "shown", url: "data:image/png;base64,P0" });
+    expect(session.images[1]).toEqual({ state: "shown", url: "data:image/png;base64,P1" });
+    // Another page at index 2: its old image goes and it is asked again.
+    expect(session.images[2]).toEqual({ state: "loading" });
+    expect(asked("note_page_image")).toEqual([0, 1, 2, 2]);
+    // The ratio of a page that stayed is kept.
+    expect(reviewPages(session.view!, session.ratios)[1].ratio).toBeCloseTo(1872 / 1404);
+  });
+
+  it("reload drops every image when the file is another version", async () => {
+    const session = await opened(["done", "done", "done"]);
+    session.seen(0, true);
+    session.measured(0, 1872, 1404);
+    await showAll();
+    // The same pages, but more strokes on them: the images are of the old file.
+    answerNow("note_open", { ...view(["done", "done", "done"]), md5: "m2" });
+    await session.reload();
+    expect(session.images).toEqual({ 0: { state: "loading" }, 1: { state: "loading" }, 2: { state: "loading" } });
+    expect(asked("note_page_image")).toEqual([0, 1, 2, 0, 1, 2]);
+    // The ratio of a page that stayed is kept.
+    expect(session.ratios[0]).toBeCloseTo(1872 / 1404);
+  });
+
+  it("reload drops images past a shorter note", async () => {
+    const session = await opened(["done", "done", "done"]);
+    session.seen(0, true);
+    await showAll();
+    answerNow("note_open", view(["done", "done"]));
+    await session.reload();
+    expect(session.view?.pages.length).toBe(2);
+    expect(Object.keys(session.images)).toEqual(["0", "1"]);
+    expect(asked("note_page_drop")).toEqual([]);
+  });
+
+  it("reload ends the call of a page that went while it loads", async () => {
+    const session = await opened(["done", "done", "done"]);
+    session.seen(0, true);
+    answerNow("note_open", view(["done"]));
+    await session.reload();
+    expect(asked("note_page_drop")).toEqual([1, 2]);
+    expect(Object.keys(session.images)).toEqual(["0"]);
+  });
+
+  it("a failed reload keeps the view and says why", async () => {
+    const session = await opened(["done", "pending"]);
+    const before = session.view;
+    expect(session.stale).toBeNull();
+    answerError("note_open", "This note is not there anymore.");
+    await session.reload();
+    expect(session.view).toBe(before);
+    expect(session.error).toBeNull();
+    expect(session.stale).toBe("This view is not up to date. This note is not there anymore.");
+    // A reload that works again ends the line.
+    answerNow("note_open", view(["done", "pending"]));
+    await session.reload();
+    expect(session.stale).toBeNull();
+  });
+
+  it("asks for no new page image while the view is not up to date", async () => {
+    const session = await opened();
+    session.seen(0, true);
+    expect(asked("note_page_image")).toEqual([0, 1, 2]);
+    answerError("note_open", "The connection to the server was cut.");
+    await session.reload();
+    // Far down: the pages there would come from a file the text may not match.
+    session.seen(0, false);
+    session.seen(9, true);
+    expect(asked("note_page_image")).toEqual([0, 1, 2]);
+    // Far pages still go.
+    expect(asked("note_page_drop")).toEqual([0, 1, 2]);
+    answerNow("note_open", view(Array.from({ length: 12 }, () => "done" as const)));
+    await session.reload();
+    expect(asked("note_page_image")).toEqual([0, 1, 2, 8, 9, 10, 11]);
+  });
+
+  it("tries a failed open again when the window gets the focus", async () => {
+    answerError("note_open", "The file did not arrive whole. Try again.");
+    const session = new ReviewSession(PATH);
+    await session.open();
+    expect(session.error).toBe("The file did not arrive whole. Try again.");
+    answerNow("note_open", view(["done"]));
+    session.refresh();
+    await flush();
+    expect(session.error).toBeNull();
+    expect(session.view?.pages).toHaveLength(1);
+    expect(calls.filter((c) => c.command === "note_open")).toHaveLength(2);
+    // With a view that is up to date, the focus reads nothing again.
+    session.refresh();
+    await flush();
+    expect(calls.filter((c) => c.command === "note_open")).toHaveLength(2);
+  });
+
+  it("a failed open has a Try Again button that opens the note again", async () => {
+    const source = (await import("../library/Review.svelte?raw")).default as string;
+    expect(source).toContain('onclick={() => void session.reload()}>Try Again</button>');
+    answerError("note_open", "The file did not arrive whole. Try again.");
+    const session = new ReviewSession(PATH);
+    await session.open();
+    answerNow("note_open", view(["done"]));
+    await session.reload();
+    expect(session.error).toBeNull();
+    expect(asked("note_seen")).toHaveLength(1);
+  });
+
+  it("tries a failed reload again when the window gets the focus", async () => {
+    const session = await opened(["done"]);
+    answerError("note_open", "The connection to the server was cut.");
+    await session.reload();
+    expect(session.stale).not.toBeNull();
+    answerNow("note_open", view(["done"]));
+    session.refresh();
+    await flush();
+    expect(session.stale).toBeNull();
+    expect(calls.filter((c) => c.command === "note_open")).toHaveLength(3);
+  });
+
+  it("a reload the window ended itself is no reason to show", async () => {
+    const session = await opened(["done"]);
+    answerError("note_open", "The review was closed.");
+    await session.reload();
+    expect(session.stale).toBeNull();
+  });
+
+  it("marks new text seen after a reload, and nothing without new text", async () => {
+    const session = await opened(["done", "pending"]);
+    expect(asked("note_seen")).toHaveLength(1);
+    answerNow("note_open", view(["done", "pending"]));
+    await session.reload();
+    expect(asked("note_seen")).toHaveLength(1);
+    answerNow("note_open", view(["done", "done"]));
+    await session.reload();
+    expect(asked("note_seen")).toHaveLength(2);
+    expect(calls.at(-1)).toEqual({ command: "note_seen", args: { key: "k1" } });
+  });
+
+  it("no note_seen for a note without a key", async () => {
+    const unread = { ...view(["pending", "pending"]), key: null };
+    answerNow("note_open", unread);
+    const session = new ReviewSession(PATH);
+    await session.open();
+    expect(session.view).toEqual(unread);
+    answerNow("note_open", { ...view(["done", "pending"]), key: null });
+    await session.reload();
+    expect(session.view?.pages[0].markdown).toBe("# Page 1");
+    expect(asked("note_seen")).toEqual([]);
+    // The store came to know the note: its text is seen.
+    answerNow("note_open", view(["done", "done"]));
+    await session.reload();
+    expect(calls.filter((c) => c.command === "note_seen").map((c) => c.args)).toEqual([{ key: "k1" }]);
+  });
+
+  it("reloads asked for while one runs give one more, and an older answer never wins", async () => {
+    const session = await opened(["pending"]);
+    const releases: ((value: unknown) => void)[] = [];
+    const held = () => new Promise((resolve) => releases.push(resolve));
+    answers.set("note_open", [held, held, held]);
+    const first = session.reload();
+    const second = session.reload();
+    const third = session.reload();
+    expect(calls.filter((c) => c.command === "note_open")).toHaveLength(2);
+    releases[0](view(["done"]));
+    await flush();
+    expect(calls.filter((c) => c.command === "note_open")).toHaveLength(3);
+    releases[1](view(["done", "done"]));
+    await Promise.all([first, second, third]);
+    expect(calls.filter((c) => c.command === "note_open")).toHaveLength(3);
+    expect(session.view?.pages.length).toBe(2);
+  });
+
+  it("a reload after the close does nothing", async () => {
+    const session = await opened(["pending"]);
+    session.close();
+    await session.reload();
+    expect(calls.filter((c) => c.command === "note_open")).toHaveLength(1);
+  });
+
   it("a note opened while the session closed is not marked seen", async () => {
     let release: (value: unknown) => void = () => {};
     answers.set("note_open", [() => new Promise((resolve) => (release = resolve))]);
@@ -339,11 +662,110 @@ describe("the review session", () => {
   });
 });
 
+describe("Save Markdown", () => {
+  it("canSaveMarkdown needs a page with text", () => {
+    expect(canSaveMarkdown(null)).toBe(false);
+    expect(canSaveMarkdown(view([]))).toBe(false);
+    expect(canSaveMarkdown(view(["pending", "pending", "failed"]))).toBe(false);
+    expect(canSaveMarkdown(view(["pending", "done"]))).toBe(true);
+    // A page whose text is only blanks has no text.
+    const blank = view(["done"]);
+    blank.pages[0].markdown = "  \n ";
+    expect(canSaveMarkdown(blank)).toBe(false);
+  });
+
+  const shown = () => calls.filter((c) => c.command === "review_shown").map((c) => c.args);
+
+  it("the review tells Rust what it shows", async () => {
+    answerNow("note_open", view(["pending", "pending"]));
+    const session = new ReviewSession(PATH);
+    await session.open();
+    expect(shown()).toEqual([{ path: PATH, canSave: false }]);
+    // A reload without new text says nothing new.
+    answerNow("note_open", view(["pending", "pending"]));
+    await session.reload();
+    expect(shown()).toHaveLength(1);
+    // The first text came: the note can be saved now.
+    answerNow("note_open", view(["done", "pending"]));
+    await session.reload();
+    expect(shown()).toEqual([
+      { path: PATH, canSave: false },
+      { path: PATH, canSave: true },
+    ]);
+    session.close();
+    expect(shown()).toEqual([
+      { path: PATH, canSave: false },
+      { path: PATH, canSave: true },
+      { path: null, canSave: false },
+    ]);
+  });
+
+  it("a search over the review hides it from the File menu until the search goes", async () => {
+    answerNow("note_open", view(["done"]));
+    const session = new ReviewSession(PATH);
+    await session.open();
+    session.cover(true);
+    // Covered twice says nothing new.
+    session.cover(true);
+    expect(shown()).toEqual([
+      { path: PATH, canSave: true },
+      { path: null, canSave: false },
+    ]);
+    // New text while covered: the menu still has nothing to save.
+    answerNow("note_open", view(["done", "done"]));
+    await session.reload();
+    expect(shown()).toHaveLength(2);
+    session.cover(false);
+    expect(shown()).toEqual([
+      { path: PATH, canSave: true },
+      { path: null, canSave: false },
+      { path: PATH, canSave: true },
+    ]);
+  });
+
+  it("a review covered before its note came tells Rust only once it is shown", async () => {
+    answerNow("note_open", view(["done"]));
+    const session = new ReviewSession(PATH);
+    session.cover(true);
+    await session.open();
+    expect(shown()).toEqual([]);
+    session.cover(false);
+    expect(shown()).toEqual([{ path: PATH, canSave: true }]);
+  });
+
+  it("a note's context menu is Rust's: the window names the note", () => {
+    const event = { preventDefault: vi.fn() };
+    noteMenu(event, PATH);
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(calls).toEqual([{ command: "library_menu", args: { target: { kind: "note", path: PATH } } }]);
+  });
+
+  it("a failed open tells Rust nothing", async () => {
+    answerError("note_open", "The note is gone.");
+    const session = new ReviewSession(PATH);
+    await session.open();
+    expect(shown()).toEqual([]);
+  });
+
+  it("an open that answers after the close does not show the note again", async () => {
+    let release: (value: unknown) => void = () => {};
+    answers.set("note_open", [() => new Promise((resolve) => (release = resolve))]);
+    const session = new ReviewSession(PATH);
+    const opening = session.open();
+    session.close();
+    release(view(["done"]));
+    await opening;
+    expect(shown()).toEqual([{ path: null, canSave: false }]);
+  });
+});
+
 describe("note text", () => {
   it("stays text: no HTML from a note is inserted", () => {
     const note = view(["done", "done"]);
     note.pages[0].markdown = '<img src=x onerror="alert(1)"> and <script>alert(2)</script>';
+    note.pages[0].blocks = [{ id: "b0", text: note.pages[0].markdown }];
     note.pages[1].markdown = "**bold** [link](javascript:alert(3))";
+    note.pages[1].blocks = [{ id: "b1", text: note.pages[1].markdown }];
     const body = render(ReviewPages, {
       props: {
         rows: reviewPages(note),

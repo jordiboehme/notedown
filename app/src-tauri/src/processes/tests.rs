@@ -5,17 +5,21 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::*;
 use crate::config::Mode;
+use crate::pause::OcrPause;
 use crate::pidfile::tests::Orphan;
 use crate::probe::test_server::{TestServer, free_port, notedown_401};
 use crate::supervisor::system_clock;
 
 const GRACE: Duration = Duration::from_millis(200);
-const WAIT: Duration = Duration::from_secs(10);
+const WAIT: Duration = crate::test_procs::HANG_GUARD;
+/// The start of the injected clock of [`Rig::paused_processes`].
+pub(crate) const NOW: u64 = 1_763_300_000_000;
+const MIN: u64 = 60_000;
 
 /// The server's fake: the start lines of `serve`, then it waits.
 const SERVE: &str = "echo 'notedown cloud server'
@@ -28,16 +32,20 @@ exec /bin/sleep 311";
 /// The pipeline's fake.
 const PIPELINE: &str = "exec /bin/sleep 312";
 
-struct Rig {
-    dir: tempfile::TempDir,
+pub(crate) struct Rig {
+    pub(crate) dir: tempfile::TempDir,
     spawned: Arc<AtomicUsize>,
+    pipeline_spawned: Arc<AtomicUsize>,
+    now: Arc<AtomicU64>,
 }
 
 impl Rig {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let rig = Self {
             dir: tempfile::tempdir().unwrap(),
             spawned: Arc::new(AtomicUsize::new(0)),
+            pipeline_spawned: Arc::new(AtomicUsize::new(0)),
+            now: Arc::new(AtomicU64::new(NOW)),
         };
         std::fs::create_dir_all(rig.data()).unwrap();
         std::fs::write(rig.dir.path().join("serve.sh"), SERVE).unwrap();
@@ -59,6 +67,41 @@ impl Rig {
         .unwrap();
     }
 
+    /// The pipeline's fake writes `<data>/ready` once its TERM trap is set, and adds a line
+    /// to `<data>/term` when a SIGTERM reaches it.
+    pub(crate) fn trap_term(&self) {
+        std::fs::write(
+            self.dir.path().join("pipeline.sh"),
+            "trap 'echo term >> \"$3/term\"; exit 0' TERM\n\
+             echo ready > \"$3/ready\"\n\
+             /bin/sleep 314 &\n\
+             wait\n",
+        )
+        .unwrap();
+    }
+
+    /// Whether a SIGTERM reached a pipeline.
+    pub(crate) fn got_term(&self) -> bool {
+        self.data().join("term").exists()
+    }
+
+    /// Waits until a pipeline of [`trap_term`](Self::trap_term) set its trap, and clears the
+    /// mark for the next one.
+    pub(crate) fn wait_ready(&self) {
+        let ready = self.data().join("ready");
+        assert!(wait_until(|| ready.exists()), "the pipeline is not ready");
+        std::fs::remove_file(ready).unwrap();
+    }
+
+    /// How many pipelines were spawned.
+    pub(crate) fn pipeline_spawns(&self) -> usize {
+        self.pipeline_spawned.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_now(&self, ms: u64) {
+        self.now.store(ms, Ordering::SeqCst);
+    }
+
     fn data(&self) -> PathBuf {
         self.dir.path().join("data")
     }
@@ -68,7 +111,7 @@ impl Rig {
     }
 
     /// Points `server.toml` at `port` on loopback.
-    fn listen_on(&self, port: u16) {
+    pub(crate) fn listen_on(&self, port: u16) {
         std::fs::write(
             self.data().join("server.toml"),
             format!("listen = [\"127.0.0.1:{port}\"]\n"),
@@ -76,7 +119,7 @@ impl Rig {
         .unwrap();
     }
 
-    fn config(&self) -> AppConfig {
+    pub(crate) fn config(&self) -> AppConfig {
         AppConfig {
             mode: Mode::Local,
             data_dir: self.data(),
@@ -86,13 +129,29 @@ impl Rig {
 
     /// Runs `serve.sh` or `pipeline.sh` after the subcommand, and counts the spawns.
     fn processes(&self, sidecar: &Path) -> Processes {
+        self.processes_with(sidecar, system_clock())
+    }
+
+    /// [`processes`](Self::processes) on the rig's own clock, which only
+    /// [`set_now`](Self::set_now) moves; it starts at [`NOW`].
+    pub(crate) fn paused_processes(&self) -> Processes {
+        let now = self.now.clone();
+        self.processes_with(
+            Path::new("/bin/sleep"),
+            Arc::new(move || now.load(Ordering::SeqCst)),
+        )
+    }
+
+    fn processes_with(&self, sidecar: &Path, clock: Clock) -> Processes {
         let dir = self.dir.path().to_path_buf();
         let spawned = self.spawned.clone();
+        let pipeline_spawned = self.pipeline_spawned.clone();
         let spawn: SpawnFn = Arc::new(move |args: &[String]| {
             spawned.fetch_add(1, Ordering::SeqCst);
             let script = if args[0] == "serve" {
                 "serve.sh"
             } else {
+                pipeline_spawned.fetch_add(1, Ordering::SeqCst);
                 "pipeline.sh"
             };
             let mut cmd = Command::new("/bin/sh");
@@ -101,7 +160,7 @@ impl Rig {
         });
         Processes::new(Options {
             spawn,
-            clock: system_clock(),
+            clock,
             sidecar: sidecar.to_path_buf(),
             run_dir: self.run_dir(),
             parent: std::process::id(),
@@ -111,7 +170,7 @@ impl Rig {
     }
 }
 
-fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+pub(crate) fn wait_until(mut done: impl FnMut() -> bool) -> bool {
     let until = Instant::now() + WAIT;
     while Instant::now() < until {
         if done() {
@@ -122,7 +181,7 @@ fn wait_until(mut done: impl FnMut() -> bool) -> bool {
     done()
 }
 
-fn wait_for(sup: &ProcessSupervisor, want: impl Fn(&ChildState) -> bool) -> ChildState {
+pub(crate) fn wait_for(sup: &ProcessSupervisor, want: impl Fn(&ChildState) -> bool) -> ChildState {
     let mut last = sup.state();
     assert!(
         wait_until(|| {
@@ -135,7 +194,7 @@ fn wait_for(sup: &ProcessSupervisor, want: impl Fn(&ChildState) -> bool) -> Chil
     last
 }
 
-fn running_pid(sup: &ProcessSupervisor) -> u32 {
+pub(crate) fn running_pid(sup: &ProcessSupervisor) -> u32 {
     match wait_for(sup, |s| matches!(s, ChildState::Running { .. })) {
         ChildState::Running { pid, .. } => pid,
         _ => unreachable!(),
@@ -148,7 +207,7 @@ fn outside(what: &str) -> ChildState {
     }
 }
 
-fn alive(pid: u32) -> bool {
+pub(crate) fn alive(pid: u32) -> bool {
     // SAFETY: signal 0 only checks that the process exists.
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
@@ -574,5 +633,199 @@ fn a_log_in_and_a_log_out_restart_the_pipeline() {
     );
     assert!(!got(&p)[2].contains("--markdown-dir"), "{:?}", got(&p));
     assert_ne!(running_pid(p.pipeline()), second);
+    p.stop_all();
+}
+
+/// A pause until resumed, or until `until_ms`.
+pub(crate) fn pause(until_ms: Option<u64>) -> Option<OcrPause> {
+    Some(OcrPause { until_ms })
+}
+
+#[test]
+fn a_paused_pipeline_does_not_start_on_start_with() {
+    let rig = Rig::new();
+    rig.listen_on(free_port());
+    let p = rig.paused_processes();
+    for until in [None, Some(NOW + MIN)] {
+        p.start_with(|| AppConfig {
+            ocr_pause: pause(until),
+            ..rig.config()
+        });
+        running_pid(p.server());
+        assert_eq!(p.pipeline().state(), ChildState::Stopped, "{until:?}");
+    }
+    // The reprobe finds nothing to start either.
+    p.reprobe_with(|| AppConfig {
+        ocr_pause: pause(None),
+        ..rig.config()
+    });
+    assert_eq!(p.pipeline().state(), ChildState::Stopped);
+    assert_eq!(rig.pipeline_spawns(), 0);
+    p.stop_all();
+}
+
+#[test]
+fn a_pause_kills_the_pipeline_at_once_and_a_resume_starts_it_once() {
+    let rig = Rig::new();
+    rig.listen_on(free_port());
+    rig.trap_term();
+    let p = rig.paused_processes();
+    p.start_with(|| rig.config());
+    let server = running_pid(p.server());
+    let first = running_pid(p.pipeline());
+    rig.wait_ready();
+
+    p.relaunch_pipeline_with(|| AppConfig {
+        ocr_pause: pause(None),
+        ..rig.config()
+    });
+    assert_eq!(p.pipeline().state(), ChildState::Stopped);
+    assert!(!alive(first), "the pipeline still runs");
+    assert!(
+        !rig.got_term(),
+        "the pipeline got a SIGTERM: its page would end first"
+    );
+    assert_eq!(running_pid(p.server()), server);
+
+    p.relaunch_pipeline_with(|| rig.config());
+    let second = running_pid(p.pipeline());
+    assert_ne!(second, first);
+    // Once: the same config again starts nothing.
+    p.relaunch_pipeline_with(|| rig.config());
+    assert_eq!(running_pid(p.pipeline()), second);
+    assert_eq!(rig.pipeline_spawns(), 2);
+    assert_eq!(running_pid(p.server()), server);
+    p.stop_all();
+}
+
+#[test]
+fn a_markdown_folder_change_during_a_pause_keeps_it_paused() {
+    let rig = Rig::new();
+    rig.listen_on(free_port());
+    rig.hold_the_writer_lock(329);
+    let p = rig.paused_processes();
+    let with = |dir: &str| AppConfig {
+        account: Some("jordi".into()),
+        markdown_dirs: [("jordi".to_owned(), PathBuf::from(dir))].into(),
+        ocr_pause: pause(Some(NOW + 5 * MIN)),
+        ..rig.config()
+    };
+    p.start_with(|| with("/a"));
+    running_pid(p.server());
+    p.relaunch_pipeline_with(|| with("/b"));
+    assert_eq!(p.pipeline().state(), ChildState::Stopped);
+    assert_eq!(rig.pipeline_spawns(), 0);
+    // The resume starts it with the new folder.
+    p.relaunch_pipeline_with(|| AppConfig {
+        ocr_pause: None,
+        ..with("/b")
+    });
+    running_pid(p.pipeline());
+    let want = "--markdown-dir jordi=/b";
+    assert!(
+        wait_until(|| p.pipeline().log().iter().any(|l| l.contains(want))),
+        "{:?}",
+        p.pipeline().log()
+    );
+    assert_eq!(rig.pipeline_spawns(), 1);
+    p.stop_all();
+}
+
+#[test]
+fn a_login_during_a_pause_keeps_it_paused() {
+    use crate::commands::ConfigState;
+    let rig = Rig::new();
+    rig.listen_on(free_port());
+    let config_dir = rig.dir.path().join("config");
+    crate::config::save(
+        &config_dir,
+        &AppConfig {
+            ocr_pause: pause(None),
+            ..rig.config()
+        },
+    )
+    .unwrap();
+    let state = ConfigState::load(config_dir);
+    let p = rig.paused_processes();
+    p.start_with(|| state.current());
+    running_pid(p.server());
+    // A log in saves the account, then relaunches the pipeline with its Markdown folder.
+    state
+        .try_update(|c| {
+            c.account = Some("jordi".into());
+            Ok::<(), ()>(())
+        })
+        .ok()
+        .unwrap();
+    p.relaunch_pipeline_with(|| state.current());
+    assert_eq!(p.pipeline().state(), ChildState::Stopped);
+    // And a log out.
+    state.forget_login().unwrap();
+    p.relaunch_pipeline_with(|| state.current());
+    assert_eq!(p.pipeline().state(), ChildState::Stopped);
+    assert_eq!(rig.pipeline_spawns(), 0);
+    p.stop_all();
+}
+
+#[test]
+fn an_expired_pause_starts_the_pipeline_after_a_restart() {
+    let rig = Rig::new();
+    rig.listen_on(free_port());
+    // The pause ended while the app was closed.
+    let config = AppConfig {
+        ocr_pause: pause(Some(NOW - MIN)),
+        ..rig.config()
+    };
+    let p = rig.paused_processes();
+    p.start_with(|| config.clone());
+    running_pid(p.pipeline());
+    assert_eq!(rig.pipeline_spawns(), 1);
+    p.stop_all();
+
+    // A pause that is still on at the start ends at its time: the clock decides.
+    let p = rig.paused_processes();
+    let config = AppConfig {
+        ocr_pause: pause(Some(NOW + MIN)),
+        ..rig.config()
+    };
+    p.start_with(|| config.clone());
+    running_pid(p.server());
+    assert_eq!(p.pipeline().state(), ChildState::Stopped);
+    rig.set_now(NOW + MIN);
+    p.start_with(|| config.clone());
+    running_pid(p.pipeline());
+    assert_eq!(rig.pipeline_spawns(), 2);
+    p.stop_all();
+}
+
+#[test]
+fn a_pause_does_not_hide_another_notedowns_pipeline() {
+    let rig = Rig::new();
+    rig.listen_on(free_port());
+    let lock = rig.data().join("pipeline").join(".writer.lock");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    let writer = std::fs::File::create(&lock).unwrap();
+    writer.try_lock().unwrap();
+    let paused = || AppConfig {
+        ocr_pause: pause(None),
+        ..rig.config()
+    };
+
+    let p = rig.paused_processes();
+    p.start_with(|| rig.config());
+    assert_eq!(p.pipeline().state(), outside("pipeline"));
+    // A pause cannot stop it: it stays outside, also at a start and a reprobe.
+    p.relaunch_pipeline_with(paused);
+    assert_eq!(p.pipeline().state(), outside("pipeline"));
+    p.start_with(paused);
+    assert_eq!(p.pipeline().state(), outside("pipeline"));
+    p.reprobe_with(paused);
+    assert_eq!(p.pipeline().state(), outside("pipeline"));
+
+    // Once it is gone, the pause holds and nothing starts.
+    writer.unlock().unwrap();
+    p.reprobe_with(paused);
+    assert_eq!(p.pipeline().state(), ChildState::Stopped);
+    assert_eq!(rig.pipeline_spawns(), 0);
     p.stop_all();
 }

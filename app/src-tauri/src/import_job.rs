@@ -179,7 +179,7 @@ pub struct UseGuard(ServerUse);
 
 /// An import's hold of the server; it ends when the guard is dropped.
 #[must_use]
-struct HoldGuard(ServerUse);
+pub(crate) struct HoldGuard(ServerUse);
 
 impl ServerUse {
     /// Refused with [`WAIT_FOR_IMPORT`] while an import holds the server.
@@ -190,6 +190,12 @@ impl ServerUse {
         }
         users.using += 1;
         Ok(UseGuard(self.clone()))
+    }
+
+    /// Holds the server as an import does; `None` while a command uses it.
+    #[cfg(test)]
+    pub(crate) fn hold_for_test(&self) -> Option<HoldGuard> {
+        self.try_hold()
     }
 
     /// An import holds the server.
@@ -564,9 +570,36 @@ struct Inner {
     run: Mutex<Run>,
     /// Signals the end of a job's process.
     reaped: Condvar,
-    /// A wait between the end of the process and its reap, so a test can pause in it.
+    /// A gate between the end of the process and its reap, so a test can pause in it.
     #[cfg(test)]
-    after_exit: Mutex<Duration>,
+    after_exit: ExitGate,
+}
+
+/// Holds a job between the end of its process and its reap while a test holds the gate.
+#[cfg(test)]
+#[derive(Default)]
+struct ExitGate {
+    /// (held, a job waits in it)
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+impl ExitGate {
+    /// A job passes: it waits here while the gate is held.
+    fn pass(&self) {
+        let mut state = lock(&self.state);
+        if !state.0 {
+            return;
+        }
+        state.1 = true;
+        self.changed.notify_all();
+        let mut state = self
+            .changed
+            .wait_while(state, |s| s.0)
+            .unwrap_or_else(PoisonError::into_inner);
+        state.1 = false;
+    }
 }
 
 #[derive(Default)]
@@ -634,7 +667,7 @@ impl ImportJobs {
                 run: Mutex::new(Run::default()),
                 reaped: Condvar::new(),
                 #[cfg(test)]
-                after_exit: Mutex::new(Duration::ZERO),
+                after_exit: ExitGate::default(),
             }),
         }
     }
@@ -808,10 +841,31 @@ impl ImportJobs {
         Ok(args)
     }
 
-    /// Makes the end of a job wait `wait` between the end of its process and its reap.
+    /// Makes the end of a job wait between the end of its process and its reap until
+    /// [`release_after_exit`](Self::release_after_exit).
     #[cfg(test)]
-    fn hold_after_exit(&self, wait: Duration) {
-        *lock(&self.inner.after_exit) = wait;
+    fn hold_after_exit(&self) {
+        lock(&self.inner.after_exit.state).0 = true;
+    }
+
+    /// Waits until a job waits in the held gate ([`crate::test_procs::HANG_GUARD`] at most).
+    #[cfg(test)]
+    fn wait_held_after_exit(&self) {
+        let gate = &self.inner.after_exit;
+        let (state, timeout) = gate
+            .changed
+            .wait_timeout_while(lock(&gate.state), crate::test_procs::HANG_GUARD, |s| !s.1)
+            .unwrap_or_else(PoisonError::into_inner);
+        drop(state);
+        assert!(!timeout.timed_out(), "no job ended");
+    }
+
+    /// Lets a held job go on to its reap.
+    #[cfg(test)]
+    fn release_after_exit(&self) {
+        let gate = &self.inner.after_exit;
+        lock(&gate.state).0 = false;
+        gate.changed.notify_all();
     }
 }
 
@@ -993,7 +1047,7 @@ impl Inner {
         // its number still belongs to it.
         wait_ended(child.id());
         #[cfg(test)]
-        std::thread::sleep(*lock(&self.after_exit));
+        self.after_exit.pass();
         {
             let mut run = lock(&self.run);
             run.pgid = None;
@@ -1123,8 +1177,12 @@ impl Inner {
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
-        // No signal after the reap: the group's number may belong to someone else by then.
         drop(run);
+        // What it left in its group (a process forked while a signal was on its way) goes too.
+        // Only a group with a member gets a signal, so its number is still this group's.
+        if !process::kill_group_until_empty(pgid, process::KILL_GUARD) {
+            eprintln!("notedown: the process group {pgid} is still there after the kill");
+        }
     }
 }
 

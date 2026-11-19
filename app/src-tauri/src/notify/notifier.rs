@@ -558,7 +558,7 @@ mod tests {
         // Let it take the status and start waiting.
         std::thread::sleep(Duration::from_millis(368));
         stop.stop();
-        assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)), Ok(()));
+        assert_eq!(done_rx.recv_timeout(crate::test_procs::HANG_GUARD), Ok(()));
         thread.join().unwrap();
     }
 
@@ -592,7 +592,7 @@ mod tests {
         send(&tx, base_status());
         let thread = std::thread::spawn(move || notifier.run(rx));
         let waited = Instant::now();
-        while deliver.shown().is_empty() && waited.elapsed() < Duration::from_secs(5) {
+        while deliver.shown().is_empty() && waited.elapsed() < crate::test_procs::HANG_GUARD {
             std::thread::sleep(Duration::from_millis(367));
         }
         assert_eq!(bodies(&deliver.shown()), ["3 files changed."]);

@@ -15,7 +15,8 @@ export type LicensedModel = { name: string; page: string | null };
 /** One part of the licence line: the models under one licensor and licence. */
 export type LicenceGroup = { models: LicensedModel[]; licensor: string; licence: string };
 
-const HUGGING_FACE = /^https:\/\/huggingface\.co\/[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
+/** A model's page as open_link opens it: https://huggingface.co/<owner>/<model>, plain names. */
+const HUGGING_FACE = /^https:\/\/huggingface\.co\/(?!\.{1,2}\/)[A-Za-z0-9._-]+\/(?!\.{1,2}$)[A-Za-z0-9._-]+$/;
 
 /**
  * The model files grouped by licensor and licence, in their order, each model once: the Qwen

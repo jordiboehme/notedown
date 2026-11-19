@@ -149,9 +149,6 @@ pub enum Reclaimed {
     Stale,
 }
 
-/// How long [`reclaim`] waits for the group to be gone after SIGKILL.
-const GONE_WAIT: Duration = Duration::from_secs(5);
-
 /// Stops a child of an earlier run that the pid file at `path` names (SIGTERM to its group,
 /// SIGKILL after `grace`), then removes the file. A file that names no child of ours is only
 /// removed.
@@ -172,8 +169,12 @@ pub fn reclaim(path: &Path, sidecar: &Path, grace: Duration) -> Reclaimed {
     }
     let _ = crate::process::signal_group(pf.pgid, libc::SIGTERM);
     wait_gone(pf.pgid, grace);
-    let _ = crate::process::signal_group(pf.pgid, libc::SIGKILL);
-    wait_gone(pf.pgid, GONE_WAIT);
+    if !crate::process::kill_group_until_empty(pf.pgid, crate::process::KILL_GUARD) {
+        eprintln!(
+            "notedown: the process group {} is still there after the kill",
+            pf.pgid
+        );
+    }
     remove(path);
     Reclaimed::Stopped { pid: pf.pid }
 }

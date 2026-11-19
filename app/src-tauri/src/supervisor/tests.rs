@@ -644,3 +644,64 @@ fn a_paused_launch_kills_the_child_at_once() {
     assert_eq!(sup.state(), ChildState::Stopped);
     assert_eq!(rig.spawns(), 1);
 }
+
+/// A child that forks without a break while the kill comes: each round starts a long `sleep`
+/// and ends the one before, so a fork is nearly always under way. `<dir>/ready` comes after its
+/// first fork.
+const FORKS_ON: &str = "sleep 3071 &\n\
+     old=$!\n\
+     echo ready > \"$DIR/ready\"\n\
+     while :; do\n\
+       sleep 3071 &\n\
+       new=$!\n\
+       kill $old 2>/dev/null\n\
+       old=$new\n\
+     done";
+
+/// The processes of group `pgid`, as `ps` lists them (zombies too).
+fn members(pgid: u32) -> Vec<String> {
+    let out = Command::new("/bin/ps")
+        .args(["-axo", "pgid=,pid=,stat=,command="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.split_whitespace().next() == Some(pgid.to_string().as_str()))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Asserts that nothing of group `pgid` is left.
+fn group_is_empty(pgid: u32) {
+    assert!(!process::group_alive(pgid), "left: {:?}", members(pgid));
+    assert_eq!(members(pgid), Vec::<String>::new());
+}
+
+#[test]
+fn kill_now_leaves_nothing_of_a_child_that_keeps_forking() {
+    let rig = Rig::new();
+    let script = rig.script("child", FORKS_ON);
+    let sup = rig.supervisor(ChildKind::Pipeline, &script);
+    sup.start(vec![]);
+    let pid = running_pid(&sup);
+    assert!(wait_until(|| rig.path().join("ready").exists()));
+
+    sup.kill_now();
+    assert_eq!(sup.state(), ChildState::Stopped);
+    group_is_empty(pid);
+}
+
+#[test]
+fn stop_leaves_nothing_of_a_child_that_keeps_forking() {
+    let rig = Rig::new();
+    // The shell ignores SIGTERM, so it still forks when the SIGKILL comes after the grace.
+    let script = rig.script("child", &format!("trap '' TERM\n{FORKS_ON}"));
+    let sup = rig.supervisor(ChildKind::Pipeline, &script);
+    sup.start(vec![]);
+    let pid = running_pid(&sup);
+    assert!(wait_until(|| rig.path().join("ready").exists()));
+
+    sup.stop();
+    assert_eq!(sup.state(), ChildState::Stopped);
+    group_is_empty(pid);
+}

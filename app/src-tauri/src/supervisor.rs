@@ -47,8 +47,6 @@ const RESET_AFTER_MS: u64 = 5 * 60 * 1000;
 const DRAIN: Duration = Duration::from_millis(250);
 /// How often a backoff looks at the clock.
 const TICK: Duration = Duration::from_millis(20);
-/// How long a stop waits for the group to be gone after SIGKILL.
-const GONE_WAIT: Duration = Duration::from_secs(5);
 
 /// The state of one supervised child.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -340,11 +338,12 @@ impl Inner {
         if let Some(worker) = worker {
             let _ = worker.join();
         }
-        if let Some(pgid) = pgid {
-            let until = Instant::now() + GONE_WAIT;
-            while process::group_alive(pgid) && Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(5));
-            }
+        // A process forked while the SIGKILL was on its way can have missed it: kill again
+        // until the group is empty, so a stop or a pause leaves nothing of the child running.
+        if let Some(pgid) = pgid
+            && !process::kill_group_until_empty(pgid, process::KILL_GUARD)
+        {
+            eprintln!("notedown: the process group {pgid} is still there after the kill");
         }
         // Only the file of this supervisor's own child: a pid file of an earlier run of the
         // app stays for the start to find.
@@ -483,8 +482,11 @@ impl Inner {
             return None;
         }
 
-        // What the child left in its group goes with it, so it holds no lock or port.
-        let _ = process::signal_group(pid, libc::SIGKILL);
+        // What the child left in its group goes with it, so it holds no lock or port. Killed
+        // until the group is empty: a process forked during the kill can have missed it.
+        if !process::kill_group_until_empty(pid, process::KILL_GUARD) {
+            eprintln!("notedown: the process group {pid} is still there after the kill");
+        }
         self.remove_pid_file();
         let _ = eof_rx.recv_timeout(DRAIN);
         let mut s = lock(&self.shared);

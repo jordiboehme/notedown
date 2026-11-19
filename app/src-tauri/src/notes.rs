@@ -416,6 +416,17 @@ impl Notes {
         by_path(&state).remove(path).map(|n| n.summary.clone())
     }
 
+    /// How many notes are new in the index as it is, without waiting: `None` while a scan
+    /// holds the index (for the main thread, which must not wait for one).
+    pub fn try_new_count(&self) -> Option<usize> {
+        let state = match self.inner.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(new_notes_of(&state).len())
+    }
+
     /// [`at_path`](Self::at_path) without waiting: `None` while a scan holds the index (for
     /// the main thread, which must not wait for one).
     pub fn try_at_path(&self, path: &str) -> Option<Option<NoteSummary>> {

@@ -38,20 +38,27 @@ pub struct MenuEntry {
 #[derive(Default)]
 pub struct MenuTargetState(pub Mutex<Option<MenuTarget>>);
 
-/// The items for `target`; `has_text` says whether a note target has text.
-pub fn context_items(target: &MenuTarget, has_text: bool) -> Vec<MenuEntry> {
+/// The items for `target`; `can` says whether its item has something to do: a note target
+/// has text, or some note is new for the New notes target.
+pub fn context_items(target: &MenuTarget, can: bool) -> Vec<MenuEntry> {
     match target {
         MenuTarget::NewNotes => vec![MenuEntry {
             id: MARK_ALL_SEEN_ID,
             text: "Mark All as Seen",
-            enabled: true,
+            enabled: can,
         }],
         MenuTarget::Note { .. } => vec![MenuEntry {
             id: SAVE_MARKDOWN_ID,
             text: crate::save_markdown::MENU_TEXT,
-            enabled: has_text,
+            enabled: can,
         }],
     }
+}
+
+/// Whether some note is new, as the New notes list shows it. It does not wait for a scan (the
+/// menu opens on the main thread): while one runs the answer is yes.
+pub fn has_new(notes: &Notes) -> bool {
+    notes.try_new_count().is_none_or(|count| count > 0)
 }
 
 /// Whether the notes index knows the note at `path` with text on some page. It does not wait
@@ -67,11 +74,12 @@ pub fn has_text(notes: &Notes, path: &str) -> bool {
 /// kept until the next menu, for [`on_context`].
 pub fn popup<R: Runtime>(window: &WebviewWindow<R>, target: MenuTarget) -> Result<(), String> {
     let app = window.app_handle();
-    let text = match &target {
-        MenuTarget::Note { path } => has_text(&app.state::<Notes>(), path),
-        MenuTarget::NewNotes => false,
+    let notes = app.state::<Notes>();
+    let can = match &target {
+        MenuTarget::Note { path } => has_text(&notes, path),
+        MenuTarget::NewNotes => has_new(&notes),
     };
-    let items = context_items(&target, text);
+    let items = context_items(&target, can);
     if items.is_empty() {
         return Ok(());
     }
@@ -133,10 +141,11 @@ mod tests {
     fn context_items_of_each_target() {
         let entry = |id, text, enabled| MenuEntry { id, text, enabled };
         let table = [
+            // No new notes: the item would do nothing.
             (
                 MenuTarget::NewNotes,
                 false,
-                vec![entry("ctx-mark-all-seen", "Mark All as Seen", true)],
+                vec![entry("ctx-mark-all-seen", "Mark All as Seen", false)],
             ),
             (
                 MenuTarget::NewNotes,
@@ -144,8 +153,8 @@ mod tests {
                 vec![entry("ctx-mark-all-seen", "Mark All as Seen", true)],
             ),
         ];
-        for (target, has_text, items) in table {
-            assert_eq!(context_items(&target, has_text), items, "{target:?}");
+        for (target, can, items) in table {
+            assert_eq!(context_items(&target, can), items, "{target:?}");
         }
         let note = MenuTarget::Note {
             path: "NOTE/a.note".to_owned(),
@@ -217,6 +226,14 @@ mod tests {
         let (notes, _data, _config) = notes_with_one_new_note(false);
         assert!(has_text(&notes, "NOTE/Note/a.note"));
         assert!(!has_text(&notes, "NOTE/Note/other.note"));
+    }
+
+    #[test]
+    fn mark_all_as_seen_is_enabled_while_a_note_is_new() {
+        let (notes, _data, _config) = notes_with_one_new_note(false);
+        assert!(has_new(&notes));
+        notes.seen_all().unwrap();
+        assert!(!has_new(&notes), "nothing is new after Mark All as Seen");
     }
 
     #[test]

@@ -195,6 +195,14 @@ impl ProcessSupervisor {
         self.inner.stop();
     }
 
+    /// Kills the child at once: SIGKILL to its group, with no SIGTERM and no grace, so the
+    /// pipeline drops the page in work. Returns when the group is gone. Nothing restarts after
+    /// it.
+    pub fn kill_now(&self) {
+        let _control = lock(&self.inner.control);
+        self.inner.stop_with(None);
+    }
+
     /// Stops the child and shows that another Notedown process does its job (`what`).
     pub fn outside(&self, what: &str) {
         let _control = lock(&self.inner.control);
@@ -236,6 +244,7 @@ impl ProcessSupervisor {
             Launch::Off => self.stop(),
             Launch::NotConnected => self.not_connected(),
             Launch::Start(args) => self.start(args.clone()),
+            Launch::Paused => self.kill_now(),
         }
     }
 
@@ -288,13 +297,19 @@ impl Inner {
         true
     }
 
-    /// Ends the current generation; the caller holds `control`.
+    /// Ends the current generation with the supervisor's grace; the caller holds `control`.
     fn stop(&self) {
+        self.stop_with(Some(self.grace));
+    }
+
+    /// Ends the current generation; the caller holds `control`. With a grace, SIGTERM goes
+    /// first and SIGKILL after the grace; without one, SIGKILL goes at once.
+    fn stop_with(&self, grace: Option<Duration>) {
         let mut s = lock(&self.shared);
         s.generation += 1;
         let worker = s.worker.take();
         let pgid = s.pgid;
-        let term = pgid.filter(|_| s.alive);
+        let term = pgid.filter(|_| s.alive).zip(grace);
         if term.is_some() {
             self.set(s, ChildState::Stopping);
         } else {
@@ -302,9 +317,9 @@ impl Inner {
             self.changed.notify_all();
         }
 
-        if let Some(pgid) = term {
+        if let Some((pgid, grace)) = term {
             let _ = process::signal_group(pgid, libc::SIGTERM);
-            let until = Instant::now() + self.grace;
+            let until = Instant::now() + grace;
             let mut s = lock(&self.shared);
             while s.alive {
                 let left = until.saturating_duration_since(Instant::now());

@@ -148,7 +148,7 @@ fn local_mode_runs_serve_and_the_pipeline_as_two_children() {
         ..AppConfig::default()
     };
     let me = std::process::id();
-    let plan = process::plan(&config, me);
+    let plan = process::plan(&config, me, START_MS);
     let server = rig.supervisor(ChildKind::Server, &script);
     let pipeline = rig.supervisor(ChildKind::Pipeline, &script);
     server.launch(&plan.server);
@@ -442,7 +442,7 @@ fn remote_mode_without_pipeline_toml_is_not_connected() {
     };
     let server = rig.supervisor(ChildKind::Server, &script);
     let pipeline = rig.supervisor(ChildKind::Pipeline, &script);
-    let plan = process::plan(&config, std::process::id());
+    let plan = process::plan(&config, std::process::id(), START_MS);
     server.launch(&plan.server);
     pipeline.launch(&plan.pipeline);
     assert_eq!(server.state(), ChildState::Stopped);
@@ -450,7 +450,7 @@ fn remote_mode_without_pipeline_toml_is_not_connected() {
     assert_eq!(rig.spawns(), 0);
 
     std::fs::write(data.join("pipeline.toml"), "").unwrap();
-    let plan = process::plan(&config, std::process::id());
+    let plan = process::plan(&config, std::process::id(), START_MS);
     assert!(matches!(plan.pipeline, Launch::Start(_)));
     pipeline.launch(&plan.pipeline);
     running_pid(&pipeline);
@@ -563,4 +563,82 @@ fn a_listener_may_read_the_state_while_the_child_starts() {
     // The starter's clone is gone before the test ends, so the last drop (which stops the
     // child) runs here and not on a thread the end of the test binary could cut short.
     starting.join().unwrap();
+}
+
+/// A child that writes `<dir>/ready` once its TERM trap is set, and `<dir>/term` when a
+/// SIGTERM reaches it.
+const TRAPS_TERM: &str = "trap 'echo term > \"$DIR/term\"; exit 0' TERM\n\
+     echo ready > \"$DIR/ready\"\n\
+     sleep 307 &\n\
+     wait";
+
+#[test]
+fn kill_now_sends_no_sigterm() {
+    let rig = Rig::new();
+    let script = rig.script("child", TRAPS_TERM);
+    let pid_file = rig.path().join("run").join("pipeline.pid");
+    // A grace past the guard: a kill that waited for it fails the test.
+    let sup = ProcessSupervisor::new(
+        ChildKind::Pipeline,
+        rig.spawn(&script),
+        rig.clock(),
+        Duration::from_secs(600),
+    );
+    sup.keep_pid_file(pid_file.clone(), PathBuf::from("/bin/sh"));
+    sup.start(vec![]);
+    let pid = running_pid(&sup);
+    assert!(wait_until(|| rig.path().join("ready").exists()));
+    assert!(pid_file.exists());
+
+    sup.kill_now();
+    assert_eq!(sup.state(), ChildState::Stopped);
+    assert!(!process::group_alive(pid));
+    assert!(!pid_file.exists());
+    assert!(!rig.path().join("term").exists(), "the child got a SIGTERM");
+    // Nothing starts again.
+    rig.set_now(rig.now() + 3_600_000);
+    assert_eq!(sup.state(), ChildState::Stopped);
+    assert_eq!(rig.spawns(), 1);
+}
+
+#[test]
+fn stop_sends_the_sigterm_that_kill_now_leaves_out() {
+    // The positive control of kill_now_sends_no_sigterm: the same child under stop().
+    let rig = Rig::new();
+    let script = rig.script("child", TRAPS_TERM);
+    let sup = ProcessSupervisor::new(
+        ChildKind::Pipeline,
+        rig.spawn(&script),
+        rig.clock(),
+        Duration::from_secs(600),
+    );
+    sup.start(vec![]);
+    running_pid(&sup);
+    assert!(wait_until(|| rig.path().join("ready").exists()));
+    sup.stop();
+    assert_eq!(sup.state(), ChildState::Stopped);
+    assert!(rig.path().join("term").exists(), "no SIGTERM came");
+}
+
+#[test]
+fn a_paused_launch_kills_the_child_at_once() {
+    let rig = Rig::new();
+    let script = rig.script("child", TRAPS_TERM);
+    let sup = ProcessSupervisor::new(
+        ChildKind::Pipeline,
+        rig.spawn(&script),
+        rig.clock(),
+        Duration::from_secs(600),
+    );
+    sup.launch(&Launch::Start(vec![]));
+    let pid = running_pid(&sup);
+    assert!(wait_until(|| rig.path().join("ready").exists()));
+    sup.launch(&Launch::Paused);
+    assert_eq!(sup.state(), ChildState::Stopped);
+    assert!(!process::group_alive(pid));
+    assert!(!rig.path().join("term").exists(), "the child got a SIGTERM");
+    // A paused launch of a stopped child starts nothing.
+    sup.launch(&Launch::Paused);
+    assert_eq!(sup.state(), ChildState::Stopped);
+    assert_eq!(rig.spawns(), 1);
 }

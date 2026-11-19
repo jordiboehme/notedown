@@ -332,7 +332,9 @@ pub fn run() {
             commands::open_recycle_bin,
             commands::update_state,
             commands::check_for_update,
-            commands::install_update_and_restart
+            commands::install_update_and_restart,
+            commands::ocr_pause,
+            commands::ocr_resume
         ])
         .build(tauri::generate_context!())
         .expect("the Notedown app could not start");
@@ -644,15 +646,37 @@ fn import_jobs(app: AppHandle, spawn: process::SpawnFn, host: ImportHost) -> Imp
     )
 }
 
-/// Starts the children as the config asks, then probes what is `Outside` every 30 s.
+/// Starts the children as the config asks, then probes what is `Outside` every 30 s. A pause
+/// whose end came while the app was closed is cleared first.
 fn supervise(app: AppHandle) {
+    let watch = app.clone();
     std::thread::spawn(move || {
         let processes = app.state::<Arc<Processes>>().inner().clone();
-        let config = app.state::<commands::ConfigState>().reader();
+        let state = app.state::<commands::ConfigState>().inner().clone();
+        if let Err(e) = state.clear_expired_pause(processes.now_ms()) {
+            eprintln!("notedown: the ended OCR pause was not cleared: {e}");
+        }
+        let config = state.reader();
         processes.start_with(|| config.current());
         loop {
             std::thread::sleep(REPROBE_EVERY);
             processes.reprobe_with(|| config.current());
+        }
+    });
+    watch_the_pause(watch);
+}
+
+/// How often the app looks whether a timed OCR pause has ended.
+const PAUSE_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Ends a timed OCR pause at its time: clears it and starts the pipeline, as Resume does.
+fn watch_the_pause(app: AppHandle) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(PAUSE_TICK);
+            if let Err(e) = commands::end_expired_pause(&app) {
+                eprintln!("notedown: the ended OCR pause was not cleared: {e}");
+            }
         }
     });
 }
@@ -929,7 +953,7 @@ mod tests {
         names.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    const SETTINGS_ONLY: [&str; 44] = [
+    const SETTINGS_ONLY: [&str; 46] = [
         "get_config",
         "set_mode",
         "set_start_view",
@@ -974,6 +998,8 @@ mod tests {
         "update_state",
         "check_for_update",
         "install_update_and_restart",
+        "ocr_pause",
+        "ocr_resume",
     ];
 
     #[test]
@@ -1101,7 +1127,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 80);
+        assert_eq!(handler_commands().len(), 82);
     }
 
     #[test]
@@ -1187,6 +1213,8 @@ mod tests {
             "update_state",
             "check_for_update",
             "install_update_and_restart",
+            "ocr_pause",
+            "ocr_resume",
         ]);
         assert_eq!(manifest_commands(), all);
         // Every granted command is a real one.

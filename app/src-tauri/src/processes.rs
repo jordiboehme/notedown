@@ -57,6 +57,8 @@ pub struct Processes {
     /// What the pipeline was last told to do; `None` before the first start and after a stop.
     pipeline_launch: Mutex<Option<Launch>>,
     quitting: AtomicBool,
+    /// The time for the plan: whether an OCR pause holds.
+    clock: Clock,
 }
 
 type ServeListener = Box<dyn Fn() + Send + Sync>;
@@ -76,7 +78,7 @@ impl Processes {
         let pipeline = ProcessSupervisor::new(
             ChildKind::Pipeline,
             options.spawn,
-            options.clock,
+            options.clock.clone(),
             options.pipeline_grace,
         );
         for sup in [&server, &pipeline] {
@@ -114,7 +116,13 @@ impl Processes {
             ops: Mutex::new(()),
             pipeline_launch: Mutex::new(None),
             quitting: AtomicBool::new(false),
+            clock: options.clock,
         }
+    }
+
+    /// The time on the clock the plan uses, in ms since 1970.
+    pub fn now_ms(&self) -> u64 {
+        (self.clock)()
     }
 
     pub fn server(&self) -> &ProcessSupervisor {
@@ -180,7 +188,7 @@ impl Processes {
                 s.spawn(move || self.reclaim(sup));
             }
         });
-        let plan = process::plan(config, self.parent);
+        let plan = process::plan(config, self.parent, self.now_ms());
         *lock(&self.pipeline_launch) = Some(plan.pipeline.clone());
         self.launch(&self.server, &plan.server, config);
         self.launch(&self.pipeline, &plan.pipeline, config);
@@ -201,7 +209,7 @@ impl Processes {
             return;
         }
         let config = &read();
-        let plan = process::plan(config, self.parent);
+        let plan = process::plan(config, self.parent, self.now_ms());
         for (sup, launch) in [
             (&self.server, &plan.server),
             (&self.pipeline, &plan.pipeline),
@@ -216,7 +224,8 @@ impl Processes {
     }
 
     /// Starts the pipeline again when what it is to run changed (another Markdown folder, a log
-    /// in or a log out), with the config read inside the lock. The server runs on. Nothing
+    /// in or a log out, an OCR pause or its end), with the config read inside the lock. During
+    /// a pause the plan stays [`Launch::Paused`], so a change of the arguments starts nothing. The server runs on. Nothing
     /// starts after a stop, before the first start or after Quit.
     pub fn relaunch_pipeline_with(&self, read: impl FnOnce() -> AppConfig) {
         let _ops = lock(&self.ops);
@@ -224,7 +233,7 @@ impl Processes {
             return;
         }
         let config = &read();
-        let launch = process::plan(config, self.parent).pipeline;
+        let launch = process::plan(config, self.parent, self.now_ms()).pipeline;
         {
             let mut last = lock(&self.pipeline_launch);
             match &*last {
@@ -233,8 +242,13 @@ impl Processes {
             }
         }
         // The app's own pipeline holds the writer lock for its whole run: stop it first, or
-        // the probe would take it for another Notedown.
-        self.pipeline.stop();
+        // the probe would take it for another Notedown. A pause kills it at once: the page in
+        // work is dropped and read again after the pause.
+        if launch == Launch::Paused {
+            self.pipeline.kill_now();
+        } else {
+            self.pipeline.stop();
+        }
         // Quit sets its flag before it waits for this lock: one that came during the stop
         // (it can take the grace) starts nothing.
         if self.quitting.load(Ordering::SeqCst) {
@@ -279,7 +293,8 @@ impl Processes {
         }
     }
 
-    /// Starts the child unless another Notedown does its job.
+    /// Starts the child unless another Notedown does its job. Only a start probes: a paused
+    /// pipeline never looks for another one.
     fn launch(&self, sup: &ProcessSupervisor, launch: &Launch, config: &AppConfig) {
         let Launch::Start(args) = launch else {
             sup.launch(launch);
@@ -308,4 +323,4 @@ impl Processes {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::Serialize;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::config::{self, AppConfig, Mode, NotificationChoices, StartView};
 use crate::import_job::{self, BackupFolder, ImportJobs, JobKind};
@@ -16,6 +16,7 @@ use crate::login::{self, LoginError, LoginGate, Password};
 use crate::model::{ModelControl, ModelState};
 use crate::notes::{NoteSummary, Notes};
 use crate::notify::deliver::{Authorization, Deliver};
+use crate::pause::{self, OcrPause, PauseChoice};
 use crate::poller::{Poller, rest_base};
 use crate::processes::{ProcessStates, Processes};
 use crate::review::{DataUrl, NoteView, Review};
@@ -112,6 +113,27 @@ impl ConfigState {
     pub fn set_last_markdown_save_dir(&self, dir: PathBuf) -> Result<(), String> {
         self.update(|c| c.last_markdown_save_dir = Some(dir))
             .map(|_| ())
+    }
+
+    /// Sets the OCR pause (`None`: the OCR runs).
+    pub fn set_ocr_pause(&self, p: Option<OcrPause>) -> Result<AppConfig, String> {
+        self.update(|c| c.ocr_pause = p)
+    }
+
+    /// Clears a timed pause whose end came by `now_ms`. True when it cleared one; a pause set
+    /// again meanwhile stays.
+    pub fn clear_expired_pause(&self, now_ms: u64) -> Result<bool, String> {
+        match self.try_update(|c| {
+            if !pause::expired(c.ocr_pause.as_ref(), now_ms) {
+                return Err(());
+            }
+            c.ocr_pause = None;
+            Ok(())
+        }) {
+            Ok(_) => Ok(true),
+            Err(TryUpdateError::Refused(())) => Ok(false),
+            Err(TryUpdateError::NotSaved(why)) => Err(why),
+        }
     }
 
     /// The config as it is now.
@@ -965,6 +987,122 @@ pub(crate) fn relaunch_pipeline(
         processes.relaunch_pipeline_with(|| reader.current());
         drop(server);
     });
+}
+
+/// Pauses the OCR (`choice` at `now_ms`): saves the pause, then kills the pipeline at once on a
+/// thread of its own. While an import holds the server, only the pause is saved: the import's
+/// own start of the children reads it. A new choice during a pause only moves its end.
+pub fn pause_ocr_with(
+    config: &ConfigState,
+    processes: &Arc<Processes>,
+    server: &import_job::ServerUse,
+    choice: PauseChoice,
+    now_ms: u64,
+) -> Result<(), String> {
+    config.set_ocr_pause(Some(pause::pause_for(choice, now_ms)))?;
+    relaunch_unless_held(config, processes, server);
+    Ok(())
+}
+
+/// Ends the OCR pause: clears it, then starts the pipeline on a thread of its own, as
+/// [`pause_ocr_with`] does.
+pub fn resume_ocr_with(
+    config: &ConfigState,
+    processes: &Arc<Processes>,
+    server: &import_job::ServerUse,
+) -> Result<(), String> {
+    config.set_ocr_pause(None)?;
+    relaunch_unless_held(config, processes, server);
+    Ok(())
+}
+
+/// Ends a timed pause whose end came by `now_ms`, as [`resume_ocr_with`] does. True when it
+/// ended one.
+pub fn end_expired_pause_with(
+    config: &ConfigState,
+    processes: &Arc<Processes>,
+    server: &import_job::ServerUse,
+    now_ms: u64,
+) -> Result<bool, String> {
+    let ended = config.clear_expired_pause(now_ms)?;
+    if ended {
+        relaunch_unless_held(config, processes, server);
+    }
+    Ok(ended)
+}
+
+/// [`relaunch_pipeline`] while no import holds the server.
+fn relaunch_unless_held(
+    config: &ConfigState,
+    processes: &Arc<Processes>,
+    server: &import_job::ServerUse,
+) {
+    if let Ok(server) = server.try_use() {
+        relaunch_pipeline(config, processes, server);
+    }
+}
+
+/// [`pause_ocr_with`] in the app, for the command and the menu bar: then the status polls again.
+pub fn pause_ocr(app: &AppHandle, choice: PauseChoice) -> Result<(), String> {
+    let processes = app.state::<Arc<Processes>>();
+    pause_ocr_with(
+        app.state::<ConfigState>().inner(),
+        processes.inner(),
+        &app.state::<ImportJobs>().server_use(),
+        choice,
+        processes.now_ms(),
+    )?;
+    pause_changed(app);
+    Ok(())
+}
+
+/// [`resume_ocr_with`] in the app, for the command and the menu bar.
+pub fn resume_ocr(app: &AppHandle) -> Result<(), String> {
+    resume_ocr_with(
+        app.state::<ConfigState>().inner(),
+        app.state::<Arc<Processes>>().inner(),
+        &app.state::<ImportJobs>().server_use(),
+    )?;
+    pause_changed(app);
+    Ok(())
+}
+
+/// [`end_expired_pause_with`] in the app, on each tick of the pause watch.
+pub fn end_expired_pause(app: &AppHandle) -> Result<(), String> {
+    let processes = app.state::<Arc<Processes>>();
+    let ended = end_expired_pause_with(
+        app.state::<ConfigState>().inner(),
+        processes.inner(),
+        &app.state::<ImportJobs>().server_use(),
+        processes.now_ms(),
+    )?;
+    if ended {
+        pause_changed(app);
+    }
+    Ok(())
+}
+
+/// After a pause, its end or a resume: the status shows it at once.
+fn pause_changed(app: &AppHandle) {
+    if let Some(poller) = app.try_state::<Poller>() {
+        poller.poll_now();
+    }
+}
+
+/// Pauses the OCR (Settings > OCR); the menu bar calls [`pause_ocr`] itself.
+#[tauri::command]
+pub async fn ocr_pause(app: AppHandle, choice: PauseChoice) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || pause_ocr(&app, choice))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Ends the OCR pause (Settings > OCR); the menu bar calls [`resume_ocr`] itself.
+#[tauri::command]
+pub async fn ocr_resume(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || resume_ocr(&app))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Whether the Keychain keeps a login for the account in the config, off the main thread.
@@ -2832,5 +2970,143 @@ mod tests {
             .unwrap();
         assert_eq!(file_time_ms(&file), Ok(1_763_300_000_123));
         assert!(file_time_ms(&dir.path().join("missing.snbak")).is_err());
+    }
+
+    mod pause {
+        use super::*;
+        use crate::pause::{OcrPause, PauseChoice};
+        use crate::processes::tests::{NOW, Rig, pause, running_pid, wait_until};
+        use crate::supervisor::ChildState;
+
+        const MIN: u64 = 60_000;
+
+        /// A Local setup that runs, its config saved in the rig's folder.
+        fn running(rig: &Rig) -> (ConfigState, Arc<Processes>) {
+            rig.listen_on(crate::probe::test_server::free_port());
+            let config_dir = rig.dir.path().join("config");
+            config::save(&config_dir, &rig.config()).unwrap();
+            let state = ConfigState::load(config_dir);
+            let p = Arc::new(rig.paused_processes());
+            p.start_with(|| state.current());
+            running_pid(p.server());
+            running_pid(p.pipeline());
+            (state, p)
+        }
+
+        /// Waits until no command uses the server: the relaunch on its thread is over.
+        fn relaunched(server: &import_job::ServerUse) {
+            assert!(
+                wait_until(|| server.hold_for_test().is_some()),
+                "the relaunch does not end"
+            );
+        }
+
+        #[test]
+        fn a_pause_is_saved_and_kills_the_pipeline_and_a_resume_starts_it() {
+            let rig = Rig::new();
+            rig.trap_term();
+            let (state, p) = running(&rig);
+            rig.wait_ready();
+            let server = import_job::ServerUse::default();
+
+            pause_ocr_with(&state, &p, &server, PauseChoice::FiveMinutes, NOW).unwrap();
+            let saved = Some(OcrPause {
+                until_ms: Some(NOW + 5 * MIN),
+            });
+            assert_eq!(state.current().ocr_pause, saved);
+            assert_eq!(config::load(&state.dir).ocr_pause, saved);
+            relaunched(&server);
+            assert_eq!(p.pipeline().state(), ChildState::Stopped);
+            assert!(!rig.got_term(), "the pipeline got a SIGTERM");
+            assert_eq!(rig.pipeline_spawns(), 1);
+
+            // Another choice during the pause only moves its end.
+            pause_ocr_with(&state, &p, &server, PauseChoice::UntilResumed, NOW).unwrap();
+            assert_eq!(state.current().ocr_pause, pause(None));
+            relaunched(&server);
+            assert_eq!(p.pipeline().state(), ChildState::Stopped);
+
+            resume_ocr_with(&state, &p, &server).unwrap();
+            assert_eq!(state.current().ocr_pause, None);
+            assert_eq!(config::load(&state.dir).ocr_pause, None);
+            relaunched(&server);
+            running_pid(p.pipeline());
+            assert_eq!(rig.pipeline_spawns(), 2);
+            p.stop_all();
+        }
+
+        #[test]
+        fn a_pause_during_an_import_only_saves() {
+            let rig = Rig::new();
+            let (state, p) = running(&rig);
+            let pid = running_pid(p.pipeline());
+            let server = import_job::ServerUse::default();
+            let import = server.hold_for_test().unwrap();
+
+            pause_ocr_with(&state, &p, &server, PauseChoice::OneHour, NOW).unwrap();
+            assert_eq!(
+                config::load(&state.dir).ocr_pause,
+                pause(Some(NOW + 60 * MIN))
+            );
+            // Nothing was relaunched: the import stops the children itself.
+            assert_eq!(running_pid(p.pipeline()), pid);
+            assert_eq!(rig.pipeline_spawns(), 1);
+
+            // The import's own start reads the saved pause.
+            drop(import);
+            p.start_with(|| state.current());
+            running_pid(p.server());
+            assert_eq!(p.pipeline().state(), ChildState::Stopped);
+            assert_eq!(rig.pipeline_spawns(), 1);
+            p.stop_all();
+        }
+
+        #[test]
+        fn a_pause_ends_at_its_time() {
+            let rig = Rig::new();
+            let (state, p) = running(&rig);
+            let server = import_job::ServerUse::default();
+            pause_ocr_with(&state, &p, &server, PauseChoice::OneMinute, NOW).unwrap();
+            relaunched(&server);
+            assert_eq!(p.pipeline().state(), ChildState::Stopped);
+
+            // Before its time: nothing changes.
+            assert_eq!(
+                end_expired_pause_with(&state, &p, &server, NOW + MIN - 1),
+                Ok(false)
+            );
+            assert!(state.current().ocr_pause.is_some());
+            // At its time it is cleared and the pipeline starts.
+            rig.set_now(NOW + MIN);
+            assert_eq!(
+                end_expired_pause_with(&state, &p, &server, NOW + MIN),
+                Ok(true)
+            );
+            assert_eq!(config::load(&state.dir).ocr_pause, None);
+            relaunched(&server);
+            running_pid(p.pipeline());
+            assert_eq!(rig.pipeline_spawns(), 2);
+            // Once.
+            assert_eq!(
+                end_expired_pause_with(&state, &p, &server, NOW + MIN),
+                Ok(false)
+            );
+            p.stop_all();
+        }
+
+        #[test]
+        fn an_expired_pause_is_cleared_at_the_start() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = ConfigState::load(dir.path().to_owned());
+            state.set_ocr_pause(pause(Some(NOW))).unwrap();
+            assert_eq!(state.clear_expired_pause(NOW - 1), Ok(false));
+            assert!(state.current().ocr_pause.is_some());
+            assert_eq!(state.clear_expired_pause(NOW), Ok(true));
+            assert_eq!(config::load(dir.path()).ocr_pause, None);
+            // A pause until resumed never expires.
+            state.set_ocr_pause(pause(None)).unwrap();
+            assert_eq!(state.clear_expired_pause(u64::MAX), Ok(false));
+            assert_eq!(config::load(dir.path()).ocr_pause, pause(None));
+        }
     }
 }

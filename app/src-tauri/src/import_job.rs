@@ -179,7 +179,7 @@ pub struct UseGuard(ServerUse);
 
 /// An import's hold of the server; it ends when the guard is dropped.
 #[must_use]
-struct HoldGuard(ServerUse);
+pub(crate) struct HoldGuard(ServerUse);
 
 impl ServerUse {
     /// Refused with [`WAIT_FOR_IMPORT`] while an import holds the server.
@@ -190,6 +190,12 @@ impl ServerUse {
         }
         users.using += 1;
         Ok(UseGuard(self.clone()))
+    }
+
+    /// Holds the server as an import does; `None` while a command uses it.
+    #[cfg(test)]
+    pub(crate) fn hold_for_test(&self) -> Option<HoldGuard> {
+        self.try_hold()
     }
 
     /// An import holds the server.

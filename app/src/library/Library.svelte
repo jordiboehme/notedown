@@ -67,8 +67,8 @@
     type Reveal,
     type Selection,
     type SidebarItem,
-    type Sort,
   } from "./view";
+  import { readSort, saveSort, type ListKind } from "./sort";
   import { entryActions, folderAt, followChange, jobRows, type Change } from "./actions";
   import { emptyConfirm, recycleRows } from "./recycle";
   import { drag, folderUnder, letGo, moveTo, stopDrag } from "./drag.svelte";
@@ -90,7 +90,26 @@
    */
   let openings = $state(0);
   const open = new SvelteSet<string>();
-  let sort = $state<Sort>({ by: "name", ascending: true });
+  /** The viewer's storage; null where it cannot be used. */
+  function storage(): Storage | null {
+    try {
+      return window.localStorage;
+    } catch {
+      return null;
+    }
+  }
+
+  /** The sort of each list kind, kept per viewer. */
+  const sorts = $state({
+    notes: readSort(storage(), "notes"),
+    folder: readSort(storage(), "folder"),
+    bin: readSort(storage(), "bin"),
+  });
+
+  function sortList<K extends ListKind>(kind: K, sort: (typeof sorts)[K]) {
+    sorts[kind] = sort;
+    saveSort(storage(), kind, sort);
+  }
   let newNotes = $state<NoteSummary[] | null>(null);
   let allNotes = $state<NoteSummary[] | null>(null);
   /** Why the last load of New or All notes failed, while that list is still missing. */
@@ -419,11 +438,20 @@
               title="New notes"
               notes={newNotes}
               empty="No new notes."
+              sort={sorts.notes}
+              onSort={(next) => sortList("notes", next)}
               onOpen={(note) => openNote(note.path)}
               onMarkAllSeen={markAllSeen}
             />
           {:else if library.selection.kind === "all"}
-            <NotesList title="All notes" notes={allNotes} empty="No notes with text yet." onOpen={(note) => openNote(note.path)} />
+            <NotesList
+              title="All notes"
+              notes={allNotes}
+              empty="No notes with text yet."
+              sort={sorts.notes}
+              onSort={(next) => sortList("notes", next)}
+              onOpen={(note) => openNote(note.path)}
+            />
           {:else if library.selection.kind === "note"}
             {#key `${library.generation}:${openings}:${library.selection.path}`}
               <Review
@@ -441,6 +469,8 @@
             <RecycleBin
               bin={library.bin}
               rows={binRows}
+              sort={sorts.bin}
+              onSort={(next) => sortList("bin", next)}
               restores={library.restores}
               question={emptyConfirm(library.bin, library.emptyAsked)}
               emptying={library.emptying}
@@ -484,10 +514,10 @@
                   folder={library.listings[listingKey(path, false)]}
                   next={library.next[listingKey(path, false)] ?? null}
                   busy={isBusy(path, false)}
-                  {sort}
+                  sort={sorts.folder}
                   {picked}
                   {renaming}
-                  onSort={(next) => (sort = next)}
+                  onSort={(next) => sortList("folder", next)}
                   onOpen={select}
                   onOpenNote={openNote}
                   onMore={() => void listNext(path, false)}

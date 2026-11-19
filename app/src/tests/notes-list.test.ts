@@ -16,7 +16,15 @@ const note: NoteSummary = {
 
 function html(notes: NoteSummary[] | null, onMarkAllSeen?: () => void) {
   return render(NotesList, {
-    props: { title: "New notes", notes, empty: "No new notes.", onOpen: () => {}, onMarkAllSeen },
+    props: {
+      title: "New notes",
+      notes,
+      empty: "No new notes.",
+      sort: { by: "date", ascending: false },
+      onSort: () => {},
+      onOpen: () => {},
+      onMarkAllSeen,
+    },
   }).body;
 }
 

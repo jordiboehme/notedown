@@ -3,18 +3,18 @@ resolver = "3"
 members = ["crates/notedown-note", "crates/notedown-ocr", "crates/notedown-cloud", "crates/notedown-pipeline", "crates/notedown-convert", "crates/notedown"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/jordiboehme/notedown"
 rust-version = "1.99.1"
 
 [workspace.dependencies]
-notedown-note = { path = "crates/notedown-note", version = "0.1.1" }
-notedown-ocr = { path = "crates/notedown-ocr", version = "0.1.1" }
-notedown-cloud = { path = "crates/notedown-cloud", version = "0.1.1" }
-notedown-convert = { path = "crates/notedown-convert", version = "0.1.1" }
-notedown-pipeline = { path = "crates/notedown-pipeline", version = "0.1.1" }
+notedown-note = { path = "crates/notedown-note", version = "0.2.0" }
+notedown-ocr = { path = "crates/notedown-ocr", version = "0.2.0" }
+notedown-cloud = { path = "crates/notedown-cloud", version = "0.2.0" }
+notedown-convert = { path = "crates/notedown-convert", version = "0.2.0" }
+notedown-pipeline = { path = "crates/notedown-pipeline", version = "0.2.0" }
 thiserror = "=2.0.21"
 anyhow = "=1.0.104"
 base64 = "=0.23.1"

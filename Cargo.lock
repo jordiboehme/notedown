@@ -2082,7 +2082,7 @@ dependencies = [
 
 [[package]]
 name = "notedown"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2104,7 +2104,7 @@ dependencies = [
 
 [[package]]
 name = "notedown-cloud"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2137,7 +2137,7 @@ dependencies = [
 
 [[package]]
 name = "notedown-convert"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "const-hex",
@@ -2153,7 +2153,7 @@ dependencies = [
 
 [[package]]
 name = "notedown-note"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "const-hex",
@@ -2169,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "notedown-ocr"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "const-hex",
  "dirs",
@@ -2184,7 +2184,7 @@ dependencies = [
 
 [[package]]
 name = "notedown-pipeline"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",

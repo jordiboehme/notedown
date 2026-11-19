@@ -268,6 +268,11 @@ describe("checklist", () => {
     expect(byId(checklist(input({ model: missing }))).model.state).toBe("todo");
   });
 
+  it("the model step names the size of the new model", () => {
+    const missing: ModelState = { ...readyModel(), installed: false, sizeBytes: 0 };
+    expect(byId(checklist(input({ model: missing }))).model.line).toBe("Download the OCR model. It is about 3.6 GB.");
+  });
+
   it("the import and the first sync do not wait for the model", () => {
     const { status, config } = beforeImport();
     const missing: ModelState = { ...readyModel(), installed: false, sizeBytes: 0 };

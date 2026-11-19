@@ -30,6 +30,8 @@ const COMMANDS: &[&str] = &[
     "model_pull",
     "model_pause",
     "model_remove",
+    "model_licences",
+    "model_clean_old",
     "library_state",
     "library_list",
     "library_entry",

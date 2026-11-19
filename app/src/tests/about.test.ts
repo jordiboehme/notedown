@@ -11,8 +11,15 @@ describe("the About page", () => {
       { label: "Support Me", url: "https://ko-fi.com/V7V31T6CL9", strong: true },
       { label: "GitHub", url: "https://github.com/jordiboehme/notedown", strong: false },
     ]);
-    expect(ABOUT.footer).toEqual(["Powered by llama.cpp and Chandra", "Created with love by Jordi Böhme, AGPL-3.0"]);
     expect(ABOUT.version("0.1.0")).toBe("Version 0.1.0");
+  });
+
+  it("about footer names Qwen", () => {
+    expect(ABOUT.footer).toEqual([
+      "Powered by llama.cpp, Qwen and PaddlePaddle models",
+      "Created with love by Jordi Böhme, AGPL-3.0",
+    ]);
+    expect(ABOUT.footer.join(" ")).not.toMatch(/chandra/i);
   });
 
   it("renders what about.ts says", () => {

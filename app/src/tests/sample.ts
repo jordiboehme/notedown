@@ -102,5 +102,15 @@ export function sampleConfig(): AppConfig {
 
 /** The model on disk and ready. */
 export function readyModel(): ModelState {
-  return { installed: true, sizeBytes: 3_400_000_000, path: "/m/model", pulling: false, progress: null, problem: null };
+  return {
+    installed: true,
+    sizeBytes: 3_556_512_484,
+    folder: "/m",
+    files: ["Qwen3.5-4B-Q4_K_M.gguf", "mmproj-F16.gguf", "pp-doclayoutv3.safetensors", "pp-ocrv6-small-det.onnx"],
+    pulling: false,
+    progress: null,
+    problem: null,
+    oldFiles: false,
+    oldBytes: 0,
+  };
 }

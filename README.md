@@ -32,7 +32,7 @@ Or download `notedown-app-v<version>-macos.dmg` from the [releases page](https:/
 open it and drag Notedown into Applications. [Install](docs/install.md) has the details.
 
 Then open Notedown in the menu bar and go to Settings, Setup. Setup walks you through it, without the
-terminal: the server, the account, the OCR model (about 3.4 GB), the backup and import of your
+terminal: the server, the account, the OCR model (about 3.6 GB), the backup and import of your
 Supernote, the first sync and your agent.
 
 Take your time with the backup. **Never write on the Supernote between the backup and the first
@@ -124,7 +124,7 @@ cargo install --path crates/notedown
 Then:
 
 ```sh
-# download the OCR model once (about 3.4 GB)
+# download the OCR model once (about 3.6 GB)
 notedown model pull
 
 # turn a folder of notes into Markdown
@@ -212,6 +212,8 @@ Notedown is licensed under AGPL-3.0-or-later, see `LICENSE`.
 The one exception is the `notedown-ocr` crate. Since 0.2.0 it is licensed under MPL-2.0, see
 `crates/notedown-ocr/LICENSE`. Versions released before keep the licence they had.
 
-The OCR model is Chandra OCR 2 by Datalab. Notedown downloads the weights on request and does not ship
-them. They are under a modified OpenRAIL-M license: free for personal use and for organisations under 2
-million USD revenue. See the model card for the exact terms.
+The OCR uses four model files. Notedown downloads them on request and does not ship them. It shows
+their licences before the download starts:
+
+- Qwen3.5-4B (Qwen team, Alibaba Cloud): Apache-2.0
+- PP-DocLayoutV3 and PP-OCRv6 (PaddlePaddle Authors): Apache-2.0

@@ -6,6 +6,7 @@
     MODEL_PROGRESS_EVENT,
     MODEL_READY_EVENT,
     failure,
+    modelCleanOld,
     modelPause,
     modelPull,
     modelRemove,
@@ -14,11 +15,15 @@
     type Progress,
   } from "../api";
   import { formatBytes, fraction } from "../format";
+  import { licences, loadLicences } from "../modelLicences.svelte";
+  import { MODEL_TEXT, canDownload, cleanOldButton, cleanOldQuestion, filesNote, licenceLine } from "../modelText";
   import Row from "../kit/Row.svelte";
   import StatusDot from "../kit/StatusDot.svelte";
 
-  // The rows of the OCR model: its state with Download, Pause and Remove, the progress of a
-  // download, the size on disk and the file. The OCR page and step 4 of the setup show it;
+  // The rows of the OCR model: its licences (before the download), its state with Download,
+  // Pause and Remove, the progress of a download, the size on disk, the folder and the files.
+  // Download waits until the licences are on screen. When the model files of Notedown 0.1 are
+  // still there, a button offers to remove them after a question; nothing removes them on its own. The OCR page and step 4 of the setup show it;
   // `onchange` tells the page each new state.
   let { onchange }: { onchange?: (model: ModelState) => void } = $props();
 
@@ -27,6 +32,7 @@
   let error = $state<string | null>(null);
   let busy = $state(false);
   let asking = $state(false);
+  let askingOld = $state(false);
 
   const pulling = $derived(model?.pulling ?? false);
 
@@ -43,8 +49,11 @@
     }
   }
 
+  const licence = $derived(licenceLine(licences.lines ?? []));
+
   onMount(() => {
     void check();
+    void loadLicences();
     const stops = [
       listen<Progress>(MODEL_PROGRESS_EVENT, (event) => {
         progress = event.payload;
@@ -93,11 +102,26 @@
       asking = false;
       model = await modelRemove();
     });
+  const cleanOld = () =>
+    act(async () => {
+      askingOld = false;
+      model = await modelCleanOld();
+    });
 </script>
 
-<Row title="Model" note="Chandra OCR 2 runs on your Mac. Your notes never leave it.">
-  <span class="value">About 3.4 GB</span>
+<Row title="Model" note={MODEL_TEXT.note}>
+  <span class="value">{MODEL_TEXT.size}</span>
 </Row>
+{#if licence}
+  <p class="licences">{licence}</p>
+{:else if licences.error}
+  <div class="licences bad">
+    <span>{licences.error}</span>
+    <button type="button" class="button" onclick={() => void loadLicences()}>Retry</button>
+  </div>
+{:else}
+  <p class="licences">Reading the licences...</p>
+{/if}
 <Row title="Status" note={error ?? model?.problem ?? null} tone="bad">
   {#if model === null}
     <span class="value">Checking...</span>
@@ -115,7 +139,7 @@
       level={model.sizeBytes > 0 ? "warning" : "bad"}
       text={model.sizeBytes > 0 ? "Partly downloaded" : "Not downloaded"}
     />
-    <button type="button" class="button" disabled={busy} onclick={download}>Download</button>
+    <button type="button" class="button" disabled={busy || !canDownload(licences)} onclick={download}>Download</button>
   {/if}
 </Row>
 {#if asking}
@@ -134,10 +158,52 @@
   <Row title="Size on disk">
     <span class="value">{formatBytes(model.sizeBytes)}</span>
   </Row>
-  {#if model.path}<Row title="File" note={model.path} path />{/if}
+  {#if model.folder}<Row title="Folder" note={model.folder} path />{/if}
+  {#if model.files.length > 0}<Row title="Files" note={filesNote(model.files)} />{/if}
+  {#if model.oldFiles}
+    <div class="old">
+      <button type="button" class="button" disabled={busy} onclick={() => (askingOld = true)}>
+        {cleanOldButton(model.oldBytes)}
+      </button>
+    </div>
+    {#if askingOld}
+      <div class="confirm" role="alertdialog" aria-labelledby="clean-old-question">
+        <p id="clean-old-question">{cleanOldQuestion(model.oldBytes)}</p>
+        <div class="answers">
+          <button type="button" class="button" onclick={() => (askingOld = false)}>Cancel</button>
+          <button type="button" class="button strong" disabled={busy} onclick={cleanOld}>Delete</button>
+        </div>
+      </div>
+    {/if}
+  {/if}
 {/if}
 
 <style>
+  .licences {
+    margin: 0;
+    padding: 0 10px 9px;
+    font-size: 11px;
+    color: var(--secondary);
+    overflow-wrap: anywhere;
+    /* The status row below follows a paragraph, not a row, so this is its separator. */
+    border-bottom: 1px solid var(--separator);
+  }
+
+  .licences.bad {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    color: var(--bad);
+  }
+
+  .old {
+    display: flex;
+    justify-content: flex-end;
+    padding: 9px 10px;
+    border-top: 1px solid var(--separator);
+  }
+
   .bar {
     width: 120px;
     accent-color: var(--brand);

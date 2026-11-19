@@ -144,10 +144,17 @@ export interface Progress {
 export interface ModelState {
   installed: boolean;
   sizeBytes: number;
-  path: string | null;
+  /** The model folder. */
+  folder: string | null;
+  /** The names of the four model files in the folder. */
+  files: string[];
   pulling: boolean;
   progress: Progress | null;
   problem: string | null;
+  /** The model files of Notedown 0.1 are still on disk. */
+  oldFiles: boolean;
+  /** The bytes of the old model files. */
+  oldBytes: number;
 }
 
 export const MODEL_PROGRESS_EVENT = "model-progress";
@@ -229,6 +236,10 @@ export const modelState = () => invoke<ModelState>("model_state");
 export const modelPull = () => invoke("model_pull");
 export const modelPause = () => invoke<ModelState>("model_pause");
 export const modelRemove = () => invoke<ModelState>("model_remove");
+/** The licences of the model files, one line per licensor. Downloads nothing. */
+export const modelLicences = () => invoke<string[]>("model_licences");
+/** Deletes the model files of Notedown 0.1. */
+export const modelCleanOld = () => invoke<ModelState>("model_clean_old");
 /** Ends the OCR pause; the pause itself starts in the menu bar or the panel. */
 export const ocrResume = () => invoke<void>("ocr_resume");
 /** Backs the Supernote at url up into dir; progress and the end come as events. */

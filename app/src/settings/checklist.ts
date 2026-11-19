@@ -175,7 +175,7 @@ function model({ model }: ChecklistInput): Own {
   if (model.pulling) return { done: false, line: "", working: "Downloading the OCR model." };
   if (model.installed) return { done: true, line: "The OCR model is on this Mac." };
   if (model.sizeBytes > 0) return { done: false, line: "The OCR model is partly downloaded. Download the rest." };
-  return { done: false, line: "Download the OCR model. It is about 3.4 GB." };
+  return { done: false, line: "Download the OCR model. It is about 3.6 GB." };
 }
 
 const JOB_LINES: Record<JobKind, string> = {

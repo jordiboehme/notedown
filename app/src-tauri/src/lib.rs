@@ -278,6 +278,8 @@ pub fn run() {
             commands::model_pull,
             commands::model_pause,
             commands::model_remove,
+            commands::model_licences,
+            commands::model_clean_old,
             commands::library_state,
             commands::library_list,
             commands::library_entry,
@@ -959,7 +961,7 @@ mod tests {
         names.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    const SETTINGS_ONLY: [&str; 45] = [
+    const SETTINGS_ONLY: [&str; 47] = [
         "get_config",
         "set_mode",
         "set_start_view",
@@ -975,6 +977,8 @@ mod tests {
         "model_pull",
         "model_pause",
         "model_remove",
+        "model_licences",
+        "model_clean_old",
         "model_state",
         "mcp_info",
         "process_logs",
@@ -1135,7 +1139,7 @@ mod tests {
     #[test]
     fn the_handler_list_is_the_manifest() {
         assert_eq!(handler_commands(), manifest_commands());
-        assert_eq!(handler_commands().len(), 83);
+        assert_eq!(handler_commands().len(), 85);
     }
 
     #[test]
@@ -1166,6 +1170,8 @@ mod tests {
             "model_pull",
             "model_pause",
             "model_remove",
+            "model_licences",
+            "model_clean_old",
             "library_state",
             "library_list",
             "library_entry",

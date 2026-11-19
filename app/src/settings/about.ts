@@ -14,6 +14,6 @@ export const ABOUT = {
     { label: "Support Me", url: "https://ko-fi.com/V7V31T6CL9", strong: true },
     { label: "GitHub", url: "https://github.com/jordiboehme/notedown", strong: false },
   ] as AboutLink[],
-  footer: ["Powered by llama.cpp and Chandra", "Created with love by Jordi Böhme, AGPL-3.0"],
+  footer: ["Powered by llama.cpp, Qwen and PaddlePaddle models", "Created with love by Jordi Böhme, AGPL-3.0"],
   version: (version: string) => `Version ${version}`,
 };

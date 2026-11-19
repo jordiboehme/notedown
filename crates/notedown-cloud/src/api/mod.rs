@@ -503,8 +503,9 @@ static DRAINS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_DR
 /// body is dropped it drops only what it has buffered and closes the connection with the client
 /// still sending, which resets it before the client reads the answer. Once the body is read to
 /// its end the connection is kept as usual. Also for a refused token: the bytes are the
-/// client's own, and at most [`MAX_DRAINS`] bodies are dropped at a time. A shutdown ends a
-/// running drain with the connection.
+/// client's own, and at most [`MAX_DRAINS`] bodies are dropped at a time (in the whole
+/// process, shared by every server in it). A graceful shutdown waits for a running drain, up
+/// to its grace time (`SHUTDOWN_GRACE` in `server.rs`, 3 s).
 fn drop_rest<S>(mut stream: S, mut seen: usize)
 where
     S: futures_util::Stream<Item = Result<Bytes, axum::Error>> + Unpin + Send + 'static,

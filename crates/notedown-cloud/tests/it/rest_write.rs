@@ -2255,6 +2255,42 @@ fn upload_request(s: &Server, path: &str, token: &str, len: usize) -> String {
     )
 }
 
+/// Asserts that the server closed `stream` without reading more of it: writing fails before
+/// 16 MiB are written (a server that read them would take them all).
+fn assert_unread(stream: &mut std::net::TcpStream) {
+    use std::io::Write;
+    // Only so that a broken server fails the test instead of hanging it.
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(60)))
+        .unwrap();
+    let chunk = vec![b'a'; 64 * 1024];
+    for _ in 0..256 {
+        if stream.write_all(&chunk).is_err() {
+            return;
+        }
+    }
+    panic!("the server read 16 MiB after its answer");
+}
+
+#[test]
+fn a_client_that_waits_for_100_continue_is_refused_without_it() {
+    use std::io::Write;
+    let s = start_imported();
+    let t = writer(&s);
+    s.state.set_upload_limits(10, 10);
+    let mut stream = connect(&s);
+    let head = upload_request(&s, "NOTE/Note/a.txt", &t, 1000);
+    let head = head.replacen("\r\n\r\n", "\r\nExpect: 100-continue\r\n\r\n", 1);
+    stream.write_all(head.as_bytes()).unwrap();
+    // The refusal from the headers, without a 100 Continue first.
+    let (status, text) = answer_of(&mut stream);
+    assert_eq!(status, 413, "{text}");
+    assert!(text.contains("too_large"), "{text}");
+    assert!(!text.contains("100 Continue"), "{text}");
+    // The server does not ask for the body: it does not read it and closes the connection.
+    assert_unread(&mut stream);
+}
+
 #[test]
 fn a_body_over_the_drain_cap_is_not_read_and_the_connection_closes() {
     use std::io::Write;
@@ -2269,10 +2305,8 @@ fn a_body_over_the_drain_cap_is_not_read_and_the_connection_closes() {
     let (status, text) = answer_of(&mut stream);
     assert_eq!(status, 413, "{text}");
     assert!(text.contains("too_large"), "{text}");
-    // The server does not wait for such a body: it closes the connection.
-    let mut rest = Vec::new();
-    let _ = stream.read_to_end(&mut rest);
-    assert!(rest.is_empty(), "{}", String::from_utf8_lossy(&rest));
+    // The server does not read such a body: it closes the connection.
+    assert_unread(&mut stream);
     // And goes on.
     assert_eq!(upload(&s, &t, "NOTE/Note/a.txt", b"ok").0, 201);
 }

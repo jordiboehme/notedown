@@ -109,6 +109,8 @@ struct Inner {
     reaped: Condvar,
     /// The last `model verify` answer, for files that have not changed since.
     verified: Mutex<Option<(Vec<FileMark>, bool)>>,
+    /// The pages of the models the last licences named, once each: `open_link` opens them.
+    pages: Mutex<Vec<String>>,
 }
 
 #[derive(Default)]
@@ -229,6 +231,7 @@ impl ModelControl {
                 run: Mutex::new(Run::default()),
                 reaped: Condvar::new(),
                 verified: Mutex::new(None),
+                pages: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -293,9 +296,22 @@ impl ModelControl {
                 process::error_text(&output.stderr, output.status)
             ));
         }
-        parse_licences(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
+        let files = parse_licences(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
             "The licences are not known: the notedown program did not name them".to_owned()
-        })
+        })?;
+        let mut pages: Vec<String> = Vec::new();
+        for file in &files {
+            if !pages.contains(&file.page) {
+                pages.push(file.page.clone());
+            }
+        }
+        *lock(&self.inner.pages) = pages;
+        Ok(files)
+    }
+
+    /// The pages of the models the last licences named; none before they were read.
+    pub fn model_pages(&self) -> Vec<String> {
+        lock(&self.inner.pages).clone()
     }
 
     /// Deletes the model files of notedown 0.1 with `model clean-old`, then says what is on

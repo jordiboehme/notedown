@@ -635,21 +635,23 @@ fn resolved(path: &Path) -> PathBuf {
     }
 }
 
-pub fn allowed_link(url: &str) -> bool {
+/// Whether `open_link` opens `url`: an About or setup link, the Notifications pane, or one of
+/// `model_pages`, the pages of the models the licences named (only when it is a model page on
+/// Hugging Face).
+pub fn allowed_link(url: &str, model_pages: &[String]) -> bool {
     ABOUT_LINKS.contains(&url)
         || SETUP_LINKS.contains(&url)
         || url == NOTIFICATIONS_PANE
-        || model_page(url)
+        || (model_page(url) && model_pages.iter().any(|page| page == url))
 }
 
-/// A model's page on Hugging Face, as the OCR page links the licences: a path of plain names
-/// under https://huggingface.co/, nothing else.
+/// A model's page on Hugging Face: https://huggingface.co/<owner>/<model>, plain names only.
 fn model_page(url: &str) -> bool {
     let Some(path) = url.strip_prefix("https://huggingface.co/") else {
         return false;
     };
     let parts: Vec<&str> = path.split('/').collect();
-    !path.is_empty()
+    parts.len() == 2
         && parts.iter().all(|part| {
             !part.is_empty()
                 && *part != "."
@@ -1941,8 +1943,8 @@ pub fn mcp_info(config: State<'_, ConfigState>) -> Result<McpInfo, String> {
 /// Opens one of the About links, the setup's links or a model's page on Hugging Face (the
 /// licences of the OCR page) in the browser. No other address opens.
 #[tauri::command]
-pub async fn open_link(url: String) -> Result<(), String> {
-    if !allowed_link(&url) {
+pub async fn open_link(model: State<'_, ModelControl>, url: String) -> Result<(), String> {
+    if !allowed_link(&url, &model.model_pages()) {
         return Err("This link does not open.".to_owned());
     }
     tauri::async_runtime::spawn_blocking(move || {
@@ -2844,45 +2846,61 @@ mod tests {
 
     #[test]
     fn only_the_about_and_setup_links_open() {
-        assert!(allowed_link("https://ko-fi.com/V7V31T6CL9"));
-        assert!(allowed_link("https://github.com/jordiboehme/notedown"));
+        assert!(allowed_link("https://ko-fi.com/V7V31T6CL9", &[]));
+        assert!(allowed_link("https://github.com/jordiboehme/notedown", &[]));
         for link in SETUP_LINKS {
-            assert!(allowed_link(link), "{link}");
+            assert!(allowed_link(link, &[]), "{link}");
         }
         assert!(!allowed_link(
-            "https://github.com/jordiboehme/notedown/blob/main/docs/other.md"
+            "https://github.com/jordiboehme/notedown/blob/main/docs/other.md",
+            &[]
         ));
-        assert!(!allowed_link("https://example.org"));
-        assert!(!allowed_link("file:///etc/passwd"));
+        assert!(!allowed_link("https://example.org", &[]));
+        assert!(!allowed_link("file:///etc/passwd", &[]));
         // The Notifications page opens the Notifications pane of System Settings, no other.
         assert!(allowed_link(
-            "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
+            "x-apple.systempreferences:com.apple.Notifications-Settings.extension",
+            &[]
         ));
         assert!(!allowed_link(
-            "x-apple.systempreferences:com.apple.preference.security"
+            "x-apple.systempreferences:com.apple.preference.security",
+            &[]
         ));
     }
 
     #[test]
-    fn the_model_pages_on_hugging_face_open() {
-        for page in [
+    fn only_the_model_pages_the_licences_named_open() {
+        let pages: Vec<String> = [
             "https://huggingface.co/Qwen/Qwen3.5-4B",
             "https://huggingface.co/PaddlePaddle/PP-DocLayoutV3",
             "https://huggingface.co/PaddlePaddle/PP-OCRv6_small_det",
-        ] {
-            assert!(allowed_link(page), "{page}");
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        for page in &pages {
+            assert!(allowed_link(page, &pages), "{page}");
+            // Before the licences were read, no model page opens.
+            assert!(!allowed_link(page, &[]), "{page}");
         }
+        // Another page on Hugging Face is no model page of ours.
+        assert!(!allowed_link(
+            "https://huggingface.co/settings/tokens",
+            &pages
+        ));
+        // An answer of the notedown program never opens another site or a strange path.
         for other in [
             "https://huggingface.co/",
             "http://huggingface.co/Qwen/Qwen3.5-4B",
-            "https://huggingface.co.example.org/Qwen",
-            "https://huggingface.co@example.org/Qwen",
+            "https://huggingface.co.example.org/Qwen/x",
+            "https://huggingface.co@example.org/Qwen/x",
             "https://huggingface.co/Qwen/../../etc",
             "https://huggingface.co/Qwen/x?y=1",
             "https://huggingface.co/Qwen/x y",
-            "-a https://huggingface.co/Qwen",
+            "https://huggingface.co/a/b/c",
+            "-a https://huggingface.co/Qwen/x",
         ] {
-            assert!(!allowed_link(other), "{other}");
+            let named = vec![other.to_owned()];
+            assert!(!allowed_link(other, &named), "{other}");
         }
     }
 

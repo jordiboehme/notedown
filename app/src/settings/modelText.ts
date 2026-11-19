@@ -19,7 +19,9 @@ const HUGGING_FACE = /^https:\/\/huggingface\.co\/[A-Za-z0-9._-]+(\/[A-Za-z0-9._
 
 /**
  * The model files grouped by licensor and licence, in their order, each model once: the Qwen
- * model and its mmproj are one model, the two detectors share one group.
+ * model and its mmproj are one model, the two detectors share one group. The notedown program
+ * groups its licence lines the same way (crates/notedown-ocr/src/model.rs, `licence_lines`): a
+ * change here changes it there too.
  */
 export function licenceGroups(files: LicenceFile[]): LicenceGroup[] {
   const groups: LicenceGroup[] = [];

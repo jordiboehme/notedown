@@ -11,6 +11,7 @@
     row,
     label,
     onRange,
+    reveal = null,
   }: {
     items: T[];
     rowHeight: number;
@@ -18,6 +19,8 @@
     row: Snippet<[T]>;
     label: string;
     onRange?: (range: Range) => void;
+    /** The key of a row to bring into view once, when it is there (a picked row). */
+    reveal?: string | number | null;
   } = $props();
 
   let scrollTop = $state(0);
@@ -33,6 +36,17 @@
     if (!scroller) return;
     scroller.scrollTop = scrollToShow({ index, rowHeight, scrollTop: scroller.scrollTop, height: scroller.clientHeight });
   }
+
+  /** The `reveal` that was brought into view; another one is brought in once its row is there. */
+  let revealed: string | number | null = null;
+  $effect(() => {
+    const wanted = reveal;
+    if (wanted === null || wanted === revealed || !scroller) return;
+    const index = items.findIndex((item) => key(item) === wanted);
+    if (index < 0) return;
+    revealed = wanted;
+    untrack(() => show(index));
+  });
 
   // Runs when the shown rows or their count change; what the callback reads does not re-run it.
   $effect(() => {

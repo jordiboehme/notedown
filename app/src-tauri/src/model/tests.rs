@@ -491,6 +491,14 @@ fn licences_come_from_the_pull_before_any_download() {
             ),
         ]
     );
+    // The pages of the models, once each, for open_link.
+    assert_eq!(
+        control.model_pages(),
+        [
+            "https://huggingface.co/Qwen/Qwen3.5-4B",
+            "https://huggingface.co/PaddlePaddle/PP-DocLayoutV3",
+        ]
+    );
     let calls = fs::read_to_string(dir.path().join("calls")).unwrap();
     assert_eq!(calls.trim(), "model pull --json --licences-only");
     assert!(events.lock().unwrap().is_empty());

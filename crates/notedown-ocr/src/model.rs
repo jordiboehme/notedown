@@ -131,7 +131,8 @@ pub fn licence_files() -> Vec<LicenceFile> {
 
 /// The licences of the four files, one line per licensor and licence, each naming its models
 /// once: "PP-DocLayoutV3 and PP-OCRv6 (PaddlePaddle Authors): Apache-2.0". Shown before a
-/// download starts.
+/// download starts. The Mac app groups the files of `model pull --json` the same way
+/// (app/src/settings/modelText.ts, `licenceGroups`): a change here changes it there too.
 pub fn licence_lines() -> Vec<String> {
     let mut groups: Vec<(&str, &str, Vec<&str>)> = Vec::new();
     for f in &FILES {

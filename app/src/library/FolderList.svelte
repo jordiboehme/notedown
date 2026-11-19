@@ -97,7 +97,7 @@
   {:else if folder.entries.length === 0 && folder.complete}
     <p class="note">This folder is empty.</p>
   {:else}
-    <VirtualRows bind:this={list} items={view.rows} rowHeight={ROW} key={(entry: Entry) => entry.id} label="Files and folders" onRange={seen}>
+    <VirtualRows bind:this={list} reveal={picked === null ? null : (view.rows.find((e) => e.path === picked)?.id ?? null)} items={view.rows} rowHeight={ROW} key={(entry: Entry) => entry.id} label="Files and folders" onRange={seen}>
       {#snippet row(entry: Entry)}
         {#snippet name()}
           <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">

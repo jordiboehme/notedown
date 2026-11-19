@@ -86,6 +86,8 @@ const COMMANDS: &[&str] = &[
     "check_for_update",
     "install_update_and_restart",
     "ocr_resume",
+    "panel_pause_menu",
+    "panel_ocr_resume",
 ];
 
 fn main() {

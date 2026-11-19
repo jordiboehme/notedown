@@ -70,17 +70,23 @@ pub fn tray_entries(
     entries.extend([
         TrayEntry::Submenu {
             text: "Pause OCR".to_owned(),
-            items: vec![
-                entry(PAUSE_1M_ID, "For 1 Minute", true),
-                entry(PAUSE_5M_ID, "For 5 Minutes", true),
-                entry(PAUSE_1H_ID, "For 1 Hour", true),
-                entry(PAUSE_UNTIL_RESUMED_ID, "Until I Resume", true),
-            ],
+            items: pause_items(),
         },
         TrayEntry::Separator,
         entry(QUIT_ID, "Quit Notedown", true),
     ]);
     entries
+}
+
+/// The items of the Pause OCR menu: the tray's submenu and the panel's menu
+/// (`commands::panel_pause_menu`). [`on_menu_event`] pauses for the one picked.
+pub fn pause_items() -> Vec<TrayEntry> {
+    vec![
+        entry(PAUSE_1M_ID, "For 1 Minute", true),
+        entry(PAUSE_5M_ID, "For 5 Minutes", true),
+        entry(PAUSE_1H_ID, "For 1 Hour", true),
+        entry(PAUSE_UNTIL_RESUMED_ID, "Until I Resume", true),
+    ]
 }
 
 /// The pause a menu item id picks.
@@ -168,7 +174,10 @@ impl TrayIconKind {
 }
 
 /// The native items of `entries`.
-fn render(app: &AppHandle, entries: &[TrayEntry]) -> tauri::Result<Vec<Box<dyn IsMenuItem<Wry>>>> {
+pub(crate) fn render(
+    app: &AppHandle,
+    entries: &[TrayEntry],
+) -> tauri::Result<Vec<Box<dyn IsMenuItem<Wry>>>> {
     entries
         .iter()
         .map(|e| -> tauri::Result<Box<dyn IsMenuItem<Wry>>> {
@@ -287,11 +296,13 @@ pub fn on_menu_event(app: &AppHandle, id: &str) {
             });
         }
         _ if pause_choice(id).is_some() => {
-            let (app, choice) = (app.clone(), pause_choice(id));
+            let (app, id) = (app.clone(), id.to_owned());
             std::thread::spawn(move || {
-                if let Some(choice) = choice
-                    && let Err(e) = crate::commands::pause_ocr(&app, choice)
-                {
+                let control = crate::commands::AppPause {
+                    app: &app,
+                    window: None,
+                };
+                if let Some(Err(e)) = crate::commands::pause_pick_with(&control, &id) {
                     eprintln!("notedown: the OCR was not paused: {e}");
                 }
             });
@@ -632,6 +643,39 @@ mod tests {
                 item(PAUSE_STATUS_ID, "OCR paused", false),
                 item(RESUME_OCR_ID, "Resume OCR Now", true),
             ])
+        );
+    }
+
+    #[test]
+    fn the_panels_pause_menu_is_the_tray_submenu() {
+        // The panel's Pause OCR menu has the tray's items and ids: a pick goes through
+        // on_menu_event to pause_ocr, as one in the tray menu does.
+        let submenu = tray_entries(None, NOW, clock)
+            .into_iter()
+            .find_map(|e| match e {
+                TrayEntry::Submenu { text, items } if text == "Pause OCR" => Some(items),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(pause_items(), submenu);
+        let picks: Vec<_> = pause_items()
+            .iter()
+            .map(|e| match e {
+                TrayEntry::Item { id, text, enabled } => {
+                    assert!(enabled, "{text}");
+                    (text.clone(), pause_choice(id))
+                }
+                other => panic!("not an item: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            picks,
+            [
+                ("For 1 Minute".to_owned(), Some(PauseChoice::OneMinute)),
+                ("For 5 Minutes".to_owned(), Some(PauseChoice::FiveMinutes)),
+                ("For 1 Hour".to_owned(), Some(PauseChoice::OneHour)),
+                ("Until I Resume".to_owned(), Some(PauseChoice::UntilResumed)),
+            ]
         );
     }
 

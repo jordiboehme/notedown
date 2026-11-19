@@ -17,6 +17,8 @@ const actions = {
   onCancelQuit: noop,
   onOpenNote: noop,
   onMoreNotes: noop,
+  onPauseMenu: noop,
+  onResumeOcr: noop,
 };
 
 function note(i: number, title = `Note ${i}`): NoteSummary {

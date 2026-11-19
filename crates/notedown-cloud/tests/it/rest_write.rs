@@ -926,19 +926,24 @@ fn upload_limits() {
     let s = start_imported();
     let t = writer(&s);
     s.state.set_upload_limits(10, 10);
-    // No Content-Length (a chunked body): 411.
+    // No Content-Length (a chunked body, here an empty one): 411.
     let (status, text) = raw(
         &s,
         &upload_head("NOTE/Note/a.txt", &t, "\r\nTransfer-Encoding: chunked"),
-        b"",
+        b"0\r\n\r\n",
         false,
     );
     assert_eq!(status, 411, "{text}");
     assert!(text.contains("length_required"), "{text}");
-    // Over the limit: 413 from the headers alone, the body is never sent.
+    // Over the limit: 413 from the headers alone, the body is never sent (the client waits
+    // for 100 Continue, which never comes).
     let (status, text) = raw(
         &s,
-        &upload_head("NOTE/Note/a.txt", &t, "\r\nContent-Length: 11"),
+        &upload_head(
+            "NOTE/Note/a.txt",
+            &t,
+            "\r\nContent-Length: 11\r\nExpect: 100-continue",
+        ),
         b"",
         false,
     );
@@ -1432,10 +1437,15 @@ fn the_quota_is_checked_again_under_the_lock() {
     assert!(text.contains("quota_exceeded"), "{text}");
     wait_for_clean_staging(&s);
     assert!(!files(&s).join("NOTE/Note/a.txt").exists());
-    // The usage the server keeps knows the second upload: refused before the body now.
+    // The usage the server keeps knows the second upload: refused before the body now (the
+    // client waits for 100 Continue).
     let (status, text) = raw(
         &s,
-        &upload_head("NOTE/Note/c.txt", &t, "\r\nContent-Length: 6"),
+        &upload_head(
+            "NOTE/Note/c.txt",
+            &t,
+            "\r\nContent-Length: 6\r\nExpect: 100-continue",
+        ),
         b"",
         false,
     );
@@ -2245,4 +2255,30 @@ fn a_body_over_the_drain_cap_is_cut_off_and_the_server_goes_on() {
             .unwrap(),
     );
     assert!(status < 300, "{status}: {answer}");
+}
+
+#[test]
+fn an_upload_refused_before_its_body_is_read_is_answered_in_json() {
+    let s = start_imported();
+    let t = writer(&s);
+    s.state.set_upload_limits(1024, 1024);
+    // Far over the file limit and the socket buffers, under the drain cap: the server reads
+    // the rest of the body before it answers, so the client gets the refusal and not a reset.
+    let put = |token: &str| {
+        json_of(
+            s.client
+                .put(s.url(&format!("/files?path={}", q("NOTE/Note/big.txt"))))
+                .bearer_auth(token)
+                .body(vec![b'a'; 32 * 1024 * 1024])
+                .send()
+                .unwrap(),
+        )
+    };
+    let (status, answer) = put(&t);
+    assert_eq!(status, 413, "{answer}");
+    assert_eq!(answer, json!({"error": "too_large"}));
+    let (status, answer) = put("nonsense");
+    assert_eq!(status, 401, "{answer}");
+    assert_eq!(answer["error"], "token_refused");
+    assert!(!files(&s).join("NOTE/Note/big.txt").exists());
 }

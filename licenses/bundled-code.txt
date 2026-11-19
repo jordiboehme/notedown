@@ -1,39 +1,48 @@
-# C and C++ code built into the macOS notedown binary (default features, OCR).
+# Code built into the macOS notedown binary (default features, OCR) that the
+# crate notices of cargo-about do not show: the C and C++ code of llama.cpp and
+# the Apache-2.0 code adapted inside pagevision.
 # scripts/third-party-notices.sh drops these leading "#" lines and appends the
 # rest to THIRD-PARTY-NOTICES.txt of the macos and app variants. The linux
-# variant is built without OCR and has no llama.cpp.
+# variant is built without OCR and has neither.
 #
 # Source: llama-cpp-sys-2 0.1.161 (crate license MIT OR Apache-2.0), which
 # builds llama.cpp from its llama.cpp/ folder with the mtmd feature. The texts
-# below are copied from that folder: LICENSE, vendor/stb/stb_image.h (end of
-# file), vendor/miniaudio/miniaudio.h (end of file), vendor/sheredom/
-# subprocess.h, vendor/hash/sha256/sha256.c, vendor/hash/rotate-bits/
-# LICENSE.md and ggml/src/ggml-cpu/llamafile/sgemm.cpp.
+# below are copied from that folder: LICENSE and
+# ggml/src/ggml-cpu/llamafile/sgemm.cpp.
 #
-# Which vendored parts are linked, checked on 2026-11-17 with
+# Which vendored parts are linked, checked on 2026-11-19 with
 #   cargo build --release -p notedown
 # (aarch64-apple-darwin, default features) and nm on target/release/notedown.
 # stb_image and miniaudio are compiled as static functions (MA_API static),
 # so "nm -gU ... | grep -E 'stbi_|ma_|nlohmann|httplib'" does not see them
 # and its "ma_" also matches "llama_". These counts were used instead:
-#   nm target/release/notedown | grep -cE 'ZL[0-9]+stbi__'    98   stb_image: linked
-#   nm target/release/notedown | grep -cE 'ZL[0-9]+ma_'       206  miniaudio: linked
-#   nm target/release/notedown | grep -c  '_subprocess_create' 2   sheredom subprocess.h: linked
-#   nm target/release/notedown | grep -cE ' T _sha256_hash$'   1   hash/sha256 (with rotate-bits): linked
+#   nm target/release/notedown | grep -cE 'ZL[0-9]+stbi__'    0   stb_image: not linked
+#   nm target/release/notedown | grep -cE 'ZL[0-9]+ma_'       0   miniaudio: not linked
+#   nm target/release/notedown | grep -c  '_subprocess_create' 0   sheredom subprocess.h: not linked
+#   nm target/release/notedown | grep -cE ' T _sha256_hash$'   0   hash/sha256 (with rotate-bits): not linked
 #   nm target/release/notedown | grep -c  'llamafile_sgemm'    1   llamafile sgemm: linked
 #   nm target/release/notedown | grep -ci 'nlohmann'           0   nlohmann json: not linked
 #   nm target/release/notedown | grep -ci 'httplib'            0   cpp-httplib: not linked
 #   nm target/release/notedown | grep -c  'XXH'                0   hash/xxhash: not linked
 #   nm target/release/notedown | grep -c  'vendor_hash'        0   hash/sha1 (namespace vendor_hash): not linked
-# Only the linked parts are listed below. Check again when llama-cpp-2 or
-# llama-cpp-sys-2 changes version.
+# Up to notedown 0.1 the Chandra code decoded PNG files inside mtmd, which
+# linked stb_image, miniaudio, subprocess.h and the SHA-256 code. pagevision
+# hands mtmd raw pixels, so they are gone.
+# Only the linked parts are listed below. Check again when llama-cpp-2,
+# llama-cpp-sys-2 or pagevision changes version.
+#
+# pagevision (git dependency from rezzer) is MPL-2.0 AND Apache-2.0. The
+# files adapted from Apache-2.0 code name their sources and copyright holders
+# in their header; the last section repeats them. The Apache-2.0 text itself
+# is in the crate notices, where pagevision is listed under Apache-2.0.
 Code built into the notedown program
 ====================================
 
 The OCR side of the notedown program (macOS) is built with llama.cpp. The
 llama-cpp-sys-2 crate builds it from source and links it into the binary.
-llama.cpp in turn bundles the parts listed after its own license. Each part
-comes with the license text from its source file.
+llama.cpp in turn bundles the part listed after its own license. Each part
+comes with the license text from its source file. The last section names the
+Apache-2.0 code inside pagevision, the page reading library of notedown.
 
 ========================================================================
 llama.cpp and ggml (MIT)
@@ -94,169 +103,58 @@ is based on https://github.com/jquesnelle/yarn:
 MIT licensed. Copyright (c) 2023 Jeffrey Quesnelle and Bowen Peng.
 
 ========================================================================
-stb_image v2.30 (MIT or public domain)
+Code adapted from oar-ocr-vl, OpenCV, PaddleOCR and PaddleX inside
+pagevision (Apache-2.0)
 ========================================================================
 
-Source: llama.cpp vendor/stb/stb_image.h, used by the mtmd image loader.
+Source: pagevision (https://github.com/jordiboehme/rezzer,
+crates/formats/pagevision). The crate is MPL-2.0. These parts of it are
+adapted from Apache-2.0 code and stay Apache-2.0:
 
-This software is available under 2 licenses -- choose whichever you prefer.
-------------------------------------------------------------------------------
-ALTERNATIVE A - MIT License
-Copyright (c) 2017 Sean Barrett
-Permission is hereby granted, free of charge, to any person obtaining a copy of
-this software and associated documentation files (the "Software"), to deal in
-the Software without restriction, including without limitation the rights to
-use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
-of the Software, and to permit persons to whom the Software is furnished to do
-so, subject to the following conditions:
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-------------------------------------------------------------------------------
-ALTERNATIVE B - Public Domain (www.unlicense.org)
-This is free and unencumbered software released into the public domain.
-Anyone is free to copy, modify, publish, use, compile, sell, or distribute this
-software, either in source code form or as a compiled binary, for any purpose,
-commercial or non-commercial, and by any means.
-In jurisdictions that recognize copyright laws, the author or authors of this
-software dedicate any and all copyright interest in the software to the public
-domain. We make this dedication for the benefit of the public at large and to
-the detriment of our heirs and successors. We intend this dedication to be an
-overt act of relinquishment in perpetuity of all present and future rights to
-this software under copyright law.
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
-ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
-WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-------------------------------------------------------------------------------
+- The PP-DocLayoutV3 model (src/detect/v3/) is adapted from oar-ocr-vl
+  0.10.3 src/models/pp_doclayout/ (Copyright the oar-ocr authors,
+  https://github.com/GreatV/oar-ocr). oar-ocr-vl ports it from Hugging Face
+  transformers (https://github.com/huggingface/transformers):
+  src/transformers/models/rt_detr (Copyright 2024 Baidu Inc and The
+  HuggingFace Inc. team), src/transformers/models/hgnet_v2 (Copyright 2025
+  Baidu Inc and The HuggingFace Inc. team) and
+  src/transformers/models/pp_doclayout_v3 (Copyright 2026 The PaddlePaddle
+  Team and The HuggingFace Inc. team).
+- The image resize (src/resize.rs) is adapted from oar-ocr-vl 0.10.3
+  src/runtime/image.rs (Copyright the oar-ocr authors), which adapts OpenCV
+  4.13.0 imgproc/src/resize.cpp (https://github.com/opencv/opencv).
+  OpenCV's COPYRIGHT file (4.13.0):
+  Copyright (C) 2000-2022, Intel Corporation, all rights reserved.
+  Copyright (C) 2009-2011, Willow Garage Inc., all rights reserved.
+  Copyright (C) 2009-2016, NVIDIA Corporation, all rights reserved.
+  Copyright (C) 2010-2013, Advanced Micro Devices, Inc., all rights reserved.
+  Copyright (C) 2015-2023, OpenCV Foundation, all rights reserved.
+  Copyright (C) 2008-2016, Itseez Inc., all rights reserved.
+  Copyright (C) 2019-2023, Xperience AI, all rights reserved.
+  Copyright (C) 2019-2022, Shenzhen Institute of Artificial Intelligence and
+  Robotics for Society, all rights reserved.
+  Copyright (C) 2022-2023, Southern University of Science And Technology,
+  all rights reserved.
+  Copyright (C) 2023-2025, OpenCV AI, all rights reserved.
+  Third party copyrights are property of their respective owners.
+- The text line post-processing (src/textdet.rs) is adapted from PaddleOCR
+  DBPostProcess and DetResizeForTest (Copyright the PaddlePaddle Authors) as
+  ported in oar-ocr-core db.rs (Copyright the oar-ocr authors).
+- The layout post-processing (src/layoutpost.rs) is adapted from oar-ocr-vl
+  0.10.3 src/pipeline/geometry/layout_filter.rs (Copyright the oar-ocr
+  authors), which follows the PaddleX layout_analysis and object_detection
+  processors (Copyright the PaddlePaddle Authors).
 
-========================================================================
-miniaudio 0.11.25 (public domain or MIT-0)
-========================================================================
+Each of these files says what was changed in its header.
 
-Source: llama.cpp vendor/miniaudio/miniaudio.h, used by the mtmd audio loader.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use these files except in compliance with the License. You may obtain a copy
+of the License at
 
-This software is available as a choice of the following licenses. Choose
-whichever you prefer.
+    http://www.apache.org/licenses/LICENSE-2.0
 
-===============================================================================
-ALTERNATIVE 1 - Public Domain (www.unlicense.org)
-===============================================================================
-This is free and unencumbered software released into the public domain.
-
-Anyone is free to copy, modify, publish, use, compile, sell, or distribute this
-software, either in source code form or as a compiled binary, for any purpose,
-commercial or non-commercial, and by any means.
-
-In jurisdictions that recognize copyright laws, the author or authors of this
-software dedicate any and all copyright interest in the software to the public
-domain. We make this dedication for the benefit of the public at large and to
-the detriment of our heirs and successors. We intend this dedication to be an
-overt act of relinquishment in perpetuity of all present and future rights to
-this software under copyright law.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
-ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
-WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-For more information, please refer to <http://unlicense.org/>
-
-===============================================================================
-ALTERNATIVE 2 - MIT No Attribution
-===============================================================================
-Copyright 2026 David Reid
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of
-this software and associated documentation files (the "Software"), to deal in
-the Software without restriction, including without limitation the rights to
-use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
-of the Software, and to permit persons to whom the Software is furnished to do
-so.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-========================================================================
-subprocess.h (Unlicense)
-========================================================================
-
-Source: llama.cpp vendor/sheredom/subprocess.h (https://github.com/sheredom/subprocess.h).
-
-This is free and unencumbered software released into the public domain.
-
-Anyone is free to copy, modify, publish, use, compile, sell, or
-distribute this software, either in source code form or as a compiled
-binary, for any purpose, commercial or non-commercial, and by any
-means.
-
-In jurisdictions that recognize copyright laws, the author or authors
-of this software dedicate any and all copyright interest in the
-software to the public domain. We make this dedication for the benefit
-of the public at large and to the detriment of our heirs and
-successors. We intend this dedication to be an overt act of
-relinquishment in perpetuity of all present and future rights to this
-software under copyright law.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
-OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
-ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
-OTHER DEALINGS IN THE SOFTWARE.
-
-For more information, please refer to <http://unlicense.org/>
-
-========================================================================
-SHA-256 (public domain)
-========================================================================
-
-Source: llama.cpp vendor/hash/sha256/sha256.c, used by mtmd.
-
-Crypto/Sha256.c -- SHA-256 Hash
-2010-06-11 : Igor Pavlov : Public domain
-This code is based on public domain code from Wei Dai's Crypto++ library.
-
-========================================================================
-rotate-bits (MIT)
-========================================================================
-
-Source: llama.cpp vendor/hash/rotate-bits, used by the SHA-256 code above.
-
-MIT License
-
-Copyright (c) 2021 William Casarin <jb55@jb55.com>
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+License for the specific language governing permissions and limitations under
+the License.

@@ -45,11 +45,15 @@ cat >"$tmp/cli.json" <<'EOF'
   "metadata": {"component": {"name": "notedown", "version": "0.1.0", "bom-ref": "path+file:///w/crates/notedown#0.1.0", "purl": "pkg:cargo/notedown@0.1.0?download_url=file://."}},
   "components": [
     {"name": "serde", "version": "1.0.0", "bom-ref": "registry#serde@1.0.0", "purl": "pkg:cargo/serde@1.0.0"},
-    {"name": "llama-cpp-sys-2", "version": "0.1.161", "bom-ref": "registry#llama-cpp-sys-2@0.1.161", "purl": "pkg:cargo/llama-cpp-sys-2@0.1.161"}
+    {"name": "llama-cpp-sys-2", "version": "0.1.161", "bom-ref": "registry#llama-cpp-sys-2@0.1.161", "purl": "pkg:cargo/llama-cpp-sys-2@0.1.161"},
+    {"name": "candle-core", "version": "0.11.1", "bom-ref": "registry#candle-core@0.11.1", "purl": "pkg:cargo/candle-core@0.11.1"},
+    {"name": "pagevision", "version": "0.1.0", "bom-ref": "git+https://github.com/jordiboehme/rezzer?rev=74188f8dc0a39053e29ba42a5b04b893bec2bd34#pagevision@0.1.0", "purl": "pkg:cargo/pagevision@0.1.0?vcs_url=git%2Bhttps://github.com/jordiboehme/rezzer%4074188f8dc0a39053e29ba42a5b04b893bec2bd34"}
   ],
   "dependencies": [
-    {"ref": "path+file:///w/crates/notedown#0.1.0", "dependsOn": ["registry#llama-cpp-sys-2@0.1.161", "registry#serde@1.0.0"]},
+    {"ref": "path+file:///w/crates/notedown#0.1.0", "dependsOn": ["git+https://github.com/jordiboehme/rezzer?rev=74188f8dc0a39053e29ba42a5b04b893bec2bd34#pagevision@0.1.0", "registry#llama-cpp-sys-2@0.1.161", "registry#serde@1.0.0"]},
+    {"ref": "git+https://github.com/jordiboehme/rezzer?rev=74188f8dc0a39053e29ba42a5b04b893bec2bd34#pagevision@0.1.0", "dependsOn": ["registry#candle-core@0.11.1", "registry#llama-cpp-sys-2@0.1.161"]},
     {"ref": "registry#serde@1.0.0", "dependsOn": []},
+    {"ref": "registry#candle-core@0.11.1", "dependsOn": []},
     {"ref": "registry#llama-cpp-sys-2@0.1.161", "dependsOn": []}
   ]
 }
@@ -112,6 +116,11 @@ else
   check "components without purl and bom-ref stay apart, by name@version" \
     '[.components[] | select(.name | startswith("bare-")) | .name] == ["bare-a", "bare-b"]'
   check "the crates of the program are in" 'any(.components[]; .name == "llama-cpp-sys-2")'
+  check "the OCR crates of the program are in, the git one too" '
+    any(.components[]; .name == "candle-core") and any(.components[]; .name == "pagevision")'
+  check "the git crate keeps its dependencies" '
+    .dependencies[] | select(.ref | startswith("git+https://github.com/jordiboehme/rezzer?"))
+    | .dependsOn | index("registry#candle-core@0.11.1") != null'
   check "the program itself is a component" 'any(.components[]; .name == "notedown")'
   check "the production npm package is in" 'any(.components[]; .name == "@tauri-apps/api")'
   check "the bundled devDependency is in, at its top-level version" \

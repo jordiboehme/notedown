@@ -315,8 +315,10 @@ jobs:
       # What each file must name. A license id must end a heading line
       # "<name> (<id>)": a plain "MIT" would also match "LIMITED". A crate is
       # a list line "  - <crate> <version>". The llama.cpp parts are checked
-      # by lines of the copied texts, not by our own summary. The Linux file
-      # must not name llama.cpp: that build has no OCR.
+      # by lines of the copied texts, not by our own summary, and the
+      # Apache-2.0 code inside pagevision by the heading of its section. The
+      # Linux file must not name llama.cpp, candle or pagevision: that build
+      # has no OCR.
       - name: Check the notices
         run: |
           set -euo pipefail
@@ -330,6 +332,8 @@ jobs:
           }
           has_crate() { grep -qE -- "^  - $2 [0-9]" "$1"; }
           ggml='Copyright (c) 2023-2026 The ggml authors'
+          pagevision='Code adapted from oar-ocr-vl, OpenCV, PaddleOCR and PaddleX inside'
+          ocr_crates='llama-cpp-sys-2 candle-core pagevision'
           for variant in macos linux app; do
             f="notices/$variant/THIRD-PARTY-NOTICES.txt"
             [ -s "$f" ] || { err "$f is missing or empty"; continue; }
@@ -355,14 +359,20 @@ jobs:
             esac
             case "$variant" in
               macos | app)
-                has_crate "$f" llama-cpp-sys-2 || err "$f does not list llama-cpp-sys-2"
-                for text in "$ggml" 'Copyright 2024 Mozilla Foundation' 'Copyright (c) 2017 Sean Barrett'; do
+                for crate in $ocr_crates; do
+                  has_crate "$f" "$crate" || err "$f does not list $crate"
+                done
+                for text in "$ggml" 'Copyright 2024 Mozilla Foundation' "$pagevision"; do
                   grep -qF -- "$text" "$f" || err "$f lacks '$text'"
                 done
                 ;;
               linux)
-                ! has_crate "$f" llama-cpp-sys-2 || err "$f lists llama-cpp-sys-2, but the Linux build has no OCR"
-                ! grep -qF -- "$ggml" "$f" || err "$f has the llama.cpp notices, but the Linux build has no OCR"
+                for crate in $ocr_crates; do
+                  ! has_crate "$f" "$crate" || err "$f lists $crate, but the Linux build has no OCR"
+                done
+                for text in "$ggml" "$pagevision"; do
+                  ! grep -qF -- "$text" "$f" || err "$f has '$text', but the Linux build has no OCR"
+                done
                 ;;
             esac
             echo "$f: $(wc -l <"$f") lines"
@@ -686,8 +696,8 @@ jobs:
             "sbom/notedown-app-v${NAME_VER}-macos.cdx.json"
 
       # Cheap guards against an SBOM that is empty or describes the wrong
-      # build: llama-cpp-sys-2 (OCR) is only in the macOS graphs, tauri and
-      # the npm packages only in the app's.
+      # build: llama-cpp-sys-2, candle-core and pagevision (OCR) are only in
+      # the macOS graphs, tauri and the npm packages only in the app's.
       - name: Check the SBOMs
         run: |
           set -euo pipefail
@@ -715,15 +725,19 @@ jobs:
             has "$f" tokio || err "$f does not list tokio"
             case "$f" in
               */notedown-app-*)
-                for c in tauri llama-cpp-sys-2 notedown svelte tailwindcss @tauri-apps/api; do
+                for c in tauri llama-cpp-sys-2 candle-core pagevision notedown svelte tailwindcss @tauri-apps/api; do
                   has "$f" "$c" || err "$f does not list $c"
                 done
                 ;;
               *-macos.cdx.json)
-                has "$f" llama-cpp-sys-2 || err "$f does not list llama-cpp-sys-2"
+                for c in llama-cpp-sys-2 candle-core pagevision; do
+                  has "$f" "$c" || err "$f does not list $c"
+                done
                 ;;
               *-linux-*)
-                ! has "$f" llama-cpp-sys-2 || err "$f lists llama-cpp-sys-2, but the Linux build has no OCR"
+                for c in llama-cpp-sys-2 candle-core pagevision; do
+                  ! has "$f" "$c" || err "$f lists $c, but the Linux build has no OCR"
+                done
                 ;;
             esac
             echo "$f: $(jq '.components | length' "$f") components"

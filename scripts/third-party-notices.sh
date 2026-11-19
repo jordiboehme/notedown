@@ -3,8 +3,10 @@
 #
 #   macos  the notedown archive for macOS: the crates of crates/notedown with
 #          default features (OCR) for aarch64-apple-darwin (about.toml), then
-#          the AWS-LC license file (licenses/aws-lc.txt) and the C and C++
-#          code of llama.cpp built into it (licenses/bundled-code.txt).
+#          the AWS-LC license file (licenses/aws-lc.txt) and the code built
+#          into it that the crate notices do not show: the C and C++ code of
+#          llama.cpp and the Apache-2.0 parts of pagevision
+#          (licenses/bundled-code.txt).
 #   linux  the notedown archives and .deb packages for Linux: the crates of
 #          crates/notedown with --no-default-features for both musl targets,
 #          then licenses/aws-lc.txt. No llama.cpp, so no bundled-code.txt.

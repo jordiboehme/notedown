@@ -670,14 +670,14 @@ fn supervise(app: AppHandle) {
 /// How often the app looks whether a timed OCR pause has ended.
 const PAUSE_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Ends a timed OCR pause at its time: clears it and starts the pipeline, as Resume does.
+/// Ends a timed OCR pause at its time: clears it and starts the pipeline, as Resume does. A
+/// clear that cannot be saved still starts the pipeline, and is told once.
 fn watch_the_pause(app: AppHandle) {
     std::thread::spawn(move || {
+        let mut watch = commands::PauseWatch::default();
         loop {
             std::thread::sleep(PAUSE_TICK);
-            if let Err(e) = commands::end_expired_pause(&app) {
-                eprintln!("notedown: the ended OCR pause was not cleared: {e}");
-            }
+            commands::end_expired_pause(&app, &mut watch);
         }
     });
 }

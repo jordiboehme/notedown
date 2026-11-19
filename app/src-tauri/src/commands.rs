@@ -1052,6 +1052,54 @@ pub fn end_expired_pause_with(
     Ok(ended)
 }
 
+/// What one tick of the pause watch did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PauseTick {
+    /// No pause ended: none is set, it still holds, or its end was handled before.
+    Holds,
+    /// The pause ended: it was cleared and the pipeline starts.
+    Ended,
+    /// The pause ended, but its clear could not be saved (why): the pipeline starts anyway,
+    /// as the plan treats an ended pause as over.
+    EndedNotSaved(String),
+}
+
+/// The pause watch: [`end_expired_pause_with`] on each tick. An ended pause whose clear cannot
+/// be saved (a full disk, a folder that cannot be written) is handled once: the pipeline starts
+/// and the failure is told once, not on every tick. Later ticks try the clear again.
+#[derive(Default)]
+pub struct PauseWatch {
+    /// The ended pause whose clear failed and was already handled.
+    not_saved: Option<OcrPause>,
+}
+
+impl PauseWatch {
+    pub fn tick(
+        &mut self,
+        config: &ConfigState,
+        processes: &Arc<Processes>,
+        server: &import_job::ServerUse,
+        now_ms: u64,
+    ) -> PauseTick {
+        match end_expired_pause_with(config, processes, server, now_ms) {
+            Ok(true) => {
+                self.not_saved = None;
+                PauseTick::Ended
+            }
+            Ok(false) => PauseTick::Holds,
+            Err(why) => {
+                let ended = config.current().ocr_pause;
+                if ended.is_some() && ended == self.not_saved {
+                    return PauseTick::Holds;
+                }
+                self.not_saved = ended;
+                relaunch_unless_held(config, processes, server);
+                PauseTick::EndedNotSaved(why)
+            }
+        }
+    }
+}
+
 /// [`relaunch_pipeline`] while no import holds the server.
 fn relaunch_unless_held(
     config: &ConfigState,
@@ -1088,19 +1136,24 @@ pub fn resume_ocr(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// [`end_expired_pause_with`] in the app, on each tick of the pause watch.
-pub fn end_expired_pause(app: &AppHandle) -> Result<(), String> {
+/// [`PauseWatch::tick`] in the app, on each tick of the pause watch: an ended pause shows in
+/// the tray menu and the status at once.
+pub fn end_expired_pause(app: &AppHandle, watch: &mut PauseWatch) {
     let processes = app.state::<Arc<Processes>>();
-    let ended = end_expired_pause_with(
+    let tick = watch.tick(
         app.state::<ConfigState>().inner(),
         processes.inner(),
         &app.state::<ImportJobs>().server_use(),
         processes.now_ms(),
-    )?;
-    if ended {
-        pause_changed(app);
+    );
+    match tick {
+        PauseTick::Holds => {}
+        PauseTick::Ended => pause_changed(app),
+        PauseTick::EndedNotSaved(why) => {
+            eprintln!("notedown: the ended OCR pause was not cleared: {why}");
+            pause_changed(app);
+        }
     }
-    Ok(())
 }
 
 /// After a pause, its end or a resume: the tray menu and the status show it at once.
@@ -3105,6 +3158,73 @@ mod tests {
                 end_expired_pause_with(&state, &p, &server, NOW + MIN),
                 Ok(false)
             );
+            p.stop_all();
+        }
+
+        #[test]
+        fn a_timed_pause_whose_clear_is_not_saved_still_ends_once() {
+            let rig = Rig::new();
+            rig.listen_on(crate::probe::test_server::free_port());
+            let config_dir = rig.dir.path().join("config");
+            config::save(&config_dir, &rig.config()).unwrap();
+            // A config folder that cannot be written once `broken` is set (a full disk).
+            let broken = Arc::new(AtomicBool::new(false));
+            let fails = broken.clone();
+            let state = ConfigState::load_with(
+                config_dir,
+                Arc::new(move |dir: &Path, c: &AppConfig| {
+                    if fails.load(Ordering::SeqCst) {
+                        return Err(std::io::Error::other("the disk is full"));
+                    }
+                    config::save(dir, c)
+                }),
+            );
+            let p = Arc::new(rig.paused_processes());
+            p.start_with(|| state.current());
+            running_pid(p.server());
+            running_pid(p.pipeline());
+            let server = import_job::ServerUse::default();
+            pause_ocr_with(&state, &p, &server, PauseChoice::OneMinute, NOW).unwrap();
+            relaunched(&server);
+            assert_eq!(p.pipeline().state(), ChildState::Stopped);
+
+            broken.store(true, Ordering::SeqCst);
+            let mut watch = PauseWatch::default();
+            // Before its end: nothing.
+            assert_eq!(
+                watch.tick(&state, &p, &server, NOW + MIN - 1),
+                PauseTick::Holds
+            );
+            // At its end the clear fails, but the pipeline starts: the pause is over.
+            rig.set_now(NOW + MIN);
+            let first = watch.tick(&state, &p, &server, NOW + MIN);
+            assert!(
+                matches!(&first, PauseTick::EndedNotSaved(why) if why.contains("the disk is full")),
+                "{first:?}"
+            );
+            relaunched(&server);
+            running_pid(p.pipeline());
+            assert_eq!(rig.pipeline_spawns(), 2);
+            // The next ticks say nothing more: the failure is told once per pause.
+            assert_eq!(
+                watch.tick(&state, &p, &server, NOW + MIN + 1_000),
+                PauseTick::Holds
+            );
+            assert!(
+                state.current().ocr_pause.is_some(),
+                "the clear was not saved"
+            );
+
+            // Once the folder can be written, the next tick clears it; the pipeline runs on.
+            broken.store(false, Ordering::SeqCst);
+            assert_eq!(
+                watch.tick(&state, &p, &server, NOW + MIN + 2_000),
+                PauseTick::Ended
+            );
+            relaunched(&server);
+            assert_eq!(config::load(&state.dir).ocr_pause, None);
+            running_pid(p.pipeline());
+            assert_eq!(rig.pipeline_spawns(), 2);
             p.stop_all();
         }
 

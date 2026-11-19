@@ -23,22 +23,37 @@ For a sync server without the OCR part (a NAS or a Raspberry Pi), add `--no-defa
 On macOS the model runs on the GPU with Metal automatically. On Linux the build needs `cmake` and a C++
 compiler, and inference runs on the CPU.
 
-Then download the OCR model once (about 3.4 GB, checked against pinned SHA-256 sums):
+Then download the OCR model once (about 3.6 GB, checked against pinned SHA-256 sums):
 
 ```sh
 notedown model pull
 ```
 
 The files go to `~/Library/Caches/notedown/models` on macOS and `$XDG_CACHE_HOME/notedown/models` on
-Linux. Set `NOTEDOWN_MODEL_DIR` to use another folder. `notedown model path` shows the paths and
-`notedown model verify` checks the files.
+Linux. Set `NOTEDOWN_MODEL_DIR` to use another folder. There are four files:
+
+- `Qwen3.5-4B-Q4_K_M.gguf` and `mmproj-F16.gguf`: Qwen3.5-4B reads the text and the drawings
+  (Qwen team, Alibaba Cloud, Apache-2.0);
+- `pp-doclayoutv3.safetensors`: PP-DocLayoutV3 finds the drawings on a page;
+- `pp-ocrv6-small-det.onnx`: PP-OCRv6 finds the text lines. Both are by the PaddlePaddle Authors,
+  Apache-2.0.
+
+Each file is pinned to a Hugging Face revision. `notedown model pull` shows the licences before it
+starts. `notedown model path` shows the folder and the four files (`cache:`, `model:`, `mmproj:`,
+`layout:` and `lines:`), and `notedown model verify` checks all four.
 
 A pull that stops (you end it, or the connection breaks) keeps what it has. The next
 `notedown model pull` continues from there. Run only one pull at a time.
 
-`notedown model pull --json` is for apps. It prints one JSON line per progress step on stdout:
+`notedown model pull --json` is for apps. Its first line on stdout names the licences:
+`{"licences": ["<line>", ...]}`. Then it prints one JSON line per progress step:
 `{"file": "<name>", "done": <bytes>, "total": <bytes>}`. The last line is `{"ready": "<path>"}`.
-An error is plain text on stderr, and the exit code is not 0.
+An error is plain text on stderr, and the exit code is not 0. With `--licences-only` it prints the
+licences and stops before the download.
+
+Notedown 0.1 used other model files (about 3.4 GB). Notedown does not delete them on its own.
+`notedown model clean-old` deletes them, and only them. The Mac app offers a button for it when they
+are still there.
 
 ## Convert and render
 
@@ -88,11 +103,10 @@ A file is skipped when its `.md` already exists and the front matter has the sam
 same model and the same Notedown major version. The model is not even loaded when every file is
 skipped.
 
-A new OCR model counts as a change. Notedown 0.2 reads with pagevision instead of Chandra OCR 2, so
-`notedown convert` reads a `.md` file that Chandra wrote again on its next run, with the new OCR. This
-takes a while on a big folder (about 30 s per page on an Apple silicon Mac). The server works
-differently: it keeps the text of pages that Chandra read and reads a page again only when the page
-changes.
+A new OCR model counts as a change. Notedown 0.2 reads with a new OCR, so `notedown convert` reads a
+`.md` file that Notedown 0.1 wrote again on its next run. This takes a while on a big folder (about
+30 s per page on an Apple silicon Mac). The server works differently: it keeps the text of pages that
+the old OCR read and reads a page again only when the page changes.
 
 A `.md` file from an older Notedown has a front matter without `type`. When its source checksum, model
 and major version still match, Notedown only replaces the front matter with the new one and keeps the
@@ -135,7 +149,7 @@ title: "Test 2"
 description: "Handwritten Supernote note, 1 page, read by OCR."
 resource: "Test 2.note"
 tags: [supernote]
-generated: { by: notedown/<version>, model: "chandra-ocr-2 Q4_K_M", at: 2026-10-05T23:10:00Z }
+generated: { by: notedown/<version>, model: "pagevision qwen3.5-4b Q4_K_M", at: 2026-10-05T23:10:00Z }
 source_date: 2026-10-05
 sources:
   - { id: note, resource: "Test 2.note", last_modified: 2026-10-05T22:55:35Z }
@@ -168,7 +182,9 @@ The keys of the front matter:
   `--out`, and also when `--out` is a symbolic link.
 - `tags` is always `[supernote]`.
 - `generated` says who wrote the text and when: `by` is Notedown with its version, `model` the OCR
-  model and `at` the time of the conversion in UTC.
+  model and `at` the time of the conversion in UTC. The model is `pagevision qwen3.5-4b Q4_K_M`, or
+  the file name of `--model` without its extension. A file that Notedown 0.1 wrote names its old
+  model here.
 - `source_date` is the day the source file was last changed, in local time.
 - `sources` names the source file once more, with `last_modified`, the time it was last changed in
   UTC. When that time can't be read, `source_date` and `last_modified` are left out.
@@ -193,8 +209,8 @@ number or a yes/no value. Dates, times and numbers are written without quotes.
 Every page starts with an `<a id="page-N"></a>` anchor, so links to a page inside the same note work
 as `#page-N`. The image line and the `<name>.assets/` folder appear only with `--images`. A page that
 hit the token limit gets `<!-- notedown: truncated -->`. Drawn diagrams that the model reads as Mermaid
-become `mermaid` code blocks, followed by the model's description of the diagram as a `>` blockquote.
-A drawing that is not a diagram becomes a `> Figure: ...` blockquote.
+become `mermaid` code blocks. When the model also describes the diagram, the description follows as a
+`>` blockquote. A drawing that is not a diagram becomes a `> Sketch: ...` blockquote.
 
 Links to other notes are listed in a `Links:` line at the end of the page. `links:` in the front
 matter keeps each link to another note: `target_file_id` is the `FILE_ID` of the target note,

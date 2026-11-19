@@ -28,7 +28,7 @@ On macOS the OCR model runs on the GPU (Metal). On Linux it runs on the CPU. The
 notedown model pull
 ```
 
-This is done once. The model is about 3.4 GB and every file is checked against a pinned SHA-256 sum. If the download stops, run the command again: it continues where it stopped. `notedown model path` shows where the files are and `notedown model verify` checks them again.
+This is done once. The model is about 3.6 GB and every file is checked against a pinned SHA-256 sum. If the download stops, run the command again: it continues where it stopped. `notedown model path` shows where the files are and `notedown model verify` checks them again.
 
 ### 3. Get your notes onto the computer
 

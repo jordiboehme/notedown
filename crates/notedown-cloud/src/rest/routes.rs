@@ -41,8 +41,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     let path = |p: &str| format!("{PREFIX}{p}");
     let get_only = |r: MethodRouter<Arc<AppState>>| r.fallback(no_route);
     // A JSON body is read whole: up to the limit of the request log, whose JSON 413 answers a
-    // larger one after it has read and dropped the rest within bounds (axum's own default of
-    // 2 MiB would answer plain text first).
+    // larger one and drops the rest within bounds (axum's own default of 2 MiB would answer
+    // plain text first).
     let json_body = |r: MethodRouter<Arc<AppState>>| {
         r.fallback(no_route)
             .layer(DefaultBodyLimit::max(crate::server::MAX_REQUEST_BODY))

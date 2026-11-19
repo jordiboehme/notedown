@@ -722,8 +722,31 @@ fn raw(s: &Server, head: &str, body: &[u8], shutdown: bool) -> (u16, String) {
     if shutdown {
         let _ = stream.shutdown(std::net::Shutdown::Write);
     }
+    answer_of(&mut stream)
+}
+
+/// Status and text of one answer on `stream`: read up to its Content-Length (the server can
+/// keep the connection open after the answer while it drops an unsent body), or to the end.
+fn answer_of(stream: &mut std::net::TcpStream) -> (u16, String) {
     let mut text = Vec::new();
-    let _ = stream.read_to_end(&mut text);
+    let mut buf = [0u8; 8192];
+    loop {
+        let head_end = text.windows(4).position(|w| w == b"\r\n\r\n");
+        if let Some(end) = head_end {
+            let head = String::from_utf8_lossy(&text[..end]).to_ascii_lowercase();
+            let len = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok());
+            if len.is_some_and(|len| text.len() >= end + 4 + len) {
+                break;
+            }
+        }
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => text.extend_from_slice(&buf[..n]),
+        }
+    }
     let text = String::from_utf8_lossy(&text).into_owned();
     let status = text
         .split_whitespace()
@@ -926,24 +949,19 @@ fn upload_limits() {
     let s = start_imported();
     let t = writer(&s);
     s.state.set_upload_limits(10, 10);
-    // No Content-Length (a chunked body, here an empty one): 411.
+    // No Content-Length (a chunked body): 411.
     let (status, text) = raw(
         &s,
         &upload_head("NOTE/Note/a.txt", &t, "\r\nTransfer-Encoding: chunked"),
-        b"0\r\n\r\n",
+        b"",
         false,
     );
     assert_eq!(status, 411, "{text}");
     assert!(text.contains("length_required"), "{text}");
-    // Over the limit: 413 from the headers alone, the body is never sent (the client waits
-    // for 100 Continue, which never comes).
+    // Over the limit: 413 from the headers alone, the body is never sent.
     let (status, text) = raw(
         &s,
-        &upload_head(
-            "NOTE/Note/a.txt",
-            &t,
-            "\r\nContent-Length: 11\r\nExpect: 100-continue",
-        ),
+        &upload_head("NOTE/Note/a.txt", &t, "\r\nContent-Length: 11"),
         b"",
         false,
     );
@@ -1437,15 +1455,10 @@ fn the_quota_is_checked_again_under_the_lock() {
     assert!(text.contains("quota_exceeded"), "{text}");
     wait_for_clean_staging(&s);
     assert!(!files(&s).join("NOTE/Note/a.txt").exists());
-    // The usage the server keeps knows the second upload: refused before the body now (the
-    // client waits for 100 Continue).
+    // The usage the server keeps knows the second upload: refused before the body now.
     let (status, text) = raw(
         &s,
-        &upload_head(
-            "NOTE/Note/c.txt",
-            &t,
-            "\r\nContent-Length: 6\r\nExpect: 100-continue",
-        ),
+        &upload_head("NOTE/Note/c.txt", &t, "\r\nContent-Length: 6"),
         b"",
         false,
     );
@@ -2216,45 +2229,77 @@ fn a_large_json_body_is_answered_in_json() {
     let (status, answer) = post(9);
     assert_eq!(status, 413, "{answer}");
     assert_eq!(answer, json!({"error": "too_large"}));
-    // Far over 8 MiB, while the client is still sending: the server reads the rest of the body
-    // before it answers, so the client gets the 413 and not a reset.
+    // Far over 8 MiB, while the client is still sending: the server reads and drops the rest
+    // of the body, so the client gets the 413 and not a reset.
     let (status, answer) = post(32);
     assert_eq!(status, 413, "{answer}");
     assert_eq!(answer, json!({"error": "too_large"}));
 }
 
+/// A connection to the server, for requests written by hand.
+fn connect(s: &Server) -> std::net::TcpStream {
+    let stream = std::net::TcpStream::connect(s.base.trim_start_matches("http://")).unwrap();
+    // Only so that a broken server fails the test instead of hanging it.
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+        .unwrap();
+    stream
+}
+
+/// The head of an upload of `len` bytes to `path`, without `Connection: close`.
+fn upload_request(s: &Server, path: &str, token: &str, len: usize) -> String {
+    format!(
+        "{}\r\nHost: {}\r\nContent-Length: {len}\r\n\r\n",
+        upload_head(path, token, ""),
+        s.base.trim_start_matches("http://")
+    )
+}
+
 #[test]
-fn a_body_over_the_drain_cap_is_cut_off_and_the_server_goes_on() {
+fn a_body_over_the_drain_cap_is_not_read_and_the_connection_closes() {
+    use std::io::Write;
     let s = start_imported();
     let t = writer(&s);
-    let mib = notedown_cloud::api::MAX_DRAINED_BODY / (1024 * 1024) + 16;
-    let body = format!(
-        "{{\"path\":\"NOTE/Note/{}\"}}",
-        "a".repeat(mib * 1024 * 1024)
-    );
-    // The server does not read this much: the client gets the 413 or a closed connection.
-    let sent = s
-        .client
-        .post(s.url("/folders"))
-        .bearer_auth(&t)
-        .header("content-type", "application/json")
-        .body(body)
-        .send();
-    if let Ok(r) = sent {
-        let (status, answer) = json_of(r);
-        assert_eq!((status, answer), (413, json!({"error": "too_large"})));
-    }
-    // The next request is answered as usual.
-    let (status, answer) = json_of(
-        s.client
-            .post(s.url("/folders"))
-            .bearer_auth(&t)
-            .header("content-type", "application/json")
-            .body(r#"{"path":"NOTE/Note/after"}"#)
-            .send()
-            .unwrap(),
-    );
-    assert!(status < 300, "{status}: {answer}");
+    s.state.set_upload_limits(10, 10);
+    let len = notedown_cloud::api::MAX_DRAINED_BODY + 1;
+    let mut stream = connect(&s);
+    stream
+        .write_all(upload_request(&s, "NOTE/Note/a.txt", &t, len).as_bytes())
+        .unwrap();
+    let (status, text) = answer_of(&mut stream);
+    assert_eq!(status, 413, "{text}");
+    assert!(text.contains("too_large"), "{text}");
+    // The server does not wait for such a body: it closes the connection.
+    let mut rest = Vec::new();
+    let _ = stream.read_to_end(&mut rest);
+    assert!(rest.is_empty(), "{}", String::from_utf8_lossy(&rest));
+    // And goes on.
+    assert_eq!(upload(&s, &t, "NOTE/Note/a.txt", b"ok").0, 201);
+}
+
+#[test]
+fn a_client_that_sends_its_body_after_the_answer_gets_the_refusal_first() {
+    use std::io::Write;
+    let s = start_imported();
+    let t = writer(&s);
+    s.state.set_upload_limits(10, 10);
+    let mut stream = connect(&s);
+    // The head alone, without Expect: the refusal comes before any byte of the body is sent.
+    stream
+        .write_all(upload_request(&s, "NOTE/Note/a.txt", &t, 1000).as_bytes())
+        .unwrap();
+    let (status, text) = answer_of(&mut stream);
+    assert_eq!(status, 413, "{text}");
+    assert!(text.contains("too_large"), "{text}");
+    // Then the body and a second request on the same connection: the server reads the body to
+    // its end and keeps the connection.
+    let mut second = vec![b'a'; 1000];
+    second.extend_from_slice(upload_request(&s, "NOTE/Note/b.txt", &t, 3).as_bytes());
+    second.extend_from_slice(b"abc");
+    let _ = stream.write_all(&second);
+    let (status, text) = answer_of(&mut stream);
+    assert_eq!(status, 201, "{text}");
+    assert!(files(&s).join("NOTE/Note/b.txt").exists());
 }
 
 #[test]
@@ -2263,7 +2308,7 @@ fn an_upload_refused_before_its_body_is_read_is_answered_in_json() {
     let t = writer(&s);
     s.state.set_upload_limits(1024, 1024);
     // Far over the file limit and the socket buffers, under the drain cap: the server reads
-    // the rest of the body before it answers, so the client gets the refusal and not a reset.
+    // and drops the rest of the body, so the client gets the refusal and not a reset.
     let put = |token: &str| {
         json_of(
             s.client

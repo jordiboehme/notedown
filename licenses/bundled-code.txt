@@ -25,9 +25,9 @@
 #   nm target/release/notedown | grep -ci 'httplib'            0   cpp-httplib: not linked
 #   nm target/release/notedown | grep -c  'XXH'                0   hash/xxhash: not linked
 #   nm target/release/notedown | grep -c  'vendor_hash'        0   hash/sha1 (namespace vendor_hash): not linked
-# Up to notedown 0.1 the Chandra code decoded PNG files inside mtmd, which
-# linked stb_image, miniaudio, subprocess.h and the SHA-256 code. pagevision
-# hands mtmd raw pixels, so they are gone.
+# Up to notedown 0.1 the Chandra code passed PNG files to the mtmd helper
+# (MtmdBitmap::from_buffer), and these parts were linked. pagevision passes raw
+# pixels (MtmdBitmap::from_image_data), and the counts above show them gone.
 # Only the linked parts are listed below. Check again when llama-cpp-2,
 # llama-cpp-sys-2 or pagevision changes version.
 #

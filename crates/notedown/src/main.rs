@@ -881,7 +881,11 @@ fn model_command(action: ModelAction) -> Result<ExitCode> {
             // The licences come first, before anything is downloaded.
             let licences = model::licence_lines();
             if json {
-                println!("{}", serde_json::json!({ "licences": licences }));
+                let files = model::licence_files();
+                println!(
+                    "{}",
+                    serde_json::json!({ "licences": licences, "files": files })
+                );
             } else {
                 eprintln!("The model files have these licences:");
                 for line in &licences {

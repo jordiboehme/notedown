@@ -104,16 +104,59 @@ pub fn label_for(model_override: Option<&Path>) -> String {
         .unwrap_or_else(|| ENGINE_LABEL.to_string())
 }
 
-/// The licences of the four files, one line per licensor. Shown before a download starts.
+/// One model file with its licence, the model it belongs to and the page of that model, as
+/// `model pull --json` names it for apps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct LicenceFile {
+    pub file: &'static str,
+    pub licence: &'static str,
+    pub licensor: &'static str,
+    pub model: &'static str,
+    pub page: &'static str,
+}
+
+/// The four files with their licences, models and pages, in download order.
+pub fn licence_files() -> Vec<LicenceFile> {
+    FILES
+        .iter()
+        .map(|f| LicenceFile {
+            file: f.local,
+            licence: f.licence,
+            licensor: f.licensor,
+            model: f.model,
+            page: f.page,
+        })
+        .collect()
+}
+
+/// The licences of the four files, one line per licensor and licence, each naming its models
+/// once: "PP-DocLayoutV3 and PP-OCRv6 (PaddlePaddle Authors): Apache-2.0". Shown before a
+/// download starts.
 pub fn licence_lines() -> Vec<String> {
-    let [model, _, layout, _] = FILES;
-    vec![
-        format!("Qwen3.5-4B ({}): {}", model.licensor, model.licence),
-        format!(
-            "PP-DocLayoutV3 and PP-OCRv6 ({}): {}",
-            layout.licensor, layout.licence
-        ),
-    ]
+    let mut groups: Vec<(&str, &str, Vec<&str>)> = Vec::new();
+    for f in &FILES {
+        match groups
+            .iter_mut()
+            .find(|(licensor, licence, _)| *licensor == f.licensor && *licence == f.licence)
+        {
+            Some((_, _, models)) if models.contains(&f.model) => {}
+            Some((_, _, models)) => models.push(f.model),
+            None => groups.push((f.licensor, f.licence, vec![f.model])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(licensor, licence, models)| format!("{} ({licensor}): {licence}", names(&models)))
+        .collect()
+}
+
+/// "A", "A and B", "A, B and C".
+fn names(models: &[&str]) -> String {
+    match models {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 /// Removes the Chandra files of notedown 0.1 (`OLD_FILES`) and their part files from `dir`, and
@@ -671,7 +714,7 @@ mod four_file_tests {
         assert_eq!(
             licence_lines(),
             [
-                "Qwen3.5-4B (Qwen team, Alibaba Cloud): Apache-2.0",
+                "Qwen3.5-4B (Qwen team): Apache-2.0",
                 "PP-DocLayoutV3 and PP-OCRv6 (PaddlePaddle Authors): Apache-2.0",
             ]
         );
@@ -679,6 +722,41 @@ mod four_file_tests {
         assert_eq!(FILES[2].licensor, FILES[3].licensor);
         assert_eq!(FILES[2].licence, FILES[3].licence);
         assert_eq!(FILES[0].licensor, FILES[1].licensor);
+    }
+
+    #[test]
+    fn each_file_names_its_model_and_page() {
+        let files = licence_files();
+        let named: Vec<(&str, &str, &str)> =
+            files.iter().map(|f| (f.file, f.model, f.page)).collect();
+        assert_eq!(
+            named,
+            [
+                (
+                    FILES[0].local,
+                    "Qwen3.5-4B",
+                    "https://huggingface.co/Qwen/Qwen3.5-4B"
+                ),
+                (
+                    FILES[1].local,
+                    "Qwen3.5-4B",
+                    "https://huggingface.co/Qwen/Qwen3.5-4B"
+                ),
+                (
+                    FILES[2].local,
+                    "PP-DocLayoutV3",
+                    "https://huggingface.co/PaddlePaddle/PP-DocLayoutV3"
+                ),
+                (
+                    FILES[3].local,
+                    "PP-OCRv6",
+                    "https://huggingface.co/PaddlePaddle/PP-OCRv6_small_det"
+                ),
+            ]
+        );
+        assert!(files.iter().all(|f| f.licence == "Apache-2.0"));
+        assert_eq!(files[0].licensor, "Qwen team");
+        assert_eq!(files[3].licensor, "PaddlePaddle Authors");
     }
 
     #[test]

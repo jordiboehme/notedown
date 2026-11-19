@@ -405,13 +405,20 @@ export function treeSelected(selection: Selection, reveal: Reveal | null): strin
   return null;
 }
 
+/** What was shown before a note opened: the place, its picked row and the search over it. */
+export type BackTo = { selection: Selection; picked: string | null; search: string | null };
+
 /**
- * Where Back from the note at `path` goes: to the note's folder with the note picked once it
- * was revealed, else to `back`, where the note was opened from.
+ * Where Back from a note goes: to what was shown before it opened, a folder with the row that
+ * was picked in it, and the search results when the note came from them. The reveal of the
+ * note does not change it; the breadcrumbs go to the note's folder.
  */
-export function afterBack(back: Selection, path: string, reveal: Reveal | null): { selection: Selection; picked: string | null } {
-  if (reveal?.note === path) return { selection: { kind: "folder", path: reveal.folder }, picked: path };
-  return { selection: back, picked: null };
+export function afterBack(from: BackTo): BackTo {
+  return {
+    selection: from.selection,
+    picked: from.selection.kind === "folder" ? from.picked : null,
+    search: from.search?.trim() ? from.search : null,
+  };
 }
 
 /** The name of a note by its path, as the review shows it before or without its text. */

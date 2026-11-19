@@ -74,18 +74,32 @@ describe("the folder the sidebar selects", () => {
 });
 
 describe("Back from a note", () => {
-  const reveal: Reveal = { note: "NOTE/Note/Work/Plan.note", folder: "NOTE/Note/Work", opens: ["NOTE/Note"] };
+  it("goes where the note was opened from, whatever the reveal did", () => {
+    // The sidebar showed the note's folder; Back still goes to New, All notes or the bin.
+    for (const kind of ["new", "all", "bin"] as const) {
+      expect(afterBack({ selection: { kind }, picked: null, search: null })).toEqual({
+        selection: { kind },
+        picked: null,
+        search: null,
+      });
+    }
+  });
 
-  it("keeps the note's folder selected, with the note picked", () => {
-    expect(afterBack({ kind: "new" }, "NOTE/Note/Work/Plan.note", reveal)).toEqual({
-      selection: { kind: "folder", path: "NOTE/Note/Work" },
-      picked: "NOTE/Note/Work/Plan.note",
+  it("gives a folder back its picked row", () => {
+    expect(afterBack({ selection: { kind: "folder", path: "INBOX" }, picked: "INBOX/Plan.note", search: null })).toEqual({
+      selection: { kind: "folder", path: "INBOX" },
+      picked: "INBOX/Plan.note",
+      search: null,
     });
   });
 
-  it("goes where it came from when the note was not revealed", () => {
-    expect(afterBack({ kind: "new" }, "NOTE/Note/Work/Plan.note", null)).toEqual({ selection: { kind: "new" }, picked: null });
-    // A reveal of another note does not count.
-    expect(afterBack({ kind: "bin" }, "NOTE/Note/Other.note", reveal)).toEqual({ selection: { kind: "bin" }, picked: null });
+  it("gives the search results back when the note came from them", () => {
+    expect(afterBack({ selection: { kind: "all" }, picked: null, search: "plan" })).toEqual({
+      selection: { kind: "all" },
+      picked: null,
+      search: "plan",
+    });
+    // An empty search is no search to give back.
+    expect(afterBack({ selection: { kind: "all" }, picked: null, search: "  " }).search).toBeNull();
   });
 });

@@ -273,7 +273,11 @@
    * goes to what was shown before.
    */
   function openNote(path: string, at?: { pageId: string; blockId: string }) {
-    if (library.selection.kind !== "note") library.back = library.selection;
+    if (library.selection.kind !== "note") {
+      library.back = library.selection;
+      backPicked = picked;
+    }
+    backSearch = null;
     reveal = null;
     show(at ? { kind: "note", path, at } : { kind: "note", path });
     openings += 1;
@@ -291,11 +295,17 @@
     for (const folder of found.opens) open.add(folder);
   }
 
-  /** Back from the note at `path`: to its folder with the note picked, once it was revealed. */
-  function back(path: string) {
-    const next = afterBack(library.back, path, reveal);
+  /** The row picked where the note was opened from, given back by Back. */
+  let backPicked: string | null = null;
+  /** The search the note was opened from, given back by Back; null when none. */
+  let backSearch: string | null = null;
+
+  /** Back from a note: to what was shown before it, with its picked row or its search. */
+  function back() {
+    const next = afterBack({ selection: library.back, picked: backPicked, search: backSearch });
     show(next.selection);
     picked = next.picked;
+    if (next.search !== null) search.type(next.search);
   }
 
   /** Shows a folder and opens the folders above it in the tree. */
@@ -371,11 +381,14 @@
 
   /** A row of the search results: it opens or selects what it names, and the search ends. */
   function openRow(row: ResultRow) {
+    const typed = search.text;
     search.clear();
     if (row.section === "text" && row.pageId !== undefined && row.blockId !== undefined) {
       openNote(row.path, { pageId: row.pageId, blockId: row.blockId });
     } else if (row.kind === "note") openNote(row.path);
-    else pickFile(row.path);
+    else return pickFile(row.path);
+    // Back gives the results back.
+    backSearch = typed;
   }
 
   function keydown(event: KeyboardEvent) {
@@ -484,7 +497,7 @@
                 covered={searching}
                 onAtTaken={() => (library.selection = withoutAt(library.selection))}
                 onOpened={noteOpened}
-                onBack={() => library.selection.kind === "note" && back(library.selection.path)}
+                onBack={back}
               />
             {/key}
           {:else if !ready}

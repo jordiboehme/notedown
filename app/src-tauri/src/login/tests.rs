@@ -1119,7 +1119,24 @@ fn log_out_does_not_wait_for_a_silent_server() {
     let dir = tempfile::tempdir().unwrap();
     let (state, store) = kept_login(dir.path(), port);
 
-    log_out_within_the_guard(&state, &store);
+    // The revoke may wait as long as the guard: it cannot give up while the test looks.
+    std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (state, store) = (&state, &store);
+        scope.spawn(move || {
+            let _ = tx.send(crate::commands::log_out_with(
+                &LoginGate::default(),
+                store,
+                state,
+                &crate::library::idle(),
+                &ServeInfo::default(),
+                crate::test_procs::HANG_GUARD,
+            ));
+        });
+        rx.recv_timeout(crate::test_procs::HANG_GUARD)
+            .expect("the log out hangs")
+            .unwrap();
+    });
     returned_tx.send(()).unwrap();
 
     // The revoke runs on a thread of its own: the log out returned while it still waited.
@@ -1142,7 +1159,7 @@ fn revoke_waits_for_a_silent_server_no_longer_than_the_bound() {
     // hang) and counts the server as unreachable.
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(revoke(&base, Token::new("tok-123")));
+        let _ = tx.send(revoke_within(&base, Token::new("tok-123"), LOGOUT_TIMEOUT));
     });
     let ended = rx
         .recv_timeout(crate::test_procs::HANG_GUARD)
@@ -1172,13 +1189,13 @@ fn revoke_counts_a_token_that_is_gone_as_done() {
     ] {
         let server = Scripted::start(vec![answer(status, body)]);
         assert_eq!(
-            revoke(&server.base(), Token::new("tok-123")),
+            revoke_within(&server.base(), Token::new("tok-123"), LOGOUT_TIMEOUT),
             Ok(()),
             "{status}"
         );
     }
     let older = Scripted::start(vec![answer("404 Not Found", r#"{"error":"no_route"}"#)]);
-    let error = revoke(&older.base(), Token::new("tok-123")).unwrap_err();
+    let error = revoke_within(&older.base(), Token::new("tok-123"), LOGOUT_TIMEOUT).unwrap_err();
     assert!(!error.to_string().contains("tok-123"), "{error}");
     assert_eq!(
         error,

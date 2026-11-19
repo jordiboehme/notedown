@@ -521,6 +521,26 @@ pub fn log_out_of(
     library: &Library,
     serve_info: &ServeInfo,
 ) -> Result<AppConfig, String> {
+    log_out_with(
+        gate,
+        store,
+        state,
+        library,
+        serve_info,
+        login::LOGOUT_TIMEOUT,
+    )
+}
+
+/// [`log_out_of`] with the revoke bounded by `revoke_bound`: a test makes it longer than it
+/// looks, so the revoke cannot give up while the test checks that the log out did not wait.
+pub(crate) fn log_out_with(
+    gate: &LoginGate,
+    store: &dyn TokenStore,
+    state: &ConfigState,
+    library: &Library,
+    serve_info: &ServeInfo,
+    revoke_bound: std::time::Duration,
+) -> Result<AppConfig, String> {
     let (forgotten, revoking) = {
         let _no_login = gate.hold();
         let before = state.current();
@@ -539,15 +559,16 @@ pub fn log_out_of(
     // On a thread of its own: this Mac is logged out already, and a silent server must not
     // hold the answer up. The call itself ends within the bound.
     if revoking.is_some() {
-        std::thread::spawn(move || revoke_quietly(revoking));
+        std::thread::spawn(move || revoke_quietly(revoking, revoke_bound));
     }
     forgotten
 }
 
-/// Revokes a token that this Mac let go of; the outcome is not shown and never logged.
-fn revoke_quietly(revoking: Option<(Token, String)>) {
+/// Revokes a token that this Mac let go of, within `bound`; the outcome is not shown and
+/// never logged.
+fn revoke_quietly(revoking: Option<(Token, String)>, bound: std::time::Duration) {
     if let Some((token, base)) = revoking {
-        let _ = login::revoke(&base, token);
+        let _ = login::revoke_within(&base, token, bound);
     }
 }
 
@@ -715,7 +736,7 @@ pub fn change_place(
     };
     // After the login lock, as after a login: the binding reads the Keychain.
     library.refresh();
-    revoke_quietly(revoking);
+    revoke_quietly(revoking, login::LOGOUT_TIMEOUT);
     Ok((replaced, ConfigAnswer { config, keychain }))
 }
 

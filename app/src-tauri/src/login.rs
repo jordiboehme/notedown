@@ -178,10 +178,10 @@ struct LoginAnswer {
 }
 
 /// Asks the server at `base` to revoke `token` (`POST /logout`, no body): once, within
-/// [`LOGOUT_TIMEOUT`]. A token the server refuses (401) or whose account is gone (410) is
+/// `bound` ([`LOGOUT_TIMEOUT`] in the app). A token the server refuses (401) or whose account is gone (410) is
 /// revoked already. The error holds neither the token nor the address.
-pub(crate) fn revoke(base: &str, token: Token) -> Result<(), RestError> {
-    let rest = Rest::with_timeout(base, Some(token), LOGOUT_TIMEOUT)?;
+pub(crate) fn revoke_within(base: &str, token: Token, bound: Duration) -> Result<(), RestError> {
+    let rest = Rest::with_timeout(base, Some(token), bound)?;
     match rest.post_empty_once::<serde::de::IgnoredAny>("/logout") {
         Ok(_) | Err(RestError::TokenRefused | RestError::AccountRemoved) => Ok(()),
         Err(error) => Err(error),

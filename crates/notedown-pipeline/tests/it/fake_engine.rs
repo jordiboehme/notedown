@@ -33,6 +33,7 @@ pub struct FakeEngine {
     calls: Arc<AtomicUsize>,
     fail_next: Arc<AtomicU32>,
     truncated: bool,
+    label: String,
     /// Runs before each call, as a person changing files while the engine reads.
     on_call: Option<Box<dyn FnMut() + Send>>,
 }
@@ -45,6 +46,7 @@ impl FakeEngine {
             calls: Arc::default(),
             fail_next: Arc::default(),
             truncated: false,
+            label: "fake-engine".to_string(),
             on_call: None,
         }
     }
@@ -57,6 +59,12 @@ impl FakeEngine {
 
     pub fn with_default(mut self, html: &str) -> Self {
         self.default_html = html.to_string();
+        self
+    }
+
+    /// The model name the engine gives (`label()`).
+    pub fn with_label(mut self, label: &str) -> Self {
+        self.label = label.to_string();
         self
     }
 
@@ -114,6 +122,6 @@ impl OcrEngine for FakeEngine {
     }
 
     fn label(&self) -> &str {
-        "fake-engine"
+        &self.label
     }
 }

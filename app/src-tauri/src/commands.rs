@@ -1074,6 +1074,12 @@ pub struct PauseWatch {
 }
 
 impl PauseWatch {
+    /// A watch that starts after the start's own clear of `pause` failed and was told: its
+    /// ticks do not tell that failure again.
+    pub fn after_failed_clear(pause: Option<OcrPause>) -> Self {
+        Self { not_saved: pause }
+    }
+
     pub fn tick(
         &mut self,
         config: &ConfigState,

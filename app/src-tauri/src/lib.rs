@@ -648,13 +648,18 @@ fn import_jobs(app: AppHandle, spawn: process::SpawnFn, host: ImportHost) -> Imp
 /// Starts the children as the config asks, then probes what is `Outside` every 30 s. A pause
 /// whose end came while the app was closed is cleared first.
 fn supervise(app: AppHandle) {
-    let watch = app.clone();
     std::thread::spawn(move || {
         let processes = app.state::<Arc<Processes>>().inner().clone();
         let state = app.state::<commands::ConfigState>().inner().clone();
-        if let Err(e) = state.clear_expired_pause(processes.now_ms()) {
-            eprintln!("notedown: the ended OCR pause was not cleared: {e}");
-        }
+        // The watch starts after this clear: a failure is told here once, not again by it.
+        let watch = match state.clear_expired_pause(processes.now_ms()) {
+            Ok(_) => commands::PauseWatch::default(),
+            Err(e) => {
+                eprintln!("notedown: the ended OCR pause was not cleared: {e}");
+                commands::PauseWatch::after_failed_clear(state.current().ocr_pause)
+            }
+        };
+        watch_the_pause(app.clone(), watch);
         // The icon was built before the config was there: now the menu shows a kept pause.
         tray::set_menu(&app);
         let config = state.reader();
@@ -664,7 +669,6 @@ fn supervise(app: AppHandle) {
             processes.reprobe_with(|| config.current());
         }
     });
-    watch_the_pause(watch);
 }
 
 /// How often the app looks whether a timed OCR pause has ended.
@@ -672,9 +676,8 @@ const PAUSE_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Ends a timed OCR pause at its time: clears it and starts the pipeline, as Resume does. A
 /// clear that cannot be saved still starts the pipeline, and is told once.
-fn watch_the_pause(app: AppHandle) {
+fn watch_the_pause(app: AppHandle, mut watch: commands::PauseWatch) {
     std::thread::spawn(move || {
-        let mut watch = commands::PauseWatch::default();
         loop {
             std::thread::sleep(PAUSE_TICK);
             commands::end_expired_pause(&app, &mut watch);

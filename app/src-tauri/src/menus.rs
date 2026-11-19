@@ -118,7 +118,11 @@ pub fn on_context(app: &AppHandle, id: &str) {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         if let Some(MenuTarget::Note { path }) = target {
-            crate::save_markdown::save_in_background(app, path);
+            crate::save_markdown::save_in_background(
+                app,
+                path,
+                crate::save_markdown::SaveFrom::List,
+            );
         }
         return;
     }

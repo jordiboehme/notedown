@@ -1712,10 +1712,11 @@ pub fn library_menu(
 #[tauri::command]
 pub async fn note_save_markdown(app: tauri::AppHandle, path: String) -> Option<String> {
     let shown = app.clone();
-    let saved =
-        tauri::async_runtime::spawn_blocking(move || crate::save_markdown::save(&app, &path))
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()));
+    let saved = tauri::async_runtime::spawn_blocking(move || {
+        crate::save_markdown::save(&app, &path, crate::save_markdown::SaveFrom::Review)
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
     match saved {
         Ok(file) => file.map(|f| f.to_string_lossy().into_owned()),
         Err(error) => {

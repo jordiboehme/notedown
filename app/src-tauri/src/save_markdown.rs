@@ -170,19 +170,36 @@ pub fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Where a save comes from, which says what a path the index does not know means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveFrom {
+    /// The review (its button, the File menu): it keeps its path while it is open, so an
+    /// unknown path is a note moved or renamed meanwhile.
+    Review,
+    /// A row of a list (a context menu): it names the note where it is now, so an unknown path
+    /// is a note the OCR has not read yet.
+    List,
+}
+
 /// A save of the note at `path` with its steps given: `ask` is the save dialog (`None` for
 /// Cancel), `markdown` reads the text and `remember` keeps the folder of the saved file. A
-/// note the index does not know at `path` (moved or renamed while its review was open) is
-/// refused with [`NOTE_GONE`](crate::notes::NOTE_GONE), one without text with [`NO_TEXT`].
+/// note without text is refused with [`NO_TEXT`]. A note the index does not know at `path` is
+/// refused with [`NOTE_GONE`](crate::notes::NOTE_GONE) from the review (moved or renamed while
+/// it was open), and with [`NO_TEXT`] from a list (not read yet).
 pub fn save_with(
     notes: &Notes,
     path: &str,
+    from: SaveFrom,
     ask: impl FnOnce(&NoteSummary) -> Option<PathBuf>,
     markdown: impl FnOnce(&NoteSummary) -> Result<String, String>,
     remember: impl FnOnce(&Path),
 ) -> Result<Option<PathBuf>, String> {
     let Some(note) = notes.at_path(path) else {
-        return Err(crate::notes::NOTE_GONE.to_owned());
+        return Err(match from {
+            SaveFrom::Review => crate::notes::NOTE_GONE,
+            SaveFrom::List => NO_TEXT,
+        }
+        .to_owned());
     };
     if note.pages_with_text == 0 {
         return Err(NO_TEXT.to_owned());
@@ -201,7 +218,7 @@ pub fn save_with(
 /// Saves the Markdown of the note at `path` into a file the user picks in the save dialog.
 /// `Ok(None)` when the user cancels, or while another save's panel is open. Blocking (the
 /// dialog waits for the user): never on the main thread.
-pub fn save(app: &AppHandle, path: &str) -> Result<Option<PathBuf>, String> {
+pub fn save(app: &AppHandle, path: &str, from: SaveFrom) -> Result<Option<PathBuf>, String> {
     let target = app.state::<SaveTarget>();
     let Some(_turn) = SaveTurn::take(&target.saving) else {
         return Ok(None);
@@ -224,6 +241,7 @@ pub fn save(app: &AppHandle, path: &str) -> Result<Option<PathBuf>, String> {
     save_with(
         &notes,
         path,
+        from,
         |note| {
             let dialog = app.dialog().file();
             let dialog = match &library {
@@ -261,10 +279,10 @@ pub fn show_error(app: &AppHandle, error: &str) {
 
 /// Saves the note at `path` on a thread of its own (menu events come on the main thread) and
 /// shows a failure.
-pub fn save_in_background(app: &AppHandle, path: String) {
+pub fn save_in_background(app: &AppHandle, path: String, from: SaveFrom) {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        if let Err(error) = save(&app, &path) {
+        if let Err(error) = save(&app, &path, from) {
             show_error(&app, &error);
         }
     });
@@ -275,7 +293,7 @@ pub fn save_in_background(app: &AppHandle, path: String) {
 pub fn on_menu(app: &AppHandle) {
     let path = lock_state(app).target().map(str::to_owned);
     if let Some(path) = path {
-        save_in_background(app, path);
+        save_in_background(app, path, SaveFrom::Review);
     }
 }
 
@@ -546,6 +564,7 @@ mod tests {
         let result = save_with(
             &notes,
             "NOTE/Note/Plan.note",
+            SaveFrom::Review,
             |_| panic!("no dialog"),
             |_| panic!("no sidecar"),
             |_| panic!("nothing to remember"),
@@ -560,11 +579,28 @@ mod tests {
         let result = save_with(
             &notes,
             "NOTE/Note/Other.note",
+            SaveFrom::Review,
             |_| panic!("no dialog"),
             |_| panic!("no sidecar"),
             |_| panic!("nothing to remember"),
         );
         assert_eq!(result, Err(crate::notes::NOTE_GONE.to_owned()));
+    }
+
+    #[test]
+    fn an_unread_note_from_a_list_has_no_text_yet() {
+        // A list row names the note where it is now. The index does not know a note the OCR
+        // has not read yet (or the menu was enabled while a scan held the index).
+        let (notes, _data, _config) = notes_with(true);
+        let result = save_with(
+            &notes,
+            "NOTE/Note/Unread.note",
+            SaveFrom::List,
+            |_| panic!("no dialog"),
+            |_| panic!("no sidecar"),
+            |_| panic!("nothing to remember"),
+        );
+        assert_eq!(result, Err(NO_TEXT.to_owned()));
     }
 
     #[test]
@@ -585,6 +621,7 @@ mod tests {
         let result = save_with(
             &notes,
             "NOTE/Note/Plan.note",
+            SaveFrom::Review,
             |note| {
                 assert_eq!(note.title, "Plan");
                 None
@@ -604,6 +641,7 @@ mod tests {
         let result = save_with(
             &notes,
             "NOTE/Note/Plan.note",
+            SaveFrom::Review,
             |_| Some(target.clone()),
             |note| {
                 assert_eq!(note.key, "A");

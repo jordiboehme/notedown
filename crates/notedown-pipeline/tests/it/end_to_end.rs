@@ -170,3 +170,43 @@ fn real_model_reads_a_fixture_page() {
     );
     assert_ne!(reading.model, "fake-engine");
 }
+
+/// The real models read test2 through the worker, and the store keeps what they read. Needs
+/// the four model files in `NOTEDOWN_MODEL_DIR` (or the cache of `notedown model pull`). Run
+/// it in a release build: the detectors are slow without optimisation.
+#[test]
+#[ignore = "needs the four pagevision model files (NOTEDOWN_MODEL_DIR)"]
+fn real_models_store_test2() {
+    let paths = resolve(None, None).unwrap_or_else(|e| {
+        panic!("set NOTEDOWN_MODEL_DIR to a folder with the four model files: {e}")
+    });
+    let d = setup();
+    let key = d.put("test2", "NOTE/Note");
+    let engine = VisionEngine::load(&paths, OcrOptions::default()).unwrap();
+    let mut w = notedown_pipeline::worker::Worker::new(
+        &crate::worker::one_machine(&d, no_settle()),
+        Box::new(engine),
+    );
+    let start = std::time::Instant::now();
+    let p = w.run_once(true).unwrap();
+    eprintln!("worker pass in {:?}: {p:?}", start.elapsed());
+    let state = d.store().note(&key).unwrap().unwrap();
+    assert_eq!(
+        state.model.as_deref(),
+        Some(notedown_ocr::model::ENGINE_LABEL)
+    );
+    for page in &state.pages {
+        eprintln!("page {} ({:?}):", page.position + 1, page.state);
+        for b in &page.blocks {
+            eprintln!("  {} {} {:?}\n{}\n", b.id, b.label, b.bbox, b.text);
+        }
+    }
+    let blocks = &state.pages[0].blocks;
+    assert!(!blocks.is_empty());
+    let text: String = blocks.iter().map(|b| b.text.as_str()).collect();
+    assert!(blocks.iter().any(|b| b.label == "Diagram"), "{blocks:?}");
+    assert!(text.contains("```mermaid"), "{text}");
+    for word in ["App", "DB", "MCP"] {
+        assert!(text.contains(word), "{word} missing: {text}");
+    }
+}

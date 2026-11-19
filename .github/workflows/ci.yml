@@ -395,7 +395,7 @@ jobs:
             echo "cargo tree printed nothing, so the check proves nothing"
             exit 1
           fi
-          if printf '%s\n' "$tree" | grep -E 'llama-cpp|notedown-ocr|notedown-pipeline|notedown-convert'; then
+          if printf '%s\n' "$tree" | grep -E 'llama-cpp|notedown-ocr|notedown-pipeline|notedown-convert|pagevision|candle'; then
             echo "the Pi build pulls in OCR"
             exit 1
           fi

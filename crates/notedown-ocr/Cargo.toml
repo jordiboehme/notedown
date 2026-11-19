@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+pagevision = { workspace = true, features = ["engine", "serde"] }
 scraper.workspace = true
 serde.workspace = true
 sha2.workspace = true

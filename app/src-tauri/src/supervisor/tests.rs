@@ -565,11 +565,13 @@ fn a_listener_may_read_the_state_while_the_child_starts() {
     starting.join().unwrap();
 }
 
-/// A child that writes `<dir>/ready` once its TERM trap is set, and `<dir>/term` when a
-/// SIGTERM reaches it.
+/// A child that writes `<dir>/ready` once its TERM trap is set and its own child runs, and
+/// `<dir>/term` when a SIGTERM reaches it. Ready comes after the fork of `sleep`: a signal to
+/// the group while the shell is still in that fork can miss the new process on macOS, which
+/// then keeps the group alive.
 const TRAPS_TERM: &str = "trap 'echo term > \"$DIR/term\"; exit 0' TERM\n\
-     echo ready > \"$DIR/ready\"\n\
      sleep 307 &\n\
+     echo ready > \"$DIR/ready\"\n\
      wait";
 
 #[test]

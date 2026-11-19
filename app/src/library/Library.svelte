@@ -53,13 +53,17 @@
     columnsView,
     listingKey,
     openAt,
+    afterBack,
     parentOf,
     pathBar,
+    revealOf,
     rootRows,
     shownFor,
     sidebarItems,
+    treeSelected,
     treeView,
     withoutAt,
+    type Reveal,
     type Selection,
     type SidebarItem,
     type Sort,
@@ -106,7 +110,11 @@
 
   const ready = $derived(library.view?.state === "ready");
   const selectedPath = $derived(library.selection.kind === "folder" ? library.selection.path : null);
-  const tree = $derived(treeView(library.listings, open, selectedPath));
+  /** Where the open note is in the tree, once its review opened it. */
+  let reveal = $state<Reveal | null>(null);
+  /** The folder the sidebar selects: the shown one, or the open note's. */
+  const sidebarPath = $derived(treeSelected(library.selection, reveal));
+  const tree = $derived(treeView(library.listings, open, sidebarPath));
   const columns = $derived(columnsView(selectedPath, library.listings, picked));
   const inTree = $derived(library.viewMode === "tree");
   const items = $derived(
@@ -242,8 +250,27 @@
    */
   function openNote(path: string, at?: { pageId: string; blockId: string }) {
     if (library.selection.kind !== "note") library.back = library.selection;
+    reveal = null;
     show(at ? { kind: "note", path, at } : { kind: "note", path });
     openings += 1;
+  }
+
+  /**
+   * The review read the note at `path`: the sidebar selects its folder and the tree opens the
+   * folders above it. A note that is gone or in the bin never gets here.
+   */
+  function noteOpened(path: string) {
+    const found = revealOf(path);
+    if (!found || library.selection.kind !== "note" || library.selection.path !== path) return;
+    reveal = found;
+    for (const folder of found.opens) open.add(folder);
+  }
+
+  /** Back from the note at `path`: to its folder with the note picked, once it was revealed. */
+  function back(path: string) {
+    const next = afterBack(library.back, path, reveal);
+    show(next.selection);
+    picked = next.picked;
   }
 
   /** Shows a folder and opens the folders above it in the tree. */
@@ -361,7 +388,7 @@
     <Sidebar
       notes={items.notes}
       tree={items.tree}
-      rows={inTree ? tree.rows : rootRows(selectedPath)}
+      rows={inTree ? tree.rows : rootRows(sidebarPath)}
       bin={items.bin}
       view={library.view}
       onPick={pick}
@@ -393,7 +420,8 @@
                 at={library.selection.at ?? null}
                 covered={searching}
                 onAtTaken={() => (library.selection = withoutAt(library.selection))}
-                onBack={() => (library.selection = library.back)}
+                onOpened={noteOpened}
+                onBack={() => library.selection.kind === "note" && back(library.selection.path)}
               />
             {/key}
           {:else if !ready}

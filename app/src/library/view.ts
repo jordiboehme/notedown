@@ -380,3 +380,36 @@ export function shownFor(view: LibraryView, selection: Selection, open: Readonly
 export function parentOf(path: string): string {
   return path.slice(0, Math.max(0, path.lastIndexOf("/")));
 }
+
+/**
+ * Where an open note is in the tree: its folder, which the sidebar selects, and the folders
+ * above it, which the tree opens. Only for a note in one of the device trees.
+ */
+export type Reveal = { note: string; folder: string; opens: string[] };
+
+/** The reveal of the note at `path`; null for a note outside the device trees. */
+export function revealOf(path: string): Reveal | null {
+  const folder = parentOf(path);
+  const inTree = ROOTS.some((root) => folder === root.path || folder.startsWith(`${root.path}/`));
+  if (!inTree) return null;
+  return { note: path, folder, opens: pathBar(folder).slice(0, -1).map((crumb) => crumb.path) };
+}
+
+/**
+ * The folder the sidebar selects: the shown folder, or the open note's folder once the note
+ * opened (`reveal` is of that note). Nothing for New, All notes and the bin.
+ */
+export function treeSelected(selection: Selection, reveal: Reveal | null): string | null {
+  if (selection.kind === "folder") return selection.path;
+  if (selection.kind === "note" && reveal?.note === selection.path) return reveal.folder;
+  return null;
+}
+
+/**
+ * Where Back from the note at `path` goes: to the note's folder with the note picked once it
+ * was revealed, else to `back`, where the note was opened from.
+ */
+export function afterBack(back: Selection, path: string, reveal: Reveal | null): { selection: Selection; picked: string | null } {
+  if (reveal?.note === path) return { selection: { kind: "folder", path: reveal.folder }, picked: path };
+  return { selection: back, picked: null };
+}

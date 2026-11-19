@@ -19,6 +19,7 @@
     at = null,
     covered = false,
     onAtTaken = () => {},
+    onOpened = () => {},
     onBack,
   }: {
     path: string;
@@ -27,6 +28,8 @@
     covered?: boolean;
     /** The session took `at`: the window drops it, so the review is not opened at it again. */
     onAtTaken?: () => void;
+    /** The first read of the note worked: the window shows where the note is. */
+    onOpened?: (path: string) => void;
     onBack: () => void;
   } = $props();
 
@@ -64,6 +67,14 @@
     await tick();
     pages?.showPage(last);
   }
+
+  // The first read that works tells the window, once.
+  let told = false;
+  $effect(() => {
+    if (!session.view || told) return;
+    told = true;
+    untrack(() => onOpened(path));
+  });
 
   // A search over the review hides it from the File menu's Save Markdown...
   $effect(() => {

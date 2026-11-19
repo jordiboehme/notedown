@@ -67,6 +67,10 @@
           aria-expanded={row.empty ? undefined : row.open}
           data-folder={row.path}
           style:padding-left="{6 + row.depth * 14}px"
+          {@attach (node) => {
+            // The selected folder comes into view (a note opened elsewhere selects its folder).
+            if (row.selected) node.scrollIntoView?.({ block: "nearest" });
+          }}
         >
           {#if row.empty}
             <span class="twisty" aria-hidden="true"></span>

@@ -31,12 +31,15 @@ describe("the model rows", () => {
   it("the old files button names their real size", () => {
     expect(cleanOldButton(3_433_278_000)).toBe("Remove the old model files (3.4 GB)");
     expect(cleanOldButton(12_000_000)).toBe("Remove the old model files (12 MB)");
+    // Only empty leftovers: no size.
+    expect(cleanOldButton(0)).toBe("Remove the old model files");
   });
 
   it("the old files are removed only after a question that names the size", () => {
     expect(cleanOldQuestion(3_433_278_000)).toBe(
       "Delete the old model files of Notedown 0.1? This frees 3.4 GB. The new model stays.",
     );
+    expect(cleanOldQuestion(0)).toBe("Delete the old model files of Notedown 0.1? The new model stays.");
   });
 
   it("Download waits for the licences", () => {

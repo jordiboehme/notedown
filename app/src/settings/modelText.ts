@@ -18,14 +18,16 @@ export function canDownload(licences: { lines: string[] | null; error: string | 
   return licenceLine(licences.lines ?? []) !== null;
 }
 
-/** The button that deletes the model files of Notedown 0.1, with the bytes they take. */
+/** The button that deletes the model files of Notedown 0.1, with the bytes they take. Empty
+ * leftovers (a part file with no bytes yet) get no size. */
 export function cleanOldButton(bytes: number): string {
-  return `Remove the old model files (${formatBytes(bytes)})`;
+  return bytes > 0 ? `Remove the old model files (${formatBytes(bytes)})` : "Remove the old model files";
 }
 
-/** The question before the old model files are deleted. */
+/** The question before the old model files are deleted; it names the size when there is one. */
 export function cleanOldQuestion(bytes: number): string {
-  return `Delete the old model files of Notedown 0.1? This frees ${formatBytes(bytes)}. The new model stays.`;
+  const frees = bytes > 0 ? ` This frees ${formatBytes(bytes)}.` : "";
+  return `Delete the old model files of Notedown 0.1?${frees} The new model stays.`;
 }
 
 /** The names of the model files in the folder. */

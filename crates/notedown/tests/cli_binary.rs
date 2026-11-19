@@ -304,7 +304,7 @@ fn convert_updates_an_old_header_without_loading_the_model() {
     let body = "\n<a id=\"page-1\"></a>\n## Page 1\n\nOld text\n";
     let old = format!(
         "---\nsource: Test 2.note\nsource_sha256: {sha}\nkind: supernote-note\npages: 1\n\
-         model: chandra-ocr-2 Q4_K_M\nconverted_at: \"2026-10-01T08:00:00Z\"\n\
+         model: pagevision qwen3.5-4b Q4_K_M\nconverted_at: \"2026-10-01T08:00:00Z\"\n\
          generator: notedown {}\nkeywords: []\n---\n{body}",
         env!("CARGO_PKG_VERSION")
     );

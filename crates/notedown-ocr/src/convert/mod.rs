@@ -10,6 +10,7 @@ mod mermaid;
 
 use crate::engine::{OcrBlock, PageOcr};
 
+pub use crate::markdown::assemble;
 pub use mermaid::looks_like_mermaid;
 
 /// One layout block of the OCR output.
@@ -28,16 +29,6 @@ pub struct Converted {
     /// The Markdown of each block, aligned with `blocks` (empty for blocks that render nothing).
     pub parts: Vec<String>,
     pub mermaid_blocks: usize,
-}
-
-/// Joins per-block Markdown the way [`html_to_markdown`] does.
-pub fn assemble(parts: &[String]) -> String {
-    let kept: Vec<&str> = parts
-        .iter()
-        .filter(|p| !p.is_empty())
-        .map(String::as_str)
-        .collect();
-    markdown::finalize(&kept.join("\n\n"))
 }
 
 /// Converts Chandra layout HTML to Markdown. Never panics on truncated or messy input.

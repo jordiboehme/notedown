@@ -40,28 +40,6 @@ pub(crate) fn render_block(label: &str, html: &str) -> Rendered {
     }
 }
 
-/// Collapses runs of blank lines and trims trailing spaces per line.
-pub(crate) fn finalize(md: &str) -> String {
-    let mut out = String::new();
-    let mut blank = false;
-    for line in md.lines() {
-        let line = line.trim_end();
-        if line.is_empty() {
-            blank = true;
-            continue;
-        }
-        if !out.is_empty() {
-            out.push_str(if blank { "\n\n" } else { "\n" });
-        }
-        blank = false;
-        out.push_str(line);
-    }
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out
-}
-
 fn descendants_named<'a>(root: ElementRef<'a>, names: &[&str]) -> Vec<ElementRef<'a>> {
     root.descendants()
         .filter_map(ElementRef::wrap)

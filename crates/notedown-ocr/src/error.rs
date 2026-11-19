@@ -20,4 +20,10 @@ pub enum OcrError {
     Io(#[from] std::io::Error),
     #[error("OCR engine error: {0}")]
     Engine(String),
+    /// The page gave no readable block.
+    #[error("no readable block on the page: {reason}")]
+    Unreadable { reason: String },
+    /// The model runtime did not do what it should (image size or image tokens).
+    #[error("OCR runtime error: {0}")]
+    Runtime(String),
 }

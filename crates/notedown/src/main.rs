@@ -15,9 +15,9 @@ use notedown_convert::links::FileIndex;
 use notedown_convert::pipeline::{Options, Outcome, convert_one};
 use notedown_note::{Notebook, RenderOptions, VersionPolicy, encode_png};
 #[cfg(feature = "ocr")]
-use notedown_ocr::model::{self, chandra::DEFAULT_MODEL};
+use notedown_ocr::model::{self, ENGINE_LABEL};
 #[cfg(feature = "ocr")]
-use notedown_ocr::{LlamaEngine, OcrEngine, OcrError, OcrOptions, PageOcr};
+use notedown_ocr::{OcrEngine, OcrError, OcrOptions, PageOcr, VisionEngine};
 
 #[derive(Parser)]
 #[command(
@@ -626,7 +626,7 @@ struct LazyEngine {
     model: Option<PathBuf>,
     mmproj: Option<PathBuf>,
     opts: OcrOptions,
-    engine: Option<LlamaEngine>,
+    engine: Option<VisionEngine>,
     load_error: Option<String>,
     loaded_in: Option<Duration>,
 }
@@ -639,15 +639,11 @@ impl OcrEngine for LazyEngine {
                 return Err(OcrError::Engine(msg.clone()));
             }
             let start = Instant::now();
-            let loaded = model::chandra::resolve(
-                &DEFAULT_MODEL,
-                self.model.as_deref(),
-                self.mmproj.as_deref(),
-            )
-            .and_then(|paths| {
-                eprintln!("loading model {} ...", paths.label);
-                LlamaEngine::load(&paths, self.opts)
-            });
+            let loaded =
+                model::resolve(self.model.as_deref(), self.mmproj.as_deref()).and_then(|paths| {
+                    eprintln!("loading model {} ...", paths.label);
+                    VisionEngine::load(&paths, self.opts)
+                });
             match loaded {
                 Ok(e) => {
                     self.loaded_in = Some(start.elapsed());
@@ -694,8 +690,8 @@ fn convert(args: ConvertArgs) -> Result<ExitCode> {
         Some(p) => p
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| DEFAULT_MODEL.label.to_string()),
-        None => DEFAULT_MODEL.label.to_string(),
+            .unwrap_or_else(|| ENGINE_LABEL.to_string()),
+        None => ENGINE_LABEL.to_string(),
     };
     let mut engine = LazyEngine {
         label,
@@ -2532,9 +2528,9 @@ fn pipeline_command(args: PipelineArgs) -> Result<ExitCode> {
     }
     // The model is loaded when a page is due, as `notedown convert` loads it.
     let loader: EngineLoader = Box::new(|| {
-        let paths = model::chandra::resolve(&DEFAULT_MODEL, None, None)?;
+        let paths = model::resolve(None, None)?;
         eprintln!("loading model {} ...", paths.label);
-        let engine = LlamaEngine::load(&paths, OcrOptions::default())?;
+        let engine = VisionEngine::load(&paths, OcrOptions::default())?;
         Ok(Box::new(engine) as Box<dyn OcrEngine>)
     });
     let mut worker = Worker::with_loader(&setup, loader);

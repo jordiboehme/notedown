@@ -6,8 +6,8 @@
 use std::path::Path;
 
 use notedown_note::{Notebook, VersionPolicy};
-use notedown_ocr::model::chandra::{DEFAULT_MODEL, resolve};
-use notedown_ocr::{LlamaEngine, OcrOptions};
+use notedown_ocr::model::resolve;
+use notedown_ocr::{OcrOptions, VisionEngine};
 use notedown_pipeline::delta::{Start, delta, manifest};
 use notedown_pipeline::model::Change;
 use notedown_pipeline::ocr::read_page;
@@ -144,7 +144,7 @@ fn a_sync_then_a_change_gives_only_that_change() {
 /// (`notedown model pull`), so the normal run needs no model. One page only: about a minute.
 #[test]
 fn real_model_reads_a_fixture_page() {
-    let paths = match resolve(&DEFAULT_MODEL, None, None) {
+    let paths = match resolve(None, None) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("skipping: the OCR model is missing ({e})");
@@ -154,7 +154,7 @@ fn real_model_reads_a_fixture_page() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/notes/test1.note");
     let nb = Notebook::open(&path, VersionPolicy::AllowUnknown).unwrap();
     let start = std::time::Instant::now();
-    let mut engine = LlamaEngine::load(&paths, OcrOptions::default()).unwrap();
+    let mut engine = VisionEngine::load(&paths, OcrOptions::default()).unwrap();
     let reading = read_page(&nb, 0, &mut engine).unwrap();
     eprintln!(
         "read page 1 of test1.note in {:?}: {:?}",

@@ -1170,9 +1170,37 @@ fn pause_changed(app: &AppHandle) {
     }
 }
 
-/// Ends the OCR pause (Settings > OCR); the menu bar calls [`resume_ocr`] itself.
+/// Ends the OCR pause (Settings > OCR); the menu bar calls [`resume_ocr`] itself, the panel
+/// has [`panel_ocr_resume`].
 #[tauri::command]
 pub async fn ocr_resume(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || resume_ocr(&app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The panel opens the Pause OCR menu at `x`, `y` (CSS pixels of the window: under the button
+/// that was pressed). Its items are the tray's Pause OCR items, so a pick goes through the menu
+/// bar's handler to [`pause_ocr`]: the tray menu, the status and Settings show it at once. On
+/// the main thread, as every native menu.
+#[tauri::command]
+pub fn panel_pause_menu(window: tauri::WebviewWindow, x: f64, y: f64) -> Result<(), String> {
+    use tauri::menu::{IsMenuItem, Menu};
+    let app = window.app_handle();
+    let items = crate::tray::render(app, &crate::tray::pause_items()).map_err(|e| e.to_string())?;
+    let refs: Vec<&dyn IsMenuItem<tauri::Wry>> = items.iter().map(|i| &**i).collect();
+    let menu = Menu::with_items(app, &refs).map_err(|e| e.to_string())?;
+    if x.is_finite() && y.is_finite() {
+        let at = tauri::LogicalPosition::new(x.max(0.0), y.max(0.0));
+        window.popup_menu_at(&menu, at).map_err(|e| e.to_string())
+    } else {
+        window.popup_menu(&menu).map_err(|e| e.to_string())
+    }
+}
+
+/// Ends the OCR pause from the panel's Resume OCR Now, as [`ocr_resume`] does for Settings.
+#[tauri::command]
+pub async fn panel_ocr_resume(app: AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || resume_ocr(&app))
         .await
         .map_err(|e| e.to_string())?
@@ -3107,6 +3135,44 @@ mod tests {
             running_pid(p.pipeline());
             assert_eq!(rig.pipeline_spawns(), 2);
             p.stop_all();
+        }
+
+        #[test]
+        fn a_pause_and_a_resume_show_in_the_tray_menu() {
+            // The panel's commands and the tray menu share pause_ocr_with and resume_ocr_with;
+            // the tray menu is built again from the saved pause (pause_changed). Nothing runs:
+            // only the config and the menu are looked at, at the fixed NOW.
+            let rig = Rig::new();
+            let config_dir = rig.dir.path().join("config");
+            config::save(&config_dir, &rig.config()).unwrap();
+            let state = ConfigState::load(config_dir);
+            let p = Arc::new(rig.paused_processes());
+            let server = import_job::ServerUse::default();
+            let menu = |state: &ConfigState| {
+                crate::tray::tray_entries(state.current().ocr_pause.as_ref(), NOW, |_| {
+                    "14:32".to_owned()
+                })
+            };
+            let resume = crate::tray::TrayEntry::Item {
+                id: crate::tray::RESUME_OCR_ID.to_owned(),
+                text: "Resume OCR Now".to_owned(),
+                enabled: true,
+            };
+            let line = |text: &str| crate::tray::TrayEntry::Item {
+                id: crate::tray::PAUSE_STATUS_ID.to_owned(),
+                text: text.to_owned(),
+                enabled: false,
+            };
+
+            pause_ocr_with(&state, &p, &server, PauseChoice::OneMinute, NOW).unwrap();
+            assert!(menu(&state).contains(&line("OCR paused until 14:32")));
+            assert!(menu(&state).contains(&resume));
+            pause_ocr_with(&state, &p, &server, PauseChoice::UntilResumed, NOW).unwrap();
+            assert!(menu(&state).contains(&line("OCR paused")));
+            resume_ocr_with(&state, &p, &server).unwrap();
+            assert!(!menu(&state).contains(&resume));
+            assert_eq!(config::load(&state.dir).ocr_pause, None);
+            relaunched(&server);
         }
 
         #[test]

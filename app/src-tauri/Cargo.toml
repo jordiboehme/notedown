@@ -70,7 +70,11 @@ objc2 = "=0.6.5"
 # The completion handlers of the notification center are Objective-C blocks.
 block2 = "=0.6.2"
 # NSString, NSDictionary and the other Foundation types the notification API takes.
-objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSString", "NSDictionary", "NSError", "NSSet", "NSBundle", "NSObject", "NSCalendar", "NSDate"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSString", "NSDictionary", "NSError", "NSSet", "NSBundle", "NSObject", "NSCalendar", "NSDate", "NSArray", "NSData", "NSGeometry", "NSURL"] }
+# The page menu of the review (page_image.rs): the PNG on the clipboard (NSPasteboard, with a
+# TIFF through NSImage for apps that read no PNG) and the share menu (NSSharingServicePicker on
+# the web view). In the tree through Tauri already.
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSPasteboard", "NSImage", "NSSharingService", "NSResponder", "NSView"] }
 # The UserNotifications framework.
 objc2-user-notifications = { version = "=0.3.2", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSettings", "UNNotificationTrigger"] }
 

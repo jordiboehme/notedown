@@ -6,7 +6,8 @@
   // One page alone in a large view over the whole window, fit to the window. The same zoom
   // keys as the pages side; the arrow keys and Page Up and Page Down go to the page before or
   // after, Escape and the Close button end it. It shows what the session has; it asks for
-  // nothing itself (`onStep` changes the page, the session asks for its image).
+  // nothing itself (`onStep` changes the page, the session asks for its image). A right click
+  // on the page opens the page menu (`onPageMenu`).
   let {
     row,
     image,
@@ -14,6 +15,7 @@
     covered = false,
     onStep,
     onClose,
+    onPageMenu = () => {},
   }: {
     row: ReviewPage;
     image: PageImage | undefined;
@@ -22,6 +24,7 @@
     covered?: boolean;
     onStep: (index: number) => void;
     onClose: () => void;
+    onPageMenu?: (event: MouseEvent, index: number) => void;
   } = $props();
 
   /** 1 fits the page to the window. */
@@ -62,7 +65,7 @@
     <!-- Fit to the window at 1: as wide as the stage or as high as it, whichever is less. -->
     <div class="paper" style:aspect-ratio={row.ratio} style:width={`min(${zoom * 100}cqw, ${zoom * 100 * row.ratio}cqh)`}>
       {#if image?.state === "shown"}
-        <img src={image.url} alt={row.label} />
+        <img src={image.url} alt={row.label} oncontextmenu={(event) => onPageMenu(event, row.index)} />
       {:else if image?.state === "failed"}
         <p class="why">{image.text}</p>
       {:else if image?.state === "loading"}

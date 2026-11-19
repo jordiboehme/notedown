@@ -9,6 +9,7 @@ pub mod menus;
 pub mod model;
 pub mod notes;
 pub mod notify;
+pub mod page_image;
 pub mod pause;
 pub mod pidfile;
 pub mod poller;
@@ -196,6 +197,8 @@ pub fn run() {
             );
             // The review renders pages with the sidecar into the app cache. It holds the
             // library and the notes index; neither holds it.
+            // The files of the shares of the last run (page_image.rs): none runs now.
+            page_image::clear_shares(&app.path().app_cache_dir()?);
             app.manage(review::Review::new(
                 library.clone(),
                 app.state::<Notes>().inner().clone(),

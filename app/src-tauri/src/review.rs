@@ -518,7 +518,7 @@ fn data_url(png: &[u8]) -> String {
 }
 
 /// The file name without `.note`, as the pipeline names a note.
-fn title_of(path: &str) -> String {
+pub fn title_of(path: &str) -> String {
     let name = path.rsplit('/').next().unwrap_or(path);
     name.strip_suffix(".note").unwrap_or(name).to_owned()
 }

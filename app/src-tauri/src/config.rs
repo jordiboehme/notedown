@@ -64,6 +64,8 @@ pub struct AppConfig {
     pub notifications: NotificationChoices,
     /// The folder of the last Save Markdown; the next save starts there.
     pub last_markdown_save_dir: Option<PathBuf>,
+    /// The folder of the last Save Image (a page of the review); the next one starts there.
+    pub last_image_save_dir: Option<PathBuf>,
     /// The OCR pause, kept over a restart; `None`: the OCR runs ([`crate::pause`]).
     pub ocr_pause: Option<OcrPause>,
 }
@@ -346,6 +348,7 @@ impl Default for AppConfig {
             last_update_shown: None,
             notifications: NotificationChoices::default(),
             last_markdown_save_dir: None,
+            last_image_save_dir: None,
             ocr_pause: None,
         }
     }
@@ -513,6 +516,7 @@ mod tests {
             last_update_shown: Some("0.2.0".into()),
             notifications: NotificationChoices::default(),
             last_markdown_save_dir: Some(PathBuf::from("/Users/someone/Notes")),
+            last_image_save_dir: Some(PathBuf::from("/Users/someone/Pictures")),
             ocr_pause: Some(OcrPause {
                 until_ms: Some(1_763_300_060_000),
             }),
@@ -565,6 +569,26 @@ mod tests {
         assert_eq!(
             load(dir.path()).last_markdown_save_dir,
             Some(PathBuf::from("/Users/someone/Notes"))
+        );
+    }
+
+    #[test]
+    fn the_last_image_save_folder_round_trips_and_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        // A config of an earlier version saved no image yet.
+        fs::write(dir.path().join(FILE), r#"{"mode":"local"}"#).unwrap();
+        assert_eq!(load(dir.path()).last_image_save_dir, None);
+        assert_eq!(AppConfig::default().last_image_save_dir, None);
+        let config = AppConfig {
+            last_image_save_dir: Some(PathBuf::from("/Users/someone/Pictures")),
+            ..AppConfig::default()
+        };
+        save(dir.path(), &config).unwrap();
+        let text = fs::read_to_string(dir.path().join(FILE)).unwrap();
+        assert!(text.contains("\"lastImageSaveDir\""), "{text}");
+        assert_eq!(
+            load(dir.path()).last_image_save_dir,
+            Some(PathBuf::from("/Users/someone/Pictures"))
         );
     }
 

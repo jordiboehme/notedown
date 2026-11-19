@@ -115,6 +115,12 @@ impl ConfigState {
             .map(|_| ())
     }
 
+    /// Keeps `dir` as the folder of the last Save Image.
+    pub fn set_last_image_save_dir(&self, dir: PathBuf) -> Result<(), String> {
+        self.update(|c| c.last_image_save_dir = Some(dir))
+            .map(|_| ())
+    }
+
     /// Sets the OCR pause (`None`: the OCR runs).
     pub fn set_ocr_pause(&self, p: Option<OcrPause>) -> Result<AppConfig, String> {
         self.update(|c| c.ocr_pause = p)

@@ -5,7 +5,7 @@
   import { NOTES_EVENT } from "../lib/library-types";
   import { ReviewSession } from "./session.svelte";
   import { status } from "../lib/status.svelte";
-  import { canSaveMarkdown, concernsNote, noteTitle, reviewNotice, reviewPages, type BlockAt } from "./review";
+  import { canSaveMarkdown, concernsNote, noteTitle, pageMenu, reviewNotice, reviewPages, type BlockAt } from "./review";
   import ReviewPages from "./ReviewPages.svelte";
   import PageViewer from "./PageViewer.svelte";
   import { ACTUAL, ZOOMS, findEndsAlone, reviewZoomKey, zoomIn, zoomOut } from "./zoom";
@@ -164,6 +164,7 @@
     onSeen={(changes) => session.seenMany(changes)}
     onMeasured={(index, width, height) => session.measured(index, width, height)}
     onOpen={(index) => session.focus(index)}
+    onPageMenu={(event, index) => pageMenu(event, path, index)}
   />
   {#if session.focused !== null && rows[session.focused]}
     <PageViewer
@@ -173,6 +174,7 @@
       {covered}
       onStep={(index) => session.focus(index)}
       onClose={() => void closeViewer()}
+      onPageMenu={(event, index) => pageMenu(event, path, index)}
     />
   {/if}
 {/if}

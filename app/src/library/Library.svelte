@@ -73,6 +73,7 @@
   import { emptyConfirm, recycleRows } from "./recycle";
   import { drag, folderUnder, letGo, moveTo, stopDrag } from "./drag.svelte";
   import { isFindKey, searchPlace, type ResultRow } from "./search";
+  import { keepsWebMenu, selectionCopy, type MenuSelection } from "./webmenu";
   import { LibrarySearch } from "./search.svelte";
   import "../lib/system.css";
   import "./library.css";
@@ -387,6 +388,21 @@
     }
   }
 
+  /** The selection when the last pointer went down; undefined before the first one. */
+  let pressSelection: MenuSelection | null | undefined;
+
+  function pressed() {
+    pressSelection = selectionCopy(window.getSelection());
+  }
+
+  /** WebKit's own menu stays only in text fields and on selected text. */
+  function contextMenu(event: MouseEvent) {
+    const selection = pressSelection !== undefined ? pressSelection : selectionCopy(window.getSelection());
+    pressSelection = undefined;
+    const target = event.target instanceof Element ? event.target : null;
+    if (!keepsWebMenu(target, selection)) event.preventDefault();
+  }
+
   function settings(page: string | null) {
     invoke("open_settings", { page }).catch(report("open_settings"));
   }
@@ -399,6 +415,8 @@
   onpointerup={released}
   onpointercancel={stopDrag}
   onkeydown={keydown}
+  onpointerdowncapture={pressed}
+  oncontextmenu={contextMenu}
 />
 
 <div class="library window">

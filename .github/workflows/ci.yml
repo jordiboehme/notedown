@@ -792,6 +792,7 @@ jobs:
           bash scripts/ci/test-version-pins.sh
           bash scripts/ci/test-jobs-passed.sh
           bash scripts/ci/test-notices.sh
+          bash scripts/ci/test-licence-headers.sh
           bash scripts/ci/test-permissions-fit.sh
           bash scripts/ci/test-app-sbom.sh
           bash scripts/ci/test-check-linux-binary.sh

@@ -33,7 +33,7 @@ ignore-build-dependencies = true
 ignore-dev-dependencies = true
 
 # Notedown's own crates are AGPL-3.0-or-later like the whole project (LICENSE
-# ships next to the binary). They have no publish = false, so this does not
+# ships next to the binary), except notedown-ocr, which is MPL-2.0 since 0.2.0. They have no publish = false, so this does not
 # drop them; the template leaves them out by their missing registry source.
 private = { ignore = true }
 

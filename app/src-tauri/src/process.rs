@@ -265,7 +265,12 @@ pub fn signal_group(pgid: u32, signal: i32) -> io::Result<()> {
     }
 }
 
-/// The longest a group kill waits for its group to be empty.
+/// The longest a group kill waits for its group to be empty. A process stuck in the kernel (a hung
+/// network or iCloud folder) can hold quit or a pause this long, so the app waits 10 s; the tests
+/// wait 120 s, so a loaded machine never fails them.
+#[cfg(not(test))]
+pub const KILL_GUARD: Duration = Duration::from_secs(10);
+#[cfg(test)]
 pub const KILL_GUARD: Duration = Duration::from_secs(120);
 
 /// Kills the group `pgid` until no process of it is left, at most `limit`. True when it is

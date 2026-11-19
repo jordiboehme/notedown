@@ -2,11 +2,12 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import { relativeTime } from "../../lib/format";
   import { status } from "../../lib/status.svelte";
-  import { failure, markdownDir, setMarkdownDir, setModelIdle, showMarkdownDir } from "../api";
+  import { failure, markdownDir, ocrResume, setMarkdownDir, setModelIdle, showMarkdownDir } from "../api";
   import { ocrConnect, REFUSED_ERROR } from "../checklist";
   import { config } from "../config.svelte";
   import { markdownRead, markdownRow } from "../markdown";
   import { MODEL_IDLE, modelIdleMinutes, modelIdleOptions, modelIdleValue } from "../modelIdle";
+  import { pauseRow } from "../ocrPause";
   import Form from "../kit/Form.svelte";
   import Row from "../kit/Row.svelte";
   import Section from "../kit/Section.svelte";
@@ -14,8 +15,8 @@
   import ConnectOcr from "../parts/ConnectOcr.svelte";
   import ModelDownload from "../parts/ModelDownload.svelte";
 
-  // Settings > OCR: the queue, the page in work, the last error (with Connect again when the
-  // server refused the OCR's token), the Markdown folder with
+  // Settings > OCR: the queue (or the pause, with Resume OCR Now), the page in work, the last
+  // error (with Connect again when the server refused the OCR's token), the Markdown folder with
   // Choose... and Show in Finder, and the model with Download, Pause and Remove, and how long
   // the model stays loaded without new pages.
   let { now }: { now: number } = $props();
@@ -26,6 +27,23 @@
     const row = ocrConnect(status.current, config.current);
     return row?.again ? row : null;
   });
+
+  // The pause starts in the menu bar; here it can end.
+  const pause = $derived(pauseRow(status.current));
+  let resumeError = $state<string | null>(null);
+  let resumeBusy = $state(false);
+
+  async function resume() {
+    resumeBusy = true;
+    try {
+      await ocrResume();
+      resumeError = null;
+    } catch (e) {
+      resumeError = failure(e);
+    } finally {
+      resumeBusy = false;
+    }
+  }
 
   let markdownPath = $state<string | null | undefined>(undefined);
   let markdownError = $state<string | null>(null);
@@ -110,7 +128,13 @@
     {#if ocr === null}
       <Row title="Status" note="Looking at the status..." />
     {:else}
-      <Row title="Status" note={ocr.line} />
+      <!-- A failed resume says why until the pause is over. -->
+      {@const failed = pause.showResume ? resumeError : null}
+      <Row title="Status" note={failed ?? pause.line ?? ocr.line} tone={failed ? "bad" : "secondary"}>
+        {#if pause.showResume}
+          <button type="button" class="button" disabled={resumeBusy} onclick={resume}>Resume OCR Now</button>
+        {/if}
+      </Row>
       {#if ocr.inWork}
         <Row title="Page in work" note={ocr.inWork.path}>
           <span class="value">Page {ocr.inWork.page} of {ocr.inWork.pages}</span>

@@ -1082,8 +1082,9 @@ pub fn end_expired_pause(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// After a pause, its end or a resume: the status shows it at once.
+/// After a pause, its end or a resume: the tray menu and the status show it at once.
 fn pause_changed(app: &AppHandle) {
+    crate::tray::set_menu(app);
     if let Some(poller) = app.try_state::<Poller>() {
         poller.poll_now();
     }

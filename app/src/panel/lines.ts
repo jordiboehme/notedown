@@ -85,9 +85,11 @@ function agentLines(status: Status, now: number): PanelLine[] {
   );
 }
 
-/** The OCR queue, or the state of the pipeline while it does not run. */
+/** The OCR queue, the pause, or the state of the pipeline while it does not run. */
 function ocrLine(status: Status, now: number): PanelLine {
   const ocr = status.ocr;
+  // A pause is no problem: its line says until when, whatever the pipeline did before it.
+  if (ocr.paused) return line("ocr", "OCR", ocr.line);
   const attention = has(status, "ocrError", "pipelineBackoff");
   const pipeline = status.pipeline.state;
   if (pipeline.state !== "running" && pipeline.state !== "notConnected") {

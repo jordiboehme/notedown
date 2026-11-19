@@ -656,6 +656,8 @@ fn supervise(app: AppHandle) {
         if let Err(e) = state.clear_expired_pause(processes.now_ms()) {
             eprintln!("notedown: the ended OCR pause was not cleared: {e}");
         }
+        // The icon was built before the config was there: now the menu shows a kept pause.
+        tray::set_menu(&app);
         let config = state.reader();
         processes.start_with(|| config.current());
         loop {

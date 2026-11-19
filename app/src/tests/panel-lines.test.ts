@@ -57,6 +57,26 @@ describe("panelLines", () => {
     expect(panelLines(status, now)[0]).toMatchObject({ text: "No Supernote yet", when: null, tone: "off" });
   });
 
+  it("a paused OCR is off and no problem", () => {
+    const status = sampleStatus(now);
+    // A status right after the pause: the pipeline still says it runs, pages wait, and the
+    // store keeps an old error.
+    status.pipeline = { line: "OCR paused until 14:32", state: { state: "running", pid: 8, sinceMs: now - 60_000 } };
+    status.ocr = {
+      ...status.ocr,
+      line: "OCR paused until 14:32",
+      queued: 3,
+      lastError: { text: "no model", atMs: now - 3 * 60_000, code: null },
+      paused: true,
+    };
+    const ocr = panelLines(status, now).find((l) => l.key === "ocr");
+    expect(ocr).toMatchObject({ text: "OCR paused until 14:32", tone: "off", attention: false, when: null, more: null });
+
+    status.pipeline = { line: "OCR paused", state: { state: "stopped" } };
+    status.ocr = { ...status.ocr, line: "OCR paused" };
+    expect(panelLines(status, now).find((l) => l.key === "ocr")).toMatchObject({ text: "OCR paused", tone: "off", attention: false });
+  });
+
   it("attention lines come first", () => {
     const status = sampleStatus(now);
     status.ocr = {

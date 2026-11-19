@@ -14,7 +14,7 @@ use crate::commands::ConfigState;
 use crate::menus::MENU_ERROR_EVENT;
 use crate::notes::Notes;
 use crate::review::Review;
-use crate::save_markdown::{SaveTarget, safe_title, start_folder, write_atomically};
+use crate::save_markdown::{SaveTarget, SaveTurn, safe_title, start_folder, write_atomically};
 use crate::windows::WindowKind;
 
 /// The ids of the menu items.
@@ -29,8 +29,10 @@ pub const SHARE_TEXT: &str = "Share...";
 
 /// What a failed copy says.
 const NOT_COPIED: &str = "The page could not be copied.";
-/// What a share says when the library window is gone.
+/// What a failed share says.
 const NOT_SHARED: &str = "The page could not be shared.";
+/// What Save Image... says while another save panel is open.
+pub const SAVE_OPEN: &str = "Finish the save that is open first.";
 
 /// What a menu item does with the page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +131,21 @@ pub fn save_with(
     Ok(Some(target))
 }
 
+/// The error of a page that could not be read, as a copy or a share says it (`what`): a gone
+/// note and a quitting app say so as they are.
+pub fn failed_as(error: String, what: &str) -> String {
+    if error == crate::notes::NOTE_GONE || error == crate::review::QUITTING {
+        error
+    } else {
+        what.to_owned()
+    }
+}
+
+/// The turn of a save, refused with [`SAVE_OPEN`] while another save panel is open.
+pub fn save_turn(target: &SaveTarget) -> Result<SaveTurn<'_>, String> {
+    target.turn().ok_or_else(|| SAVE_OPEN.to_owned())
+}
+
 /// The PNG of page `index` of the note at `path`, as the review rendered it. Blocking.
 fn page_png(app: &AppHandle, path: &str, index: usize) -> Result<Vec<u8>, String> {
     let review = app.state::<Review>().inner().clone();
@@ -136,13 +153,11 @@ fn page_png(app: &AppHandle, path: &str, index: usize) -> Result<Vec<u8>, String
 }
 
 /// Saves page `index` of the note at `path` into a file the user picks. Blocking (the
-/// dialog waits for the user): never on the main thread. `Ok(None)` for Cancel, or while
+/// dialog waits for the user): never on the main thread. `Ok(None)` for Cancel; refused while
 /// another save's panel is open.
 fn save(app: &AppHandle, path: &str, index: usize) -> Result<Option<PathBuf>, String> {
     let target = app.state::<SaveTarget>();
-    let Some(_turn) = target.turn() else {
-        return Ok(None);
-    };
+    let _turn = save_turn(&target)?;
     let library = crate::save_markdown::shown_library(app);
     let config_state = app.state::<ConfigState>().inner().clone();
     let config = config_state.current();
@@ -199,23 +214,21 @@ fn run(
 ) -> Result<(), String> {
     match action {
         PageAction::Copy => {
-            let png = page_png(app, path, index)?;
-            on_main(app, move || mac::copy(&png))?
+            let png = page_png(app, path, index).map_err(|e| failed_as(e, NOT_COPIED))?;
+            on_main(app, move || copy(&png))?
                 .then_some(())
                 .ok_or_else(|| NOT_COPIED.to_owned())
         }
         PageAction::Save => save(app, path, index).map(|_| ()),
         PageAction::Share => {
-            let png = page_png(app, path, index)?;
+            let png = page_png(app, path, index).map_err(|e| failed_as(e, NOT_SHARED))?;
             let name = image_name(&note_title(&app.state::<Notes>(), path), index);
             let root = app.path().app_cache_dir().map_err(|e| e.to_string())?;
             let file = write_share(&root, &name, &png)?;
             let window = app
                 .get_webview_window(WindowKind::Library.label())
                 .ok_or_else(|| NOT_SHARED.to_owned())?;
-            window
-                .with_webview(move |webview| mac::share(webview.inner(), &file, at))
-                .map_err(|e| format!("{NOT_SHARED} {e}"))
+            show_share(app, &window, file, at)
         }
     }
 }
@@ -233,14 +246,53 @@ pub fn on_menu(app: &AppHandle, action: PageAction, path: String, index: usize, 
     });
 }
 
+#[cfg(target_os = "macos")]
+use mac::{copy, share};
+
+/// Only macOS has a clipboard and a share menu here.
+#[cfg(not(target_os = "macos"))]
+fn copy(_png: &[u8]) -> bool {
+    false
+}
+
+/// Shows the share menu for `file` at `at` of the library window's web view, on the main
+/// thread; a view that is missing then says so through the notice.
+#[cfg(target_os = "macos")]
+fn show_share(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    file: PathBuf,
+    at: (f64, f64),
+) -> Result<(), String> {
+    let shown = app.clone();
+    window
+        .with_webview(move |webview| {
+            if !share(webview.inner(), &file, at) {
+                let _ = shown.emit_to(WindowKind::Library.label(), MENU_ERROR_EVENT, NOT_SHARED);
+            }
+        })
+        .map_err(|e| format!("{NOT_SHARED} {e}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn show_share(
+    _app: &AppHandle,
+    _window: &tauri::WebviewWindow,
+    _file: PathBuf,
+    _at: (f64, f64),
+) -> Result<(), String> {
+    Err(NOT_SHARED.to_owned())
+}
+
 /// The AppKit side: the clipboard and the share menu. Main thread only.
+#[cfg(target_os = "macos")]
 mod mac {
     use std::cell::RefCell;
     use std::ffi::c_void;
     use std::path::Path;
 
     use objc2::AllocAnyThread;
-    use objc2::rc::Retained;
+    use objc2::rc::{Retained, autoreleasepool};
     use objc2::runtime::AnyObject;
     use objc2_app_kit::{
         NSImage, NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSSharingServicePicker,
@@ -255,6 +307,10 @@ mod mac {
 
     /// Puts `png` on the general clipboard as PNG, and as TIFF for apps that read no PNG.
     pub fn copy(png: &[u8]) -> bool {
+        autoreleasepool(|_| copy_in_pool(png))
+    }
+
+    fn copy_in_pool(png: &[u8]) -> bool {
         let data = NSData::with_bytes(png);
         let tiff =
             NSImage::initWithData(NSImage::alloc(), &data).and_then(|i| i.TIFFRepresentation());
@@ -275,11 +331,16 @@ mod mac {
     }
 
     /// Shows the share menu for `file` at `at` (CSS pixels from the top left) of `view`, the
-    /// library window's WKWebView.
-    pub fn share(view: *mut c_void, file: &Path, at: (f64, f64)) {
+    /// library window's WKWebView. False when there is no view.
+    pub fn share(view: *mut c_void, file: &Path, at: (f64, f64)) -> bool {
         if view.is_null() {
-            return;
+            return false;
         }
+        autoreleasepool(|_| share_in_pool(view, file, at));
+        true
+    }
+
+    fn share_in_pool(view: *mut c_void, file: &Path, at: (f64, f64)) {
         // SAFETY: Tauri hands the WKWebView of the window, an NSView, on the main thread, and
         // it lives while the window does.
         let view: &NSView = unsafe { &*view.cast::<NSView>() };
@@ -307,6 +368,31 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn a_page_that_cannot_be_read_says_what_failed() {
+        assert_eq!(
+            failed_as(crate::review::NO_IMAGE.to_owned(), NOT_COPIED),
+            NOT_COPIED
+        );
+        assert_eq!(
+            failed_as(crate::review::TOO_LONG.to_owned(), NOT_SHARED),
+            NOT_SHARED
+        );
+        // A gone note and a quitting app say so as they are.
+        for kept in [crate::notes::NOTE_GONE, crate::review::QUITTING] {
+            assert_eq!(failed_as(kept.to_owned(), NOT_COPIED), kept);
+        }
+    }
+
+    #[test]
+    fn a_second_save_panel_says_so() {
+        let target = SaveTarget::default();
+        let first = save_turn(&target).expect("the first save");
+        assert_eq!(save_turn(&target).err(), Some(SAVE_OPEN.to_owned()));
+        drop(first);
+        assert!(save_turn(&target).is_ok());
+    }
 
     #[test]
     fn each_item_has_its_action() {

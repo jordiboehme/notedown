@@ -33,7 +33,7 @@ pub mod tasks;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -51,6 +51,15 @@ use crate::auth::Device;
 use crate::diag::{LogEntry, LogKind};
 use crate::server::{AppState, MAX_REQUEST_BODY};
 use envelope::{LogDevice, LogFlags, Reply, Streamed};
+
+/// The most bytes of a request body that the request log reads in all when the body is over
+/// [`MAX_REQUEST_BODY`]: it reads and drops the rest, so the client, still sending, receives the
+/// refusal and not a reset. A larger body is cut off.
+pub const MAX_DRAINED_BODY: usize = 64 * 1024 * 1024;
+
+/// The longest time the request log reads and drops the rest of a refused body; a slower
+/// sender is cut off.
+const DRAIN_TIME: Duration = Duration::from_secs(10);
 
 pub const FLAG_UNKNOWN: &str = "unknown_endpoint";
 pub const FLAG_RETRY: &str = "retry_suspected";
@@ -474,12 +483,110 @@ fn raw_json(bytes: &[u8]) -> Option<String> {
     Some(text.to_string())
 }
 
+/// Whether the rest of a refused `body` is read and dropped ([`drop_rest`]). A body whose
+/// Content-Length is over [`MAX_DRAINED_BODY`] is not read at all: hyper closes the connection
+/// after the answer, so such a client, still sending, can get a reset instead of the answer.
+fn drainable(body: &Body) -> bool {
+    use axum::body::HttpBody as _;
+    body.size_hint()
+        .exact()
+        .is_none_or(|n| n <= MAX_DRAINED_BODY as u64)
+}
+
+/// The most refused bodies dropped at the same time; past it a body is not read (as before).
+const MAX_DRAINS: usize = 64;
+static DRAINS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_DRAINS);
+
+/// Reads and drops the rest of a refused request body in a task of its own, while the answer
+/// goes out at once, until `seen` (the bytes read before) reaches [`MAX_DRAINED_BODY`] or
+/// [`DRAIN_TIME`] has passed. hyper sends an answer while it still reads the body, but when the
+/// body is dropped it drops only what it has buffered and closes the connection with the client
+/// still sending, which resets it before the client reads the answer. Once the body is read to
+/// its end the connection is kept as usual. Also for a refused token: the bytes are the
+/// client's own, and at most [`MAX_DRAINS`] bodies are dropped at a time (in the whole
+/// process, shared by every server in it). A graceful shutdown waits for a running drain, up
+/// to its grace time (`SHUTDOWN_GRACE` in `server.rs`, 3 s).
+fn drop_rest<S>(mut stream: S, mut seen: usize)
+where
+    S: futures_util::Stream<Item = Result<Bytes, axum::Error>> + Unpin + Send + 'static,
+{
+    use futures_util::StreamExt;
+    let Ok(permit) = DRAINS.try_acquire() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let rest = async {
+            while seen < MAX_DRAINED_BODY {
+                match stream.next().await {
+                    Some(Ok(c)) => seen += c.len(),
+                    _ => break,
+                }
+            }
+        };
+        let _ = tokio::time::timeout(DRAIN_TIME, rest).await;
+        drop(permit);
+    });
+}
+
+/// The whole request body when it is at most [`MAX_REQUEST_BODY`] bytes, else `None` (also for
+/// a broken body). Over the limit the rest is dropped within bounds ([`drop_rest`]).
+async fn read_body(body: Body) -> Option<Bytes> {
+    use futures_util::StreamExt;
+    let drain = drainable(&body);
+    let mut stream = body.into_data_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        if bytes.len() + chunk.len() > MAX_REQUEST_BODY {
+            if drain {
+                drop_rest(stream, bytes.len() + chunk.len());
+            }
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Some(Bytes::from(bytes))
+}
+
+/// Whether the request log drops the rest of a streamed body the handler left unread: only a
+/// `drainable` one, and not when the client waits for `100 Continue` (`expects`) and the
+/// handler never asked for the body (`polled`). Such a client sends no body, and a drain that
+/// polls before hyper has written the answer would make hyper send the 100 and ask for it.
+fn drains_rest(drainable: bool, expects: bool, polled: bool) -> bool {
+    drainable && (polled || !expects)
+}
+
+/// The body of a streamed route as the handler reads it. The request log keeps a second handle,
+/// so when the handler answers without reading it all (a refusal), the request log drops the
+/// rest ([`drop_rest`]). `polled` tells whether the handler asked for the body at all (then
+/// hyper has sent `100 Continue` to a client that waits for it). A plain mutex is enough: only
+/// one side polls at a time, and the lock is never held across an await.
+struct SharedBody {
+    stream: Arc<std::sync::Mutex<axum::body::BodyDataStream>>,
+    polled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl futures_util::Stream for SharedBody {
+    type Item = Result<Bytes, axum::Error>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.polled.store(true, Ordering::Relaxed);
+        let mut stream = self.stream.lock().unwrap_or_else(|e| e.into_inner());
+        futures_util::StreamExt::poll_next_unpin(&mut *stream, cx)
+    }
+}
+
 /// Writes one [`LogEntry`] per request: method, path, query, headers, masked bodies, status,
 /// envelope result, duration, device, firmware and flags. The request body is read up to
 /// [`MAX_REQUEST_BODY`]; a larger one is not passed on (the answer is still an envelope, or the
-/// JSON 413 `too_large` of the REST API). The byte uploads of accept mode and the app's upload
+/// JSON 413 `too_large` of the REST API), and its rest is read and dropped within bounds
+/// while the answer goes out ([`drop_rest`]). The byte uploads of accept mode and the app's upload
 /// ([`crate::rest::is_streamed_write`]) are passed on unread and logged as
-/// `<N bytes, not logged>`.
+/// `<N bytes, not logged>`; what a handler leaves unread (a refusal before or while it reads)
+/// is dropped the same way.
 /// A REST read that succeeded and a repeated REST token refusal are passed on without a line
 /// ([`crate::rest::unlogged`]).
 pub async fn log_request(
@@ -525,7 +632,18 @@ pub async fn log_request(
         // Counted while the handler streams it; never buffered here.
         let seen = Arc::new(AtomicU64::new(0));
         let counter = seen.clone();
-        let stream = futures_util::StreamExt::map(body.into_data_stream(), move |chunk| {
+        let drain = drainable(&body);
+        let expects = parts
+            .headers
+            .get(axum::http::header::EXPECT)
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"100-continue"));
+        let shared = Arc::new(std::sync::Mutex::new(body.into_data_stream()));
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body = SharedBody {
+            stream: shared.clone(),
+            polled: polled.clone(),
+        };
+        let stream = futures_util::StreamExt::map(body, move |chunk| {
             if let Ok(b) = &chunk {
                 counter.fetch_add(b.len() as u64, Ordering::Relaxed);
             }
@@ -533,14 +651,22 @@ pub async fn log_request(
         });
         let request = Request::from_parts(parts, Body::from_stream(stream));
         let response = next.run(request).await;
+        // The handler has dropped the body: drop what it left unread (nothing after a full read).
+        if drains_rest(drain, expects, polled.load(Ordering::Relaxed))
+            && let Ok(stream) = Arc::try_unwrap(shared)
+        {
+            let stream = stream.into_inner().unwrap_or_else(|e| e.into_inner());
+            let read = usize::try_from(seen.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
+            drop_rest(stream, read);
+        }
         entry.request_body = Some(Value::String(format!(
             "<{} bytes, not logged>",
             seen.load(Ordering::Relaxed)
         )));
         response
     } else {
-        match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
-            Ok(bytes) => {
+        match read_body(body).await {
+            Some(bytes) => {
                 entry.request_body = body_for_log(&bytes, &content_type);
                 entry.request_body_raw = raw_json(&bytes);
                 if let Some(Value::Object(m)) = &entry.request_body {
@@ -554,7 +680,7 @@ pub async fn log_request(
                 let request = Request::from_parts(parts, Body::from(bytes));
                 next.run(request).await
             }
-            Err(_) => {
+            None => {
                 entry.request_body = Some(Value::String(format!(
                     "<body not read: larger than {MAX_REQUEST_BODY} bytes or broken; content-type {}>",
                     if content_type.is_empty() {
@@ -677,4 +803,20 @@ fn finish_entry(
     }
     entry.duration_ms = Some(started.elapsed().as_millis() as u64);
     state.log.record(entry);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drains_rest;
+
+    #[test]
+    fn a_client_waiting_for_100_continue_is_not_asked_for_its_body() {
+        // drainable, expects, polled
+        assert!(drains_rest(true, false, false));
+        assert!(drains_rest(true, false, true));
+        assert!(drains_rest(true, true, true));
+        assert!(!drains_rest(true, true, false));
+        assert!(!drains_rest(false, false, true));
+        assert!(!drains_rest(false, true, true));
+    }
 }

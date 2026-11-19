@@ -17,6 +17,8 @@
     onToggle,
     onSettings,
     onNewMenu,
+    scrollTo = null,
+    onScrolled = () => {},
   }: {
     notes: SidebarItem[];
     tree: boolean;
@@ -28,6 +30,10 @@
     onToggle: (path: string) => void;
     onSettings: (page: string | null) => void;
     onNewMenu: () => void;
+    /** A folder to scroll into view once its row is there (a note opened elsewhere revealed it). */
+    scrollTo?: string | null;
+    /** The folder of `scrollTo` was scrolled into view. */
+    onScrolled?: () => void;
   } = $props();
 </script>
 
@@ -67,6 +73,12 @@
           aria-expanded={row.empty ? undefined : row.open}
           data-folder={row.path}
           style:padding-left="{6 + row.depth * 14}px"
+          {@attach (node) => {
+            // Once, when its row is there: later the user scrolls the sidebar as they like.
+            if (row.path !== scrollTo) return;
+            node.scrollIntoView?.({ block: "nearest" });
+            onScrolled();
+          }}
         >
           {#if row.empty}
             <span class="twisty" aria-hidden="true"></span>

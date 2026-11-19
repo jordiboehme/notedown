@@ -1,6 +1,6 @@
 <script lang="ts" generics="T">
   import { untrack, type Snippet } from "svelte";
-  import { visibleRange, type Range } from "./view";
+  import { scrollToShow, visibleRange, type Range } from "./view";
 
   // A list that puts only the visible rows (and a few around them) in the DOM; spacers keep the
   // full height. Every row is `rowHeight` pixels high.
@@ -11,6 +11,7 @@
     row,
     label,
     onRange,
+    reveal = null,
   }: {
     items: T[];
     rowHeight: number;
@@ -18,6 +19,8 @@
     row: Snippet<[T]>;
     label: string;
     onRange?: (range: Range) => void;
+    /** The key of a row to bring into view once, when it is there (a picked row). */
+    reveal?: string | number | null;
   } = $props();
 
   let scrollTop = $state(0);
@@ -25,6 +28,25 @@
 
   const range = $derived(visibleRange({ scrollTop, height, rowHeight, count: items.length }));
   const shown = $derived(items.slice(range.start, range.end));
+
+  let scroller: HTMLDivElement | undefined = $state();
+
+  /** Scrolls row `index` into view (a sort moved the picked row). */
+  export function show(index: number) {
+    if (!scroller) return;
+    scroller.scrollTop = scrollToShow({ index, rowHeight, scrollTop: scroller.scrollTop, height: scroller.clientHeight });
+  }
+
+  /** The `reveal` that was brought into view; another one is brought in once its row is there. */
+  let revealed: string | number | null = null;
+  $effect(() => {
+    const wanted = reveal;
+    if (wanted === null || wanted === revealed || !scroller) return;
+    const index = items.findIndex((item) => key(item) === wanted);
+    if (index < 0) return;
+    revealed = wanted;
+    untrack(() => show(index));
+  });
 
   // Runs when the shown rows or their count change; what the callback reads does not re-run it.
   $effect(() => {
@@ -34,6 +56,7 @@
 </script>
 
 <div
+  bind:this={scroller}
   class="scroller"
   role="list"
   aria-label={label}

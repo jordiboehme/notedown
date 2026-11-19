@@ -938,7 +938,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2082,7 +2082,7 @@ dependencies = [
 
 [[package]]
 name = "notedown"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2104,7 +2104,7 @@ dependencies = [
 
 [[package]]
 name = "notedown-cloud"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2137,7 +2137,7 @@ dependencies = [
 
 [[package]]
 name = "notedown-convert"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "const-hex",
@@ -2153,7 +2153,7 @@ dependencies = [
 
 [[package]]
 name = "notedown-note"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.23.1",
  "const-hex",
@@ -2169,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "notedown-ocr"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "const-hex",
  "dirs",
@@ -2184,7 +2184,7 @@ dependencies = [
 
 [[package]]
 name = "notedown-pipeline"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2317,7 +2317,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 [[package]]
 name = "pagevision"
 version = "0.1.0"
-source = "git+https://github.com/jordiboehme/rezzer?rev=a0685acfa2e576310e3bb7a30bb79a7f45593154#a0685acfa2e576310e3bb7a30bb79a7f45593154"
+source = "git+https://github.com/jordiboehme/rezzer?rev=d69bd72a6ef857e45a755b3b79e1b7d7bbf39165#d69bd72a6ef857e45a755b3b79e1b7d7bbf39165"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -2563,7 +2563,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2910,7 +2910,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2967,7 +2967,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3400,7 +3400,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4021,7 +4021,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

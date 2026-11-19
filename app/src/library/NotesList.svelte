@@ -1,25 +1,33 @@
 <script lang="ts">
   import type { NoteSummary } from "../lib/library-types";
+  import SortHeads from "./SortHeads.svelte";
   import VirtualRows from "./VirtualRows.svelte";
   import { noteMenu } from "./review";
+  import { nextSort, sortNotes, type NotesSort } from "./sort";
   import { dateText, folderLabel } from "./view";
 
-  // New notes or all notes as rows; a click opens the review of the note and a right click
-  // its context menu (Rust's). Titles are text.
+  // New notes or all notes as rows, sorted by a column; a click opens the review of the note
+  // and a right click its context menu (Rust's). Titles are text.
   let {
     title,
     notes,
     empty,
+    sort,
+    onSort,
     onOpen,
     onMarkAllSeen,
   }: {
     title: string;
     notes: NoteSummary[] | null;
     empty: string;
+    sort: NotesSort;
+    onSort: (sort: NotesSort) => void;
     onOpen: (note: NoteSummary) => void;
     /** Given only for the New list: it shows the Mark All as Seen button. */
     onMarkAllSeen?: () => void;
   } = $props();
+
+  const rows = $derived(notes ? sortNotes(notes, sort) : []);
 </script>
 
 <div class="head">
@@ -29,8 +37,17 @@
   {/if}
 </div>
 
-<div class="heads" role="presentation">
-  <span>Name</span><span>Folder</span><span class="pages">Pages</span><span>Changed</span>
+<div class="heads" role="group" aria-label="Sort">
+  <SortHeads
+    columns={[
+      { by: "name", title: "Name" },
+      { by: "folder", title: "Folder" },
+      { by: "pages", title: "Pages", end: true },
+      { by: "date", title: "Changed" },
+    ]}
+    {sort}
+    onSort={(by) => onSort(nextSort(sort, by))}
+  />
 </div>
 
 {#if notes === null}
@@ -38,7 +55,7 @@
 {:else if notes.length === 0}
   <p class="note">{empty}</p>
 {:else}
-  <VirtualRows items={notes} rowHeight={24} key={(note: NoteSummary) => note.key} label={title}>
+  <VirtualRows items={rows} rowHeight={24} key={(note: NoteSummary) => note.key} label={title}>
     {#snippet row(note: NoteSummary)}
       <button type="button" class="row" onclick={() => onOpen(note)} oncontextmenu={(event) => noteMenu(event, note.path)}>
         <span class="text">{note.title}</span>
@@ -85,10 +102,6 @@
 
   .heads {
     flex: none;
-    padding-top: 4px;
-    padding-bottom: 4px;
-    font-size: 11px;
-    color: var(--secondary);
     border-bottom: 1px solid var(--separator);
   }
 

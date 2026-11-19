@@ -441,7 +441,14 @@ fn verify_names_each_file() {
 }
 
 #[cfg(feature = "ocr")]
-const LICENCES_JSON: &str = r#"{"licences":["Qwen3.5-4B (Qwen team, Alibaba Cloud): Apache-2.0","PP-DocLayoutV3 and PP-OCRv6 (PaddlePaddle Authors): Apache-2.0"]}"#;
+const LICENCES_JSON: &str = concat!(
+    r#"{"files":["#,
+    r#"{"file":"Qwen3.5-4B-Q4_K_M.gguf","licence":"Apache-2.0","licensor":"Qwen team","model":"Qwen3.5-4B","page":"https://huggingface.co/Qwen/Qwen3.5-4B"},"#,
+    r#"{"file":"mmproj-F16.gguf","licence":"Apache-2.0","licensor":"Qwen team","model":"Qwen3.5-4B","page":"https://huggingface.co/Qwen/Qwen3.5-4B"},"#,
+    r#"{"file":"pp-doclayoutv3.safetensors","licence":"Apache-2.0","licensor":"PaddlePaddle Authors","model":"PP-DocLayoutV3","page":"https://huggingface.co/PaddlePaddle/PP-DocLayoutV3"},"#,
+    r#"{"file":"pp-ocrv6-small-det.onnx","licence":"Apache-2.0","licensor":"PaddlePaddle Authors","model":"PP-OCRv6","page":"https://huggingface.co/PaddlePaddle/PP-OCRv6_small_det"}"#,
+    r#"],"licences":["Qwen3.5-4B (Qwen team): Apache-2.0","PP-DocLayoutV3 and PP-OCRv6 (PaddlePaddle Authors): Apache-2.0"]}"#
+);
 
 #[cfg(feature = "ocr")]
 #[test]
@@ -462,7 +469,7 @@ fn pull_shows_licences_and_size_before_it_starts() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     let expected = "The model files have these licences:\n\
-                    Qwen3.5-4B (Qwen team, Alibaba Cloud): Apache-2.0\n\
+                    Qwen3.5-4B (Qwen team): Apache-2.0\n\
                     PP-DocLayoutV3 and PP-OCRv6 (PaddlePaddle Authors): Apache-2.0\n\
                     The download is about 3.6 GB.\n";
     assert!(stderr.starts_with(expected), "{stderr}");

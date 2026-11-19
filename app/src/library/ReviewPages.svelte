@@ -12,7 +12,8 @@
   // dragged; the split is kept per viewer. A double-click on a page opens it alone
   // (`onOpen`); `showPage` scrolls both sides to a page. The text side shows each block of a
   // page in its own `pre`; `showBlock` scrolls it to a block (a search hit), marks the block
-  // until the text side scrolls away from it, and the pages side follows.
+  // until the text side scrolls away from it, and the pages side follows. A right click on a
+  // shown page opens the page menu (`onPageMenu`).
   let {
     rows,
     images,
@@ -20,6 +21,7 @@
     onSeen,
     onMeasured,
     onOpen = () => {},
+    onPageMenu = () => {},
   }: {
     rows: ReviewPage[];
     images: Record<number, PageImage>;
@@ -27,6 +29,7 @@
     onSeen: (changes: [index: number, visible: boolean][]) => void;
     onMeasured: (index: number, width: number, height: number) => void;
     onOpen?: (index: number) => void;
+    onPageMenu?: (event: MouseEvent, index: number) => void;
   } = $props();
 
   /** The viewer's storage; null where it cannot be used. */
@@ -223,6 +226,7 @@
             <img
               src={image.url}
               alt={row.label}
+              oncontextmenu={(event) => onPageMenu(event, row.index)}
               onload={(event) => {
                 const img = event.currentTarget as HTMLImageElement;
                 onMeasured(row.index, img.naturalWidth, img.naturalHeight);

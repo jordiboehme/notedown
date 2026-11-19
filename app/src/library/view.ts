@@ -191,6 +191,19 @@ export function visibleRange(args: {
   return { start, end, top: start * rowHeight, bottom: (count - end) * rowHeight };
 }
 
+/**
+ * Where a virtual list scrolls so row `index` is in view: as it is when the row is in view
+ * already (or there is no row), else just far enough.
+ */
+export function scrollToShow(args: { index: number; rowHeight: number; scrollTop: number; height: number }): number {
+  const { index, rowHeight, scrollTop, height } = args;
+  if (index < 0) return scrollTop;
+  const top = index * rowHeight;
+  if (top < scrollTop) return top;
+  if (top + rowHeight > scrollTop + height) return top + rowHeight - height;
+  return scrollTop;
+}
+
 /** How many rows before the end the next page is asked for. */
 export const PAGE_AHEAD = 50;
 
@@ -370,13 +383,125 @@ export function columnsView(
   return { columns, shown, missing };
 }
 
-/** The listings the window shows in a view, for `library_shown`. */
-export function shownFor(view: LibraryView, selection: Selection, open: ReadonlySet<string>): ShownListing[] {
+/**
+ * The listings the window shows in a view, for `library_shown`. The columns follow the open
+ * note's folder once it was revealed (`reveal`), so they are ready when it shows.
+ */
+export function shownFor(
+  view: LibraryView,
+  selection: Selection,
+  open: ReadonlySet<string>,
+  reveal: Reveal | null = null,
+): ShownListing[] {
   if (view === "tree") return shownListings(selection, open);
-  return selection.kind === "folder" ? columnsView(selection.path, {}).shown : [];
+  const { path } = columnsPlace(selection, reveal, null);
+  return path === null ? [] : columnsView(path, {}).shown;
 }
 
 /** The folder that holds a path. */
 export function parentOf(path: string): string {
   return path.slice(0, Math.max(0, path.lastIndexOf("/")));
+}
+
+/**
+ * Where an open note is in the tree: its folder, which the sidebar selects, and the folders
+ * the tree opens, from the device tree down to the folder itself. Only for a note in one of
+ * the device trees.
+ */
+export type Reveal = { note: string; folder: string; opens: string[] };
+
+/** The reveal of the note at `path`; null for a note outside the device trees. */
+export function revealOf(path: string): Reveal | null {
+  const folder = parentOf(path);
+  const inTree = ROOTS.some((root) => folder === root.path || folder.startsWith(`${root.path}/`));
+  if (!inTree) return null;
+  return { note: path, folder, opens: pathBar(folder).map((crumb) => crumb.path) };
+}
+
+/**
+ * The folder the sidebar selects: the shown folder, or the open note's folder once the note
+ * opened (`reveal` is of that note). Nothing for New, All notes and the bin.
+ */
+export function treeSelected(selection: Selection, reveal: Reveal | null): string | null {
+  if (selection.kind === "folder") return selection.path;
+  if (selection.kind === "note" && reveal?.note === selection.path) return reveal.folder;
+  return null;
+}
+
+/**
+ * The folder the columns show and the file picked in its column: the shown folder with its
+ * picked file, or, while a note is open, its folder with the note once it was revealed.
+ */
+export function columnsPlace(
+  selection: Selection,
+  reveal: Reveal | null,
+  picked: string | null,
+): { path: string | null; file: string | null } {
+  if (selection.kind === "folder") return { path: selection.path, file: picked };
+  if (selection.kind === "note" && reveal?.note === selection.path) return { path: reveal.folder, file: reveal.note };
+  return { path: null, file: null };
+}
+
+/**
+ * A click on the folder `path` of the toolbar's path: it shows the folder; the open note's own
+ * folder shows with the note picked, any other folder with nothing picked.
+ */
+export function crumbTarget(selection: Selection, path: string): { folder: string; picked: string | null } {
+  const picked = selection.kind === "note" && parentOf(selection.path) === path ? selection.path : null;
+  return { folder: path, picked };
+}
+
+/**
+ * Where Back from a note goes once a note opens over `shown` (the place and its picked row),
+ * from the search results when `search` is the search text. A note that opens over a note
+ * keeps the place before the first one.
+ */
+export function noteOrigin(
+  before: BackTo,
+  shown: { selection: Selection; picked: string | null },
+  search: string | null,
+): BackTo {
+  if (shown.selection.kind === "note") return { ...before, search };
+  return { selection: shown.selection, picked: shown.picked, search };
+}
+
+/** What was shown before a note opened: the place, its picked row and the search over it. */
+export type BackTo = { selection: Selection; picked: string | null; search: string | null };
+
+/**
+ * Where Back from a note goes: to what was shown before it opened, a folder with the row that
+ * was picked in it, and the search results when the note came from them. The reveal of the
+ * note does not change it; the breadcrumbs go to the note's folder.
+ */
+export function afterBack(from: BackTo): BackTo {
+  return {
+    selection: from.selection,
+    picked: from.selection.kind === "folder" ? from.picked : null,
+    search: from.search?.trim() ? from.search : null,
+  };
+}
+
+/** The name of a note by its path, as the review shows it before or without its text. */
+export function noteTitle(path: string): string {
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  return name.endsWith(".note") ? name.slice(0, -".note".length) : name;
+}
+
+/** A part of the toolbar's path: a folder (a button that shows it) or a name (`path` null). */
+export type PathPart = { label: string; path: string | null };
+
+const PLACE_NAMES = { new: "New", all: "All notes", bin: "Recycle bin" } as const;
+
+/**
+ * The path in the toolbar: the folders of the shown folder, or of the open note followed by
+ * its name; New, All notes and the bin show their own name. `full` is the whole path as text,
+ * for the tooltip.
+ */
+export function toolbarPath(selection: Selection): { crumbs: PathPart[]; full: string } {
+  let crumbs: PathPart[];
+  if (selection.kind === "folder") crumbs = pathBar(selection.path);
+  else if (selection.kind === "note") {
+    crumbs = [...pathBar(parentOf(selection.path)), { label: noteTitle(selection.path), path: null }];
+  } else crumbs = [{ label: PLACE_NAMES[selection.kind], path: null }];
+  return { crumbs, full: crumbs.map((crumb) => crumb.label).join(" / ") };
 }

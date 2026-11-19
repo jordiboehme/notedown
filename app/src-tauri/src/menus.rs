@@ -17,13 +17,21 @@ const MARK_ALL_SEEN_ID: &str = "ctx-mark-all-seen";
 const SAVE_MARKDOWN_ID: &str = "ctx-save-markdown";
 
 /// What the user opened a context menu on.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum MenuTarget {
     /// The New notes row of the sidebar and the header of its list.
     NewNotes,
     /// A note, by its wire path.
     Note { path: String },
+    /// Page `index` (0-based) of the note at `path`, right-clicked at `x`, `y` (CSS pixels of
+    /// the window's web view).
+    Page {
+        path: String,
+        index: usize,
+        x: f64,
+        y: f64,
+    },
 }
 
 /// One item of a context menu.
@@ -52,6 +60,18 @@ pub fn context_items(target: &MenuTarget, can: bool) -> Vec<MenuEntry> {
             text: crate::save_markdown::MENU_TEXT,
             enabled: can,
         }],
+        MenuTarget::Page { .. } => [
+            (crate::page_image::COPY_ID, crate::page_image::COPY_TEXT),
+            (crate::page_image::SAVE_ID, crate::page_image::SAVE_TEXT),
+            (crate::page_image::SHARE_ID, crate::page_image::SHARE_TEXT),
+        ]
+        .into_iter()
+        .map(|(id, text)| MenuEntry {
+            id,
+            text,
+            enabled: can,
+        })
+        .collect(),
     }
 }
 
@@ -78,6 +98,7 @@ pub fn popup<R: Runtime>(window: &WebviewWindow<R>, target: MenuTarget) -> Resul
     let can = match &target {
         MenuTarget::Note { path } => has_text(&notes, path),
         MenuTarget::NewNotes => has_new(&notes),
+        MenuTarget::Page { .. } => true,
     };
     let items = context_items(&target, can);
     if items.is_empty() {
@@ -109,6 +130,19 @@ pub fn run_context(notes: &Notes, id: &str) -> Result<(), String> {
 /// The user picked the context item `id`. The work runs off the main thread, which is the one
 /// that delivers menu events. A failure goes to the library window as its notice.
 pub fn on_context(app: &AppHandle, id: &str) {
+    if let Some(action) = crate::page_image::action_of(id) {
+        // The page the menu was opened on.
+        let target = app
+            .state::<MenuTargetState>()
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(MenuTarget::Page { path, index, x, y }) = target {
+            crate::page_image::on_menu(app, action, path, index, (x, y));
+        }
+        return;
+    }
     if id == SAVE_MARKDOWN_ID {
         // The note the menu was opened on; its save shows its own failure.
         let target = app
@@ -171,6 +205,34 @@ mod tests {
             context_items(&note, false),
             [entry("ctx-save-markdown", "Save Markdown...", false)]
         );
+    }
+
+    #[test]
+    fn a_page_has_copy_save_and_share() {
+        let page = MenuTarget::Page {
+            path: "NOTE/Note/a.note".to_owned(),
+            index: 2,
+            x: 10.0,
+            y: 20.5,
+        };
+        let entry = |id, text| MenuEntry {
+            id,
+            text,
+            enabled: true,
+        };
+        assert_eq!(
+            context_items(&page, true),
+            [
+                entry("ctx-copy-image", "Copy Image"),
+                entry("ctx-save-image", "Save Image..."),
+                entry("ctx-share-image", "Share..."),
+            ]
+        );
+        let parsed: MenuTarget = serde_json::from_str(
+            r#"{"kind":"page","path":"NOTE/Note/a.note","index":2,"x":10,"y":20.5}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed, page);
     }
 
     #[test]

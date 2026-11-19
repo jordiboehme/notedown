@@ -53,21 +53,31 @@
     columnsView,
     listingKey,
     openAt,
+    afterBack,
+    columnsPlace,
+    crumbTarget,
+    noteOrigin,
     parentOf,
     pathBar,
+    revealOf,
     rootRows,
     shownFor,
     sidebarItems,
+    toolbarPath,
+    treeSelected,
     treeView,
     withoutAt,
+    type BackTo,
+    type Reveal,
     type Selection,
     type SidebarItem,
-    type Sort,
   } from "./view";
+  import { readSort, saveSort, type ListKind } from "./sort";
   import { entryActions, folderAt, followChange, jobRows, type Change } from "./actions";
   import { emptyConfirm, recycleRows } from "./recycle";
   import { drag, folderUnder, letGo, moveTo, stopDrag } from "./drag.svelte";
   import { isFindKey, searchPlace, type ResultRow } from "./search";
+  import { WebMenuGuard, selectionCopy } from "./webmenu";
   import { LibrarySearch } from "./search.svelte";
   import "../lib/system.css";
   import "./library.css";
@@ -85,7 +95,26 @@
    */
   let openings = $state(0);
   const open = new SvelteSet<string>();
-  let sort = $state<Sort>({ by: "name", ascending: true });
+  /** The viewer's storage; null where it cannot be used. */
+  function storage(): Storage | null {
+    try {
+      return window.localStorage;
+    } catch {
+      return null;
+    }
+  }
+
+  /** The sort of each list kind, kept per viewer. */
+  const sorts = $state({
+    notes: readSort(storage(), "notes"),
+    folder: readSort(storage(), "folder"),
+    bin: readSort(storage(), "bin"),
+  });
+
+  function sortList<K extends ListKind>(kind: K, sort: (typeof sorts)[K]) {
+    sorts[kind] = sort;
+    saveSort(storage(), kind, sort);
+  }
   let newNotes = $state<NoteSummary[] | null>(null);
   let allNotes = $state<NoteSummary[] | null>(null);
   /** Why the last load of New or All notes failed, while that list is still missing. */
@@ -106,8 +135,16 @@
 
   const ready = $derived(library.view?.state === "ready");
   const selectedPath = $derived(library.selection.kind === "folder" ? library.selection.path : null);
-  const tree = $derived(treeView(library.listings, open, selectedPath));
-  const columns = $derived(columnsView(selectedPath, library.listings, picked));
+  /** Where the open note is in the tree, once its review opened it. */
+  let reveal = $state<Reveal | null>(null);
+  /** The folder the tree scrolls into view once its row is there; null when none waits. */
+  let scrollTo = $state<string | null>(null);
+  /** The folder the sidebar selects: the shown one, or the open note's. */
+  const sidebarPath = $derived(treeSelected(library.selection, reveal));
+  const tree = $derived(treeView(library.listings, open, sidebarPath));
+  /** The columns show the shown folder, or the open note's folder with the note picked. */
+  const columnsAt = $derived(columnsPlace(library.selection, reveal, picked));
+  const columns = $derived(columnsView(columnsAt.path, library.listings, columnsAt.file));
   const inTree = $derived(library.viewMode === "tree");
   const items = $derived(
     sidebarItems(library.view, { newNotes: newNotes?.length ?? null, allNotes: allNotes?.length ?? null }, library.selection),
@@ -127,7 +164,7 @@
   // binding (the generation moves).
   $effect(() => {
     void library.generation;
-    const shown = shownFor(library.viewMode, library.selection, open);
+    const shown = shownFor(library.viewMode, library.selection, open, reveal);
     const binShown = library.selection.kind === "bin";
     untrack(() => showListings(shown, binShown));
   });
@@ -231,6 +268,7 @@
   /** Shows `next`: the picked row, a rename and a new folder's name end. */
   function show(next: Selection) {
     library.selection = next;
+    scrollTo = null;
     picked = null;
     renaming = null;
     naming = false;
@@ -240,10 +278,35 @@
    * Shows the review of the note at `path`, at the block `at` (a search hit) when given; Back
    * goes to what was shown before.
    */
-  function openNote(path: string, at?: { pageId: string; blockId: string }) {
-    if (library.selection.kind !== "note") library.back = library.selection;
+  function openNote(path: string, at?: { pageId: string; blockId: string }, fromSearch: string | null = null) {
+    origin = noteOrigin(origin, { selection: library.selection, picked }, fromSearch);
+    library.back = origin.selection;
+    reveal = null;
     show(at ? { kind: "note", path, at } : { kind: "note", path });
     openings += 1;
+  }
+
+  /**
+   * The review read the note at `path`: the sidebar selects its folder and the tree opens the
+   * folders above it. A note that is gone or in the bin never gets here.
+   */
+  function noteOpened(path: string) {
+    const found = revealOf(path);
+    if (!found || library.selection.kind !== "note" || library.selection.path !== path) return;
+    reveal = found;
+    scrollTo = found.folder;
+    for (const folder of found.opens) open.add(folder);
+  }
+
+  /** Where Back from the open note goes: the place, its picked row, the search. */
+  let origin: BackTo = { selection: library.back, picked: null, search: null };
+
+  /** Back from a note: to what was shown before it, with its picked row or its search. */
+  function back() {
+    const next = afterBack(origin);
+    show(next.selection);
+    picked = next.picked;
+    if (next.search !== null) search.type(next.search);
   }
 
   /** Shows a folder and opens the folders above it in the tree. */
@@ -298,6 +361,8 @@
     if (open.has(path)) {
       // Closing a folder closes the folders below it too: they are not shown.
       for (const other of [...open]) if (other === path || other.startsWith(`${path}/`)) open.delete(other);
+      // A folder that waits to scroll into view is not shown anymore.
+      if (scrollTo !== null && scrollTo.startsWith(`${path}/`)) scrollTo = null;
     } else {
       open.add(path);
     }
@@ -319,10 +384,12 @@
 
   /** A row of the search results: it opens or selects what it names, and the search ends. */
   function openRow(row: ResultRow) {
+    // Back from a note gives the results back.
+    const typed = search.text;
     search.clear();
     if (row.section === "text" && row.pageId !== undefined && row.blockId !== undefined) {
-      openNote(row.path, { pageId: row.pageId, blockId: row.blockId });
-    } else if (row.kind === "note") openNote(row.path);
+      openNote(row.path, { pageId: row.pageId, blockId: row.blockId }, typed);
+    } else if (row.kind === "note") openNote(row.path, undefined, typed);
     else pickFile(row.path);
   }
 
@@ -340,6 +407,12 @@
     }
   }
 
+  /** WebKit's own menu stays only in text fields and on selected text. */
+  const menuGuard = new WebMenuGuard((x, y) => {
+    const caret = document.caretRangeFromPoint?.(x, y) ?? null;
+    return selectionCopy(window.getSelection(), caret ? { node: caret.startContainer, offset: caret.startOffset } : null);
+  });
+
   function settings(page: string | null) {
     invoke("open_settings", { page }).catch(report("open_settings"));
   }
@@ -352,16 +425,34 @@
   onpointerup={released}
   onpointercancel={stopDrag}
   onkeydown={keydown}
+  onpointerdowncapture={(event) => menuGuard.pressed(event)}
+  oncontextmenu={(event) => menuGuard.menu(event)}
 />
 
 <div class="library window">
   <StatusLine status={status.current} {now} onSetUp={() => settings("setup")} />
-  <Toolbar bind:this={toolbar} view={library.viewMode} onView={(view) => void chooseView(view)} {search} />
+  <Toolbar
+    bind:this={toolbar}
+    view={library.viewMode}
+    onView={(view) => {
+      // A reveal that waits to scroll is for the view it was made in.
+      scrollTo = null;
+      void chooseView(view);
+    }}
+    {search}
+    path={toolbarPath(library.selection)}
+    onOpen={(path) => {
+      const target = crumbTarget(library.selection, path);
+      search.clear();
+      select(target.folder);
+      picked = target.picked;
+    }}
+  />
   <div class="body">
     <Sidebar
       notes={items.notes}
       tree={items.tree}
-      rows={inTree ? tree.rows : rootRows(selectedPath)}
+      rows={inTree ? tree.rows : rootRows(sidebarPath)}
       bin={items.bin}
       view={library.view}
       onPick={pick}
@@ -369,6 +460,8 @@
       onToggle={toggle}
       onSettings={settings}
       onNewMenu={newMenu}
+      scrollTo={inTree ? scrollTo : null}
+      onScrolled={() => (scrollTo = null)}
     />
     <main class="main">
       <SearchLayer {searching}>
@@ -381,11 +474,20 @@
               title="New notes"
               notes={newNotes}
               empty="No new notes."
+              sort={sorts.notes}
+              onSort={(next) => sortList("notes", next)}
               onOpen={(note) => openNote(note.path)}
               onMarkAllSeen={markAllSeen}
             />
           {:else if library.selection.kind === "all"}
-            <NotesList title="All notes" notes={allNotes} empty="No notes with text yet." onOpen={(note) => openNote(note.path)} />
+            <NotesList
+              title="All notes"
+              notes={allNotes}
+              empty="No notes with text yet."
+              sort={sorts.notes}
+              onSort={(next) => sortList("notes", next)}
+              onOpen={(note) => openNote(note.path)}
+            />
           {:else if library.selection.kind === "note"}
             {#key `${library.generation}:${openings}:${library.selection.path}`}
               <Review
@@ -393,7 +495,8 @@
                 at={library.selection.at ?? null}
                 covered={searching}
                 onAtTaken={() => (library.selection = withoutAt(library.selection))}
-                onBack={() => (library.selection = library.back)}
+                onOpened={noteOpened}
+                onBack={back}
               />
             {/key}
           {:else if !ready}
@@ -402,6 +505,8 @@
             <RecycleBin
               bin={library.bin}
               rows={binRows}
+              sort={sorts.bin}
+              onSort={(next) => sortList("bin", next)}
               restores={library.restores}
               question={emptyConfirm(library.bin, library.emptyAsked)}
               emptying={library.emptying}
@@ -430,7 +535,6 @@
             {#if !inTree}
               {#key library.generation}
                 <ColumnsView
-                  {path}
                   columns={columns.columns}
                   {renaming}
                   onSelect={select}
@@ -446,10 +550,10 @@
                   folder={library.listings[listingKey(path, false)]}
                   next={library.next[listingKey(path, false)] ?? null}
                   busy={isBusy(path, false)}
-                  {sort}
+                  sort={sorts.folder}
                   {picked}
                   {renaming}
-                  onSort={(next) => (sort = next)}
+                  onSort={(next) => sortList("folder", next)}
                   onOpen={select}
                   onOpenNote={openNote}
                   onMore={() => void listNext(path, false)}

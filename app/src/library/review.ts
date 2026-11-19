@@ -142,10 +142,7 @@ export function concernsNote(payload: unknown, path: string): boolean {
 }
 
 /** The name of a note by its path, as the review shows it before or without its text. */
-export function noteTitle(path: string): string {
-  const name = path.slice(path.lastIndexOf("/") + 1);
-  return name.endsWith(".note") ? name.slice(0, -".note".length) : name;
-}
+export { noteTitle } from "./view";
 
 export type Side = "pages" | "text";
 
@@ -190,4 +187,20 @@ export function noteMenu(event: { preventDefault(): void }, path: string) {
   invoke("library_menu", { target: { kind: "note", path } }).catch((error: unknown) =>
     console.error("notedown: library_menu failed", error),
   );
+}
+
+/**
+ * The context menu of page `index` of the note at `path` (in the review and in the large
+ * view), instead of WebKit's: Rust builds it (Copy Image, Save Image..., Share...) and does its
+ * work. The share menu shows at the pointer.
+ */
+export function pageMenu(
+  event: { preventDefault(): void; clientX: number; clientY: number },
+  path: string,
+  index: number,
+) {
+  event.preventDefault();
+  invoke("library_menu", {
+    target: { kind: "page", path, index, x: event.clientX, y: event.clientY },
+  }).catch((error: unknown) => console.error("notedown: library_menu failed", error));
 }

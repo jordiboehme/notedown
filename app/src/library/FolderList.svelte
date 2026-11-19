@@ -1,15 +1,16 @@
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import type { Entry, FolderState } from "../lib/library-types";
   import NameField from "./NameField.svelte";
-  import PathBar from "./PathBar.svelte";
+  import SortHeads from "./SortHeads.svelte";
   import VirtualRows from "./VirtualRows.svelte";
   import { opensReview } from "./actions";
   import { noteMenu } from "./review";
   import { drag, pressOn } from "./drag.svelte";
+  import { loadsRest, nextSort } from "./sort";
   import { dateText, listRows, needsNextPage, sizeText, type Range, type Sort } from "./view";
 
-  // The selected folder: the path bar, the column heads and the rows. The first page shows at
+  // The selected folder: the column heads and the rows. The first page shows at
   // once; the next page is asked for when the rows near its end come into view. A click picks
   // a row (for the file actions), a double click opens a folder or the review of a .note file
   // (Enter too, for a .note), a press and a drag moves it.
@@ -46,40 +47,43 @@
   const ROW = 24;
   const view = $derived(folder ? listRows(folder, sort) : { rows: [], sortable: false });
 
+  /** A head was clicked in this folder: it loads all its pages, so the sort covers every row. */
+  let clicked = $state(false);
+
+  let list: ReturnType<typeof VirtualRows<Entry>> | undefined = $state();
+
   function sortBy(by: Sort["by"]) {
-    if (!view.sortable) return;
-    onSort(sort.by === by ? { by, ascending: !sort.ascending } : { by, ascending: by === "name" });
+    clicked = true;
+    onSort(nextSort(sort, by));
+    // The picked row stays picked; the sort may move it out of view.
+    void tick().then(() => {
+      if (picked !== null) list?.show(view.rows.findIndex((entry) => entry.path === picked));
+    });
   }
 
   function seen(range: Range) {
     if (needsNextPage({ end: range.end, count: view.rows.length, next, busy })) onMore();
   }
 
-  // A page without rows shows no rows to come near: the next page is asked for at once.
+  // A page without rows shows no rows to come near: the next page is asked for at once. A sort
+  // that is not the order of the pages asks for every page; the rows are sorted once all came.
   $effect(() => {
-    if (folder && view.rows.length === 0 && needsNextPage({ end: 0, count: 0, next, busy })) untrack(onMore);
+    if (!folder || folder.error !== null) return;
+    const all = view.rows.length === 0 || loadsRest("folder", sort, clicked);
+    if (all && needsNextPage({ end: view.rows.length, count: view.rows.length, next, busy })) untrack(onMore);
   });
-
-  function arrow(by: Sort["by"]): string {
-    if (!view.sortable || sort.by !== by) return "";
-    return sort.ascending ? "▴" : "▾";
-  }
 </script>
 
-<PathBar {path} {onOpen} />
-
 <div class="heads" role="group" aria-label="Sort">
-  {#each [["name", "Name"], ["size", "Size"], ["date", "Changed"]] as const as [by, title] (by)}
-    <button
-      type="button"
-      class="head {by}"
-      disabled={!view.sortable}
-      title={view.sortable ? undefined : "The folder can be sorted once it is loaded."}
-      onclick={() => sortBy(by)}
-    >
-      {title}<span class="arrow" aria-hidden="true">{arrow(by)}</span>
-    </button>
-  {/each}
+  <SortHeads
+    columns={[
+      { by: "name", title: "Name" },
+      { by: "size", title: "Size", end: true },
+      { by: "date", title: "Changed" },
+    ]}
+    {sort}
+    onSort={sortBy}
+  />
 </div>
 
 <!-- The rows of the shown folder: a drop anywhere here that is not on a folder row goes into it. -->
@@ -93,7 +97,7 @@
   {:else if folder.entries.length === 0 && folder.complete}
     <p class="note">This folder is empty.</p>
   {:else}
-    <VirtualRows items={view.rows} rowHeight={ROW} key={(entry: Entry) => entry.id} label="Files and folders" onRange={seen}>
+    <VirtualRows bind:this={list} reveal={picked === null ? null : (view.rows.find((e) => e.path === picked)?.id ?? null)} items={view.rows} rowHeight={ROW} key={(entry: Entry) => entry.id} label="Files and folders" onRange={seen}>
       {#snippet row(entry: Entry)}
         {#snippet name()}
           <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
@@ -166,28 +170,6 @@
   .heads {
     flex: none;
     border-bottom: 1px solid var(--separator);
-  }
-
-  .head {
-    font: inherit;
-    font-size: 11px;
-    text-align: left;
-    color: var(--secondary);
-    padding: 4px 0;
-    border: 0;
-    background: none;
-  }
-
-  .head:disabled {
-    color: var(--tertiary);
-  }
-
-  .head.size {
-    text-align: right;
-  }
-
-  .arrow {
-    margin-left: 4px;
   }
 
   .row {

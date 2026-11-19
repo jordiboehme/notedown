@@ -5,7 +5,7 @@
   import { NOTES_EVENT } from "../lib/library-types";
   import { ReviewSession } from "./session.svelte";
   import { status } from "../lib/status.svelte";
-  import { canSaveMarkdown, concernsNote, noteTitle, reviewNotice, reviewPages, type BlockAt } from "./review";
+  import { canSaveMarkdown, concernsNote, noteTitle, pageMenu, reviewNotice, reviewPages, type BlockAt } from "./review";
   import ReviewPages from "./ReviewPages.svelte";
   import PageViewer from "./PageViewer.svelte";
   import { ACTUAL, ZOOMS, findEndsAlone, reviewZoomKey, zoomIn, zoomOut } from "./zoom";
@@ -19,6 +19,7 @@
     at = null,
     covered = false,
     onAtTaken = () => {},
+    onOpened = () => {},
     onBack,
   }: {
     path: string;
@@ -27,6 +28,8 @@
     covered?: boolean;
     /** The session took `at`: the window drops it, so the review is not opened at it again. */
     onAtTaken?: () => void;
+    /** The first read of the note worked: the window shows where the note is. */
+    onOpened?: (path: string) => void;
     onBack: () => void;
   } = $props();
 
@@ -64,6 +67,14 @@
     await tick();
     pages?.showPage(last);
   }
+
+  // The first read that works tells the window, once.
+  let told = false;
+  $effect(() => {
+    if (!session.view || told) return;
+    told = true;
+    untrack(() => onOpened(path));
+  });
 
   // A search over the review hides it from the File menu's Save Markdown...
   $effect(() => {
@@ -153,6 +164,7 @@
     onSeen={(changes) => session.seenMany(changes)}
     onMeasured={(index, width, height) => session.measured(index, width, height)}
     onOpen={(index) => session.focus(index)}
+    onPageMenu={(event, index) => pageMenu(event, path, index)}
   />
   {#if session.focused !== null && rows[session.focused]}
     <PageViewer
@@ -162,6 +174,7 @@
       {covered}
       onStep={(index) => session.focus(index)}
       onClose={() => void closeViewer()}
+      onPageMenu={(event, index) => pageMenu(event, path, index)}
     />
   {/if}
 {/if}

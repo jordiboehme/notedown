@@ -47,11 +47,11 @@ cat >"$tmp/cli.json" <<'EOF'
     {"name": "serde", "version": "1.0.0", "bom-ref": "registry#serde@1.0.0", "purl": "pkg:cargo/serde@1.0.0"},
     {"name": "llama-cpp-sys-2", "version": "0.1.161", "bom-ref": "registry#llama-cpp-sys-2@0.1.161", "purl": "pkg:cargo/llama-cpp-sys-2@0.1.161"},
     {"name": "candle-core", "version": "0.11.1", "bom-ref": "registry#candle-core@0.11.1", "purl": "pkg:cargo/candle-core@0.11.1"},
-    {"name": "pagevision", "version": "0.1.0", "bom-ref": "git+https://github.com/jordiboehme/rezzer?rev=a0685acfa2e576310e3bb7a30bb79a7f45593154#pagevision@0.1.0", "purl": "pkg:cargo/pagevision@0.1.0?vcs_url=git%2Bhttps://github.com/jordiboehme/rezzer%40a0685acfa2e576310e3bb7a30bb79a7f45593154"}
+    {"name": "pagevision", "version": "0.1.0", "bom-ref": "git+https://github.com/jordiboehme/rezzer?rev=d69bd72a6ef857e45a755b3b79e1b7d7bbf39165#pagevision@0.1.0", "purl": "pkg:cargo/pagevision@0.1.0?vcs_url=git%2Bhttps://github.com/jordiboehme/rezzer%40d69bd72a6ef857e45a755b3b79e1b7d7bbf39165"}
   ],
   "dependencies": [
-    {"ref": "path+file:///w/crates/notedown#0.1.0", "dependsOn": ["git+https://github.com/jordiboehme/rezzer?rev=a0685acfa2e576310e3bb7a30bb79a7f45593154#pagevision@0.1.0", "registry#llama-cpp-sys-2@0.1.161", "registry#serde@1.0.0"]},
-    {"ref": "git+https://github.com/jordiboehme/rezzer?rev=a0685acfa2e576310e3bb7a30bb79a7f45593154#pagevision@0.1.0", "dependsOn": ["registry#candle-core@0.11.1", "registry#llama-cpp-sys-2@0.1.161"]},
+    {"ref": "path+file:///w/crates/notedown#0.1.0", "dependsOn": ["git+https://github.com/jordiboehme/rezzer?rev=d69bd72a6ef857e45a755b3b79e1b7d7bbf39165#pagevision@0.1.0", "registry#llama-cpp-sys-2@0.1.161", "registry#serde@1.0.0"]},
+    {"ref": "git+https://github.com/jordiboehme/rezzer?rev=d69bd72a6ef857e45a755b3b79e1b7d7bbf39165#pagevision@0.1.0", "dependsOn": ["registry#candle-core@0.11.1", "registry#llama-cpp-sys-2@0.1.161"]},
     {"ref": "registry#serde@1.0.0", "dependsOn": []},
     {"ref": "registry#candle-core@0.11.1", "dependsOn": []},
     {"ref": "registry#llama-cpp-sys-2@0.1.161", "dependsOn": []}

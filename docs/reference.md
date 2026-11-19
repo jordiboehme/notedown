@@ -45,8 +45,10 @@ starts. `notedown model path` shows the folder and the four files (`cache:`, `mo
 A pull that stops (you end it, or the connection breaks) keeps what it has. The next
 `notedown model pull` continues from there. Run only one pull at a time.
 
-`notedown model pull --json` is for apps. Its first line on stdout names the licences:
-`{"licences": ["<line>", ...]}`. Then it prints one JSON line per progress step:
+`notedown model pull --json` is for apps. Its first line on stdout names the licences, as lines
+and per file with the model it belongs to and the page of that model:
+`{"licences": ["<line>", ...], "files": [{"file": "<name>", "model": "<model>", "page": "<url>",
+"licence": "<licence>", "licensor": "<licensor>"}, ...]}`. Then it prints one JSON line per progress step:
 `{"file": "<name>", "done": <bytes>, "total": <bytes>}`. The last line is `{"ready": "<path>"}`.
 An error is plain text on stderr, and the exit code is not 0. With `--licences-only` it prints the
 licences and stops before the download.

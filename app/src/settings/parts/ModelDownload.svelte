@@ -11,12 +11,21 @@
     modelPull,
     modelRemove,
     modelState,
+    openLink,
     type ModelState,
     type Progress,
   } from "../api";
   import { formatBytes, fraction } from "../format";
   import { licences, loadLicences } from "../modelLicences.svelte";
-  import { MODEL_TEXT, canDownload, cleanOldButton, cleanOldQuestion, filesNote, licenceLine } from "../modelText";
+  import {
+    MODEL_TEXT,
+    canDownload,
+    cleanOldButton,
+    cleanOldQuestion,
+    filesNote,
+    licenceGroups,
+    modelJoint,
+  } from "../modelText";
   import Row from "../kit/Row.svelte";
   import StatusDot from "../kit/StatusDot.svelte";
 
@@ -49,7 +58,12 @@
     }
   }
 
-  const licence = $derived(licenceLine(licences.lines ?? []));
+  const groups = $derived(licenceGroups(licences.files ?? []));
+
+  /** A model's page opens in the browser (Rust opens only pages on Hugging Face). */
+  function openPage(page: string) {
+    openLink(page).catch((error: unknown) => console.error("notedown: the link did not open", error));
+  }
 
   onMount(() => {
     void check();
@@ -112,8 +126,15 @@
 <Row title="Model" note={MODEL_TEXT.note}>
   <span class="value">{MODEL_TEXT.size}</span>
 </Row>
-{#if licence}
-  <p class="licences">{licence}</p>
+{#if groups.length > 0}
+  <p class="licences">
+    Licences: {#each groups as group, g (g)}{#if g > 0}{"; "}{/if}{#each group.models as model, i (model.name)}{modelJoint(
+          i,
+          group.models.length,
+        )}{#if model.page}<button type="button" class="link" onclick={() => openPage(model.page!)}
+            >{model.name}</button
+          >{:else}{model.name}{/if}{/each} ({group.licensor}): {group.licence}{/each}
+  </p>
 {:else if licences.error}
   <div class="licences bad">
     <span>{licences.error}</span>
@@ -187,6 +208,26 @@
     overflow-wrap: anywhere;
     /* The status row below follows a paragraph, not a row, so this is its separator. */
     border-bottom: 1px solid var(--separator);
+  }
+
+  /* A model name: looks like a link, opens its page in the browser. */
+  .licences .link {
+    font: inherit;
+    color: var(--accent);
+    padding: 0;
+    border: 0;
+    background: none;
+    cursor: pointer;
+  }
+
+  .licences .link:hover {
+    text-decoration: underline;
+  }
+
+  .licences .link:focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--accent), transparent 50%);
+    outline-offset: 1px;
+    border-radius: 2px;
   }
 
   .licences.bad {

@@ -62,6 +62,13 @@ pub struct SaveTarget {
 /// The one save that runs; dropped, the next may start.
 pub struct SaveTurn<'a>(&'a AtomicBool);
 
+impl SaveTarget {
+    /// The turn of a save (of Markdown or of an image), `None` while a save panel is open.
+    pub fn turn(&self) -> Option<SaveTurn<'_>> {
+        SaveTurn::take(&self.saving)
+    }
+}
+
 impl<'a> SaveTurn<'a> {
     /// The turn, `None` while another save runs (its panel is open).
     pub fn take(saving: &'a AtomicBool) -> Option<Self> {
@@ -79,20 +86,23 @@ impl Drop for SaveTurn<'_> {
 #[derive(Default)]
 pub struct SaveMenuItem(pub Mutex<Option<MenuItem<Wry>>>);
 
-/// The file name a save proposes for a note titled `title`: `<title>.md`, with "/" and ":"
-/// (which a Mac file name cannot hold) as "-" and no leading dot. A note without a title is
-/// "Note.md".
+/// The file name a save proposes for a note titled `title`: `<title>.md` (see [`safe_title`]).
 pub fn file_name(title: &str) -> String {
+    format!("{}.md", safe_title(title))
+}
+
+/// A note's title as the start of a file name: "/" and ":" (which a Mac file name cannot hold)
+/// as "-" and no leading dot. A note without a title is "Note".
+pub fn safe_title(title: &str) -> String {
     // A leading dot would make a hidden file.
     let title = title.trim().trim_start_matches('.').trim();
     if title.is_empty() {
-        return "Note.md".to_owned();
+        return "Note".to_owned();
     }
-    let safe: String = title
+    title
         .chars()
         .map(|c| if c == '/' || c == ':' { '-' } else { c })
-        .collect();
-    format!("{safe}.md")
+        .collect()
 }
 
 /// The folder the save dialog opens in: the folder of the last save while it is a folder,
@@ -138,7 +148,7 @@ pub fn markdown_of(spawn: &SpawnFn, config: &AppConfig, key: &str) -> Result<Str
 /// Writes `text` to `path`: into a temp file in the same folder, then renamed over `path`, so
 /// the file is never half written. The temp file is removed when that fails. The folder is
 /// synced after the rename, so the new name survives a crash too.
-pub fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
+pub fn write_atomically(path: &Path, text: impl AsRef<[u8]>) -> Result<(), String> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let not_saved = |e: std::io::Error| format!("The file {} was not saved: {e}", path.display());
     let dir = path.parent().unwrap_or(Path::new("."));
@@ -154,7 +164,7 @@ pub fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
             .write(true)
             .create_new(true)
             .open(&temp)?;
-        file.write_all(text.as_bytes())?;
+        file.write_all(text.as_ref())?;
         file.sync_all()?;
         drop(file);
         std::fs::rename(&temp, path)
@@ -220,24 +230,17 @@ pub fn save_with(
 /// dialog waits for the user): never on the main thread.
 pub fn save(app: &AppHandle, path: &str, from: SaveFrom) -> Result<Option<PathBuf>, String> {
     let target = app.state::<SaveTarget>();
-    let Some(_turn) = SaveTurn::take(&target.saving) else {
+    let Some(_turn) = target.turn() else {
         return Ok(None);
     };
-    // The panel is a sheet on the library window when that shows.
-    let library = app
-        .get_webview_window(WindowKind::Library.label())
-        .filter(|w| w.is_visible().unwrap_or(false));
+    let library = shown_library(app);
     let notes = app.state::<Notes>().inner().clone();
     // A page the review shows with text may be newer than the index's last scan.
     notes.refresh();
     let config_state = app.state::<ConfigState>().inner().clone();
     let config = config_state.current();
     let spawn = app.state::<crate::setup::Sidecar>().0.clone();
-    let downloads = app
-        .path()
-        .download_dir()
-        .or_else(|_| app.path().home_dir().map(|home| home.join("Downloads")))
-        .unwrap_or_default();
+    let downloads = downloads(app);
     save_with(
         &notes,
         path,
@@ -265,6 +268,20 @@ pub fn save(app: &AppHandle, path: &str, from: SaveFrom) -> Result<Option<PathBu
             }
         },
     )
+}
+
+/// The library window while it shows: a save panel is a sheet on it then.
+pub fn shown_library(app: &AppHandle) -> Option<tauri::WebviewWindow> {
+    app.get_webview_window(WindowKind::Library.label())
+        .filter(|w| w.is_visible().unwrap_or(false))
+}
+
+/// The Downloads folder, where a save starts without an earlier one.
+pub fn downloads(app: &AppHandle) -> PathBuf {
+    app.path()
+        .download_dir()
+        .or_else(|_| app.path().home_dir().map(|home| home.join("Downloads")))
+        .unwrap_or_default()
 }
 
 /// Shows a failed save in a dialog. It does not wait for the user.

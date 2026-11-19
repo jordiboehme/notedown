@@ -1,17 +1,17 @@
 // The licences of the model files. The model rows show them before the download, so they are
 // asked for once when the rows first show; they do not change while the app runs.
 
-import { failure, modelLicences } from "./api";
+import { failure, modelLicences, type LicenceFile } from "./api";
 
-export const licences = $state<{ lines: string[] | null; error: string | null }>({ lines: null, error: null });
+export const licences = $state<{ files: LicenceFile[] | null; error: string | null }>({ files: null, error: null });
 
 let asked: Promise<void> | null = null;
 
-/** Asks the notedown program for the licence lines, once. A failure may be asked again. */
+/** Asks the notedown program for the licences, once. A failure may be asked again. */
 export function loadLicences(): Promise<void> {
   asked ??= modelLicences()
-    .then((lines) => {
-      licences.lines = lines;
+    .then((files) => {
+      licences.files = files;
       licences.error = null;
     })
     .catch((e) => {

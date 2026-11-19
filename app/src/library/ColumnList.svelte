@@ -56,7 +56,14 @@
     <p class="note problem" role="status">{column.error}</p>
   {/if}
   {#if column.rows.length > 0}
-    <VirtualRows items={column.rows} rowHeight={ROW} key={(row: ColumnRow) => row.path} {label} onRange={seen}>
+    <VirtualRows
+      items={column.rows}
+      rowHeight={ROW}
+      key={(row: ColumnRow) => row.path}
+      {label}
+      onRange={seen}
+      reveal={column.rows.find((row) => row.selected)?.path ?? null}
+    >
       {#snippet row(entry: ColumnRow)}
         {#snippet icon()}
           <svg class="icon" class:folder={entry.kind === "folder"} viewBox="0 0 16 16" aria-hidden="true">

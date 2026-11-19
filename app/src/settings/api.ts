@@ -236,8 +236,11 @@ export const modelState = () => invoke<ModelState>("model_state");
 export const modelPull = () => invoke("model_pull");
 export const modelPause = () => invoke<ModelState>("model_pause");
 export const modelRemove = () => invoke<ModelState>("model_remove");
-/** The licences of the model files, one line per licensor. Downloads nothing. */
-export const modelLicences = () => invoke<string[]>("model_licences");
+/** One model file's licence, its model and the page of that model. */
+export type LicenceFile = { model: string; page: string; licence: string; licensor: string };
+
+/** The licences of the model files, one per file. Downloads nothing. */
+export const modelLicences = () => invoke<LicenceFile[]>("model_licences");
 /** Deletes the model files of Notedown 0.1. */
 export const modelCleanOld = () => invoke<ModelState>("model_clean_old");
 /** Ends the OCR pause; the pause itself starts in the menu bar or the panel. */

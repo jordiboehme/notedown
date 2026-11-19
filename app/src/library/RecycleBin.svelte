@@ -2,16 +2,22 @@
   import { untrack } from "svelte";
   import type { RecycleItem } from "../lib/library-types";
   import type { Restore } from "../lib/library.svelte";
+  import SortHeads from "./SortHeads.svelte";
   import VirtualRows from "./VirtualRows.svelte";
   import { binNeedsNext, binView, type Bin, type RecycleRow } from "./recycle";
+  import { loadsRest, nextSort, sortBin, type BinSort } from "./sort";
   import type { Range } from "./view";
 
   // The recycle bin: Empty in its toolbar (asked in the window first), and a row per item with
   // Restore. A restore into a taken place asks for another name in its row. The first page shows
-  // at once; the next page is asked for when the rows near its end come into view.
+  // at once; the next page is asked for when the rows near its end come into view. The rows are
+  // sorted by a column once every page came; a sort that is not the order of the pages (newest
+  // first) asks for every page.
   let {
     bin,
     rows,
+    sort,
+    onSort,
     restores,
     question,
     emptying,
@@ -27,6 +33,8 @@
   }: {
     bin: Bin;
     rows: RecycleRow[];
+    sort: BinSort;
+    onSort: (sort: BinSort) => void;
     restores: Record<string, Restore>;
     /** The question before Empty while it is asked; null when not. */
     question: string | null;
@@ -45,14 +53,25 @@
 
   const ROW = 28;
   const view = $derived(binView(bin));
+  /** A head was clicked: the bin loads all its pages, so the sort covers every row. */
+  let clicked = $state(false);
+  const shown = $derived(bin.next === null ? sortBin(rows, sort) : rows);
 
   function seen(range: Range) {
     if (binNeedsNext(bin, range.end, rows.length)) onMore();
   }
 
-  // A page without rows shows no rows to come near: the next page is asked for at once.
+  function sortBy(by: BinSort["by"]) {
+    clicked = true;
+    onSort(nextSort(sort, by));
+  }
+
+  // A page without rows shows no rows to come near: the next page is asked for at once. So is
+  // every page while the sort is not the order of the pages.
   $effect(() => {
-    if (bin.loaded && rows.length === 0 && binNeedsNext(bin, 0, 0)) untrack(onMore);
+    if (!bin.loaded) return;
+    const all = rows.length === 0 || loadsRest("bin", sort, clicked);
+    if (all && binNeedsNext(bin, rows.length, rows.length)) untrack(onMore);
   });
 
   /**
@@ -91,11 +110,17 @@
   {/if}
 </div>
 
-<div class="heads" aria-hidden="true">
-  <span>Name</span>
-  <span>Was in</span>
-  <span>Deleted</span>
-  <span class="size">Size</span>
+<div class="heads" role="group" aria-label="Sort">
+  <SortHeads
+    columns={[
+      { by: "name", title: "Name" },
+      { by: "folder", title: "Was in" },
+      { by: "deleted", title: "Deleted" },
+      { by: "size", title: "Size", end: true },
+    ]}
+    {sort}
+    onSort={sortBy}
+  />
   <span></span>
 </div>
 
@@ -109,7 +134,7 @@
   {:else if view.empty}
     <p class="note">The recycle bin is empty.</p>
   {:else if rows.length > 0}
-    <VirtualRows items={rows} rowHeight={ROW} key={(row: RecycleRow) => row.key} label="Deleted files and folders" onRange={seen}>
+    <VirtualRows items={shown} rowHeight={ROW} key={(row: RecycleRow) => row.key} label="Deleted files and folders" onRange={seen}>
       {#snippet row(row: RecycleRow)}
         {@const restore = restores[row.key]}
         <div class="row" class:asking={restore?.state === "asking"}>
@@ -210,10 +235,6 @@
 
   .heads {
     flex: none;
-    padding-top: 4px;
-    padding-bottom: 4px;
-    font-size: 11px;
-    color: var(--secondary);
     border-bottom: 1px solid var(--separator);
   }
 

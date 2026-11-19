@@ -903,6 +903,31 @@ jobs:
             exit 1
           fi
 
+      # licenses/bundled-code.txt names only the vendored llama.cpp parts
+      # that are linked. A bump of llama-cpp-2 or pagevision can link one of
+      # the others again, so the counts of its dated nm note are checked
+      # here: the left-out parts must stay out, sgemm must stay in.
+      - name: The CLI links only the llama.cpp parts its notices name
+        run: |
+          set -euo pipefail
+          syms="$RUNNER_TEMP/notedown.nm"
+          nm "target/$TARGET/release/notedown" >"$syms"
+          bad=0
+          count() { grep -cE -- "$1" "$syms" || true; }
+          for pattern in 'ZL[0-9]+stbi__' 'ZL[0-9]+ma_' '_subprocess_create' ' T _sha256_hash$' \
+            '[Nn]lohmann' '[Hh]ttplib' 'XXH' 'vendor_hash'; do
+            n="$(count "$pattern")"
+            echo "$pattern: $n"
+            if [ "$n" != 0 ]; then
+              echo "::error::the CLI links '$pattern' ($n symbols), but licenses/bundled-code.txt does not name it"
+              bad=1
+            fi
+          done
+          n="$(count 'llamafile_sgemm')"
+          echo "llamafile_sgemm: $n"
+          [ "$n" != 0 ] || { echo "::error::llamafile sgemm is not linked: check licenses/bundled-code.txt"; bad=1; }
+          exit "$bad"
+
       # A run with a tag (a release or the rehearsal) must sign, notarize
       # and sign its updater files. A run without a tag and without any of
       # the eight secrets builds unsigned with a throwaway updater key. A

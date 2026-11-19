@@ -1179,31 +1179,94 @@ pub async fn ocr_resume(app: AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())?
 }
 
-/// The panel opens the Pause OCR menu at `x`, `y` (CSS pixels of the window: under the button
-/// that was pressed). Its items are the tray's Pause OCR items, so a pick goes through the menu
-/// bar's handler to [`pause_ocr`]: the tray menu, the status and Settings show it at once. On
-/// the main thread, as every native menu.
+/// What the pause controls ask of the app: show the Pause OCR menu, pause, resume. The app's
+/// side is [`AppPause`]; the tests use a fake.
+pub trait OcrPauseControl {
+    /// Pops up `items` at `at` (logical points of the window), or at the pointer.
+    fn popup(&self, items: &[crate::tray::TrayEntry], at: Option<(f64, f64)>)
+    -> Result<(), String>;
+    fn pause(&self, choice: PauseChoice) -> Result<(), String>;
+    fn resume(&self) -> Result<(), String>;
+}
+
+/// The app's pause control: [`pause_ocr`] and [`resume_ocr`], and the native menu over
+/// `window` (the panel; `None` for the tray, which shows no popup).
+pub struct AppPause<'a> {
+    pub app: &'a AppHandle,
+    pub window: Option<&'a tauri::WebviewWindow>,
+}
+
+impl OcrPauseControl for AppPause<'_> {
+    fn popup(
+        &self,
+        items: &[crate::tray::TrayEntry],
+        at: Option<(f64, f64)>,
+    ) -> Result<(), String> {
+        use tauri::menu::{IsMenuItem, Menu};
+        let window = self.window.ok_or("no window for the menu")?;
+        let native = crate::tray::render(self.app, items).map_err(|e| e.to_string())?;
+        let refs: Vec<&dyn IsMenuItem<tauri::Wry>> = native.iter().map(|i| &**i).collect();
+        let menu = Menu::with_items(self.app, &refs).map_err(|e| e.to_string())?;
+        match at {
+            Some((x, y)) => window
+                .popup_menu_at(&menu, tauri::LogicalPosition::new(x, y))
+                .map_err(|e| e.to_string()),
+            None => window.popup_menu(&menu).map_err(|e| e.to_string()),
+        }
+    }
+
+    fn pause(&self, choice: PauseChoice) -> Result<(), String> {
+        pause_ocr(self.app, choice)
+    }
+
+    fn resume(&self) -> Result<(), String> {
+        resume_ocr(self.app)
+    }
+}
+
+/// Shows the Pause OCR menu at `x`, `y` (CSS pixels of the window: under the pressed button),
+/// with the tray's Pause OCR items. A point off the window is moved onto it; one that is not a
+/// number shows the menu at the pointer.
+pub fn panel_pause_menu_with(control: &impl OcrPauseControl, x: f64, y: f64) -> Result<(), String> {
+    let at = (x.is_finite() && y.is_finite()).then(|| (x.max(0.0), y.max(0.0)));
+    control.popup(&crate::tray::pause_items(), at)
+}
+
+/// The pick of menu item `id`: pauses for its choice, `None` when `id` is no pause item. The
+/// tray's submenu and the panel's menu both end here (`tray::on_menu_event`).
+pub fn pause_pick_with(control: &impl OcrPauseControl, id: &str) -> Option<Result<(), String>> {
+    crate::tray::pause_choice(id).map(|choice| control.pause(choice))
+}
+
+/// Resume OCR Now in the panel.
+pub fn panel_ocr_resume_with(control: &impl OcrPauseControl) -> Result<(), String> {
+    control.resume()
+}
+
+/// The panel opens the Pause OCR menu ([`panel_pause_menu_with`]). A pick goes through the
+/// menu bar's handler to [`pause_ocr`]: the tray menu, the status and Settings show it at once.
+/// On the main thread, as every native menu.
 #[tauri::command]
 pub fn panel_pause_menu(window: tauri::WebviewWindow, x: f64, y: f64) -> Result<(), String> {
-    use tauri::menu::{IsMenuItem, Menu};
-    let app = window.app_handle();
-    let items = crate::tray::render(app, &crate::tray::pause_items()).map_err(|e| e.to_string())?;
-    let refs: Vec<&dyn IsMenuItem<tauri::Wry>> = items.iter().map(|i| &**i).collect();
-    let menu = Menu::with_items(app, &refs).map_err(|e| e.to_string())?;
-    if x.is_finite() && y.is_finite() {
-        let at = tauri::LogicalPosition::new(x.max(0.0), y.max(0.0));
-        window.popup_menu_at(&menu, at).map_err(|e| e.to_string())
-    } else {
-        window.popup_menu(&menu).map_err(|e| e.to_string())
-    }
+    let app = window.app_handle().clone();
+    let control = AppPause {
+        app: &app,
+        window: Some(&window),
+    };
+    panel_pause_menu_with(&control, x, y)
 }
 
 /// Ends the OCR pause from the panel's Resume OCR Now, as [`ocr_resume`] does for Settings.
 #[tauri::command]
 pub async fn panel_ocr_resume(app: AppHandle) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || resume_ocr(&app))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        panel_ocr_resume_with(&AppPause {
+            app: &app,
+            window: None,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Whether the Keychain keeps a login for the account in the config, off the main thread.
@@ -3072,6 +3135,97 @@ mod tests {
             .unwrap();
         assert_eq!(file_time_ms(&file), Ok(1_763_300_000_123));
         assert!(file_time_ms(&dir.path().join("missing.snbak")).is_err());
+    }
+
+    mod panel_pause {
+        use super::*;
+        use crate::tray::{self, TrayEntry};
+        use std::cell::RefCell;
+
+        /// One popup: its items and where it showed.
+        type Popup = (Vec<TrayEntry>, Option<(f64, f64)>);
+
+        /// Records what the panel's commands asked of the app.
+        #[derive(Default)]
+        struct FakeControl {
+            calls: RefCell<Vec<String>>,
+            popups: RefCell<Vec<Popup>>,
+        }
+
+        impl OcrPauseControl for FakeControl {
+            fn popup(&self, items: &[TrayEntry], at: Option<(f64, f64)>) -> Result<(), String> {
+                self.calls.borrow_mut().push("popup".into());
+                self.popups.borrow_mut().push((items.to_vec(), at));
+                Ok(())
+            }
+            fn pause(&self, choice: PauseChoice) -> Result<(), String> {
+                self.calls.borrow_mut().push(format!("pause {choice:?}"));
+                Ok(())
+            }
+            fn resume(&self) -> Result<(), String> {
+                self.calls.borrow_mut().push("resume".into());
+                Ok(())
+            }
+        }
+
+        fn ids(items: &[TrayEntry]) -> Vec<String> {
+            items
+                .iter()
+                .filter_map(|e| match e {
+                    TrayEntry::Item { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn the_menu_pops_up_the_tray_items_under_the_button() {
+            let fake = FakeControl::default();
+            panel_pause_menu_with(&fake, 12.0, 40.5).unwrap();
+            // Off the window or not a number: clamped, or at the pointer.
+            panel_pause_menu_with(&fake, -3.0, 8.0).unwrap();
+            panel_pause_menu_with(&fake, f64::NAN, 8.0).unwrap();
+            panel_pause_menu_with(&fake, 8.0, f64::INFINITY).unwrap();
+            let popups = fake.popups.borrow();
+            let at: Vec<_> = popups.iter().map(|(_, at)| *at).collect();
+            assert_eq!(at, [Some((12.0, 40.5)), Some((0.0, 8.0)), None, None]);
+            for (items, _) in popups.iter() {
+                assert_eq!(*items, tray::pause_items());
+            }
+            assert_eq!(*fake.calls.borrow(), ["popup"; 4]);
+        }
+
+        #[test]
+        fn a_pick_in_the_menu_pauses_for_its_choice() {
+            // Every item the panel's menu shows pauses with its choice through the control,
+            // whose app side is commands::pause_ocr.
+            let fake = FakeControl::default();
+            panel_pause_menu_with(&fake, 0.0, 0.0).unwrap();
+            let shown = fake.popups.borrow()[0].0.clone();
+            for id in ids(&shown) {
+                assert_eq!(pause_pick_with(&fake, &id), Some(Ok(())), "{id}");
+            }
+            assert_eq!(
+                fake.calls.borrow()[1..],
+                [
+                    "pause OneMinute",
+                    "pause FiveMinutes",
+                    "pause OneHour",
+                    "pause UntilResumed"
+                ]
+            );
+            // Other ids are no pause.
+            assert_eq!(pause_pick_with(&fake, tray::RESUME_OCR_ID), None);
+            assert_eq!(pause_pick_with(&fake, tray::QUIT_ID), None);
+            assert_eq!(fake.calls.borrow().len(), 5);
+        }
+
+        #[test]
+        fn resume_ocr_now_resumes_through_the_control() {
+            let fake = FakeControl::default();
+            panel_ocr_resume_with(&fake).unwrap();
+            assert_eq!(*fake.calls.borrow(), ["resume"]);
+        }
     }
 
     mod pause {

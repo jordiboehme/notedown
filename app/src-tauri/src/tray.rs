@@ -296,11 +296,13 @@ pub fn on_menu_event(app: &AppHandle, id: &str) {
             });
         }
         _ if pause_choice(id).is_some() => {
-            let (app, choice) = (app.clone(), pause_choice(id));
+            let (app, id) = (app.clone(), id.to_owned());
             std::thread::spawn(move || {
-                if let Some(choice) = choice
-                    && let Err(e) = crate::commands::pause_ocr(&app, choice)
-                {
+                let control = crate::commands::AppPause {
+                    app: &app,
+                    window: None,
+                };
+                if let Some(Err(e)) = crate::commands::pause_pick_with(&control, &id) {
                     eprintln!("notedown: the OCR was not paused: {e}");
                 }
             });

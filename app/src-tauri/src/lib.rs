@@ -1293,30 +1293,6 @@ mod tests {
         assert!(!granted("panel").contains("ocr_resume"));
     }
 
-    /// The body of `fn name` in commands.rs, up to the next item.
-    fn command_body(name: &str) -> &'static str {
-        let source = include_str!("commands.rs");
-        let start = source
-            .find(&format!("pub fn {name}("))
-            .or_else(|| source.find(&format!("pub async fn {name}(")))
-            .unwrap_or_else(|| panic!("no {name} in commands.rs"));
-        let body = &source[start..];
-        &body[..body.find("\n}\n").expect("no end of the function")]
-    }
-
-    #[test]
-    fn the_panels_pause_commands_use_the_shared_pause_logic() {
-        // Without a mock runtime the commands cannot run in a test: their bodies are read. The
-        // menu has the tray's items, whose picks go to commands::pause_ocr (tray.rs tests);
-        // Resume goes to commands::resume_ocr, as the tray and the settings do.
-        let menu = command_body("panel_pause_menu");
-        assert!(menu.contains("tray::pause_items()"), "{menu}");
-        assert!(menu.contains("popup_menu"), "{menu}");
-        let resume = command_body("panel_ocr_resume");
-        assert!(resume.contains("resume_ocr(&app)"), "{resume}");
-        assert!(command_body("ocr_resume").contains("resume_ocr(&app)"));
-    }
-
     #[test]
     fn the_review_is_only_the_librarys() {
         for command in [

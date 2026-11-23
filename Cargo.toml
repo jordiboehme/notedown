@@ -33,7 +33,7 @@ tempfile = "=3.27.0"
 clap = { version = "=4.6.7", features = ["derive"] }
 time = { version = "=0.3.55", features = ["formatting", "parsing", "macros"] }
 # Only for the local UTC offset: it reads the zone data itself, no localtime_r, no child process.
-jiff = { version = "=0.2.46", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
+jiff = { version = "=1.0.0", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 toml = "=1.2.1"
 hmac = "=0.13.0"
 md-5 = "=0.11.0"

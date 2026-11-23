@@ -259,7 +259,7 @@ jobs:
       # `fallback: none` fails the step rather than building or downloading
       # anything else. The second step is the same install and runs only
       # after the first one failed (a bad network day).
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         id: about
         continue-on-error: true
         with:
@@ -270,7 +270,7 @@ jobs:
         if: ${{ steps.about.outcome == 'failure' }}
         run: sleep 30
 
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         if: ${{ steps.about.outcome == 'failure' }}
         with:
           tool: cargo-about@0.9.3
@@ -454,7 +454,7 @@ jobs:
       # osv-scanner can name the crates inside a shipped binary or image. The
       # install action has a prebuilt binary for both runners and checks it
       # against the SHA-256 in its manifest. Two tries, as in notices.
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         id: auditable
         continue-on-error: true
         with:
@@ -465,7 +465,7 @@ jobs:
         if: ${{ steps.auditable.outcome == 'failure' }}
         run: sleep 30
 
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         if: ${{ steps.auditable.outcome == 'failure' }}
         with:
           tool: cargo-auditable@0.7.7
@@ -474,7 +474,7 @@ jobs:
       # The install action's cargo-deb manifest has an x86_64 Linux binary
       # only, so the arm64 leg falls back to `cargo install --locked
       # cargo-deb@3.8.0`: the same pinned version, built from crates.io.
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         id: cargo-deb
         continue-on-error: true
         with:
@@ -485,7 +485,7 @@ jobs:
         if: ${{ steps.cargo-deb.outcome == 'failure' }}
         run: sleep 30
 
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         if: ${{ steps.cargo-deb.outcome == 'failure' }}
         with:
           tool: cargo-deb@3.8.0
@@ -612,7 +612,7 @@ jobs:
           bash scripts/ci/retry.sh 3 rustup toolchain install
           rustup show active-toolchain
 
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         id: cyclonedx
         continue-on-error: true
         with:
@@ -623,7 +623,7 @@ jobs:
         if: ${{ steps.cyclonedx.outcome == 'failure' }}
         run: sleep 30
 
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         if: ${{ steps.cyclonedx.outcome == 'failure' }}
         with:
           tool: cargo-cyclonedx@0.5.9
@@ -833,7 +833,7 @@ jobs:
 
       # Two tries, as in notices. The install action has a prebuilt binary
       # for Apple silicon and checks it against its manifest.
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         id: auditable
         continue-on-error: true
         with:
@@ -844,7 +844,7 @@ jobs:
         if: ${{ steps.auditable.outcome == 'failure' }}
         run: sleep 30
 
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         if: ${{ steps.auditable.outcome == 'failure' }}
         with:
           tool: cargo-auditable@0.7.7
